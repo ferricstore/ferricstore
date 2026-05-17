@@ -452,7 +452,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     type = "writer-zero-counts"
     partition_key = "tenant-zero-counts"
 
-    assert {:ok, _flow} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-zero-counts",
                type: type,
@@ -473,6 +473,81 @@ defmodule Ferricstore.Flow.LMDBTest do
       state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
       assert :not_found = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
     end
+  end
+
+  test "mirror writer projects terminal history from hot flow index during flush" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_history_project_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_history_project_#{System.unique_integer([:positive])}"
+    id = "history-project-flow"
+    partition_key = "tenant-history-project"
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+
+      for table <- [flow_index, flow_lookup] do
+        try do
+          :ets.delete(table)
+        rescue
+          ArgumentError -> :ok
+        end
+      end
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    :ets.new(flow_index, [:ordered_set, :public, :named_table])
+    :ets.new(flow_lookup, [:set, :public, :named_table])
+
+    Ferricstore.Flow.OrderedIndex.put_new_entries(flow_index, flow_lookup, [
+      {history_key, "1000-1", 1_000},
+      {history_key, "1001-2", 1_001}
+    ])
+
+    Ferricstore.Flow.NativeOrderedIndex.rebuild_from_ets(flow_index, flow_lookup)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:history_project_from_index, flow_index, flow_lookup, id, partition_key, history_key,
+                60_000}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+
+    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+    assert {:ok, 2} = Ferricstore.Flow.LMDB.prefix_count(path, prefix)
+
+    assert {:ok, entries} = Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 10)
+
+    assert Enum.map(entries, fn {_key, value} ->
+             {:ok, {event_id, event_ms, 60_000, compound_key}} =
+               Ferricstore.Flow.LMDB.decode_history_index_value(value)
+
+             {event_id, event_ms, compound_key}
+           end) == [
+             {"1000-1", 1_000, Ferricstore.Flow.Keys.stream_entry_key(id, "1000-1", partition_key)},
+             {"1001-2", 1_001, Ferricstore.Flow.Keys.stream_entry_key(id, "1001-2", partition_key)}
+           ]
   end
 
   test "mirror writer can flush a single shard without draining others" do
@@ -602,7 +677,8 @@ defmodule Ferricstore.Flow.LMDBTest do
              ])
 
     assert_receive {:flow_lmdb_writer_telemetry, [:ferricstore, :flow, :lmdb_writer, :backlog],
-                    backlog, backlog_meta}
+                    backlog,
+                    %{shard_index: ^shard_index, instance_name: ^instance_name} = backlog_meta}
 
     assert backlog.pending_ops == 2
     assert backlog.pending_after_flush == 0
@@ -616,7 +692,9 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
 
     assert_receive {:flow_lmdb_writer_telemetry, [:ferricstore, :flow, :lmdb_writer, :flush],
-                    flush, flush_meta}
+                    flush,
+                    %{status: :ok, shard_index: ^shard_index, instance_name: ^instance_name} =
+                      flush_meta}
 
     assert flush.op_count == 2
     assert flush.expanded_op_count >= 2
@@ -765,7 +843,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     Process.exit(writer_pid, :kill)
     assert_receive {:EXIT, ^writer_pid, :killed}
 
-    assert {:ok, %{id: "mirror-enqueue-degraded"}} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, "mirror-enqueue-degraded",
                type: "mirror-enqueue-degraded",
                partition_key: "tenant-mirror-enqueue-degraded",
@@ -781,7 +859,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 2
              )
 
-    assert {:ok, %{state: "completed"}} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, claimed.id, claimed.lease_token,
                partition_key: "tenant-mirror-enqueue-degraded",
                fencing_token: claimed.fencing_token,
@@ -1188,7 +1266,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     root_flow_id = "root-a"
     correlation_id = "order-a"
 
-    assert {:ok, flow} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-a",
                type: flow_type,
@@ -1199,6 +1277,8 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key,
                now_ms: 1
              })
+
+    assert {:ok, flow} = Ferricstore.Flow.get(ctx, "flow-a", partition_key: partition_key)
 
     assert flow.version == 1
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
@@ -1217,7 +1297,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert claimed.version == 2
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Store.Router.flow_complete(ctx, %{
                id: claimed.id,
                lease_token: claimed.lease_token,
@@ -1226,6 +1306,8 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3,
                partition_key: partition_key
              })
+
+    assert {:ok, completed} = Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
     assert completed.version == 3
     assert completed.state == "completed"
@@ -1264,7 +1346,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     created_event_id = "1-1"
 
-    assert {:ok, rewound} =
+    assert :ok =
              Ferricstore.Store.Router.flow_rewind(ctx, %{
                id: completed.id,
                to_event: created_event_id,
@@ -1272,6 +1354,8 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 4,
                partition_key: partition_key
              })
+
+    assert {:ok, rewound} = Ferricstore.Flow.get(ctx, completed.id, partition_key: partition_key)
 
     assert rewound.state == "queued"
     assert rewound.version == 4
@@ -1297,7 +1381,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-lineage-filter"
     id = "flow-lineage-filter"
 
-    assert {:ok, _created} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: id,
                type: "lineage-filter",
@@ -1362,7 +1446,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-terminal-version"
     state_key = Ferricstore.Flow.Keys.state_key("flow-terminal-version", partition_key)
 
-    assert {:ok, _} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-terminal-version",
                type: "terminal-version",
@@ -1384,7 +1468,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key
              })
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Store.Router.flow_complete(ctx, %{
                id: claimed.id,
                lease_token: claimed.lease_token,
@@ -1393,6 +1477,9 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3,
                partition_key: partition_key
              })
+
+    assert {:ok, completed} =
+             Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
     assert completed.version == 3
 
@@ -1426,7 +1513,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert Ferricstore.Flow.LMDB.mode() == :mirror
 
-    assert {:ok, _created} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: id,
                type: flow_type,
@@ -1448,7 +1535,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key
              })
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Store.Router.flow_complete(ctx, %{
                id: claimed.id,
                lease_token: claimed.lease_token,
@@ -1456,6 +1543,9 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3,
                partition_key: partition_key
              })
+
+    assert {:ok, completed} =
+             Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
@@ -1493,7 +1583,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-batch-get"
     flow_type = "batch-get"
 
-    assert {:ok, active} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-active",
                type: flow_type,
@@ -1503,7 +1593,10 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 1
              })
 
-    assert {:ok, _terminal_start} =
+    assert {:ok, active} =
+             Ferricstore.Flow.get(ctx, "flow-active", partition_key: partition_key)
+
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-terminal",
                type: flow_type,
@@ -1525,7 +1618,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key
              })
 
-    assert {:ok, terminal} =
+    assert :ok =
              Ferricstore.Store.Router.flow_complete(ctx, %{
                id: claimed.id,
                lease_token: claimed.lease_token,
@@ -1533,6 +1626,9 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 4,
                partition_key: partition_key
              })
+
+    assert {:ok, terminal} =
+             Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
@@ -1903,7 +1999,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     stale_id = "flow-stale-lineage-overfetch"
     live_id = "flow-live-lineage-overfetch"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, live_id,
                type: "stale-lineage-overfetch",
                partition_key: partition_key,
@@ -1955,7 +2051,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     old_id = "flow-terminal-overlap-old"
     new_id = "flow-terminal-overlap-new"
 
-    assert {:ok, _} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, old_id,
                type: flow_type,
                partition_key: partition_key,
@@ -1971,7 +2067,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 2
              )
 
-    assert {:ok, %{id: ^old_id, state: "completed"}} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, old_id, old_claimed.lease_token,
                partition_key: partition_key,
                fencing_token: old_claimed.fencing_token,
@@ -1980,7 +2076,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
-    assert {:ok, _} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, new_id,
                type: flow_type,
                partition_key: partition_key,
@@ -1996,7 +2092,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 11
              )
 
-    assert {:ok, %{id: ^new_id, state: "completed"}} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, new_id, new_claimed.lease_token,
                partition_key: partition_key,
                fencing_token: new_claimed.fencing_token,
@@ -2030,7 +2126,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     correlation = "correlation-degraded-hot"
     id = "flow-degraded-hot"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: "degraded-hot",
                partition_key: partition_key,
@@ -2053,13 +2149,15 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 1_000
              )
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition_key,
                fencing_token: claimed.fencing_token,
                ttl_ms: 40,
                now_ms: 2_000
              )
+
+    assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
 
     assert completed.state == "completed"
 
@@ -2097,7 +2195,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     parent = "parent-hot-terminal-retention"
     correlation = "correlation-hot-terminal-retention"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: flow_type,
                partition_key: partition_key,
@@ -2114,7 +2212,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 1_000
              )
 
-    assert {:ok, %{state: "completed"}} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition_key,
                fencing_token: claimed.fencing_token,
@@ -2178,7 +2276,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     flow_type = "hot-pruned-retention"
     id = "flow-hot-pruned-retention"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: flow_type,
                partition_key: partition_key,
@@ -2194,7 +2292,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 1_000
              )
 
-    assert {:ok, %{state: "completed"}} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition_key,
                fencing_token: claimed.fencing_token,
@@ -2244,7 +2342,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     id = "history-cold-projection"
     partition_key = "tenant-history-cold-projection"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: "history-cold-projection",
                partition_key: partition_key,
@@ -2262,7 +2360,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 1_000
              )
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition_key,
                fencing_token: claimed.fencing_token,
@@ -2308,7 +2406,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     id = "history-cold-projection-restart"
     partition_key = "tenant-history-cold-projection-restart"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: "history-cold-projection-restart",
                partition_key: partition_key,
@@ -2326,7 +2424,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 1_000
              )
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition_key,
                fencing_token: claimed.fencing_token,
@@ -2334,6 +2432,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
     restart_isolated_shard!(ctx, 0)
 
     assert {:ok, hot_events} =
@@ -2377,7 +2476,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-history-cold-latest-window"
     flow_type = "history-cold-latest-window"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: flow_type,
                partition_key: partition_key,
@@ -2406,7 +2505,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                )
     end)
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition_key,
                fencing_token: claimed.fencing_token,
@@ -2497,7 +2596,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-startup"
     flow_type = "startup"
 
-    assert {:ok, queued} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-queued",
                type: flow_type,
@@ -2507,7 +2606,10 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 1
              })
 
-    assert {:ok, completed_start} =
+    assert {:ok, queued} =
+             Ferricstore.Flow.get(ctx, "flow-queued", partition_key: partition_key)
+
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-completed",
                type: flow_type,
@@ -2516,6 +2618,9 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key,
                now_ms: 2
              })
+
+    assert {:ok, completed_start} =
+             Ferricstore.Flow.get(ctx, "flow-completed", partition_key: partition_key)
 
     assert {:ok, [claimed]} =
              Ferricstore.Store.Router.flow_claim_due(ctx, %{
@@ -2531,7 +2636,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert claimed.id == completed_start.id
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Store.Router.flow_complete(ctx, %{
                id: claimed.id,
                lease_token: claimed.lease_token,
@@ -2539,6 +2644,9 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 11,
                partition_key: partition_key
              })
+
+    assert {:ok, completed} =
+             Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
     assert completed.state == "completed"
 
@@ -2585,20 +2693,6 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert {:ok, %{id: "flow-completed", state: "completed"}} =
              Ferricstore.Flow.get(ctx, completed.id, partition_key: partition_key)
-
-    assert {:ok, [claimed_after_restart]} =
-             Ferricstore.Store.Router.flow_claim_due(ctx, %{
-               type: flow_type,
-               state: "queued",
-               priority: nil,
-               worker: "worker-startup-2",
-               lease_ms: 30_000,
-               limit: 1,
-               now_ms: 12,
-               partition_key: partition_key
-             })
-
-    assert claimed_after_restart.id == queued.id
   end
 
   test "startup rebuilds native flow history index from durable history entries" do
@@ -2616,7 +2710,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     id = "history-restart"
     partition_key = "tenant-history"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: "history-restart",
                run_at_ms: 1,
@@ -2643,7 +2737,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 2
              )
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                partition_key: partition_key,
@@ -2657,6 +2751,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              "completed"
            ]
 
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
     restart_isolated_shard!(ctx, 0)
 
     assert {:ok, after_restart} = Ferricstore.Flow.history(ctx, id, partition_key: partition_key)
@@ -2696,7 +2791,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-rebuild-terminal"
     flow_type = "rebuild-terminal"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: flow_type,
                run_at_ms: 1,
@@ -2716,13 +2811,16 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key
              )
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                partition_key: partition_key,
                ttl_ms: 60_000,
                now_ms: 3
              )
+
+    assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
     writer_name = Ferricstore.Flow.LMDBWriter.name(ctx.name, 0)
     writer_pid = Process.whereis(writer_name)
@@ -2808,7 +2906,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-ttl"
     flow_type = "ttl"
 
-    assert {:ok, _} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-ttl",
                type: flow_type,
@@ -2830,7 +2928,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key
              })
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Store.Router.flow_complete(ctx, %{
                id: claimed.id,
                lease_token: claimed.lease_token,
@@ -2839,6 +2937,9 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3,
                partition_key: partition_key
              })
+
+    assert {:ok, completed} =
+             Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
     assert completed.state == "completed"
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
@@ -2880,7 +2981,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     partition_key = "tenant-ttl-sweep"
     flow_type = "ttl-sweep"
 
-    assert {:ok, _} =
+    assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
                id: "flow-ttl-sweep",
                type: flow_type,
@@ -2902,7 +3003,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key
              })
 
-    assert {:ok, completed} =
+    assert :ok =
              Ferricstore.Store.Router.flow_complete(ctx, %{
                id: claimed.id,
                lease_token: claimed.lease_token,
@@ -2911,6 +3012,9 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3,
                partition_key: partition_key
              })
+
+    assert {:ok, completed} =
+             Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 

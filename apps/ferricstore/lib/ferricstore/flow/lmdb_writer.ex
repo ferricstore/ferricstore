@@ -465,9 +465,79 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  defp expand_op(
+         path,
+         {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
+          expire_at_ms, parent_flow_id, root_flow_id, correlation_id},
+         acc
+       )
+       when is_binary(id) and is_binary(type) and is_binary(terminal_state) and
+              is_integer(updated_at_ms) and is_binary(state_key) and is_integer(expire_at_ms) do
+    state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
+    terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, id, updated_at_ms)
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+    value =
+      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      )
+
+    with {:ok, acc} <-
+           expand_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc) do
+      {:ok,
+       prepend_ops(
+         acc,
+         terminal_project_metadata_ops(
+           id,
+           partition_key,
+           updated_at_ms,
+           expire_at_ms,
+           state_key,
+           parent_flow_id,
+           root_flow_id,
+           correlation_id
+         )
+       )}
+    end
+  end
+
   defp expand_op(_path, {:query_put, query_key, value}, acc)
        when is_binary(query_key) and is_binary(value) do
     {:ok, prepend_ops(acc, [{:put, query_key, value}])}
+  end
+
+  defp expand_op(
+         _path,
+         {:history_project_from_index, flow_index, flow_lookup, id, partition_key, history_key,
+          expire_at_ms},
+         acc
+       )
+       when is_binary(id) and is_binary(history_key) and is_integer(expire_at_ms) do
+    entries = history_project_from_index_entries(flow_index, flow_lookup, history_key)
+
+    {:ok,
+     prepend_ops(
+       acc,
+       history_put_many_ops(id, partition_key, history_key, expire_at_ms, entries)
+     )}
+  end
+
+  defp expand_op(
+         _path,
+         {:history_put_many, id, partition_key, history_key, expire_at_ms, entries},
+         acc
+       )
+       when is_binary(id) and is_binary(history_key) and is_integer(expire_at_ms) and
+              is_list(entries) do
+    {:ok,
+     prepend_ops(
+       acc,
+       history_put_many_ops(id, partition_key, history_key, expire_at_ms, entries)
+     )}
   end
 
   defp expand_op(_path, {:query_delete, query_key}, acc) when is_binary(query_key) do
@@ -640,7 +710,230 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
-  defp prepend_ops(acc, ops), do: %{acc | ops: Enum.reverse(ops) ++ acc.ops}
+  defp prepend_ops(acc, ops), do: %{acc | ops: :lists.reverse(ops, acc.ops)}
+
+  defp history_project_from_index_entries(nil, _flow_lookup, _history_key), do: []
+  defp history_project_from_index_entries(_flow_index, nil, _history_key), do: []
+
+  defp history_project_from_index_entries(flow_index, flow_lookup, history_key) do
+    case Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup) do
+      nil -> history_project_from_ets_entries(flow_index, flow_lookup, history_key)
+      native -> history_project_from_native_entries(native, history_key)
+    end
+  rescue
+    ArgumentError -> []
+  end
+
+  defp history_project_from_native_entries(native, history_key) do
+    native
+    |> Ferricstore.Flow.NativeOrderedIndex.range_slice(history_key, :neg_inf, :inf, false, 0, :all)
+    |> history_project_normalize_entries()
+  rescue
+    ArgumentError -> []
+  end
+
+  defp history_project_from_ets_entries(flow_index, _flow_lookup, history_key) do
+    flow_index
+    |> Ferricstore.Flow.OrderedIndex.range_slice(history_key, :neg_inf, :inf, false, 0, :all)
+    |> history_project_normalize_entries()
+  rescue
+    ArgumentError -> []
+  end
+
+  defp history_project_normalize_entries(entries) do
+    Enum.map(entries, fn {event_id, event_ms} -> {event_id, trunc(event_ms)} end)
+  end
+
+  defp terminal_project_metadata_ops(
+         id,
+         partition_key,
+         score,
+         expire_at_ms,
+         state_key,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id
+       ) do
+    []
+    |> terminal_project_metadata_op(
+      :parent,
+      parent_flow_id,
+      partition_key,
+      id,
+      score,
+      expire_at_ms,
+      state_key
+    )
+    |> terminal_project_metadata_op(
+      :root,
+      root_flow_id,
+      partition_key,
+      id,
+      score,
+      expire_at_ms,
+      state_key
+    )
+    |> terminal_project_metadata_op(
+      :correlation,
+      correlation_id,
+      partition_key,
+      id,
+      score,
+      expire_at_ms,
+      state_key
+    )
+  end
+
+  defp terminal_project_metadata_op(
+         ops,
+         :root,
+         nil,
+         _partition_key,
+         _id,
+         _score,
+         _expire_at_ms,
+         _state_key
+       ),
+       do: ops
+
+  defp terminal_project_metadata_op(
+         ops,
+         :root,
+         "",
+         _partition_key,
+         _id,
+         _score,
+         _expire_at_ms,
+         _state_key
+       ),
+       do: ops
+
+  defp terminal_project_metadata_op(
+         ops,
+         :root,
+         id,
+         _partition_key,
+         id,
+         _score,
+         _expire_at_ms,
+         _state_key
+       ),
+       do: ops
+
+  defp terminal_project_metadata_op(
+         ops,
+         kind,
+         value,
+         partition_key,
+         id,
+         score,
+         expire_at_ms,
+         state_key
+       )
+       when is_binary(value) and value != "" do
+    index_key =
+      case kind do
+        :parent -> Ferricstore.Flow.Keys.parent_index_key(value, partition_key)
+        :root -> Ferricstore.Flow.Keys.root_index_key(value, partition_key)
+        :correlation -> Ferricstore.Flow.Keys.correlation_index_key(value, partition_key)
+      end
+
+    query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
+    value = Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms, state_key)
+
+    [{:put, query_key, value} | ops]
+  end
+
+  defp terminal_project_metadata_op(
+         ops,
+         _kind,
+         _value,
+         _partition_key,
+         _id,
+         _score,
+         _expire_at_ms,
+         _state_key
+       ),
+       do: ops
+
+  defp terminal_project_metadata_index_keys(
+         id,
+         partition_key,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id
+       ) do
+    []
+    |> terminal_project_metadata_index_key(:parent, parent_flow_id, partition_key, id)
+    |> terminal_project_metadata_index_key(:root, root_flow_id, partition_key, id)
+    |> terminal_project_metadata_index_key(:correlation, correlation_id, partition_key, id)
+  end
+
+  defp terminal_project_metadata_index_key(keys, :root, nil, _partition_key, _id), do: keys
+  defp terminal_project_metadata_index_key(keys, :root, "", _partition_key, _id), do: keys
+  defp terminal_project_metadata_index_key(keys, :root, id, _partition_key, id), do: keys
+
+  defp terminal_project_metadata_index_key(keys, kind, value, partition_key, _id)
+       when is_binary(value) and value != "" do
+    key =
+      case kind do
+        :parent -> Ferricstore.Flow.Keys.parent_index_key(value, partition_key)
+        :root -> Ferricstore.Flow.Keys.root_index_key(value, partition_key)
+        :correlation -> Ferricstore.Flow.Keys.correlation_index_key(value, partition_key)
+      end
+
+    [key | keys]
+  end
+
+  defp terminal_project_metadata_index_key(keys, _kind, _value, _partition_key, _id), do: keys
+
+  defp history_put_many_ops(id, partition_key, history_key, expire_at_ms, entries) do
+    entries
+    |> Enum.flat_map(fn {event_id, event_ms} ->
+      compound_key = Ferricstore.Flow.Keys.stream_entry_key(id, event_id, partition_key)
+      history_index_key = Ferricstore.Flow.LMDB.history_index_key(history_key, event_id, event_ms)
+
+      [
+        {:put, history_index_key,
+         Ferricstore.Flow.LMDB.encode_history_index_value(
+           event_id,
+           event_ms,
+           compound_key,
+          expire_at_ms
+        )}
+      ]
+      |> maybe_history_expire_put(expire_at_ms, history_index_key)
+      |> Enum.reverse()
+    end)
+    |> maybe_history_flow_expire_put(expire_at_ms, history_key)
+  end
+
+  defp maybe_history_expire_put(ops, expire_at_ms, history_index_key) do
+    case Ferricstore.Flow.LMDB.history_expire_key(expire_at_ms, history_index_key) do
+      nil ->
+        ops
+
+      expire_key ->
+        [
+          {:put, expire_key, Ferricstore.Flow.LMDB.encode_history_expire_value(history_index_key)}
+          | ops
+        ]
+    end
+  end
+
+  defp maybe_history_flow_expire_put(ops, expire_at_ms, history_key) do
+    case Ferricstore.Flow.LMDB.history_flow_expire_key(expire_at_ms, history_key) do
+      nil ->
+        ops
+
+      expire_key ->
+        ops ++
+          [
+            {:put, expire_key,
+             Ferricstore.Flow.LMDB.encode_history_flow_expire_value(history_key, expire_at_ms)}
+          ]
+    end
+  end
 
   defp maybe_put_expire_key(ops, terminal_key, value, state_key, count_key) do
     case Ferricstore.Flow.LMDB.decode_terminal_index_value(value) do
@@ -735,6 +1028,34 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
+  defp apply_after_flush(
+         {:prune_terminal_flow_v2, ets, zset_index, zset_lookup, flow_index, flow_lookup,
+          state_key, type, terminal_state, partition_key, parent_flow_id, root_flow_id,
+          correlation_id, id, version}
+       ) do
+    state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
+
+    metadata_index_keys =
+      terminal_project_metadata_index_keys(
+        id,
+        partition_key,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id
+      )
+
+    prune_terminal_state_key(ets, state_key, version)
+
+    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
+
+    Enum.each(metadata_index_keys, fn index_key ->
+      safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
+    end)
+
+    :ok
+  end
+
   defp apply_after_flush({:defer_after_flush, delay_ms, action}) do
     delay_ms = normalize_delay_ms(delay_ms)
 
@@ -778,6 +1099,11 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp safe_flow_index_delete_member(_flow_index, nil, _state_index_key, _id), do: :ok
 
   defp safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id) do
+    case Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup) do
+      nil -> :ok
+      native -> Ferricstore.Flow.NativeOrderedIndex.delete_member(native, state_index_key, id)
+    end
+
     Ferricstore.Flow.OrderedIndex.delete_member(flow_index, flow_lookup, state_index_key, id)
   rescue
     ArgumentError -> :ok

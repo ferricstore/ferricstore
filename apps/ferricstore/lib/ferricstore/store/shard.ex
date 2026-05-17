@@ -9,32 +9,7 @@ defmodule Ferricstore.Store.Shard do
   `v2_append_batch`, `v2_append_tombstone`, `v2_scan_file`, hint file I/O.
   No Rust-side Store resource, HashMap keydir, or Mutex.
 
-  ## Ownership boundary
-
-  `Shard` owns the storage partition lifecycle, not the default application's
-  quorum write ingress.
-
-  It is responsible for:
-
-    * startup and recovery of the shard's Bitcask files, keydir, and indexes
-    * active-file state, file rotation, compaction, merge, and garbage cleanup
-    * cold-read fallback and validated file refs for streaming large values
-    * pause/resume, flush, stats, and other administrative lifecycle calls
-    * custom/direct instance writes that intentionally bypass the default Raft
-      cluster
-
-  For the default application instance, user-visible writes should enter through
-  `Ferricstore.Raft.Batcher`, then `Ferricstore.Raft.StateMachine.apply/3`.
-  The state machine is the mutation authority because Raft provides the
-  serialized committed order for read-modify-write commands. During the write
-  ingress migration this module still contains legacy/default write handlers,
-  but new default-instance write paths should not route through
-  `GenServer.call(shard, write_command)`.
-
-  ## Custom/direct write path
-
-  Custom embedded instances and non-default direct stores use the shard's local
-  write path:
+  ## Write path: group commit
 
   1. The key is written to ETS immediately (reads see it at once).
   2. The entry is appended to an in-memory pending list.
@@ -46,10 +21,7 @@ defmodule Ferricstore.Store.Shard do
      Data-file durability is owned by `Ferricstore.Store.BitcaskCheckpointer`,
      which runs on its own, longer tick and issues `v2_fsync` against
      the same active file.
-  4. File rotation occurs when the active file exceeds the configured limit.
-
-  Default quorum writes do not use this direct path; they are committed by Raft
-  first and applied by `Ferricstore.Raft.StateMachine`.
+  4. File rotation occurs when the active file exceeds 256 MB.
 
   ## Read path: ETS bypass
 
@@ -75,9 +47,10 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.{BlobRef, BlobStore, BlobValue, ColdRead}
+  alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -97,10 +70,19 @@ defmodule Ferricstore.Store.Shard do
   @cold_read_timeout_ms 10_000
   @cold_read_compaction_retry_attempts 8
   @cold_read_compaction_retry_delay_ms 1
+  @standalone_global_key "__standalone_global__"
+  @standalone_flow_many_commands [
+    :flow_create_many,
+    :flow_complete_many,
+    :flow_transition_many,
+    :flow_retry_many,
+    :flow_fail_many,
+    :flow_cancel_many
+  ]
 
-  # Default maximum active file size before rotation (8 GiB).
+  # Default maximum active file size before rotation (256 MB).
   # Configurable via :max_active_file_size application env.
-  @default_max_active_file_size 8 * 1024 * 1024 * 1024
+  @default_max_active_file_size 256 * 1024 * 1024
 
   # Default fragmentation thresholds for per-file dead bytes tracking.
   @default_fragmentation_threshold 0.5
@@ -145,13 +127,20 @@ defmodule Ferricstore.Store.Shard do
     raft?: true,
     # Maximum active file size before rotation. Cached from Application env
     # at init time. Updated via handle_cast(:update_max_active_file_size, n).
-    max_active_file_size: 8 * 1024 * 1024 * 1024,
+    max_active_file_size: 256 * 1024 * 1024,
     writes_paused: false,
     zset_score_index: nil,
     zset_score_lookup: nil,
     flow_index: nil,
     flow_lookup: nil,
-    zset_index_ready: MapSet.new()
+    zset_index_ready: MapSet.new(),
+    standalone_batch: [],
+    standalone_batch_timer: nil,
+    standalone_flush_ref: nil,
+    standalone_flush_entries: [],
+    standalone_inflight_keys: MapSet.new(),
+    standalone_waiting: [],
+    standalone_write_barrier: false
   ]
 
   # -------------------------------------------------------------------
@@ -193,6 +182,10 @@ defmodule Ferricstore.Store.Shard do
       ctx = Keyword.get(opts, :instance_ctx)
       fsync_dir_fun = Keyword.get(opts, :fsync_dir_fun, &NIF.v2_fsync_dir/1)
 
+      if ctx && !Ferricstore.ReplicationMode.raft?() do
+        :ok = Ferricstore.Store.StandaloneTxLog.recover_once(data_dir)
+      end
+
       path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
       {active_file_id, active_file_size, active_file_path} =
@@ -230,6 +223,24 @@ defmodule Ferricstore.Store.Shard do
         ShardLifecycle.recover_keydir(path, keydir, index, ctx)
       end)
 
+      profile_startup_phase(index, :flow_native_index_init, fn ->
+        case Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup) do
+          nil ->
+            Ferricstore.Flow.NativeOrderedIndex.register(
+              flow_index,
+              flow_lookup,
+              Ferricstore.Flow.NativeOrderedIndex.new()
+            )
+
+          _native ->
+            :ok
+        end
+      end)
+
+      profile_startup_phase(index, :flow_history_projector_recover, fn ->
+        :ok = Ferricstore.Flow.HistoryProjector.recover(ctx, index, path, keydir)
+      end)
+
       profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
         Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
           path,
@@ -241,6 +252,10 @@ defmodule Ferricstore.Store.Shard do
           flow_index,
           flow_lookup
         )
+      end)
+
+      profile_startup_phase(index, :flow_native_index_rebuild, fn ->
+        Ferricstore.Flow.NativeOrderedIndex.merge_from_ets(flow_index, flow_lookup)
       end)
 
       keydir = publish_rebuilt_keydir(keydir, keydir_name)
@@ -419,7 +434,6 @@ defmodule Ferricstore.Store.Shard do
     # into a private startup table and publish it only after recovery finishes.
     delete_keydir_table(keydir_name)
     reset_keydir_binary_counter(ctx, index)
-    Ferricstore.Store.ExpiryTracker.reset(ctx, index)
 
     temp_name = rebuilding_keydir_name(keydir_name)
     delete_keydir_table(temp_name)
@@ -556,12 +570,116 @@ defmodule Ferricstore.Store.Shard do
     {:reply, {:error, "ERR shard writes paused for sync"}, state}
   end
 
+  def handle_call({:standalone_commit, command}, from, state) do
+    state =
+      state
+      |> enqueue_standalone_commit(from, command)
+      |> maybe_flush_full_standalone_batch()
+
+    {:noreply, state}
+  end
+
+  def handle_call(:standalone_cross_shard_barrier_acquire, _from, state) do
+    state = drain_standalone_commits_for_sync(state)
+
+    cond do
+      state.standalone_write_barrier ->
+        {:reply, {:error, :standalone_cross_shard_barrier_busy}, state}
+
+      state.writes_paused ->
+        {:reply, {:error, :prior_standalone_write_failed}, state}
+
+      state.last_flush_error != nil ->
+        {:reply, {:error, state.last_flush_error}, %{state | writes_paused: true}}
+
+      true ->
+        {:reply, :ok, %{state | standalone_write_barrier: true}}
+    end
+  end
+
+  def handle_call(:standalone_cross_shard_barrier_release, _from, state) do
+    state =
+      cond do
+        state.writes_paused ->
+          state
+          |> clear_standalone_write_barrier()
+          |> reject_queued_standalone_commits(
+            {:standalone_durability_failed, :prior_standalone_write_failed}
+          )
+
+        state.last_flush_error != nil ->
+          state
+          |> clear_standalone_write_barrier()
+          |> reject_queued_standalone_commits(
+            {:standalone_durability_failed, state.last_flush_error}
+          )
+          |> Map.put(:writes_paused, true)
+
+        true ->
+          state
+          |> clear_standalone_write_barrier()
+          |> drain_standalone_waiting()
+          |> flush_ready_standalone_batch()
+      end
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call(
+        {:standalone_commit_sync, {:cross_shard_tx, _shard_batches} = command},
+        _from,
+        state
+      ) do
+    state = drain_standalone_commits_for_sync(state)
+
+    cond do
+      state.writes_paused ->
+        {:reply, {:error, {:standalone_durability_failed, :prior_standalone_write_failed}}, state}
+
+      state.last_flush_error != nil ->
+        {:reply, {:error, {:standalone_durability_failed, state.last_flush_error}},
+         %{state | writes_paused: true}}
+
+      true ->
+        sm_state = direct_sm_state(state)
+
+        case run_standalone_command(command, sm_state) do
+          {:ok, new_sm_state, result} ->
+            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+
+          {:error, new_sm_state, reason} ->
+            state =
+              if new_sm_state do
+                apply_direct_sm_state(state, new_sm_state)
+              else
+                state
+              end
+
+            {:reply, {:error, {:standalone_durability_failed, reason}},
+             %{state | writes_paused: true}}
+        end
+    end
+  end
+
+  def handle_call(:standalone_commit_debug, _from, state) do
+    {:reply,
+     %{
+       batch_count: length(state.standalone_batch),
+       waiting_count: length(state.standalone_waiting),
+       inflight_count: length(state.standalone_flush_entries),
+       inflight_keys: MapSet.to_list(state.standalone_inflight_keys)
+     }, state}
+  end
+
   def handle_call(:write_status, _from, state) do
     {:reply,
      %{
        writes_paused: state.writes_paused,
        last_flush_error: state.last_flush_error,
-       pending_count: state.pending_count
+       pending_count: state.pending_count,
+       standalone_batch_count: length(state.standalone_batch),
+       standalone_waiting_count: length(state.standalone_waiting),
+       standalone_flush_inflight: state.standalone_flush_ref != nil
      }, state}
   end
 
@@ -745,41 +863,157 @@ defmodule Ferricstore.Store.Shard do
         _from,
         state
       ) do
-    {:reply,
-     {:ok,
-      FlowIndex.range_slice(
-        state.flow_index,
-        key,
-        min_bound,
-        max_bound,
-        reverse?,
-        offset,
-        count
-      )}, state}
+    reply =
+      case native_flow_index_for_read(state, key) do
+        :not_native ->
+          {:ok,
+           FlowIndex.range_slice(
+             state.flow_index,
+             key,
+             min_bound,
+             max_bound,
+             reverse?,
+             offset,
+             count
+           )}
+
+        {:ok, native} ->
+          {:ok, NativeFlowIndex.range_slice(native, key, min_bound, max_bound, reverse?, offset, count)}
+
+        :unavailable ->
+          :unavailable
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:flow_index_rank_range, key, start_idx, stop_idx, reverse?}, _from, state) do
-    {:reply, {:ok, FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)},
-     state}
+    reply =
+      case native_flow_index_for_read(state, key) do
+        :not_native ->
+          {:ok, FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)}
+
+        {:ok, native} ->
+          {:ok, NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)}
+
+        :unavailable ->
+          :unavailable
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:flow_index_rank_range_many, requests}, _from, state) do
-    results =
-      Enum.map(requests, fn {key, start_idx, stop_idx, reverse?} ->
-        FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)
-      end)
+    reply =
+      Enum.reduce_while(requests, {:ok, []}, fn {key, start_idx, stop_idx, reverse?}, {:ok, acc} ->
+        case native_flow_index_for_read(state, key) do
+          :not_native ->
+            result = FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)
+            {:cont, {:ok, [result | acc]}}
 
-    {:reply, {:ok, results}, state}
+          {:ok, native} ->
+            result = NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)
+            {:cont, {:ok, [result | acc]}}
+
+          :unavailable ->
+            {:halt, :unavailable}
+        end
+      end)
+      |> case do
+        {:ok, results} -> {:ok, Enum.reverse(results)}
+        :unavailable -> :unavailable
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:flow_index_count_all, key}, _from, state) do
-    {:reply, {:ok, FlowIndex.count_all(state.flow_lookup, key)}, state}
+    reply =
+      case native_flow_index_for_read(state, key) do
+        :not_native -> {:ok, FlowIndex.count_all(state.flow_lookup, key)}
+        {:ok, native} -> {:ok, NativeFlowIndex.count_all(native, key)}
+        :unavailable -> :unavailable
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:flow_index_count_all_many, keys}, _from, state) do
-    counts = Enum.map(keys, &FlowIndex.count_all(state.flow_lookup, &1))
-    {:reply, {:ok, counts}, state}
+    reply =
+      case native_flow_index_for_count_many(state, keys) do
+        :not_native_or_mixed ->
+          Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
+            case native_flow_index_for_read(state, key) do
+              :not_native ->
+                {:cont, {:ok, [FlowIndex.count_all(state.flow_lookup, key) | acc]}}
+
+              {:ok, native} ->
+                {:cont, {:ok, [NativeFlowIndex.count_all(native, key) | acc]}}
+
+              :unavailable ->
+                {:halt, :unavailable}
+            end
+          end)
+          |> case do
+            {:ok, counts} -> {:ok, Enum.reverse(counts)}
+            :unavailable -> :unavailable
+          end
+
+        {:ok, native} ->
+          {:ok, NativeFlowIndex.count_many(native, keys)}
+
+        :unavailable ->
+          :unavailable
+      end
+
+    {:reply, reply, state}
   end
+
+  defp native_flow_index_for_count_many(_state, []), do: :not_native_or_mixed
+
+  defp native_flow_index_for_count_many(state, keys) do
+    case native_flow_index_for_read(state, hd(keys)) do
+      :not_native ->
+        :not_native_or_mixed
+
+      :unavailable ->
+        :unavailable
+
+      {:ok, native} ->
+        Enum.reduce_while(keys, {:ok, native}, fn key, {:ok, first_native} ->
+          case native_flow_index_for_read(state, key) do
+            {:ok, ^first_native} -> {:cont, {:ok, first_native}}
+            :unavailable -> {:halt, :unavailable}
+            _other -> {:halt, :not_native_or_mixed}
+          end
+        end)
+        |> case do
+          {:ok, native} -> {:ok, native}
+          :unavailable -> :unavailable
+          :not_native_or_mixed -> :not_native_or_mixed
+        end
+    end
+  end
+
+  defp native_flow_index_for_read(state, key) do
+    if native_flow_lifecycle_index_key?(key) do
+      case NativeFlowIndex.get(state.flow_index, state.flow_lookup) do
+        nil -> :unavailable
+        native -> {:ok, native}
+      end
+    else
+      :not_native
+    end
+  end
+
+  defp native_flow_lifecycle_index_key?(key) when is_binary(key) do
+    :binary.match(key, "}:d:") != :nomatch or
+      :binary.match(key, "}:i:s:") != :nomatch or
+      :binary.match(key, "}:i:r:") != :nomatch or
+      :binary.match(key, "}:i:w:") != :nomatch
+  end
+
+  defp native_flow_lifecycle_index_key?(_key), do: false
 
   def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
     redis_key
@@ -868,6 +1102,7 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   def handle_call({:pause_writes}, _from, state) do
+    state = drain_standalone_commits_for_sync(state)
     state = await_in_flight(state)
     state = flush_pending_sync(state)
     {:reply, :ok, %{state | writes_paused: true}}
@@ -975,45 +1210,6 @@ defmodule Ferricstore.Store.Shard do
       end
 
     {:reply, {:ok, sizes}, state}
-  end
-
-  def handle_call(:sweep_blob_garbage, _from, state) do
-    state = await_in_flight(state)
-    state = flush_pending_sync(state)
-
-    reply =
-      cond do
-        blob_gc_replay_metrics_unavailable?(state) ->
-          {:ok, blob_gc_skipped_stats(state, :missing_raft_replay_metrics)}
-
-        blob_side_channel_threshold(state) > 0 ->
-          with :ok <- flush_blob_gc_writer(state),
-               :ok <- fsync_blob_gc_active_file(state),
-               :ok <- blob_gc_replay_safe(state) do
-            with {:ok, live_refs} <- collect_live_blob_refs(state),
-                 {:ok, stats} <-
-                   BlobStore.sweep_unreferenced(state.data_dir, state.index, live_refs) do
-              :telemetry.execute(
-                [:ferricstore, :blob, :gc],
-                %{deleted_files: stats.deleted_files, deleted_bytes: stats.deleted_bytes},
-                %{shard_index: state.index}
-              )
-
-              {:ok, stats}
-            end
-          else
-            {:skip, reason} ->
-              {:ok, blob_gc_skipped_stats(state, reason)}
-
-            {:error, _reason} = error ->
-              error
-          end
-
-        true ->
-          {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 0}}
-      end
-
-    {:reply, reply, state}
   end
 
   def handle_call({:run_compaction, _file_ids}, _from, %{writes_paused: true} = state) do
@@ -1232,7 +1428,11 @@ defmodule Ferricstore.Store.Shard do
 
   # Synchronous flush — used by tests and by delete to ensure durability.
   def handle_call(:flush, _from, state) do
-    state = await_in_flight(state)
+    state =
+      state
+      |> flush_standalone_batch()
+      |> await_standalone_flush()
+      |> await_in_flight()
 
     state = flush_pending_sync(state)
 
@@ -1245,7 +1445,7 @@ defmodule Ferricstore.Store.Shard do
   # Synchronous expiry sweep — used by tests to trigger a sweep and wait for
   # completion before making assertions.
   def handle_call(:expiry_sweep, _from, state) do
-    state = ShardLifecycle.do_expiry_sweep(state, force: true)
+    state = ShardLifecycle.do_expiry_sweep(state)
     {:reply, :ok, state}
   end
 
@@ -1337,6 +1537,520 @@ defmodule Ferricstore.Store.Shard do
       flow_lookup_name: state.flow_lookup,
       flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path)
     }
+  end
+
+  defp enqueue_standalone_commit(state, from, command) do
+    entry = {from, command, standalone_command_keys(command)}
+
+    if state.standalone_write_barrier or
+         standalone_entry_conflicts?(entry, state.standalone_inflight_keys) do
+      %{state | standalone_waiting: state.standalone_waiting ++ [entry]}
+    else
+      enqueue_ready_standalone_commit(state, entry)
+    end
+  end
+
+  defp enqueue_ready_standalone_commit(state, entry) do
+    timer =
+      if state.standalone_batch_timer == nil and state.standalone_flush_ref == nil do
+        Process.send_after(self(), :standalone_commit_flush, standalone_commit_delay_ms())
+      else
+        state.standalone_batch_timer
+      end
+
+    %{
+      state
+      | standalone_batch: [entry | state.standalone_batch],
+        standalone_batch_timer: timer
+    }
+  end
+
+  defp maybe_flush_full_standalone_batch(state) do
+    if length(state.standalone_batch) >= standalone_commit_max_ops() do
+      flush_standalone_batch(state)
+    else
+      state
+    end
+  end
+
+  defp standalone_commit_delay_ms do
+    :ferricstore
+    |> Application.get_env(:standalone_fsync_max_delay_ms, @flush_interval_ms)
+    |> normalize_positive_integer(@flush_interval_ms)
+  end
+
+  defp standalone_commit_max_ops do
+    :ferricstore
+    |> Application.get_env(:standalone_fsync_max_ops, 1024)
+    |> normalize_positive_integer(1024)
+  end
+
+  defp normalize_positive_integer(value, _default) when is_integer(value) and value > 0, do: value
+  defp normalize_positive_integer(_value, default), do: default
+
+  defp flush_standalone_batch(%{standalone_batch: []} = state) do
+    %{state | standalone_batch_timer: nil}
+  end
+
+  defp flush_standalone_batch(%{standalone_flush_ref: ref} = state) when ref != nil do
+    %{state | standalone_batch_timer: nil}
+  end
+
+  defp flush_standalone_batch(state) do
+    if timer = state.standalone_batch_timer do
+      Process.cancel_timer(timer)
+    end
+
+    entries = Enum.reverse(state.standalone_batch)
+    sm_state = direct_sm_state(state)
+    ref = make_ref()
+    parent = self()
+
+    _pid =
+      spawn_link(fn ->
+        send(parent, {:standalone_commit_flushed, ref, run_standalone_batch(entries, sm_state)})
+      end)
+
+    %{
+      state
+      | standalone_batch: [],
+        standalone_batch_timer: nil,
+        standalone_flush_ref: ref,
+        standalone_flush_entries: entries,
+        standalone_inflight_keys: standalone_entries_keys(entries)
+    }
+  end
+
+  defp run_standalone_batch(entries, sm_state) do
+    commands = Enum.map(entries, fn {_from, command, _keys} -> command end)
+
+    try do
+      if Enum.any?(commands, &match?({:cross_shard_tx, _}, &1)) do
+        run_standalone_commands_sequential(commands, sm_state)
+      else
+        case Ferricstore.Raft.StateMachine.apply_standalone_batch(commands, sm_state) do
+          {new_sm_state, {:ok, results}} when is_list(results) ->
+            {:ok, new_sm_state, results}
+
+          {new_sm_state, {:error, reason}} ->
+            {:error, new_sm_state, reason}
+
+          {new_sm_state, result} ->
+            {:ok, new_sm_state, List.wrap(result)}
+        end
+      end
+    rescue
+      error ->
+        {:error, nil, {:exception, error}}
+    catch
+      kind, reason ->
+        {:error, nil, {kind, reason}}
+    end
+  end
+
+  defp run_standalone_commands_sequential(commands, sm_state) do
+    Enum.reduce_while(commands, {:ok, sm_state, []}, fn command, {:ok, acc_state, results} ->
+      case run_standalone_command(command, acc_state) do
+        {:ok, new_state, result} ->
+          {:cont, {:ok, new_state, [result | results]}}
+
+        {:error, new_state, reason} ->
+          {:halt, {:error, new_state, reason}}
+      end
+    end)
+    |> case do
+      {:ok, new_state, results} -> {:ok, new_state, Enum.reverse(results)}
+      {:error, new_state, reason} -> {:error, new_state, reason}
+    end
+  end
+
+  defp run_standalone_command({:cross_shard_tx, _shard_batches} = command, sm_state) do
+    case Ferricstore.Raft.StateMachine.apply_standalone_command(command, sm_state) do
+      {new_sm_state, {:error, reason}} -> {:error, new_sm_state, reason}
+      {new_sm_state, result} -> {:ok, new_sm_state, result}
+      {new_sm_state, {:error, reason}, _effects} -> {:error, new_sm_state, reason}
+      {new_sm_state, result, _effects} -> {:ok, new_sm_state, result}
+    end
+  end
+
+  defp run_standalone_command(command, sm_state) do
+    case Ferricstore.Raft.StateMachine.apply_standalone_batch([command], sm_state) do
+      {new_sm_state, {:ok, [result]}} -> {:ok, new_sm_state, result}
+      {new_sm_state, {:ok, results}} when is_list(results) -> {:ok, new_sm_state, results}
+      {new_sm_state, {:error, reason}} -> {:error, new_sm_state, reason}
+      {new_sm_state, result} -> {:ok, new_sm_state, result}
+    end
+  end
+
+  defp handle_standalone_flush_result(ref, result, %{standalone_flush_ref: ref} = state) do
+    entries = state.standalone_flush_entries
+
+    state =
+      %{
+        state
+        | standalone_flush_ref: nil,
+          standalone_flush_entries: [],
+          standalone_inflight_keys: MapSet.new()
+      }
+
+    case result do
+      {:ok, new_sm_state, results} ->
+        state = apply_direct_sm_state(state, new_sm_state)
+        reply_standalone_results(entries, results)
+
+        state
+        |> drain_standalone_waiting()
+        |> flush_ready_standalone_batch()
+
+      {:error, new_sm_state, reason} ->
+        state =
+          if new_sm_state do
+            apply_direct_sm_state(state, new_sm_state)
+          else
+            state
+          end
+
+        reply_standalone_error(entries, {:standalone_durability_failed, reason})
+        reply_standalone_error(state.standalone_batch, {:standalone_durability_failed, reason})
+        reply_standalone_error(state.standalone_waiting, {:standalone_durability_failed, reason})
+
+        %{
+          state
+          | writes_paused: true,
+            standalone_batch: [],
+            standalone_batch_timer: nil,
+            standalone_waiting: []
+        }
+    end
+  end
+
+  defp handle_standalone_flush_result(_ref, _result, state), do: state
+
+  defp flush_ready_standalone_batch(%{standalone_batch: []} = state), do: state
+  defp flush_ready_standalone_batch(state), do: flush_standalone_batch(state)
+
+  defp clear_standalone_write_barrier(state), do: %{state | standalone_write_barrier: false}
+
+  defp reject_queued_standalone_commits(state, reason) do
+    if timer = state.standalone_batch_timer do
+      Process.cancel_timer(timer)
+    end
+
+    reply_standalone_error(state.standalone_batch, reason)
+    reply_standalone_error(state.standalone_waiting, reason)
+
+    %{state | standalone_batch: [], standalone_batch_timer: nil, standalone_waiting: []}
+  end
+
+  defp await_standalone_flush(%{standalone_flush_ref: nil} = state), do: state
+
+  defp await_standalone_flush(%{standalone_flush_ref: ref} = state) do
+    receive do
+      {:standalone_commit_flushed, ^ref, result} ->
+        ref
+        |> handle_standalone_flush_result(result, state)
+        |> await_standalone_flush()
+    after
+      30_000 ->
+        %{state | last_flush_error: {:standalone_commit_flush_timeout, ref}}
+    end
+  end
+
+  defp drain_standalone_commits_for_sync(state) do
+    state
+    |> drain_standalone_waiting()
+    |> flush_ready_standalone_batch()
+    |> await_standalone_flush()
+  end
+
+  defp drain_standalone_waiting(%{standalone_write_barrier: true} = state), do: state
+
+  defp drain_standalone_waiting(state) do
+    {ready, waiting} =
+      Enum.split_with(state.standalone_waiting, fn entry ->
+        not standalone_entry_conflicts?(entry, state.standalone_inflight_keys)
+      end)
+
+    %{
+      state
+      | standalone_batch: Enum.reverse(ready) ++ state.standalone_batch,
+        standalone_waiting: waiting
+    }
+  end
+
+  defp standalone_entry_conflicts?({_from, _command, keys}, inflight_keys) do
+    (standalone_global_keys?(keys) and MapSet.size(inflight_keys) > 0) or
+      standalone_global_keys?(inflight_keys) or
+      not MapSet.disjoint?(keys, inflight_keys)
+  end
+
+  defp standalone_global_keys?(keys), do: MapSet.member?(keys, @standalone_global_key)
+
+  defp standalone_entries_keys(entries) do
+    Enum.reduce(entries, MapSet.new(), fn {_from, _command, keys}, acc ->
+      MapSet.union(acc, keys)
+    end)
+  end
+
+  defp standalone_command_keys({:batch, commands}) when is_list(commands) do
+    commands
+    |> Enum.reduce(MapSet.new(), fn command, acc ->
+      MapSet.union(acc, standalone_command_keys(command))
+    end)
+    |> standalone_nonempty_keys()
+  end
+
+  defp standalone_command_keys({:async, _origin, command}) when is_tuple(command) do
+    standalone_command_keys(command)
+  end
+
+  defp standalone_command_keys({:async, command}) when is_tuple(command) do
+    standalone_command_keys(command)
+  end
+
+  defp standalone_command_keys({command, %{hlc_ts: _remote_ts}}) when is_tuple(command) do
+    standalone_command_keys(command)
+  end
+
+  defp standalone_command_keys({:cross_shard_tx, shard_batches}) when is_list(shard_batches) do
+    shard_batches
+    |> Enum.reduce(MapSet.new(), fn
+      {_shard_idx, entries, _namespace}, acc when is_list(entries) ->
+        Enum.reduce(entries, acc, fn entry, acc ->
+          MapSet.union(acc, standalone_cross_shard_entry_keys(entry))
+        end)
+
+      _other, acc ->
+        MapSet.put(acc, @standalone_global_key)
+    end)
+    |> standalone_nonempty_keys()
+  end
+
+  defp standalone_command_keys({:cross_shard_tx, _shard_batches}) do
+    standalone_global_keys()
+  end
+
+  defp standalone_command_keys({:server_command, _command}) do
+    standalone_global_keys()
+  end
+
+  defp standalone_command_keys({:list_op_lmove, source, destination, _from_dir, _to_dir}) do
+    MapSet.new([standalone_lock_key(source), standalone_lock_key(destination)])
+  end
+
+  defp standalone_command_keys({:pfmerge, destination, sources}) when is_list(sources) do
+    standalone_lock_keys([destination | sources])
+  end
+
+  defp standalone_command_keys({:pfmerge, destination, source_keys, _source_sketches})
+       when is_list(source_keys) do
+    standalone_lock_keys([destination | source_keys])
+  end
+
+  defp standalone_command_keys({:cms_merge, destination, sources, _weights, _create_params})
+       when is_list(sources) do
+    standalone_lock_keys([destination | sources])
+  end
+
+  defp standalone_command_keys({:lock_keys, keys, _owner_ref, _expire_at_ms})
+       when is_list(keys) do
+    standalone_lock_keys(keys)
+  end
+
+  defp standalone_command_keys({:unlock_keys, keys, _owner_ref}) when is_list(keys) do
+    standalone_lock_keys(keys)
+  end
+
+  defp standalone_command_keys({:locked_put, key, _value, _expire_at_ms, _owner_ref}) do
+    MapSet.new([standalone_lock_key(key)])
+  end
+
+  defp standalone_command_keys({:locked_delete, key, _owner_ref}) do
+    MapSet.new([standalone_lock_key(key)])
+  end
+
+  defp standalone_command_keys({:locked_delete_prefix, prefix, _owner_ref}) do
+    MapSet.new([standalone_lock_key(prefix)])
+  end
+
+  defp standalone_command_keys({:compound_put, redis_key, _compound_key, _value, _expire_at_ms}) do
+    MapSet.new([standalone_lock_key(redis_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete, redis_key, _compound_key}) do
+    MapSet.new([standalone_lock_key(redis_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete_prefix, redis_key, _prefix}) do
+    MapSet.new([standalone_lock_key(redis_key)])
+  end
+
+  defp standalone_command_keys({:compound_put, compound_key, _value, _expire_at_ms}) do
+    MapSet.new([standalone_lock_key(compound_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete, compound_key}) do
+    MapSet.new([standalone_lock_key(compound_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete_prefix, prefix}) do
+    MapSet.new([standalone_lock_key(prefix)])
+  end
+
+  defp standalone_command_keys({command, route_key, %{records: records}})
+       when command in @standalone_flow_many_commands and is_list(records) do
+    standalone_flow_record_keys(route_key, records)
+  end
+
+  defp standalone_command_keys({:flow_spawn_children, route_key, %{children: children}})
+       when is_list(children) do
+    standalone_flow_record_keys(route_key, children)
+  end
+
+  defp standalone_command_keys({:flow_claim_due, _route_key, _attrs}) do
+    # Claims discover and mutate record keys by scanning due indexes, so the
+    # exact write set is not knowable before the state machine runs.
+    standalone_global_keys()
+  end
+
+  defp standalone_command_keys(command) when is_tuple(command) and tuple_size(command) > 1 do
+    case elem(command, 1) do
+      key when is_binary(key) -> MapSet.new([standalone_lock_key(key)])
+      _other -> standalone_global_keys()
+    end
+  end
+
+  defp standalone_command_keys(_command), do: standalone_global_keys()
+
+  defp standalone_lock_keys(keys) do
+    keys
+    |> Enum.reduce(MapSet.new(), fn key, acc ->
+      if is_binary(key) do
+        MapSet.put(acc, standalone_lock_key(key))
+      else
+        MapSet.put(acc, @standalone_global_key)
+      end
+    end)
+    |> standalone_nonempty_keys()
+  end
+
+  defp standalone_lock_key(key) when is_binary(key) do
+    Ferricstore.Store.CompoundKey.extract_redis_key(key)
+  end
+
+  defp standalone_nonempty_keys(keys) do
+    if MapSet.size(keys) == 0 do
+      standalone_global_keys()
+    else
+      keys
+    end
+  end
+
+  defp standalone_global_keys, do: MapSet.new([@standalone_global_key])
+
+  defp standalone_cross_shard_entry_keys({_pos, tx_entry}),
+    do: standalone_tx_entry_keys(tx_entry)
+
+  defp standalone_cross_shard_entry_keys(_entry), do: standalone_global_keys()
+
+  defp standalone_tx_entry_keys({_name, args, command}) do
+    command
+    |> standalone_tx_command_keys(args)
+    |> standalone_lock_keys()
+  end
+
+  defp standalone_tx_entry_keys(_entry), do: standalone_global_keys()
+
+  defp standalone_tx_command_keys({:msetnx, args}, _args), do: every_other_arg(args)
+
+  defp standalone_tx_command_keys({:copy, source, destination, _replace?}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:rename, source, destination}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:renamenx, source, destination}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:lmove, source, destination, _from_dir, _to_dir}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:smove, source, destination, _member}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({command, [destination | sources]}, _args)
+       when command in [:sdiffstore, :sinterstore, :sunionstore] and is_list(sources),
+       do: [destination | sources]
+
+  defp standalone_tx_command_keys(_command, args) when is_list(args),
+    do: standalone_tx_args_keys(args)
+
+  defp standalone_tx_command_keys(_command, _args), do: [@standalone_global_key]
+
+  defp standalone_tx_args_keys(["MSETNX" | args]), do: every_other_arg(args)
+  defp standalone_tx_args_keys([source, destination | _rest]), do: [source, destination]
+  defp standalone_tx_args_keys(_args), do: [@standalone_global_key]
+
+  defp every_other_arg(args) when is_list(args) do
+    args
+    |> Enum.with_index()
+    |> Enum.filter(fn {_arg, index} -> rem(index, 2) == 0 end)
+    |> Enum.map(fn {arg, _index} -> arg end)
+  end
+
+  defp every_other_arg(_args), do: [@standalone_global_key]
+
+  defp standalone_flow_record_keys(route_key, records) do
+    records
+    |> Enum.reduce_while([route_key], fn
+      %{id: id} = attrs, acc when is_binary(id) ->
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+        {:cont, [key | acc]}
+
+      _record, _acc ->
+        {:halt, :global}
+    end)
+    |> case do
+      :global -> standalone_global_keys()
+      keys -> standalone_lock_keys(keys)
+    end
+  end
+
+  defp reply_standalone_results(entries, results) when length(entries) == length(results) do
+    Enum.zip(entries, results)
+    |> Enum.each(fn {{from, _command, _keys}, result} -> GenServer.reply(from, result) end)
+  end
+
+  defp reply_standalone_results([{from, {:batch, _commands}, _keys}], results) do
+    GenServer.reply(from, {:ok, results})
+  end
+
+  defp reply_standalone_results(entries, [result]) do
+    Enum.each(entries, fn {from, _command, _keys} -> GenServer.reply(from, result) end)
+  end
+
+  defp reply_standalone_results(entries, results) do
+    reply_standalone_error(entries, {:standalone_result_mismatch, length(results)})
+  end
+
+  defp reply_standalone_error(entries, reason) do
+    Enum.each(entries, fn {from, _command, _keys} -> GenServer.reply(from, {:error, reason}) end)
+  end
+
+  @doc false
+  def __standalone_command_keys_for_test__(command) do
+    command
+    |> standalone_command_keys()
+    |> MapSet.to_list()
+    |> Enum.sort()
+  end
+
+  @doc false
+  def __standalone_command_keys_conflict_for_test__(left, right) do
+    left_keys = standalone_command_keys(left)
+    right_keys = standalone_command_keys(right)
+
+    standalone_entry_conflicts?({nil, left, left_keys}, right_keys)
   end
 
   defp shared_write_version(%{instance_ctx: %{write_version: write_version}, index: index}) do
@@ -1936,6 +2650,14 @@ defmodule Ferricstore.Store.Shard do
     {:noreply, state}
   end
 
+  def handle_info(:standalone_commit_flush, state) do
+    {:noreply, flush_standalone_batch(state)}
+  end
+
+  def handle_info({:standalone_commit_flushed, ref, result}, state) do
+    {:noreply, handle_standalone_flush_result(ref, result, state)}
+  end
+
   # Periodic fragmentation re-evaluation for idle shards.
   # Catches shards that accumulated dead data then stopped receiving writes.
   # Disk pressure is intentionally not cleared here; only a successful append or
@@ -2034,16 +2756,9 @@ defmodule Ferricstore.Store.Shard do
             # Simple GET cold-read completion. Warm only if the ETS entry still
             # points at the same disk location read by this request.
             if value != nil do
-              reply_materialized_pending_read(
-                %{state | pending_reads: rest_pending},
-                from,
-                key,
-                value,
-                exp,
-                fid,
-                off,
-                vsize
-              )
+              ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
+              GenServer.reply(from, value)
+              {:noreply, %{state | pending_reads: rest_pending}}
             else
               retry_or_reply_nil_cold_read(
                 %{state | pending_reads: rest_pending},
@@ -2056,16 +2771,9 @@ defmodule Ferricstore.Store.Shard do
             # GET_META cold-read completion. The reply may linearize before a
             # later overwrite, but ETS warming must still be location-checked.
             if value != nil do
-              reply_materialized_pending_meta_read(
-                %{state | pending_reads: rest_pending},
-                from,
-                key,
-                value,
-                exp,
-                fid,
-                off,
-                vsize
-              )
+              ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
+              GenServer.reply(from, {value, exp})
+              {:noreply, %{state | pending_reads: rest_pending}}
             else
               retry_or_reply_nil_cold_read(
                 %{state | pending_reads: rest_pending},
@@ -2183,217 +2891,6 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp emit_pending_read_error_for_fid(_state, _fid, _reason), do: :ok
-
-  defp reply_materialized_pending_read(state, from, key, value, exp, fid, off, vsize) do
-    case materialize_blob_value(state, value) do
-      {:ok, materialized} ->
-        ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
-        GenServer.reply(from, materialized)
-        {:noreply, state}
-
-      {:error, reason} ->
-        emit_pending_read_error(state, {from, key, exp, fid, off, vsize}, reason)
-        GenServer.reply(from, nil)
-        {:noreply, state}
-    end
-  end
-
-  defp reply_materialized_pending_meta_read(state, from, key, value, exp, fid, off, vsize) do
-    case materialize_blob_value(state, value) do
-      {:ok, materialized} ->
-        ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
-        GenServer.reply(from, {materialized, exp})
-        {:noreply, state}
-
-      {:error, reason} ->
-        emit_pending_read_error(state, {from, key, :meta, exp, fid, off, vsize}, reason)
-        GenServer.reply(from, nil)
-        {:noreply, state}
-    end
-  end
-
-  defp flush_blob_gc_writer(state) do
-    Ferricstore.Store.BitcaskWriter.flush(state.instance_ctx, state.index)
-  end
-
-  defp fsync_blob_gc_active_file(%{active_file_path: path} = state) when is_binary(path) do
-    case NIF.v2_fsync(path) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        :telemetry.execute(
-          [:ferricstore, :blob, :gc],
-          %{deleted_files: 0, deleted_bytes: 0},
-          %{shard_index: state.index, status: :error, reason: :active_fsync_failed, path: path}
-        )
-
-        {:error, {:blob_gc_active_fsync_failed, path, reason}}
-    end
-  end
-
-  defp fsync_blob_gc_active_file(state) do
-    {:error, {:blob_gc_active_fsync_failed, Map.get(state, :active_file_path), :invalid_path}}
-  end
-
-  defp blob_gc_replay_safe(%{raft?: true, instance_ctx: ctx, index: index})
-       when is_map(ctx) do
-    with {:ok, last_applied} <-
-           shard_atomic_get_required(Map.get(ctx, :last_applied_index), index),
-         {:ok, last_released} <-
-           shard_atomic_get_required(Map.get(ctx, :last_released_cursor_index), index) do
-      if last_applied > last_released do
-        {:skip, {:raft_replay_gap, last_applied, last_released}}
-      else
-        :ok
-      end
-    else
-      {:error, :missing_raft_replay_metrics} -> {:skip, :missing_raft_replay_metrics}
-    end
-  end
-
-  defp blob_gc_replay_safe(%{raft?: true}), do: {:skip, :missing_raft_replay_metrics}
-
-  defp blob_gc_replay_safe(_state), do: :ok
-
-  defp blob_gc_replay_metrics_unavailable?(%{raft?: true, instance_ctx: ctx, index: index})
-       when is_map(ctx) do
-    not shard_atomic_available?(Map.get(ctx, :last_applied_index), index) or
-      not shard_atomic_available?(Map.get(ctx, :last_released_cursor_index), index)
-  end
-
-  defp blob_gc_replay_metrics_unavailable?(%{raft?: true}), do: true
-  defp blob_gc_replay_metrics_unavailable?(_state), do: false
-
-  defp shard_atomic_available?(ref, index)
-       when is_reference(ref) and is_integer(index) and index >= 0 do
-    index < :atomics.info(ref).size
-  end
-
-  defp shard_atomic_available?(_ref, _index), do: false
-
-  defp blob_gc_skipped_stats(state, reason) do
-    :telemetry.execute(
-      [:ferricstore, :blob, :gc],
-      %{deleted_files: 0, deleted_bytes: 0},
-      %{shard_index: state.index, status: :skipped, reason: reason}
-    )
-
-    %{
-      deleted_files: 0,
-      deleted_bytes: 0,
-      kept_files: 0,
-      skipped: true,
-      reason: reason
-    }
-  end
-
-  defp shard_atomic_get_required(ref, index)
-       when is_reference(ref) and is_integer(index) and index >= 0 do
-    size = :atomics.info(ref).size
-
-    if index < size do
-      {:ok, :atomics.get(ref, index + 1)}
-    else
-      {:error, :missing_raft_replay_metrics}
-    end
-  end
-
-  defp shard_atomic_get_required(_ref, _index), do: {:error, :missing_raft_replay_metrics}
-
-  defp collect_live_blob_refs(state) do
-    now_ms = Ferricstore.HLC.now_ms()
-
-    :ets.foldl(
-      fn entry, acc -> collect_live_blob_refs_from_entry(state, now_ms, entry, acc) end,
-      {:ok, MapSet.new()},
-      state.keydir
-    )
-  end
-
-  defp collect_live_blob_refs_from_entry(
-         state,
-         now_ms,
-         {key, value, expire_at_ms, _lfu, fid, offset, value_size},
-         {:ok, refs}
-       )
-       when is_binary(key) do
-    cond do
-      expire_at_ms != 0 and expire_at_ms <= now_ms ->
-        {:ok, refs}
-
-      true ->
-        refs = maybe_add_blob_ref(refs, value)
-
-        if BlobRef.encoded_size?(value_size) and valid_blob_gc_location?(fid, offset) do
-          collect_disk_blob_ref(state, key, fid, offset, refs)
-        else
-          {:ok, refs}
-        end
-    end
-  end
-
-  defp collect_live_blob_refs_from_entry(_state, _now_ms, _entry, acc), do: acc
-
-  defp maybe_add_blob_ref(refs, value) do
-    case BlobRef.decode(value) do
-      {:ok, ref} -> MapSet.put(refs, ref)
-      :error -> refs
-    end
-  end
-
-  defp collect_disk_blob_ref(state, key, fid, offset, refs) do
-    path = blob_gc_value_path(state, key, fid)
-
-    case ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms) do
-      {:ok, value} ->
-        {:ok, maybe_add_blob_ref(refs, value)}
-
-      {:error, reason} ->
-        {:error, {:blob_gc_live_ref_read_failed, key, path, reason}}
-    end
-  end
-
-  defp blob_gc_value_path(state, key, fid) do
-    case promoted_blob_gc_path(state, key) do
-      nil -> ShardETS.file_path(state.shard_data_path, fid)
-      dedicated_path -> ShardCompound.dedicated_file_path(dedicated_path, fid)
-    end
-  end
-
-  defp promoted_blob_gc_path(state, key) do
-    with {:ok, redis_key} <- promoted_blob_gc_parent_key(key),
-         path when is_binary(path) <- ShardCompound.promoted_store(state, redis_key) do
-      path
-    else
-      _ -> nil
-    end
-  end
-
-  defp promoted_blob_gc_parent_key(<<"H:", rest::binary>>), do: split_promoted_parent(rest)
-  defp promoted_blob_gc_parent_key(<<"S:", rest::binary>>), do: split_promoted_parent(rest)
-  defp promoted_blob_gc_parent_key(<<"Z:", rest::binary>>), do: split_promoted_parent(rest)
-  defp promoted_blob_gc_parent_key(_key), do: :error
-
-  defp split_promoted_parent(rest) do
-    case :binary.split(rest, <<0>>) do
-      [redis_key, _member] when byte_size(redis_key) > 0 -> {:ok, redis_key}
-      _ -> :error
-    end
-  end
-
-  defp valid_blob_gc_location?(fid, offset) do
-    is_integer(fid) and fid >= 0 and is_integer(offset) and offset >= 0
-  end
-
-  defp materialize_blob_value(%{data_dir: data_dir, index: shard_index} = state, value) do
-    BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
-  end
-
-  defp materialize_blob_value(_state, value), do: {:ok, value}
-
-  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
-  defp blob_side_channel_threshold(_state), do: 0
 
   defp retry_or_reply_nil_cold_read(state, pending_entry, attempts_left) do
     case resolve_nil_cold_read(state, pending_entry, attempts_left) do
@@ -2612,7 +3109,10 @@ defmodule Ferricstore.Store.Shard do
 
   @impl true
   def terminate(reason, state) do
-    ShardLifecycle.do_terminate(reason, state)
+    state
+    |> flush_standalone_batch()
+    |> await_standalone_flush()
+    |> then(&ShardLifecycle.do_terminate(reason, &1))
   end
 
   # -------------------------------------------------------------------

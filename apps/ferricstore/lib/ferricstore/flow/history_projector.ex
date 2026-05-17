@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.HistoryProjectedIndex
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Store.{DiskPressure, LFU, WriteVersion}
@@ -36,6 +37,37 @@ defmodule Ferricstore.Flow.HistoryProjector do
     shard_index = Keyword.fetch!(opts, :shard_index)
     instance_ctx = Keyword.get(opts, :instance_ctx)
     GenServer.start_link(__MODULE__, opts, name: name(instance_ctx, shard_index))
+  end
+
+  @spec recover(map() | nil, non_neg_integer(), binary(), :ets.tid() | atom() | nil) ::
+          :ok | {:error, term()}
+  def recover(instance_ctx, shard_index, shard_data_path, keydir_override \\ nil) do
+    case ensure_history_file(shard_data_path) do
+      :ok ->
+        case recover_history_log(instance_ctx, shard_index, shard_data_path, keydir_override) do
+          :ok ->
+            projected = HistoryProjectedIndex.read(shard_data_path)
+            publish_projected_index(instance_ctx, shard_index, shard_data_path, projected)
+
+          {:error, reason} = error ->
+            emit_recover_error(instance_ctx, shard_index, reason)
+            error
+        end
+
+      {:error, reason} = error ->
+        emit_recover_error(instance_ctx, shard_index, {:ensure_history_file_failed, reason})
+        error
+
+      other ->
+        reason = {:ensure_history_file_failed, other}
+        emit_recover_error(instance_ctx, shard_index, reason)
+        {:error, reason}
+    end
+  rescue
+    error ->
+      reason = {:history_projector_recover_failed, error}
+      emit_recover_error(instance_ctx, shard_index, reason)
+      {:error, reason}
   end
 
   @spec name(map() | nil, non_neg_integer()) :: atom()
@@ -125,10 +157,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
     shard_index = Keyword.fetch!(opts, :shard_index)
     shard_data_path = Keyword.fetch!(opts, :shard_data_path)
     instance_ctx = Keyword.get(opts, :instance_ctx)
-    :ok = ensure_history_file(shard_data_path)
-    recover_history_log(instance_ctx, shard_index, shard_data_path)
-    projected = HistoryProjectedIndex.read(shard_data_path)
-    publish_projected_index(instance_ctx, shard_index, shard_data_path, projected)
+
+    :ok =
+      if Keyword.get(opts, :recover_on_init, true) do
+        recover(instance_ctx, shard_index, shard_data_path)
+      else
+        prepare_recovered_history_projector(instance_ctx, shard_index, shard_data_path)
+      end
 
     {:ok,
      %{
@@ -393,6 +428,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp publish_history_index(instance_ctx, shard_index, entries) do
     {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+    native = NativeFlowIndex.get(flow_index, flow_lookup)
 
     {new_entries, update_entries} =
       entries
@@ -411,6 +447,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
     if new_entries != [], do: FlowIndex.put_new_entries(flow_index, flow_lookup, new_entries)
     if update_entries != [], do: FlowIndex.put_entries(flow_index, flow_lookup, update_entries)
+    if native && new_entries != [], do: NativeFlowIndex.put_new_entries(native, new_entries)
+    if native && update_entries != [], do: NativeFlowIndex.put_entries(native, update_entries)
 
     :ok
   end
@@ -422,6 +460,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
       :ok
     else
       {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+      native = NativeFlowIndex.get(flow_index, flow_lookup)
 
       trim_items =
         caps
@@ -452,6 +491,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
             |> Enum.each(fn {history_key, items} ->
               event_ids = Enum.map(items, fn {_history_key, event_id, _key} -> event_id end)
               FlowIndex.delete_members(flow_index, flow_lookup, history_key, event_ids)
+              if native, do: NativeFlowIndex.delete_members(native, history_key, event_ids)
             end)
 
             Enum.each(tombstone_keys, fn key ->
@@ -505,13 +545,14 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp valid_tombstone_location?(_location), do: false
 
-  defp recover_history_log(instance_ctx, shard_index, shard_data_path) do
+  defp recover_history_log(instance_ctx, shard_index, shard_data_path, keydir_override) do
     file_path = history_file_path(shard_data_path, 0)
 
     case NIF.v2_scan_file(file_path) do
       {:ok, records} ->
-        keydir = keydir(instance_ctx, shard_index)
+        keydir = keydir_override || keydir(instance_ctx, shard_index)
         {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+        native = NativeFlowIndex.get(flow_index, flow_lookup)
 
         Enum.each(records, fn
           {key, _offset, _value_size, _expire_at_ms, true} ->
@@ -521,6 +562,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
             case parse_history_entry_key(key) do
               {:ok, history_key, event_id, _event_ms} ->
                 FlowIndex.delete_member(flow_index, flow_lookup, history_key, event_id)
+                if native, do: NativeFlowIndex.delete_member(native, history_key, event_id)
 
               :error ->
                 :ok
@@ -537,15 +579,44 @@ defmodule Ferricstore.Flow.HistoryProjector do
             case parse_history_entry_key(key) do
               {:ok, history_key, event_id, event_ms} ->
                 FlowIndex.put_member(flow_index, flow_lookup, history_key, event_id, event_ms)
+                if native, do: NativeFlowIndex.put_member(native, history_key, event_id, event_ms)
 
               :error ->
                 :ok
             end
           end)
 
-      _ ->
         :ok
+
+      {:error, reason} ->
+        {:error, {:history_scan_failed, reason}}
+
+      other ->
+        {:error, {:history_scan_unexpected, other}}
     end
+  rescue
+    error -> {:error, {:history_recover_exception, error}}
+  end
+
+  defp prepare_recovered_history_projector(instance_ctx, shard_index, shard_data_path) do
+    with :ok <- ensure_history_file(shard_data_path) do
+      projected = HistoryProjectedIndex.read(shard_data_path)
+      publish_projected_index(instance_ctx, shard_index, shard_data_path, projected)
+    end
+  rescue
+    error -> {:error, {:history_projector_prepare_failed, error}}
+  end
+
+  defp emit_recover_error(instance_ctx, shard_index, reason) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :history_projector, :recover],
+      %{errors: 1},
+      %{
+        instance: instance_name(instance_ctx),
+        shard_index: shard_index,
+        reason: reason
+      }
+    )
   rescue
     _ -> :ok
   end

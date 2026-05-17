@@ -41,6 +41,7 @@ pub mod bloom;
 pub mod cms;
 pub mod compaction;
 pub mod cuckoo;
+pub mod flow_index;
 pub mod fs_nif;
 pub mod hint;
 pub mod io_backend;
@@ -82,9 +83,11 @@ mod atoms {
         put,
         delete,
         mismatch,
+        miss,
         not_found,
         missing,
         value,
+        fallback,
     }
 }
 
@@ -112,6 +115,7 @@ static LMDB_STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<LmdbSto
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
     let _ = rustler::resource!(ValueBuffer, env);
+    flow_index::register_resource(env);
     tdigest::register_resource(env);
     tdigest::register_mmap_resource(env);
     true

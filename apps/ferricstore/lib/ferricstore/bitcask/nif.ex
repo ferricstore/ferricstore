@@ -23,6 +23,281 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec rust_allocated_bytes() :: {:ok, non_neg_integer()} | {:error, term()}
   def rust_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
 
+  # -- Flow native ordered index resource --
+  @type flow_index_resource :: reference()
+
+  @spec flow_index_new() :: flow_index_resource()
+  def flow_index_new, do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_put_entries(flow_index_resource(), [{binary(), binary(), float()}]) :: :ok
+  def flow_index_put_entries(_resource, _entries), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_put_new_entries(flow_index_resource(), [{binary(), binary(), float()}]) :: :ok
+  def flow_index_put_new_entries(_resource, _entries), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_move_entries(flow_index_resource(), [
+          {binary(), binary(), binary(), float()}
+        ]) :: :ok
+  def flow_index_move_entries(_resource, _entries), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_delete_members(flow_index_resource(), binary(), [binary()]) :: :ok
+  def flow_index_delete_members(_resource, _key, _members), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_apply_batch(
+          flow_index_resource(),
+          [{binary(), binary(), float()}],
+          [{binary(), binary(), float()}],
+          [{binary(), binary(), binary(), float()}],
+          [{binary(), [binary()]}],
+          [flow_index_claim_entry()]
+        ) :: :ok
+  def flow_index_apply_batch(
+        _resource,
+        _put_entries,
+        _put_new_entries,
+        _move_entries,
+        _delete_entries,
+        _claim_entries
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_score_of(flow_index_resource(), binary(), binary()) ::
+          {:ok, float()} | :miss
+  def flow_index_score_of(_resource, _key, _member), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_range_slice(
+          flow_index_resource(),
+          binary(),
+          non_neg_integer(),
+          float(),
+          non_neg_integer(),
+          float(),
+          boolean(),
+          non_neg_integer(),
+          integer()
+        ) :: [{binary(), float()}]
+  def flow_index_range_slice(
+        _resource,
+        _key,
+        _min_kind,
+        _min_score,
+        _max_kind,
+        _max_score,
+        _reverse?,
+        _offset,
+        _count
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_take_due(
+          flow_index_resource(),
+          binary(),
+          float(),
+          non_neg_integer()
+        ) :: [{binary(), float()}]
+  def flow_index_take_due(_resource, _key, _max_score, _count),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_claim_due_candidates(
+          flow_index_resource(),
+          [binary()],
+          float(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: [{binary(), binary(), float()}]
+  def flow_index_claim_due_candidates(_resource, _keys, _max_score, _limit, _max_scan),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_count_all(flow_index_resource(), binary()) :: non_neg_integer()
+  def flow_index_count_all(_resource, _key), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_count_many(flow_index_resource(), [binary()]) :: [non_neg_integer()]
+  def flow_index_count_many(_resource, _keys), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_count_keys(flow_index_resource()) :: [binary()]
+  def flow_index_count_keys(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_due_count_keys(flow_index_resource()) :: [binary()]
+  def flow_index_due_count_keys(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_restore_count(flow_index_resource(), binary(), integer()) :: :ok
+  def flow_index_restore_count(_resource, _key, _count), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_delete_count(flow_index_resource(), binary()) :: :ok
+  def flow_index_delete_count(_resource, _key), do: :erlang.nif_error(:nif_not_loaded)
+
+  @type flow_index_claim_entry ::
+          {binary(), binary(), float(), binary(), float(), binary(), float(), binary(), float(),
+           binary(), binary(), float()}
+
+  @spec flow_index_apply_claim_entries(flow_index_resource(), [flow_index_claim_entry()]) :: :ok
+  def flow_index_apply_claim_entries(_resource, _entries),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_rollback_claim_entries(flow_index_resource(), [flow_index_claim_entry()]) ::
+          :ok
+  def flow_index_rollback_claim_entries(_resource, _entries),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @type flow_record_claim_plan ::
+          {binary(), flow_index_claim_entry(), binary(), non_neg_integer() | nil}
+
+  @spec flow_record_plan_claims(
+          [{binary(), float()}],
+          [binary() | nil],
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary()
+        ) :: {:ok, [flow_record_claim_plan()], [binary()], non_neg_integer()} | :fallback
+  def flow_record_plan_claims(
+        _candidates,
+        _values,
+        _type,
+        _expected_state,
+        _worker,
+        _lease_ms,
+        _now_ms,
+        _remaining,
+        _from_due_key,
+        _to_due_key,
+        _from_state_key,
+        _to_state_key,
+        _inflight_key,
+        _worker_key,
+        _state_key_prefix
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_record_encode(
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary()
+        ) :: binary()
+  def flow_record_encode(
+        _id,
+        _type,
+        _state,
+        _version,
+        _attempts,
+        _fencing_token,
+        _created_at_ms,
+        _updated_at_ms,
+        _next_run_at_ms,
+        _priority,
+        _ttl_ms,
+        _history_hot_max_events,
+        _history_max_events,
+        _retention_ttl_ms,
+        _terminal_retention_until_ms,
+        _partition_key,
+        _payload_ref,
+        _parent_flow_id,
+        _parent_partition_key,
+        _root_flow_id,
+        _correlation_id,
+        _result_ref,
+        _error_ref,
+        _lease_owner,
+        _lease_token,
+        _lease_deadline_ms,
+        _run_state,
+        _rewound_to_event_id,
+        _child_groups_encoded
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_record_decode(binary()) :: {:ok, list()} | :error
+  def flow_record_decode(_value), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_history_encode(
+          binary(),
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary()
+        ) :: binary()
+  def flow_history_encode(
+        _event,
+        _version,
+        _now_ms,
+        _id,
+        _type,
+        _state,
+        _priority,
+        _attempts,
+        _fencing_token,
+        _created_at_ms,
+        _updated_at_ms,
+        _next_run_at_ms,
+        _lease_deadline_ms,
+        _lease_owner,
+        _payload_ref,
+        _parent_flow_id,
+        _root_flow_id,
+        _correlation_id,
+        _result_ref,
+        _error_ref,
+        _rewound_to_event_id,
+        _meta_encoded
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_history_decode(binary()) :: {:ok, list()} | :error
+  def flow_history_decode(_value), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- v2 Pure stateless NIFs (no Store resource, no Mutex) --
   @spec v2_append_record(binary(), binary(), binary(), non_neg_integer()) ::
           {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}

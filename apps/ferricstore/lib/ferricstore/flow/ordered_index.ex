@@ -299,12 +299,43 @@ defmodule Ferricstore.Flow.OrderedIndex do
 
   @spec count_keys(:ets.tid() | atom()) :: [binary()]
   def count_keys(lookup_table) do
-    :ets.select(lookup_table, [
-      {{{:count, :"$1"}, :"$2"}, [{:is_binary, :"$1"}, {:>, :"$2", 0}], [:"$1"]}
-    ])
+    count_keys_from_counts(lookup_table)
   rescue
     ArgumentError -> []
   end
+
+  @spec due_count_keys(:ets.tid() | atom()) :: [binary()]
+  def due_count_keys(lookup_table) do
+    lookup_table
+    |> count_keys_from_counts()
+    |> Enum.filter(&due_key?/1)
+  rescue
+    ArgumentError -> []
+  end
+
+  @spec restore_count(:ets.tid() | atom(), binary(), integer()) :: :ok
+  def restore_count(lookup_table, key, count) do
+    :ets.insert(lookup_table, {{:count, key}, count})
+    :ok
+  end
+
+  @spec delete_count(:ets.tid() | atom(), binary()) :: :ok
+  def delete_count(lookup_table, key) do
+    :ets.delete(lookup_table, {:count, key})
+    :ok
+  end
+
+  defp count_keys_from_counts(lookup_table) do
+    :ets.select(lookup_table, [
+      {{{:count, :"$1"}, :"$2"}, [{:is_binary, :"$1"}, {:>, :"$2", 0}], [:"$1"]}
+    ])
+  end
+
+  defp due_key?(key) when is_binary(key) do
+    String.starts_with?(key, "f:{f") and match?({_pos, _len}, :binary.match(key, "}:d:"))
+  end
+
+  defp due_key?(_key), do: false
 
   defp increment_count(_lookup_table, _key, 0), do: :ok
 

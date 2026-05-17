@@ -377,6 +377,9 @@ defmodule Ferricstore.FlowTest do
     assert Ferricstore.Flow.Keys.state_key?(state_key)
     refute Ferricstore.Flow.Keys.state_key?(history_key)
 
+    assert Ferricstore.Flow.Keys.stream_entry_key_from_history_key(history_key, "1-1") ==
+             Ferricstore.Flow.Keys.stream_entry_key("flow-a", "1-1", partition_key)
+
     old_state_key = "flow:{flow:" <> String.duplicate("0", 64) <> "}:state:flow-a"
     assert byte_size(state_key) < byte_size(old_state_key)
   end
@@ -425,7 +428,20 @@ defmodule Ferricstore.FlowTest do
     assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(normal_record)) ==
              normal_record
 
+    assert Ferricstore.Flow.encode_record(Map.delete(record, :child_groups)) == compact
+
     assert byte_size(compact) < byte_size(term_record)
+
+    large_record = %{
+      record
+      | created_at_ms: 1_777_777_777_777,
+        updated_at_ms: 1_777_777_777_888,
+        next_run_at_ms: 1_777_777_777_999,
+        lease_deadline_ms: 1_777_777_778_111
+    }
+
+    assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(large_record)) ==
+             large_record
 
     assert_raise ArgumentError, fn ->
       Ferricstore.Flow.decode_record("FSF9" <> binary_part(compact, 4, byte_size(compact) - 4))
@@ -434,6 +450,43 @@ defmodule Ferricstore.FlowTest do
     assert_raise ArgumentError, fn ->
       Ferricstore.Flow.decode_record(binary_part(compact, 0, byte_size(compact) - 1))
     end
+  end
+
+  test "flow state record encoding preserves zeroes nils and empty binaries" do
+    record = %{
+      id: "flow-zero",
+      type: "checkout",
+      state: "queued",
+      version: 0,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 0,
+      updated_at_ms: 0,
+      next_run_at_ms: 0,
+      priority: 0,
+      ttl_ms: 0,
+      retention_ttl_ms: 0,
+      terminal_retention_until_ms: 0,
+      history_hot_max_events: 0,
+      history_max_events: 0,
+      partition_key: "",
+      payload_ref: nil,
+      parent_flow_id: "",
+      parent_partition_key: nil,
+      root_flow_id: "",
+      correlation_id: "",
+      result_ref: nil,
+      error_ref: "",
+      lease_owner: "",
+      lease_token: nil,
+      lease_deadline_ms: 0,
+      run_state: "",
+      rewound_to_event_id: nil,
+      child_groups: %{}
+    }
+
+    assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(record)) ==
+             Map.delete(record, :rewound_to_event_id)
   end
 
   test "flow history encoding is compact and includes metadata" do
@@ -509,6 +562,14 @@ defmodule Ferricstore.FlowTest do
         "retry_decision" => "scheduled",
         "retry_next_run_at_ms" => nil
       })
+
+    assert compact ==
+             record
+             |> Ferricstore.Flow.history_snapshot("retry", 1_100, %{
+               "retry_decision" => "scheduled",
+               "retry_next_run_at_ms" => nil
+             })
+             |> Ferricstore.Flow.encode_history_snapshot()
 
     assert "FSH1" <> _ = compact
 
@@ -682,17 +743,17 @@ defmodule Ferricstore.FlowTest do
                     %{count: 4, gets: 3, histories: 1}, %{source: :pipeline}}
   end
 
-  test "pipeline_write_batch_independent works" do
+  test "pipeline_write_batch_independent works in raft mode" do
     ctx = FerricStore.Instance.get(:default)
-    partition_key = uid("flow-pipeline-write-partition")
-    id_a = uid("flow-pipeline-write-a")
-    id_b = uid("flow-pipeline-write-b")
+    partition_key = uid("flow-pipeline-write-standalone-partition")
+    id_a = uid("flow-pipeline-write-standalone-a")
+    id_b = uid("flow-pipeline-write-standalone-b")
 
     assert [:ok, :ok] =
              Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
                {:create, id_a,
                 [
-                  type: "pipeline-write",
+                  type: "pipeline-write-standalone",
                   state: "queued",
                   run_at_ms: 1,
                   now_ms: 1,
@@ -700,7 +761,7 @@ defmodule Ferricstore.FlowTest do
                 ]},
                {:create, id_b,
                 [
-                  type: "pipeline-write",
+                  type: "pipeline-write-standalone",
                   state: "queued",
                   run_at_ms: 1,
                   now_ms: 1,
@@ -710,6 +771,105 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, %{id: ^id_a}} = FerricStore.flow_get(id_a, partition_key: partition_key)
     assert {:ok, %{id: ^id_b}} = FerricStore.flow_get(id_b, partition_key: partition_key)
+  end
+
+  test "pipeline_write_batch_independent terminal commands preserve per-command success" do
+    ctx = FerricStore.Instance.get(:default)
+    partition_key = uid("flow-pipeline-terminal-partition")
+    type = uid("flow-pipeline-terminal")
+    now_ms = 1_000
+    ids = Enum.map(1..3, &uid("flow-pipeline-terminal-#{&1}"))
+
+    Enum.each(ids, fn id ->
+      assert {:ok, _} =
+               flow_create_and_get(id,
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 now_ms: now_ms,
+                 run_at_ms: now_ms
+               )
+    end)
+
+    assert {:ok, claims} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition_key,
+               worker: "pipeline-terminal",
+               limit: 3,
+               now_ms: now_ms,
+               lease_ms: 30_000
+             )
+
+    claims_by_id = Map.new(claims, fn claim -> {claim.id, claim} end)
+    [id_a, id_b, id_c] = ids
+    claim_a = Map.fetch!(claims_by_id, id_a)
+    claim_b = Map.fetch!(claims_by_id, id_b)
+    claim_c = Map.fetch!(claims_by_id, id_c)
+
+    assert [:ok, {:error, _reason}, :ok] =
+             Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
+               {:complete, id_a, claim_a.lease_token,
+                [
+                  partition_key: partition_key,
+                  fencing_token: claim_a.fencing_token,
+                  now_ms: now_ms + 1
+                ]},
+               {:complete, id_b, "wrong-token",
+                [
+                  partition_key: partition_key,
+                  fencing_token: claim_b.fencing_token,
+                  now_ms: now_ms + 1
+                ]},
+               {:complete, id_c, claim_c.lease_token,
+                [
+                  partition_key: partition_key,
+                  fencing_token: claim_c.fencing_token,
+                  now_ms: now_ms + 1
+                ]}
+             ])
+
+    assert {:ok, %{state: "completed"}} = FerricStore.flow_get(id_a, partition_key: partition_key)
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(id_b, partition_key: partition_key)
+    assert {:ok, %{state: "completed"}} = FerricStore.flow_get(id_c, partition_key: partition_key)
+  end
+
+  test "pipeline_write_batch_independent terminal commands preserve duplicate flow order" do
+    ctx = FerricStore.Instance.get(:default)
+    partition_key = uid("flow-pipeline-terminal-dup-partition")
+    type = uid("flow-pipeline-terminal-dup")
+    now_ms = 1_000
+    id = uid("flow-pipeline-terminal-dup")
+
+    assert {:ok, _} =
+             flow_create_and_get(id,
+               type: type,
+               state: "queued",
+               partition_key: partition_key,
+               now_ms: now_ms,
+               run_at_ms: now_ms
+             )
+
+    assert {:ok, [claim]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition_key,
+               worker: "pipeline-terminal-dup",
+               limit: 1,
+               now_ms: now_ms,
+               lease_ms: 30_000
+             )
+
+    command =
+      {:complete, id, claim.lease_token,
+       [
+         partition_key: partition_key,
+         fencing_token: claim.fencing_token,
+         now_ms: now_ms + 1
+       ]}
+
+    assert [:ok, {:error, _reason}] =
+             Ferricstore.Flow.pipeline_write_batch_independent(ctx, [command, command])
+
+    assert {:ok, %{state: "completed"}} = FerricStore.flow_get(id, partition_key: partition_key)
   end
 
   test "pipeline_claim_due_batch coalesces compatible claims and preserves worker boundaries" do
@@ -2695,7 +2855,7 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR key too large" <> _} =
              flow_create_and_get(large_id, type: "checkout")
 
-    assert {:error, "ERR flow payload_ref does not exist"} =
+    assert {:error, "ERR flow payload_ref input is not supported; use payload"} =
              flow_create_and_get("payload-ref-input", type: "checkout", payload_ref: "p")
 
     assert {:error, "ERR flow result_ref input is not supported; use result"} =
@@ -2832,11 +2992,19 @@ defmodule Ferricstore.FlowTest do
     range_ids = fn index_key ->
       shard_index = Ferricstore.Store.Router.shard_for(ctx, index_key)
 
-      {flow_index, _flow_lookup} =
+      {flow_index, flow_lookup} =
         Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard_index)
 
       flow_index
-      |> Ferricstore.Flow.OrderedIndex.range_slice(index_key, :neg_inf, :inf, false, 0, :all)
+      |> Ferricstore.Flow.NativeOrderedIndex.get(flow_lookup)
+      |> Ferricstore.Flow.NativeOrderedIndex.range_slice(
+        index_key,
+        :neg_inf,
+        :inf,
+        false,
+        0,
+        :all
+      )
       |> Enum.map(fn {member, _score} -> member end)
     end
 
@@ -3065,11 +3233,23 @@ defmodule Ferricstore.FlowTest do
     due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition)
     shard_index = Ferricstore.Store.Router.shard_for(ctx, due_key)
     {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard_index)
+    assert native = Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup)
 
     {zset_index, zset_lookup} =
       Ferricstore.Store.Shard.ZSetIndex.table_names(ctx.name, shard_index)
 
     assert [{^id, 1000.0}] =
+             Ferricstore.Flow.NativeOrderedIndex.range_slice(
+               native,
+               due_key,
+               :neg_inf,
+               {:inclusive, 1_000.0},
+               false,
+               0,
+               10
+             )
+
+    assert [] =
              Ferricstore.Flow.OrderedIndex.range_slice(
                flow_index,
                due_key,
@@ -3098,6 +3278,30 @@ defmodule Ferricstore.FlowTest do
                lease_ms: 30_000
              )
 
+    running_due_key = Ferricstore.Flow.Keys.due_key(type, "running", 0, partition)
+
+    assert [] =
+             Ferricstore.Flow.NativeOrderedIndex.range_slice(
+               native,
+               due_key,
+               :neg_inf,
+               {:inclusive, 1_000.0},
+               false,
+               0,
+               10
+             )
+
+    assert [{^id, 31_000.0}] =
+             Ferricstore.Flow.NativeOrderedIndex.range_slice(
+               native,
+               running_due_key,
+               :neg_inf,
+               {:inclusive, 31_000.0},
+               false,
+               0,
+               10
+             )
+
     assert [] =
              Ferricstore.Flow.OrderedIndex.range_slice(
                flow_index,
@@ -3109,8 +3313,131 @@ defmodule Ferricstore.FlowTest do
                10
              )
 
+    assert {:ok, []} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-native-index-2",
+               limit: 1,
+               now_ms: 1_000,
+               lease_ms: 30_000
+             )
+
     inflight_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition)
-    assert 1 = Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, inflight_key)
+    assert 0 = Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, inflight_key)
+    assert 1 = Ferricstore.Flow.NativeOrderedIndex.count_all(native, inflight_key)
+  end
+
+  test "flow_claim_due validates record due time when native due score is stale" do
+    ctx = FerricStore.Instance.get(:default)
+    partition = uid("tenant-native-stale-score")
+    type = uid("native-stale-score")
+    id = uid("flow-native-stale-score")
+
+    assert {:ok, _} =
+             flow_create_and_get(id,
+               type: type,
+               partition_key: partition,
+               run_at_ms: 10_000,
+               now_ms: 1_000
+             )
+
+    due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, due_key)
+    {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard_index)
+    assert native = Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup)
+
+    assert :ok = Ferricstore.Flow.NativeOrderedIndex.put_member(native, due_key, id, 1_000)
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-native-stale-score",
+               limit: 1,
+               now_ms: 1_000,
+               lease_ms: 30_000
+             )
+
+    assert {:ok, [%{id: ^id, state: "running"}]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-native-stale-score",
+               limit: 1,
+               now_ms: 10_000,
+               lease_ms: 30_000
+             )
+  end
+
+  test "flow_claim_due keeps metadata-indexed flows claimable through generic fallback" do
+    partition = uid("tenant-claim-metadata")
+    type = uid("claim-metadata")
+    id = uid("flow-claim-metadata")
+    correlation_id = uid("correlation")
+
+    assert {:ok, _} =
+             flow_create_and_get(id,
+               type: type,
+               partition_key: partition,
+               correlation_id: correlation_id,
+               run_at_ms: 1_000,
+               now_ms: 900
+             )
+
+    assert {:ok, [%{id: ^id, state: "running", correlation_id: ^correlation_id}]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-claim-metadata",
+               limit: 1,
+               now_ms: 1_000,
+               lease_ms: 30_000
+             )
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-claim-metadata-2",
+               limit: 1,
+               now_ms: 1_000,
+               lease_ms: 30_000
+             )
+  end
+
+  test "flow_claim_due restores native overfetch beyond requested limit" do
+    partition = uid("tenant-native-overfetch")
+    type = uid("native-overfetch")
+    ids = for i <- 1..3, do: uid("flow-native-overfetch-#{i}")
+
+    for id <- ids do
+      assert {:ok, _} =
+               flow_create_and_get(id,
+                 type: type,
+                 partition_key: partition,
+                 run_at_ms: 1_000,
+                 now_ms: 900
+               )
+    end
+
+    assert {:ok, [%{id: first_id}]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-native-overfetch-1",
+               limit: 1,
+               now_ms: 1_000,
+               lease_ms: 30_000
+             )
+
+    assert first_id in ids
+
+    assert {:ok, [%{id: second_id}]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-native-overfetch-2",
+               limit: 1,
+               now_ms: 1_000,
+               lease_ms: 30_000
+             )
+
+    assert second_id in ids
+    assert second_id != first_id
   end
 
   test "partition_key scopes claim, complete, retry, get, and history" do
@@ -4017,6 +4344,62 @@ defmodule Ferricstore.FlowTest do
 
     assert retried.state == "payment_failed"
     assert retried.next_run_at_ms == 2_000
+  end
+
+  test "native claim batch state write survives standalone restart" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    name = :"flow_native_claim_restart_#{System.unique_integer([:positive])}"
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_#{name}")
+    ctx = start_flow_restart_instance(name, data_dir)
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+
+      current_ctx =
+        try do
+          FerricStore.Instance.get(name)
+        rescue
+          _ -> ctx
+        end
+
+      stop_flow_restart_instance(current_ctx, delete?: true)
+    end)
+
+    type = uid("native-claim-restart")
+    id = uid("flow-native-claim-restart")
+
+    assert {:ok, _flow} =
+             impl_flow_create_and_get(ctx, id,
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.Impl.flow_claim_due(ctx, type,
+               state: "queued",
+               worker: "worker-native-restart",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert claimed.id == id
+    assert claimed.state == "running"
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+    stop_flow_restart_instance(ctx, delete?: false)
+
+    restarted = start_flow_restart_instance(name, data_dir)
+
+    assert {:ok, restored} = FerricStore.Impl.flow_get(restarted, id)
+    assert restored.state == "running"
+    assert restored.lease_token == claimed.lease_token
+    assert restored.fencing_token == claimed.fencing_token
+    assert restored.lease_owner == "worker-native-restart"
   end
 
   test "standalone restart preserves spawned child group state" do
@@ -6322,13 +6705,15 @@ defmodule Ferricstore.FlowTest do
     assert completed.state == "completed"
     assert {:ok, %{queued: 0, completed: 1}} = FerricStore.flow_info("rewind")
 
-    assert {:ok, rewound} =
+    assert :ok =
              FerricStore.flow_rewind(id,
                to_event: created_event_id,
                run_at_ms: 5_000,
                expect_state: "completed",
                now_ms: 3_000
              )
+
+    assert {:ok, rewound} = FerricStore.flow_get(id)
 
     assert rewound.state == "queued"
     assert rewound.next_run_at_ms == 5_000

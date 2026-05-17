@@ -61,7 +61,8 @@ defmodule Ferricstore.Store.ShardSupervisor do
              [
                shard_index: i,
                shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, i),
-               instance_ctx: instance_ctx
+               instance_ctx: instance_ctx,
+               recover_on_init: false
              ]},
             id: :"flow_history_projector_#{i}"
           ),

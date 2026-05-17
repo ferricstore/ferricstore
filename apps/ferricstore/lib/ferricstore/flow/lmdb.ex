@@ -116,6 +116,8 @@ defmodule Ferricstore.Flow.LMDB do
     "flow-terminal-index:" <> state_index_key <> <<0>>
   end
 
+  def terminal_index_global_prefix, do: "flow-terminal-index:"
+
   def terminal_index_key(state_index_key, id, updated_at_ms)
       when is_binary(state_index_key) and is_binary(id) and is_integer(updated_at_ms) do
     terminal_index_prefix(state_index_key) <>
@@ -140,6 +142,8 @@ defmodule Ferricstore.Flow.LMDB do
   def terminal_by_state_key_key(state_key) when is_binary(state_key) do
     "flow-terminal-by-state:" <> state_key
   end
+
+  def terminal_by_state_global_prefix, do: "flow-terminal-by-state:"
 
   def query_index_prefix(index_key) when is_binary(index_key) do
     "flow-query-index:" <> index_key <> <<0>>

@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   alias Ferricstore.Flow
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
@@ -55,6 +56,19 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         end
       )
       |> persist_terminal_counts(lmdb_path)
+
+    lmdb_active_rebuilt =
+      rebuild_active_flow_indexes_from_lmdb(
+        lmdb_path,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup
+      )
+
+    stats =
+      stats
+      |> Map.put(:lmdb_active_rebuilt, lmdb_active_rebuilt)
       |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
       |> Map.put(
         :history,
@@ -191,14 +205,23 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             Map.update(counts, count_key, 1, &(&1 + 1))
           }
         else
-          {cleanup_stale_terminal_ops(lmdb_path, key) ++ lmdb_ops, prunes,
-           [{key, record} | active], counts}
+          {lmdb_ops, prunes, [{key, record} | active], counts}
         end
       end)
 
     case LMDB.write_batch(lmdb_path, Enum.reverse(ops)) do
       :ok ->
-        Enum.each(Enum.reverse(active_records), fn {_key, record} ->
+        active_records = Enum.reverse(active_records)
+
+        cleanup_ops =
+          cleanup_stale_terminal_reverse_ops(lmdb_path, keydir, shard_path) ++
+            Enum.flat_map(active_records, fn {key, record} ->
+              cleanup_stale_terminal_ops(lmdb_path, key, record)
+            end)
+
+        cleanup_result = LMDB.write_batch(lmdb_path, cleanup_ops)
+
+        Enum.each(active_records, fn {_key, record} ->
           rebuild_active_indexes(zset_score_index, zset_score_lookup, record)
           rebuild_active_flow_indexes(flow_index, flow_lookup, record)
         end)
@@ -213,7 +236,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           lmdb: acc.lmdb + length(decoded),
           terminal: acc.terminal + length(terminal_prunes),
           active: acc.active + length(active_records),
-          lmdb_errors: acc.lmdb_errors,
+          lmdb_errors: acc.lmdb_errors + if(cleanup_result == :ok, do: 0, else: 1),
           terminal_counts: terminal_counts
         }
 
@@ -231,6 +254,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         }
     end
   end
+
+  defp read_and_decode(entries, shard_path), do: read_and_decode(entries, shard_path, nil, nil)
 
   defp read_and_decode(entries, shard_path, shard_index, instance_ctx) do
     {hot, cold} =
@@ -252,12 +277,122 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     hot_decoded ++ cold_decoded
   end
 
-  defp cleanup_stale_terminal_ops(lmdb_path, state_key) do
+  defp cleanup_stale_terminal_ops(lmdb_path, state_key, record) do
     reverse_key = LMDB.terminal_by_state_key_key(state_key)
 
-    case LMDB.get(lmdb_path, reverse_key) do
-      {:ok, terminal_key} when is_binary(terminal_key) ->
-        [{:delete, reverse_key}, {:delete, terminal_key}]
+    reverse_ops =
+      case LMDB.get(lmdb_path, reverse_key) do
+        {:ok, terminal_key} when is_binary(terminal_key) ->
+          [{:delete, reverse_key}, {:delete, terminal_key}]
+
+        _ ->
+          []
+      end
+
+    reverse_ops ++ cleanup_stale_terminal_ops_by_id(lmdb_path, state_key, record)
+  end
+
+  defp cleanup_stale_terminal_ops_by_id(lmdb_path, state_key, %{id: id, type: type} = record)
+       when is_binary(id) and is_binary(type) do
+    partition_key = Map.get(record, :partition_key)
+
+    specific_ops =
+      ["completed", "failed", "cancelled"]
+      |> Enum.flat_map(fn terminal_state ->
+        index_key = Flow.Keys.state_index_key(type, terminal_state, partition_key)
+
+        cleanup_stale_terminal_ops_under_prefix(
+          lmdb_path,
+          LMDB.terminal_index_prefix(index_key),
+          id,
+          state_key,
+          false
+        )
+      end)
+
+    if specific_ops == [] do
+      cleanup_stale_terminal_ops_under_prefix(
+        lmdb_path,
+        LMDB.terminal_index_global_prefix(),
+        id,
+        state_key,
+        true
+      )
+    else
+      specific_ops
+    end
+  end
+
+  defp cleanup_stale_terminal_ops_by_id(_lmdb_path, _state_key, _record), do: []
+
+  defp cleanup_stale_terminal_reverse_ops(lmdb_path, keydir, shard_path) do
+    case LMDB.prefix_entries(
+           lmdb_path,
+           LMDB.terminal_by_state_global_prefix(),
+           terminal_projection_scan_limit()
+         ) do
+      {:ok, entries} ->
+        Enum.flat_map(entries, fn {reverse_key, terminal_key} ->
+          with {:ok, state_key} <- terminal_state_key_from_reverse_key(reverse_key),
+               false <- terminal_state_key?(keydir, shard_path, state_key),
+               true <- is_binary(terminal_key) do
+            [{:delete, reverse_key} | LMDB.terminal_index_delete_ops(lmdb_path, terminal_key, nil)]
+          else
+            _ -> []
+          end
+        end)
+
+      _ ->
+        []
+    end
+  end
+
+  defp terminal_state_key_from_reverse_key(
+         <<"flow-terminal-by-state:", state_key::binary>>
+       )
+       when byte_size(state_key) > 0,
+       do: {:ok, state_key}
+
+  defp terminal_state_key_from_reverse_key(_reverse_key), do: :error
+
+  defp terminal_state_key?(keydir, shard_path, state_key) when is_binary(state_key) do
+    case :ets.lookup(keydir, state_key) do
+      [entry] ->
+        case read_and_decode([entry], shard_path) do
+          [{_key, _value, _expire_at_ms, record}] ->
+            LMDB.terminal_state?(Map.get(record, :state))
+
+          _ ->
+            false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp cleanup_stale_terminal_ops_under_prefix(
+         lmdb_path,
+         prefix,
+         id,
+         current_state_key,
+         legacy_only?
+       ) do
+    case LMDB.prefix_entries(lmdb_path, prefix, terminal_projection_scan_limit()) do
+      {:ok, entries} ->
+        Enum.flat_map(entries, fn {terminal_key, value} ->
+          case LMDB.decode_terminal_index_value(value) do
+            {:ok, {^id, _updated_at_ms, _expire_at_ms, nil}} ->
+              LMDB.terminal_index_delete_ops(lmdb_path, terminal_key, nil)
+
+            {:ok, {^id, _updated_at_ms, _expire_at_ms, ^current_state_key}}
+            when is_binary(current_state_key) and not legacy_only? ->
+              LMDB.terminal_index_delete_ops(lmdb_path, terminal_key, current_state_key)
+
+            _ ->
+              []
+          end
+        end)
 
       _ ->
         []
@@ -421,45 +556,84 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp rebuild_active_flow_indexes(_flow_index, nil, _record), do: :ok
 
   defp rebuild_active_flow_indexes(flow_index, flow_lookup, record) do
+    entries = active_flow_index_entries(record)
+
+    Enum.each(entries, fn {key, member, score} ->
+      FlowIndex.put_member(flow_index, flow_lookup, key, member, score)
+    end)
+
+    case NativeFlowIndex.get(flow_index, flow_lookup) do
+      nil -> :ok
+      native -> NativeFlowIndex.put_entries(native, entries)
+    end
+  end
+
+  defp rebuild_active_flow_indexes_from_lmdb(
+         lmdb_path,
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup
+       ) do
+    now_ms = Ferricstore.CommandTime.now_ms()
+
+    case LMDB.prefix_entries(lmdb_path, "f:", lmdb_state_rebuild_scan_limit()) do
+      {:ok, entries} ->
+        Enum.reduce(entries, 0, fn {key, blob}, count ->
+          with true <- Flow.Keys.state_key?(key),
+               {:ok, value} <- LMDB.decode_value(blob, now_ms),
+               %{state: state} = record <- Flow.decode_record(value),
+               false <- LMDB.terminal_state?(state) do
+            rebuild_active_indexes(zset_score_index, zset_score_lookup, record)
+            rebuild_active_flow_indexes(flow_index, flow_lookup, record)
+            count + 1
+          else
+            _ -> count
+          end
+        end)
+
+      _ ->
+        0
+    end
+  end
+
+  defp active_flow_index_entries(record) do
     partition_key = Map.get(record, :partition_key)
     updated_score = Map.get(record, :updated_at_ms, 0)
     state_index_key = Flow.Keys.state_index_key(record.type, record.state, partition_key)
 
-    FlowIndex.put_member(flow_index, flow_lookup, state_index_key, record.id, updated_score)
-    maybe_rebuild_flow_due_index(flow_index, flow_lookup, record)
-    maybe_rebuild_flow_running_indexes(flow_index, flow_lookup, record)
+    [{state_index_key, record.id, updated_score}]
+    |> maybe_add_due_index_entry(record, partition_key)
+    |> maybe_add_running_index_entries(record, partition_key)
   end
 
-  defp maybe_rebuild_flow_due_index(
-         flow_index,
-         flow_lookup,
-         %{next_run_at_ms: next_run_at_ms} = record
-       )
+  defp maybe_add_due_index_entry(entries, %{next_run_at_ms: next_run_at_ms} = record, partition_key)
        when is_integer(next_run_at_ms) do
-    partition_key = Map.get(record, :partition_key)
     priority = Map.get(record, :priority, 0)
     due_key = Flow.Keys.due_key(record.type, record.state, priority, partition_key)
 
-    FlowIndex.put_member(flow_index, flow_lookup, due_key, record.id, next_run_at_ms)
+    [{due_key, record.id, next_run_at_ms} | entries]
   end
 
-  defp maybe_rebuild_flow_due_index(_flow_index, _flow_lookup, _record), do: :ok
+  defp maybe_add_due_index_entry(entries, _record, _partition_key), do: entries
 
-  defp maybe_rebuild_flow_running_indexes(
-         flow_index,
-         flow_lookup,
-         %{state: "running", lease_deadline_ms: lease_deadline_ms} = record
+  defp maybe_add_running_index_entries(
+         entries,
+         %{state: "running", lease_deadline_ms: lease_deadline_ms} = record,
+         partition_key
        )
        when is_integer(lease_deadline_ms) do
-    partition_key = Map.get(record, :partition_key)
     inflight_key = Flow.Keys.inflight_index_key(record.type, partition_key)
     worker_key = Flow.Keys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
 
-    FlowIndex.put_member(flow_index, flow_lookup, inflight_key, record.id, lease_deadline_ms)
-    FlowIndex.put_member(flow_index, flow_lookup, worker_key, record.id, lease_deadline_ms)
+    [
+      {worker_key, record.id, lease_deadline_ms},
+      {inflight_key, record.id, lease_deadline_ms}
+      | entries
+    ]
   end
 
-  defp maybe_rebuild_flow_running_indexes(_flow_index, _flow_lookup, _record), do: :ok
+  defp maybe_add_running_index_entries(entries, _record, _partition_key), do: entries
 
   defp rebuild_flow_history_indexes(
          _keydir,
@@ -676,6 +850,14 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   defp history_projection_scan_limit do
     Application.get_env(:ferricstore, :flow_lmdb_history_rebuild_scan_limit, 1_000_000)
+  end
+
+  defp terminal_projection_scan_limit do
+    Application.get_env(:ferricstore, :flow_lmdb_terminal_rebuild_scan_limit, 1_000_000)
+  end
+
+  defp lmdb_state_rebuild_scan_limit do
+    Application.get_env(:ferricstore, :flow_lmdb_state_rebuild_scan_limit, 1_000_000)
   end
 
   defp flow_record_expire_at(%{terminal_retention_until_ms: expire_at_ms})

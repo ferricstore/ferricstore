@@ -78,6 +78,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Raft.PerfToggles
   alias Ferricstore.Flow
   alias Ferricstore.Flow.HistoryProjector
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.Flow.RetryPolicy
@@ -85,9 +86,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   alias Ferricstore.Store.{
     BitcaskWriter,
-    BlobRef,
-    BlobStore,
-    BlobValue,
     ColdRead,
     CompoundKey,
     ExpiryTracker,
@@ -112,6 +110,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @cold_location_retry_sleep_ms 1
   @sm_apply_state_key :sm_apply_state
   @sm_standalone_staged_key :sm_standalone_staged_apply
+  @sm_force_async_flow_history_key :sm_force_async_flow_history
   @sm_pending_write_keys [
     :sm_pending_writes,
     :sm_pending_originals,
@@ -119,13 +118,19 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_lmdb_values,
     :sm_pending_lmdb_mirror_ops,
     :sm_pending_lmdb_mirror_after_flush,
+    :sm_pending_lmdb_mirror_default_shard,
+    :sm_pending_lmdb_mirror_tagged,
     :sm_pending_flow_history_projections,
+    :sm_pending_fast_claim_index_rollbacks,
     :sm_pending_flow_index_originals,
     :sm_pending_flow_index_counts,
+    :sm_pending_flow_native_ops,
     :sm_pending_zset_index_ops,
     :sm_pending_prob_creates,
+    :sm_pending_has_delete,
     :sm_pending_fast_put_batch,
-    :sm_pending_fast_delete_batch
+    :sm_pending_fast_delete_batch,
+    :sm_pending_fast_staged_put_batch
   ]
   @sm_pending_write_initial_values [
     sm_pending_writes: [],
@@ -134,13 +139,19 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_lmdb_values: %{},
     sm_pending_lmdb_mirror_ops: [],
     sm_pending_lmdb_mirror_after_flush: [],
+    sm_pending_lmdb_mirror_default_shard: nil,
+    sm_pending_lmdb_mirror_tagged: false,
     sm_pending_flow_history_projections: [],
+    sm_pending_fast_claim_index_rollbacks: [],
     sm_pending_flow_index_originals: %{},
     sm_pending_flow_index_counts: %{},
+    sm_pending_flow_native_ops: [],
     sm_pending_zset_index_ops: [],
     sm_pending_prob_creates: [],
+    sm_pending_has_delete: false,
     sm_pending_fast_put_batch: false,
-    sm_pending_fast_delete_batch: false
+    sm_pending_fast_delete_batch: false,
+    sm_pending_fast_staged_put_batch: false
   ]
 
   defguardp valid_cold_location(file_id, offset, value_size)
@@ -292,12 +303,6 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:put_batch, entries}` -- Hot-path write-only SET batch where entries
       are `{key, value, expire_at_ms}` tuples. Stages Bitcask records, then
       publishes ETS after append succeeds. Returns `{:ok, results}`.
-    * `{:set_blob_ref, key, encoded_ref, expire_at_ms, opts}` -- Conditional
-      SET whose large value was externalized before Ra submission. NX/XX/GET
-      checks still run inside the state machine.
-    * `{:put_blob_batch, entries}` -- SET batch where some values were already
-      externalized to blob refs before Ra submission. Entries are
-      `{key, value_or_ref, expire_at_ms, :value | :blob_ref}` tuples.
     * `{:delete, key}` -- Delete a key. Writes a tombstone to Bitcask, removes
       from ETS.
     * `{:delete_batch, keys}` -- Hot-path DEL batch. Returns `{:ok, results}`.
@@ -305,21 +310,11 @@ defmodule Ferricstore.Raft.StateMachine do
       this shape when later commands in the same Ra entry need pending
       read-your-own-write state. Returns `{:ok, results}` where results is a
       list of individual command results.
-    * `{:getset_blob_ref, key, encoded_ref}` -- GETSET whose replacement value
-      was externalized before Ra submission. Returns the old value and stores
-      the ref only after validating it.
     * `{:list_op, key, operation}` -- Execute a list operation (LPUSH, RPUSH,
       LPOP, RPOP, etc.) as an atomic read-modify-write. Reads the current value
       from ETS/Bitcask, delegates to `ListOps.execute/4`, and persists the result.
     * `{:compound_put, compound_key, value, expire_at_ms}` -- Write a hash/set/zset
       field. Inserts `{compound_key, value, expire_at_ms}` into ETS and Bitcask.
-    * `{:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}` --
-      Compound PUT whose large value was externalized before Ra submission.
-      ZSET score commands stay inline so score indexes never consume refs.
-    * `{:compound_blob_batch_put, redis_key, entries}` -- Compound batch PUT
-      where entries are `{compound_key, value_or_ref, expire_at_ms,
-      :value | :blob_ref}` tuples. Blob refs are validated before any entry is
-      made visible.
     * `{:compound_delete, compound_key}` -- Delete a hash/set/zset field. Removes
       the compound key from ETS and Bitcask.
     * `{:compound_delete_prefix, prefix}` -- Delete all compound keys matching the
@@ -332,9 +327,6 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:append, key, suffix}` -- Atomic read-modify-write append. Reads the
       current value (or `""`), concatenates `suffix`, writes back. Returns
       `{:ok, byte_size(new_value)}`.
-    * `{:append_blob_ref, key, encoded_ref}` -- APPEND whose suffix was
-      externalized before Ra submission. Materializes and validates the suffix
-      before mutating the key.
     * `{:getset, key, new_value}` -- Atomic get-and-set. Reads the old value,
       writes the new value with no expiry, returns the old value (or `nil`).
     * `{:getdel, key}` -- Atomic get-and-delete. Reads the value, deletes the
@@ -344,15 +336,9 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:setrange, key, offset, value}` -- Atomic set-range. Reads the current
       value, pads with zero bytes if needed, replaces bytes at `offset`, writes
       back. Returns `{:ok, byte_size(new_value)}`.
-    * `{:setrange_blob_ref, key, offset, encoded_ref}` -- SETRANGE whose patch
-      bytes were externalized before Ra submission. Materializes and validates
-      the patch before mutating the key.
     * `{:cas, key, expected, new_value, ttl_ms}` -- Compare-and-swap. Reads the
       current value; if it matches `expected`, writes `new_value` with optional
       TTL. Returns `1` (swapped), `0` (mismatch), or `nil` (key missing/expired).
-    * `{:cas_blob_ref, key, expected, encoded_ref, ttl_ms}` -- CAS whose new
-      value was externalized before Ra submission. Validates the ref only after
-      the expected value matches.
     * `{:lock, key, owner, ttl_ms}` -- Distributed lock acquire. If the key does
       not exist, is expired, or is already held by the same owner, sets
       `{owner, ttl}`. Returns `:ok` or `{:error, reason}`.
@@ -447,27 +433,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  def apply(meta, {:put_blob_ref, key, encoded_ref, expire_at_ms}, state) do
-    with_apply_time(meta, fn ->
-      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-      result =
-        case check_key_lock(state, redis_key, nil) do
-          :ok ->
-            with_pending_writes(state, fn ->
-              do_put_blob_ref(state, key, encoded_ref, expire_at_ms)
-            end)
-
-          {:error, :key_locked} ->
-            {:error, :key_locked}
-        end
-
-      old_count = state.applied_count
-      new_state = %{state | applied_count: old_count + 1}
-      maybe_release_cursor(meta, old_count, new_state, result)
-    end)
-  end
-
   def apply(meta, {:set, key, value, expire_at_ms, opts}, state) do
     with_apply_time(meta, fn ->
       redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
@@ -476,27 +441,6 @@ defmodule Ferricstore.Raft.StateMachine do
         case check_key_lock(state, redis_key, nil) do
           :ok ->
             with_pending_writes(state, fn -> do_set(state, key, value, expire_at_ms, opts) end)
-
-          {:error, :key_locked} ->
-            {:error, :key_locked}
-        end
-
-      old_count = state.applied_count
-      new_state = %{state | applied_count: old_count + 1}
-      maybe_release_cursor(meta, old_count, new_state, result)
-    end)
-  end
-
-  def apply(meta, {:set_blob_ref, key, encoded_ref, expire_at_ms, opts}, state) do
-    with_apply_time(meta, fn ->
-      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-      result =
-        case check_key_lock(state, redis_key, nil) do
-          :ok ->
-            with_pending_writes(state, fn ->
-              do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts)
-            end)
 
           {:error, :key_locked} ->
             {:error, :key_locked}
@@ -534,19 +478,6 @@ defmodule Ferricstore.Raft.StateMachine do
       write_result =
         with_pending_writes(state, fn ->
           apply_put_batch_entries(state, entries)
-        end)
-
-      finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
-    end)
-  end
-
-  def apply(meta, {:put_blob_batch, entries}, state) when is_list(entries) do
-    with_apply_time(meta, fn ->
-      old_count = state.applied_count
-
-      write_result =
-        with_pending_writes(state, fn ->
-          apply_put_blob_batch_entries(state, entries)
         end)
 
       finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
@@ -703,27 +634,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  def apply(meta, {:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}, state) do
-    with_apply_time(meta, fn ->
-      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
-
-      result =
-        case check_key_lock(state, redis_key, nil) do
-          :ok ->
-            with_pending_writes(state, fn ->
-              do_compound_put_blob_ref(state, redis_key, compound_key, encoded_ref, expire_at_ms)
-            end)
-
-          {:error, :key_locked} ->
-            {:error, :key_locked}
-        end
-
-      old_count = state.applied_count
-      new_state = %{state | applied_count: old_count + 1}
-      maybe_release_cursor(meta, old_count, new_state, result)
-    end)
-  end
-
   def apply(meta, {:compound_batch_put, redis_key, entries}, state)
       when is_binary(redis_key) and is_list(entries) do
     with_apply_time(meta, fn ->
@@ -732,20 +642,6 @@ defmodule Ferricstore.Raft.StateMachine do
       write_result =
         with_pending_writes(state, fn ->
           apply_compound_batch_put_entries(state, redis_key, entries)
-        end)
-
-      finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
-    end)
-  end
-
-  def apply(meta, {:compound_blob_batch_put, redis_key, entries}, state)
-      when is_binary(redis_key) and is_list(entries) do
-    with_apply_time(meta, fn ->
-      old_count = state.applied_count
-
-      write_result =
-        with_pending_writes(state, fn ->
-          apply_compound_blob_batch_put_entries(state, redis_key, entries)
         end)
 
       finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
@@ -820,16 +716,8 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_append(state, key, suffix) end)
   end
 
-  def apply(meta, {:append_blob_ref, key, encoded_ref}, state) do
-    apply_pending_with_time(meta, state, fn -> do_append_blob_ref(state, key, encoded_ref) end)
-  end
-
   def apply(meta, {:getset, key, new_value}, state) do
     apply_pending_with_time(meta, state, fn -> do_getset(state, key, new_value) end)
-  end
-
-  def apply(meta, {:getset_blob_ref, key, encoded_ref}, state) do
-    apply_pending_with_time(meta, state, fn -> do_getset_blob_ref(state, key, encoded_ref) end)
   end
 
   def apply(meta, {:getdel, key}, state) do
@@ -842,12 +730,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:setrange, key, offset, value}, state) do
     apply_pending_with_time(meta, state, fn -> do_setrange(state, key, offset, value) end)
-  end
-
-  def apply(meta, {:setrange_blob_ref, key, offset, encoded_ref}, state) do
-    apply_pending_with_time(meta, state, fn ->
-      do_setrange_blob_ref(state, key, offset, encoded_ref)
-    end)
   end
 
   # Atomic SETBIT — read bitmap blob, mutate one bit, write back. Previously
@@ -942,12 +824,6 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_cas(state, key, expected, new_value, ttl_ms) end)
   end
 
-  def apply(meta, {:cas_blob_ref, key, expected, encoded_ref, ttl_ms}, state) do
-    apply_pending_with_time(meta, state, fn ->
-      do_cas_blob_ref(state, key, expected, encoded_ref, ttl_ms)
-    end)
-  end
-
   def apply(meta, {:lock, key, owner, ttl_ms}, state) do
     apply_pending_with_time(meta, state, fn -> do_lock(state, key, owner, ttl_ms) end)
   end
@@ -1027,27 +903,6 @@ defmodule Ferricstore.Raft.StateMachine do
         case check_key_lock(state, redis_key, owner_ref) do
           :ok ->
             with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
-
-          {:error, _} = err ->
-            err
-        end
-
-      old_count = state.applied_count
-      new_state = %{state | applied_count: old_count + 1}
-      maybe_release_cursor(meta, old_count, new_state, result)
-    end)
-  end
-
-  def apply(meta, {:locked_put_blob_ref, key, encoded_ref, expire_at_ms, owner_ref}, state) do
-    with_apply_time(meta, fn ->
-      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-      result =
-        case check_key_lock(state, redis_key, owner_ref) do
-          :ok ->
-            with_pending_writes(state, fn ->
-              do_put_blob_ref(state, key, encoded_ref, expire_at_ms)
-            end)
 
           {:error, _} = err ->
             err
@@ -1242,6 +1097,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_create_many(state, attrs) end)
   end
 
+  def apply(meta, {:flow_create_pipeline_batch, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_create_pipeline_batch(state, attrs) end)
+  end
+
   def apply(meta, {:flow_spawn_children, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_spawn_children(state, attrs) end)
   end
@@ -1260,6 +1119,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:flow_complete_many, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_complete_many(state, attrs) end)
+  end
+
+  def apply(meta, {:flow_terminal_pipeline_batch, op, _key, attrs}, state)
+      when op in [:complete, :retry, :fail, :cancel] and is_map(attrs) do
+    apply_pending_with_time(meta, state, fn ->
+      do_flow_terminal_pipeline_batch(state, op, attrs)
+    end)
   end
 
   def apply(meta, {:flow_transition, _key, attrs}, state) when is_map(attrs) do
@@ -1752,7 +1618,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_history_projector_replay_safe?(state, instance_ctx, release_index) do
-    not flow_async_history?(state) or
+    not flow_history_projector_required?(state) or
       HistoryProjector.durable?(
         instance_ctx,
         state.shard_index,
@@ -1760,6 +1626,13 @@ defmodule Ferricstore.Raft.StateMachine do
         release_index
       )
   end
+
+  defp flow_history_projector_required?(state) do
+    flow_async_history?(state) or flow_claim_async_history?(state)
+  end
+
+  defp flow_claim_async_history?(state),
+    do: Map.get(state, :flow_claim_async_history, true) == true
 
   defp request_replay_safe_indexes(
          state,
@@ -2291,7 +2164,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     put_in_ctx = fn ctx, key, value, expire_at_ms ->
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
-      disk_val = persisted_disk_binary_for_ctx!(ctx, anchor_state, value)
+      disk_val = to_disk_binary(value)
 
       record_cross_shard_pending_original(ctx, key)
 
@@ -2491,7 +2364,7 @@ defmodule Ferricstore.Raft.StateMachine do
       Promotion.await_compaction_latch(anchor_state, redis_key)
 
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
-      disk_val = persisted_disk_binary_for_ctx!(ctx, anchor_state, value)
+      disk_val = to_disk_binary(value)
       active = Promotion.find_active(dedicated_path)
       fid = parse_fid_from_path(active)
 
@@ -2576,7 +2449,7 @@ defmodule Ferricstore.Raft.StateMachine do
       prepared =
         Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
           value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
-          disk_val = persisted_disk_binary_for_ctx!(ctx, anchor_state, value)
+          disk_val = to_disk_binary(value)
           {compound_key, value, value_for, disk_val, expire_at_ms}
         end)
 
@@ -3103,25 +2976,25 @@ defmodule Ferricstore.Raft.StateMachine do
     try do
       case :ets.lookup(ctx.keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-          cross_shard_materialize_value(ctx, value)
+          value
 
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case read_cold_async(path, off, key) do
-            {:ok, v} -> cross_shard_materialize_value(ctx, v)
+            {:ok, v} -> v
             _ -> nil
           end
 
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-          cross_shard_materialize_value(ctx, value)
+          value
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case read_cold_async(path, off, key) do
-            {:ok, v} -> cross_shard_materialize_value(ctx, v)
+            {:ok, v} -> v
             _ -> nil
           end
 
@@ -3150,25 +3023,25 @@ defmodule Ferricstore.Raft.StateMachine do
     try do
       case :ets.lookup(ctx.keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-          {cross_shard_materialize_value(ctx, value), 0}
+          {value, 0}
 
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case read_cold_async(path, off, key) do
-            {:ok, v} -> {cross_shard_materialize_value(ctx, v), 0}
+            {:ok, v} -> {v, 0}
             _ -> nil
           end
 
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-          {cross_shard_materialize_value(ctx, value), exp}
+          {value, exp}
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case read_cold_async(path, off, key) do
-            {:ok, v} -> {cross_shard_materialize_value(ctx, v), exp}
+            {:ok, v} -> {v, exp}
             _ -> nil
           end
 
@@ -3219,14 +3092,11 @@ defmodule Ferricstore.Raft.StateMachine do
             value == nil ->
               field = sm_prefix_field(key)
               path = sm_file_path_from_path(data_path, fid)
-              entry = {ctx, field, key, path, off}
+              entry = {field, key, path, off}
               {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
 
             true ->
-              materialized = cross_shard_materialize_value(ctx, value)
-
-              {[{:value, {sm_prefix_field(key), materialized}} | tokens], cold_entries,
-               cold_count}
+              {[{:value, {sm_prefix_field(key), value}} | tokens], cold_entries, cold_count}
           end
         end)
 
@@ -3258,40 +3128,23 @@ defmodule Ferricstore.Raft.StateMachine do
   defp cross_shard_read_cold_batch([]), do: []
 
   defp cross_shard_read_cold_batch(entries) do
-    locations = Enum.map(entries, fn {_ctx, _field, key, path, off} -> {path, off, key} end)
+    locations = Enum.map(entries, fn {_field, key, path, off} -> {path, off, key} end)
 
     values =
       locations
       |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
       |> normalize_state_machine_batch_values(length(entries))
 
-    emit_state_machine_batch_cold_errors(entries, values, fn {_ctx, _field, _key, path, _off} ->
+    emit_state_machine_batch_cold_errors(entries, values, fn {_field, _key, path, _off} ->
       path
     end)
 
     Enum.zip(entries, values)
     |> Enum.map(fn
-      {{ctx, field, _key, _path, _off}, value} when is_binary(value) ->
-        {field, cross_shard_materialize_value(ctx, value)}
-
-      {_entry, _value} ->
-        nil
+      {{field, _key, _path, _off}, value} when is_binary(value) -> {field, value}
+      {_entry, _value} -> nil
     end)
   end
-
-  defp cross_shard_materialize_value(%{data_dir: data_dir, index: shard_index} = ctx, value) do
-    case BlobValue.maybe_materialize(
-           data_dir,
-           shard_index,
-           blob_side_channel_threshold(ctx),
-           value
-         ) do
-      {:ok, materialized} -> materialized
-      {:error, _reason} -> nil
-    end
-  end
-
-  defp cross_shard_materialize_value(_ctx, value), do: value
 
   defp normalize_state_machine_batch_values({:ok, values}, count)
        when is_list(values) and length(values) == count,
@@ -3901,51 +3754,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp apply_single(state, {:locked_put, key, value, expire_at_ms, owner_ref}) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-    case check_key_lock(state, redis_key, owner_ref) do
-      :ok -> do_put(state, key, value, expire_at_ms)
-      {:error, :key_locked} -> {:error, :key_locked}
-    end
-  end
-
-  defp apply_single(state, {:put_blob_ref, key, encoded_ref, expire_at_ms}) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-    case check_key_lock(state, redis_key, nil) do
-      :ok -> do_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialize_pending?: true)
-      {:error, :key_locked} -> {:error, :key_locked}
-    end
-  end
-
-  defp apply_single(state, {:locked_put_blob_ref, key, encoded_ref, expire_at_ms, owner_ref}) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-    case check_key_lock(state, redis_key, owner_ref) do
-      :ok -> do_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialize_pending?: true)
-      {:error, :key_locked} -> {:error, :key_locked}
-    end
-  end
-
   defp apply_single(state, {:set, key, value, expire_at_ms, opts}) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
     case check_key_lock(state, redis_key, nil) do
       :ok -> do_set(state, key, value, expire_at_ms, opts)
       {:error, :key_locked} -> {:error, :key_locked}
-    end
-  end
-
-  defp apply_single(state, {:set_blob_ref, key, encoded_ref, expire_at_ms, opts}) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-    case check_key_lock(state, redis_key, nil) do
-      :ok ->
-        do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts, materialize_pending?: true)
-
-      {:error, :key_locked} ->
-        {:error, :key_locked}
     end
   end
 
@@ -3978,31 +3792,8 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp apply_single(state, {:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
-
-    case check_key_lock(state, redis_key, nil) do
-      :ok ->
-        do_compound_put_blob_ref(state, redis_key, compound_key, encoded_ref, expire_at_ms,
-          materialize_pending?: true
-        )
-
-      {:error, :key_locked} ->
-        {:error, :key_locked}
-    end
-  end
-
   defp apply_single(state, {:compound_batch_put, redis_key, entries}) do
     case apply_compound_batch_put_entries(state, redis_key, entries) do
-      results when is_list(results) -> :ok
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp apply_single(state, {:compound_blob_batch_put, redis_key, entries}) do
-    case apply_compound_blob_batch_put_entries(state, redis_key, entries,
-           materialize_pending?: true
-         ) do
       results when is_list(results) -> :ok
       {:error, _reason} = error -> error
     end
@@ -4081,16 +3872,8 @@ defmodule Ferricstore.Raft.StateMachine do
     do_append(state, key, suffix)
   end
 
-  defp apply_single(state, {:append_blob_ref, key, encoded_ref}) do
-    do_append_blob_ref(state, key, encoded_ref)
-  end
-
   defp apply_single(state, {:getset, key, new_value}) do
     do_getset(state, key, new_value)
-  end
-
-  defp apply_single(state, {:getset_blob_ref, key, encoded_ref}) do
-    do_getset_blob_ref(state, key, encoded_ref, materialize_pending?: true)
   end
 
   defp apply_single(state, {:getdel, key}) do
@@ -4103,10 +3886,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:setrange, key, offset, value}) do
     do_setrange(state, key, offset, value)
-  end
-
-  defp apply_single(state, {:setrange_blob_ref, key, offset, encoded_ref}) do
-    do_setrange_blob_ref(state, key, offset, encoded_ref)
   end
 
   defp apply_single(state, {:setbit, key, offset, bit_val}) do
@@ -4137,10 +3916,6 @@ defmodule Ferricstore.Raft.StateMachine do
     do_cas(state, key, expected, new_value, ttl_ms)
   end
 
-  defp apply_single(state, {:cas_blob_ref, key, expected, encoded_ref, ttl_ms}) do
-    do_cas_blob_ref(state, key, expected, encoded_ref, ttl_ms, materialize_pending?: true)
-  end
-
   defp apply_single(state, {:lock, key, owner, ttl_ms}) do
     do_lock(state, key, owner, ttl_ms)
   end
@@ -4169,6 +3944,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_create_many(state, attrs)
   end
 
+  defp apply_single(state, {:flow_create_pipeline_batch, _key, attrs}) do
+    do_flow_create_pipeline_batch(state, attrs)
+  end
+
   defp apply_single(state, {:flow_spawn_children, _key, attrs}) do
     do_flow_spawn_children(state, attrs)
   end
@@ -4187,6 +3966,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:flow_complete_many, _key, attrs}) do
     do_flow_complete_many(state, attrs)
+  end
+
+  defp apply_single(state, {:flow_terminal_pipeline_batch, op, _key, attrs})
+       when op in [:complete, :retry, :fail, :cancel] do
+    do_flow_terminal_pipeline_batch(state, op, attrs)
   end
 
   defp apply_single(state, {:flow_transition, _key, attrs}) do
@@ -4372,67 +4156,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp apply_put_blob_batch_entries(state, entries) do
-    with :ok <- validate_put_blob_batch_entries(state, entries) do
-      Enum.map(entries, fn
-        {key, value, expire_at_ms, :value} ->
-          do_put(state, key, value, expire_at_ms)
-
-        {key, encoded_ref, expire_at_ms, :blob_ref} ->
-          do_put_validated_blob_ref(state, key, encoded_ref, expire_at_ms)
-      end)
-    end
-  end
-
-  defp validate_put_blob_batch_entries(state, entries) do
-    with {:ok, refs} <- collect_put_blob_batch_refs(state, entries),
-         :ok <- validate_put_blob_refs(state, refs) do
-      :ok
-    end
-  end
-
-  defp collect_put_blob_batch_refs(state, entries) do
-    Enum.reduce_while(entries, {:ok, []}, fn
-      {key, encoded_ref, _expire_at_ms, :blob_ref}, {:ok, refs}
-      when is_binary(key) and is_binary(encoded_ref) ->
-        with :ok <- validate_put_blob_batch_lock(state, key),
-             {:ok, %BlobRef{} = ref} <- BlobRef.decode(encoded_ref) do
-          {:cont, {:ok, [ref | refs]}}
-        else
-          :error -> {:halt, {:error, {:blob_ref_unavailable, :invalid_ref}}}
-          {:error, _reason} = error -> {:halt, error}
-        end
-
-      {key, value, _expire_at_ms, :value}, {:ok, refs} when is_binary(key) and is_binary(value) ->
-        case validate_put_blob_batch_lock(state, key) do
-          :ok -> {:cont, {:ok, refs}}
-          {:error, _reason} = error -> {:halt, error}
-        end
-
-      _invalid, {:ok, _refs} ->
-        {:halt, {:error, {:blob_batch_invalid_entry, :invalid_entry}}}
-    end)
-    |> case do
-      {:ok, refs} -> {:ok, Enum.reverse(refs)}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp validate_put_blob_refs(_state, []), do: :ok
-
-  defp validate_put_blob_refs(state, refs) do
-    case BlobStore.verify_many(state.data_dir, state.shard_index, refs) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
-    end
-  end
-
-  defp validate_put_blob_batch_lock(state, key) do
-    key
-    |> CompoundKey.extract_redis_key()
-    |> then(&check_key_lock(state, &1, nil))
-  end
-
   defp put_batch_fast_path?(state, entries) do
     PerfToggles.put_batch_apply_fast_path?() and not cross_shard_pending_active?() and
       not standalone_staged_apply?() and
@@ -4464,24 +4187,16 @@ defmodule Ferricstore.Raft.StateMachine do
   # If a future compact term needs read-your-own-write inside the same Ra entry,
   # use the generic `{:batch, commands}` machinery or add a dedicated equivalent
   # with rollback, ordering, and mixed-result tests.
-  defp apply_put_batch_entries_fast(state, entries) do
+  defp apply_put_batch_entries_fast(_state, entries) do
     pending = Process.get(:sm_pending_writes, [])
     pending_values = Process.get(:sm_pending_values, %{})
     mirror_flow_policy? = flow_lmdb_mirror?(nil)
     fast_publish? = pending == [] and pending_values == %{}
 
-    disk_values =
-      persisted_disk_binaries!(
-        state,
-        Enum.map(entries, fn {_key, value, _expire_at_ms} -> value end)
-      )
-
     {results, pending} =
-      entries
-      |> Enum.zip(disk_values)
-      |> Enum.reduce({[], pending}, fn
-        {{key, value, expire_at_ms}, disk_val}, {results, pending_acc} ->
-          ets_val = value_for_ets(value, hot_cache_threshold(state))
+      Enum.reduce(entries, {[], pending}, fn
+        {key, value, expire_at_ms}, {results, pending_acc} ->
+          disk_val = to_disk_binary(value)
 
           if mirror_flow_policy? and FlowKeys.policy_key?(key) do
             queue_pending_lmdb_mirror_put(key, disk_val, expire_at_ms)
@@ -4489,7 +4204,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           {
             [:ok | results],
-            [{:put, key, disk_val, expire_at_ms, ets_val, byte_size(disk_val)} | pending_acc]
+            [{:put, key, disk_val, expire_at_ms} | pending_acc]
           }
       end)
 
@@ -4612,30 +4327,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp apply_compound_blob_batch_put_entries(state, redis_key, entries, opts \\ []) do
-    cond do
-      not compound_blob_put_entries_for_key?(redis_key, entries) ->
-        {:error, :compound_batch_cross_key}
-
-      Map.get(state, :cross_shard_locks, %{}) != %{} ->
-        compound_batch_lock_checked_results(state, redis_key, entries, fn ->
-          do_compound_blob_batch_put(state, redis_key, entries, opts)
-        end)
-
-      true ->
-        case check_key_lock(state, redis_key, nil) do
-          :ok ->
-            case do_compound_blob_batch_put(state, redis_key, entries, opts) do
-              :ok -> List.duplicate(:ok, length(entries))
-              {:error, _reason} = error -> error
-            end
-
-          {:error, :key_locked} = error ->
-            List.duplicate(error, length(entries))
-        end
-    end
-  end
-
   defp apply_compound_batch_delete_keys(state, redis_key, compound_keys) do
     cond do
       not compound_delete_keys_for_key?(redis_key, compound_keys) ->
@@ -4683,17 +4374,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  defp compound_blob_put_entries_for_key?(redis_key, entries) do
-    Enum.all?(entries, fn
-      {compound_key, _value_or_ref, _expire_at_ms, tag}
-      when is_binary(compound_key) and tag in [:value, :blob_ref] ->
-        CompoundKey.extract_redis_key(compound_key) == redis_key
-
-      _entry ->
-        false
-    end)
-  end
-
   defp compound_delete_keys_for_key?(redis_key, compound_keys) do
     Enum.all?(compound_keys, fn
       compound_key when is_binary(compound_key) ->
@@ -4706,12 +4386,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp maybe_queue_origin_pending_put(state, key, value, expire_at_ms) do
     expected_value = value_for_ets(value, hot_cache_threshold(state))
-    disk_value = persisted_disk_binary!(state, value)
 
     case :ets.lookup(state.ets, key) do
       [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, 0, _vs}]
       when expected_value != nil ->
-        queue_pending_put(key, disk_value, expire_at_ms, value, expected_value)
+        queue_pending_put(key, to_disk_binary(value), expire_at_ms)
 
       _ ->
         :ok
@@ -4725,11 +4404,9 @@ defmodule Ferricstore.Raft.StateMachine do
          expected_value,
          expire_at_ms
        ) do
-    disk_value = persisted_disk_binary!(state, value)
-
     case :ets.lookup(state.ets, key) do
       [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, _off, _value_size}] ->
-        queue_pending_put(key, disk_value, expire_at_ms, value, expected_value)
+        queue_pending_put(key, to_disk_binary(value), expire_at_ms)
 
       _ ->
         :ok
@@ -4748,12 +4425,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_origin_async_put(state, key, value, expire_at_ms) do
     expected_value = value_for_ets(value, hot_cache_threshold(state))
-    disk_value = persisted_disk_binary!(state, value)
+    disk_value = to_disk_binary(value)
 
     case :ets.lookup(state.ets, key) do
       [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, 0, _vs}]
       when expected_value != nil ->
-        queue_pending_put(key, disk_value, expire_at_ms, value, expected_value)
+        queue_pending_put(key, disk_value, expire_at_ms)
         :ok
 
       [{^key, ^expected_value, ^expire_at_ms, _lfu, fid, off, vs}]
@@ -4765,7 +4442,7 @@ defmodule Ferricstore.Raft.StateMachine do
         end
 
       [{^key, _other_value, _other_exp, _lfu, :pending, _off, _vs}] ->
-        queue_pending_put(key, disk_value, expire_at_ms, value, expected_value)
+        queue_pending_put(key, disk_value, expire_at_ms)
         :ok
 
       _ ->
@@ -5136,7 +4813,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp normalize_stamped_command(command), do: command
 
   defp with_cross_shard_pending_writes(state, fun) do
-    init_pending_write_process_state()
+    init_pending_write_process_state(state)
     Process.put(:sm_cross_shard_pending_writes, [])
     Process.put(:sm_cross_shard_pending_originals, %{})
 
@@ -5152,6 +4829,8 @@ defmodule Ferricstore.Raft.StateMachine do
         nil ->
           case flush_cross_shard_pending_writes(state) do
             {:ok, flushed_state} ->
+              :ok = flush_pending_flow_native_indexes(flushed_state)
+
               case publish_pending_flow_history_projections(flushed_state) do
                 :ok ->
                   observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
@@ -5188,11 +4867,6 @@ defmodule Ferricstore.Raft.StateMachine do
         rollback_pending_writes(state)
         reraise error, __STACKTRACE__
     catch
-      :throw, {:blob_externalize_failed, reason} ->
-        rollback_cross_shard_pending_writes(state)
-        rollback_pending_writes(state)
-        {:error, {:blob_externalize_failed, reason}}
-
       kind, reason ->
         rollback_cross_shard_pending_writes(state)
         rollback_pending_writes(state)
@@ -5515,6 +5189,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp queue_cross_shard_pending_delete(ctx, key) do
     pending = Process.get(:sm_cross_shard_pending_writes, [])
+    Process.put(:sm_pending_has_delete, true)
 
     Process.put(:sm_cross_shard_pending_writes, [
       {:delete, ctx.index, ctx.keydir, ctx.active_file_path, ctx.active_file_id, key} | pending
@@ -5562,7 +5237,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # :pending locations and returns the disk error instead of acknowledging
   # success to the caller.
   defp with_pending_writes(state, fun) do
-    init_pending_write_process_state()
+    init_pending_write_process_state(state)
     started_at = System.monotonic_time()
 
     try do
@@ -5592,12 +5267,6 @@ defmodule Ferricstore.Raft.StateMachine do
         rollback_pending_writes(state)
         reraise error, __STACKTRACE__
     catch
-      :throw, {:blob_externalize_failed, reason} ->
-        rollback_pending_writes(state)
-        error = {:error, {:blob_externalize_failed, reason}}
-        emit_raft_apply_telemetry(state, started_at, error, :rolled_back)
-        error
-
       kind, reason ->
         rollback_pending_writes(state)
         :erlang.raise(kind, reason, __STACKTRACE__)
@@ -5606,10 +5275,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp init_pending_write_process_state do
+  defp init_pending_write_process_state(state) do
     Enum.each(@sm_pending_write_initial_values, fn {key, value} ->
       Process.put(key, value)
     end)
+
+    Process.put(:sm_pending_lmdb_mirror_default_shard, Map.get(state, :shard_index, 0))
   end
 
   defp clear_pending_write_process_state do
@@ -5624,30 +5295,46 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(attrs, :partition_key)
     state_key = FlowKeys.state_key(id, partition_key)
 
-    case flow_read_record(state, id, partition_key) do
+    case flow_create_existing_state(state, attrs, state_key) do
       nil ->
-        record = flow_create_record(state, attrs)
-
-        with :ok <- flow_validate_record_keys(record),
-             :ok <- flow_put_record_values(state, record, attrs),
-             :ok <-
-               flow_put_new_state_record(
-                 state,
-                 state_key,
-                 record
-               ),
-             :ok <- flow_due_put(state, record),
-             :ok <- flow_index_put(state, record),
-             :ok <- flow_history_put(state, record, "created", Map.get(record, :created_at_ms)),
-             :ok <- flow_history_trim(state, record) do
-          :ok
-        end
+        flow_create_apply_new_record(state, attrs, state_key)
 
       existing ->
         case flow_create_duplicate_result(state, existing, attrs) do
           {:ok, _existing} -> :ok
           {:error, _reason} = error -> error
         end
+    end
+  end
+
+  defp flow_create_apply_new_record(state, attrs, state_key) do
+    key_info = flow_create_fast_key_info(attrs, state_key)
+    record = flow_create_record(state, attrs)
+    plan = flow_create_fast_plan(record, attrs, key_info)
+
+    with :ok <- flow_many_same_state_machine_shard_by_keys?(state, [key_info]),
+         :ok <- flow_validate_create_fast_plan_keys(plan) do
+      flow_create_many_fast_apply(state, [plan])
+    else
+      {:error, _reason} = error -> error
+      _ -> flow_create_apply_new_record_slow(state, attrs, state_key, record)
+    end
+  end
+
+  defp flow_create_apply_new_record_slow(state, attrs, state_key, record) do
+    with :ok <- flow_validate_record_keys(record),
+         :ok <- flow_put_record_values(state, record, attrs),
+         :ok <-
+           flow_put_new_state_record(
+             state,
+             state_key,
+             record
+           ),
+         :ok <- flow_due_put(state, record),
+         :ok <- flow_index_put(state, record),
+         :ok <- flow_history_put(state, record, "created", Map.get(record, :created_at_ms)),
+         :ok <- flow_history_trim(state, record) do
+      :ok
     end
   end
 
@@ -5663,11 +5350,242 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_create_many(_state, _attrs),
     do: {:error, "ERR flow items must be a non-empty list"}
 
+  defp do_flow_create_pipeline_batch(state, %{records: [_ | _] = attrs_list}) do
+    case flow_create_pipeline_batch_fast_prepare(state, attrs_list) do
+      {:ok, plans} ->
+        case flow_create_many_fast_apply(state, plans) do
+          :ok -> List.duplicate(:ok, length(attrs_list))
+          {:error, _reason} = error -> List.duplicate(error, length(attrs_list))
+        end
+
+      :fallback ->
+        {results, plans} = flow_create_pipeline_batch_prepare(state, attrs_list)
+
+        if plans == [] do
+          results
+        else
+          case flow_create_many_apply(state, plans) do
+            :ok ->
+              results
+
+            {:error, _reason} = error ->
+              Enum.map(results, fn
+                :ok -> error
+                other -> other
+              end)
+          end
+        end
+    end
+  end
+
+  defp do_flow_create_pipeline_batch(_state, _attrs),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_create_pipeline_batch_fast_prepare(state, attrs_list) do
+    if Enum.any?(attrs_list, &Map.get(&1, :idempotent, false)) do
+      :fallback
+    else
+      with :ok <- flow_many_partition_keys_present?(attrs_list),
+           key_infos = flow_create_fast_key_infos(attrs_list),
+           :ok <- flow_many_same_state_machine_shard_by_keys?(state, key_infos),
+           :ok <- flow_create_many_unique?(attrs_list),
+           {:ok, plans} <- flow_create_non_idempotent_many_prepare(state, attrs_list, key_infos) do
+        {:ok, plans}
+      else
+        _ -> :fallback
+      end
+    end
+  end
+
+  defp flow_create_fast_key_infos(attrs_list) do
+    Enum.map(attrs_list, fn attrs ->
+      id = Map.fetch!(attrs, :id)
+      partition_key = Map.get(attrs, :partition_key)
+      tag = FlowKeys.tag(partition_key)
+
+      %{
+        partition_key: partition_key,
+        tag: tag,
+        state_key: flow_state_key_with_tag(tag, id)
+      }
+    end)
+  end
+
+  defp flow_create_fast_key_info(attrs, state_key) do
+    partition_key = Map.get(attrs, :partition_key)
+
+    %{
+      partition_key: partition_key,
+      tag: FlowKeys.tag(partition_key),
+      state_key: state_key
+    }
+  end
+
+  defp flow_many_same_state_machine_shard_by_keys?(
+         %{instance_ctx: ctx, shard_index: shard_index},
+         key_infos
+       )
+       when is_map(ctx) do
+    if Enum.all?(key_infos, fn %{state_key: key} -> Router.shard_for(ctx, key) == shard_index end) do
+      :ok
+    else
+      {:error, "ERR flow batch crosses shards"}
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp flow_many_same_state_machine_shard_by_keys?(_state, _key_infos), do: :ok
+
+  defp flow_create_non_idempotent_many_prepare(state, attrs_list, key_infos) do
+    keys = Enum.map(key_infos, & &1.state_key)
+
+    if Enum.any?(flow_state_keys_present(state, keys), & &1) do
+      {:error, "ERR flow already exists"}
+    else
+      attrs_list
+      |> Enum.zip(key_infos)
+      |> Enum.reduce_while({:ok, []}, fn {%{id: _id} = attrs, key_info}, {:ok, acc} ->
+        record = flow_create_record(state, attrs)
+        plan = flow_create_fast_plan(record, attrs, key_info)
+
+        case flow_validate_create_fast_plan_keys(plan) do
+          :ok -> {:cont, {:ok, [plan | acc]}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, plans} -> {:ok, Enum.reverse(plans)}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp flow_create_fast_plan(record, attrs, %{tag: tag, state_key: state_key}) do
+    partition_key = Map.get(record, :partition_key)
+    id = Map.fetch!(record, :id)
+    type = Map.fetch!(record, :type)
+    flow_state = Map.fetch!(record, :state)
+    score = Map.get(record, :updated_at_ms, 0)
+    history_key = flow_history_key_with_tag(tag, id)
+
+    %{
+      record: record,
+      attrs: attrs,
+      partition_key: partition_key,
+      tag: tag,
+      state_key: state_key,
+      history_key: history_key,
+      state_index_key: flow_state_index_key_with_tag(tag, type, flow_state),
+      state_index_score: score,
+      due_key: flow_create_fast_due_key(record, tag, type, flow_state),
+      running_index_entries: flow_create_fast_running_index_entries(record, tag, type),
+      metadata_index_entries: flow_metadata_index_entries_with_tag(record, tag)
+    }
+  end
+
+  defp flow_create_fast_due_key(%{next_run_at_ms: nil}, _tag, _type, _flow_state), do: nil
+
+  defp flow_create_fast_due_key(%{priority: priority}, tag, type, flow_state) do
+    flow_due_key_with_tag(tag, type, flow_state, priority)
+  end
+
+  defp flow_create_fast_running_index_entries(%{state: "running"} = record, tag, type) do
+    lease_score = Map.get(record, :lease_deadline_ms, 0)
+
+    [
+      {flow_inflight_index_key_with_tag(tag, type), lease_score},
+      {flow_worker_index_key_with_tag(tag, Map.get(record, :lease_owner, "")), lease_score}
+    ]
+  end
+
+  defp flow_create_fast_running_index_entries(_record, _tag, _type), do: []
+
+  defp flow_validate_create_fast_plan_keys(%{
+         record: record,
+         state_key: state_key,
+         history_key: history_key,
+         state_index_key: state_index_key,
+         due_key: due_key,
+         running_index_entries: running_index_entries,
+         metadata_index_entries: metadata_index_entries
+       }) do
+    with :ok <- flow_validate_key_size(state_key),
+         :ok <- flow_validate_key_size(history_key),
+         :ok <- flow_validate_key_size(state_index_key),
+         :ok <-
+           flow_validate_key_size(
+             FlowKeys.stream_entry_key_from_history_key(
+               history_key,
+               "18446744073709551615-18446744073709551615"
+             )
+           ),
+         :ok <- flow_validate_create_fast_due_key(due_key),
+         :ok <- flow_validate_create_fast_index_entries(running_index_entries),
+         :ok <- flow_validate_create_fast_metadata_entries(metadata_index_entries) do
+      if byte_size(Map.fetch!(record, :id)) <= Router.max_key_size() do
+        :ok
+      else
+        {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+      end
+    end
+  end
+
+  defp flow_validate_create_fast_due_key(nil), do: :ok
+  defp flow_validate_create_fast_due_key(key), do: flow_validate_key_size(key)
+
+  defp flow_validate_create_fast_index_entries(entries) do
+    Enum.reduce_while(entries, :ok, fn {key, _score}, :ok ->
+      case flow_validate_key_size(key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_validate_create_fast_metadata_entries(entries) do
+    Enum.reduce_while(entries, :ok, fn {key, _id, _score}, :ok ->
+      case flow_validate_key_size(key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_create_pipeline_batch_prepare(state, attrs_list) do
+    {results, plans, _seen} =
+      Enum.reduce(attrs_list, {[], [], MapSet.new()}, fn attrs, {results, plans, seen} ->
+        key = FlowKeys.state_key(Map.get(attrs, :id), Map.get(attrs, :partition_key))
+
+        if MapSet.member?(seen, key) do
+          {[{:error, "ERR flow already exists"} | results], plans, seen}
+        else
+          case flow_create_many_prepare(state, [attrs]) do
+            {:ok, _records, new_plans} ->
+              {[:ok | results], Enum.reverse(new_plans) ++ plans, MapSet.put(seen, key)}
+
+            {:error, _reason} = error ->
+              {[error | results], plans, seen}
+          end
+        end
+      end)
+
+    {Enum.reverse(results), Enum.reverse(plans)}
+  end
+
+  defp flow_create_existing_state(state, %{idempotent: true}, state_key) do
+    flow_read_record_by_key(state, state_key)
+  end
+
+  defp flow_create_existing_state(state, _attrs, state_key) do
+    if flow_state_key_present?(state, state_key), do: :present, else: nil
+  end
+
   defp do_flow_spawn_children(
          state,
          %{id: parent_id, partition_key: partition_key, children: [_ | _] = children} = attrs
        ) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
 
     with {:ok, parent} <- flow_require_record(state, parent_id, partition_key),
          :ok <- flow_require_parent_partition(parent, partition_key),
@@ -5705,7 +5623,7 @@ defmodule Ferricstore.Raft.StateMachine do
          %{id: parent_id, partition_key: partition_key, children: [_ | _] = children} = attrs
        ) do
     parent_state = cross_shard_state_for_key(state, FlowKeys.state_key(parent_id, partition_key))
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
 
     with {:ok, parent} <- flow_require_record(parent_state, parent_id, partition_key),
          :ok <- flow_require_parent_partition(parent, partition_key),
@@ -5774,7 +5692,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_create_record(state, %{id: id, type: type, state: flow_state} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
     priority = Map.get(attrs, :priority, 0)
     retention = flow_retention_for_create(state, attrs)
@@ -6161,7 +6079,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_create_many_prepare(state, attrs_list) do
-    existing_records = flow_read_records(state, attrs_list)
+    existing_records = flow_create_many_existing_states(state, attrs_list)
 
     attrs_list
     |> Enum.zip(existing_records)
@@ -6174,6 +6092,9 @@ defmodule Ferricstore.Raft.StateMachine do
             :ok -> {:cont, {:ok, [record | acc], [{record, attrs} | new_acc]}}
             {:error, _reason} = error -> {:halt, error}
           end
+
+        :present ->
+          {:halt, {:error, "ERR flow already exists"}}
 
         existing ->
           case flow_create_duplicate_result(state, existing, attrs) do
@@ -6188,7 +6109,25 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_create_many_existing_states(state, attrs_list) do
+    keys = flow_state_keys_for_attrs(attrs_list)
+    present = flow_state_keys_present(state, keys)
+
+    attrs_list
+    |> Enum.zip(Enum.zip(keys, present))
+    |> Enum.map(fn
+      {%{idempotent: true}, {key, true}} -> flow_read_record_by_key(state, key)
+      {%{idempotent: true}, {_key, false}} -> nil
+      {_attrs, {_key, true}} -> :present
+      {_attrs, {_key, false}} -> nil
+    end)
+  end
+
   defp flow_create_many_apply(state, plans) do
+    if flow_create_fast_staged_put_batch?(state) do
+      Process.put(:sm_pending_fast_staged_put_batch, true)
+    end
+
     records = Enum.map(plans, fn {record, _attrs} -> record end)
 
     with :ok <- flow_create_put_record_values(state, plans),
@@ -6198,6 +6137,39 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_create_put_history(state, records) do
       :ok
     end
+  end
+
+  defp flow_create_many_fast_apply(state, plans) do
+    if flow_create_fast_staged_put_batch?(state) do
+      Process.put(:sm_pending_fast_staged_put_batch, true)
+    end
+
+    with :ok <- flow_create_fast_put_record_values(state, plans),
+         :ok <- flow_create_put_fast_state_records(state, plans),
+         :ok <- flow_create_put_fast_due(state, plans),
+         :ok <- flow_create_put_fast_indexes(state, plans),
+         :ok <- flow_create_put_fast_history(state, plans) do
+      :ok
+    end
+  end
+
+  defp flow_create_fast_put_record_values(state, plans) do
+    if flow_create_fast_plans_have_record_values?(plans) do
+      record_attrs = Enum.map(plans, fn %{record: record, attrs: attrs} -> {record, attrs} end)
+      flow_create_put_record_values(state, record_attrs)
+    else
+      :ok
+    end
+  end
+
+  defp flow_create_fast_plans_have_record_values?(plans) do
+    Enum.any?(plans, fn %{attrs: attrs} -> flow_attrs_have_record_values?(attrs) end)
+  end
+
+  defp flow_create_fast_staged_put_batch?(state) do
+    not cross_shard_pending_active?() and not standalone_staged_apply?() and
+      Map.get(state, :cross_shard_locks, %{}) == %{} and
+      Process.get(:sm_pending_writes, []) == [] and Process.get(:sm_pending_values, %{}) == %{}
   end
 
   defp do_flow_claim_due(
@@ -6211,31 +6183,108 @@ defmodule Ferricstore.Raft.StateMachine do
            priority: priority
          } = attrs
        ) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
 
-    state_filter =
-      flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
+    flow_claim_due_phase(
+      :total,
+      flow_claim_due_phase_meta(state, partition_key, priority, limit),
+      fn ->
+        state_filter =
+          flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
 
-    case flow_claim_due_priorities(
-           state,
-           type,
-           state_filter,
-           worker,
-           lease_ms,
-           now_ms,
-           partition_key,
-           flow_claim_priorities(priority),
-           limit,
-           []
-         ) do
-      {:error, _reason} = error -> error
-      claimed -> {:ok, claimed}
-    end
+        case flow_claim_due_priorities(
+               state,
+               type,
+               state_filter,
+               worker,
+               lease_ms,
+               now_ms,
+               partition_key,
+               flow_claim_priorities(priority),
+               limit,
+               []
+             ) do
+          {:error, _reason} = error -> error
+          claimed -> {:ok, claimed}
+        end
+      end
+    )
   end
 
   defp flow_claim_priorities(nil), do: [2, 1, 0]
   defp flow_claim_priorities(priority), do: [priority]
+
+  defp flow_claim_due_phase(phase, metadata, fun) when is_function(fun, 0) do
+    started_at = System.monotonic_time()
+    result = fun.()
+
+    measurements =
+      result
+      |> flow_claim_due_phase_measurements()
+      |> Map.put(:duration_us, duration_us(started_at))
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :claim_due_phase],
+      measurements,
+      Map.put(metadata, :phase, phase)
+    )
+
+    result
+  end
+
+  defp flow_claim_due_phase_meta(state) do
+    %{shard_index: Map.get(state, :shard_index)}
+  end
+
+  defp flow_claim_due_phase_meta(state, partition_key, priority, limit) do
+    state
+    |> flow_claim_due_phase_meta()
+    |> Map.merge(%{
+      partition_mode: flow_claim_due_partition_mode(partition_key),
+      priority: priority,
+      limit: limit
+    })
+  end
+
+  defp flow_claim_due_partition_mode(:any), do: :any
+  defp flow_claim_due_partition_mode(nil), do: :default
+  defp flow_claim_due_partition_mode(_partition_key), do: :specific
+
+  defp flow_claim_due_phase_measurements({:ok, records}) when is_list(records),
+    do: %{items: length(records)}
+
+  defp flow_claim_due_phase_measurements({plans, stale_due_ids, accepted})
+       when is_list(plans) and is_list(stale_due_ids) and is_integer(accepted),
+       do: %{plans: length(plans), stale_due_ids: length(stale_due_ids), accepted: accepted}
+
+  defp flow_claim_due_phase_measurements({plans, stale_due_ids})
+       when is_list(plans) and is_list(stale_due_ids),
+       do: %{plans: length(plans), stale_due_ids: length(stale_due_ids)}
+
+  defp flow_claim_due_phase_measurements({records, native_taken?})
+       when is_list(records) and is_boolean(native_taken?),
+       do: %{items: length(records)}
+
+  defp flow_claim_due_phase_measurements(records) when is_list(records),
+    do: %{items: length(records)}
+
+  defp flow_claim_due_phase_measurements({:error, _reason}), do: %{errors: 1}
+  defp flow_claim_due_phase_measurements(_result), do: %{}
+
+  defp flow_claim_due_internal_phase(phase, metadata, measurements, fun)
+       when is_function(fun, 0) do
+    started_at = System.monotonic_time()
+    result = fun.()
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :claim_due_phase],
+      Map.put(measurements, :duration_us, duration_us(started_at)),
+      Map.put(metadata, :phase, phase)
+    )
+
+    result
+  end
 
   defp flow_claim_state_filter(state_filter, []), do: state_filter
 
@@ -6285,7 +6334,12 @@ defmodule Ferricstore.Raft.StateMachine do
          limit,
          claimed
        ) do
-    due_keys = flow_claim_due_keys(state, type, state_filter, partition_key, priority)
+    due_keys =
+      flow_claim_due_phase(
+        :due_keys,
+        flow_claim_due_phase_meta(state, partition_key, priority, limit),
+        fn -> flow_claim_due_keys(state, type, state_filter, partition_key, priority) end
+      )
 
     case flow_claim_due_scan_keys(
            state,
@@ -6331,7 +6385,8 @@ defmodule Ferricstore.Raft.StateMachine do
          claimed
        ) do
     flow_ensure_due_index_ready(state, due_key)
-    max_scan = max((limit - length(claimed)) * 16, limit + 64)
+    claimed_count = length(claimed)
+    max_scan = max((limit - claimed_count) * 16, limit + 64)
 
     case flow_claim_due_scan(
            state,
@@ -6345,11 +6400,11 @@ defmodule Ferricstore.Raft.StateMachine do
            limit,
            max_scan,
            0,
-           length(claimed),
+           claimed_count,
            claimed
          ) do
       {:error, _reason} = error -> error
-      scanned_claimed -> Enum.reverse(scanned_claimed)
+      {scanned_claimed, _scanned_count} -> scanned_claimed
     end
   end
 
@@ -6397,6 +6452,33 @@ defmodule Ferricstore.Raft.StateMachine do
        do: claimed
 
   defp flow_claim_due_scan_key_rounds(
+         state,
+         due_keys,
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         limit,
+         claimed
+       ) do
+    flow_claim_due_scan_key_rounds(
+      state,
+      due_keys,
+      type,
+      state_filter,
+      worker,
+      lease_ms,
+      now_ms,
+      partition_key,
+      limit,
+      claimed,
+      length(claimed)
+    )
+  end
+
+  defp flow_claim_due_scan_key_rounds(
          _state,
          _due_keys,
          _type,
@@ -6406,9 +6488,10 @@ defmodule Ferricstore.Raft.StateMachine do
          _now_ms,
          _partition_key,
          limit,
-         claimed
+         claimed,
+         claimed_count
        )
-       when length(claimed) >= limit,
+       when claimed_count >= limit,
        do: claimed
 
   defp flow_claim_due_scan_key_rounds(
@@ -6421,15 +6504,21 @@ defmodule Ferricstore.Raft.StateMachine do
          now_ms,
          partition_key,
          limit,
-         claimed
+         claimed,
+         claimed_count
        ) do
-    scan_result =
-      Enum.reduce_while(due_keys, {claimed, false}, fn due_key, {acc, progressed?} ->
-        claimed_count = length(acc)
+    round_chunk =
+      flow_claim_due_scan_key_round_chunk(limit - claimed_count, length(due_keys))
 
-        if claimed_count >= limit do
-          {:halt, {acc, progressed?}}
+    scan_result =
+      Enum.reduce_while(due_keys, {claimed, claimed_count, false}, fn due_key,
+                                                                      {acc, acc_count,
+                                                                       progressed?} ->
+        if acc_count >= limit do
+          {:halt, {acc, acc_count, progressed?}}
         else
+          target_count = min(limit, acc_count + round_chunk)
+
           case flow_claim_due_scan(
                  state,
                  due_key,
@@ -6439,18 +6528,17 @@ defmodule Ferricstore.Raft.StateMachine do
                  lease_ms,
                  now_ms,
                  partition_key,
-                 min(limit, claimed_count + 1),
-                 32,
+                 target_count,
+                 max((target_count - acc_count) * 16, 32),
                  0,
-                 claimed_count,
+                 acc_count,
                  acc
                ) do
             {:error, _reason} = error ->
               {:halt, error}
 
-            scanned_claimed ->
-              next_acc = Enum.reverse(scanned_claimed)
-              {:cont, {next_acc, progressed? or length(next_acc) > claimed_count}}
+            {next_acc, next_count} ->
+              {:cont, {next_acc, next_count, progressed? or next_count > acc_count}}
           end
         end
       end)
@@ -6459,9 +6547,9 @@ defmodule Ferricstore.Raft.StateMachine do
       {:error, _reason} = error ->
         error
 
-      {next_claimed, progressed?} ->
+      {next_claimed, next_count, progressed?} ->
         cond do
-          length(next_claimed) >= limit ->
+          next_count >= limit ->
             next_claimed
 
           progressed? ->
@@ -6475,7 +6563,8 @@ defmodule Ferricstore.Raft.StateMachine do
               now_ms,
               partition_key,
               limit,
-              next_claimed
+              next_claimed,
+              next_count
             )
 
           true ->
@@ -6483,6 +6572,13 @@ defmodule Ferricstore.Raft.StateMachine do
         end
     end
   end
+
+  defp flow_claim_due_scan_key_round_chunk(remaining, due_key_count)
+       when remaining > 0 and due_key_count > 0 do
+    max(1, div(remaining + due_key_count - 1, due_key_count))
+  end
+
+  defp flow_claim_due_scan_key_round_chunk(_remaining, _due_key_count), do: 1
 
   defp flow_claim_due_keys(_state, type, state_filter, partition_key, priority)
        when partition_key != :any and is_binary(state_filter) do
@@ -6496,7 +6592,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_claim_due_keys(state, type, state_filter, partition_key, priority) do
     state
-    |> flow_index_count_keys()
+    |> flow_claim_index_count_keys()
     |> Enum.filter(&flow_due_key_matches?(&1, type, state_filter, partition_key, priority))
   end
 
@@ -6551,7 +6647,7 @@ defmodule Ferricstore.Raft.StateMachine do
          claimed
        )
        when claimed_count >= limit do
-    claimed |> Enum.reverse() |> Enum.take(limit)
+    {claimed, claimed_count}
   end
 
   defp flow_claim_due_scan(
@@ -6566,11 +6662,11 @@ defmodule Ferricstore.Raft.StateMachine do
          _limit,
          max_scan,
          scanned,
-         _claimed_count,
+         claimed_count,
          claimed
        )
        when scanned >= max_scan do
-    Enum.reverse(claimed)
+    {claimed, claimed_count}
   end
 
   defp flow_claim_due_scan(
@@ -6589,21 +6685,23 @@ defmodule Ferricstore.Raft.StateMachine do
          claimed
        ) do
     remaining = limit - claimed_count
-    batch_size = min(max(remaining * 2, 32), max_scan - scanned)
+    batch_size = min(max(remaining, 32), max_scan - scanned)
 
     candidates =
-      flow_index_range_slice(
-        state,
-        due_key,
-        :neg_inf,
-        {:inclusive, now_ms * 1.0},
-        false,
-        0,
-        batch_size
+      flow_claim_due_phase(
+        :range_slice,
+        Map.put(
+          flow_claim_due_phase_meta(state, partition_key, nil, remaining),
+          :batch_size,
+          batch_size
+        ),
+        fn ->
+          flow_claim_due_candidate_slice(state, due_key, now_ms, batch_size)
+        end
       )
 
     if candidates == [] do
-      Enum.reverse(claimed)
+      {claimed, claimed_count}
     else
       case flow_claim_candidate_batch(
              state,
@@ -6642,6 +6740,51 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_claim_due_candidate_slice(state, due_key, now_ms, batch_size) do
+    case flow_native_index(state) do
+      nil ->
+        flow_claim_due_ets_candidate_slice(state, due_key, now_ms, batch_size)
+
+      native ->
+        candidates =
+          native
+          |> NativeFlowIndex.claim_due_candidates([due_key], now_ms, batch_size, batch_size)
+          |> Enum.map(fn
+            {^due_key, id, score} -> {id, score}
+            {_key, id, score} -> {id, score}
+          end)
+
+        case candidates do
+          [] -> flow_claim_due_ets_candidate_slice(state, due_key, now_ms, batch_size)
+          [_ | _] -> candidates
+        end
+    end
+  end
+
+  defp flow_claim_due_ets_candidate_slice(state, due_key, now_ms, batch_size) do
+    if flow_index_tables?(state) do
+      FlowIndex.range_slice(
+        state.flow_index_name,
+        due_key,
+        :neg_inf,
+        {:inclusive, now_ms * 1.0},
+        false,
+        0,
+        batch_size
+      )
+    else
+      ZSetIndex.range_slice(
+        state.zset_score_index_name,
+        due_key,
+        :neg_inf,
+        {:inclusive, now_ms * 1.0},
+        false,
+        0,
+        batch_size
+      )
+    end
+  end
+
   defp flow_claim_candidate_batch(
          state,
          due_key,
@@ -6670,10 +6813,20 @@ defmodule Ferricstore.Raft.StateMachine do
         remaining
       )
 
+    phase_meta =
+      state
+      |> flow_claim_due_phase_meta(partition_key, nil, remaining)
+      |> Map.merge(%{candidates: length(candidates)})
+
     case flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
       :ok ->
         next_claimed =
-          Enum.reduce(plans, claimed, fn {_record, next}, acc -> [next | acc] end)
+          flow_claim_due_phase(:return_assemble, phase_meta, fn ->
+            Enum.reduce(plans, claimed, fn plan, acc ->
+              {_record, next} = flow_claim_plan_pair(plan)
+              [next | acc]
+            end)
+          end)
 
         {claimed_count + length(plans), next_claimed}
 
@@ -6694,61 +6847,555 @@ defmodule Ferricstore.Raft.StateMachine do
          candidates,
          remaining
        ) do
-    records = flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
+    case flow_plan_claim_candidates_native(
+           state,
+           due_key,
+           type,
+           state_filter,
+           worker,
+           lease_ms,
+           now_ms,
+           partition_key,
+           candidates,
+           remaining
+         ) do
+      {:ok, result} ->
+        result
+
+      :fallback ->
+        flow_plan_claim_candidates_elixir(
+          state,
+          due_key,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          partition_key,
+          candidates,
+          remaining
+        )
+    end
+  end
+
+  defp flow_plan_claim_candidates_elixir(
+         state,
+         due_key,
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         candidates,
+         remaining
+       ) do
+    phase_meta =
+      state
+      |> flow_claim_due_phase_meta(partition_key, nil, remaining)
+      |> Map.merge(%{candidates: length(candidates)})
+
+    records =
+      flow_claim_due_phase(:hydrate_records, phase_meta, fn ->
+        flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
+      end)
 
     {plans, stale_due_ids, _count} =
-      candidates
-      |> Enum.zip(records)
-      |> Enum.reduce_while({[], [], 0}, fn {{id, _score}, record},
-                                           {plans, stale_due_ids, count} ->
-        if count >= remaining do
-          {:halt, {plans, stale_due_ids, count}}
-        else
-          case flow_prepare_claim_candidate_record(
-                 record,
-                 id,
-                 type,
-                 state_filter,
-                 worker,
-                 lease_ms,
-                 now_ms
-               ) do
-            {:ok, record, next} ->
-              {:cont, {[{record, next} | plans], stale_due_ids, count + 1}}
-
-            :delete_due ->
-              {:cont, {plans, [id | stale_due_ids], count}}
-
-            :skip ->
-              {:cont, {plans, stale_due_ids, count}}
-          end
-        end
+      flow_claim_due_phase(:plan_candidates, phase_meta, fn ->
+        flow_plan_claim_candidate_records(
+          candidates,
+          records,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          remaining
+        )
       end)
 
     {Enum.reverse(plans), Enum.reverse(stale_due_ids)}
   end
 
-  defp flow_read_claim_candidate_records(state, :any, due_key, candidates) do
-    keys =
-      Enum.map(candidates, fn {id, _score} ->
-        case FlowKeys.state_key_from_due_key(due_key, id) do
-          {:ok, key} -> key
-          :error -> FlowKeys.state_key(id, nil)
-        end
-      end)
-
-    flow_read_records_by_keys(state, keys)
-  end
-
-  defp flow_read_claim_candidate_records(state, partition_key, _due_key, candidates) do
-    flow_read_records(
-      state,
-      Enum.map(candidates, fn {id, _score} -> %{id: id, partition_key: partition_key} end)
+  defp flow_plan_claim_candidate_records(
+         candidates,
+         records,
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         remaining
+       ) do
+    flow_plan_claim_candidate_records(
+      candidates,
+      records,
+      type,
+      state_filter,
+      worker,
+      lease_ms,
+      now_ms,
+      remaining,
+      [],
+      [],
+      0
     )
   end
 
+  defp flow_plan_claim_candidate_records(
+         _candidates,
+         _records,
+         _type,
+         _state_filter,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         remaining,
+         plans,
+         stale_due_ids,
+         count
+       )
+       when count >= remaining do
+    {plans, stale_due_ids, count}
+  end
+
+  defp flow_plan_claim_candidate_records(
+         [],
+         _records,
+         _type,
+         _state_filter,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _remaining,
+         plans,
+         stale_due_ids,
+         count
+       ) do
+    {plans, stale_due_ids, count}
+  end
+
+  defp flow_plan_claim_candidate_records(
+         _candidates,
+         [],
+         _type,
+         _state_filter,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _remaining,
+         plans,
+         stale_due_ids,
+         count
+       ) do
+    {plans, stale_due_ids, count}
+  end
+
+  defp flow_plan_claim_candidate_records(
+         [{id, due_score} | candidates],
+         [record | records],
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         remaining,
+         plans,
+         stale_due_ids,
+         count
+       ) do
+    case flow_prepare_claim_candidate_record(
+           record,
+           id,
+           type,
+           state_filter,
+           worker,
+           lease_ms,
+           now_ms,
+           due_score
+         ) do
+      {:ok, record, next, from_due_score} ->
+        flow_plan_claim_candidate_records(
+          candidates,
+          records,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          remaining,
+          [{record, next, from_due_score} | plans],
+          stale_due_ids,
+          count + 1
+        )
+
+      :delete_due ->
+        flow_plan_claim_candidate_records(
+          candidates,
+          records,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          remaining,
+          plans,
+          [id | stale_due_ids],
+          count
+        )
+
+      {:skip, _restore_score} ->
+        flow_plan_claim_candidate_records(
+          candidates,
+          records,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          remaining,
+          plans,
+          stale_due_ids,
+          count
+        )
+    end
+  end
+
+  defp flow_plan_claim_candidates_native(
+         state,
+         due_key,
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         candidates,
+         remaining
+       )
+       when is_binary(type) and is_binary(worker) do
+    cond do
+      remaining <= 0 ->
+        {:ok, {[], []}}
+
+      not flow_index_tables?(state) ->
+        :fallback
+
+      flow_native_index(state) == nil ->
+        :fallback
+
+      true ->
+        with {:ok,
+              {expected_state, from_due_key, to_due_key, from_state_key, to_state_key,
+               inflight_key, worker_key, state_key_prefix}} <-
+               flow_native_claim_keys(due_key, type, state_filter, worker) do
+          phase_meta =
+            state
+            |> flow_claim_due_phase_meta(partition_key, nil, remaining)
+            |> Map.merge(%{candidates: length(candidates)})
+
+          values =
+            flow_claim_due_phase(:hydrate_values, phase_meta, fn ->
+              flow_read_claim_candidate_values(state, partition_key, due_key, candidates)
+            end)
+
+          if flow_lmdb_mirror?(state) and Enum.any?(values, &is_nil/1) do
+            :fallback
+          else
+            native_result =
+              flow_claim_due_phase(:plan_candidates_native, phase_meta, fn ->
+                Ferricstore.Flow.NativeOrderedIndex.plan_claims(
+                  candidates,
+                  values,
+                  type,
+                  expected_state,
+                  worker,
+                  lease_ms,
+                  now_ms,
+                  remaining,
+                  from_due_key,
+                  to_due_key,
+                  from_state_key,
+                  to_state_key,
+                  inflight_key,
+                  worker_key,
+                  state_key_prefix
+                )
+              end)
+
+            case native_result do
+              {:ok, native_plans, stale_due_ids, count} ->
+                case flow_decode_native_claim_plans(native_plans) do
+                  {:ok, plans} when length(plans) == count -> {:ok, {plans, stale_due_ids}}
+                  :fallback -> :fallback
+                  _ -> :fallback
+                end
+
+              :fallback ->
+                :fallback
+            end
+          end
+        else
+          _ -> :fallback
+        end
+    end
+  end
+
+  defp flow_plan_claim_candidates_native(
+         _state,
+         _due_key,
+         _type,
+         _state_filter,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _partition_key,
+         _candidates,
+         _remaining
+       ),
+       do: :fallback
+
+  defp flow_native_claim_keys(due_key, type, state_filter, worker) do
+    with {:ok, tag} <- flow_due_key_tag(due_key),
+         {:ok, expected_state} <- flow_due_key_expected_state(state_filter),
+         {:ok, priority} <- flow_due_key_priority(due_key, tag, type, expected_state),
+         false <- expected_state == "running" do
+      from_due_key = due_key
+      to_due_key = "f:" <> tag <> ":d:" <> type <> ":running:p" <> Integer.to_string(priority)
+      from_state_key = "f:" <> tag <> ":i:s:" <> type <> ":" <> expected_state
+      to_state_key = "f:" <> tag <> ":i:s:" <> type <> ":running"
+      inflight_key = "f:" <> tag <> ":i:r:" <> type
+      worker_key = "f:" <> tag <> ":i:w:" <> worker
+      state_key_prefix = "f:" <> tag <> ":s:"
+
+      with :ok <- flow_validate_key_size(from_due_key),
+           :ok <- flow_validate_key_size(to_due_key),
+           :ok <- flow_validate_key_size(from_state_key),
+           :ok <- flow_validate_key_size(to_state_key),
+           :ok <- flow_validate_key_size(inflight_key),
+           :ok <- flow_validate_key_size(worker_key) do
+        {:ok,
+         {expected_state, from_due_key, to_due_key, from_state_key, to_state_key, inflight_key,
+          worker_key, state_key_prefix}}
+      end
+    end
+  end
+
+  defp flow_due_key_expected_state({:exclude, state_filter, exclude_states})
+       when is_list(exclude_states) do
+    with {:ok, expected_state} <- flow_due_key_expected_state(state_filter),
+         false <- expected_state in exclude_states do
+      {:ok, expected_state}
+    else
+      _ -> :error
+    end
+  end
+
+  defp flow_due_key_expected_state(state_filter) when is_binary(state_filter),
+    do: {:ok, state_filter}
+
+  defp flow_due_key_expected_state(_state_filter), do: :error
+
+  defp flow_due_key_tag(due_key) when is_binary(due_key) do
+    case :binary.match(due_key, "}:d:") do
+      {pos, _len} when pos >= 2 ->
+        {:ok, binary_part(due_key, 2, pos + 1 - 2)}
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  defp flow_due_key_tag(_due_key), do: :error
+
+  defp flow_due_key_priority(due_key, tag, type, expected_state)
+       when is_binary(due_key) and is_binary(tag) and is_binary(type) and
+              is_binary(expected_state) do
+    prefix = "f:" <> tag <> ":d:" <> type <> ":" <> expected_state <> ":p"
+    prefix_size = byte_size(prefix)
+
+    with true <- byte_size(due_key) > prefix_size,
+         <<^prefix::binary-size(prefix_size), priority_bin::binary>> <- due_key do
+      case Integer.parse(priority_bin) do
+        {priority, ""} -> {:ok, priority}
+        _ -> :error
+      end
+    else
+      _ -> :error
+    end
+  end
+
+  defp flow_due_key_priority(_due_key, _tag, _type, _expected_state), do: :error
+
+  defp flow_decode_native_claim_plans(native_plans) do
+    native_plans
+    |> Enum.reduce_while({:ok, []}, fn
+      {next_value, entry, state_key, previous_history_ms}, {:ok, acc}
+      when is_binary(next_value) and is_tuple(entry) and is_binary(state_key) ->
+        with next when is_map(next) <- flow_decode_native_claim_record(next_value) do
+          {:cont,
+           {:ok,
+            [
+              {:native_claim, next, entry, state_key, next_value, previous_history_ms}
+              | acc
+            ]}}
+        else
+          _ -> {:halt, :fallback}
+        end
+
+      _other, _acc ->
+        {:halt, :fallback}
+    end)
+    |> case do
+      {:ok, plans} -> {:ok, Enum.reverse(plans)}
+      :fallback -> :fallback
+    end
+  end
+
+  defp flow_decode_native_claim_record(value) do
+    Flow.decode_record(value)
+  rescue
+    _ -> nil
+  end
+
+  defp flow_read_claim_candidate_records(state, :any, due_key, candidates) do
+    prefix = flow_state_key_prefix_from_due_key(due_key)
+
+    if flow_lmdb_mirror?(state) do
+      keys =
+        if is_binary(prefix) do
+          Enum.map(candidates, fn {id, _score} -> prefix <> id end)
+        else
+          Enum.map(candidates, fn {id, _score} -> FlowKeys.state_key(id, nil) end)
+        end
+
+      flow_read_records_by_keys(state, keys)
+    else
+      flow_read_claim_candidate_hot_records(state, candidates, prefix, nil)
+    end
+  end
+
+  defp flow_read_claim_candidate_records(state, partition_key, due_key, candidates) do
+    prefix = flow_state_key_prefix_from_due_key(due_key)
+
+    if flow_lmdb_mirror?(state) do
+      keys =
+        if is_binary(prefix) do
+          Enum.map(candidates, fn {id, _score} -> prefix <> id end)
+        else
+          Enum.map(candidates, fn {id, _score} -> FlowKeys.state_key(id, partition_key) end)
+        end
+
+      flow_read_records_by_keys(state, keys)
+    else
+      flow_read_claim_candidate_hot_records(state, candidates, prefix, partition_key)
+    end
+  end
+
+  defp flow_read_claim_candidate_values(state, :any, due_key, candidates) do
+    prefix = flow_state_key_prefix_from_due_key(due_key)
+    flow_read_claim_candidate_hot_values(state, candidates, prefix, nil)
+  end
+
+  defp flow_read_claim_candidate_values(state, partition_key, due_key, candidates) do
+    prefix = flow_state_key_prefix_from_due_key(due_key)
+    flow_read_claim_candidate_hot_values(state, candidates, prefix, partition_key)
+  end
+
+  defp flow_read_claim_candidate_hot_values(state, candidates, prefix, partition_key) do
+    candidates
+    |> flow_read_claim_candidate_hot_values_loop(state, prefix, partition_key, [])
+    |> Enum.reverse()
+  end
+
+  defp flow_read_claim_candidate_hot_values_loop([], _state, _prefix, _partition_key, acc),
+    do: acc
+
+  defp flow_read_claim_candidate_hot_values_loop(
+         [{id, _score} | rest],
+         state,
+         prefix,
+         partition_key,
+         acc
+       ) do
+    key =
+      if is_binary(prefix) do
+        prefix <> id
+      else
+        FlowKeys.state_key(id, partition_key)
+      end
+
+    flow_read_claim_candidate_hot_values_loop(
+      rest,
+      state,
+      prefix,
+      partition_key,
+      [flow_read_hot_state_value(state, key) | acc]
+    )
+  end
+
+  defp flow_read_hot_state_value(state, key) do
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0, _lfu, _pending, _touched_at, _disk_size}] when is_binary(value) ->
+        value
+
+      [{^key, value, expire_at_ms, _lfu, _pending, _touched_at, _disk_size}]
+      when is_binary(value) and is_integer(expire_at_ms) ->
+        if expire_at_ms > apply_now_ms(), do: value, else: nil
+
+      _other ->
+        case ets_lookup(state, key) do
+          {:ok, value} when is_binary(value) -> value
+          _ -> nil
+        end
+    end
+  end
+
+  defp flow_read_claim_candidate_hot_records(state, candidates, prefix, partition_key) do
+    candidates
+    |> flow_read_claim_candidate_hot_records_loop(state, prefix, partition_key, [])
+    |> Enum.reverse()
+  end
+
+  defp flow_read_claim_candidate_hot_records_loop([], _state, _prefix, _partition_key, acc),
+    do: acc
+
+  defp flow_read_claim_candidate_hot_records_loop(
+         [{id, _score} | rest],
+         state,
+         prefix,
+         partition_key,
+         acc
+       ) do
+    key =
+      if is_binary(prefix) do
+        prefix <> id
+      else
+        FlowKeys.state_key(id, partition_key)
+      end
+
+    flow_read_claim_candidate_hot_records_loop(
+      rest,
+      state,
+      prefix,
+      partition_key,
+      [flow_read_hot_state_record(state, key) | acc]
+    )
+  end
+
+  defp flow_state_key_prefix_from_due_key(due_key) when is_binary(due_key) do
+    case :binary.match(due_key, "}:d:") do
+      {pos, _len} when pos >= 2 ->
+        tag = binary_part(due_key, 2, pos + 1 - 2)
+        "f:" <> tag <> ":s:"
+
+      :nomatch ->
+        nil
+    end
+  end
+
   defp do_flow_extend_lease(state, %{id: id, lease_token: lease_token} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     lease_ms = Map.fetch!(attrs, :lease_ms)
     partition_key = Map.get(attrs, :partition_key)
 
@@ -6788,7 +7435,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_complete(state, %{id: id, lease_token: lease_token} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
@@ -6818,35 +7465,37 @@ defmodule Ferricstore.Raft.StateMachine do
       id = Map.fetch!(record, :id)
       partition_key = Map.get(record, :partition_key)
 
+      payload_ref =
+        flow_value_ref(
+          attrs,
+          :payload,
+          id,
+          version,
+          partition_key,
+          Map.get(record, :payload_ref)
+        )
+
+      result_ref = flow_value_ref(attrs, :result, id, version, partition_key)
+      retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
+
       next =
-        record
-        |> Map.merge(%{
-          state: "completed",
-          version: version,
-          updated_at_ms: now_ms,
-          payload_ref:
-            flow_value_ref(
-              attrs,
-              :payload,
-              id,
-              version,
-              partition_key,
-              Map.get(record, :payload_ref)
-            ),
-          result_ref: flow_value_ref(attrs, :result, id, version, partition_key),
-          ttl_ms: nil,
-          retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
-          history_hot_max_events: Map.get(record, :history_hot_max_events),
-          history_max_events: Map.get(record, :history_max_events),
-          lease_owner: nil,
-          lease_token: nil,
-          lease_deadline_ms: 0,
-          next_run_at_ms: nil
-        })
+        %{
+          record
+          | state: "completed",
+            version: version,
+            updated_at_ms: now_ms,
+            payload_ref: payload_ref,
+            result_ref: result_ref,
+            ttl_ms: nil,
+            retention_ttl_ms: retention_ttl_ms,
+            lease_owner: nil,
+            lease_token: nil,
+            lease_deadline_ms: 0,
+            next_run_at_ms: nil
+        }
         |> flow_stamp_terminal_retention(now_ms)
 
-      with :ok <- flow_validate_record_keys(record),
-           :ok <- flow_validate_record_keys(next) do
+      with :ok <- flow_validate_terminal_state_index_key(next) do
         {:ok, record, next}
       end
     end
@@ -6878,7 +7527,7 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.zip(existing_records)
     |> Enum.reduce_while({:ok, []}, fn
       {%{id: _id, lease_token: lease_token} = attrs, existing}, {:ok, acc} ->
-        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+        now_ms = flow_attrs_now_ms(attrs)
 
         case existing do
           nil ->
@@ -6901,9 +7550,13 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_complete_many_apply(state, plans) do
+    flow_complete_many_apply(state, plans, :unknown)
+  end
+
+  defp flow_complete_many_apply(state, plans, has_record_values?) do
     pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
 
-    with :ok <- flow_many_put_record_values(state, plans),
+    with :ok <- flow_many_put_record_values(state, plans, has_record_values?),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
          :ok <- flow_many_put_history(state, pair_plans, "completed"),
@@ -6912,11 +7565,153 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp do_flow_terminal_pipeline_batch(state, op, %{records: [_ | _] = attrs_list})
+       when op in [:complete, :retry, :fail, :cancel] do
+    {results, plans, has_record_values?} =
+      flow_terminal_pipeline_prepare(state, op, attrs_list, %{}, [], [], false)
+
+    case flow_terminal_pipeline_apply(state, op, Enum.reverse(plans), has_record_values?) do
+      :ok -> Enum.reverse(results)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp do_flow_terminal_pipeline_batch(_state, _op, _attrs),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_terminal_pipeline_prepare(
+         _state,
+         _op,
+         [],
+         _virtual_records,
+         results,
+         plans,
+         has_record_values?
+       ) do
+    {results, plans, has_record_values?}
+  end
+
+  defp flow_terminal_pipeline_prepare(
+         state,
+         op,
+         [%{id: id} = attrs | rest],
+         virtual_records,
+         results,
+         plans,
+         has_record_values?
+       )
+       when is_binary(id) and id != "" do
+    partition_key = Map.get(attrs, :partition_key)
+    state_key = FlowKeys.state_key(id, partition_key)
+    now_ms = flow_attrs_now_ms(attrs)
+    record = Map.get(virtual_records, state_key) || flow_read_record(state, id, partition_key)
+
+    case flow_terminal_pipeline_prepare_one(state, op, record, attrs, now_ms) do
+      {:ok, next, plan} ->
+        flow_terminal_pipeline_prepare(
+          state,
+          op,
+          rest,
+          Map.put(virtual_records, state_key, next),
+          [:ok | results],
+          [plan | plans],
+          has_record_values? or flow_attrs_have_record_values?(attrs)
+        )
+
+      {:error, _reason} = error ->
+        flow_terminal_pipeline_prepare(
+          state,
+          op,
+          rest,
+          virtual_records,
+          [error | results],
+          plans,
+          has_record_values?
+        )
+    end
+  end
+
+  defp flow_terminal_pipeline_prepare(
+         state,
+         op,
+         [_bad | rest],
+         virtual_records,
+         results,
+         plans,
+         has_record_values?
+       ) do
+    flow_terminal_pipeline_prepare(
+      state,
+      op,
+      rest,
+      virtual_records,
+      [{:error, "ERR flow id must be a non-empty string"} | results],
+      plans,
+      has_record_values?
+    )
+  end
+
+  defp flow_terminal_pipeline_prepare_one(_state, _op, nil, _attrs, _now_ms),
+    do: {:error, "ERR flow not found"}
+
+  defp flow_terminal_pipeline_prepare_one(_state, :complete, record, attrs, now_ms) do
+    case flow_prepare_complete_existing_record(
+           record,
+           attrs,
+           Map.get(attrs, :lease_token),
+           now_ms
+         ) do
+      {:ok, record, next} -> {:ok, next, {record, next, attrs}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_terminal_pipeline_prepare_one(state, :retry, record, attrs, now_ms) do
+    case flow_prepare_retry_existing_record(
+           state,
+           record,
+           attrs,
+           Map.get(attrs, :lease_token),
+           now_ms
+         ) do
+      {:ok, record, next, history_meta} -> {:ok, next, {record, next, history_meta, attrs}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_terminal_pipeline_prepare_one(_state, :fail, record, attrs, now_ms) do
+    case flow_prepare_fail_existing_record(record, attrs, Map.get(attrs, :lease_token), now_ms) do
+      {:ok, record, next} -> {:ok, next, {record, next, attrs}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_terminal_pipeline_prepare_one(_state, :cancel, record, attrs, now_ms) do
+    case flow_prepare_cancel_existing_record(record, attrs, now_ms) do
+      {:ok, record, next} -> {:ok, next, {record, next, attrs}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_terminal_pipeline_apply(_state, _op, [], _has_record_values?), do: :ok
+
+  defp flow_terminal_pipeline_apply(state, :complete, plans, has_record_values?),
+    do: flow_complete_many_apply(state, plans, has_record_values?)
+
+  defp flow_terminal_pipeline_apply(state, :retry, plans, has_record_values?),
+    do: flow_retry_many_apply(state, plans, has_record_values?)
+
+  defp flow_terminal_pipeline_apply(state, :fail, plans, has_record_values?),
+    do: flow_fail_many_apply(state, plans, has_record_values?)
+
+  defp flow_terminal_pipeline_apply(state, :cancel, plans, _has_record_values?),
+    do: flow_cancel_many_apply(state, plans)
+
   defp do_flow_transition(
          state,
          %{id: id, from_state: from_state, to_state: to_state} = attrs
        ) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
     partition_key = Map.get(attrs, :partition_key)
 
@@ -6938,8 +7733,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_transition_many(state, %{records: [_ | _] = attrs_list}) do
     with :ok <- flow_many_partitions_valid?(state, attrs_list),
          :ok <- flow_transition_many_unique?(attrs_list),
-         {:ok, plans} <- flow_transition_many_prepare(state, attrs_list),
-         :ok <- flow_transition_many_apply(state, plans) do
+         {:ok, plans, value_mode} <- flow_transition_many_prepare(state, attrs_list),
+         :ok <- flow_transition_many_apply(state, plans, value_mode) do
       :ok
     end
   end
@@ -7080,9 +7875,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
     attrs_list
     |> Enum.zip(existing_records)
-    |> Enum.reduce_while({:ok, []}, fn
-      {%{id: id, from_state: from_state, to_state: to_state} = attrs, existing}, {:ok, acc} ->
-        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    |> Enum.reduce_while({:ok, [], :empty}, fn
+      {%{id: id, from_state: from_state, to_state: to_state} = attrs, existing},
+      {:ok, acc, value_mode} ->
+        now_ms = flow_attrs_now_ms(attrs)
         run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
 
         case flow_prepare_transition_existing_record(
@@ -7094,23 +7890,31 @@ defmodule Ferricstore.Raft.StateMachine do
                run_at_ms,
                now_ms
              ) do
-          {:ok, record, next} -> {:cont, {:ok, [{record, next, attrs} | acc]}}
-          {:error, _reason} = error -> {:halt, error}
+          {:ok, record, next} ->
+            {:cont,
+             {:ok, [{record, next, attrs} | acc],
+              flow_merge_record_value_mode(value_mode, flow_attrs_record_value_mode(attrs))}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
         end
 
-      {_bad, _existing}, {:ok, _acc} ->
+      {_bad, _existing}, {:ok, _acc, _value_mode} ->
         {:halt, {:error, "ERR flow id must be a non-empty string"}}
     end)
     |> case do
-      {:ok, plans} -> {:ok, Enum.reverse(plans)}
-      {:error, _reason} = error -> error
+      {:ok, plans, value_mode} ->
+        {:ok, Enum.reverse(plans), flow_finalize_record_value_mode(value_mode)}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp flow_transition_many_apply(state, plans) do
+  defp flow_transition_many_apply(state, plans, value_mode) do
     pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
 
-    with :ok <- flow_transition_many_put_record_values(state, plans),
+    with :ok <- flow_transition_many_put_record_values(state, plans, value_mode),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
          :ok <- flow_transition_put_history(state, pair_plans) do
@@ -7118,7 +7922,17 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_transition_many_put_record_values(state, plans) do
+  defp flow_transition_many_put_record_values(_state, _plans, :none), do: :ok
+
+  defp flow_transition_many_put_record_values(state, plans, :payload_only) do
+    flow_transition_many_put_payloads(state, plans)
+  end
+
+  defp flow_transition_many_put_record_values(state, plans, :mixed) do
+    flow_many_put_record_values(state, plans, true)
+  end
+
+  defp flow_transition_many_put_record_values(state, plans, :unknown) do
     if flow_transition_many_payload_only?(plans) do
       flow_transition_many_put_payloads(state, plans)
     else
@@ -7157,7 +7971,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_retry(state, %{id: id, lease_token: lease_token} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
@@ -7192,37 +8006,38 @@ defmodule Ferricstore.Raft.StateMachine do
       {next_state, next_run_at_ms, retry_decision} =
         flow_retry_next_state(record, attrs, retry_policy, next_attempts, now_ms)
 
+      payload_ref =
+        flow_value_ref(
+          attrs,
+          :payload,
+          id,
+          version,
+          partition_key,
+          Map.get(record, :payload_ref)
+        )
+
+      error_ref = flow_value_ref(attrs, :error, id, version, partition_key)
+
       next =
-        record
-        |> Map.merge(%{
-          state: next_state,
-          version: version,
-          attempts: next_attempts,
-          updated_at_ms: now_ms,
-          next_run_at_ms: next_run_at_ms,
-          payload_ref:
-            flow_value_ref(
-              attrs,
-              :payload,
-              id,
-              version,
-              partition_key,
-              Map.get(record, :payload_ref)
-            ),
-          error_ref: flow_value_ref(attrs, :error, id, version, partition_key),
-          ttl_ms: nil,
-          retention_ttl_ms: Map.get(record, :retention_ttl_ms),
-          history_hot_max_events: Map.get(record, :history_hot_max_events),
-          history_max_events: Map.get(record, :history_max_events),
-          lease_owner: nil,
-          lease_token: nil,
-          lease_deadline_ms: 0,
-          run_state: nil
-        })
+        %{
+          record
+          | state: next_state,
+            version: version,
+            attempts: next_attempts,
+            updated_at_ms: now_ms,
+            next_run_at_ms: next_run_at_ms,
+            payload_ref: payload_ref,
+            error_ref: error_ref,
+            ttl_ms: nil,
+            retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+            lease_owner: nil,
+            lease_token: nil,
+            lease_deadline_ms: 0,
+            run_state: nil
+        }
         |> flow_stamp_terminal_retention(now_ms)
 
-      with :ok <- flow_validate_record_keys(record),
-           :ok <- flow_validate_record_keys(next) do
+      with :ok <- flow_validate_claim_next_record_keys(next) do
         {:ok, record, next, flow_retry_history_meta(record, next, retry_policy, retry_decision)}
       end
     end
@@ -7299,7 +8114,7 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.zip(existing_records)
     |> Enum.reduce_while({:ok, []}, fn
       {%{id: _id, lease_token: lease_token} = attrs, existing}, {:ok, acc} ->
-        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+        now_ms = flow_attrs_now_ms(attrs)
 
         case existing do
           nil ->
@@ -7325,12 +8140,16 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_retry_many_apply(state, plans) do
+    flow_retry_many_apply(state, plans, :unknown)
+  end
+
+  defp flow_retry_many_apply(state, plans, has_record_values?) do
     pair_plans = Enum.map(plans, fn {record, next, _history_meta, _attrs} -> {record, next} end)
 
     history_plans =
       Enum.map(plans, fn {record, next, history_meta, _attrs} -> {record, next, history_meta} end)
 
-    with :ok <- flow_many_put_record_values(state, plans),
+    with :ok <- flow_many_put_record_values(state, plans, has_record_values?),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
          :ok <- flow_retry_many_put_history(state, history_plans),
@@ -7353,7 +8172,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_many_after_retry_terminal(state, plans) do
     Enum.reduce_while(plans, :ok, fn {_record, next}, :ok ->
-      now_ms = Map.get(next, :updated_at_ms, apply_now_ms())
+      now_ms = flow_record_updated_at_ms(next)
 
       case flow_maybe_after_retry_terminal(state, next, now_ms) do
         :ok -> {:cont, :ok}
@@ -7363,7 +8182,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_fail(state, %{id: id, lease_token: lease_token} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
@@ -7393,35 +8212,37 @@ defmodule Ferricstore.Raft.StateMachine do
       id = Map.fetch!(record, :id)
       partition_key = Map.get(record, :partition_key)
 
+      payload_ref =
+        flow_value_ref(
+          attrs,
+          :payload,
+          id,
+          version,
+          partition_key,
+          Map.get(record, :payload_ref)
+        )
+
+      error_ref = flow_value_ref(attrs, :error, id, version, partition_key)
+      retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
+
       next =
-        record
-        |> Map.merge(%{
-          state: "failed",
-          version: version,
-          updated_at_ms: now_ms,
-          payload_ref:
-            flow_value_ref(
-              attrs,
-              :payload,
-              id,
-              version,
-              partition_key,
-              Map.get(record, :payload_ref)
-            ),
-          error_ref: flow_value_ref(attrs, :error, id, version, partition_key),
-          ttl_ms: nil,
-          retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
-          history_hot_max_events: Map.get(record, :history_hot_max_events),
-          history_max_events: Map.get(record, :history_max_events),
-          lease_owner: nil,
-          lease_token: nil,
-          lease_deadline_ms: 0,
-          next_run_at_ms: nil
-        })
+        %{
+          record
+          | state: "failed",
+            version: version,
+            updated_at_ms: now_ms,
+            payload_ref: payload_ref,
+            error_ref: error_ref,
+            ttl_ms: nil,
+            retention_ttl_ms: retention_ttl_ms,
+            lease_owner: nil,
+            lease_token: nil,
+            lease_deadline_ms: 0,
+            next_run_at_ms: nil
+        }
         |> flow_stamp_terminal_retention(now_ms)
 
-      with :ok <- flow_validate_record_keys(record),
-           :ok <- flow_validate_record_keys(next) do
+      with :ok <- flow_validate_terminal_state_index_key(next) do
         {:ok, record, next}
       end
     end
@@ -7453,7 +8274,7 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.zip(existing_records)
     |> Enum.reduce_while({:ok, []}, fn
       {%{id: _id, lease_token: lease_token} = attrs, existing}, {:ok, acc} ->
-        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+        now_ms = flow_attrs_now_ms(attrs)
 
         case existing do
           nil ->
@@ -7476,9 +8297,13 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_fail_many_apply(state, plans) do
+    flow_fail_many_apply(state, plans, :unknown)
+  end
+
+  defp flow_fail_many_apply(state, plans, has_record_values?) do
     pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
 
-    with :ok <- flow_many_put_record_values(state, plans),
+    with :ok <- flow_many_put_record_values(state, plans, has_record_values?),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
          :ok <- flow_many_put_history(state, pair_plans, "failed"),
@@ -7488,7 +8313,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_cancel(state, %{id: id} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
@@ -7516,34 +8341,35 @@ defmodule Ferricstore.Raft.StateMachine do
       version = Map.fetch!(record, :version) + 1
       partition_key = Map.get(record, :partition_key)
 
+      error_ref =
+        flow_value_ref(
+          attrs,
+          :error,
+          Map.fetch!(record, :id),
+          version,
+          partition_key,
+          Map.get(attrs, :reason_ref)
+        )
+
+      retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
+
       next =
-        record
-        |> Map.merge(%{
-          state: "cancelled",
-          version: version,
-          updated_at_ms: now_ms,
-          error_ref:
-            flow_value_ref(
-              attrs,
-              :error,
-              Map.fetch!(record, :id),
-              version,
-              partition_key,
-              Map.get(attrs, :reason_ref)
-            ),
-          ttl_ms: nil,
-          retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
-          history_hot_max_events: Map.get(record, :history_hot_max_events),
-          history_max_events: Map.get(record, :history_max_events),
-          lease_owner: nil,
-          lease_token: nil,
-          lease_deadline_ms: 0,
-          next_run_at_ms: nil
-        })
+        %{
+          record
+          | state: "cancelled",
+            version: version,
+            updated_at_ms: now_ms,
+            error_ref: error_ref,
+            ttl_ms: nil,
+            retention_ttl_ms: retention_ttl_ms,
+            lease_owner: nil,
+            lease_token: nil,
+            lease_deadline_ms: 0,
+            next_run_at_ms: nil
+        }
         |> flow_stamp_terminal_retention(now_ms)
 
-      with :ok <- flow_validate_record_keys(record),
-           :ok <- flow_validate_record_keys(next) do
+      with :ok <- flow_validate_terminal_state_index_key(next) do
         {:ok, record, next}
       end
     end
@@ -7571,7 +8397,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_cross_terminal(state, :complete, %{id: id, lease_token: lease_token} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7585,7 +8411,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_cross_terminal(state, :fail, %{id: id, lease_token: lease_token} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7599,7 +8425,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_cross_terminal(state, :retry, %{id: id, lease_token: lease_token} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7622,7 +8448,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_cross_terminal(state, :cancel, %{id: id} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7671,7 +8497,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_cross_terminal_prepare(state, :complete, %{id: id, lease_token: lease_token} = attrs)
        when is_binary(id) and id != "" do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7684,7 +8510,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_cross_terminal_prepare(state, :fail, %{id: id, lease_token: lease_token} = attrs)
        when is_binary(id) and id != "" do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7697,7 +8523,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_cross_terminal_prepare(state, :retry, %{id: id, lease_token: lease_token} = attrs)
        when is_binary(id) and id != "" do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7710,7 +8536,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_cross_terminal_prepare(state, :cancel, %{id: id} = attrs)
        when is_binary(id) and id != "" do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
     child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
@@ -7893,25 +8719,27 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_maybe_cancel_children_on_parent_closed(state, parent, now_ms) do
-    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(parent, :state)) or
-         flow_has_resolved_cancel_child_group?(parent) do
-      flow_cancel_children_on_parent_closed(state, parent, now_ms)
-    else
-      :ok
+    case flow_child_groups(parent) do
+      groups when map_size(groups) == 0 ->
+        :ok
+
+      groups ->
+        if Ferricstore.Flow.LMDB.terminal_state?(Map.get(parent, :state)) or
+             flow_has_resolved_cancel_child_group?(groups) do
+          flow_cancel_children_on_parent_closed(state, parent, now_ms, groups)
+        else
+          :ok
+        end
     end
   end
 
-  defp flow_has_resolved_cancel_child_group?(parent) do
-    parent
-    |> flow_child_groups()
-    |> Enum.any?(fn {_group_id, group} ->
+  defp flow_has_resolved_cancel_child_group?(groups) do
+    Enum.any?(groups, fn {_group_id, group} ->
       not is_nil(Map.get(group, "resolved")) and flow_group_should_cancel_children?(group)
     end)
   end
 
-  defp flow_cancel_children_on_parent_closed(state, parent, now_ms) do
-    groups = flow_child_groups(parent)
-
+  defp flow_cancel_children_on_parent_closed(state, parent, now_ms, groups) do
     {updated_groups, child_refs} =
       Enum.reduce(groups, {groups, []}, fn {group_id, group}, {groups_acc, child_acc} ->
         if flow_group_should_cancel_children?(group) do
@@ -8110,16 +8938,34 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_many_after_terminal(state, plans, status) do
     Enum.reduce_while(plans, :ok, fn {_record, next}, :ok ->
-      now_ms = Map.get(next, :updated_at_ms, apply_now_ms())
-
-      with :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms),
-           :ok <- flow_maybe_apply_child_terminal(state, next, status, now_ms) do
+      if flow_terminal_after_noop?(next) do
         {:cont, :ok}
       else
-        {:error, _reason} = error -> {:halt, error}
+        now_ms = flow_record_updated_at_ms(next)
+
+        with :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms),
+             :ok <- flow_maybe_apply_child_terminal(state, next, status, now_ms) do
+          {:cont, :ok}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
       end
     end)
   end
+
+  defp flow_terminal_after_noop?(record) do
+    flow_blank_metadata?(Map.get(record, :parent_flow_id)) and
+      flow_empty_child_groups?(Map.get(record, :child_groups))
+  end
+
+  defp flow_empty_child_groups?(groups) when is_map(groups), do: map_size(groups) == 0
+  defp flow_empty_child_groups?(_groups), do: true
+
+  defp flow_record_updated_at_ms(%{updated_at_ms: now_ms}) when is_integer(now_ms), do: now_ms
+  defp flow_record_updated_at_ms(_record), do: apply_now_ms()
+
+  defp flow_attrs_now_ms(%{now_ms: now_ms}), do: now_ms
+  defp flow_attrs_now_ms(_attrs), do: apply_now_ms()
 
   defp flow_child_terminal_parent_next(parent, child, status, now_ms) do
     child_id = Map.fetch!(child, :id)
@@ -8276,7 +9122,7 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.zip(existing_records)
     |> Enum.reduce_while({:ok, []}, fn
       {%{id: _id} = attrs, existing}, {:ok, acc} ->
-        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+        now_ms = flow_attrs_now_ms(attrs)
 
         case existing do
           nil ->
@@ -8316,10 +9162,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
       case do_flow_put_record_values(state, next, attrs) do
         :ok ->
-          case flow_refresh_terminal_value_expirations(state, next, refresh_attrs) do
-            :ok -> {:cont, :ok}
-            {:error, _reason} = error -> {:halt, error}
-          end
+          :ok = flow_refresh_terminal_value_expirations(state, next, refresh_attrs)
+          {:cont, :ok}
 
         {:error, _reason} = error ->
           {:halt, error}
@@ -8328,7 +9172,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_retention_cleanup(state, attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     limit = Map.get(attrs, :limit, 100)
     ets_entries = flow_retention_expired_state_entries(state, now_ms, limit)
 
@@ -8448,15 +9292,15 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_retention_decode_state_record(state, _key, value, _fid, _offset, _value_size)
+  defp flow_retention_decode_state_record(_state, _key, value, _fid, _offset, _value_size)
        when is_binary(value) do
-    flow_decode_record_blob(state, value)
+    flow_decode_record_blob(value)
   end
 
   defp flow_retention_decode_state_record(state, key, nil, fid, offset, value_size)
        when valid_cold_location(fid, offset, value_size) do
     case ColdRead.pread_at(sm_file_path(state, fid), offset, key, @cold_read_timeout_ms) do
-      {:ok, value} -> flow_decode_record_blob(state, value)
+      {:ok, value} -> flow_decode_record_blob(value)
       {:error, _reason} -> :miss
     end
   end
@@ -8655,7 +9499,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_rewind(state, %{id: id, to_event: to_event} = attrs) do
-    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    now_ms = flow_attrs_now_ms(attrs)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
@@ -8677,7 +9521,7 @@ defmodule Ferricstore.Raft.StateMachine do
              ),
            :ok <- flow_history_put_planned(state, record, next, "rewound", now_ms),
            :ok <- flow_after_history_put(state, next) do
-        {:ok, Map.delete(next, :rewound_to_event_id)}
+        :ok
       end
     end
   end
@@ -8689,19 +9533,23 @@ defmodule Ferricstore.Raft.StateMachine do
          state_filter,
          worker,
          lease_ms,
-         now_ms
+         now_ms,
+         due_score
        ) do
     case record do
       nil ->
         :delete_due
 
       %{type: record_type} when record_type != type ->
-        :skip
+        {:skip, flow_claim_restore_due_score(record, due_score)}
 
       %{state: record_state} = record ->
         cond do
           flow_claim_state_excluded?(state_filter, record_state) ->
-            :skip
+            {:skip, flow_claim_restore_due_score(record, due_score)}
+
+          not flow_claim_record_due_ready?(record, now_ms) ->
+            {:skip, flow_claim_restore_due_score(record, due_score)}
 
           flow_claim_state_match?(state_filter, record_state) ->
             next_version = Map.fetch!(record, :version) + 1
@@ -8713,29 +9561,21 @@ defmodule Ferricstore.Raft.StateMachine do
                 ":" <> Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_fencing_token)
 
             next =
-              record
-              |> Map.merge(%{
-                state: "running",
-                version: next_version,
-                fencing_token: next_fencing_token,
-                updated_at_ms: now_ms,
-                ttl_ms: nil,
-                retention_ttl_ms: Map.get(record, :retention_ttl_ms),
-                history_hot_max_events: Map.get(record, :history_hot_max_events),
-                history_max_events: Map.get(record, :history_max_events),
-                lease_owner: worker,
-                lease_token: token,
-                lease_deadline_ms: deadline_ms,
-                next_run_at_ms: deadline_ms,
-                run_state: flow_claim_run_state(record)
-              })
-              |> flow_stamp_terminal_retention(now_ms)
+              flow_claim_next_record(
+                record,
+                next_version,
+                next_fencing_token,
+                worker,
+                token,
+                deadline_ms,
+                now_ms
+              )
 
-            with :ok <- flow_validate_record_keys(record),
-                 :ok <- flow_validate_record_keys(next) do
-              {:ok, record, next}
+            with {:ok, from_due_score} <- flow_claim_numeric_score(due_score),
+                 :ok <- flow_validate_claim_next_record_keys(next) do
+              {:ok, record, next, from_due_score}
             else
-              _ -> :skip
+              _ -> {:skip, flow_claim_restore_due_score(record, due_score)}
             end
 
           true ->
@@ -8745,6 +9585,73 @@ defmodule Ferricstore.Raft.StateMachine do
       _record ->
         :delete_due
     end
+  end
+
+  defp flow_claim_next_record(
+         %{
+           state: _state,
+           version: _version,
+           fencing_token: _fencing_token,
+           updated_at_ms: _updated_at_ms,
+           ttl_ms: _ttl_ms,
+           retention_ttl_ms: _retention_ttl_ms,
+           terminal_retention_until_ms: _terminal_retention_until_ms,
+           history_hot_max_events: _history_hot_max_events,
+           history_max_events: _history_max_events,
+           lease_owner: _lease_owner,
+           lease_token: _lease_token,
+           lease_deadline_ms: _lease_deadline_ms,
+           next_run_at_ms: _next_run_at_ms,
+           run_state: _run_state
+         } = record,
+         next_version,
+         next_fencing_token,
+         worker,
+         token,
+         deadline_ms,
+         now_ms
+       ) do
+    %{
+      record
+      | state: "running",
+        version: next_version,
+        fencing_token: next_fencing_token,
+        updated_at_ms: now_ms,
+        ttl_ms: nil,
+        terminal_retention_until_ms: nil,
+        lease_owner: worker,
+        lease_token: token,
+        lease_deadline_ms: deadline_ms,
+        next_run_at_ms: deadline_ms,
+        run_state: flow_claim_run_state(record)
+    }
+  end
+
+  defp flow_claim_next_record(
+         record,
+         next_version,
+         next_fencing_token,
+         worker,
+         token,
+         deadline_ms,
+         now_ms
+       ) do
+    Map.merge(record, %{
+      state: "running",
+      version: next_version,
+      fencing_token: next_fencing_token,
+      updated_at_ms: now_ms,
+      ttl_ms: nil,
+      retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+      terminal_retention_until_ms: nil,
+      history_hot_max_events: Map.get(record, :history_hot_max_events),
+      history_max_events: Map.get(record, :history_max_events),
+      lease_owner: worker,
+      lease_token: token,
+      lease_deadline_ms: deadline_ms,
+      next_run_at_ms: deadline_ms,
+      run_state: flow_claim_run_state(record)
+    })
   end
 
   defp flow_claim_state_excluded?({:exclude, _state_filter, exclude_states}, state),
@@ -8765,13 +9672,81 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_claim_run_state(%{state: flow_state}), do: flow_state
 
+  defp flow_claim_plan_pair(
+         {:native_claim, next, _entry, _state_key, _value, _previous_history_ms}
+       ),
+       do: {next, next}
+
+  defp flow_claim_plan_pair({record, next, _from_due_score}), do: {record, next}
+  defp flow_claim_plan_pair({record, next}), do: {record, next}
+
+  defp flow_claim_plan_due_score(
+         {:native_claim, _next,
+          {_id, _from_due_key, due_score, _to_due_key, _to_due_score, _from_state_key,
+           _from_state_score, _to_state_key, _to_state_score, _inflight_key, _worker_key,
+           _lease_score}, _state_key, _value, _previous_history_ms}
+       ),
+       do: flow_claim_numeric_score(due_score)
+
+  defp flow_claim_plan_due_score({_record, _next, due_score}),
+    do: flow_claim_numeric_score(due_score)
+
+  defp flow_claim_plan_due_score({record, _next}),
+    do: flow_claim_numeric_score(Map.get(record, :next_run_at_ms))
+
+  defp flow_claim_record_state_score(record),
+    do: flow_claim_numeric_score(Map.get(record, :updated_at_ms, 0))
+
+  defp flow_claim_record_due_ready?(record, now_ms) do
+    with {:ok, due_score} <- flow_claim_numeric_score(Map.get(record, :next_run_at_ms)),
+         {:ok, now_score} <- flow_claim_numeric_score(now_ms) do
+      due_score <= now_score
+    else
+      _ -> false
+    end
+  end
+
+  defp flow_claim_numeric_score(score) when is_float(score), do: {:ok, score}
+  defp flow_claim_numeric_score(score) when is_integer(score), do: {:ok, score * 1.0}
+  defp flow_claim_numeric_score(_score), do: :error
+
+  defp flow_claim_restore_due_score(record, due_score) do
+    case flow_claim_numeric_score(Map.get(record, :next_run_at_ms)) do
+      {:ok, score} ->
+        score
+
+      :error ->
+        case flow_claim_numeric_score(due_score) do
+          {:ok, score} -> score
+          :error -> 0.0
+        end
+    end
+  end
+
   defp flow_apply_claim_batch(_state, _due_key, [], [], _now_ms), do: :ok
 
   defp flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
-    with :ok <- flow_zset_delete_members_from_key(state, due_key, stale_due_ids),
-         :ok <- flow_claim_move_indexes(state, plans),
-         :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_claim_put_history(state, plans, now_ms) do
+    phase_meta =
+      state
+      |> flow_claim_due_phase_meta()
+      |> Map.merge(%{plans: length(plans), stale_due_ids: length(stale_due_ids)})
+
+    with :ok <-
+           flow_claim_due_phase(:delete_stale_due, phase_meta, fn ->
+             flow_zset_delete_members_from_key(state, due_key, stale_due_ids)
+           end),
+         :ok <-
+           flow_claim_due_phase(:move_indexes, phase_meta, fn ->
+             flow_claim_move_indexes(state, plans)
+           end),
+         :ok <-
+           flow_claim_due_phase(:state_write, phase_meta, fn ->
+             flow_claim_put_state_records(state, plans)
+           end),
+         :ok <-
+           flow_claim_due_phase(:history_write, phase_meta, fn ->
+             flow_claim_put_history(state, plans, now_ms)
+           end) do
       :ok
     end
   end
@@ -8779,8 +9754,17 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_move_indexes(_state, []), do: :ok
 
   defp flow_claim_move_indexes(state, plans) do
+    case flow_claim_move_indexes_fast(state, plans) do
+      :ok -> :ok
+      :fallback -> flow_claim_move_indexes_generic(state, plans)
+    end
+  end
+
+  defp flow_claim_move_indexes_generic(state, plans) do
     {moves, deletes, puts} =
-      Enum.reduce(plans, {[], [], %{}}, fn {record, next}, {moves, deletes, puts} ->
+      Enum.reduce(plans, {[], [], %{}}, fn plan, {moves, deletes, puts} ->
+        {record, next} = flow_claim_plan_pair(plan)
+
         {moves, deletes, puts} =
           flow_claim_due_index_plan(record, next, moves, deletes, puts)
 
@@ -8805,6 +9789,383 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_zset_index_delete_grouped(state, deletes) do
       flow_claim_put_grouped_zset_entries(state, puts)
     end
+  end
+
+  defp flow_claim_move_indexes_fast(state, plans) do
+    cond do
+      not flow_index_tables?(state) ->
+        :ok
+
+      flow_native_index(state) == nil ->
+        :fallback
+
+      true ->
+        phase_meta =
+          state
+          |> flow_claim_due_phase_meta()
+          |> Map.merge(%{plans: length(plans)})
+
+        case flow_claim_due_internal_phase(
+               :fast_index_entries,
+               phase_meta,
+               %{items: length(plans)},
+               fn -> flow_claim_fast_index_entries(state, plans) end
+             ) do
+          {:ok, entries} ->
+            flow_claim_apply_fast_index_entries(state, entries)
+
+          :fallback ->
+            :fallback
+        end
+    end
+  end
+
+  defp flow_claim_fast_index_entries(
+         _state,
+         [{:native_claim, _next, _entry, _key, _value, _prev} | _] = plans
+       ) do
+    Enum.reduce_while(plans, {:ok, []}, fn
+      {:native_claim, _next, entry, _state_key, _value, _previous_history_ms}, {:ok, acc} ->
+        {:cont, {:ok, [entry | acc]}}
+
+      _other, _acc ->
+        {:halt, :fallback}
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      :fallback -> :fallback
+    end
+  end
+
+  defp flow_claim_fast_index_entries(_state, plans) do
+    Enum.reduce_while(plans, {:ok, [], nil, nil, nil, nil, nil, nil}, fn plan,
+                                                                         {:ok, acc,
+                                                                          from_due_cache,
+                                                                          to_due_cache,
+                                                                          from_state_cache,
+                                                                          to_state_cache,
+                                                                          inflight_cache,
+                                                                          worker_cache} ->
+      {record, next} = flow_claim_plan_pair(plan)
+
+      if flow_claim_fast_index_record_shape?(record, next) do
+        id = next.id
+        record_partition_key = Map.get(record, :partition_key)
+        partition_key = Map.get(next, :partition_key)
+
+        {from_due_key, from_due_cache} =
+          flow_claim_cached_due_index_key(from_due_cache, record)
+
+        {to_due_key, to_due_cache} =
+          flow_claim_cached_due_index_key(to_due_cache, next)
+
+        {from_state_key, from_state_cache} =
+          flow_claim_cached_state_index_key(
+            from_state_cache,
+            record.type,
+            record.state,
+            record_partition_key
+          )
+
+        {to_state_key, to_state_cache} =
+          flow_claim_cached_state_index_key(to_state_cache, next.type, next.state, partition_key)
+
+        {inflight_key, inflight_cache} =
+          flow_claim_cached_inflight_index_key(inflight_cache, next.type, partition_key)
+
+        {worker_key, worker_cache} =
+          flow_claim_cached_worker_index_key(
+            worker_cache,
+            Map.get(next, :lease_owner, ""),
+            partition_key
+          )
+
+        with true <- is_binary(from_due_key) and is_binary(to_due_key),
+             {:ok, from_due_score} <- flow_claim_plan_due_score(plan),
+             {:ok, from_state_score} <- flow_claim_record_state_score(record) do
+          lease_score = Map.get(next, :lease_deadline_ms, 0) * 1.0
+
+          entry =
+            {id, from_due_key, from_due_score * 1.0, to_due_key,
+             Map.fetch!(next, :next_run_at_ms) * 1.0, from_state_key, from_state_score * 1.0,
+             to_state_key, Map.get(next, :updated_at_ms, 0) * 1.0, inflight_key, worker_key,
+             lease_score}
+
+          {:cont,
+           {:ok, [entry | acc], from_due_cache, to_due_cache, from_state_cache, to_state_cache,
+            inflight_cache, worker_cache}}
+        else
+          _ -> {:halt, :fallback}
+        end
+      else
+        {:halt, :fallback}
+      end
+    end)
+    |> case do
+      {:ok, entries, _from_due_cache, _to_due_cache, _from_state_cache, _to_state_cache,
+       _inflight_cache, _worker_cache} ->
+        {:ok, entries}
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp flow_claim_cached_due_index_key(cache, %{next_run_at_ms: nil}), do: {nil, cache}
+
+  defp flow_claim_cached_due_index_key(
+         cache,
+         %{type: type, state: flow_state, priority: priority} = record
+       ) do
+    partition_key = Map.get(record, :partition_key)
+    cache_key = {type, flow_state, priority, partition_key}
+
+    case cache do
+      {^cache_key, key} ->
+        {key, cache}
+
+      _ ->
+        key = FlowKeys.due_key(type, flow_state, priority, partition_key)
+        {key, {cache_key, key}}
+    end
+  end
+
+  defp flow_claim_cached_state_index_key(cache, type, flow_state, partition_key) do
+    cache_key = {type, flow_state, partition_key}
+
+    case cache do
+      {^cache_key, key} ->
+        {key, cache}
+
+      _ ->
+        key = FlowKeys.state_index_key(type, flow_state, partition_key)
+        {key, {cache_key, key}}
+    end
+  end
+
+  defp flow_claim_cached_inflight_index_key(cache, type, partition_key) do
+    cache_key = {type, partition_key}
+
+    case cache do
+      {^cache_key, key} ->
+        {key, cache}
+
+      _ ->
+        key = FlowKeys.inflight_index_key(type, partition_key)
+        {key, {cache_key, key}}
+    end
+  end
+
+  defp flow_claim_cached_worker_index_key(cache, worker, partition_key) do
+    cache_key = {worker, partition_key}
+
+    case cache do
+      {^cache_key, key} ->
+        {key, cache}
+
+      _ ->
+        key = FlowKeys.worker_index_key(worker, partition_key)
+        {key, {cache_key, key}}
+    end
+  end
+
+  defp flow_claim_fast_index_record_shape?(record, next) do
+    Map.get(record, :state) != "running" and Map.get(next, :state) == "running" and
+      flow_claim_fast_metadata_empty?(record) and flow_claim_fast_metadata_empty?(next)
+  end
+
+  defp flow_claim_fast_metadata_empty?(record) do
+    id = Map.get(record, :id)
+
+    flow_blank_metadata?(Map.get(record, :parent_flow_id)) and
+      flow_blank_metadata?(Map.get(record, :correlation_id)) and
+      Map.get(record, :root_flow_id) in [nil, "", id]
+  end
+
+  defp flow_claim_apply_fast_index_entries(state, entries) do
+    phase_meta =
+      state
+      |> flow_claim_due_phase_meta()
+      |> Map.merge(%{entries: length(entries)})
+
+    case flow_native_index(state) do
+      nil ->
+        flow_claim_apply_fast_index_entries_ets(state, entries, phase_meta)
+
+      _native ->
+        flow_claim_due_internal_phase(
+          :fast_index_track_originals,
+          phase_meta,
+          %{items: length(entries)},
+          fn ->
+            flow_claim_queue_fast_index_rollback(state, entries)
+          end
+        )
+
+        flow_claim_due_internal_phase(
+          :fast_index_native_due_apply,
+          phase_meta,
+          %{items: length(entries)},
+          fn ->
+            flow_native_apply_claim_entries(state, entries)
+          end
+        )
+    end
+  end
+
+  defp flow_claim_apply_fast_index_entries_ets(state, entries, phase_meta) do
+    flow_claim_due_internal_phase(
+      :fast_index_track_originals,
+      phase_meta,
+      %{items: length(entries)},
+      fn ->
+        flow_claim_track_fast_index_originals(state, entries)
+      end
+    )
+
+    {index_deletes, lookup_deletes, index_inserts, lookup_inserts, count_deltas} =
+      flow_claim_due_internal_phase(
+        :fast_index_build_ops,
+        phase_meta,
+        %{items: length(entries)},
+        fn ->
+          Enum.reduce(entries, {[], [], [], [], %{}}, fn {id, _from_due_key, _from_due_score,
+                                                          _to_due_key, _to_due_score,
+                                                          from_state_key, from_state_score,
+                                                          to_state_key, to_state_score,
+                                                          inflight_key, worker_key, lease_score},
+                                                         {index_deletes, lookup_deletes,
+                                                          index_inserts, lookup_inserts,
+                                                          count_deltas} ->
+            # Due scheduling is native-authoritative on the claim hot path.
+            # Keep ETS state/running indexes synchronous for existing APIs, but
+            # do not synchronously project due deletes/inserts here; stale ETS
+            # due rows are ignored by claim_due because reads come from native.
+            index_deletes = [{from_state_key, from_state_score, id} | index_deletes]
+
+            lookup_deletes = [{from_state_key, id} | lookup_deletes]
+
+            index_inserts = [
+              {{to_state_key, to_state_score, id}, true},
+              {{inflight_key, lease_score, id}, true},
+              {{worker_key, lease_score, id}, true}
+              | index_inserts
+            ]
+
+            lookup_inserts = [
+              {{to_state_key, id}, to_state_score},
+              {{inflight_key, id}, lease_score},
+              {{worker_key, id}, lease_score}
+              | lookup_inserts
+            ]
+
+            count_deltas =
+              count_deltas
+              |> Map.update(from_state_key, -1, &(&1 - 1))
+              |> Map.update(to_state_key, 1, &(&1 + 1))
+              |> Map.update(inflight_key, 1, &(&1 + 1))
+              |> Map.update(worker_key, 1, &(&1 + 1))
+
+            {index_deletes, lookup_deletes, index_inserts, lookup_inserts, count_deltas}
+          end)
+        end
+      )
+
+    flow_claim_due_internal_phase(
+      :fast_index_ets_index_deletes,
+      phase_meta,
+      %{items: length(index_deletes)},
+      fn ->
+        Enum.each(index_deletes, &:ets.delete(state.flow_index_name, &1))
+      end
+    )
+
+    flow_claim_due_internal_phase(
+      :fast_index_ets_lookup_deletes,
+      phase_meta,
+      %{items: length(lookup_deletes)},
+      fn ->
+        Enum.each(lookup_deletes, &:ets.delete(state.flow_lookup_name, &1))
+      end
+    )
+
+    flow_claim_due_internal_phase(
+      :fast_index_ets_index_inserts,
+      phase_meta,
+      %{items: length(index_inserts)},
+      fn ->
+        if index_inserts != [], do: :ets.insert(state.flow_index_name, index_inserts)
+      end
+    )
+
+    flow_claim_due_internal_phase(
+      :fast_index_ets_lookup_inserts,
+      phase_meta,
+      %{items: length(lookup_inserts)},
+      fn ->
+        if lookup_inserts != [], do: :ets.insert(state.flow_lookup_name, lookup_inserts)
+      end
+    )
+
+    flow_claim_due_internal_phase(
+      :fast_index_native_due_apply,
+      phase_meta,
+      %{items: length(entries)},
+      fn ->
+        flow_native_apply_claim_entries(state, entries)
+      end
+    )
+
+    flow_claim_due_internal_phase(
+      :fast_index_count_updates,
+      phase_meta,
+      %{items: map_size(count_deltas)},
+      fn ->
+        Enum.each(count_deltas, fn
+          {_key, 0} ->
+            :ok
+
+          {key, delta} ->
+            :ets.update_counter(
+              state.flow_lookup_name,
+              {:count, key},
+              {2, delta},
+              {{:count, key}, 0}
+            )
+        end)
+      end
+    )
+
+    :ok
+  end
+
+  defp flow_claim_track_fast_index_originals(state, entries) do
+    flow_claim_queue_fast_index_rollback(state, entries)
+    flow_claim_track_fast_index_count_originals(state, entries)
+  end
+
+  defp flow_claim_queue_fast_index_rollback(state, entries) do
+    case Process.get(:sm_pending_fast_claim_index_rollbacks, :undefined) do
+      rollbacks when is_list(rollbacks) ->
+        rollback = {state.flow_index_name, state.flow_lookup_name, entries}
+        Process.put(:sm_pending_fast_claim_index_rollbacks, [rollback | rollbacks])
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp flow_claim_track_fast_index_count_originals(state, entries) do
+    keys =
+      entries
+      |> Enum.flat_map(fn {_id, _from_due_key, _from_due_score, _to_due_key, _to_due_score,
+                           from_state_key, _from_state_score, to_state_key, _to_state_score,
+                           inflight_key, worker_key, _lease_score} ->
+        [from_state_key, to_state_key, inflight_key, worker_key]
+      end)
+      |> Enum.uniq()
+
+    Enum.each(keys, &track_flow_index_count_original(state, &1))
   end
 
   defp flow_claim_queue_old_terminal_lmdb_deletes(state, record) do
@@ -8931,11 +10292,11 @@ defmodule Ferricstore.Raft.StateMachine do
         end
       end)
 
-    with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
-         :ok <- flow_zset_index_delete_grouped(state, deletes) do
+    with :ok <- flow_index_move_lifecycle_entries(state, Enum.reverse(moves)),
+         :ok <- flow_zset_lifecycle_index_delete_grouped(state, deletes) do
       puts
       |> Enum.each(fn {key, member_score_pairs} ->
-        flow_zset_put_many_new(state, key, Enum.reverse(member_score_pairs))
+        flow_index_put_new_lifecycle_members(state, key, Enum.reverse(member_score_pairs))
       end)
 
       :ok
@@ -8948,6 +10309,18 @@ defmodule Ferricstore.Raft.StateMachine do
     FlowKeys.due_key(type, flow_state, priority, Map.get(record, :partition_key))
   end
 
+  defp flow_transition_move_state_indexes(state, [{record, next}]) do
+    from_key =
+      FlowKeys.state_index_key(record.type, record.state, Map.get(record, :partition_key))
+
+    to_key = FlowKeys.state_index_key(next.type, next.state, Map.get(next, :partition_key))
+
+    flow_index_move_lifecycle_entries(
+      state,
+      [{from_key, to_key, next.id, Map.get(next, :updated_at_ms, 0)}]
+    )
+  end
+
   defp flow_transition_move_state_indexes(state, plans) do
     moves =
       Enum.map(plans, fn {record, next} ->
@@ -8958,78 +10331,147 @@ defmodule Ferricstore.Raft.StateMachine do
         {from_key, to_key, next.id, Map.get(next, :updated_at_ms, 0)}
       end)
 
-    flow_index_move_entries(state, moves)
+    flow_index_move_lifecycle_entries(state, moves)
+  end
+
+  defp flow_transition_move_metadata_indexes(state, [{record, next}]) do
+    case flow_transition_metadata_index_plan(record, next, [], [], []) do
+      {[], [], []} ->
+        :ok
+
+      {moves, deletes, puts} ->
+        with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
+             :ok <- flow_zset_index_delete_grouped(state, deletes) do
+          flow_index_put_new_entries(state, Enum.reverse(puts))
+        end
+    end
   end
 
   defp flow_transition_move_metadata_indexes(state, plans) do
     {moves, deletes, puts} =
       Enum.reduce(plans, {[], [], []}, fn {record, next}, {moves, deletes, puts} ->
-        old_entries =
-          Map.new(flow_metadata_index_entries(record), fn {key, id, score} ->
-            {key, {id, score}}
-          end)
-
-        new_entries =
-          Map.new(flow_metadata_index_entries(next), fn {key, id, score} -> {key, {id, score}} end)
-
-        moves =
-          Enum.reduce(new_entries, moves, fn {key, {id, score}}, acc ->
-            if Map.has_key?(old_entries, key) do
-              [{key, key, id, score} | acc]
-            else
-              acc
-            end
-          end)
-
-        deletes =
-          Enum.reduce(old_entries, deletes, fn {key, {id, _score}}, acc ->
-            if Map.has_key?(new_entries, key), do: acc, else: [{key, id} | acc]
-          end)
-
-        puts =
-          Enum.reduce(new_entries, puts, fn {key, {id, score}}, acc ->
-            if Map.has_key?(old_entries, key), do: acc, else: [{key, id, score} | acc]
-          end)
-
-        {moves, deletes, puts}
+        flow_transition_metadata_index_plan(record, next, moves, deletes, puts)
       end)
 
-    with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
-         :ok <- flow_zset_index_delete_grouped(state, deletes) do
-      flow_index_put_new_entries(state, Enum.reverse(puts))
+    case {moves, deletes, puts} do
+      {[], [], []} ->
+        :ok
+
+      _ ->
+        with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
+             :ok <- flow_zset_index_delete_grouped(state, deletes) do
+          flow_index_put_new_entries(state, Enum.reverse(puts))
+        end
     end
   end
 
-  defp flow_transition_delete_old_secondary_indexes(state, plans) do
-    Enum.each(plans, fn {record, _next} ->
-      maybe_queue_terminal_lmdb_index_delete(state, record)
-    end)
+  defp flow_transition_metadata_index_plan(record, next, moves, deletes, puts) do
+    if flow_metadata_index_record_empty?(record) and flow_metadata_index_record_empty?(next) do
+      {moves, deletes, puts}
+    else
+      old_entries_list = flow_metadata_index_entries(record)
+      new_entries_list = flow_metadata_index_entries(next)
 
-    plans
-    |> Enum.each(fn {record, _next} ->
-      if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-        queue_lmdb_metadata_index_deletes(state, record)
+      case {old_entries_list, new_entries_list} do
+        {[], []} ->
+          {moves, deletes, puts}
+
+        _ ->
+          old_entries =
+            Map.new(old_entries_list, fn {key, id, score} ->
+              {key, {id, score}}
+            end)
+
+          new_entries =
+            Map.new(new_entries_list, fn {key, id, score} -> {key, {id, score}} end)
+
+          moves =
+            Enum.reduce(new_entries, moves, fn {key, {id, score}}, acc ->
+              if Map.has_key?(old_entries, key) do
+                [{key, key, id, score} | acc]
+              else
+                acc
+              end
+            end)
+
+          deletes =
+            Enum.reduce(old_entries, deletes, fn {key, {id, _score}}, acc ->
+              if Map.has_key?(new_entries, key), do: acc, else: [{key, id} | acc]
+            end)
+
+          puts =
+            Enum.reduce(new_entries, puts, fn {key, {id, score}}, acc ->
+              if Map.has_key?(old_entries, key), do: acc, else: [{key, id, score} | acc]
+            end)
+
+          {moves, deletes, puts}
       end
-    end)
+    end
+  end
 
-    running_deletes =
-      plans
-      |> Enum.flat_map(fn
-        {%{state: "running"} = record, _next} ->
+  defp flow_metadata_index_record_empty?(%{
+         id: id,
+         parent_flow_id: parent_flow_id,
+         root_flow_id: root_flow_id,
+         correlation_id: correlation_id
+       }) do
+    flow_metadata_index_empty?(parent_flow_id, root_flow_id, correlation_id, id)
+  end
+
+  defp flow_metadata_index_record_empty?(record) do
+    id = Map.get(record, :id)
+
+    flow_metadata_index_empty?(
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      id
+    )
+  end
+
+  defp flow_transition_delete_old_secondary_indexes(state, [{%{state: "running"} = record, _next}]) do
+    partition_key = Map.get(record, :partition_key)
+
+    flow_zset_lifecycle_index_delete_grouped(state, [
+      {FlowKeys.inflight_index_key(record.type, partition_key), record.id},
+      {FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key), record.id}
+    ])
+  end
+
+  defp flow_transition_delete_old_secondary_indexes(state, plans) do
+    {terminal_records, running_deletes} =
+      Enum.reduce(plans, {[], []}, fn
+        {%{state: "running"} = record, _next}, {terminal_records, running_deletes} ->
           partition_key = Map.get(record, :partition_key)
 
-          [
+          running_deletes = [
             {FlowKeys.inflight_index_key(record.type, partition_key), record.id},
             {FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key),
              record.id}
+            | running_deletes
           ]
 
-        _plan ->
-          []
+          {terminal_records, running_deletes}
+
+        {record, _next}, {terminal_records, running_deletes} ->
+          if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+            {[record | terminal_records], running_deletes}
+          else
+            {terminal_records, running_deletes}
+          end
       end)
 
-    flow_zset_index_delete_grouped(state, running_deletes)
+    Enum.each(terminal_records, fn record ->
+      maybe_queue_terminal_lmdb_index_delete(state, record)
+      queue_lmdb_metadata_index_deletes(state, record)
+    end)
+
+    flow_zset_lifecycle_index_delete_grouped(state, running_deletes)
   end
+
+  defp flow_transition_put_new_running_indexes(_state, [{_record, %{state: flow_state}}])
+       when flow_state != "running",
+       do: :ok
 
   defp flow_transition_put_new_running_indexes(state, plans) do
     plans
@@ -9038,31 +10480,291 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_claim_put_state_records(state, plans) do
-    Enum.each(plans, fn {_record, next} ->
-      partition_key = Map.get(next, :partition_key)
+    case flow_claim_put_native_state_records_batch(state, plans) do
+      :ok ->
+        :ok
 
-      flow_put_state_record(
-        state,
-        FlowKeys.state_key(next.id, partition_key),
-        next
-      )
-    end)
+      :fallback ->
+        case flow_claim_put_state_records_batch(state, plans) do
+          :ok ->
+            :ok
 
-    :ok
+          :fallback ->
+            flow_claim_put_state_records_loop(state, plans, nil)
+            :ok
+        end
+    end
   end
 
-  defp flow_create_put_state_records(state, records) do
-    Enum.each(records, fn record ->
-      partition_key = Map.get(record, :partition_key)
+  defp flow_claim_put_native_state_records_batch(
+         state,
+         [{:native_claim, _next, _entry, _state_key, _next_value, _previous_history_ms} | _] =
+           plans
+       ) do
+    cond do
+      cross_shard_pending_active?() ->
+        :fallback
 
-      flow_put_new_state_record(
-        state,
-        FlowKeys.state_key(record.id, partition_key),
-        record
-      )
+      standalone_staged_apply?() ->
+        :fallback
+
+      true ->
+        lmdb_mirror? = flow_lmdb_mirror?(state)
+
+        with {:ok, staged_entries} <-
+               flow_claim_stage_native_state_record_entries(
+                 plans,
+                 lmdb_mirror?,
+                 []
+               ) do
+          entries =
+            Enum.map(staged_entries, fn {state_key, next, next_value, disk_val, entry} ->
+              previous = :ets.lookup(state.ets, state_key)
+              originals = Process.get(:sm_pending_originals, %{})
+              updated = record_pending_original_from_previous(state_key, previous, originals)
+
+              if updated != originals do
+                Process.put(:sm_pending_originals, updated)
+              end
+
+              track_keydir_binary_delta_from_previous(state, state_key, previous, next_value, 0)
+              maybe_queue_lmdb_policy_put(state_key, disk_val, 0)
+
+              if lmdb_mirror? do
+                maybe_queue_lmdb_indexes_for_state_record(state, state_key, next_value, 0, next)
+              end
+
+              queue_pending_put(state_key, disk_val, 0)
+
+              entry
+            end)
+
+          :ets.insert(state.ets, entries)
+          :ok
+        end
+    end
+  end
+
+  defp flow_claim_put_native_state_records_batch(_state, _plans), do: :fallback
+
+  defp flow_claim_stage_native_state_record_entries([], _lmdb_mirror?, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp flow_claim_stage_native_state_record_entries(
+         [
+           {:native_claim, next, _entry, state_key, next_value, _previous_history_ms}
+           | rest
+         ],
+         lmdb_mirror?,
+         acc
+       ) do
+    if lmdb_mirror? and Ferricstore.Flow.LMDB.terminal_state?(Map.get(next, :state)) do
+      :fallback
+    else
+      disk_val = to_disk_binary(next_value)
+      entry = {state_key, next_value, 0, LFU.initial(), :pending, 0, byte_size(disk_val)}
+
+      flow_claim_stage_native_state_record_entries(rest, lmdb_mirror?, [
+        {state_key, next, next_value, disk_val, entry} | acc
+      ])
+    end
+  end
+
+  defp flow_claim_stage_native_state_record_entries(_plans, _lmdb_mirror?, _acc), do: :fallback
+
+  defp flow_claim_put_state_records_batch(state, plans) do
+    case flow_claim_state_record_key_records(plans) do
+      {:ok, key_records} -> flow_put_state_records_batch(state, key_records)
+      :fallback -> :fallback
+    end
+  end
+
+  defp flow_claim_state_record_key_records(plans) do
+    plans
+    |> Enum.reduce_while({:ok, [], nil}, fn
+      {:native_claim, _next, _entry, _state_key, _next_value, _previous_history_ms}, _acc ->
+        {:halt, :fallback}
+
+      {_record, next, _from_due_score}, {:ok, acc, cache} ->
+        {key, cache} = flow_state_record_key(cache, next)
+        {:cont, {:ok, [{key, next} | acc], cache}}
+
+      {_record, next}, {:ok, acc, cache} ->
+        {key, cache} = flow_state_record_key(cache, next)
+        {:cont, {:ok, [{key, next} | acc], cache}}
+
+      _other, _acc ->
+        {:halt, :fallback}
     end)
+    |> case do
+      {:ok, key_records, _cache} -> {:ok, Enum.reverse(key_records)}
+      :fallback -> :fallback
+    end
+  end
 
-    :ok
+  defp flow_claim_put_state_records_loop(_state, [], _cache), do: :ok
+
+  defp flow_claim_put_state_records_loop(
+         state,
+         [{:native_claim, next, _entry, state_key, next_value, _previous_history_ms} | rest],
+         cache
+       ) do
+    flow_put_state_record_encoded(state, state_key, next_value, 0, next)
+    flow_claim_put_state_records_loop(state, rest, cache)
+  end
+
+  defp flow_claim_put_state_records_loop(state, [{_record, next, _from_due_score} | rest], cache) do
+    {key, cache} = flow_state_record_key(cache, next)
+    flow_put_state_record(state, key, next)
+    flow_claim_put_state_records_loop(state, rest, cache)
+  end
+
+  defp flow_claim_put_state_records_loop(state, [{_record, next} | rest], cache) do
+    {key, cache} = flow_state_record_key(cache, next)
+    flow_put_state_record(state, key, next)
+    flow_claim_put_state_records_loop(state, rest, cache)
+  end
+
+  defp flow_state_record_key(cache, %{id: id} = record) do
+    partition_key = Map.get(record, :partition_key)
+
+    case cache do
+      {^partition_key, prefix} when is_binary(prefix) ->
+        {prefix <> id, cache}
+
+      _ ->
+        prefix = FlowKeys.state_key("", partition_key)
+        {prefix <> id, {partition_key, prefix}}
+    end
+  end
+
+  defp flow_state_key_with_tag(tag, id), do: "f:" <> tag <> ":s:" <> id
+  defp flow_history_key_with_tag(tag, id), do: "f:" <> tag <> ":h:" <> id
+
+  defp flow_due_key_with_tag(tag, type, flow_state, priority) do
+    "f:" <> tag <> ":d:" <> type <> ":" <> flow_state <> ":p" <> Integer.to_string(priority)
+  end
+
+  defp flow_state_index_key_with_tag(tag, type, flow_state) do
+    "f:" <> tag <> ":i:s:" <> type <> ":" <> flow_state
+  end
+
+  defp flow_inflight_index_key_with_tag(tag, type), do: "f:" <> tag <> ":i:r:" <> type
+  defp flow_worker_index_key_with_tag(tag, worker), do: "f:" <> tag <> ":i:w:" <> worker
+  defp flow_parent_index_key_with_tag(tag, parent_id), do: "f:" <> tag <> ":i:p:" <> parent_id
+  defp flow_root_index_key_with_tag(tag, root_id), do: "f:" <> tag <> ":i:o:" <> root_id
+
+  defp flow_correlation_index_key_with_tag(tag, correlation_id),
+    do: "f:" <> tag <> ":i:c:" <> correlation_id
+
+  defp flow_create_put_state_records(state, records) do
+    {key_records, _cache} =
+      Enum.map_reduce(records, nil, fn record, cache ->
+        {key, cache} = flow_state_record_key(cache, record)
+        {{key, record}, cache}
+      end)
+
+    case flow_put_state_records_batch(state, key_records) do
+      :ok ->
+        :ok
+
+      :fallback ->
+        Enum.each(key_records, fn {key, record} ->
+          flow_put_new_state_record(state, key, record)
+        end)
+
+        :ok
+    end
+  end
+
+  defp flow_create_put_fast_state_records(state, plans) do
+    key_records = Enum.map(plans, fn %{state_key: key, record: record} -> {key, record} end)
+
+    case flow_put_state_records_batch(state, key_records) do
+      :ok ->
+        :ok
+
+      :fallback ->
+        Enum.each(key_records, fn {key, record} ->
+          flow_put_new_state_record(state, key, record)
+        end)
+
+        :ok
+    end
+  end
+
+  defp flow_put_state_records_batch(_state, []), do: :ok
+
+  defp flow_put_state_records_batch(state, key_records) do
+    cond do
+      cross_shard_pending_active?() ->
+        :fallback
+
+      standalone_staged_apply?() ->
+        :fallback
+
+      true ->
+        mirror? = flow_lmdb_mirror?(state)
+        originals = Process.get(:sm_pending_originals, %{})
+        pending_values = Process.get(:sm_pending_values, %{})
+
+        {entries, writes, originals, pending_values} =
+          Enum.reduce(key_records, {[], [], originals, pending_values}, fn {key, record},
+                                                                           {entries, writes,
+                                                                            originals,
+                                                                            pending_values} ->
+            value = flow_encode(record)
+            expire_at_ms = flow_record_expire_at(record)
+            disk_val = to_disk_binary(value)
+            previous = :ets.lookup(state.ets, key)
+            originals = record_pending_original_from_previous(key, previous, originals)
+
+            {entry, write} =
+              if mirror? and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+                lfu = flow_record_lfu(record, value)
+
+                track_keydir_binary_delta_from_previous(
+                  state,
+                  key,
+                  previous,
+                  nil,
+                  expire_at_ms
+                )
+
+                maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
+
+                {
+                  {key, nil, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)},
+                  {:put_cold, key, disk_val, expire_at_ms, lfu}
+                }
+              else
+                track_keydir_binary_delta_from_previous(
+                  state,
+                  key,
+                  previous,
+                  value,
+                  expire_at_ms
+                )
+
+                maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
+
+                {
+                  {key, value, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)},
+                  {:put, key, disk_val, expire_at_ms}
+                }
+              end
+
+            pending_values = Map.put(pending_values, key, {disk_val, expire_at_ms})
+            {[entry | entries], [write | writes], originals, pending_values}
+          end)
+
+        Process.put(:sm_pending_originals, originals)
+        Process.put(:sm_pending_values, pending_values)
+        Process.put(:sm_pending_writes, writes ++ Process.get(:sm_pending_writes, []))
+
+        :ets.insert(state.ets, entries)
+        :ok
+    end
   end
 
   defp flow_claim_put_running_indexes(state, plans) do
@@ -9098,6 +10800,49 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
 
     flow_index_put_new_entries(state, Enum.flat_map(records, &flow_metadata_index_entries/1))
+
+    :ok
+  end
+
+  defp flow_create_put_fast_due(state, plans) do
+    plans
+    |> Enum.reduce(%{}, fn
+      %{due_key: nil}, acc ->
+        acc
+
+      %{due_key: key, record: %{id: id, next_run_at_ms: score}}, acc ->
+        flow_claim_add_zset_entry(acc, key, id, score)
+    end)
+    |> flow_put_lifecycle_index_groups(state)
+  end
+
+  defp flow_create_put_fast_indexes(state, plans) do
+    lifecycle_groups =
+      Enum.reduce(plans, %{}, fn %{record: record} = plan, acc ->
+        acc =
+          flow_claim_add_zset_entry(
+            acc,
+            plan.state_index_key,
+            record.id,
+            plan.state_index_score
+          )
+
+        Enum.reduce(plan.running_index_entries, acc, fn {key, score}, inner_acc ->
+          flow_claim_add_zset_entry(inner_acc, key, record.id, score)
+        end)
+      end)
+
+    with :ok <- flow_put_lifecycle_index_groups(lifecycle_groups, state) do
+      plans
+      |> Enum.flat_map(fn %{metadata_index_entries: entries} -> entries end)
+      |> then(&flow_index_put_new_entries(state, &1))
+    end
+  end
+
+  defp flow_put_lifecycle_index_groups(groups, state) do
+    Enum.each(groups, fn {key, member_score_pairs} ->
+      flow_index_put_new_lifecycle_members(state, key, Enum.reverse(member_score_pairs))
+    end)
 
     :ok
   end
@@ -9144,23 +10889,161 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_claim_put_history(state, plans, now_ms) do
-    history_entries =
-      Enum.map(plans, fn {record, next} ->
-        flow_history_put_ready_entry(
-          state,
-          next,
-          "claimed",
-          now_ms,
-          flow_previous_history_ms(record)
-        )
+    flow_with_forced_async_history(fn ->
+      flow_claim_put_history_batch(state, plans, now_ms)
+    end)
+  end
+
+  defp flow_claim_put_history_batch(_state, [], _now_ms), do: :ok
+
+  defp flow_claim_put_history_batch(state, plans, now_ms) do
+    if flow_async_history_enabled?(state) do
+      {projection_entries, after_history_records} =
+        flow_claim_async_history_entries(state, plans, now_ms, [], [])
+
+      with :ok <- queue_pending_flow_history_projections_batch(projection_entries) do
+        flow_claim_after_history_put_records_batch(state, after_history_records)
+      end
+    else
+      history_entries =
+        Enum.map(plans, fn
+          {:native_claim, next, _entry, _state_key, _value, previous_history_ms} ->
+            flow_history_put_ready_entry(
+              state,
+              next,
+              "claimed",
+              now_ms,
+              previous_history_ms
+            )
+
+          plan ->
+            {record, next} = flow_claim_plan_pair(plan)
+
+            flow_history_put_ready_entry(
+              state,
+              next,
+              "claimed",
+              now_ms,
+              flow_previous_history_ms(record)
+            )
+        end)
+
+      with :ok <- flow_history_index_put_entries(state, history_entries) do
+        flow_claim_after_history_put_batch(state, plans)
+      end
+    end
+  end
+
+  defp flow_claim_async_history_entries(_state, [], _now_ms, entries, after_history_records) do
+    {Enum.reverse(entries), Enum.reverse(after_history_records)}
+  end
+
+  defp flow_claim_async_history_entries(
+         state,
+         [{:native_claim, next, _entry, _state_key, _value, previous_history_ms} | rest],
+         now_ms,
+         entries,
+         after_history_records
+       ) do
+    entry = flow_claim_async_history_entry(state, next, now_ms, previous_history_ms)
+    after_history_records = flow_claim_after_history_record_acc(next, after_history_records)
+
+    flow_claim_async_history_entries(
+      state,
+      rest,
+      now_ms,
+      [entry | entries],
+      after_history_records
+    )
+  end
+
+  defp flow_claim_async_history_entries(
+         state,
+         [plan | rest],
+         now_ms,
+         entries,
+         after_history_records
+       ) do
+    {record, next} = flow_claim_plan_pair(plan)
+    entry = flow_claim_async_history_entry(state, next, now_ms, flow_previous_history_ms(record))
+    after_history_records = flow_claim_after_history_record_acc(next, after_history_records)
+
+    flow_claim_async_history_entries(
+      state,
+      rest,
+      now_ms,
+      [entry | entries],
+      after_history_records
+    )
+  end
+
+  defp flow_claim_after_history_record_acc(record, acc) do
+    if flow_claim_after_history_fast_record?(record), do: acc, else: [record | acc]
+  end
+
+  defp flow_claim_async_history_entry(
+         state,
+         %{id: id, version: version} = record,
+         now_ms,
+         previous_history_ms
+       ) do
+    partition_key = Map.get(record, :partition_key)
+    history_key = FlowKeys.history_key(id, partition_key)
+
+    {event_id, event_ms} =
+      flow_history_next_event(state, history_key, now_ms, version, previous_history_ms)
+
+    compound_key = FlowKeys.stream_entry_key_from_history_key(history_key, event_id)
+
+    %{
+      key: compound_key,
+      expire_at_ms: 0,
+      history_key: history_key,
+      event_id: event_id,
+      event_ms: event_ms,
+      version: version,
+      history_max_events: Map.get(record, :history_max_events),
+      record: record,
+      event: "claimed",
+      now_ms: now_ms,
+      meta: %{}
+    }
+  end
+
+  defp flow_claim_after_history_put_batch(state, plans) do
+    records =
+      Enum.map(plans, fn plan ->
+        {_record, next} = flow_claim_plan_pair(plan)
+        next
       end)
 
-    flow_history_index_put_entries(state, history_entries)
-
-    plans
-    |> Enum.map(fn {_record, next} -> next end)
-    |> flow_after_history_put_many(state)
+    flow_claim_after_history_put_records_batch(state, records)
   end
+
+  defp flow_claim_after_history_put_records_batch(state, records) do
+    if Enum.all?(records, &flow_claim_after_history_fast_record?/1) do
+      :ok
+    else
+      flow_after_history_put_many(records, state)
+    end
+  end
+
+  defp flow_claim_after_history_fast_record?(%{state: "running"} = record) do
+    flow_history_trim_skippable?(record)
+  end
+
+  defp flow_claim_after_history_fast_record?(_record), do: false
+
+  defp flow_history_trim_skippable?(%{history_max_events: nil}), do: true
+
+  defp flow_history_trim_skippable?(%{history_max_events: max}) when not is_integer(max),
+    do: true
+
+  defp flow_history_trim_skippable?(%{history_max_events: max, version: version})
+       when is_integer(version) and version <= max,
+       do: true
+
+  defp flow_history_trim_skippable?(_record), do: false
 
   defp flow_transition_put_history(state, plans) do
     flow_many_put_history(state, plans, "transitioned")
@@ -9222,6 +11105,27 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_create_put_fast_history(state, plans) do
+    history_entries =
+      Enum.map(plans, fn %{record: record, history_key: history_key} ->
+        flow_history_put_ready_entry_with_key(
+          state,
+          record,
+          history_key,
+          "created",
+          Map.get(record, :created_at_ms),
+          nil,
+          %{}
+        )
+      end)
+
+    with :ok <- flow_history_index_put_entries(state, history_entries) do
+      plans
+      |> Enum.map(fn %{record: record} -> record end)
+      |> flow_after_history_put_many(state)
+    end
+  end
+
   defp flow_require_record(state, id, partition_key) do
     case flow_read_record(state, id, partition_key) do
       nil -> {:error, "ERR flow not found"}
@@ -9241,7 +11145,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_history_put_ready_entry(
          state,
-         %{id: id, version: version} = record,
+         %{id: id, version: _version} = record,
          event,
          now_ms,
          previous_history_ms,
@@ -9250,22 +11154,46 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
 
+    flow_history_put_ready_entry_with_key(
+      state,
+      record,
+      history_key,
+      event,
+      now_ms,
+      previous_history_ms,
+      meta
+    )
+  end
+
+  defp flow_history_put_ready_entry_with_key(
+         state,
+         %{version: version} = record,
+         history_key,
+         event,
+         now_ms,
+         previous_history_ms,
+         meta
+       ) do
     {event_id, event_ms} =
       flow_history_next_event(state, history_key, now_ms, version, previous_history_ms)
 
-    compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+    compound_key = FlowKeys.stream_entry_key_from_history_key(history_key, event_id)
 
-    :ok =
-      flow_history_put_or_queue_entry(state, %{
-        key: compound_key,
-        expire_at_ms: 0,
-        history_key: history_key,
-        event_id: event_id,
-        event_ms: event_ms,
-        version: version,
-        history_max_events: Map.get(record, :history_max_events),
-        snapshot: Flow.history_snapshot(record, event, now_ms, meta)
-      })
+    entry = %{
+      key: compound_key,
+      expire_at_ms: 0,
+      history_key: history_key,
+      event_id: event_id,
+      event_ms: event_ms,
+      version: version,
+      history_max_events: Map.get(record, :history_max_events),
+      record: record,
+      event: event,
+      now_ms: now_ms,
+      meta: meta
+    }
+
+    :ok = flow_history_put_or_queue_entry(state, entry)
 
     {history_key, event_id, event_ms}
   end
@@ -9306,22 +11234,40 @@ defmodule Ferricstore.Raft.StateMachine do
          %{id: id, type: type, state: flow_state, priority: priority} = record
        ) do
     partition_key = Map.get(record, :partition_key)
+    state_key = FlowKeys.state_key(id, partition_key)
+    history_key = FlowKeys.history_key(id, partition_key)
 
-    with :ok <- flow_validate_key_size(FlowKeys.state_key(id, partition_key)),
-         :ok <- flow_validate_key_size(FlowKeys.history_key(id, partition_key)),
+    with :ok <- flow_validate_key_size(state_key),
+         :ok <- flow_validate_key_size(history_key),
          :ok <- flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)),
          :ok <-
            flow_validate_key_size(
-             FlowKeys.stream_entry_key(
-               id,
-               "18446744073709551615-18446744073709551615",
-               partition_key
+             FlowKeys.stream_entry_key_from_history_key(
+               history_key,
+               "18446744073709551615-18446744073709551615"
              )
            ) do
       with :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key),
            :ok <- flow_validate_running_index_keys(record, type, partition_key) do
         flow_validate_metadata_index_keys(record, partition_key)
       end
+    end
+  end
+
+  defp flow_validate_terminal_state_index_key(%{type: type, state: flow_state} = record) do
+    type
+    |> FlowKeys.state_index_key(flow_state, Map.get(record, :partition_key))
+    |> flow_validate_key_size()
+  end
+
+  defp flow_validate_claim_next_record_keys(
+         %{type: type, state: flow_state, priority: priority} = record
+       ) do
+    partition_key = Map.get(record, :partition_key)
+
+    with :ok <- flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)),
+         :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key) do
+      flow_validate_running_index_keys(record, type, partition_key)
     end
   end
 
@@ -9380,6 +11326,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_read_record(state, id, partition_key) do
     key = FlowKeys.state_key(id, partition_key)
 
+    flow_read_record_by_key(state, key)
+  end
+
+  defp flow_read_record_by_key(state, key) do
     cond do
       flow_lmdb_mirror?(state) ->
         case flow_read_mirror_record(state, key) do
@@ -9408,12 +11358,62 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_read_records(state, attrs_list) do
-    keys =
-      Enum.map(attrs_list, fn attrs ->
-        FlowKeys.state_key(Map.fetch!(attrs, :id), Map.get(attrs, :partition_key))
-      end)
+    flow_read_records_by_keys(state, flow_state_keys_for_attrs(attrs_list))
+  end
 
-    flow_read_records_by_keys(state, keys)
+  defp flow_state_keys_for_attrs(attrs_list) do
+    Enum.map(attrs_list, fn attrs ->
+      FlowKeys.state_key(Map.fetch!(attrs, :id), Map.get(attrs, :partition_key))
+    end)
+  end
+
+  defp flow_state_key_present?(state, key) do
+    case flow_state_key_present_hot?(state, key) do
+      true -> true
+      false -> flow_lmdb_mirror?(state) and flow_lmdb_record_present?(state, key)
+    end
+  end
+
+  defp flow_state_keys_present(state, keys) do
+    hot_results = Enum.map(keys, &flow_state_key_present_hot?(state, &1))
+
+    if flow_lmdb_mirror?(state) and Enum.any?(hot_results, &(&1 == false)) do
+      lmdb_reads =
+        keys
+        |> Enum.zip(hot_results)
+        |> Enum.with_index()
+        |> Enum.flat_map(fn
+          {{key, false}, idx} -> [{idx, key}]
+          {_present, _idx} -> []
+        end)
+
+      lmdb_results =
+        flow_lmdb_records_present(
+          state,
+          Enum.map(lmdb_reads, fn {_idx, key} -> key end)
+        )
+
+      lmdb_by_idx =
+        lmdb_reads
+        |> Enum.zip(lmdb_results)
+        |> Map.new(fn {{idx, _key}, present?} -> {idx, present?} end)
+
+      hot_results
+      |> Enum.with_index()
+      |> Enum.map(fn
+        {true, _idx} -> true
+        {false, idx} -> Map.get(lmdb_by_idx, idx, false)
+      end)
+    else
+      hot_results
+    end
+  end
+
+  defp flow_state_key_present_hot?(state, key) do
+    case ets_lookup(state, key) do
+      {:hit, value, _expire_at_ms} when is_binary(value) -> true
+      _ -> false
+    end
   end
 
   defp flow_read_records_by_keys(state, keys) do
@@ -9422,7 +11422,17 @@ defmodule Ferricstore.Raft.StateMachine do
         flow_read_mirror_records(state, keys)
 
       true ->
-        Enum.map(keys, &flow_read_ets_record(state, &1))
+        Enum.map(keys, &flow_read_hot_state_record(state, &1))
+    end
+  end
+
+  defp flow_read_hot_state_record(state, key) do
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when is_binary(value) ->
+        flow_decode_hot_state_value(value)
+
+      _ ->
+        flow_read_ets_record(state, key)
     end
   end
 
@@ -9530,17 +11540,102 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_lmdb_records_present(_state, []), do: []
+
+  defp flow_lmdb_records_present(state, keys) do
+    pending = Process.get(:sm_pending_lmdb_values, %{})
+
+    {results, lmdb_keys} =
+      keys
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, []}, fn {key, idx}, {result_acc, read_acc} ->
+        if Map.has_key?(pending, key) do
+          result = flow_pending_lmdb_record_present?(pending, key)
+          {Map.put(result_acc, idx, result), read_acc}
+        else
+          {result_acc, [{idx, key} | read_acc]}
+        end
+      end)
+
+    lmdb_results =
+      flow_lmdb_get_many_present(
+        state,
+        lmdb_keys
+        |> Enum.reverse()
+        |> Enum.map(fn {_idx, key} -> key end)
+      )
+
+    results =
+      lmdb_keys
+      |> Enum.reverse()
+      |> Enum.zip(lmdb_results)
+      |> Enum.reduce(results, fn {{idx, _key}, present?}, acc -> Map.put(acc, idx, present?) end)
+
+    for idx <- 0..(length(keys) - 1)//1, do: Map.get(results, idx, false)
+  end
+
+  defp flow_lmdb_get_many_present(_state, []), do: []
+
+  defp flow_lmdb_get_many_present(state, keys) do
+    case Ferricstore.Flow.LMDB.get_many(flow_lmdb_record_path(state), keys) do
+      {:ok, results} ->
+        Enum.map(results, fn
+          {:ok, blob} -> flow_lmdb_blob_present?(blob)
+          :not_found -> false
+          {:error, _reason} -> false
+        end)
+
+      {:error, _reason} ->
+        Enum.map(keys, fn key ->
+          case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), key) do
+            {:ok, blob} -> flow_lmdb_blob_present?(blob)
+            :not_found -> false
+            {:error, _reason} -> false
+          end
+        end)
+    end
+  end
+
+  defp flow_lmdb_record_present?(state, key) do
+    case flow_lmdb_get_many_present(state, [key]) do
+      [present?] -> present?
+      _ -> false
+    end
+  end
+
+  defp flow_pending_lmdb_record_present?(pending, key) do
+    case Map.get(pending, key) do
+      {:put, blob} -> flow_lmdb_blob_present?(blob)
+      :delete -> false
+      _ -> false
+    end
+  end
+
+  defp flow_lmdb_blob_present?(blob) when is_binary(blob) do
+    case Ferricstore.Flow.LMDB.decode_value(blob, apply_now_ms()) do
+      {:ok, _value} -> true
+      :expired -> false
+      :error -> false
+    end
+  end
+
+  defp flow_lmdb_blob_present?(_blob), do: false
+
   defp flow_read_ets_record(state, key) do
     case ets_lookup(state, key) do
       {:hit, value, _expire_at_ms} when is_binary(value) ->
-        try do
-          Flow.decode_record(value)
-        rescue
-          _ -> nil
-        end
+        flow_decode_hot_state_value(value)
 
       _ ->
         nil
+    end
+  end
+
+  defp flow_decode_hot_state_value(value) when is_binary(value) do
+    try do
+      Flow.decode_record(value)
+    rescue
+      _ -> nil
     end
   end
 
@@ -9589,15 +11684,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_decode_record_blob(_value), do: :miss
 
-  defp flow_decode_record_blob(state, value) when is_binary(value) do
-    case materialize_blob_value(state, value) do
-      {:ok, materialized} -> flow_decode_record_blob(materialized)
-      {:error, _reason} -> :miss
-    end
-  end
-
-  defp flow_decode_record_blob(_state, _value), do: :miss
-
   defp flow_history_event_fields(state, id, event_id, partition_key) do
     history_key = FlowKeys.history_key(id, partition_key)
 
@@ -9608,8 +11694,8 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_history_indexed_event_fields(state, id, partition_key, history_key, event_id) do
-    compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+  defp flow_history_indexed_event_fields(state, _id, _partition_key, history_key, event_id) do
+    compound_key = FlowKeys.stream_entry_key_from_history_key(history_key, event_id)
 
     case flow_index_score_of(state, history_key, event_id) do
       {:ok, _score} ->
@@ -9771,13 +11857,13 @@ defmodule Ferricstore.Raft.StateMachine do
     due_key = FlowKeys.due_key(type, flow_state, priority, partition_key)
     score = Map.fetch!(record, :next_run_at_ms)
 
-    flow_zset_put_new(state, due_key, id, score)
+    flow_index_put_new_lifecycle_members(state, due_key, [{id, score}])
   end
 
   defp flow_zset_delete_members_from_key(_state, _due_key, []), do: :ok
 
   defp flow_zset_delete_members_from_key(state, due_key, ids) do
-    flow_zset_delete_many(state, due_key, Enum.uniq(ids))
+    flow_index_delete_lifecycle_members(state, due_key, Enum.uniq(ids))
   end
 
   defp flow_zset_index_delete_grouped(state, key_ids) do
@@ -9790,12 +11876,39 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp flow_zset_lifecycle_index_delete_grouped(_state, []), do: :ok
+
+  defp flow_zset_lifecycle_index_delete_grouped(state, [{key, id}]) do
+    flow_index_delete_lifecycle_members(state, key, [id])
+  end
+
+  defp flow_zset_lifecycle_index_delete_grouped(state, [{key, id1}, {key, id2}]) do
+    ids = if id1 == id2, do: [id1], else: [id1, id2]
+    flow_index_delete_lifecycle_members(state, key, ids)
+  end
+
+  defp flow_zset_lifecycle_index_delete_grouped(state, [{key1, id1}, {key2, id2}]) do
+    flow_index_delete_lifecycle_members(state, key1, [id1])
+    flow_index_delete_lifecycle_members(state, key2, [id2])
+  end
+
+  defp flow_zset_lifecycle_index_delete_grouped(state, key_ids) do
+    key_ids
+    |> Enum.group_by(fn {key, _id} -> key end, fn {_key, id} -> id end)
+    |> Enum.each(fn {key, ids} ->
+      flow_index_delete_lifecycle_members(state, key, Enum.uniq(ids))
+    end)
+
+    :ok
+  end
+
   defp flow_index_put(state, %{id: id, type: type, state: flow_state} = record) do
     partition_key = Map.get(record, :partition_key)
     state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
     updated_score = Map.get(record, :updated_at_ms, 0)
 
-    with :ok <- flow_zset_put_new(state, state_index_key, id, updated_score),
+    with :ok <-
+           flow_index_put_new_lifecycle_members(state, state_index_key, [{id, updated_score}]),
          :ok <- flow_metadata_index_put(state, record, updated_score) do
       flow_running_index_put(state, record)
     end
@@ -9826,14 +11939,20 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_metadata_index_empty?(parent_flow_id, root_flow_id, correlation_id, id) do
     flow_blank_metadata?(parent_flow_id) and flow_blank_metadata?(correlation_id) and
-      root_flow_id in [nil, "", id]
+      flow_blank_or_same_metadata?(root_flow_id, id)
   end
 
-  defp flow_blank_metadata?(value), do: value in [nil, ""]
+  defp flow_blank_metadata?(nil), do: true
+  defp flow_blank_metadata?(""), do: true
+  defp flow_blank_metadata?(_value), do: false
 
-  defp flow_metadata_index_entry(entries, :root, value, _partition_key, id, _score)
-       when value in [nil, "", id],
-       do: entries
+  defp flow_blank_or_same_metadata?(nil, _id), do: true
+  defp flow_blank_or_same_metadata?("", _id), do: true
+  defp flow_blank_or_same_metadata?(value, id), do: value == id
+
+  defp flow_metadata_index_entry(entries, :root, nil, _partition_key, _id, _score), do: entries
+  defp flow_metadata_index_entry(entries, :root, "", _partition_key, _id, _score), do: entries
+  defp flow_metadata_index_entry(entries, :root, id, _partition_key, id, _score), do: entries
 
   defp flow_metadata_index_entry(entries, kind, value, partition_key, id, score)
        when is_binary(value) and value != "" do
@@ -9849,14 +11968,51 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_metadata_index_entry(entries, _kind, _value, _partition_key, _id, _score), do: entries
 
+  defp flow_metadata_index_entries_with_tag(record, tag) do
+    id = Map.get(record, :id)
+    parent_flow_id = Map.get(record, :parent_flow_id)
+    root_flow_id = Map.get(record, :root_flow_id)
+    correlation_id = Map.get(record, :correlation_id)
+
+    if flow_metadata_index_empty?(parent_flow_id, root_flow_id, correlation_id, id) do
+      []
+    else
+      score = Map.get(record, :updated_at_ms, 0)
+
+      []
+      |> flow_metadata_index_entry_with_tag(:parent, parent_flow_id, tag, id, score)
+      |> flow_metadata_index_entry_with_tag(:root, root_flow_id, tag, id, score)
+      |> flow_metadata_index_entry_with_tag(:correlation, correlation_id, tag, id, score)
+    end
+  end
+
+  defp flow_metadata_index_entry_with_tag(entries, :root, nil, _tag, _id, _score), do: entries
+  defp flow_metadata_index_entry_with_tag(entries, :root, "", _tag, _id, _score), do: entries
+  defp flow_metadata_index_entry_with_tag(entries, :root, id, _tag, id, _score), do: entries
+
+  defp flow_metadata_index_entry_with_tag(entries, kind, value, tag, id, score)
+       when is_binary(value) and value != "" do
+    key =
+      case kind do
+        :parent -> flow_parent_index_key_with_tag(tag, value)
+        :root -> flow_root_index_key_with_tag(tag, value)
+        :correlation -> flow_correlation_index_key_with_tag(tag, value)
+      end
+
+    [{key, id, score} | entries]
+  end
+
+  defp flow_metadata_index_entry_with_tag(entries, _kind, _value, _tag, _id, _score), do: entries
+
   defp flow_running_index_put(state, %{state: "running", id: id, type: type} = record) do
     partition_key = Map.get(record, :partition_key)
     lease_score = Map.get(record, :lease_deadline_ms, 0)
     inflight_index_key = FlowKeys.inflight_index_key(type, partition_key)
     worker_index_key = FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
 
-    with :ok <- flow_zset_put_new(state, inflight_index_key, id, lease_score) do
-      flow_zset_put_new(state, worker_index_key, id, lease_score)
+    with :ok <-
+           flow_index_put_new_lifecycle_members(state, inflight_index_key, [{id, lease_score}]) do
+      flow_index_put_new_lifecycle_members(state, worker_index_key, [{id, lease_score}])
     end
   end
 
@@ -9865,7 +12021,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_due_put_many_new(_state, []), do: :ok
 
   defp flow_due_put_many_new(state, records) do
-    flow_due_put_many_with(state, records, &flow_zset_put_many_new/3)
+    flow_due_put_many_with(state, records, &flow_index_put_new_lifecycle_members/3)
   end
 
   defp flow_due_put_many_with(state, records, put_fun) do
@@ -9906,41 +12062,35 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_tables?(_state), do: false
 
-  defp flow_index_range_slice(
-         %{flow_index_name: index} = state,
-         key,
-         min_bound,
-         max_bound,
-         reverse?,
-         offset,
-         count
-       ) do
-    if flow_index_tables?(state) do
-      FlowIndex.range_slice(index, key, min_bound, max_bound, reverse?, offset, count)
-    else
-      ZSetIndex.range_slice(
-        state.zset_score_index_name,
-        key,
-        min_bound,
-        max_bound,
-        reverse?,
-        offset,
-        count
-      )
+  defp flow_native_index(%{flow_index_name: index, flow_lookup_name: lookup})
+       when index != nil and lookup != nil do
+    NativeFlowIndex.get(index, lookup)
+  end
+
+  defp flow_native_index(_state), do: nil
+
+  defp flow_claim_index_count_keys(state) do
+    case flow_native_index(state) do
+      nil -> flow_index_count_keys(state)
+      native -> NativeFlowIndex.due_count_keys(native)
     end
   end
 
-  defp flow_index_range_slice(state, key, min_bound, max_bound, reverse?, offset, count) do
-    ZSetIndex.range_slice(
-      state.zset_score_index_name,
-      key,
-      min_bound,
-      max_bound,
-      reverse?,
-      offset,
-      count
-    )
+  defp flow_native_index_for_read(state, key) do
+    if flow_native_lifecycle_index_key?(key) and
+         Process.get(:sm_pending_flow_native_ops, []) == [] do
+      flow_native_index(state)
+    end
   end
+
+  defp flow_native_lifecycle_index_key?(key) when is_binary(key) do
+    :binary.match(key, "}:d:") != :nomatch or
+      :binary.match(key, "}:i:s:") != :nomatch or
+      :binary.match(key, "}:i:r:") != :nomatch or
+      :binary.match(key, "}:i:w:") != :nomatch
+  end
+
+  defp flow_native_lifecycle_index_key?(_key), do: false
 
   defp flow_index_rank_range(
          %{flow_index_name: index} = state,
@@ -9949,41 +12099,50 @@ defmodule Ferricstore.Raft.StateMachine do
          stop_idx,
          reverse?
        ) do
-    if flow_index_tables?(state) do
-      FlowIndex.rank_range(index, key, start_idx, stop_idx, reverse?)
-    else
-      []
+    case flow_native_index_for_read(state, key) do
+      nil ->
+        if flow_index_tables?(state) do
+          FlowIndex.rank_range(index, key, start_idx, stop_idx, reverse?)
+        else
+          []
+        end
+
+      native ->
+        NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)
     end
   end
 
   defp flow_index_rank_range(_state, _key, _start_idx, _stop_idx, _reverse?), do: []
 
   defp flow_index_count_all(%{flow_lookup_name: lookup} = state, key) do
-    if flow_index_tables?(state), do: FlowIndex.count_all(lookup, key), else: 0
+    case flow_native_index_for_read(state, key) do
+      nil -> if flow_index_tables?(state), do: FlowIndex.count_all(lookup, key), else: 0
+      native -> NativeFlowIndex.count_all(native, key)
+    end
   end
 
   defp flow_index_count_all(_state, _key), do: 0
 
   defp flow_index_count_keys(%{flow_lookup_name: lookup} = state) do
-    if flow_index_tables?(state), do: FlowIndex.count_keys(lookup), else: []
+    case flow_native_index(state) do
+      nil -> if flow_index_tables?(state), do: FlowIndex.due_count_keys(lookup), else: []
+      native -> NativeFlowIndex.due_count_keys(native)
+    end
   end
 
   defp flow_index_count_keys(_state), do: []
 
   defp flow_index_score_of(%{flow_lookup_name: lookup} = state, key, member) do
-    if flow_index_tables?(state), do: FlowIndex.score_of(lookup, key, member), else: :miss
+    case flow_native_index_for_read(state, key) do
+      nil ->
+        if flow_index_tables?(state), do: FlowIndex.score_of(lookup, key, member), else: :miss
+
+      native ->
+        NativeFlowIndex.score_of(native, key, member)
+    end
   end
 
   defp flow_index_score_of(_state, _key, _member), do: :miss
-
-  defp flow_zset_put_new(
-         state,
-         due_key,
-         id,
-         score
-       ) do
-    flow_index_put_new_member(state, due_key, id, score)
-  end
 
   defp flow_zset_put_many_new(
          state,
@@ -10001,15 +12160,6 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_index_delete_members(state, due_key, ids)
   end
 
-  defp flow_index_put_new_member(state, key, member, score) do
-    if flow_index_tables?(state) do
-      track_flow_index_missing_originals(state, key, [member])
-      FlowIndex.put_new_member(state.flow_index_name, state.flow_lookup_name, key, member, score)
-    end
-
-    :ok
-  end
-
   defp flow_index_put_members(state, key, member_score_pairs) do
     if flow_index_tables?(state) do
       track_flow_index_originals(
@@ -10024,6 +12174,8 @@ defmodule Ferricstore.Raft.StateMachine do
         key,
         member_score_pairs
       )
+
+      flow_native_put_members(state, key, member_score_pairs)
     end
 
     :ok
@@ -10043,9 +12195,44 @@ defmodule Ferricstore.Raft.StateMachine do
         key,
         member_score_pairs
       )
+
+      flow_native_put_new_members(state, key, member_score_pairs)
     end
 
     :ok
+  end
+
+  defp flow_index_put_new_lifecycle_members(state, key, member_score_pairs) do
+    if flow_native_lifecycle_pending?(state) do
+      flow_native_put_new_members(state, key, member_score_pairs)
+    else
+      if flow_index_tables?(state) do
+        track_flow_index_missing_originals(
+          state,
+          key,
+          Enum.map(member_score_pairs, fn {member, _score} -> member end),
+          :lifecycle
+        )
+
+        FlowIndex.put_new_members(
+          state.flow_index_name,
+          state.flow_lookup_name,
+          key,
+          member_score_pairs
+        )
+
+        flow_native_put_new_members(state, key, member_score_pairs)
+      end
+    end
+
+    :ok
+  end
+
+  defp flow_native_lifecycle_pending?(state) do
+    case flow_native_index(state) do
+      nil -> false
+      _native -> is_list(Process.get(:sm_pending_flow_native_ops, :undefined))
+    end
   end
 
   defp flow_index_put_new_entries(state, key_member_score_triples) do
@@ -10063,6 +12250,8 @@ defmodule Ferricstore.Raft.StateMachine do
         state.flow_lookup_name,
         key_member_score_triples
       )
+
+      flow_native_put_new_entries(state, key_member_score_triples)
     end
 
     :ok
@@ -10084,6 +12273,63 @@ defmodule Ferricstore.Raft.StateMachine do
         state.flow_lookup_name,
         key_key_member_score_quads
       )
+
+      flow_native_move_entries(state, key_key_member_score_quads)
+    end
+
+    :ok
+  end
+
+  defp flow_index_move_lifecycle_entries(state, [{_from_key, _to_key, _member, _score} = entry]) do
+    if flow_native_lifecycle_pending?(state) do
+      flow_native_move_entries(state, [entry])
+    else
+      flow_index_move_lifecycle_entries_ets(state, [entry])
+    end
+  end
+
+  defp flow_index_move_lifecycle_entries(state, key_key_member_score_quads) do
+    if flow_native_lifecycle_pending?(state) do
+      flow_native_move_entries(state, key_key_member_score_quads)
+    else
+      flow_index_move_lifecycle_entries_ets(state, key_key_member_score_quads)
+    end
+  end
+
+  defp flow_index_move_lifecycle_entries_ets(state, [{from_key, to_key, member, _score} = entry]) do
+    if flow_index_tables?(state) do
+      if from_key == to_key do
+        track_flow_index_originals(state, from_key, [member], :lifecycle)
+      else
+        track_flow_index_originals(state, from_key, [member], :lifecycle)
+        track_flow_index_originals(state, to_key, [member], :lifecycle)
+      end
+
+      FlowIndex.move_entries(state.flow_index_name, state.flow_lookup_name, [entry])
+      flow_native_move_entries(state, [entry])
+    end
+
+    :ok
+  end
+
+  defp flow_index_move_lifecycle_entries_ets(state, key_key_member_score_quads) do
+    if flow_index_tables?(state) do
+      key_key_member_score_quads
+      |> Enum.flat_map(fn {from_key, to_key, member, _score} ->
+        [{from_key, member}, {to_key, member}]
+      end)
+      |> Enum.group_by(fn {key, _member} -> key end, fn {_key, member} -> member end)
+      |> Enum.each(fn {key, members} ->
+        track_flow_index_originals(state, key, Enum.uniq(members), :lifecycle)
+      end)
+
+      FlowIndex.move_entries(
+        state.flow_index_name,
+        state.flow_lookup_name,
+        key_key_member_score_quads
+      )
+
+      flow_native_move_entries(state, key_key_member_score_quads)
     end
 
     :ok
@@ -10093,35 +12339,96 @@ defmodule Ferricstore.Raft.StateMachine do
     if flow_index_tables?(state) do
       track_flow_index_originals(state, key, members)
       FlowIndex.delete_members(state.flow_index_name, state.flow_lookup_name, key, members)
+      flow_native_delete_members(state, key, members)
+    end
+
+    :ok
+  end
+
+  defp flow_index_delete_lifecycle_members(state, key, members) do
+    if flow_native_lifecycle_pending?(state) do
+      flow_native_delete_members(state, key, members)
+    else
+      if flow_index_tables?(state) do
+        track_flow_index_originals(state, key, members, :lifecycle)
+        FlowIndex.delete_members(state.flow_index_name, state.flow_lookup_name, key, members)
+        flow_native_delete_members(state, key, members)
+      end
+    end
+
+    :ok
+  end
+
+  defp flow_native_put_members(state, key, member_score_pairs) do
+    case flow_native_index(state) do
+      nil ->
+        :ok
+
+      native ->
+        entries = Enum.map(member_score_pairs, fn {member, score} -> {key, member, score} end)
+        flow_native_apply_or_queue(native, {:put_entries, entries})
+    end
+  end
+
+  defp flow_native_put_new_members(state, key, member_score_pairs) do
+    case flow_native_index(state) do
+      nil ->
+        :ok
+
+      native ->
+        entries = Enum.map(member_score_pairs, fn {member, score} -> {key, member, score} end)
+        flow_native_apply_or_queue(native, {:put_new_entries, entries})
+    end
+  end
+
+  defp flow_native_put_new_entries(state, key_member_score_triples) do
+    case flow_native_index(state) do
+      nil -> :ok
+      native -> flow_native_apply_or_queue(native, {:put_new_entries, key_member_score_triples})
+    end
+  end
+
+  defp flow_native_move_entries(state, key_key_member_score_quads) do
+    case flow_native_index(state) do
+      nil -> :ok
+      native -> flow_native_apply_or_queue(native, {:move_entries, key_key_member_score_quads})
+    end
+  end
+
+  defp flow_native_delete_members(state, key, members) do
+    case flow_native_index(state) do
+      nil -> :ok
+      native -> flow_native_apply_or_queue(native, {:delete_members, key, members})
+    end
+  end
+
+  defp flow_native_apply_claim_entries(state, entries) do
+    case flow_native_index(state) do
+      nil -> :ok
+      native -> flow_native_apply_or_queue(native, {:apply_claim_entries, entries})
+    end
+  end
+
+  defp flow_native_apply_or_queue(native, op) do
+    case Process.get(:sm_pending_flow_native_ops, :undefined) do
+      ops when is_list(ops) ->
+        Process.put(:sm_pending_flow_native_ops, [{native, op} | ops])
+
+      _ ->
+        NativeFlowIndex.apply_batch(native, [op])
     end
 
     :ok
   end
 
   defp track_flow_index_missing_originals(state, key, members) do
-    case Process.get(:sm_pending_flow_index_originals, :undefined) do
-      originals when is_map(originals) ->
-        track_flow_index_count_original(state, key)
-
-        originals =
-          Enum.reduce(members, originals, fn member, acc ->
-            original_key = {state.flow_index_name, state.flow_lookup_name, key, member}
-            Map.put_new(acc, original_key, :missing)
-          end)
-
-        Process.put(:sm_pending_flow_index_originals, originals)
-
-      _ ->
-        :ok
-    end
-
-    :ok
+    track_flow_index_missing_originals(state, key, members, :auto)
   end
 
-  defp track_flow_index_originals(state, key, members) do
+  defp track_flow_index_missing_originals(state, key, members, native_hint) do
     case Process.get(:sm_pending_flow_index_originals, :undefined) do
       originals when is_map(originals) ->
-        track_flow_index_count_original(state, key)
+        track_flow_index_count_original(state, key, native_hint)
 
         originals =
           Enum.reduce(members, originals, fn member, acc ->
@@ -10131,9 +12438,9 @@ defmodule Ferricstore.Raft.StateMachine do
               acc
             else
               original =
-                case FlowIndex.score_of(state.flow_lookup_name, key, member) do
-                  {:ok, score} -> {:score, score}
-                  :miss -> :missing
+                case flow_index_member_original(state, key, member, native_hint) do
+                  {:score, _score} = original -> original
+                  :missing -> :missing
                 end
 
               Map.put(acc, original_key, original)
@@ -10149,7 +12456,42 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp track_flow_index_originals(state, key, members) do
+    track_flow_index_originals(state, key, members, :auto)
+  end
+
+  defp track_flow_index_originals(state, key, members, native_hint) do
+    case Process.get(:sm_pending_flow_index_originals, :undefined) do
+      originals when is_map(originals) ->
+        track_flow_index_count_original(state, key, native_hint)
+
+        originals =
+          Enum.reduce(members, originals, fn member, acc ->
+            original_key = {state.flow_index_name, state.flow_lookup_name, key, member}
+
+            if Map.has_key?(acc, original_key) do
+              acc
+            else
+              original = flow_index_member_original(state, key, member, native_hint)
+
+              Map.put(acc, original_key, original)
+            end
+          end)
+
+        Process.put(:sm_pending_flow_index_originals, originals)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
   defp track_flow_index_count_original(state, key) do
+    track_flow_index_count_original(state, key, :auto)
+  end
+
+  defp track_flow_index_count_original(state, key, native_hint) do
     case Process.get(:sm_pending_flow_index_counts, :undefined) do
       counts when is_map(counts) ->
         count_key = {state.flow_index_name, state.flow_lookup_name, key}
@@ -10157,11 +12499,7 @@ defmodule Ferricstore.Raft.StateMachine do
         if Map.has_key?(counts, count_key) do
           :ok
         else
-          original =
-            case :ets.lookup(state.flow_lookup_name, {:count, key}) do
-              [{{:count, ^key}, count}] when is_integer(count) -> {:count, count}
-              _ -> :missing
-            end
+          original = flow_index_count_original(state, key, native_hint)
 
           Process.put(:sm_pending_flow_index_counts, Map.put(counts, count_key, original))
         end
@@ -10173,7 +12511,80 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp flow_index_member_original(state, key, member, :lifecycle) do
+    case flow_native_index(state) do
+      nil ->
+        flow_index_ets_member_original(state, key, member)
+
+      native ->
+        case NativeFlowIndex.score_of(native, key, member) do
+          {:ok, score} -> {:score, score}
+          :miss -> :missing
+        end
+    end
+  end
+
+  defp flow_index_member_original(state, key, member, :auto) do
+    case flow_native_index_for_read(state, key) do
+      nil ->
+        flow_index_ets_member_original(state, key, member)
+
+      native ->
+        case NativeFlowIndex.score_of(native, key, member) do
+          {:ok, score} -> {:score, score}
+          :miss -> :missing
+        end
+    end
+  end
+
+  defp flow_index_ets_member_original(state, key, member) do
+    case FlowIndex.score_of(state.flow_lookup_name, key, member) do
+      {:ok, score} -> {:score, score}
+      :miss -> :missing
+    end
+  end
+
+  defp flow_index_count_original(state, key, :lifecycle) do
+    case flow_native_index(state) do
+      nil ->
+        flow_index_ets_count_original(state, key)
+
+      native ->
+        case NativeFlowIndex.count_all(native, key) do
+          count when is_integer(count) and count > 0 -> {:count, count}
+          _other -> :missing
+        end
+    end
+  end
+
+  defp flow_index_count_original(state, key, :auto) do
+    case flow_native_index_for_read(state, key) do
+      nil ->
+        flow_index_ets_count_original(state, key)
+
+      native ->
+        case NativeFlowIndex.count_all(native, key) do
+          count when is_integer(count) and count > 0 -> {:count, count}
+          _other -> :missing
+        end
+    end
+  end
+
+  defp flow_index_ets_count_original(state, key) do
+    case :ets.lookup(state.flow_lookup_name, {:count, key}) do
+      [{{:count, ^key}, count}] when is_integer(count) -> {:count, count}
+      _ -> :missing
+    end
+  end
+
   defp rollback_pending_flow_indexes do
+    Process.get(:sm_pending_fast_claim_index_rollbacks, [])
+    |> Enum.each(fn {index_table, lookup_table, entries} ->
+      if :ets.whereis(index_table) != :undefined and :ets.whereis(lookup_table) != :undefined do
+        rollback_fast_claim_index_entries(index_table, lookup_table, entries)
+      end
+    end)
+
     Process.get(:sm_pending_flow_index_originals, %{})
     |> Enum.each(fn
       {{index_table, lookup_table, key, member}, {:score, score}} ->
@@ -10191,16 +12602,42 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.each(fn
       {{_index_table, lookup_table, key}, {:count, count}} ->
         if :ets.whereis(lookup_table) != :undefined do
-          :ets.insert(lookup_table, {{:count, key}, count})
+          FlowIndex.restore_count(lookup_table, key, count)
         end
 
       {{_index_table, lookup_table, key}, :missing} ->
         if :ets.whereis(lookup_table) != :undefined do
-          :ets.delete(lookup_table, {:count, key})
+          FlowIndex.delete_count(lookup_table, key)
         end
     end)
 
     :ok
+  end
+
+  defp rollback_fast_claim_index_entries(index_table, lookup_table, entries) do
+    Enum.each(entries, fn {id, from_due_key, from_due_score, to_due_key, to_due_score,
+                           from_state_key, from_state_score, to_state_key, to_state_score,
+                           inflight_key, worker_key, lease_score} ->
+      :ets.delete(index_table, {to_due_key, to_due_score, id})
+      :ets.delete(index_table, {to_state_key, to_state_score, id})
+      :ets.delete(index_table, {inflight_key, lease_score, id})
+      :ets.delete(index_table, {worker_key, lease_score, id})
+
+      :ets.delete(lookup_table, {to_due_key, id})
+      :ets.delete(lookup_table, {to_state_key, id})
+      :ets.delete(lookup_table, {inflight_key, id})
+      :ets.delete(lookup_table, {worker_key, id})
+
+      :ets.insert(index_table, [
+        {{from_due_key, from_due_score, id}, true},
+        {{from_state_key, from_state_score, id}, true}
+      ])
+
+      :ets.insert(lookup_table, [
+        {{from_due_key, id}, from_due_score},
+        {{from_state_key, id}, from_state_score}
+      ])
+    end)
   end
 
   defp flow_history_put(state, record, event, now_ms) do
@@ -10237,7 +12674,7 @@ defmodule Ferricstore.Raft.StateMachine do
     {event_id, event_ms} =
       flow_history_next_event(state, history_key, now_ms, version, previous_history_ms)
 
-    compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+    compound_key = FlowKeys.stream_entry_key_from_history_key(history_key, event_id)
 
     entry = %{
       key: compound_key,
@@ -10247,12 +12684,15 @@ defmodule Ferricstore.Raft.StateMachine do
       event_ms: event_ms,
       version: version,
       history_max_events: Map.get(record, :history_max_events),
-      snapshot: Flow.history_snapshot(record, event, now_ms, meta)
+      record: record,
+      event: event,
+      now_ms: now_ms,
+      meta: meta
     }
 
     with :ok <-
            flow_history_put_or_queue_entry(state, entry) do
-      if flow_async_history?(state) do
+      if flow_async_history_enabled?(state) do
         :ok
       else
         flow_history_index_put(state, history_key, event_id, event_ms, version)
@@ -10292,7 +12732,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_previous_history_ms(_record), do: nil
 
   defp flow_history_put_or_queue_entry(state, entry) do
-    if flow_async_history?(state) do
+    if flow_async_history_enabled?(state) do
       queue_pending_flow_history_projection(entry)
     else
       raw_put_cold(state, entry.key, flow_history_entry_value(entry), entry.expire_at_ms)
@@ -10311,6 +12751,24 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_async_history?(state), do: Map.get(state, :flow_async_history, false) == true
 
+  defp flow_async_history_enabled?(state) do
+    flow_async_history?(state) or Process.get(@sm_force_async_flow_history_key) == true
+  end
+
+  defp flow_with_forced_async_history(fun) when is_function(fun, 0) do
+    previous = Process.get(@sm_force_async_flow_history_key, :unset)
+    Process.put(@sm_force_async_flow_history_key, true)
+
+    try do
+      fun.()
+    after
+      case previous do
+        :unset -> Process.delete(@sm_force_async_flow_history_key)
+        value -> Process.put(@sm_force_async_flow_history_key, value)
+      end
+    end
+  end
+
   defp flow_history_index_put(state, history_key, event_id, ms, 1) do
     flow_index_put_new_members(state, history_key, [{event_id, ms}])
     :ok
@@ -10324,7 +12782,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_index_put_entries(_state, []), do: :ok
 
   defp flow_history_index_put_entries(state, entries) do
-    if flow_async_history?(state) do
+    if flow_async_history_enabled?(state) do
       :ok
     else
       flow_index_put_new_entries(state, entries)
@@ -10412,25 +12870,10 @@ defmodule Ferricstore.Raft.StateMachine do
       id = Map.fetch!(record, :id)
       partition_key = Map.get(record, :partition_key)
       history_key = FlowKeys.history_key(id, partition_key)
-      count = flow_index_count_all(state, history_key)
 
-      if count > 0 do
-        with_lmdb_mirror_shard(state, fn ->
-          state
-          |> flow_index_rank_range(history_key, 0, count - 1, false)
-          |> Enum.each(fn {event_id, event_ms} ->
-            compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
-
-            queue_lmdb_history_index_put(
-              record,
-              history_key,
-              event_id,
-              trunc(event_ms),
-              compound_key
-            )
-          end)
-        end)
-      end
+      with_lmdb_mirror_shard(state, fn ->
+        queue_lmdb_history_indexes_project_from_index(state, record, history_key)
+      end)
     end
 
     :ok
@@ -10449,32 +12892,8 @@ defmodule Ferricstore.Raft.StateMachine do
     raw_put(state, key, value, expire_at_ms)
   end
 
-  defp do_put_blob_ref(state, key, encoded_ref, expire_at_ms, opts \\ [])
-
-  defp do_put_blob_ref(state, key, encoded_ref, expire_at_ms, opts) when is_binary(encoded_ref) do
-    with {:ok, pending_value} <- prepare_blob_ref_pending_value(state, encoded_ref, opts) do
-      do_put_validated_blob_ref(state, key, encoded_ref, expire_at_ms, pending_value)
-    end
-  end
-
-  defp do_put_blob_ref(_state, _key, _encoded_ref, _expire_at_ms, _opts),
-    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
-
-  defp do_put_validated_blob_ref(
-         state,
-         key,
-         encoded_ref,
-         expire_at_ms,
-         pending_value \\ :none
-       ) do
-    maybe_clear_compound_data_structure_for_string_put(state, key)
-    raw_put_persisted_blob_ref(state, key, encoded_ref, expire_at_ms, pending_value)
-  end
-
   defp flow_put_record_values(state, record, attrs) do
-    with :ok <- do_flow_put_record_values(state, record, attrs) do
-      flow_refresh_terminal_value_expirations(state, record, attrs)
-    end
+    do_flow_put_record_values(state, record, attrs)
   end
 
   defp do_flow_put_record_values(state, record, attrs) do
@@ -10502,13 +12921,16 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_refresh_terminal_value_expirations(state, record, attrs) do
-    expire_at_ms = flow_record_expire_at(record)
+    flow_refresh_terminal_value_expirations_without_materializing(state, record, attrs)
+  end
 
-    if expire_at_ms > 0 and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      flow_refresh_record_value_expirations(state, record, attrs)
-    else
-      :ok
-    end
+  defp flow_refresh_terminal_value_expirations_without_materializing(_state, _record, _attrs) do
+    # Payload/result/error bytes are separate value/blob records. Terminal state
+    # writes must not read those bytes just to refresh TTL: large payloads would
+    # turn a metadata transition into a hidden cold-read/materialize path. Newly
+    # supplied values are already written above with the terminal record expiry;
+    # existing refs keep their original value-retention policy.
+    :ok
   end
 
   defp flow_refresh_record_value_expirations(state, record, attrs) do
@@ -10541,15 +12963,37 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_create_put_record_values(state, plans) do
-    Enum.reduce_while(plans, :ok, fn {record, attrs}, :ok ->
-      case flow_put_record_values(state, record, attrs) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
+    if flow_create_plans_have_record_values?(plans) do
+      Enum.reduce_while(plans, :ok, fn {record, attrs}, :ok ->
+        case flow_put_record_values(state, record, attrs) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    else
+      :ok
+    end
   end
 
   defp flow_many_put_record_values(state, plans) do
+    flow_many_put_record_values(state, plans, :unknown)
+  end
+
+  defp flow_many_put_record_values(_state, _plans, false), do: :ok
+
+  defp flow_many_put_record_values(state, plans, true) do
+    flow_many_put_record_values_nonempty(state, plans)
+  end
+
+  defp flow_many_put_record_values(state, plans, :unknown) do
+    if flow_many_plans_have_record_values?(plans) do
+      flow_many_put_record_values_nonempty(state, plans)
+    else
+      :ok
+    end
+  end
+
+  defp flow_many_put_record_values_nonempty(state, plans) do
     Enum.reduce_while(plans, :ok, fn
       {_record, next, attrs}, :ok ->
         case flow_put_record_values(state, next, attrs) do
@@ -10564,6 +13008,46 @@ defmodule Ferricstore.Raft.StateMachine do
         end
     end)
   end
+
+  defp flow_create_plans_have_record_values?(plans) do
+    Enum.any?(plans, fn {_record, attrs} -> flow_attrs_have_record_values?(attrs) end)
+  end
+
+  defp flow_many_plans_have_record_values?(plans) do
+    Enum.any?(plans, fn
+      {_record, _next, attrs} -> flow_attrs_have_record_values?(attrs)
+      {_record, _next, _history_meta, attrs} -> flow_attrs_have_record_values?(attrs)
+    end)
+  end
+
+  defp flow_attrs_have_record_values?(attrs) do
+    Map.has_key?(attrs, :payload) or Map.has_key?(attrs, :result) or Map.has_key?(attrs, :error)
+  end
+
+  defp flow_attrs_record_value_mode(attrs) do
+    has_payload? = Map.has_key?(attrs, :payload)
+    has_result? = Map.has_key?(attrs, :result)
+    has_error? = Map.has_key?(attrs, :error)
+
+    cond do
+      has_payload? and not has_result? and not has_error? -> :payload_only
+      has_payload? or has_result? or has_error? -> :mixed
+      true -> :none
+    end
+  end
+
+  defp flow_merge_record_value_mode(:mixed, _mode), do: :mixed
+  defp flow_merge_record_value_mode(_mode, :mixed), do: :mixed
+  defp flow_merge_record_value_mode(:empty, mode), do: mode
+  defp flow_merge_record_value_mode(:none, :none), do: :none
+  defp flow_merge_record_value_mode(:none, :payload_only), do: :mixed
+  defp flow_merge_record_value_mode(:payload_only, :none), do: :mixed
+  defp flow_merge_record_value_mode(:none, mode), do: mode
+  defp flow_merge_record_value_mode(mode, :none), do: mode
+  defp flow_merge_record_value_mode(:payload_only, :payload_only), do: :payload_only
+
+  defp flow_finalize_record_value_mode(:empty), do: :none
+  defp flow_finalize_record_value_mode(mode), do: mode
 
   defp flow_put_state_record(state, key, record) when is_map(record) do
     flow_put_state_record_encoded(
@@ -10605,7 +13089,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_put_hot(state, key, value, expire_at_ms) do
-    disk_val = persisted_disk_binary!(state, value)
+    disk_val = to_disk_binary(value)
 
     if cross_shard_pending_active?() do
       cross_shard_raw_put(state, key, value, disk_val, expire_at_ms, LFU.initial())
@@ -10623,7 +13107,8 @@ defmodule Ferricstore.Raft.StateMachine do
         )
       end
 
-      queue_pending_put(key, disk_val, expire_at_ms, value, value)
+      queue_pending_put(key, disk_val, expire_at_ms)
+      Process.put(:sm_pending_fast_staged_put_batch, true)
       maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
 
       :ok
@@ -10635,7 +13120,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp raw_put_cold(state, key, value, expire_at_ms, lfu) do
-    disk_val = persisted_disk_binary!(state, value)
+    disk_val = to_disk_binary(value)
 
     if cross_shard_pending_active?() do
       ets_val = nil
@@ -10652,7 +13137,8 @@ defmodule Ferricstore.Raft.StateMachine do
         )
       end
 
-      queue_pending_put_cold(key, disk_val, expire_at_ms, lfu, value)
+      queue_pending_put_cold(key, disk_val, expire_at_ms, lfu)
+      Process.put(:sm_pending_fast_staged_put_batch, true)
       :ok
     end
   end
@@ -10724,12 +13210,16 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_record_lfu(_record, value), do: flow_cold_lfu(value)
 
   defp flow_cold_lfu(value) when is_binary(value) do
-    case flow_decode_record_blob(value) do
-      {:ok, %{version: version}} when is_integer(version) ->
-        {:flow_state_version, version, LFU.initial()}
+    if Flow.record_blob?(value) do
+      case flow_decode_record_blob(value) do
+        {:ok, %{version: version}} when is_integer(version) ->
+          {:flow_state_version, version, LFU.initial()}
 
-      _ ->
-        LFU.initial()
+        _ ->
+          LFU.initial()
+      end
+    else
+      LFU.initial()
     end
   end
 
@@ -10737,7 +13227,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp raw_put(state, key, value, expire_at_ms) do
     ets_val = value_for_ets(value, hot_cache_threshold(state))
-    disk_val = persisted_disk_binary!(state, value)
+    disk_val = to_disk_binary(value)
 
     if cross_shard_pending_active?() do
       cross_shard_raw_put(state, key, ets_val, disk_val, expire_at_ms, LFU.initial())
@@ -10763,30 +13253,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
       # Accumulate for batch disk write — flushed by flush_pending_writes
       # at the end of apply/3 before returning to ra.
-      queue_pending_put(key, disk_val, expire_at_ms, value, ets_val)
+      queue_pending_put(key, disk_val, expire_at_ms)
       maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
 
-      :ok
-    end
-  end
-
-  defp raw_put_persisted_blob_ref(state, key, encoded_ref, expire_at_ms, pending_value) do
-    if cross_shard_pending_active?() do
-      cross_shard_raw_put(state, key, nil, encoded_ref, expire_at_ms, LFU.initial())
-      :ok
-    else
-      record_pending_original(state, key)
-
-      unless standalone_staged_apply?() do
-        track_keydir_binary_delta(state, key, nil, expire_at_ms)
-
-        :ets.insert(
-          state.ets,
-          {key, nil, expire_at_ms, LFU.initial(), :pending, 0, byte_size(encoded_ref)}
-        )
-      end
-
-      queue_pending_put_blob_ref(key, encoded_ref, expire_at_ms, pending_value)
       :ok
     end
   end
@@ -10833,67 +13302,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts, apply_opts \\ [])
-
-  defp do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts, apply_opts)
-       when is_binary(encoded_ref) do
-    compound_data_structure? = compound_data_structure_key?(state, key)
-    get? = Map.get(opts, :get, false)
-    current = set_current_meta(state, key, get?)
-    exists? = current != nil or compound_data_structure?
-
-    {old_value, old_expire_at_ms} =
-      case current do
-        nil -> {nil, expire_at_ms}
-        {old_value, old_expire_at_ms} -> {old_value, old_expire_at_ms}
-      end
-
-    skip? =
-      cond do
-        Map.get(opts, :nx, false) and exists? -> true
-        Map.get(opts, :xx, false) and not exists? -> true
-        true -> false
-      end
-
-    cond do
-      compound_data_structure? and get? ->
-        {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-
-      skip? and get? ->
-        old_value
-
-      skip? ->
-        nil
-
-      true ->
-        effective_expire_at_ms =
-          if Map.get(opts, :keepttl, false) and exists? do
-            old_expire_at_ms
-          else
-            expire_at_ms
-          end
-
-        case prepare_blob_ref_pending_value(state, encoded_ref, apply_opts) do
-          {:ok, pending_value} ->
-            do_put_validated_blob_ref(
-              state,
-              key,
-              encoded_ref,
-              effective_expire_at_ms,
-              pending_value
-            )
-
-            if get?, do: old_value, else: :ok
-
-          {:error, _reason} = error ->
-            error
-        end
-    end
-  end
-
-  defp do_set_blob_ref(_state, _key, _encoded_ref, _expire_at_ms, _opts, _apply_opts),
-    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
-
   defp set_current_meta(state, key, true), do: do_get_meta(state, key)
 
   defp set_current_meta(state, key, false) do
@@ -10938,7 +13346,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     case Process.put(:sm_pending_writes, []) do
       [] ->
-        :ok
+        flush_pending_flow_native_indexes(state)
 
       pending when is_list(pending) ->
         batch = Enum.reverse(pending)
@@ -10977,6 +13385,7 @@ defmodule Ferricstore.Raft.StateMachine do
               {:ok, locations} ->
                 clear_disk_pressure(state)
                 apply_pending_locations(state, file_id, batch, locations)
+                flush_pending_flow_native_indexes(state)
                 flush_pending_zset_indexes(state)
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
@@ -10995,14 +13404,38 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flush_pending_flow_native_indexes(state) do
+    case Process.put(:sm_pending_flow_native_ops, []) do
+      [] ->
+        :ok
+
+      ops when is_list(ops) ->
+        ops
+        |> Enum.reverse()
+        |> Enum.reduce(%{}, fn
+          {native, op}, acc ->
+            Map.update(acc, native, [op], &[op | &1])
+
+          op, acc ->
+            case flow_native_index(state) do
+              nil -> acc
+              native -> Map.update(acc, native, [op], &[op | &1])
+            end
+        end)
+        |> Enum.each(fn {native, native_ops} ->
+          NativeFlowIndex.apply_batch(native, Enum.reverse(native_ops))
+        end)
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
   defp bitcask_batch_stats(batch) do
     Enum.reduce(batch, {0, 0, 0}, fn
       {:put, key, value, _expire_at_ms}, {batch_bytes, record_bytes, delete_count} ->
-        bytes = byte_size(key) + byte_size(value)
-        {batch_bytes + bytes, record_bytes + @bitcask_record_header_size + bytes, delete_count}
-
-      {:put, key, value, _expire_at_ms, _ets_value, _staged_size},
-      {batch_bytes, record_bytes, delete_count} ->
         bytes = byte_size(key) + byte_size(value)
         {batch_bytes + bytes, record_bytes + @bitcask_record_header_size + bytes, delete_count}
 
@@ -11171,20 +13604,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_append_pending_batch_sync(file_path, batch) do
-    if Enum.any?(batch, &match?({:delete, _, _}, &1)) do
+    if pending_batch_has_delete?(batch) do
       ops =
         Enum.map(batch, fn
-          {:put, key, value, expire_at_ms} ->
-            {:put, key, value, expire_at_ms}
-
-          {:put, key, value, expire_at_ms, _ets_value, _staged_size} ->
-            {:put, key, value, expire_at_ms}
-
-          {:put_cold, key, value, expire_at_ms, _lfu} ->
-            {:put, key, value, expire_at_ms}
-
-          {:delete, key, _prob_path} ->
-            {:delete, key}
+          {:put, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {:put, key, value, expire_at_ms}
+          {:delete, key, _prob_path} -> {:delete, key}
         end)
 
       case NIF.v2_append_ops_batch_nosync(file_path, ops) do
@@ -11200,14 +13625,8 @@ defmodule Ferricstore.Raft.StateMachine do
     else
       puts =
         Enum.map(batch, fn
-          {:put, key, value, expire_at_ms} ->
-            {key, value, expire_at_ms}
-
-          {:put, key, value, expire_at_ms, _ets_value, _staged_size} ->
-            {key, value, expire_at_ms}
-
-          {:put_cold, key, value, expire_at_ms, _lfu} ->
-            {key, value, expire_at_ms}
+          {:put, key, value, expire_at_ms} -> {key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {key, value, expire_at_ms}
         end)
 
       case NIF.v2_append_batch(file_path, puts) do
@@ -11226,34 +13645,20 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp append_pending_batch_nosync(file_path, batch) do
-    if Enum.any?(batch, &match?({:delete, _, _}, &1)) do
+    if pending_batch_has_delete?(batch) do
       ops =
         Enum.map(batch, fn
-          {:put, key, value, expire_at_ms} ->
-            {:put, key, value, expire_at_ms}
-
-          {:put, key, value, expire_at_ms, _ets_value, _staged_size} ->
-            {:put, key, value, expire_at_ms}
-
-          {:put_cold, key, value, expire_at_ms, _lfu} ->
-            {:put, key, value, expire_at_ms}
-
-          {:delete, key, _prob_path} ->
-            {:delete, key}
+          {:put, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {:put, key, value, expire_at_ms}
+          {:delete, key, _prob_path} -> {:delete, key}
         end)
 
       NIF.v2_append_ops_batch_nosync(file_path, ops)
     else
       puts =
         Enum.map(batch, fn
-          {:put, key, value, expire_at_ms} ->
-            {key, value, expire_at_ms}
-
-          {:put, key, value, expire_at_ms, _ets_value, _staged_size} ->
-            {key, value, expire_at_ms}
-
-          {:put_cold, key, value, expire_at_ms, _lfu} ->
-            {key, value, expire_at_ms}
+          {:put, key, value, expire_at_ms} -> {key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {key, value, expire_at_ms}
         end)
 
       case NIF.v2_append_batch_nosync(file_path, puts) do
@@ -11268,6 +13673,14 @@ defmodule Ferricstore.Raft.StateMachine do
         {:error, _reason} = error ->
           error
       end
+    end
+  end
+
+  defp pending_batch_has_delete?(batch) do
+    case Process.get(:sm_pending_has_delete, :unknown) do
+      true -> true
+      false -> false
+      _ -> Enum.any?(batch, &match?({:delete, _, _}, &1))
     end
   end
 
@@ -11315,7 +13728,6 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp pending_entry_op({:put, _key, _value, _expire_at_ms}), do: :put
-  defp pending_entry_op({:put, _key, _value, _expire_at_ms, _ets_value, _staged_size}), do: :put
   defp pending_entry_op({:put_cold, _key, _value, _expire_at_ms, _lfu}), do: :put
   defp pending_entry_op({:delete, _key, _prob_path}), do: :delete
 
@@ -11347,6 +13759,16 @@ defmodule Ferricstore.Raft.StateMachine do
       Process.get(:sm_pending_fast_delete_batch) == true and delete_only_pending_batch?(batch) ->
         apply_fast_delete_pending_locations(state, batch, locations)
 
+      Process.get(:sm_pending_fast_staged_put_batch) == true and
+          put_or_put_cold_pending_batch?(batch) ->
+        apply_fast_staged_put_pending_locations(
+          state,
+          file_id,
+          batch,
+          locations,
+          hot_cache_threshold(state)
+        )
+
       true ->
         apply_pending_locations(state, file_id, batch, locations, standalone_staged_apply?())
     end
@@ -11355,7 +13777,6 @@ defmodule Ferricstore.Raft.StateMachine do
   defp put_only_pending_batch?(batch) do
     Enum.all?(batch, fn
       {:put, _key, _value, _expire_at_ms} -> true
-      {:put, _key, _value, _expire_at_ms, _ets_value, _staged_size} -> true
       _entry -> false
     end)
   end
@@ -11363,6 +13784,14 @@ defmodule Ferricstore.Raft.StateMachine do
   defp delete_only_pending_batch?(batch) do
     Enum.all?(batch, fn
       {:delete, _key, _prob_path} -> true
+      _entry -> false
+    end)
+  end
+
+  defp put_or_put_cold_pending_batch?(batch) do
+    Enum.all?(batch, fn
+      {:put, _key, _value, _expire_at_ms} -> true
+      {:put_cold, _key, _value, _expire_at_ms, _lfu} -> true
       _entry -> false
     end)
   end
@@ -11377,25 +13806,6 @@ defmodule Ferricstore.Raft.StateMachine do
          hot_threshold
        ) do
     ets_val = value_for_ets(value, hot_threshold)
-    previous = :ets.lookup(state.ets, key)
-
-    track_keydir_binary_delta_from_previous(state, key, previous, ets_val, expire_at_ms)
-
-    :ets.insert(
-      state.ets,
-      {key, ets_val, expire_at_ms, LFU.initial(), file_id, offset, value_size}
-    )
-
-    apply_fast_put_pending_locations(state, file_id, batch, locations, hot_threshold)
-  end
-
-  defp apply_fast_put_pending_locations(
-         state,
-         file_id,
-         [{:put, key, _value, expire_at_ms, ets_val, _staged_size} | batch],
-         [{:put, offset, value_size} | locations],
-         hot_threshold
-       ) do
     previous = :ets.lookup(state.ets, key)
 
     track_keydir_binary_delta_from_previous(state, key, previous, ets_val, expire_at_ms)
@@ -11423,60 +13833,79 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_fast_delete_pending_locations(state, batch, locations)
   end
 
-  defp apply_pending_locations(state, file_id, batch, locations, staged?) do
-    apply_pending_locations(
-      state,
-      file_id,
-      batch,
-      locations,
-      staged?,
-      pending_batch_key_counts(batch)
-    )
+  defp apply_fast_staged_put_pending_locations(
+         _state,
+         _file_id,
+         [],
+         [],
+         _hot_threshold
+       ),
+       do: :ok
+
+  defp apply_fast_staged_put_pending_locations(
+         state,
+         file_id,
+         [{:put, key, value, expire_at_ms} | batch],
+         [{:put, offset, value_size} | locations],
+         hot_threshold
+       ) do
+    expected_value = value_for_ets(value, hot_threshold)
+    expected_staged_size = byte_size(to_disk_binary(value))
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, ^expected_value, ^expire_at_ms, lfu, :pending, 0, ^expected_staged_size}] ->
+        :ets.insert(
+          state.ets,
+          {key, expected_value, expire_at_ms, lfu, file_id, offset, value_size}
+        )
+
+      _other ->
+        apply_put_pending_location(state, key, value, expire_at_ms, file_id, offset, value_size)
+    end
+
+    apply_fast_staged_put_pending_locations(state, file_id, batch, locations, hot_threshold)
   end
 
-  defp apply_pending_locations(_state, _file_id, [], [], _staged?, _key_counts), do: :ok
+  defp apply_fast_staged_put_pending_locations(
+         state,
+         file_id,
+         [{:put_cold, key, value, expire_at_ms, lfu} | batch],
+         [{:put, offset, value_size} | locations],
+         hot_threshold
+       ) do
+    expected_staged_size = byte_size(to_disk_binary(value))
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, nil, ^expire_at_ms, ^lfu, :pending, 0, ^expected_staged_size}] ->
+        :ets.insert(state.ets, {key, nil, expire_at_ms, lfu, file_id, offset, value_size})
+
+      _other ->
+        apply_put_cold_pending_location(
+          state,
+          key,
+          value,
+          expire_at_ms,
+          lfu,
+          file_id,
+          offset,
+          value_size
+        )
+    end
+
+    apply_fast_staged_put_pending_locations(state, file_id, batch, locations, hot_threshold)
+  end
+
+  defp apply_pending_locations(_state, _file_id, [], [], _staged?), do: :ok
 
   defp apply_pending_locations(
          state,
          file_id,
          [{:put, key, val, exp} | batch],
          [{:put, offset, value_size} | locations],
-         staged?,
-         key_counts
+         staged?
        ) do
-    {superseded?, key_counts} = consume_pending_key_count(key_counts, key)
-
-    unless superseded? do
-      apply_put_pending_location(state, key, val, exp, file_id, offset, value_size)
-    end
-
-    apply_pending_locations(state, file_id, batch, locations, staged?, key_counts)
-  end
-
-  defp apply_pending_locations(
-         state,
-         file_id,
-         [{:put, key, _val, exp, expected_value, expected_staged_size} | batch],
-         [{:put, offset, value_size} | locations],
-         staged?,
-         key_counts
-       ) do
-    {superseded?, key_counts} = consume_pending_key_count(key_counts, key)
-
-    unless superseded? do
-      apply_put_pending_location(
-        state,
-        key,
-        expected_value,
-        exp,
-        expected_staged_size,
-        file_id,
-        offset,
-        value_size
-      )
-    end
-
-    apply_pending_locations(state, file_id, batch, locations, staged?, key_counts)
+    apply_put_pending_location(state, key, val, exp, file_id, offset, value_size)
+    apply_pending_locations(state, file_id, batch, locations, staged?)
   end
 
   defp apply_pending_locations(
@@ -11484,16 +13913,10 @@ defmodule Ferricstore.Raft.StateMachine do
          file_id,
          [{:put_cold, key, val, exp, lfu} | batch],
          [{:put, offset, value_size} | locations],
-         staged?,
-         key_counts
+         staged?
        ) do
-    {superseded?, key_counts} = consume_pending_key_count(key_counts, key)
-
-    unless superseded? do
-      apply_put_cold_pending_location(state, key, val, exp, lfu, file_id, offset, value_size)
-    end
-
-    apply_pending_locations(state, file_id, batch, locations, staged?, key_counts)
+    apply_put_cold_pending_location(state, key, val, exp, lfu, file_id, offset, value_size)
+    apply_pending_locations(state, file_id, batch, locations, staged?)
   end
 
   defp apply_pending_locations(
@@ -11501,18 +13924,15 @@ defmodule Ferricstore.Raft.StateMachine do
          file_id,
          [{:delete, key, nil} | batch],
          [{:delete, _offset, _record_size} | locations],
-         staged?,
-         key_counts
+         staged?
        ) do
-    {superseded?, key_counts} = consume_pending_key_count(key_counts, key)
-
-    if staged? and not superseded? do
+    if staged? do
       track_keydir_binary_remove(state, key)
       :ets.delete(state.ets, key)
       maybe_queue_lmdb_state_delete_after_publish(state, key)
     end
 
-    apply_pending_locations(state, file_id, batch, locations, staged?, key_counts)
+    apply_pending_locations(state, file_id, batch, locations, staged?)
   end
 
   defp apply_pending_locations(
@@ -11520,46 +13940,16 @@ defmodule Ferricstore.Raft.StateMachine do
          file_id,
          [{:delete, key, prob_path} | batch],
          [{:delete, _offset, _record_size} | locations],
-         staged?,
-         key_counts
+         staged?
        ) do
-    {superseded?, key_counts} = consume_pending_key_count(key_counts, key)
-
-    if staged? and not superseded? do
+    if staged? do
       track_keydir_binary_remove(state, key)
       :ets.delete(state.ets, key)
       maybe_queue_lmdb_state_delete_after_publish(state, key)
     end
 
     maybe_delete_prob_file_path(state, prob_path)
-    apply_pending_locations(state, file_id, batch, locations, staged?, key_counts)
-  end
-
-  defp pending_batch_key_counts(batch) do
-    Enum.reduce(batch, %{}, fn
-      {:put, key, _value, _expire_at_ms}, acc ->
-        Map.update(acc, key, 1, &(&1 + 1))
-
-      {:put, key, _value, _expire_at_ms, _ets_value, _staged_size}, acc ->
-        Map.update(acc, key, 1, &(&1 + 1))
-
-      {:put_cold, key, _value, _expire_at_ms, _lfu}, acc ->
-        Map.update(acc, key, 1, &(&1 + 1))
-
-      {:delete, key, _prob_path}, acc ->
-        Map.update(acc, key, 1, &(&1 + 1))
-
-      _entry, acc ->
-        acc
-    end)
-  end
-
-  defp consume_pending_key_count(key_counts, key) do
-    case Map.get(key_counts, key, 0) do
-      count when count > 1 -> {true, Map.put(key_counts, key, count - 1)}
-      1 -> {false, Map.delete(key_counts, key)}
-      _other -> {false, key_counts}
-    end
+    apply_pending_locations(state, file_id, batch, locations, staged?)
   end
 
   defp apply_put_cold_pending_location(
@@ -11597,28 +13987,6 @@ defmodule Ferricstore.Raft.StateMachine do
     expected_value = value_for_ets(value, hot_cache_threshold(state))
     expected_staged_size = byte_size(to_disk_binary(value))
 
-    apply_put_pending_location(
-      state,
-      key,
-      expected_value,
-      expire_at_ms,
-      expected_staged_size,
-      file_id,
-      offset,
-      value_size
-    )
-  end
-
-  defp apply_put_pending_location(
-         state,
-         key,
-         expected_value,
-         expire_at_ms,
-         expected_staged_size,
-         file_id,
-         offset,
-         value_size
-       ) do
     if standalone_staged_apply?() do
       track_keydir_binary_delta(state, key, expected_value, expire_at_ms)
 
@@ -11681,40 +14049,31 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp queue_pending_put(key, disk_value, expire_at_ms, logical_value, ets_value) do
+  defp queue_pending_put(key, value, expire_at_ms) do
     pending = Process.get(:sm_pending_writes, [])
-
-    Process.put(:sm_pending_writes, [
-      {:put, key, disk_value, expire_at_ms, ets_value, byte_size(disk_value)} | pending
-    ])
-
+    Process.put(:sm_pending_writes, [{:put, key, value, expire_at_ms} | pending])
     pending_values = Process.get(:sm_pending_values, %{})
-    Process.put(:sm_pending_values, Map.put(pending_values, key, {logical_value, expire_at_ms}))
+    Process.put(:sm_pending_values, Map.put(pending_values, key, {value, expire_at_ms}))
   end
 
-  defp queue_pending_put_blob_ref(key, encoded_ref, expire_at_ms, pending_value) do
-    pending = Process.get(:sm_pending_writes, [])
-
-    Process.put(:sm_pending_writes, [
-      {:put, key, encoded_ref, expire_at_ms, nil, byte_size(encoded_ref)} | pending
-    ])
-
-    if pending_value != :none do
-      pending_values = Process.get(:sm_pending_values, %{})
-      Process.put(:sm_pending_values, Map.put(pending_values, key, {pending_value, expire_at_ms}))
-    end
-  end
-
-  defp queue_pending_put_cold(key, value, expire_at_ms, lfu, logical_value) do
+  defp queue_pending_put_cold(key, value, expire_at_ms, lfu) do
     pending = Process.get(:sm_pending_writes, [])
     Process.put(:sm_pending_writes, [{:put_cold, key, value, expire_at_ms, lfu} | pending])
     pending_values = Process.get(:sm_pending_values, %{})
-    Process.put(:sm_pending_values, Map.put(pending_values, key, {logical_value, expire_at_ms}))
+    Process.put(:sm_pending_values, Map.put(pending_values, key, {value, expire_at_ms}))
   end
 
   defp queue_pending_flow_history_projection(entry) do
     pending = Process.get(:sm_pending_flow_history_projections, [])
     Process.put(:sm_pending_flow_history_projections, [entry | pending])
+    :ok
+  end
+
+  defp queue_pending_flow_history_projections_batch([]), do: :ok
+
+  defp queue_pending_flow_history_projections_batch(entries) when is_list(entries) do
+    pending = Process.get(:sm_pending_flow_history_projections, [])
+    Process.put(:sm_pending_flow_history_projections, Enum.reverse(entries, pending))
     :ok
   end
 
@@ -11794,6 +14153,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp queue_pending_delete(key, prob_path) do
     pending = Process.get(:sm_pending_writes, [])
     Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
+    Process.put(:sm_pending_has_delete, true)
     pending_values = Process.get(:sm_pending_values, %{})
     Process.put(:sm_pending_values, Map.put(pending_values, key, :deleted))
   end
@@ -11801,6 +14161,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp queue_pending_delete_fast(key, prob_path) do
     pending = Process.get(:sm_pending_writes, [])
     Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
+    Process.put(:sm_pending_has_delete, true)
   end
 
   defp standalone_staged_apply?, do: Process.get(@sm_standalone_staged_key) == true
@@ -12010,44 +14371,50 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms) do
     partition_key = Map.get(record, :partition_key)
-    state_index_key = FlowKeys.state_index_key(record.type, record.state, partition_key)
     updated_at_ms = Map.get(record, :updated_at_ms, 0)
 
-    index_key =
-      Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, record.id, updated_at_ms)
-
-    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
-    metadata_index_keys = flow_metadata_index_keys(record)
-
-    queue_pending_lmdb_mirror_terminal_put(
-      index_key,
-      Ferricstore.Flow.LMDB.encode_terminal_index_value(
-        record.id,
-        updated_at_ms,
-        expire_at_ms,
-        state_key,
-        count_key
-      ),
+    queue_pending_lmdb_mirror_terminal_project(
+      Map.fetch!(record, :id),
+      Map.fetch!(record, :type),
+      Map.fetch!(record, :state),
+      partition_key,
+      updated_at_ms,
       state_key,
-      count_key
+      expire_at_ms,
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id)
     )
 
     queue_pending_lmdb_mirror_after_flush(
       {:defer_after_flush, flow_terminal_hot_ttl_ms(),
-       {:prune_terminal_flow, state.ets, Map.get(state, :zset_score_index_name),
+       {:prune_terminal_flow_v2, state.ets, Map.get(state, :zset_score_index_name),
         Map.get(state, :zset_score_lookup_name), Map.get(state, :flow_index_name),
-        Map.get(state, :flow_lookup_name), state_key, state_index_key, metadata_index_keys,
-        record.id, Map.fetch!(record, :version)}}
+        Map.get(state, :flow_lookup_name), state_key, Map.fetch!(record, :type),
+        Map.fetch!(record, :state), partition_key, Map.get(record, :parent_flow_id),
+        Map.get(record, :root_flow_id), Map.get(record, :correlation_id), Map.fetch!(record, :id),
+        Map.fetch!(record, :version)}}
     )
-
-    queue_lmdb_metadata_index_puts(record, expire_at_ms)
   end
 
-  defp flow_metadata_index_keys(record) do
-    record
-    |> flow_metadata_index_entries()
-    |> Enum.map(fn {index_key, _id, _score} -> index_key end)
-    |> Enum.uniq()
+  defp queue_pending_lmdb_mirror_terminal_project(
+         id,
+         type,
+         terminal_state,
+         partition_key,
+         updated_at_ms,
+         state_key,
+         expire_at_ms,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id
+       ) do
+    queue_pending_lmdb_mirror_op(
+      {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
+       expire_at_ms, parent_flow_id, root_flow_id, correlation_id}
+    )
+
+    :ok
   end
 
   defp flow_terminal_hot_ttl_ms do
@@ -12068,22 +14435,6 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp normalize_non_negative_integer(_value, default), do: default
-
-  defp queue_lmdb_metadata_index_puts(record, expire_at_ms) do
-    state_key = FlowKeys.state_key(record.id, Map.get(record, :partition_key))
-
-    record
-    |> flow_metadata_index_entries()
-    |> Enum.each(fn {index_key, id, score} ->
-      index_key
-      |> Ferricstore.Flow.LMDB.query_index_key(id, score)
-      |> queue_pending_lmdb_mirror_query_put(
-        Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms, state_key)
-      )
-    end)
-
-    :ok
-  end
 
   defp maybe_queue_terminal_lmdb_index_delete(state, record) do
     with_lmdb_mirror_shard(state, fn ->
@@ -12118,53 +14469,20 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp queue_lmdb_history_index_put(record, history_key, event_id, event_ms, compound_key) do
-    expire_at_ms = flow_record_expire_at(record)
-
-    history_index_key = Ferricstore.Flow.LMDB.history_index_key(history_key, event_id, event_ms)
-
-    queue_pending_lmdb_mirror_query_put(
-      history_index_key,
-      Ferricstore.Flow.LMDB.encode_history_index_value(
-        event_id,
-        event_ms,
-        compound_key,
-        expire_at_ms
-      )
+  defp queue_lmdb_history_indexes_project_from_index(state, record, history_key) do
+    queue_pending_lmdb_mirror_op(
+      {:history_project_from_index, Map.get(state, :flow_index_name), Map.get(state, :flow_lookup_name),
+       Map.fetch!(record, :id), Map.get(record, :partition_key), history_key,
+       flow_record_expire_at(record)}
     )
 
-    case Ferricstore.Flow.LMDB.history_expire_key(expire_at_ms, history_index_key) do
-      nil ->
-        :ok
-
-      expire_key ->
-        queue_pending_lmdb_mirror_query_put(
-          expire_key,
-          Ferricstore.Flow.LMDB.encode_history_expire_value(history_index_key)
-        )
-    end
-
-    case Ferricstore.Flow.LMDB.history_flow_expire_key(expire_at_ms, history_key) do
-      nil ->
-        :ok
-
-      expire_key ->
-        queue_pending_lmdb_mirror_query_put(
-          expire_key,
-          Ferricstore.Flow.LMDB.encode_history_flow_expire_value(history_key, expire_at_ms)
-        )
-    end
+    :ok
   end
 
   defp queue_lmdb_history_index_delete(_record, history_key, event_id, event_ms) do
     history_key
     |> Ferricstore.Flow.LMDB.history_index_key(event_id, event_ms)
     |> queue_pending_lmdb_mirror_history_delete()
-  end
-
-  defp queue_pending_lmdb_mirror_query_put(query_key, value) do
-    queue_pending_lmdb_mirror_op({:query_put, query_key, value})
-    :ok
   end
 
   defp queue_pending_lmdb_mirror_history_delete(history_index_key) do
@@ -12182,12 +14500,6 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp queue_pending_lmdb_mirror_terminal_put(terminal_key, value, state_key, count_key) do
-    op = {:terminal_put, terminal_key, value, state_key, count_key}
-    queue_pending_lmdb_mirror_op(op)
-    :ok
-  end
-
   defp queue_pending_lmdb_mirror_terminal_delete(terminal_key, state_key, count_key) do
     op = {:terminal_delete, terminal_key, state_key, count_key}
     queue_pending_lmdb_mirror_op(op)
@@ -12196,28 +14508,51 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp queue_pending_lmdb_mirror_after_flush(action) do
     pending = Process.get(:sm_pending_lmdb_mirror_after_flush, [])
-    Process.put(:sm_pending_lmdb_mirror_after_flush, [tag_lmdb_mirror_shard(action) | pending])
+
+    item =
+      case Process.get(:sm_pending_lmdb_mirror_shard) do
+        shard_index when is_integer(shard_index) and shard_index >= 0 ->
+          {:lmdb_shard, shard_index, action}
+
+        _other ->
+          action
+      end
+
+    Process.put(:sm_pending_lmdb_mirror_after_flush, [item | pending])
     :ok
   end
 
   defp queue_pending_lmdb_mirror_op(op) do
     pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [tag_lmdb_mirror_shard(op) | pending])
-  end
 
-  defp tag_lmdb_mirror_shard(op) do
-    case Process.get(:sm_pending_lmdb_mirror_shard) do
-      shard_index when is_integer(shard_index) and shard_index >= 0 ->
-        {:lmdb_shard, shard_index, op}
+    item =
+      case Process.get(:sm_pending_lmdb_mirror_shard) do
+        shard_index when is_integer(shard_index) and shard_index >= 0 ->
+          {:lmdb_shard, shard_index, op}
 
-      _other ->
-        op
-    end
+        _other ->
+          op
+      end
+
+    Process.put(:sm_pending_lmdb_mirror_ops, [item | pending])
   end
 
   defp with_lmdb_mirror_shard(state, fun) when is_function(fun, 0) do
+    shard_index = Map.get(state, :shard_index, 0)
+
+    case Process.get(:sm_pending_lmdb_mirror_default_shard, shard_index) do
+      ^shard_index ->
+        fun.()
+
+      _other ->
+        with_tagged_lmdb_mirror_shard(shard_index, fun)
+    end
+  end
+
+  defp with_tagged_lmdb_mirror_shard(shard_index, fun) do
     previous = Process.get(:sm_pending_lmdb_mirror_shard, :undefined)
-    Process.put(:sm_pending_lmdb_mirror_shard, Map.get(state, :shard_index, 0))
+    Process.put(:sm_pending_lmdb_mirror_shard, shard_index)
+    Process.put(:sm_pending_lmdb_mirror_tagged, true)
 
     try do
       fun.()
@@ -12249,6 +14584,14 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp enqueue_lmdb_mirror_groups(state, ops, after_flush) do
+    if Process.get(:sm_pending_lmdb_mirror_tagged, false) do
+      enqueue_tagged_lmdb_mirror_groups(state, ops, after_flush)
+    else
+      enqueue_lmdb_mirror_group(state, state.shard_index, ops, after_flush)
+    end
+  end
+
+  defp enqueue_tagged_lmdb_mirror_groups(state, ops, after_flush) do
     op_groups = group_lmdb_mirror_items(ops, state.shard_index)
     after_flush_groups = group_lmdb_mirror_items(after_flush, state.shard_index)
 
@@ -12258,17 +14601,25 @@ defmodule Ferricstore.Raft.StateMachine do
       shard_ops = Map.get(op_groups, shard_index, [])
       shard_after_flush = Map.get(after_flush_groups, shard_index, [])
 
-      case Ferricstore.Flow.LMDBWriter.enqueue(
-             state.instance_name,
-             shard_index,
-             shard_ops,
-             shard_after_flush
-           ) do
+      case enqueue_lmdb_mirror_group(state, shard_index, shard_ops, shard_after_flush) do
         :ok -> {:cont, :ok}
         {:error, _reason} = error -> {:halt, error}
-        other -> {:halt, {:error, other}}
+        other -> {:halt, other}
       end
     end)
+  end
+
+  defp enqueue_lmdb_mirror_group(state, shard_index, shard_ops, shard_after_flush) do
+    case Ferricstore.Flow.LMDBWriter.enqueue(
+           state.instance_name,
+           shard_index,
+           shard_ops,
+           shard_after_flush
+         ) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, other}
+    end
   end
 
   defp group_lmdb_mirror_items(items, default_shard) do
@@ -12547,82 +14898,6 @@ defmodule Ferricstore.Raft.StateMachine do
   defp to_disk_binary(v) when is_binary(v), do: v
   defp to_disk_binary(v), do: :erlang.term_to_binary(v)
 
-  defp persisted_disk_binary!(state, value) do
-    disk_value = to_disk_binary(value)
-
-    case BlobValue.maybe_externalize(
-           state.data_dir,
-           state.shard_index,
-           blob_side_channel_threshold(state),
-           disk_value
-         ) do
-      {:ok, persisted_value} -> persisted_value
-      {:error, reason} -> throw({:blob_externalize_failed, reason})
-    end
-  end
-
-  defp persisted_disk_binaries!(state, values) do
-    disk_values = Enum.map(values, &to_disk_binary/1)
-
-    case BlobValue.maybe_externalize_many(
-           state.data_dir,
-           state.shard_index,
-           blob_side_channel_threshold(state),
-           disk_values
-         ) do
-      {:ok, persisted_values} -> persisted_values
-      {:error, reason} -> throw({:blob_externalize_failed, reason})
-    end
-  end
-
-  defp blob_side_channel_threshold(state), do: BlobValue.threshold(instance_ctx_for_state(state))
-
-  defp persisted_disk_binary_for_ctx!(ctx, state, value) do
-    disk_value = to_disk_binary(value)
-    data_dir = Map.get(ctx, :data_dir) || Map.get(state, :data_dir)
-    shard_index = Map.get(ctx, :index, Map.get(state, :shard_index, 0))
-
-    case BlobValue.maybe_externalize(
-           data_dir,
-           shard_index,
-           blob_side_channel_threshold(state),
-           disk_value
-         ) do
-      {:ok, persisted_value} -> persisted_value
-      {:error, reason} -> throw({:blob_externalize_failed, reason})
-    end
-  end
-
-  defp validate_put_blob_ref(state, encoded_ref) do
-    with {:ok, %BlobRef{} = ref} <- BlobRef.decode(encoded_ref),
-         :ok <- BlobStore.verify(state.data_dir, state.shard_index, ref) do
-      :ok
-    else
-      :error -> {:error, {:blob_ref_unavailable, :invalid_ref}}
-      {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
-    end
-  end
-
-  defp prepare_blob_ref_pending_value(state, encoded_ref, opts) do
-    if Keyword.get(opts, :materialize_pending?, false) do
-      materialize_blob_command_value(state, encoded_ref)
-    else
-      with :ok <- validate_put_blob_ref(state, encoded_ref) do
-        {:ok, :none}
-      end
-    end
-  end
-
-  defp materialize_blob_command_value(state, encoded_ref) do
-    with {:ok, %BlobRef{} = ref} <- BlobRef.decode(encoded_ref),
-         {:ok, payload} <- BlobStore.get(state.data_dir, state.shard_index, ref) do
-      {:ok, payload}
-    else
-      :error -> {:error, {:blob_ref_unavailable, :invalid_ref}}
-      {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Private: string mutation operations
   # ---------------------------------------------------------------------------
@@ -12725,16 +15000,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_append_blob_ref(state, key, encoded_ref) when is_binary(encoded_ref) do
-    with :ok <- ensure_string_key(state, key),
-         {:ok, suffix} <- materialize_blob_command_value(state, encoded_ref) do
-      do_append(state, key, suffix)
-    end
-  end
-
-  defp do_append_blob_ref(_state, _key, _encoded_ref),
-    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
-
   # Atomic GETSET: reads old value, writes new value with no expiry, returns
   # old value directly (not wrapped in {:ok, ...}).
   defp do_getset(state, key, new_value) do
@@ -12744,20 +15009,6 @@ defmodule Ferricstore.Raft.StateMachine do
       old
     end
   end
-
-  defp do_getset_blob_ref(state, key, encoded_ref, apply_opts \\ [])
-
-  defp do_getset_blob_ref(state, key, encoded_ref, apply_opts) when is_binary(encoded_ref) do
-    with :ok <- ensure_string_key(state, key),
-         {:ok, pending_value} <- prepare_blob_ref_pending_value(state, encoded_ref, apply_opts) do
-      old = do_get(state, key)
-      do_put_validated_blob_ref(state, key, encoded_ref, 0, pending_value)
-      old
-    end
-  end
-
-  defp do_getset_blob_ref(_state, _key, _encoded_ref, _apply_opts),
-    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # Atomic GETDEL: reads value, deletes key, returns value directly (not
   # wrapped in {:ok, ...}). Returns nil if key does not exist.
@@ -12806,17 +15057,6 @@ defmodule Ferricstore.Raft.StateMachine do
       {:ok, byte_size(new_val)}
     end
   end
-
-  defp do_setrange_blob_ref(state, key, offset, encoded_ref)
-       when is_integer(offset) and offset >= 0 and is_binary(encoded_ref) do
-    with :ok <- ensure_string_key(state, key),
-         {:ok, value} <- materialize_blob_command_value(state, encoded_ref) do
-      do_setrange(state, key, offset, value)
-    end
-  end
-
-  defp do_setrange_blob_ref(_state, _key, _offset, _encoded_ref),
-    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
   # needed, flip the single bit, write back. Preserves expire_at_ms.
@@ -12976,7 +15216,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       selected_delete_keys = Enum.map(selected, &CompoundKey.set_member(redis_key, &1))
 
-      with :ok <- do_compound_batch_delete_read_visible(state, redis_key, selected_delete_keys),
+      with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
            :ok <- maybe_delete_empty_compound_type_key(state, redis_key, prefix, selected) do
         if is_nil(count), do: List.first(selected), else: selected
       end
@@ -13008,7 +15248,7 @@ defmodule Ferricstore.Raft.StateMachine do
       selected_delete_keys =
         Enum.map(selected, fn {member, _score} -> CompoundKey.zset_member(redis_key, member) end)
 
-      with :ok <- do_compound_batch_delete_read_visible(state, redis_key, selected_delete_keys),
+      with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
            :ok <- maybe_delete_empty_compound_type_key(state, redis_key, prefix, selected) do
         Enum.flat_map(selected, fn {member, score} -> [member, format_zset_score(score)] end)
       end
@@ -13146,18 +15386,10 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.zip(values)
     |> Enum.reduce(results, fn
       {{index, key, exp, fid, off}, value}, acc when is_binary(value) ->
-        persisted_size = byte_size(value)
-
-        case materialize_blob_value(state, value) do
-          {:ok, materialized} ->
-            ets_value = value_for_ets(materialized, hot_cache_threshold(state))
-            track_keydir_binary_warm(state, ets_value)
-            :ets.insert(state.ets, {key, ets_value, exp, LFU.initial(), fid, off, persisted_size})
-            Map.put(acc, index, materialized)
-
-          {:error, _reason} ->
-            acc
-        end
+        ets_value = value_for_ets(value, hot_cache_threshold(state))
+        track_keydir_binary_warm(state, ets_value)
+        :ets.insert(state.ets, {key, ets_value, exp, LFU.initial(), fid, off, byte_size(value)})
+        Map.put(acc, index, value)
 
       {_read, _value}, acc ->
         acc
@@ -13287,34 +15519,6 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
     end
   end
-
-  defp do_cas_blob_ref(state, key, expected, encoded_ref, expire_at_ms, apply_opts \\ [])
-
-  defp do_cas_blob_ref(state, key, expected, encoded_ref, expire_at_ms, apply_opts)
-       when is_binary(encoded_ref) do
-    case ets_lookup(state, key) do
-      {:hit, ^expected, old_exp} ->
-        expire = if expire_at_ms, do: expire_at_ms, else: old_exp
-
-        with {:ok, pending_value} <-
-               prepare_blob_ref_pending_value(state, encoded_ref, apply_opts) do
-          do_put_validated_blob_ref(state, key, encoded_ref, expire, pending_value)
-          1
-        end
-
-      {:hit, _other, _exp} ->
-        0
-
-      :expired ->
-        nil
-
-      :miss ->
-        nil
-    end
-  end
-
-  defp do_cas_blob_ref(_state, _key, _expected, _encoded_ref, _expire_at_ms, _apply_opts),
-    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # ---------------------------------------------------------------------------
   # Private: distributed lock operations
@@ -13643,17 +15847,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
     case read_cold_async(path, off, key) do
       {:ok, value} when is_binary(value) ->
-        case materialize_blob_value(state, value) do
-          {:ok, materialized} ->
-            v = value_for_ets(materialized, hot_cache_threshold(state))
-            # Cold -> warm: previous ETS value was nil, only new value bytes matter
-            track_keydir_binary_warm(state, v)
-            :ets.insert(state.ets, {key, v, expire_at_ms, LFU.initial(), fid, off, vsize})
-            {:hit, materialized, expire_at_ms}
-
-          {:error, _reason} ->
-            :miss
-        end
+        v = value_for_ets(value, hot_cache_threshold(state))
+        # Cold -> warm: previous ETS value was nil, only new value bytes matter
+        track_keydir_binary_warm(state, v)
+        :ets.insert(state.ets, {key, v, expire_at_ms, LFU.initial(), fid, off, byte_size(value)})
+        {:hit, value, expire_at_ms}
 
       _ ->
         retry_warm_from_changed_cold_location(
@@ -13699,10 +15897,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp read_cold_async(path, offset, key) do
     Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
-  end
-
-  defp materialize_blob_value(%{data_dir: data_dir, shard_index: shard_index} = state, value) do
-    BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
   end
 
   # Returns the full file path for a log file within this shard's data dir.
@@ -13919,88 +16113,6 @@ defmodule Ferricstore.Raft.StateMachine do
     result
   end
 
-  defp do_compound_put_blob_ref(
-         state,
-         redis_key,
-         compound_key,
-         encoded_ref,
-         expire_at_ms,
-         opts \\ []
-       )
-
-  defp do_compound_put_blob_ref(
-         state,
-         redis_key,
-         compound_key,
-         encoded_ref,
-         expire_at_ms,
-         opts
-       )
-       when is_binary(encoded_ref) do
-    opts =
-      if zset_compound_key?(redis_key, compound_key) do
-        Keyword.put(opts, :materialize_pending?, true)
-      else
-        opts
-      end
-
-    with {:ok, pending_value} <- prepare_blob_ref_pending_value(state, encoded_ref, opts) do
-      result =
-        case promoted_compound_path(state, redis_key, compound_key) do
-          nil ->
-            raw_put_persisted_blob_ref(
-              state,
-              compound_key,
-              encoded_ref,
-              expire_at_ms,
-              pending_value
-            )
-
-          dedicated_path ->
-            do_promoted_compound_put_blob_ref(
-              state,
-              redis_key,
-              compound_key,
-              encoded_ref,
-              expire_at_ms,
-              dedicated_path,
-              pending_value
-            )
-        end
-
-      if result == :ok do
-        zset_index_put(
-          state,
-          redis_key,
-          compound_key,
-          blob_ref_index_value(encoded_ref, pending_value)
-        )
-      end
-
-      result
-    end
-  end
-
-  defp do_compound_put_blob_ref(
-         _state,
-         _redis_key,
-         _compound_key,
-         _encoded_ref,
-         _expire_at_ms,
-         _opts
-       ),
-       do: {:error, {:blob_ref_unavailable, :invalid_ref}}
-
-  defp blob_ref_index_value(_encoded_ref, pending_value) when pending_value != :none,
-    do: pending_value
-
-  defp blob_ref_index_value(encoded_ref, :none), do: encoded_ref
-
-  defp zset_compound_key?(redis_key, compound_key)
-       when is_binary(redis_key) and is_binary(compound_key) do
-    String.starts_with?(compound_key, CompoundKey.zset_prefix(redis_key))
-  end
-
   defp do_compound_batch_put(_state, _redis_key, []), do: :ok
 
   defp do_compound_batch_put(state, redis_key, entries) do
@@ -14013,231 +16125,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
       :mixed ->
         do_compound_batch_put_generic(state, redis_key, entries)
-    end
-  end
-
-  defp do_compound_blob_batch_put(_state, _redis_key, [], _opts), do: :ok
-
-  defp do_compound_blob_batch_put(state, redis_key, entries, opts) do
-    with {:ok, prepared} <-
-           prepare_compound_blob_batch_put_entries(state, redis_key, entries, opts) do
-      case compound_blob_batch_put_target(state, redis_key, entries) do
-        :shared ->
-          do_shared_compound_blob_batch_put(state, redis_key, prepared, opts)
-
-        {:promoted, dedicated_path} ->
-          do_promoted_compound_blob_batch_put(state, redis_key, prepared, dedicated_path)
-
-        :mixed ->
-          do_compound_blob_batch_put_generic(state, redis_key, prepared)
-      end
-    end
-  end
-
-  defp prepare_compound_blob_batch_put_entries(state, redis_key, entries, opts) do
-    materialize_pending? = Keyword.get(opts, :materialize_pending?, false)
-
-    entries
-    |> Enum.reduce_while({:ok, [], []}, fn
-      {compound_key, value, expire_at_ms, :value}, {:ok, prepared, refs}
-      when is_binary(compound_key) and is_binary(value) ->
-        {:cont, {:ok, [{:value, compound_key, value, expire_at_ms} | prepared], refs}}
-
-      {compound_key, encoded_ref, expire_at_ms, :blob_ref}, {:ok, prepared, refs}
-      when is_binary(compound_key) and is_binary(encoded_ref) ->
-        if materialize_pending? or zset_compound_key?(redis_key, compound_key) do
-          case materialize_blob_command_value(state, encoded_ref) do
-            {:ok, payload} ->
-              entry = {:blob_ref, compound_key, encoded_ref, expire_at_ms, payload}
-              {:cont, {:ok, [entry | prepared], refs}}
-
-            {:error, _reason} = error ->
-              {:halt, error}
-          end
-        else
-          case BlobRef.decode(encoded_ref) do
-            {:ok, %BlobRef{} = ref} ->
-              entry = {:blob_ref, compound_key, encoded_ref, expire_at_ms, :none}
-              {:cont, {:ok, [entry | prepared], [ref | refs]}}
-
-            :error ->
-              {:halt, {:error, {:blob_ref_unavailable, :invalid_ref}}}
-          end
-        end
-
-      _invalid, {:ok, _prepared, _refs} ->
-        {:halt, {:error, {:blob_batch_invalid_entry, :invalid_entry}}}
-    end)
-    |> case do
-      {:ok, prepared, refs} ->
-        with :ok <- validate_put_blob_refs(state, Enum.reverse(refs)) do
-          {:ok,
-           prepared
-           |> Enum.reverse()
-           |> Enum.map(&compound_blob_batch_disk_entry(state, &1))}
-        end
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp compound_blob_batch_disk_entry(state, {:value, compound_key, value, expire_at_ms}) do
-    disk_value = persisted_disk_binary!(state, value)
-    ets_value = value_for_ets(value, hot_cache_threshold(state))
-
-    {compound_key, disk_value, expire_at_ms, ets_value, value, value}
-  end
-
-  defp compound_blob_batch_disk_entry(
-         _state,
-         {:blob_ref, compound_key, encoded_ref, expire_at_ms, pending_value}
-       ) do
-    {compound_key, encoded_ref, expire_at_ms, nil, pending_value,
-     blob_ref_index_value(encoded_ref, pending_value)}
-  end
-
-  defp do_shared_compound_blob_batch_put(state, redis_key, prepared, opts) do
-    materialize_pending? = Keyword.get(opts, :materialize_pending?, false)
-
-    cond do
-      compound_blob_batch_fast_path?(state, materialize_pending?) ->
-        do_shared_compound_blob_batch_put_fast(state, redis_key, prepared)
-
-      true ->
-        do_compound_blob_batch_put_generic(state, redis_key, prepared)
-    end
-  end
-
-  defp compound_blob_batch_fast_path?(state, false) do
-    compound_shared_fast_path?(state) and Process.get(:sm_pending_writes, []) == [] and
-      Process.get(:sm_pending_values, %{}) == %{}
-  end
-
-  defp compound_blob_batch_fast_path?(_state, _materialize_pending?), do: false
-
-  defp do_shared_compound_blob_batch_put_fast(state, redis_key, prepared) do
-    pending =
-      Enum.reduce(prepared, [], fn {compound_key, disk_value, expire_at_ms, ets_value,
-                                    _pending_value, index_value},
-                                   acc ->
-        queue_zset_index_put_after_flush(state, redis_key, compound_key, index_value)
-
-        [
-          {:put, compound_key, disk_value, expire_at_ms, ets_value, byte_size(disk_value)}
-          | acc
-        ]
-      end)
-
-    Process.put(:sm_pending_writes, pending)
-    Process.put(:sm_pending_fast_put_batch, true)
-    :ok
-  end
-
-  defp do_compound_blob_batch_put_generic(state, redis_key, prepared) do
-    Enum.each(prepared, fn entry ->
-      queue_prepared_compound_blob_put(state, redis_key, entry)
-    end)
-
-    :ok
-  end
-
-  defp queue_prepared_compound_blob_put(
-         state,
-         redis_key,
-         {compound_key, disk_value, expire_at_ms, ets_value, pending_value, index_value}
-       ) do
-    if cross_shard_pending_active?() do
-      cross_shard_raw_put(state, compound_key, ets_value, disk_value, expire_at_ms, LFU.initial())
-    else
-      record_pending_original(state, compound_key)
-
-      unless standalone_staged_apply?() do
-        track_keydir_binary_delta(state, compound_key, ets_value, expire_at_ms)
-
-        :ets.insert(
-          state.ets,
-          {compound_key, ets_value, expire_at_ms, LFU.initial(), :pending, 0,
-           byte_size(disk_value)}
-        )
-      end
-
-      queue_pending_prepared_put(
-        compound_key,
-        disk_value,
-        expire_at_ms,
-        ets_value,
-        pending_value
-      )
-    end
-
-    queue_zset_index_put_after_flush(state, redis_key, compound_key, index_value)
-    :ok
-  end
-
-  defp queue_pending_prepared_put(key, disk_value, expire_at_ms, ets_value, pending_value) do
-    pending = Process.get(:sm_pending_writes, [])
-
-    Process.put(:sm_pending_writes, [
-      {:put, key, disk_value, expire_at_ms, ets_value, byte_size(disk_value)} | pending
-    ])
-
-    if pending_value != :none do
-      pending_values = Process.get(:sm_pending_values, %{})
-      Process.put(:sm_pending_values, Map.put(pending_values, key, {pending_value, expire_at_ms}))
-    end
-  end
-
-  defp do_promoted_compound_blob_batch_put(state, redis_key, prepared, dedicated_path) do
-    Promotion.await_compaction_latch(state, redis_key)
-
-    active = Promotion.find_active(dedicated_path)
-    fid = parse_fid_from_path(active)
-
-    disk_entries =
-      Enum.map(prepared, fn {compound_key, disk_value, expire_at_ms, _ets_value, _pending_value,
-                             _index_value} ->
-        {compound_key, disk_value, expire_at_ms}
-      end)
-
-    case NIF.v2_append_batch(active, disk_entries) do
-      {:ok, locations} when length(locations) == length(prepared) ->
-        prepared
-        |> Enum.zip(locations)
-        |> Enum.each(fn
-          {{compound_key, _disk_value, expire_at_ms, ets_value, pending_value, index_value},
-           {offset, value_size}} ->
-            track_keydir_binary_delta(state, compound_key, ets_value, expire_at_ms)
-
-            :ets.insert(
-              state.ets,
-              {compound_key, ets_value, expire_at_ms, LFU.initial(), fid, offset, value_size}
-            )
-
-            if pending_value != :none do
-              sm_tx_put_pending(compound_key, pending_value, expire_at_ms)
-            else
-              clear_tx_deleted_key(compound_key)
-            end
-
-            zset_index_put(state, redis_key, compound_key, index_value)
-        end)
-
-        :ok
-
-      {:ok, locations} ->
-        {:error, {:batch_result_mismatch, length(prepared), locations}}
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp clear_tx_deleted_key(key) do
-    deleted = Process.get(:tx_deleted_keys, MapSet.new())
-
-    if MapSet.member?(deleted, key) do
-      Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
     end
   end
 
@@ -14265,25 +16152,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  defp compound_blob_batch_put_target(
-         state,
-         redis_key,
-         [{compound_key, _value_or_ref, _expire_at_ms, _tag} | rest]
-       ) do
-    first_path = promoted_compound_path(state, redis_key, compound_key)
-
-    if Enum.all?(rest, fn {key, _value_or_ref, _expire_at_ms, _tag} ->
-         promoted_compound_path(state, redis_key, key) == first_path
-       end) do
-      case first_path do
-        nil -> :shared
-        dedicated_path -> {:promoted, dedicated_path}
-      end
-    else
-      :mixed
-    end
-  end
-
   # Shared compound batches use the same publish-after-append contract as
   # put_batch: do not install visible ETS rows until Bitcask returns ordered
   # locations for the whole batch. ZSET side indexes are queued and flushed
@@ -14296,10 +16164,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
       pending =
         Enum.reduce(entries, pending, fn {compound_key, value, expire_at_ms}, acc ->
-          disk_val = persisted_disk_binary!(state, value)
-          ets_val = value_for_ets(value, hot_cache_threshold(state))
-          queue_zset_index_put_after_flush(state, redis_key, compound_key, value)
-          [{:put, compound_key, disk_val, expire_at_ms, ets_val, byte_size(disk_val)} | acc]
+          disk_val = to_disk_binary(value)
+          queue_zset_index_put_after_flush(state, redis_key, compound_key, disk_val)
+          [{:put, compound_key, disk_val, expire_at_ms} | acc]
         end)
 
       Process.put(:sm_pending_writes, pending)
@@ -14322,7 +16189,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     disk_entries =
       Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
-        {compound_key, persisted_disk_binary!(state, value), expire_at_ms}
+        {compound_key, to_disk_binary(value), expire_at_ms}
       end)
 
     case NIF.v2_append_batch(active, disk_entries) do
@@ -14330,7 +16197,7 @@ defmodule Ferricstore.Raft.StateMachine do
         entries
         |> Enum.zip(disk_entries)
         |> Enum.zip(locations)
-        |> Enum.each(fn {{{compound_key, value, expire_at_ms}, {_key, _disk_val, _exp}},
+        |> Enum.each(fn {{{compound_key, value, expire_at_ms}, {_key, disk_val, _exp}},
                          {offset, value_size}} ->
           ets_val = value_for_ets(value, hot_cache_threshold(state))
           track_keydir_binary_delta(state, compound_key, ets_val, expire_at_ms)
@@ -14348,7 +16215,7 @@ defmodule Ferricstore.Raft.StateMachine do
             Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
           end
 
-          zset_index_put(state, redis_key, compound_key, value)
+          zset_index_put(state, redis_key, compound_key, disk_val)
         end)
 
         :ok
@@ -14396,17 +16263,6 @@ defmodule Ferricstore.Raft.StateMachine do
       case result do
         :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp do_compound_batch_delete_read_visible(_state, _redis_key, []), do: :ok
-
-  defp do_compound_batch_delete_read_visible(state, redis_key, compound_keys) do
-    Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
-      case do_compound_delete(state, redis_key, compound_key) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
       end
     end)
   end
@@ -14546,7 +16402,7 @@ defmodule Ferricstore.Raft.StateMachine do
     Promotion.await_compaction_latch(state, redis_key)
 
     value_for = value_for_ets(value, hot_cache_threshold(state))
-    disk_val = persisted_disk_binary!(state, value)
+    disk_val = to_disk_binary(value)
     active = Promotion.find_active(dedicated_path)
     fid = parse_fid_from_path(active)
 
@@ -14562,47 +16418,6 @@ defmodule Ferricstore.Raft.StateMachine do
         )
 
         sm_tx_put_pending(compound_key, value, expire_at_ms)
-        deleted = Process.get(:tx_deleted_keys, MapSet.new())
-
-        if MapSet.member?(deleted, compound_key) do
-          Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
-        end
-
-        :ok
-
-      {:error, _reason} = err ->
-        err
-    end
-  end
-
-  defp do_promoted_compound_put_blob_ref(
-         state,
-         redis_key,
-         compound_key,
-         encoded_ref,
-         expire_at_ms,
-         dedicated_path,
-         pending_value
-       ) do
-    Promotion.await_compaction_latch(state, redis_key)
-
-    active = Promotion.find_active(dedicated_path)
-    fid = parse_fid_from_path(active)
-
-    case NIF.v2_append_record(active, compound_key, encoded_ref, expire_at_ms) do
-      {:ok, {offset, _record_size}} ->
-        value_size = byte_size(encoded_ref)
-        track_keydir_binary_delta(state, compound_key, nil, expire_at_ms)
-
-        :ets.insert(
-          state.ets,
-          {compound_key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size}
-        )
-
-        if pending_value != :none do
-          sm_tx_put_pending(compound_key, pending_value, expire_at_ms)
-        end
-
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         if MapSet.member?(deleted, compound_key) do
