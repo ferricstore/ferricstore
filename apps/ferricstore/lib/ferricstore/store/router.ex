@@ -3856,21 +3856,16 @@ defmodule Ferricstore.Store.Router do
 
     values = flow_terminal_many_values(ctx, keys)
     value_by_key = Map.new(Enum.zip(keys, values))
+    noop_by_key = Map.new(Enum.zip(keys, flow_terminal_many_noop_flags(values)))
 
     Enum.map(keyed_attrs, fn
       {child_key, _id, _partition_key} ->
         case Map.get(value_by_key, child_key) do
           value when is_binary(value) ->
-            case Ferricstore.Flow.decode_record(value) do
-              %{partition_key: _partition_key} = record ->
-                {:ok,
-                 [child_key]
-                 |> flow_maybe_add_parent_key(record)
-                 |> flow_add_child_group_keys(record)
-                 |> Enum.uniq()}
-
-              _other ->
-                :missing
+            if Map.get(noop_by_key, child_key) do
+              {:ok, [child_key]}
+            else
+              flow_terminal_key_entry_decode(child_key, value)
             end
 
           _other ->
@@ -3880,6 +3875,48 @@ defmodule Ferricstore.Store.Router do
       :missing ->
         :missing
     end)
+  end
+
+  defp flow_terminal_many_noop_flags(values) do
+    binaries = for value <- values, is_binary(value), do: value
+
+    flags =
+      case binaries do
+        [] -> []
+        [_ | _] -> Ferricstore.Bitcask.NIF.flow_records_terminal_after_noop(binaries)
+      end
+
+    {result, _remaining} =
+      Enum.map_reduce(values, flags, fn
+        value, [flag | remaining] when is_binary(value) ->
+          {flag == true, remaining}
+
+        value, remaining when is_binary(value) ->
+          {false, remaining}
+
+        _value, remaining ->
+          {false, remaining}
+      end)
+
+    result
+  rescue
+    _ -> List.duplicate(false, length(values))
+  end
+
+  defp flow_terminal_key_entry_decode(child_key, value) do
+    case Ferricstore.Flow.decode_record(value) do
+      %{partition_key: _partition_key} = record ->
+        {:ok,
+         [child_key]
+         |> flow_maybe_add_parent_key(record)
+         |> flow_add_child_group_keys(record)
+         |> Enum.uniq()}
+
+      _other ->
+        :missing
+    end
+  rescue
+    _ -> :missing
   end
 
   defp flow_terminal_many_values(_ctx, []), do: []
@@ -3915,17 +3952,7 @@ defmodule Ferricstore.Store.Router do
 
     case flow_get(ctx, id, partition_key) do
       value when is_binary(value) ->
-        case Ferricstore.Flow.decode_record(value) do
-          %{partition_key: _partition_key} = record ->
-            {:ok,
-             [child_key]
-             |> flow_maybe_add_parent_key(record)
-             |> flow_add_child_group_keys(record)
-             |> Enum.uniq()}
-
-          _other ->
-            :missing
-        end
+        flow_terminal_key_entry_decode(child_key, value)
 
       _other ->
         :missing

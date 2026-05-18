@@ -5929,7 +5929,7 @@ defmodule Ferricstore.Flow do
     @global_tag "{f}"
     @partition_tag_prefix "{f:"
     @auto_partition_prefix "__flow_auto__:"
-    @auto_partition_buckets 16
+    @auto_partition_buckets 256
 
     def state_key(id, partition_key \\ nil)
 

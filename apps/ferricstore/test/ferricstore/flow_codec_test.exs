@@ -32,6 +32,27 @@ defmodule Ferricstore.FlowCodecTest do
     assert decoded == record
   end
 
+  test "terminal after noop batch NIF detects records without terminal side effects" do
+    parented = %{base_record() | parent_flow_id: "parent-1"}
+
+    parent = %{
+      base_record()
+      | child_groups: %{
+          "default" => %{
+            "children" => %{"child-1" => "running"},
+            "child_partitions" => %{}
+          }
+        }
+    }
+
+    assert Ferricstore.Bitcask.NIF.flow_records_terminal_after_noop([
+             Flow.encode_record(base_record()),
+             Flow.encode_record(parented),
+             Flow.encode_record(parent),
+             "not-a-flow-record"
+           ]) == [true, false, false, false]
+  end
+
   test "history codec keeps terminal metadata and refs" do
     record = %{base_record() | state: "completed", result_ref: "flow/value/a/result/2"}
     encoded = Flow.encode_history_fields(record, "123-1", 123, %{reason: "ok"})

@@ -749,6 +749,21 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
     Ok((crate::atoms::ok(), fields).encode(env))
 }
 
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_records_terminal_after_noop(values: Vec<Binary<'_>>) -> Vec<bool> {
+    values
+        .iter()
+        .map(|value| {
+            decode_flow_record(value.as_slice())
+                .map(|record| {
+                    blank(record.parent_flow_id)
+                        && encoded_child_groups_empty(record.child_groups_encoded)
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_history_encode<'a>(
     env: Env<'a>,
@@ -1446,6 +1461,14 @@ fn decode_encoded_bin_field(input: &[u8]) -> Option<(&[u8], &[u8])> {
     let remaining = &rest[len..];
     let consumed = before_len - remaining.len();
     Some((&input[..consumed], remaining))
+}
+
+fn encoded_child_groups_empty(encoded: &[u8]) -> bool {
+    match decode_bin(encoded) {
+        Some((None, rest)) => rest.is_empty(),
+        Some((Some(value), rest)) => rest.is_empty() && value == b"J{}",
+        None => false,
+    }
 }
 
 fn encode_claimed_record(

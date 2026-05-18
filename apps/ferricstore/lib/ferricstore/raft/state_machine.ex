@@ -7654,7 +7654,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_terminal_pipeline_batch(state, op, %{records: [_ | _] = attrs_list})
        when op in [:complete, :retry, :fail, :cancel] do
     {results, plans, has_record_values?} =
-      flow_terminal_pipeline_prepare(state, op, attrs_list, %{}, [], [], false)
+      flow_terminal_pipeline_prepare(state, op, attrs_list)
 
     case flow_terminal_pipeline_apply(
            state,
@@ -7669,6 +7669,118 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp do_flow_terminal_pipeline_batch(_state, _op, _attrs),
     do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_terminal_pipeline_prepare(state, op, attrs_list) do
+    case flow_terminal_pipeline_unique_records(state, attrs_list) do
+      {:ok, records} ->
+        flow_terminal_pipeline_prepare_records(state, op, attrs_list, records, [], [], false)
+
+      :fallback ->
+        flow_terminal_pipeline_prepare(state, op, attrs_list, %{}, [], [], false)
+    end
+  end
+
+  defp flow_terminal_pipeline_unique_records(state, attrs_list) do
+    attrs_list
+    |> Enum.reduce_while({:ok, [], MapSet.new()}, fn
+      %{id: id} = attrs, {:ok, keys, seen} when is_binary(id) and id != "" ->
+        key = FlowKeys.state_key(id, Map.get(attrs, :partition_key))
+
+        if MapSet.member?(seen, key) do
+          {:halt, :fallback}
+        else
+          {:cont, {:ok, [key | keys], MapSet.put(seen, key)}}
+        end
+
+      _attrs, _acc ->
+        {:halt, :fallback}
+    end)
+    |> case do
+      {:ok, keys, _seen} -> {:ok, flow_read_records_by_keys(state, Enum.reverse(keys))}
+      :fallback -> :fallback
+    end
+  end
+
+  defp flow_terminal_pipeline_prepare_records(
+         _state,
+         _op,
+         [],
+         [],
+         results,
+         plans,
+         has_record_values?
+       ) do
+    {results, plans, has_record_values?}
+  end
+
+  defp flow_terminal_pipeline_prepare_records(
+         state,
+         op,
+         [%{id: id} = attrs | rest_attrs],
+         [record | rest_records],
+         results,
+         plans,
+         has_record_values?
+       )
+       when is_binary(id) and id != "" do
+    now_ms = flow_attrs_now_ms(attrs)
+
+    case flow_terminal_pipeline_prepare_one(state, op, record, attrs, now_ms) do
+      {:ok, _next, plan} ->
+        flow_terminal_pipeline_prepare_records(
+          state,
+          op,
+          rest_attrs,
+          rest_records,
+          [:ok | results],
+          [plan | plans],
+          has_record_values? or flow_attrs_have_record_values?(attrs)
+        )
+
+      {:error, _reason} = error ->
+        flow_terminal_pipeline_prepare_records(
+          state,
+          op,
+          rest_attrs,
+          rest_records,
+          [error | results],
+          plans,
+          has_record_values?
+        )
+    end
+  end
+
+  defp flow_terminal_pipeline_prepare_records(
+         state,
+         op,
+         [_bad | rest_attrs],
+         [_record | rest_records],
+         results,
+         plans,
+         has_record_values?
+       ) do
+    flow_terminal_pipeline_prepare_records(
+      state,
+      op,
+      rest_attrs,
+      rest_records,
+      [{:error, "ERR flow id must be a non-empty string"} | results],
+      plans,
+      has_record_values?
+    )
+  end
+
+  defp flow_terminal_pipeline_prepare_records(
+         state,
+         op,
+         _attrs,
+         _records,
+         results,
+         plans,
+         has_record_values?
+       ) do
+    flow_terminal_pipeline_prepare(state, op, [], %{}, results, plans, has_record_values?)
+  end
 
   defp flow_terminal_pipeline_prepare(
          _state,
