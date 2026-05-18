@@ -4,12 +4,18 @@ defmodule Ferricstore.Flow.LMDBWriter do
   use GenServer
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
 
   require Logger
 
   @default_flush_interval_ms 100
+  @default_lagged_flush_interval_ms 30_000
+  @default_lagged_flush_jitter_ms 5_000
   @default_max_ops 10_000
+  @default_lagged_max_ops 100_000
+  @default_flush_chunk_ops 10_000
+  @default_lagged_flush_chunk_pause_ms 1
   @terminal_states ["completed", "failed", "cancelled"]
 
   def start_link(opts) do
@@ -190,6 +196,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
     state = %{
       instance_name: instance_name_from_opts(opts),
+      mode: Ferricstore.Flow.LMDB.mode(),
       shard_index: shard_index,
       shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, shard_index),
       path:
@@ -201,6 +208,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       pending_after_flush: [],
       count: 0,
       first_pending_at: nil,
+      last_enqueue_at: nil,
       timer_ref: nil,
       durable_index: 0,
       requested_index: 0,
@@ -210,9 +218,23 @@ defmodule Ferricstore.Flow.LMDBWriter do
         Application.get_env(
           :ferricstore,
           :flow_lmdb_flush_interval_ms,
-          @default_flush_interval_ms
+          default_flush_interval_ms()
         ),
-      max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, @default_max_ops)
+      flush_jitter_ms:
+        Application.get_env(
+          :ferricstore,
+          :flow_lmdb_flush_jitter_ms,
+          default_flush_jitter_ms()
+        ),
+      max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, default_max_ops()),
+      flush_chunk_ops:
+        Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops, @default_flush_chunk_ops),
+      flush_chunk_pause_ms:
+        Application.get_env(
+          :ferricstore,
+          :flow_lmdb_flush_chunk_pause_ms,
+          default_flush_chunk_pause_ms()
+        )
     }
 
     durable_index = LMDBReplaySafeIndex.read(state.shard_data_path)
@@ -231,6 +253,34 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  defp default_flush_interval_ms do
+    case Ferricstore.Flow.LMDB.mode() do
+      :lagged -> @default_lagged_flush_interval_ms
+      _ -> @default_flush_interval_ms
+    end
+  end
+
+  defp default_max_ops do
+    case Ferricstore.Flow.LMDB.mode() do
+      :lagged -> @default_lagged_max_ops
+      _ -> @default_max_ops
+    end
+  end
+
+  defp default_flush_jitter_ms do
+    case Ferricstore.Flow.LMDB.mode() do
+      :lagged -> @default_lagged_flush_jitter_ms
+      _ -> 0
+    end
+  end
+
+  defp default_flush_chunk_pause_ms do
+    case Ferricstore.Flow.LMDB.mode() do
+      :lagged -> @default_lagged_flush_chunk_pause_ms
+      _ -> 0
+    end
+  end
+
   defp instance_name_from_ctx(%{name: name}) when is_atom(name) and not is_nil(name), do: name
   defp instance_name_from_ctx(_ctx), do: :default
 
@@ -244,13 +294,14 @@ defmodule Ferricstore.Flow.LMDBWriter do
         | pending: prepend_reverse(ops, state.pending),
           pending_after_flush: prepend_reverse(after_flush, state.pending_after_flush),
           count: state.count + length(ops),
-          first_pending_at: state.first_pending_at || now
+          first_pending_at: state.first_pending_at || now,
+          last_enqueue_at: now
       }
-      |> ensure_timer()
+      |> ensure_enqueue_timer()
 
     emit_backlog(state, now)
 
-    if state.count >= state.max_ops do
+    if flush_on_max_ops?(state) do
       {:noreply, flush_pending(state)}
     else
       {:noreply, state}
@@ -279,10 +330,22 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp ensure_timer(%{timer_ref: nil, flush_interval_ms: interval} = state) do
-    %{state | timer_ref: Process.send_after(self(), :flush, interval)}
+    delay = interval + timer_jitter_ms(Map.get(state, :flush_jitter_ms, 0))
+    %{state | timer_ref: Process.send_after(self(), :flush, delay)}
   end
 
   defp ensure_timer(state), do: state
+
+  defp ensure_enqueue_timer(%{mode: :lagged, timer_ref: timer_ref} = state)
+       when is_reference(timer_ref) do
+    Process.cancel_timer(timer_ref)
+    ensure_timer(%{state | timer_ref: nil})
+  end
+
+  defp ensure_enqueue_timer(state), do: ensure_timer(state)
+
+  defp flush_on_max_ops?(%{mode: :lagged}), do: false
+  defp flush_on_max_ops?(state), do: state.count >= state.max_ops
 
   defp flush_pending(state) do
     {state, _reply} = flush_pending_with_reply(state)
@@ -293,7 +356,14 @@ defmodule Ferricstore.Flow.LMDBWriter do
          %{pending: [], requested_index: requested, durable_index: durable} = state
        )
        when requested <= durable do
-    {%{state | count: 0, pending_after_flush: [], first_pending_at: nil, timer_ref: nil}, :ok}
+    {%{
+       state
+       | count: 0,
+         pending_after_flush: [],
+         first_pending_at: nil,
+         last_enqueue_at: nil,
+         timer_ref: nil
+     }, :ok}
   end
 
   defp flush_pending_with_reply(state) do
@@ -316,6 +386,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
             pending_after_flush: [],
             count: 0,
             first_pending_at: nil,
+            last_enqueue_at: nil,
             timer_ref: nil
         }
 
@@ -340,10 +411,16 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do
+    LMDBFlushCoordinator.with_permit(state.instance_name, fn ->
+      flush_ops_and_marker_with_permit(state, ops, started_at)
+    end)
+  end
+
+  defp flush_ops_and_marker_with_permit(state, ops, started_at) do
     try do
       with {:ok, state} <- maybe_ensure_lmdb_ready(state, ops),
            {:ok, ops, state} <- expand_ops(state, ops),
-           :ok <- write_ops(state.path, ops),
+           :ok <- write_ops_chunked(state, ops),
            :ok <- cache_terminal_counts(state.path, state.terminal_count_cache),
            {:ok, state} <- persist_requested(state, started_at) do
         {:ok, state, length(ops)}
@@ -369,6 +446,26 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp write_ops(_path, []), do: :ok
   defp write_ops(path, ops), do: Ferricstore.Flow.LMDB.write_batch(path, ops)
+
+  defp write_ops_chunked(_state, []), do: :ok
+
+  defp write_ops_chunked(state, ops) do
+    chunk_size = normalize_positive_integer(Map.get(state, :flush_chunk_ops), @default_flush_chunk_ops)
+    pause_ms = normalize_non_negative_integer(Map.get(state, :flush_chunk_pause_ms), 0)
+
+    ops
+    |> Enum.chunk_every(chunk_size)
+    |> Enum.reduce_while(:ok, fn chunk, :ok ->
+      case write_ops(state.path, chunk) do
+        :ok ->
+          if pause_ms > 0, do: Process.sleep(pause_ms)
+          {:cont, :ok}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
 
   defp expand_ops(state, []) do
     {:ok, [], Map.put(state, :terminal_count_cache, empty_terminal_count_cache())}
@@ -1080,6 +1177,40 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp normalize_delay_ms(delay_ms) when is_integer(delay_ms) and delay_ms >= 0, do: delay_ms
   defp normalize_delay_ms(_delay_ms), do: 0
+
+  defp timer_jitter_ms(jitter_ms) do
+    jitter_ms = normalize_non_negative_integer(jitter_ms, 0)
+
+    if jitter_ms == 0 do
+      0
+    else
+      :erlang.phash2({self(), System.unique_integer([:monotonic])}, jitter_ms + 1)
+    end
+  end
+
+  defp normalize_positive_integer(value, _default) when is_integer(value) and value > 0,
+    do: value
+
+  defp normalize_positive_integer(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed > 0 -> parsed
+      _ -> default
+    end
+  end
+
+  defp normalize_positive_integer(_value, default), do: default
+
+  defp normalize_non_negative_integer(value, _default) when is_integer(value) and value >= 0,
+    do: value
+
+  defp normalize_non_negative_integer(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed >= 0 -> parsed
+      _ -> default
+    end
+  end
+
+  defp normalize_non_negative_integer(_value, default), do: default
 
   defp safe_zset_delete_member(nil, _zset_lookup, _state_index_key, _id), do: :ok
   defp safe_zset_delete_member(_zset_index, nil, _state_index_key, _id), do: :ok

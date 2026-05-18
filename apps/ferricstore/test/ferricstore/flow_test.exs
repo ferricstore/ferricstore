@@ -910,6 +910,59 @@ defmodule Ferricstore.FlowTest do
                     %{commands: 3, groups: 2, coalesced_calls: 1}, %{source: :resp_pipeline}}
   end
 
+  test "pipeline_claim_due_batch coalesces job-only claim responses" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("pipeline-claim-jobs")
+    partition_key = uid("tenant")
+    ids = Enum.map(1..2, &uid("pipeline-claim-jobs-#{&1}"))
+
+    Enum.each(ids, fn id ->
+      assert {:ok, %{id: ^id}} =
+               flow_create_and_get(id,
+                 type: type,
+                 partition_key: partition_key,
+                 now_ms: 1,
+                 run_at_ms: 1
+               )
+    end)
+
+    attach_flow_telemetry([[:ferricstore, :flow, :pipeline_claim_due_batch]])
+
+    assert [
+             {:ok, [%{id: first_id, lease_token: first_lease, fencing_token: first_fence} = first]},
+             {:ok, [%{id: second_id, lease_token: second_lease, fencing_token: second_fence} = second]}
+           ] =
+             Ferricstore.Flow.pipeline_claim_due_batch(ctx, [
+               {:claim_due, type,
+                [
+                  worker: "worker-a",
+                  partition_key: partition_key,
+                  limit: 1,
+                  now_ms: 2,
+                  return: :jobs
+                ]},
+               {:claim_due, type,
+                [
+                  worker: "worker-a",
+                  partition_key: partition_key,
+                  limit: 1,
+                  now_ms: 2,
+                  return: :jobs
+                ]}
+             ])
+
+    assert MapSet.new([first_id, second_id]) == MapSet.new(ids)
+    assert is_binary(first_lease)
+    assert is_binary(second_lease)
+    assert is_integer(first_fence)
+    assert is_integer(second_fence)
+    refute Map.has_key?(first, :version)
+    refute Map.has_key?(second, :version)
+
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_claim_due_batch],
+                    %{commands: 2, groups: 1, coalesced_calls: 1}, %{source: :resp_pipeline}}
+  end
+
   test "pipeline_claim_due_batch groups interleaved independent partitions" do
     ctx = FerricStore.Instance.get(:default)
     type = uid("pipeline-claim-partitions")
@@ -1455,14 +1508,17 @@ defmodule Ferricstore.FlowTest do
     assert flow_b.correlation_id == "corr:item"
   end
 
-  test "flow_create_many rejects missing partition and rolls back duplicate batches" do
+  test "flow_create_many auto-partitions missing partition and rolls back duplicate batches" do
     partition = uid("tenant")
     type = uid("bulk-atomic")
     existing_id = uid("bulk-existing")
     new_id = uid("bulk-new")
 
-    assert {:error, "ERR flow partition_key is required"} =
+    assert {:ok, [auto_flow]} =
              flow_create_many_and_get(nil, [%{id: new_id}], type: type)
+
+    assert auto_flow.id == new_id
+    assert Ferricstore.Flow.Keys.auto_partition_key?(auto_flow.partition_key)
 
     assert {:ok, _} =
              flow_create_and_get(existing_id,
@@ -1492,6 +1548,64 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, nil} = FerricStore.flow_get(new_id, partition_key: partition)
     assert {:ok, []} = FerricStore.flow_history(new_id, partition_key: partition)
+  end
+
+  test "flow_create_many independent keeps successful items when one create fails" do
+    partition = uid("tenant-create-many-independent")
+    type = uid("bulk-independent-create")
+    existing_id = uid("bulk-independent-existing")
+    new_id = uid("bulk-independent-new")
+
+    assert {:ok, _} =
+             flow_create_and_get(existing_id,
+               type: type,
+               partition_key: partition,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [{:error, "ERR flow already exists"}, :ok]} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: existing_id}, %{id: new_id}],
+               type: type,
+               run_at_ms: 1_000,
+               independent: true
+             )
+
+    assert {:ok, %{id: ^new_id, state: "queued"}} =
+             FerricStore.flow_get(new_id, partition_key: partition)
+  end
+
+  test "flow_create_many independent auto-partitions without client-side grouping" do
+    type = uid("bulk-independent-auto-create")
+    existing_id = uid("bulk-independent-auto-existing")
+    new_id = uid("bulk-independent-auto-new")
+    ids = Enum.map(1..32, fn idx -> uid("bulk-independent-auto-#{idx}") end)
+
+    assert {:ok, _} =
+             flow_create_and_get(existing_id,
+               type: type,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, results} =
+             FerricStore.flow_create_many(
+               nil,
+               [%{id: existing_id}, %{id: new_id} | Enum.map(ids, &%{id: &1})],
+               type: type,
+               run_at_ms: 1_000,
+               independent: true
+             )
+
+    assert [{:error, "ERR flow already exists"} | created_results] = results
+    assert Enum.all?(created_results, &(&1 == :ok))
+
+    for id <- [new_id | ids] do
+      assert {:ok, %{id: ^id, state: "queued", partition_key: partition_key}} =
+               FerricStore.flow_get(id)
+
+      assert Ferricstore.Flow.Keys.auto_partition_key?(partition_key)
+    end
   end
 
   test "flow_create_many idempotent retry returns existing records without duplicate writes" do
@@ -2982,11 +3096,6 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-index")
     type = "indexed"
     worker = "worker-index"
-    queued_index = Ferricstore.Flow.Keys.state_index_key(type, "queued")
-    running_index = Ferricstore.Flow.Keys.state_index_key(type, "running")
-    completed_index = Ferricstore.Flow.Keys.state_index_key(type, "completed")
-    inflight_index = Ferricstore.Flow.Keys.inflight_index_key(type)
-    worker_index = Ferricstore.Flow.Keys.worker_index_key(worker)
     ctx = FerricStore.Instance.get(:default)
 
     range_ids = fn index_key ->
@@ -3008,7 +3117,18 @@ defmodule Ferricstore.FlowTest do
       |> Enum.map(fn {member, _score} -> member end)
     end
 
-    assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
+    assert {:ok, created} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
+    assert Ferricstore.Flow.Keys.auto_partition_key?(created.partition_key)
+
+    queued_index = Ferricstore.Flow.Keys.state_index_key(type, "queued", created.partition_key)
+    running_index = Ferricstore.Flow.Keys.state_index_key(type, "running", created.partition_key)
+
+    completed_index =
+      Ferricstore.Flow.Keys.state_index_key(type, "completed", created.partition_key)
+
+    inflight_index = Ferricstore.Flow.Keys.inflight_index_key(type, created.partition_key)
+    worker_index = Ferricstore.Flow.Keys.worker_index_key(worker, created.partition_key)
+
     assert [^id] = range_ids.(queued_index)
 
     assert {:ok, [first_claim]} =
@@ -3085,6 +3205,9 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, completed} = FerricStore.flow_list(type, state: "completed", count: 10)
     assert Enum.map(completed, & &1.id) == [claimed_done.id]
+
+    assert {:ok, terminals} = FerricStore.flow_terminals(type, state: "completed", count: 10)
+    assert Enum.map(terminals, & &1.id) == [claimed_done.id]
 
     assert {:ok, info} = FerricStore.flow_info(type)
     assert info.queued == 1
@@ -3552,6 +3675,64 @@ defmodule Ferricstore.FlowTest do
 
     assert claimed_b.id == id_b
     assert claimed_b.partition_key == partition_b
+  end
+
+  test "flow_create without partition auto-spreads and default claim_due fetches across buckets" do
+    type = uid("claim-auto-bucket")
+
+    ids =
+      1..64
+      |> Enum.map(fn i -> uid("flow-auto-bucket-#{i}") end)
+
+    shards =
+      ids
+      |> Enum.map(fn id -> shard_for(Ferricstore.Flow.Keys.state_key(id)) end)
+      |> MapSet.new()
+
+    assert MapSet.size(shards) > 1
+
+    Enum.each(ids, fn id ->
+      assert {:ok, flow} =
+               flow_create_and_get(id,
+                 type: type,
+                 run_at_ms: 1_000
+               )
+
+      assert flow.id == id
+      assert Ferricstore.Flow.Keys.auto_partition_key?(flow.partition_key)
+    end)
+
+    claimed =
+      1..16
+      |> Enum.reduce_while([], fn _round, acc ->
+        case FerricStore.flow_claim_due(type,
+               worker: "worker-auto-bucket",
+               lease_ms: 30_000,
+               limit: length(ids),
+               now_ms: 1_000
+             ) do
+          {:ok, []} ->
+            {:cont, acc}
+
+          {:ok, records} ->
+            next = records ++ acc
+
+            if MapSet.new(Enum.map(next, & &1.id)) == MapSet.new(ids) do
+              {:halt, next}
+            else
+              {:cont, next}
+            end
+
+          {:error, _reason} = error ->
+            flunk("claim_due failed: #{inspect(error)}")
+        end
+      end)
+
+    assert MapSet.new(Enum.map(claimed, & &1.id)) == MapSet.new(ids)
+
+    assert claimed
+           |> Enum.map(& &1.partition_key)
+           |> Enum.all?(&Ferricstore.Flow.Keys.auto_partition_key?/1)
   end
 
   test "flow_claim_due can scan any partition and selected states" do
@@ -5316,6 +5497,38 @@ defmodule Ferricstore.FlowTest do
     assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new([id_a, id_b])
   end
 
+  test "flow_transition_many independent keeps successful items when one item fails" do
+    partition = uid("tenant-transition-many-independent")
+    type = uid("bulk-transition-independent")
+    id_a = uid("transition-independent-bad")
+    id_b = uid("transition-independent-good")
+
+    assert {:ok, _} =
+             flow_create_many_and_get(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [{:error, "ERR stale flow lease"}, :ok]} =
+             FerricStore.flow_transition_many(
+               partition,
+               "queued",
+               "ready",
+               [
+                 %{id: id_a, fencing_token: 1},
+                 %{id: id_b, fencing_token: 0}
+               ],
+               run_at_ms: 2_000,
+               independent: true
+             )
+
+    assert {:ok, %{state: "queued"}} = FerricStore.flow_get(id_a, partition_key: partition)
+    assert {:ok, %{state: "ready"}} = FerricStore.flow_get(id_b, partition_key: partition)
+  end
+
   test "flow_transition_many spans shards and rolls back failing shard group" do
     {same_a, same_b, other} = mixed_partition_keys()
     type = uid("bulk-mixed-transition")
@@ -5806,6 +6019,163 @@ defmodule Ferricstore.FlowTest do
     assert fetched_b.state == "queued"
     assert fetched_a.version == 1
     assert fetched_b.version == 1
+  end
+
+  test "terminal many independent keeps successful items when one item fails" do
+    partition = uid("tenant-terminal-many-independent")
+
+    complete_bad =
+      create_claimed_flow(
+        uid("complete-independent-bad"),
+        partition,
+        uid("complete-independent"),
+        "worker-complete-independent"
+      )
+
+    complete_good =
+      create_claimed_flow(
+        uid("complete-independent-good"),
+        partition,
+        uid("complete-independent"),
+        "worker-complete-independent"
+      )
+
+    assert {:ok, [{:error, "ERR stale flow lease"}, :ok]} =
+             FerricStore.flow_complete_many(
+               partition,
+               [
+                 %{
+                   id: complete_bad.id,
+                   lease_token: complete_bad.lease_token,
+                   fencing_token: complete_bad.fencing_token + 1
+                 },
+                 %{
+                   id: complete_good.id,
+                   lease_token: complete_good.lease_token,
+                   fencing_token: complete_good.fencing_token
+                 }
+               ],
+               now_ms: 2_000,
+               independent: true
+             )
+
+    assert {:ok, %{state: "running"}} =
+             FerricStore.flow_get(complete_bad.id, partition_key: partition)
+
+    assert {:ok, %{state: "completed"}} =
+             FerricStore.flow_get(complete_good.id, partition_key: partition)
+
+    retry_bad =
+      create_claimed_flow(
+        uid("retry-independent-bad"),
+        partition,
+        uid("retry-independent"),
+        "worker-retry-independent"
+      )
+
+    retry_good =
+      create_claimed_flow(
+        uid("retry-independent-good"),
+        partition,
+        uid("retry-independent"),
+        "worker-retry-independent"
+      )
+
+    assert {:ok, [{:error, "ERR stale flow lease"}, :ok]} =
+             FerricStore.flow_retry_many(
+               partition,
+               [
+                 %{
+                   id: retry_bad.id,
+                   lease_token: retry_bad.lease_token,
+                   fencing_token: retry_bad.fencing_token + 1
+                 },
+                 %{
+                   id: retry_good.id,
+                   lease_token: retry_good.lease_token,
+                   fencing_token: retry_good.fencing_token
+                 }
+               ],
+               run_at_ms: 3_000,
+               now_ms: 2_000,
+               independent: true
+             )
+
+    assert {:ok, %{state: "running"}} =
+             FerricStore.flow_get(retry_bad.id, partition_key: partition)
+
+    assert {:ok, %{state: "queued"}} =
+             FerricStore.flow_get(retry_good.id, partition_key: partition)
+
+    fail_bad =
+      create_claimed_flow(
+        uid("fail-independent-bad"),
+        partition,
+        uid("fail-independent"),
+        "worker-fail-independent"
+      )
+
+    fail_good =
+      create_claimed_flow(
+        uid("fail-independent-good"),
+        partition,
+        uid("fail-independent"),
+        "worker-fail-independent"
+      )
+
+    assert {:ok, [{:error, "ERR stale flow lease"}, :ok]} =
+             FerricStore.flow_fail_many(
+               partition,
+               [
+                 %{
+                   id: fail_bad.id,
+                   lease_token: fail_bad.lease_token,
+                   fencing_token: fail_bad.fencing_token + 1
+                 },
+                 %{
+                   id: fail_good.id,
+                   lease_token: fail_good.lease_token,
+                   fencing_token: fail_good.fencing_token
+                 }
+               ],
+               now_ms: 2_000,
+               independent: true
+             )
+
+    assert {:ok, %{state: "running"}} =
+             FerricStore.flow_get(fail_bad.id, partition_key: partition)
+
+    assert {:ok, %{state: "failed"}} =
+             FerricStore.flow_get(fail_good.id, partition_key: partition)
+
+    cancel_type = uid("cancel-independent")
+    cancel_bad = uid("cancel-independent-bad")
+    cancel_good = uid("cancel-independent-good")
+
+    assert {:ok, _} =
+             flow_create_many_and_get(
+               partition,
+               [%{id: cancel_bad}, %{id: cancel_good}],
+               type: cancel_type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [{:error, "ERR stale flow lease"}, :ok]} =
+             FerricStore.flow_cancel_many(
+               partition,
+               [
+                 %{id: cancel_bad, fencing_token: 1},
+                 %{id: cancel_good, fencing_token: 0}
+               ],
+               now_ms: 2_000,
+               independent: true
+             )
+
+    assert {:ok, %{state: "queued"}} = FerricStore.flow_get(cancel_bad, partition_key: partition)
+
+    assert {:ok, %{state: "cancelled"}} =
+             FerricStore.flow_get(cancel_good, partition_key: partition)
   end
 
   test "flow_cancel_many spans shards and rolls back failing shard group" do

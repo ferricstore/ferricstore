@@ -183,6 +183,7 @@ defmodule Ferricstore.Commands.Flow do
   def normalize_result({:error, _} = error), do: error
 
   defp normalize_value(nil), do: nil
+  defp normalize_value(:ok), do: "OK"
 
   defp normalize_value({event_id, fields}) when is_binary(event_id),
     do: [event_id, normalize_map(fields)]

@@ -308,6 +308,80 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     assert done_parent.child_groups["fanout"]["children"][child] == "completed"
   end
 
+  test "FLOW terminal pipeline reaches Flow write coalescer" do
+    ctx = FerricStore.Instance.get(:default)
+    type = "pipeline-terminal-#{System.unique_integer([:positive])}"
+    partition_key = "tenant-pipe-flow-terminal"
+    complete_id = "pipe_flow_complete_#{System.unique_integer([:positive])}"
+    cancel_id = "pipe_flow_cancel_#{System.unique_integer([:positive])}"
+    handler_id = {:pipeline_flow_terminal_write, self(), make_ref()}
+
+    assert :ok =
+             FerricStore.flow_create(complete_id,
+               type: type,
+               state: "queued",
+               partition_key: partition_key,
+               now_ms: 1,
+               run_at_ms: 1
+             )
+
+    assert :ok =
+             FerricStore.flow_create(cancel_id,
+               type: type,
+               state: "queued",
+               partition_key: partition_key,
+               now_ms: 2,
+               run_at_ms: 2
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition_key,
+               worker: "pipeline-terminal-worker",
+               limit: 1,
+               now_ms: 9_000_000_000_000
+             )
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :pipeline_write, :stop],
+        fn _event, measurements, metadata, test_pid ->
+          send(test_pid, {:flow_pipeline_write, measurements, metadata})
+        end,
+        self()
+      )
+
+    state = connection_state(ctx)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("FLOW terminal pipeline write coalescer")
+
+    commands = [
+      {:command, "FLOW.COMPLETE", [],
+       {:flow_complete, claimed.id, claimed.lease_token,
+        [partition_key: partition_key, fencing_token: claimed.fencing_token]}, []},
+      {:command, "FLOW.CANCEL", [],
+       {:flow_cancel, cancel_id,
+        [partition_key: partition_key, fencing_token: 0, now_ms: 9_000_000_000_001]}, []}
+    ]
+
+    try do
+      assert {:continue, ^state} =
+               Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+      assert_receive {:pipeline_response, response}
+      refute response =~ "-ERR"
+      assert_receive {:flow_pipeline_write, _measurements, %{result: :ok}}
+
+      assert {:ok, completed} = FerricStore.flow_get(claimed.id, partition_key: partition_key)
+      assert {:ok, cancelled} = FerricStore.flow_get(cancel_id, partition_key: partition_key)
+      assert completed.state == "completed"
+      assert cancelled.state == "cancelled"
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
   test "SET pipeline fast path writes through sandbox namespace" do
     ctx = FerricStore.Instance.get(:default)
     sandbox = "sandbox_pipe:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"

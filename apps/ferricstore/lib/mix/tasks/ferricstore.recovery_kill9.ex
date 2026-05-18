@@ -262,13 +262,21 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
     :telemetry.attach(
       handler_id,
       [:ferricstore, :shard, :startup_phase],
-      fn _event, measurements, metadata, _config ->
-        send(owner, {:startup_profile, metadata.phase, measurements.duration_us})
-      end,
-      nil
+      &__MODULE__.handle_startup_profile_event/4,
+      owner
     )
 
     handler_id
+  end
+
+  @doc false
+  def handle_startup_profile_event(
+        _event,
+        %{duration_us: duration_us},
+        %{phase: phase},
+        owner
+      ) do
+    send(owner, {:startup_profile, phase, duration_us})
   end
 
   defp collect_startup_profile(handler_id) do

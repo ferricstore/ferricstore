@@ -6,22 +6,20 @@ defmodule Ferricstore.Flow.LMDB do
   @default_map_size 64 * 1024 * 1024 * 1024
   @terminal_count_cache :ferricstore_flow_lmdb_terminal_count_cache
 
-  # Flow LMDB is part of the Flow storage contract now. Legacy "off" values are
-  # normalized to mirror mode so queries and cold terminal reads stay available.
-  def enabled?, do: true
+  def enabled?, do: mode() != :off
 
   def mirror? do
-    mode() == :mirror
+    mode() in [:mirror, :lagged]
   end
 
   def mode do
-    configured = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    :ferricstore
+    |> Application.get_env(:flow_lmdb_mode, default_mode())
+    |> normalize_mode()
+  end
 
-    if configured != nil do
-      normalize_mode(configured)
-    else
-      :mirror
-    end
+  defp default_mode do
+    if Application.get_env(:ferricstore, :flow_lmdb_enabled, false), do: :mirror, else: :off
   end
 
   def map_size do
@@ -680,13 +678,19 @@ defmodule Ferricstore.Flow.LMDB do
 
   defp refresh_terminal_count_cache_after_delete(_path, :missing), do: :ok
 
-  defp normalize_mode(:off), do: :mirror
+  defp normalize_mode(:off), do: :off
+  defp normalize_mode(:lagged), do: :lagged
+  defp normalize_mode(:async), do: :lagged
   defp normalize_mode(:write_through), do: :mirror
   defp normalize_mode(:mirror), do: :mirror
-  defp normalize_mode(value) when value in [false, "false", "0", "off"], do: :mirror
-  defp normalize_mode(value) when value in [true, "true", "1", "mirror"], do: :mirror
+  defp normalize_mode(value) when value in [false, "false", "FALSE", "0", "off", nil], do: :off
+
+  defp normalize_mode(value) when value in ["lagged", "async", "batched"],
+    do: :lagged
+
+  defp normalize_mode(value) when value in [true, "true", "TRUE", "1", "mirror", "on"], do: :mirror
   defp normalize_mode(value) when value in ["write_through", "write-through"], do: :mirror
-  defp normalize_mode(_value), do: :mirror
+  defp normalize_mode(_value), do: default_mode()
 
   defp expired_terminal_sweep_ops(path, entries, now_ms) do
     Enum.reduce_while(entries, {[], %{}, 0}, fn {expire_key, expire_value},

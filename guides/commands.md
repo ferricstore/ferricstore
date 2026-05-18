@@ -45,7 +45,8 @@ compatibility commands. They are exposed through RESP3 and the embedded API:
 
 Production semantics, retry policy, history caps, LMDB cold projection, and
 operator metrics are documented in `docs/flow-production-readiness.md` and
-`docs/flow-retry-policy.md`.
+`docs/flow-retry-policy.md`. The Elixir workflow SDK for the embedded API is
+documented in `docs/flow-elixir-sdk.md`.
 
 ### Commands with Minor Differences
 

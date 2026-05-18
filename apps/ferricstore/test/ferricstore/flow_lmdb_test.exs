@@ -72,6 +72,98 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
+  test "lagged mode keeps LMDB projection enabled but uses larger writer batches" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+    Application.delete_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    Application.delete_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_lagged_writer_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_lagged_writer_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:state:lagged"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    writer_pid =
+      start_supervised!(
+        {Ferricstore.Flow.LMDBWriter,
+         shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+      )
+
+    writer_state = :sys.get_state(writer_pid)
+
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
+    assert Ferricstore.Flow.LMDB.mirror?()
+    assert writer_state.flush_interval_ms == 30_000
+    assert writer_state.flush_jitter_ms == 5_000
+    assert writer_state.max_ops == 100_000
+    assert writer_state.flush_chunk_ops == 10_000
+    assert writer_state.flush_chunk_pause_ms == 1
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v1"}])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
+  end
+
+  test "flush coordinator serializes LMDB writers by default" do
+    instance_name = :"flow_lmdb_flush_coordinator_#{System.unique_integer([:positive])}"
+    parent = self()
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBFlushCoordinator, instance_name: instance_name, max_concurrent: 1}
+    )
+
+    first =
+      spawn(fn ->
+        Ferricstore.Flow.LMDBFlushCoordinator.with_permit(instance_name, fn ->
+          send(parent, :first_entered)
+
+          receive do
+            :release_first -> :ok
+          end
+
+          send(parent, :first_leaving)
+        end)
+      end)
+
+    assert_receive :first_entered
+
+    _second =
+      spawn(fn ->
+        Ferricstore.Flow.LMDBFlushCoordinator.with_permit(instance_name, fn ->
+          send(parent, :second_entered)
+        end)
+      end)
+
+    refute_receive :second_entered, 50
+    send(first, :release_first)
+    assert_receive :first_leaving
+    assert_receive :second_entered
+  end
+
   test "empty rebuild does not open LMDB" do
     data_dir =
       Path.join(
@@ -304,18 +396,40 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, _} = Ferricstore.Flow.LMDB.get(path, reused_key)
   end
 
-  test "flow LMDB mode defaults to mirror and legacy off cannot disable it" do
+  test "flow LMDB mode defaults off unless explicitly enabled" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_enabled = Application.get_env(:ferricstore, :flow_lmdb_enabled)
 
-    on_exit(fn -> restore_env(:flow_lmdb_mode, old_mode) end)
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_enabled, old_enabled)
+    end)
 
     Application.delete_env(:ferricstore, :flow_lmdb_mode)
+    Application.delete_env(:ferricstore, :flow_lmdb_enabled)
+    refute Ferricstore.Flow.LMDB.enabled?()
+    assert Ferricstore.Flow.LMDB.mode() == :off
+    refute Ferricstore.Flow.LMDB.mirror?()
+
+    Application.put_env(:ferricstore, :flow_lmdb_enabled, true)
     assert Ferricstore.Flow.LMDB.enabled?()
     assert Ferricstore.Flow.LMDB.mode() == :mirror
-    assert Ferricstore.Flow.LMDB.mirror?()
 
-    for legacy_off <- [:off, false, "false", "0", "off"] do
-      Application.put_env(:ferricstore, :flow_lmdb_mode, legacy_off)
+    for off <- [:off, false, "false", "FALSE", "0", "off", nil] do
+      Application.put_env(:ferricstore, :flow_lmdb_mode, off)
+      assert Ferricstore.Flow.LMDB.mode() == :off
+      refute Ferricstore.Flow.LMDB.mirror?()
+    end
+
+    for lagged <- [:lagged, :async, "lagged", "async", "batched"] do
+      Application.put_env(:ferricstore, :flow_lmdb_mode, lagged)
+      assert Ferricstore.Flow.LMDB.enabled?()
+      assert Ferricstore.Flow.LMDB.mode() == :lagged
+      assert Ferricstore.Flow.LMDB.mirror?()
+    end
+
+    for mirror <- [:mirror, true, "true", "TRUE", "1", "mirror", "on"] do
+      Application.put_env(:ferricstore, :flow_lmdb_mode, mirror)
       assert Ferricstore.Flow.LMDB.mode() == :mirror
       assert Ferricstore.Flow.LMDB.mirror?()
     end
@@ -548,6 +662,66 @@ defmodule Ferricstore.Flow.LMDBTest do
              {"1000-1", 1_000, Ferricstore.Flow.Keys.stream_entry_key(id, "1000-1", partition_key)},
              {"1001-2", 1_001, Ferricstore.Flow.Keys.stream_entry_key(id, "1001-2", partition_key)}
            ]
+  end
+
+  test "lagged writer debounces flush while writes continue" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_flush_jitter = Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 100)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_jitter_ms, 0)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 2)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_lagged_debounce_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_lagged_debounce_#{System.unique_integer([:positive])}"
+    key1 = "flow:{flow:test}:state:lagged-debounce-1"
+    key2 = "flow:{flow:test}:state:lagged-debounce-2"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_flush_jitter_ms, old_flush_jitter)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key1, "v1"}])
+
+    Process.sleep(40)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key2, "v2"}])
+
+    Process.sleep(30)
+
+    refute File.exists?(Path.join(path, "data.mdb"))
+
+    Process.sleep(150)
+
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key1)
+    assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key2)
   end
 
   test "mirror writer can flush a single shard without draining others" do
@@ -871,6 +1045,51 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert_receive {:flow_lmdb_mirror_degraded, [:ferricstore, :flow, :lmdb_mirror, :degraded],
                     %{count: 1}, %{shard_index: 0, reason: :writer_not_started}}
+  end
+
+  test "state-machine skips LMDB mirror enqueue when mode is off" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_trap = Process.flag(:trap_exit, true)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :off)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+    writer_name = Ferricstore.Flow.LMDBWriter.name(ctx.name, 0)
+    writer_pid = Process.whereis(writer_name)
+
+    on_exit(fn ->
+      Process.flag(:trap_exit, old_trap)
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    Process.exit(writer_pid, :kill)
+    assert_receive {:EXIT, ^writer_pid, :killed}
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, "mirror-off-no-enqueue",
+               type: "mirror-off-no-enqueue",
+               partition_key: "tenant-mirror-off-no-enqueue",
+               correlation_id: "correlation-mirror-off-no-enqueue",
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, "mirror-off-no-enqueue",
+               partition_key: "tenant-mirror-off-no-enqueue",
+               worker: "worker-mirror-off-no-enqueue",
+               now_ms: 2
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, claimed.id, claimed.lease_token,
+               partition_key: "tenant-mirror-off-no-enqueue",
+               fencing_token: claimed.fencing_token,
+               now_ms: 3
+             )
+
+    assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 0
+    assert :atomics.get(ctx.flow_lmdb_mirror_degraded, 1) == 0
   end
 
   test "mirror writer persists replay-safe marker only after pending ops flush" do
@@ -1492,11 +1711,11 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert is_integer(vsize)
   end
 
-  test "default mirror mode persists terminal Flow state for cold reads and info" do
+  test "mirror mode persists terminal Flow state for cold reads and info" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
 
-    Application.delete_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
     Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
 
     ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)

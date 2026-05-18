@@ -1,5 +1,7 @@
 import Config
 
+config :logger, level: :warning
+
 config :ferricstore, Ferricstore.Bitcask.NIF,
   skip_compilation?: true,
   load_from: {:ferricstore, "priv/native/ferricstore_bitcask"}

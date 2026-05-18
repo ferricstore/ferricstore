@@ -242,16 +242,20 @@ defmodule Ferricstore.Store.Shard do
       end)
 
       profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
-        Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
-          path,
-          keydir,
-          index,
-          ctx,
-          zset_score_index,
-          zset_score_lookup,
-          flow_index,
-          flow_lookup
-        )
+        if Ferricstore.Flow.LMDB.mirror?() do
+          Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+            path,
+            keydir,
+            index,
+            ctx,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup
+          )
+        else
+          :ok
+        end
       end)
 
       profile_startup_phase(index, :flow_native_index_rebuild, fn ->

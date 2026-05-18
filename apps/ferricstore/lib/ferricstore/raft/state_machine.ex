@@ -5697,6 +5697,65 @@ defmodule Ferricstore.Raft.StateMachine do
     priority = Map.get(attrs, :priority, 0)
     retention = flow_retention_for_create(state, attrs)
 
+    flow_create_record_with_retention(
+      attrs,
+      id,
+      type,
+      flow_state,
+      now_ms,
+      run_at_ms,
+      priority,
+      retention
+    )
+  end
+
+  defp flow_create_record_cached_retention(state, attrs, retention_cache) do
+    key = flow_create_retention_cache_key(attrs)
+
+    case Map.fetch(retention_cache, key) do
+      {:ok, retention} ->
+        {flow_create_record_with_resolved_retention(attrs, retention), retention_cache}
+
+      :error ->
+        retention = flow_retention_for_create(state, attrs)
+
+        {flow_create_record_with_resolved_retention(attrs, retention),
+         Map.put(retention_cache, key, retention)}
+    end
+  end
+
+  defp flow_create_record_with_resolved_retention(
+         %{id: id, type: type, state: flow_state} = attrs,
+         retention
+       ) do
+    now_ms = flow_attrs_now_ms(attrs)
+    run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
+    priority = Map.get(attrs, :priority, 0)
+
+    flow_create_record_with_retention(
+      attrs,
+      id,
+      type,
+      flow_state,
+      now_ms,
+      run_at_ms,
+      priority,
+      retention
+    )
+  end
+
+  defp flow_create_record_with_retention(
+         attrs,
+         id,
+         type,
+         flow_state,
+         now_ms,
+         run_at_ms,
+         priority,
+         retention
+       ) do
+    partition_key = Map.get(attrs, :partition_key)
+
     %{
       id: id,
       type: type,
@@ -5713,8 +5772,8 @@ defmodule Ferricstore.Raft.StateMachine do
       terminal_retention_until_ms: nil,
       history_hot_max_events: Map.fetch!(retention, :history_hot_max_events),
       history_max_events: Map.fetch!(retention, :history_max_events),
-      partition_key: Map.get(attrs, :partition_key),
-      payload_ref: flow_value_ref(attrs, :payload, id, 1, Map.get(attrs, :partition_key)),
+      partition_key: partition_key,
+      payload_ref: flow_value_ref(attrs, :payload, id, 1, partition_key),
       parent_flow_id: Map.get(attrs, :parent_flow_id),
       parent_partition_key: Map.get(attrs, :parent_partition_key),
       root_flow_id: Map.get(attrs, :root_flow_id) || id,
@@ -5728,6 +5787,16 @@ defmodule Ferricstore.Raft.StateMachine do
       child_groups: %{}
     }
     |> flow_stamp_terminal_retention(now_ms)
+  end
+
+  defp flow_create_retention_cache_key(attrs) do
+    {
+      Map.get(attrs, :type),
+      Map.get(attrs, :state),
+      Map.get(attrs, :retention_ttl_ms),
+      Map.get(attrs, :history_hot_max_events),
+      Map.get(attrs, :history_max_events)
+    }
   end
 
   defp flow_require_parent_partition(parent, partition_key) do
@@ -5946,6 +6015,14 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_put_retention_override(map, _key, nil), do: map
   defp maybe_put_retention_override(map, key, value), do: Map.put(map, key, value)
 
+  defp flow_stamp_terminal_retention(
+         %{state: state, terminal_retention_until_ms: nil} = record,
+         _now_ms
+       )
+       when state != "completed" and state != "failed" and state != "cancelled" do
+    record
+  end
+
   defp flow_stamp_terminal_retention(record, now_ms) do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
       retention_ttl_ms = Map.get(record, :retention_ttl_ms)
@@ -6083,29 +6160,34 @@ defmodule Ferricstore.Raft.StateMachine do
 
     attrs_list
     |> Enum.zip(existing_records)
-    |> Enum.reduce_while({:ok, [], []}, fn {%{id: _id} = attrs, existing}, {:ok, acc, new_acc} ->
-      case existing do
-        nil ->
-          record = flow_create_record(state, attrs)
+    |> Enum.reduce_while({:ok, [], [], %{}}, fn
+      {%{id: _id} = attrs, existing}, {:ok, acc, new_acc, retention_cache} ->
+        case existing do
+          nil ->
+            {record, retention_cache} =
+              flow_create_record_cached_retention(state, attrs, retention_cache)
 
-          case flow_validate_record_keys(record) do
-            :ok -> {:cont, {:ok, [record | acc], [{record, attrs} | new_acc]}}
-            {:error, _reason} = error -> {:halt, error}
-          end
+            case flow_validate_record_keys(record) do
+              :ok -> {:cont, {:ok, [record | acc], [{record, attrs} | new_acc], retention_cache}}
+              {:error, _reason} = error -> {:halt, error}
+            end
 
-        :present ->
-          {:halt, {:error, "ERR flow already exists"}}
+          :present ->
+            {:halt, {:error, "ERR flow already exists"}}
 
-        existing ->
-          case flow_create_duplicate_result(state, existing, attrs) do
-            {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc}}
-            {:error, _reason} = error -> {:halt, error}
-          end
-      end
+          existing ->
+            case flow_create_duplicate_result(state, existing, attrs) do
+              {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc, retention_cache}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+        end
     end)
     |> case do
-      {:ok, records, new_records} -> {:ok, Enum.reverse(records), Enum.reverse(new_records)}
-      {:error, _reason} = error -> error
+      {:ok, records, new_records, _retention_cache} ->
+        {:ok, Enum.reverse(records), Enum.reverse(new_records)}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -6581,12 +6663,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_due_scan_key_round_chunk(_remaining, _due_key_count), do: 1
 
   defp flow_claim_due_keys(_state, type, state_filter, partition_key, priority)
-       when partition_key != :any and is_binary(state_filter) do
+       when partition_key not in [:any, :auto] and is_binary(state_filter) do
     [FlowKeys.due_key(type, state_filter, priority, partition_key)]
   end
 
   defp flow_claim_due_keys(_state, type, states, partition_key, priority)
-       when partition_key != :any and is_list(states) do
+       when partition_key not in [:any, :auto] and is_list(states) do
     Enum.map(states, &FlowKeys.due_key(type, &1, priority, partition_key))
   end
 
@@ -6607,6 +6689,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_due_key_matches?(_key, _type, _state_filter, _partition_key, _priority), do: false
 
   defp flow_due_key_partition_match?(_key, :any), do: true
+
+  defp flow_due_key_partition_match?(key, :auto) do
+    String.starts_with?(key, "f:{fa:") and String.contains?(key, "}:d:")
+  end
 
   defp flow_due_key_partition_match?(key, partition_key) do
     tag = FlowKeys.tag(partition_key)
@@ -7557,7 +7643,7 @@ defmodule Ferricstore.Raft.StateMachine do
     pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
 
     with :ok <- flow_many_put_record_values(state, plans, has_record_values?),
-         :ok <- flow_transition_move_indexes(state, pair_plans),
+         :ok <- flow_terminal_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
          :ok <- flow_many_put_history(state, pair_plans, "completed"),
          :ok <- flow_many_after_terminal(state, pair_plans, "completed") do
@@ -7570,7 +7656,12 @@ defmodule Ferricstore.Raft.StateMachine do
     {results, plans, has_record_values?} =
       flow_terminal_pipeline_prepare(state, op, attrs_list, %{}, [], [], false)
 
-    case flow_terminal_pipeline_apply(state, op, Enum.reverse(plans), has_record_values?) do
+    case flow_terminal_pipeline_apply(
+           state,
+           op,
+           Enum.reverse(plans),
+           has_record_values?
+         ) do
       :ok -> Enum.reverse(results)
       {:error, _reason} = error -> error
     end
@@ -7704,8 +7795,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_terminal_pipeline_apply(state, :fail, plans, has_record_values?),
     do: flow_fail_many_apply(state, plans, has_record_values?)
 
-  defp flow_terminal_pipeline_apply(state, :cancel, plans, _has_record_values?),
-    do: flow_cancel_many_apply(state, plans)
+  defp flow_terminal_pipeline_apply(state, :cancel, plans, has_record_values?),
+    do: flow_cancel_many_apply(state, plans, has_record_values?)
 
   defp do_flow_transition(
          state,
@@ -7797,30 +7888,30 @@ defmodule Ferricstore.Raft.StateMachine do
       partition_key = Map.get(record, :partition_key)
 
       next =
-        record
-        |> Map.merge(%{
-          state: to_state,
-          version: version,
-          updated_at_ms: now_ms,
-          next_run_at_ms: run_at_ms,
-          priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
-          payload_ref:
-            flow_value_ref(
-              attrs,
-              :payload,
-              id,
-              version,
-              partition_key,
-              Map.get(record, :payload_ref)
-            ),
-          ttl_ms: nil,
-          retention_ttl_ms: Map.get(record, :retention_ttl_ms),
-          history_hot_max_events: Map.get(record, :history_hot_max_events),
-          history_max_events: Map.get(record, :history_max_events),
-          lease_owner: nil,
-          lease_token: nil,
-          lease_deadline_ms: 0
-        })
+        %{
+          record
+          | state: to_state,
+            version: version,
+            updated_at_ms: now_ms,
+            next_run_at_ms: run_at_ms,
+            priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
+            payload_ref:
+              flow_value_ref(
+                attrs,
+                :payload,
+                id,
+                version,
+                partition_key,
+                Map.get(record, :payload_ref)
+              ),
+            ttl_ms: nil,
+            retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+            history_hot_max_events: Map.get(record, :history_hot_max_events),
+            history_max_events: Map.get(record, :history_max_events),
+            lease_owner: nil,
+            lease_token: nil,
+            lease_deadline_ms: 0
+        }
         |> flow_stamp_terminal_retention(now_ms)
 
       with :ok <- flow_validate_record_keys(next) do
@@ -8304,7 +8395,7 @@ defmodule Ferricstore.Raft.StateMachine do
     pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
 
     with :ok <- flow_many_put_record_values(state, plans, has_record_values?),
-         :ok <- flow_transition_move_indexes(state, pair_plans),
+         :ok <- flow_terminal_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
          :ok <- flow_many_put_history(state, pair_plans, "failed"),
          :ok <- flow_many_after_terminal(state, pair_plans, "failed") do
@@ -8381,7 +8472,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <- do_flow_put_record_values(state, next, attrs),
          :ok <- flow_refresh_terminal_value_expirations(state, next, refresh_attrs),
-         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_terminal_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
@@ -8611,7 +8702,7 @@ defmodule Ferricstore.Raft.StateMachine do
     plans = [{record, next}]
 
     with :ok <- flow_put_record_values(state, next, attrs),
-         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_terminal_transition_move_indexes(state, plans),
          :ok <- flow_put_state_record(state, FlowKeys.state_key(next.id, partition_key), next),
          :ok <- flow_history_put_planned(state, record, next, "completed", now_ms),
          :ok <- flow_after_history_put(state, next) do
@@ -8623,7 +8714,7 @@ defmodule Ferricstore.Raft.StateMachine do
     plans = [{record, next}]
 
     with :ok <- flow_put_record_values(state, next, attrs),
-         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_terminal_transition_move_indexes(state, plans),
          :ok <- flow_put_state_record(state, FlowKeys.state_key(next.id, partition_key), next),
          :ok <- flow_history_put_planned(state, record, next, "failed", now_ms),
          :ok <- flow_after_history_put(state, next) do
@@ -8637,7 +8728,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <- do_flow_put_record_values(state, next, attrs),
          :ok <- flow_refresh_terminal_value_expirations(state, next, refresh_attrs),
-         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_terminal_transition_move_indexes(state, plans),
          :ok <- flow_put_state_record(state, FlowKeys.state_key(next.id, partition_key), next),
          :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
          :ok <- flow_after_history_put(state, next) do
@@ -9145,10 +9236,14 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_cancel_many_apply(state, plans) do
+    flow_cancel_many_apply(state, plans, :unknown)
+  end
+
+  defp flow_cancel_many_apply(state, plans, has_record_values?) do
     pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
 
-    with :ok <- flow_cancel_many_put_record_values(state, plans),
-         :ok <- flow_transition_move_indexes(state, pair_plans),
+    with :ok <- flow_cancel_many_put_record_values(state, plans, has_record_values?),
+         :ok <- flow_terminal_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
          :ok <- flow_many_put_history(state, pair_plans, "cancelled"),
          :ok <- flow_many_after_terminal(state, pair_plans, "cancelled") do
@@ -9156,7 +9251,17 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_cancel_many_put_record_values(state, plans) do
+  defp flow_cancel_many_put_record_values(_state, _plans, false), do: :ok
+
+  defp flow_cancel_many_put_record_values(state, plans, :unknown) do
+    if flow_many_plans_have_record_values?(plans) do
+      flow_cancel_many_put_record_values(state, plans, true)
+    else
+      :ok
+    end
+  end
+
+  defp flow_cancel_many_put_record_values(state, plans, true) do
     Enum.reduce_while(plans, :ok, fn {_record, next, attrs}, :ok ->
       refresh_attrs = flow_cancel_refresh_attrs(attrs)
 
@@ -10264,6 +10369,14 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_transition_move_metadata_indexes(state, plans),
          :ok <- flow_transition_delete_old_secondary_indexes(state, plans) do
       flow_transition_put_new_running_indexes(state, plans)
+    end
+  end
+
+  defp flow_terminal_transition_move_indexes(state, plans) do
+    with :ok <- flow_transition_move_due_indexes(state, plans),
+         :ok <- flow_transition_move_state_indexes(state, plans),
+         :ok <- flow_transition_move_metadata_indexes(state, plans) do
+      flow_transition_delete_old_secondary_indexes(state, plans)
     end
   end
 
@@ -14471,9 +14584,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp queue_lmdb_history_indexes_project_from_index(state, record, history_key) do
     queue_pending_lmdb_mirror_op(
-      {:history_project_from_index, Map.get(state, :flow_index_name), Map.get(state, :flow_lookup_name),
-       Map.fetch!(record, :id), Map.get(record, :partition_key), history_key,
-       flow_record_expire_at(record)}
+      {:history_project_from_index, Map.get(state, :flow_index_name),
+       Map.get(state, :flow_lookup_name), Map.fetch!(record, :id),
+       Map.get(record, :partition_key), history_key, flow_record_expire_at(record)}
     )
 
     :ok

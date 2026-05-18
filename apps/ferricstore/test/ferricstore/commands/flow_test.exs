@@ -1253,6 +1253,49 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow claim_due with job-only return through Rust AST" do
+    type = uid("flow-command-claim-jobs")
+    id = uid("flow-command-claim-jobs-id")
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", type, "STATE", "queued", "RUN_AT", "1000", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert [
+             %{
+               "id" => ^id,
+               "type" => ^type,
+               "state" => "running",
+               "lease_token" => lease_token,
+               "fencing_token" => fencing_token
+             } = job
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 type,
+                 "STATE",
+                 "queued",
+                 "WORKER",
+                 "worker-a",
+                 "LIMIT",
+                 "1",
+                 "NOW",
+                 "1000",
+                 "RETURN",
+                 "JOBS"
+               ],
+               MockStore.make()
+             )
+
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
+    refute Map.has_key?(job, "version")
+  end
+
   test "dispatches Flow claim_due with any partition and repeated states through Rust AST" do
     type = uid("flow-command-claim-any")
     partition = uid("tenant")

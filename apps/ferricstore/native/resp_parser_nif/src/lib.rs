@@ -5194,6 +5194,7 @@ fn make_flow_create_many_command_ast<'a>(
     }
 
     let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
+    let auto = ascii_eq_ignore_case(arg_bytes[0], b"AUTO");
 
     let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
         return (
@@ -5216,7 +5217,7 @@ fn make_flow_create_many_command_ast<'a>(
     }
 
     let opts =
-        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_create_option) {
+        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_create_many_option) {
             Ok(opts) => opts,
             Err(err) => return (tag, args[0], err).encode(env),
         };
@@ -5246,7 +5247,7 @@ fn make_flow_create_many_command_ast<'a>(
         idx += item_width;
     }
 
-    let partition = if mixed {
+    let partition = if mixed || auto {
         atoms::nil().encode(env)
     } else {
         args[0]
@@ -6383,6 +6384,25 @@ fn flow_create_option<'a>(
     )
 }
 
+fn flow_create_many_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    if ascii_eq_ignore_case(arg_bytes[idx], b"INDEPENDENT") {
+        flow_option(
+            env,
+            args,
+            arg_bytes,
+            idx,
+            &[(b"INDEPENDENT", "independent", FlowOptType::Boolean)],
+        )
+    } else {
+        flow_create_option(env, args, arg_bytes, idx)
+    }
+}
+
 fn flow_value_put_option<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -6725,6 +6745,7 @@ fn flow_claim_due_option<'a>(
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"RETURN", "return", FlowOptType::Binary),
             (b"RECLAIM_EXPIRED", "reclaim_expired", FlowOptType::Boolean),
             (b"RECLAIM_RATIO", "reclaim_ratio", FlowOptType::NonNegative),
         ],
@@ -6789,6 +6810,7 @@ fn flow_complete_many_option<'a>(
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"INDEPENDENT", "independent", FlowOptType::Boolean),
         ],
     )
 }
@@ -6834,6 +6856,7 @@ fn flow_retry_many_option<'a>(
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"INDEPENDENT", "independent", FlowOptType::Boolean),
         ],
     )
 }
@@ -6855,6 +6878,7 @@ fn flow_fail_many_option<'a>(
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"INDEPENDENT", "independent", FlowOptType::Boolean),
         ],
     )
 }
@@ -6876,6 +6900,7 @@ fn flow_cancel_many_option<'a>(
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"INDEPENDENT", "independent", FlowOptType::Boolean),
         ],
     )
 }
@@ -6897,6 +6922,7 @@ fn flow_transition_many_option<'a>(
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"INDEPENDENT", "independent", FlowOptType::Boolean),
         ],
     )
 }

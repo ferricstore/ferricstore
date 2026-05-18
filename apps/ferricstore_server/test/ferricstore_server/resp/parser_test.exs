@@ -1910,6 +1910,25 @@ defmodule FerricstoreServer.Resp.ParserTest do
                 {:command, "FLOW.CREATE_MANY", ["tenant-a", "ITEMS", "flow-min", "payload-min"],
                  {:flow_create_many, "tenant-a", [{:id, "flow-min", :payload, "payload-min"}],
                   []}, ["tenant-a"]},
+                {:command, "FLOW.COMPLETE_MANY",
+                 ["tenant-a", "INDEPENDENT", "true", "ITEMS", "flow-1", "lease-1", "1"],
+                 {:flow_complete_many, "tenant-a",
+                  [{:id, "flow-1", :lease_token, "lease-1", :fencing_token, 1}],
+                  [independent: true]}, ["tenant-a"]},
+                {:command, "FLOW.RETRY_MANY",
+                 ["tenant-a", "INDEPENDENT", "true", "ITEMS", "flow-1", "lease-1", "1"],
+                 {:flow_retry_many, "tenant-a",
+                  [{:id, "flow-1", :lease_token, "lease-1", :fencing_token, 1}],
+                  [independent: true]}, ["tenant-a"]},
+                {:command, "FLOW.FAIL_MANY",
+                 ["tenant-a", "INDEPENDENT", "true", "ITEMS", "flow-1", "lease-1", "1"],
+                 {:flow_fail_many, "tenant-a",
+                  [{:id, "flow-1", :lease_token, "lease-1", :fencing_token, 1}],
+                  [independent: true]}, ["tenant-a"]},
+                {:command, "FLOW.CANCEL_MANY",
+                 ["tenant-a", "INDEPENDENT", "true", "ITEMS", "flow-1", "1"],
+                 {:flow_cancel_many, "tenant-a", [{:id, "flow-1", :fencing_token, 1}],
+                  [independent: true]}, ["tenant-a"]},
                 {:command, "FLOW.CREATE_MANY",
                  [
                    "MIXED",
@@ -1918,6 +1937,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "RUN_AT",
                    "1000",
                    "IDEMPOTENT",
+                   "true",
+                   "INDEPENDENT",
                    "true",
                    "ITEMS",
                    "flow-1",
@@ -1931,7 +1952,26 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   [
                     {"flow-1", [partition_key: "device-a", payload: "payload-1"]},
                     {"flow-2", [partition_key: "device-b", payload: "payload-2"]}
-                  ], [type: "iot", run_at_ms: 1000, idempotent: true]}, ["device-a", "device-b"]},
+                  ], [type: "iot", run_at_ms: 1000, idempotent: true, independent: true]},
+                 ["device-a", "device-b"]},
+                {:command, "FLOW.CREATE_MANY",
+                 [
+                   "AUTO",
+                   "TYPE",
+                   "iot",
+                   "INDEPENDENT",
+                   "true",
+                   "ITEMS",
+                   "flow-auto-1",
+                   "payload-1",
+                   "flow-auto-2",
+                   "payload-2"
+                 ],
+                 {:flow_create_many, nil,
+                  [
+                    {:id, "flow-auto-1", :payload, "payload-1"},
+                    {:id, "flow-auto-2", :payload, "payload-2"}
+                  ], [type: "iot", independent: true]}, ["AUTO"]},
                 {:command, "FLOW.TRANSITION_MANY",
                  [
                    "MIXED",
@@ -1939,6 +1979,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "ready",
                    "RUN_AT",
                    "2000",
+                   "INDEPENDENT",
+                   "true",
                    "ITEMS",
                    "flow-1",
                    "device-a",
@@ -1954,13 +1996,18 @@ defmodule FerricstoreServer.Resp.ParserTest do
                     {"flow-1", [partition_key: "device-a", fencing_token: 1]},
                     {"flow-2",
                      [partition_key: "device-b", fencing_token: 2, lease_token: "lease-2"]}
-                  ], [run_at_ms: 2000]}, ["device-a", "device-b"]}
+                  ], [run_at_ms: 2000, independent: true]}, ["device-a", "device-b"]}
               ], ""} =
                Parser.parse_commands(
                  "flow.create_many tenant-a ITEMS flow-min payload-min\r\n" <>
-                   "flow.create_many MIXED TYPE iot RUN_AT 1000 IDEMPOTENT true ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
-                   "flow.transition_many MIXED queued ready RUN_AT 2000 ITEMS flow-1 device-a 1 - flow-2 device-b 2 lease-2\r\n"
-               )
+                   "flow.complete_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
+                   "flow.retry_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
+                  "flow.fail_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
+                  "flow.cancel_many tenant-a INDEPENDENT true ITEMS flow-1 1\r\n" <>
+                  "flow.create_many MIXED TYPE iot RUN_AT 1000 IDEMPOTENT true INDEPENDENT true ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
+                  "flow.create_many AUTO TYPE iot INDEPENDENT true ITEMS flow-auto-1 payload-1 flow-auto-2 payload-2\r\n" <>
+                  "flow.transition_many MIXED queued ready RUN_AT 2000 INDEPENDENT true ITEMS flow-1 device-a 1 - flow-2 device-b 2 lease-2\r\n"
+              )
     end
 
     test "parses mixed-partition Flow spawn_children into typed Rust AST" do

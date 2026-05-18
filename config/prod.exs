@@ -1,5 +1,7 @@
 import Config
 
+config :logger, level: :info
+
 config :ferricstore, :port, 6379
 config :ferricstore, :data_dir, "/var/lib/ferricstore/data"
 

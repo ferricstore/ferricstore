@@ -116,10 +116,16 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_opts(opts),
+           {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- validate_create_many_items(items),
            {:ok, attrs_list} <- create_many_attrs(items, opts, partition_key),
-           :ok <- validate_unique_create_ids(attrs_list) do
-        Router.flow_create_many(ctx, partition_key, attrs_list)
+           :ok <- validate_unique_create_ids(attrs_list, independent?) do
+        if independent? do
+          {:ok, Router.flow_create_many_independent(ctx, attrs_list)}
+        else
+          Router.flow_create_many(ctx, partition_key, attrs_list)
+        end
       end
 
     observe_flow(:create, started, result, %{
@@ -177,7 +183,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_type(type),
          :ok <- validate_key_size(__MODULE__.Keys.policy_key(type)),
          {:ok, policy} <- RetryPolicy.normalize_flow_policy(type, opts) do
-      case Router.put(
+      case Router.flow_policy_put_all(
              ctx,
              __MODULE__.Keys.policy_key(type),
              RetryPolicy.encode_flow_policy(policy),
@@ -225,7 +231,7 @@ defmodule Ferricstore.Flow do
   end
 
   defp claim_due_result(ctx, type, opts) do
-    with :ok <- validate_opts(opts),
+    with :ok <- validate_opts(opts, return: true),
          :ok <- validate_type(type),
          {:ok, state} <- optional_claim_states(opts),
          {:ok, worker} <- required_binary(opts, :worker),
@@ -233,7 +239,8 @@ defmodule Ferricstore.Flow do
          {:ok, limit} <- optional_claim_limit(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, payload_return} <- payload_return_opts(opts, true),
+         {:ok, return_mode} <- optional_claim_return(opts),
+         {:ok, payload_return} <- payload_return_opts(opts, return_mode == :records),
          {:ok, reclaim_expired?} <- optional_boolean(opts, :reclaim_expired, true),
          {:ok, reclaim_ratio} <- optional_reclaim_ratio(opts),
          {:ok, partition_key} <- optional_claim_partition_key(opts),
@@ -252,12 +259,29 @@ defmodule Ferricstore.Flow do
 
       case claim_due_router_result(ctx, attrs, reclaim_expired?, reclaim_ratio) do
         {:ok, records} when is_list(records) ->
-          {:ok, hydrate_payload_records(ctx, records, payload_return)}
+          {:ok, claim_due_return_records(ctx, records, payload_return, return_mode)}
 
         other ->
           other
       end
     end
+  end
+
+  defp claim_due_return_records(_ctx, records, _payload_return, :jobs),
+    do: Enum.map(records, &claim_due_job_response/1)
+
+  defp claim_due_return_records(ctx, records, payload_return, :records),
+    do: hydrate_payload_records(ctx, records, payload_return)
+
+  defp claim_due_job_response(record) do
+    %{
+      id: Map.get(record, :id),
+      type: Map.get(record, :type),
+      state: Map.get(record, :state),
+      partition_key: Map.get(record, :partition_key),
+      lease_token: Map.get(record, :lease_token),
+      fencing_token: Map.get(record, :fencing_token)
+    }
   end
 
   defp claim_due_router_result(ctx, %{state: "running"} = attrs, _reclaim_expired?, _ratio) do
@@ -351,10 +375,16 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_opts(opts),
+           {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- validate_complete_many_items(items),
            {:ok, attrs_list} <- complete_many_attrs(items, opts, partition_key),
-           :ok <- validate_unique_transition_ids(attrs_list) do
-        Router.flow_complete_many(ctx, partition_key, attrs_list)
+           :ok <- validate_unique_transition_ids(attrs_list, independent?) do
+        if independent? do
+          flow_terminal_many_independent(ctx, :complete, attrs_list)
+        else
+          Router.flow_complete_many(ctx, partition_key, attrs_list)
+        end
       end
 
     observe_flow(:complete, started, result, %{flow_id: nil, _count: length(items)})
@@ -386,11 +416,17 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_opts(opts),
+           {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- validate_transition_many_items(items),
            {:ok, attrs_list} <-
              transition_many_attrs(items, opts, partition_key, from_state, to_state),
-           :ok <- validate_unique_transition_ids(attrs_list) do
-        Router.flow_transition_many(ctx, partition_key, attrs_list)
+           :ok <- validate_unique_transition_ids(attrs_list, independent?) do
+        if independent? do
+          {:ok, Router.flow_transition_batch(ctx, attrs_list)}
+        else
+          Router.flow_transition_many(ctx, partition_key, attrs_list)
+        end
       end
 
     observe_flow(:transition, started, result, %{
@@ -641,10 +677,16 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_opts(opts),
+           {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- validate_retry_many_items(items),
            {:ok, attrs_list} <- retry_many_attrs(items, opts, partition_key),
-           :ok <- validate_unique_transition_ids(attrs_list) do
-        Router.flow_retry_many(ctx, partition_key, attrs_list)
+           :ok <- validate_unique_transition_ids(attrs_list, independent?) do
+        if independent? do
+          flow_terminal_many_independent(ctx, :retry, attrs_list)
+        else
+          Router.flow_retry_many(ctx, partition_key, attrs_list)
+        end
       end
 
     observe_flow(:retry, started, result, %{flow_id: nil, _count: length(items)})
@@ -670,10 +712,16 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_opts(opts),
+           {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- validate_fail_many_items(items),
            {:ok, attrs_list} <- fail_many_attrs(items, opts, partition_key),
-           :ok <- validate_unique_transition_ids(attrs_list) do
-        Router.flow_fail_many(ctx, partition_key, attrs_list)
+           :ok <- validate_unique_transition_ids(attrs_list, independent?) do
+        if independent? do
+          flow_terminal_many_independent(ctx, :fail, attrs_list)
+        else
+          Router.flow_fail_many(ctx, partition_key, attrs_list)
+        end
       end
 
     observe_flow(:fail, started, result, %{flow_id: nil, _count: length(items)})
@@ -698,10 +746,16 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_opts(opts),
+           {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- validate_cancel_many_items(items),
            {:ok, attrs_list} <- cancel_many_attrs(items, opts, partition_key),
-           :ok <- validate_unique_transition_ids(attrs_list) do
-        Router.flow_cancel_many(ctx, partition_key, attrs_list)
+           :ok <- validate_unique_transition_ids(attrs_list, independent?) do
+        if independent? do
+          flow_terminal_many_independent(ctx, :cancel, attrs_list)
+        else
+          Router.flow_cancel_many(ctx, partition_key, attrs_list)
+        end
       end
 
     observe_flow(:cancel, started, result, %{flow_id: nil, _count: length(items)})
@@ -744,23 +798,21 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
          {:ok, state} <- flow_state(opts),
-         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
-         index_key = __MODULE__.Keys.state_index_key(type, state, partition_key),
-         :ok <- validate_key_size(index_key),
-         {:ok, ids} <-
-           flow_index_ids(
+         {:ok, records} <-
+           flow_list_records(
              ctx,
-             index_key,
+             type,
              state,
              partition_key,
              count,
              include_cold? or consistent_projection?,
              consistent_projection?
            ) do
-      flow_records_for_ids(ctx, ids, partition_key)
+      {:ok, records}
     end
   end
 
@@ -775,7 +827,7 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
          {:ok, state} <- flow_terminal_state(opts),
-         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
@@ -818,6 +870,12 @@ defmodule Ferricstore.Flow do
     do: {:error, "ERR flow type must be a non-empty string"}
 
   def failures(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  defp flow_terminal_many_independent(ctx, op, attrs_list)
+       when op in [:complete, :retry, :fail, :cancel] do
+    commands = Enum.map(attrs_list, &{op, &1})
+    {:ok, Router.flow_terminal_command_batch(ctx, commands)}
+  end
 
   def by_parent(ctx, parent_flow_id, opts \\ [])
 
@@ -924,7 +982,7 @@ defmodule Ferricstore.Flow do
   def info(ctx, type, opts) when is_binary(type) and is_list(opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
-         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          {:ok, counts, inflight} <-
@@ -938,7 +996,7 @@ defmodule Ferricstore.Flow do
       {:ok,
        counts
        |> Map.put(:type, type)
-       |> Map.put(:partition_key, partition_key)
+       |> Map.put(:partition_key, flow_response_partition_key(partition_key))
        |> Map.put(:inflight, inflight)}
     end
   end
@@ -953,15 +1011,13 @@ defmodule Ferricstore.Flow do
   def stuck(ctx, type, opts) when is_binary(type) and is_list(opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
-         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          {:ok, older_than_ms} <- optional_non_neg_integer(opts, :older_than_ms, 0),
          {:ok, now_ms} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         index_key = __MODULE__.Keys.inflight_index_key(type, partition_key),
-         :ok <- validate_key_size(index_key),
          cutoff = now_ms - older_than_ms,
-         {:ok, ids} <- flow_zrangebyscore(ctx, index_key, "-inf", Integer.to_string(cutoff)) do
-      flow_records_for_ids(ctx, Enum.take(ids, count), partition_key)
+         {:ok, records} <- flow_stuck_records(ctx, type, partition_key, cutoff, count) do
+      {:ok, records}
     end
   end
 
@@ -1425,6 +1481,32 @@ defmodule Ferricstore.Flow do
       state when state in @terminal_states -> {:ok, state}
       _ -> {:error, "ERR flow terminal state must be failed, completed, cancelled, or any"}
     end
+  end
+
+  defp flow_terminal_records(
+         ctx,
+         type,
+         state,
+         :auto,
+         count,
+         include_cold?,
+         consistent?
+       ) do
+    __MODULE__.Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
+      case flow_terminal_records(
+             ctx,
+             type,
+             state,
+             partition_key,
+             count,
+             include_cold?,
+             consistent?
+           ) do
+        {:ok, records} -> {:cont, {:ok, records ++ acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp flow_terminal_records(
@@ -2423,6 +2505,36 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp flow_list_records(ctx, type, state, :auto, count, include_cold?, consistent?) do
+    __MODULE__.Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
+      case flow_list_records(ctx, type, state, partition_key, count, include_cold?, consistent?) do
+        {:ok, records} -> {:cont, {:ok, records ++ acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, records} ->
+        {:ok,
+         records
+         |> sort_flow_records_by_update()
+         |> Enum.take(count)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp flow_list_records(ctx, type, state, partition_key, count, include_cold?, consistent?) do
+    index_key = __MODULE__.Keys.state_index_key(type, state, partition_key)
+
+    with :ok <- validate_key_size(index_key),
+         {:ok, ids} <-
+           flow_index_ids(ctx, index_key, state, partition_key, count, include_cold?, consistent?) do
+      flow_records_for_ids(ctx, ids, partition_key)
+    end
+  end
+
   defp safe_decode_record(value) when is_binary(value) do
     {:ok, decode_record(value)}
   rescue
@@ -2552,6 +2664,27 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp flow_info_counts(ctx, type, :auto, include_cold?, consistent?) do
+    zero_counts =
+      [@default_state, "running" | @terminal_states]
+      |> Map.new(&{String.to_atom(&1), 0})
+
+    __MODULE__.Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, zero_counts, 0}, fn partition_key,
+                                                   {:ok, counts_acc, inflight_acc} ->
+      case flow_info_counts(ctx, type, partition_key, include_cold?, consistent?) do
+        {:ok, counts, inflight} ->
+          merged =
+            Map.merge(counts_acc, counts, fn _state, left, right -> left + right end)
+
+          {:cont, {:ok, merged, inflight_acc + inflight}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
   defp flow_info_counts(ctx, type, partition_key, include_cold?, consistent?) do
     state_keys =
       Enum.map([@default_state, "running" | @terminal_states], fn state ->
@@ -2589,6 +2722,38 @@ defmodule Ferricstore.Flow do
         {:ok, counts} -> {:ok, counts, inflight}
         {:error, _reason} = error -> error
       end
+    end
+  end
+
+  defp flow_response_partition_key(:auto), do: nil
+  defp flow_response_partition_key(partition_key), do: partition_key
+
+  defp flow_stuck_records(ctx, type, :auto, cutoff, count) do
+    __MODULE__.Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
+      case flow_stuck_records(ctx, type, partition_key, cutoff, count) do
+        {:ok, records} -> {:cont, {:ok, records ++ acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, records} ->
+        {:ok,
+         records
+         |> sort_flow_records_by_update()
+         |> Enum.take(count)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp flow_stuck_records(ctx, type, partition_key, cutoff, count) do
+    index_key = __MODULE__.Keys.inflight_index_key(type, partition_key)
+
+    with :ok <- validate_key_size(index_key),
+         {:ok, ids} <- flow_zrangebyscore(ctx, index_key, "-inf", Integer.to_string(cutoff)) do
+      flow_records_for_ids(ctx, Enum.take(ids, count), partition_key)
     end
   end
 
@@ -3398,18 +3563,26 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp validate_opts(opts) do
+  defp validate_opts(opts, allowed \\ []) do
     cond do
       not Keyword.keyword?(opts) ->
         {:error, "ERR flow opts must be a keyword list"}
 
-      Keyword.has_key?(opts, :return) ->
+      Keyword.has_key?(opts, :return) and not Keyword.get(allowed, :return, false) ->
         {:error, "ERR flow return option is not supported"}
 
       true ->
         :ok
     end
   end
+
+  defp validate_unique_create_ids(_attrs_list, true), do: :ok
+  defp validate_unique_create_ids(attrs_list, false), do: validate_unique_create_ids(attrs_list)
+
+  defp validate_unique_transition_ids(_attrs_list, true), do: :ok
+
+  defp validate_unique_transition_ids(attrs_list, false),
+    do: validate_unique_transition_ids(attrs_list)
 
   defp reject_public_value_ref_input(opts, ref_key, value_key) do
     if Keyword.has_key?(opts, ref_key) do
@@ -3471,6 +3644,8 @@ defmodule Ferricstore.Flow do
          :ok <- validate_history_event_caps(history_hot_max_events, history_max_events),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts) do
+      partition_key = partition_key || __MODULE__.Keys.auto_partition_key(id)
+
       attrs =
         %{
           id: id,
@@ -3978,7 +4153,7 @@ defmodule Ferricstore.Flow do
 
   defp pipeline_claim_due_command({:claim_due, type, opts})
        when is_binary(type) and is_list(opts) do
-    with :ok <- validate_opts(opts),
+    with :ok <- validate_opts(opts, return: true),
          :ok <- validate_type(type),
          {:ok, state} <- optional_claim_states(opts),
          {:ok, worker} <- required_binary(opts, :worker),
@@ -3986,7 +4161,8 @@ defmodule Ferricstore.Flow do
          {:ok, limit} <- optional_claim_limit(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, payload_return} <- payload_return_opts(opts, true),
+         {:ok, return_mode} <- optional_claim_return(opts),
+         {:ok, payload_return} <- payload_return_opts(opts, return_mode == :records),
          {:ok, reclaim_expired?} <- optional_boolean(opts, :reclaim_expired, true),
          {:ok, reclaim_ratio} <- optional_reclaim_ratio(opts),
          {:ok, partition_key} <- optional_claim_partition_key(opts),
@@ -3999,6 +4175,7 @@ defmodule Ferricstore.Flow do
           limit,
           priority,
           now,
+          return_mode,
           payload_return,
           reclaim_expired?,
           reclaim_ratio,
@@ -4020,7 +4197,7 @@ defmodule Ferricstore.Flow do
       queue_key = {type, state, priority, now, partition_key}
 
       key =
-        {type, state, worker, lease_ms, priority, now, payload_return, reclaim_expired?,
+        {type, state, worker, lease_ms, priority, now, return_mode, payload_return, reclaim_expired?,
          reclaim_ratio, partition_key}
 
       {:ok,
@@ -4031,6 +4208,7 @@ defmodule Ferricstore.Flow do
          limit: limit,
          key: key,
          queue_key: queue_key,
+         return_mode: return_mode,
          payload_return: payload_return,
          reclaim_expired?: reclaim_expired?,
          reclaim_ratio: reclaim_ratio,
@@ -4195,7 +4373,7 @@ defmodule Ferricstore.Flow do
       |> Enum.map(fn allocations ->
         {:ok, Enum.flat_map(allocations, & &1)}
       end)
-      |> hydrate_claim_due_pipeline_results(ctx, hd(claims).payload_return)
+      |> hydrate_claim_due_pipeline_results(ctx, hd(claims).payload_return, hd(claims).return_mode)
     else
       {:error, _reason} = error -> List.duplicate(error, length(claims))
     end
@@ -4236,9 +4414,9 @@ defmodule Ferricstore.Flow do
     end)
   end
 
-  defp hydrate_claim_due_pipeline_results(results, ctx, payload_return) do
+  defp hydrate_claim_due_pipeline_results(results, ctx, payload_return, return_mode) do
     Enum.map(results, fn
-      {:ok, records} -> {:ok, hydrate_payload_records(ctx, records, payload_return)}
+      {:ok, records} -> {:ok, claim_due_return_records(ctx, records, payload_return, return_mode)}
       other -> other
     end)
   end
@@ -4257,6 +4435,7 @@ defmodule Ferricstore.Flow do
          limit,
          priority,
          now,
+         return_mode,
          payload_return,
          reclaim_expired?,
          reclaim_ratio,
@@ -4267,6 +4446,7 @@ defmodule Ferricstore.Flow do
       worker: worker,
       lease_ms: lease_ms,
       limit: limit,
+      return: return_mode,
       payload: payload_return.enabled?,
       payload_max_bytes: payload_return.max_bytes,
       reclaim_expired: reclaim_expired?,
@@ -5135,9 +5315,7 @@ defmodule Ferricstore.Flow do
        )
 
   defp many_item_partition_key(nil, item_opts, _mismatch_error) do
-    item_opts
-    |> Keyword.get(:partition_key)
-    |> required_partition_key()
+    optional_partition_key(partition_key: Keyword.get(item_opts, :partition_key))
   end
 
   defp many_item_partition_key(partition_key, item_opts, :allow_override)
@@ -5535,6 +5713,10 @@ defmodule Ferricstore.Flow do
     validate_key_size(__MODULE__.Keys.due_key(type, state, priority, nil))
   end
 
+  defp validate_claim_due_keys(type, state, priority, :auto) when is_binary(state) do
+    validate_key_size(__MODULE__.Keys.due_key(type, state, priority, nil))
+  end
+
   defp validate_claim_due_keys(type, state, priority, partition_key) do
     validate_key_size(__MODULE__.Keys.due_key(type, state, priority, partition_key))
   end
@@ -5555,20 +5737,63 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp optional_auto_partition_key(opts) do
+    case Keyword.fetch(opts, :partition_key) do
+      :error -> {:ok, :auto}
+      {:ok, :auto} -> {:ok, :auto}
+      {:ok, "AUTO"} -> {:ok, :auto}
+      {:ok, "auto"} -> {:ok, :auto}
+      {:ok, _value} -> optional_partition_key(opts)
+    end
+  end
+
   defp optional_claim_partition_key(opts) do
     case Keyword.get(opts, :partition_key, nil) do
+      nil ->
+        {:ok, :auto}
+
       :any ->
         {:ok, :any}
+
+      :auto ->
+        {:ok, :auto}
+
+      :global ->
+        {:ok, nil}
 
       value when is_binary(value) and value != "" ->
         case String.upcase(value) do
           "ANY" -> {:ok, :any}
+          "AUTO" -> {:ok, :auto}
           "GLOBAL" -> {:ok, nil}
           _ -> {:ok, value}
         end
 
       _ ->
         optional_partition_key(opts)
+    end
+  end
+
+  defp optional_claim_return(opts) do
+    case Keyword.get(opts, :return, :records) do
+      value when value in [:records, :record, :full] ->
+        {:ok, :records}
+
+      value when value in [:jobs, :job] ->
+        {:ok, :jobs}
+
+      value when is_binary(value) ->
+        case String.upcase(value) do
+          "RECORDS" -> {:ok, :records}
+          "RECORD" -> {:ok, :records}
+          "FULL" -> {:ok, :records}
+          "JOBS" -> {:ok, :jobs}
+          "JOB" -> {:ok, :jobs}
+          _ -> {:error, "ERR flow claim return must be records or jobs"}
+        end
+
+      _ ->
+        {:error, "ERR flow claim return must be records or jobs"}
     end
   end
 
@@ -5703,8 +5928,16 @@ defmodule Ferricstore.Flow do
 
     @global_tag "{f}"
     @partition_tag_prefix "{f:"
+    @auto_partition_prefix "__flow_auto__:"
+    @auto_partition_buckets 16
 
-    def state_key(id, partition_key \\ nil) do
+    def state_key(id, partition_key \\ nil)
+
+    def state_key(id, nil) when is_binary(id) do
+      "f:" <> tag(auto_partition_key(id)) <> ":s:" <> id
+    end
+
+    def state_key(id, partition_key) do
       "f:" <> tag(partition_key) <> ":s:" <> id
     end
 
@@ -5719,11 +5952,24 @@ defmodule Ferricstore.Flow do
       end
     end
 
-    def history_key(id, partition_key \\ nil) do
+    def history_key(id, partition_key \\ nil)
+
+    def history_key(id, nil) when is_binary(id) do
+      "f:" <> tag(auto_partition_key(id)) <> ":h:" <> id
+    end
+
+    def history_key(id, partition_key) do
       "f:" <> tag(partition_key) <> ":h:" <> id
     end
 
     def value_key(id, kind, version, partition_key \\ nil)
+
+    def value_key(id, kind, version, nil)
+        when kind in [:payload, :result, :error] and is_integer(version) and is_binary(id) do
+      value_key(id, kind, version, auto_partition_key(id))
+    end
+
+    def value_key(id, kind, version, partition_key)
         when kind in [:payload, :result, :error] and is_integer(version) do
       "f:" <>
         tag(partition_key) <>
@@ -5793,9 +6039,55 @@ defmodule Ferricstore.Flow do
     def tag(:global), do: @global_tag
 
     def tag(partition_key) when is_binary(partition_key) do
-      @partition_tag_prefix <>
-        Base.url_encode64(:crypto.hash(:sha256, partition_key), padding: false) <> "}"
+      if auto_partition_key?(partition_key) do
+        bucket =
+          binary_part(
+            partition_key,
+            byte_size(@auto_partition_prefix),
+            byte_size(partition_key) - byte_size(@auto_partition_prefix)
+          )
+
+        "{fa:" <> bucket <> "}"
+      else
+        @partition_tag_prefix <>
+          Base.url_encode64(:crypto.hash(:sha256, partition_key), padding: false) <> "}"
+      end
     end
+
+    def auto_partition_key(id) when is_binary(id) do
+      bucket =
+        id
+        |> :erlang.crc32()
+        |> rem(@auto_partition_buckets)
+
+      @auto_partition_prefix <> Integer.to_string(bucket)
+    end
+
+    def auto_partition_keys do
+      Enum.map(0..(@auto_partition_buckets - 1), fn bucket ->
+        @auto_partition_prefix <> Integer.to_string(bucket)
+      end)
+    end
+
+    def auto_partition_key?(partition_key) when is_binary(partition_key) do
+      if String.starts_with?(partition_key, @auto_partition_prefix) do
+        bucket =
+          binary_part(
+            partition_key,
+            byte_size(@auto_partition_prefix),
+            byte_size(partition_key) - byte_size(@auto_partition_prefix)
+          )
+
+        case Integer.parse(bucket) do
+          {value, ""} -> value >= 0 and value < @auto_partition_buckets
+          _ -> false
+        end
+      else
+        false
+      end
+    end
+
+    def auto_partition_key?(_partition_key), do: false
 
     defp flow_value_kind(:payload), do: "p"
     defp flow_value_kind(:result), do: "r"

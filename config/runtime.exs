@@ -1,6 +1,19 @@
 import Config
 
 if config_env() == :prod do
+  log_level =
+    case String.downcase(System.get_env("FERRICSTORE_LOG_LEVEL", "info")) do
+      "debug" -> :debug
+      "info" -> :info
+      "notice" -> :notice
+      "warning" -> :warning
+      "warn" -> :warning
+      "error" -> :error
+      _other -> :info
+    end
+
+  config :logger, level: log_level
+
   # ---------------------------------------------------------------------------
   # Core
   # ---------------------------------------------------------------------------
@@ -43,16 +56,84 @@ if config_env() == :prod do
       System.get_env(
         "FERRICSTORE_FLOW_LMDB_MODE",
         if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-          do: "mirror",
+          do: "lagged",
           else: "off"
         )
       ),
     flow_lmdb_map_size:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
     flow_lmdb_flush_interval_ms:
-      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS", "100")),
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS",
+          if(
+            System.get_env(
+              "FERRICSTORE_FLOW_LMDB_MODE",
+              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
+                do: "lagged",
+                else: "off"
+              )
+            ) in ["lagged", "async", "batched"],
+            do: "30000",
+            else: "100"
+          )
+        )
+      ),
     flow_lmdb_max_batch_ops:
-      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS", "10000")),
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS",
+          if(
+            System.get_env(
+              "FERRICSTORE_FLOW_LMDB_MODE",
+              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
+                do: "lagged",
+                else: "off"
+              )
+            ) in ["lagged", "async", "batched"],
+            do: "100000",
+            else: "10000"
+          )
+        )
+      ),
+    flow_lmdb_flush_chunk_ops:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_OPS", "10000")),
+    flow_lmdb_flush_chunk_pause_ms:
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS",
+          if(
+            System.get_env(
+              "FERRICSTORE_FLOW_LMDB_MODE",
+              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
+                do: "lagged",
+                else: "off"
+              )
+            ) in ["lagged", "async", "batched"],
+            do: "1",
+            else: "0"
+          )
+        )
+      ),
+    flow_lmdb_flush_jitter_ms:
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS",
+          if(
+            System.get_env(
+              "FERRICSTORE_FLOW_LMDB_MODE",
+              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
+                do: "lagged",
+                else: "off"
+              )
+            ) in ["lagged", "async", "batched"],
+            do: "5000",
+            else: "0"
+          )
+        )
+      ),
+    flow_lmdb_max_concurrent_flushes:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
 

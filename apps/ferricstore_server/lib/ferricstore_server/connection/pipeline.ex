@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Pipeline do
-  @moduledoc "Pipeline dispatcher with batch fast paths for GET, SET, and mixed GET+SET workloads."
+  @moduledoc "Pipeline dispatcher with batch fast paths for GET, SET, mixed GET+SET, and Flow workloads."
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
@@ -800,6 +800,35 @@ defmodule FerricstoreServer.Connection.Pipeline do
        do: extract_flow_writes(rest, [{:transition, id, from_state, to_state, opts} | acc])
 
   defp extract_flow_writes(
+         [{:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
+          | rest],
+         acc
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: extract_flow_writes(rest, [{:complete, id, lease_token, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: extract_flow_writes(rest, [{:retry, id, lease_token, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: extract_flow_writes(rest, [{:fail, id, lease_token, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_list(opts),
+       do: extract_flow_writes(rest, [{:cancel, id, opts} | acc])
+
+  defp extract_flow_writes(
          [{:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys} | rest],
          acc
        )
@@ -818,6 +847,28 @@ defmodule FerricstoreServer.Connection.Pipeline do
        )
        when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
        do: {:ok, {:transition, id, from_state, to_state, opts}}
+
+  defp flow_write_op(
+         {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: {:ok, {:complete, id, lease_token, opts}}
+
+  defp flow_write_op(
+         {:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys}
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: {:ok, {:retry, id, lease_token, opts}}
+
+  defp flow_write_op(
+         {:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys}
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: {:ok, {:fail, id, lease_token, opts}}
+
+  defp flow_write_op({:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:cancel, id, opts}}
 
   defp flow_write_op({:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys})
        when is_binary(id) and is_list(opts),
