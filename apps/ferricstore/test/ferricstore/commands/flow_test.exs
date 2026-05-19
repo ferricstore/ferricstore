@@ -85,8 +85,52 @@ defmodule Ferricstore.Commands.FlowTest do
                  Integer.to_string(fencing_token),
                  lease_token
                ],
+             MockStore.make()
+           )
+  end
+
+  test "dispatches flow claim_due payload return options through Rust AST" do
+    id = uid("claim-payload-option")
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 id,
+                 "TYPE",
+                 "checkout",
+                 "STATE",
+                 "queued",
+                 "PAYLOAD",
+                 "payload-bytes",
+                 "NOW",
+                 "1000"
+               ],
                MockStore.make()
              )
+
+    assert [%{"id" => ^id} = claimed] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 "checkout",
+                 "STATE",
+                 "queued",
+                 "WORKER",
+                 "worker-payload-option",
+                 "LIMIT",
+                 "1",
+                 "NOW",
+                 "2000",
+                 "PAYLOAD",
+                 "false",
+                 "PAYLOAD_MAX_BYTES",
+                 "1024"
+               ],
+               MockStore.make()
+             )
+
+    refute Map.has_key?(claimed, "payload")
   end
 
   test "rejects unsupported Flow value ref inputs through Rust AST" do

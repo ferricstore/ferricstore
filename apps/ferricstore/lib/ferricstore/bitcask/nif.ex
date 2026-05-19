@@ -511,13 +511,13 @@ defmodule Ferricstore.Bitcask.NIF do
 
   # -- Stateless pread/pwrite Bloom NIFs --
   @spec bloom_file_create(binary(), non_neg_integer(), non_neg_integer()) ::
-          :ok | {:error, term()}
+          {:ok, :ok} | {:error, term()}
   def bloom_file_create(_path, _num_bits, _num_hashes), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec bloom_file_add(binary(), binary()) :: :ok | {:error, term()}
+  @spec bloom_file_add(binary(), binary()) :: {:ok, 0 | 1} | {:error, term()}
   def bloom_file_add(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec bloom_file_madd(binary(), [binary()]) :: :ok | {:error, term()}
+  @spec bloom_file_madd(binary(), [binary()]) :: {:ok, [0 | 1]} | {:error, term()}
   def bloom_file_madd(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec bloom_file_exists(binary(), binary()) :: {:ok, boolean()} | {:error, term()}

@@ -2592,18 +2592,12 @@ defmodule Ferricstore.Store.Router do
     elapsed = System.monotonic_time(:millisecond) - start
     timeout = max(10_000 - elapsed, 0)
 
-    refs_by_token =
-      Map.new(remaining_refs, fn {token, shard_idx, indices} ->
-        {token, {shard_idx, indices}}
-      end)
-
     {_status, replies, _unresolved} =
       remaining_refs
-      |> Enum.map(fn {token, _shard_idx, _indices} -> token end)
-      |> ReplyAwaiter.collect(timeout)
+      |> Enum.map(fn {token, shard_idx, indices} -> {token, {shard_idx, indices}} end)
+      |> ReplyAwaiter.collect_tagged(timeout)
 
-    Enum.reduce(replies, acc, fn {token, result}, next_acc ->
-      {shard_idx, indices} = Map.fetch!(refs_by_token, token)
+    Enum.reduce(replies, acc, fn {{shard_idx, indices}, result}, next_acc ->
       apply_shard_results(result, indices, shard_idx, wv_size, ctx, next_acc)
     end)
   end
@@ -2961,6 +2955,30 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc false
+  def flow_value_put(ctx, %{owner_flow_id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_value_put, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_signal(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_signal, key, attrs})
+    end
+  end
+
+  @doc false
   def flow_create_batch(_ctx, []), do: []
 
   def flow_create_batch(ctx, attrs_list) when is_list(attrs_list) do
@@ -3189,6 +3207,11 @@ defmodule Ferricstore.Store.Router do
     )
   end
 
+  def flow_claim_due(ctx, %{partition_keys: [_ | _] = partition_keys, limit: limit} = attrs)
+      when is_integer(limit) and limit > 0 do
+    flow_claim_due_partition_keys(ctx, attrs, Enum.uniq(partition_keys), limit)
+  end
+
   def flow_claim_due(ctx, %{partition_key: partition_key, limit: limit} = attrs)
       when partition_key == :any and is_integer(limit) and limit > 0 do
     start_idx = flow_claim_due_start_shard(ctx, attrs)
@@ -3254,6 +3277,88 @@ defmodule Ferricstore.Store.Router do
 
       other ->
         other
+    end
+  end
+
+  defp flow_claim_due_partition_keys(ctx, attrs, partition_keys, limit) do
+    type = Map.fetch!(attrs, :type)
+    state = flow_claim_route_state(Map.get(attrs, :state))
+    priority = Map.get(attrs, :priority) || 0
+    start_idx = flow_claim_due_start_shard(ctx, attrs)
+
+    groups =
+      partition_keys
+      |> Enum.group_by(fn partition_key ->
+        key = Ferricstore.Flow.Keys.due_key(type, state, priority, partition_key)
+        shard_for(ctx, key)
+      end)
+      |> Enum.sort_by(fn {idx, _keys} ->
+        rem(idx - start_idx + ctx.shard_count, ctx.shard_count)
+      end)
+
+    case flow_claim_due_partition_key_commands(groups, attrs, limit) do
+      [] ->
+        {:ok, []}
+
+      [{key, command}] ->
+        case raft_write(ctx, shard_for(ctx, key), key, command) do
+          {:ok, records} when is_list(records) -> {:ok, Enum.take(records, limit)}
+          other -> other
+        end
+
+      commands ->
+        ctx
+        |> pipeline_write_batch(commands)
+        |> flow_claim_due_partition_key_results(limit)
+    end
+  end
+
+  defp flow_claim_due_partition_key_commands([], _attrs, _limit), do: []
+
+  defp flow_claim_due_partition_key_commands(groups, attrs, limit) do
+    group_count = length(groups)
+    base = div(limit, group_count)
+    extra = rem(limit, group_count)
+    type = Map.fetch!(attrs, :type)
+    state = flow_claim_route_state(Map.get(attrs, :state))
+    priority = Map.get(attrs, :priority) || 0
+
+    groups
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {{_idx, partition_keys}, group_idx} ->
+      quota = base + if(group_idx < extra, do: 1, else: 0)
+
+      if quota <= 0 do
+        []
+      else
+        key = Ferricstore.Flow.Keys.due_key(type, state, priority, hd(partition_keys))
+
+        shard_attrs =
+          attrs
+          |> Map.put(:limit, quota)
+          |> Map.put(:partition_key, hd(partition_keys))
+          |> Map.put(:partition_keys, partition_keys)
+
+        [{key, {:flow_claim_due, key, shard_attrs}}]
+      end
+    end)
+  end
+
+  defp flow_claim_due_partition_key_results(results, limit) do
+    results
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, records}, {:ok, acc} when is_list(records) ->
+        {:cont, {:ok, acc ++ records}}
+
+      {:error, _reason} = error, {:ok, _acc} ->
+        {:halt, error}
+
+      other, {:ok, _acc} ->
+        {:halt, other}
+    end)
+    |> case do
+      {:ok, records} -> {:ok, Enum.take(records, limit)}
+      other -> other
     end
   end
 

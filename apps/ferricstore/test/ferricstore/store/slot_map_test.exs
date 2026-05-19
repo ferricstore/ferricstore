@@ -91,6 +91,14 @@ defmodule Ferricstore.Store.SlotMapTest do
                SlotMap.slot_for_key("{user:42}:profile")
     end
 
+    test "flow key fast path uses the embedded flow tag" do
+      assert SlotMap.slot_for_key("f:{fa:42}:s:flow-1") ==
+               SlotMap.slot_for_key("{fa:42}:probe")
+
+      assert SlotMap.slot_for_key("X:f:{fa:42}:h:flow-1\0event-1") ==
+               SlotMap.slot_for_key("{fa:42}:probe")
+    end
+
     test "empty key returns valid slot" do
       slot = SlotMap.slot_for_key("")
       assert slot >= 0 and slot <= 1023

@@ -530,20 +530,17 @@ pub fn flow_record_plan_claims<'a>(
             return Ok(crate::atoms::fallback().encode(env));
         }
 
-        if !flow_record_fast_claim_shape(&record) {
-            return Ok(crate::atoms::fallback().encode(env));
-        }
-
         if record.flow_type != flow_type {
             continue;
         }
 
-        if record.state == RUNNING_STATE {
-            return Ok(crate::atoms::fallback().encode(env));
+        if record.state != expected_state {
+            stale_terms.push(id_bin.encode(env));
+            continue;
         }
 
-        if record.state != expected_state {
-            continue;
+        if !flow_record_fast_claim_shape(&record) {
+            return Ok(crate::atoms::fallback().encode(env));
         }
 
         let Some(next_run_at_ms) = record.next_run_at_ms else {
@@ -1164,10 +1161,15 @@ impl FlowOrderedIndex {
         }
 
         let mut rows = Vec::with_capacity(count);
+        let lower = OrderedEntry {
+            key: key.to_vec(),
+            score: Score(f64::NEG_INFINITY),
+            member: Vec::new(),
+        };
 
-        for entry in &self.ordered {
+        for entry in self.ordered.range(lower..) {
             if entry.key.as_slice() != key {
-                continue;
+                break;
             }
 
             if entry.score.0 > max_score {
@@ -1203,9 +1205,15 @@ impl FlowOrderedIndex {
         let mut scanned = 0usize;
 
         for key in keys {
-            for entry in &self.ordered {
+            let lower = OrderedEntry {
+                key: key.to_vec(),
+                score: Score(f64::NEG_INFINITY),
+                member: Vec::new(),
+            };
+
+            for entry in self.ordered.range(lower..) {
                 if entry.key.as_slice() != *key {
-                    continue;
+                    break;
                 }
 
                 if entry.score.0 > max_score {
@@ -1281,7 +1289,9 @@ impl Bound {
 }
 
 fn due_key(key: &[u8]) -> bool {
-    key.starts_with(b"f:{f") && key.windows(4).any(|window| window == b"}:d:")
+    key.starts_with(b"f:{f")
+        && (key.windows(4).any(|window| window == b"}:d:")
+            || key.windows(5).any(|window| window == b"}:da:"))
 }
 
 fn add_count_delta(count_deltas: &mut HashMap<Vec<u8>, i64>, key: &[u8], delta: i64) {

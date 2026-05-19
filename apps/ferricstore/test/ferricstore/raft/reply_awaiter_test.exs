@@ -38,6 +38,19 @@ defmodule Ferricstore.Raft.ReplyAwaiterTest do
     assert_received {^unrelated_ref, :do_not_consume}
   end
 
+  test "tagged batch collection returns metadata without consuming unrelated messages" do
+    unrelated_ref = make_ref()
+    send(self(), {unrelated_ref, :do_not_consume})
+
+    {from, token} = ReplyAwaiter.new()
+    GenServer.reply(from, :ok)
+
+    assert {:ok, [{{:shard, 1}, :ok}], []} ==
+             ReplyAwaiter.collect_tagged([{token, {:shard, 1}}], 100)
+
+    assert_received {^unrelated_ref, :do_not_consume}
+  end
+
   test "batch collection cancels unresolved tokens on timeout" do
     {from, token} = ReplyAwaiter.new()
 

@@ -857,8 +857,10 @@ defmodule Ferricstore.Commands.Catalog do
   defp flow_dynamic_keys("FLOW.VALUE.PUT", args),
     do: {:ok, args_at(args, flow_partition_key_indices(args, 1))}
 
+  defp flow_dynamic_keys("FLOW.VALUE.MGET", args), do: {:ok, args}
+
   defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.CREATE", "FLOW.GET", "FLOW.HISTORY"],
+       when name in ["FLOW.CREATE", "FLOW.SIGNAL", "FLOW.GET", "FLOW.HISTORY"],
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
 
   defp flow_dynamic_keys(name, args)
@@ -912,13 +914,28 @@ defmodule Ferricstore.Commands.Catalog do
 
     option_start..max(option_start, option_end - 1)
     |> Enum.reduce([], fn idx, acc ->
-      if idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITION") do
-        [idx + 1 | acc]
-      else
-        acc
+      cond do
+        idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITION") ->
+          [idx + 1 | acc]
+
+        idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITIONS") ->
+          flow_partition_count_indices(args, idx + 1, option_end) ++ acc
+
+        true ->
+          acc
       end
     end)
     |> Enum.reverse()
+  end
+
+  defp flow_partition_count_indices(args, count_idx, option_end) do
+    with count_arg when not is_nil(count_arg) <- Enum.at(args, count_idx),
+         {count, ""} when count > 0 <- Integer.parse(to_string(count_arg)),
+         true <- count_idx + count < option_end do
+      Enum.to_list((count_idx + 1)..(count_idx + count))
+    else
+      _ -> []
+    end
   end
 
   defp flow_create_many_key_indices([]), do: []

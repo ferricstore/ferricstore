@@ -1692,9 +1692,26 @@ defmodule FerricstoreServer.Resp.ParserTest do
                     idempotent: true
                   ]}, ["tenant-a"]},
                 {:command, "FLOW.VALUE.PUT",
-                 ["shared-payload", "PARTITION", "tenant-a", "OWNER_FLOW_ID", "flow-1"],
+                 [
+                   "shared-payload",
+                   "PARTITION",
+                   "tenant-a",
+                   "OWNER_FLOW_ID",
+                   "flow-1",
+                   "NAME",
+                   "order",
+                   "OVERRIDE",
+                   "true"
+                 ],
                  {:flow_value_put, "shared-payload",
-                  [partition_key: "tenant-a", owner_flow_id: "flow-1"]}, ["tenant-a"]},
+                  [
+                    partition_key: "tenant-a",
+                    owner_flow_id: "flow-1",
+                    name: "order",
+                    override: true
+                  ]}, ["tenant-a"]},
+                {:command, "FLOW.VALUE.MGET", ["ref-a", "ref-b"],
+                 {:flow_value_mget, ["ref-a", "ref-b"]}, ["ref-a", "ref-b"]},
                 {:command, "FLOW.CLAIM_DUE",
                  [
                    "checkout",
@@ -1786,7 +1803,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
               ], ""} =
                Parser.parse_commands(
                  "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a RETENTION_TTL 5000 HISTORY_MAX_EVENTS 10 IDEMPOTENT true\r\n" <>
-                   "flow.value.put shared-payload PARTITION tenant-a OWNER_FLOW_ID flow-1\r\n" <>
+                   "flow.value.put shared-payload PARTITION tenant-a OWNER_FLOW_ID flow-1 NAME order OVERRIDE true\r\n" <>
+                   "flow.value.mget ref-a ref-b\r\n" <>
                    "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
                    "flow.reclaim checkout WORKER worker-b LEASE_MS 30000 LIMIT 10 NOW 2000\r\n" <>
                    "flow.complete flow-1 lease-1 FENCING 1 RESULT result-1\r\n" <>
@@ -1799,6 +1817,30 @@ defmodule FerricstoreServer.Resp.ParserTest do
                )
     end
 
+    test "parses Flow many write commands with named value mutations" do
+      assert {:ok,
+              [
+                {:command, "FLOW.COMPLETE_MANY", _complete_args,
+                 {:flow_complete_many, "tenant-a",
+                  [{:id, "flow-1", :lease_token, "lease-1", :fencing_token, 1}],
+                  [
+                    now_ms: 1000,
+                    values: [{"receipt", "bytes"}],
+                    value_refs: [{"profile", "profile-ref"}],
+                    drop_values: ["old"],
+                    override_values: ["receipt"]
+                  ]}, ["tenant-a"]},
+                {:command, "FLOW.TRANSITION_MANY", _transition_args,
+                 {:flow_transition_many, "tenant-a", "running", "waiting",
+                  [{:id, "flow-1", :fencing_token, 1, :lease_token, "lease-1"}],
+                  [run_at_ms: 2000, values: [{"step", "bytes"}]]}, ["tenant-a"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.complete_many tenant-a NOW 1000 VALUE receipt bytes VALUE_REF profile profile-ref DROP_VALUE old OVERRIDE_VALUE receipt ITEMS flow-1 lease-1 1\r\n" <>
+                   "flow.transition_many tenant-a running waiting RUN_AT 2000 VALUE step bytes ITEMS flow-1 1 lease-1\r\n"
+               )
+    end
+
     test "parses Flow read commands into typed Rust AST" do
       assert {:ok,
               [
@@ -1808,12 +1850,19 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  {:flow_get, "flow-1", [payload: false]}, ["flow-1"]},
                 {:command, "FLOW.GET", ["flow-1", "PAYLOAD", "MAXBYTES", "4096"],
                  {:flow_get, "flow-1", [payload: true, payload_max_bytes: 4096]}, ["flow-1"]},
+                {:command, "FLOW.GET", ["flow-1", "VALUE", "order", "VALUE", "payment"],
+                 {:flow_get, "flow-1", [values: "order", values: "payment"]}, ["flow-1"]},
                 {:command, "FLOW.LIST", ["checkout", "STATE", "queued", "COUNT", "25"],
                  {:flow_list, "checkout", [state: "queued", count: 25]}, ["checkout"]},
                 {:command, "FLOW.CLAIM_DUE",
                  ["checkout", "WORKER", "worker-a", "LIMIT", "10", "PAYLOAD", "MAXBYTES", "2048"],
                  {:flow_claim_due, "checkout",
                   [worker: "worker-a", limit: 10, payload: true, payload_max_bytes: 2048]},
+                 ["checkout"]},
+                {:command, "FLOW.CLAIM_DUE",
+                 ["checkout", "WORKER", "worker-a", "LIMIT", "10", "VALUE", "order"],
+                 {:flow_claim_due, "checkout",
+                  [worker: "worker-a", limit: 10, values: "order"]},
                  ["checkout"]},
                 {:command, "FLOW.INFO", ["checkout", "PARTITION", "tenant-a"],
                  {:flow_info, "checkout", [partition_key: "tenant-a"]}, ["tenant-a"]},
@@ -1893,8 +1942,10 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  "flow.get flow-1 PARTITION GLOBAL\r\n" <>
                    "flow.get flow-1 NOPAYLOAD\r\n" <>
                    "flow.get flow-1 PAYLOAD MAXBYTES 4096\r\n" <>
+                   "flow.get flow-1 VALUE order VALUE payment\r\n" <>
                    "flow.list checkout STATE queued COUNT 25\r\n" <>
                    "flow.claim_due checkout WORKER worker-a LIMIT 10 PAYLOAD MAXBYTES 2048\r\n" <>
+                   "flow.claim_due checkout WORKER worker-a LIMIT 10 VALUE order\r\n" <>
                    "flow.info checkout PARTITION tenant-a\r\n" <>
                    "flow.stuck checkout OLDER_THAN 1000 COUNT 10\r\n" <>
                    "flow.history flow-1 COUNT 10 FROM_MS 1000 TO_MS 2000 FROM_VERSION 2 TO_VERSION 4 EVENT claimed WORKER worker-a REV true\r\n" <>
@@ -2042,6 +2093,40 @@ defmodule FerricstoreServer.Resp.ParserTest do
               ], ""} =
                Parser.parse_commands(
                  "flow.spawn_children parent-1 GROUP fanout PARTITION parent-p FENCING 1 ITEMS MIXED child-a device-a child payload-a child-b device-b child payload-b\r\n"
+               )
+    end
+
+    test "parses extended Flow create_many and spawn_children item named values" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE_MANY", _create_args,
+                 {:flow_create_many, nil,
+                  [
+                    {"flow-1",
+                     [
+                       partition_key: "device-a",
+                       payload: "payload-1",
+                       values: [{"order", "order-bytes"}],
+                       value_refs: [{"profile", "profile-ref"}]
+                     ]}
+                  ], [type: "iot", state: "queued"]}, ["device-a"]},
+                {:command, "FLOW.SPAWN_CHILDREN", _spawn_args,
+                 {:flow_spawn_children, "parent-1",
+                  [
+                    {"child-a",
+                     [
+                       partition_key: "device-a",
+                       type: "child",
+                       payload: "payload-a",
+                       values: [{"order", "order-bytes"}],
+                       value_refs: [{"profile", "profile-ref"}]
+                     ]}
+                  ], [group_id: "fanout", partition_key: "parent-p", fencing_token: 1]},
+                 ["parent-p", "device-a"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create_many MIXED TYPE iot STATE queued ITEMS_EXT 1 flow-1 device-a payload-1 1 order order-bytes 1 profile profile-ref\r\n" <>
+                   "flow.spawn_children parent-1 GROUP fanout PARTITION parent-p FENCING 1 ITEMS_EXT 1 child-a device-a child payload-a 1 order order-bytes 1 profile profile-ref\r\n"
                )
     end
 

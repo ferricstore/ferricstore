@@ -319,15 +319,9 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         to_state_key,
         inflight_key,
         worker_key,
-        state_key_prefix
+      state_key_prefix
       ) do
-    native_candidates =
-      Enum.flat_map(candidates, fn {id, score_input} ->
-        case parse_score(score_input) do
-          {:ok, score} -> [{id, score}]
-          :error -> []
-        end
-      end)
+    native_candidates = parse_claim_candidates(candidates, [])
 
     NIF.flow_record_plan_claims(
       native_candidates,
@@ -347,6 +341,22 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       state_key_prefix
     )
   end
+
+  defp parse_claim_candidates([], acc), do: Enum.reverse(acc)
+
+  defp parse_claim_candidates([{id, score} | rest], acc)
+       when is_binary(id) and is_float(score) do
+    parse_claim_candidates(rest, [{id, score} | acc])
+  end
+
+  defp parse_claim_candidates([{id, score_input} | rest], acc) when is_binary(id) do
+    case parse_score(score_input) do
+      {:ok, score} -> parse_claim_candidates(rest, [{id, score} | acc])
+      :error -> parse_claim_candidates(rest, acc)
+    end
+  end
+
+  defp parse_claim_candidates([_other | rest], acc), do: parse_claim_candidates(rest, acc)
 
   defp registry_key(index_table, lookup_table), do: {@registry_key, index_table, lookup_table}
 

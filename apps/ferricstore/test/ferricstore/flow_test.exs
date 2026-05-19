@@ -384,6 +384,31 @@ defmodule Ferricstore.FlowTest do
     assert byte_size(state_key) < byte_size(old_state_key)
   end
 
+  test "flow create rejects ids whose max history stream entry would exceed key size" do
+    partition_key = "stream-boundary"
+    max_event_id = "18446744073709551615-18446744073709551615"
+    stream_entry_extra = byte_size("X:" <> <<0>> <> max_event_id)
+    base_history_key = Ferricstore.Flow.Keys.history_key("", partition_key)
+
+    id_size =
+      Ferricstore.Store.Router.max_key_size() - stream_entry_extra - byte_size(base_history_key) +
+        1
+
+    id = String.duplicate("x", id_size)
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    max_stream_key = Ferricstore.Flow.Keys.stream_entry_key_from_history_key(history_key, max_event_id)
+
+    assert byte_size(history_key) <= Ferricstore.Store.Router.max_key_size()
+    assert byte_size(max_stream_key) > Ferricstore.Store.Router.max_key_size()
+
+    assert {:error, "ERR key too large" <> _} =
+             FerricStore.flow_create(id,
+               type: "audit",
+               state: "queued",
+               partition_key: partition_key
+             )
+  end
+
   test "flow state record encoding is compact" do
     record = %{
       id: "flow-1",
@@ -961,6 +986,32 @@ defmodule Ferricstore.FlowTest do
 
     assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_claim_due_batch],
                     %{commands: 2, groups: 1, coalesced_calls: 1}, %{source: :resp_pipeline}}
+  end
+
+  test "claim_due supports compact job responses" do
+    type = uid("claim-jobs-compact")
+    partition_key = uid("tenant")
+    id = uid("claim-jobs-compact")
+
+    assert {:ok, %{id: ^id}} =
+             flow_create_and_get(id,
+               type: type,
+               partition_key: partition_key,
+               now_ms: 1,
+               run_at_ms: 1
+             )
+
+    assert {:ok, [[^id, ^partition_key, lease_token, fencing_token]]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-compact",
+               partition_key: partition_key,
+               limit: 1,
+               now_ms: 2,
+               return: :jobs_compact
+             )
+
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
   end
 
   test "pipeline_claim_due_batch groups interleaved independent partitions" do
@@ -3677,6 +3728,60 @@ defmodule Ferricstore.FlowTest do
     assert claimed_b.partition_key == partition_b
   end
 
+  test "flow_claim_due can scan selected partition_keys in one call" do
+    partition_a = uid("tenant-a")
+    partition_b = uid("tenant-b")
+    partition_c = uid("tenant-c")
+    type = uid("claim-partition-keys")
+    id_a = uid("flow-partition-keys-a")
+    id_b = uid("flow-partition-keys-b")
+    id_c = uid("flow-partition-keys-c")
+
+    assert {:ok, _} =
+             flow_create_and_get(id_a,
+               type: type,
+               partition_key: partition_a,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             flow_create_and_get(id_b,
+               type: type,
+               partition_key: partition_b,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             flow_create_and_get(id_c,
+               type: type,
+               partition_key: partition_c,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_keys: [partition_a, partition_b],
+               worker: "worker-many-partitions",
+               lease_ms: 30_000,
+               limit: 10,
+               now_ms: 1_000
+             )
+
+    assert MapSet.new(Enum.map(claimed, & &1.id)) == MapSet.new([id_a, id_b])
+    assert Enum.all?(claimed, &(&1.partition_key in [partition_a, partition_b]))
+
+    assert {:ok, [claimed_c]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition_c,
+               worker: "worker-c",
+               lease_ms: 30_000,
+               limit: 10,
+               now_ms: 1_000
+             )
+
+    assert claimed_c.id == id_c
+  end
+
   test "flow_create without partition auto-spreads and default claim_due fetches across buckets" do
     type = uid("claim-auto-bucket")
 
@@ -3793,6 +3898,31 @@ defmodule Ferricstore.FlowTest do
 
     assert claimed_held.id == held_partition
     assert claimed_held.partition_key == partition_b
+  end
+
+  test "flow_claim_due omitted state claims any due state" do
+    type = uid("claim-omitted-state-any")
+    queued_id = uid("flow-claim-omitted-queued")
+    ready_id = uid("flow-claim-omitted-ready")
+
+    assert {:ok, _} = flow_create_and_get(queued_id, type: type, run_at_ms: 1_000)
+
+    assert {:ok, _} =
+             flow_create_and_get(ready_id,
+               type: type,
+               state: "ready",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-omitted-state-any",
+               lease_ms: 30_000,
+               limit: 10,
+               now_ms: 1_000
+             )
+
+    assert MapSet.new(Enum.map(claimed, & &1.id)) == MapSet.new([queued_id, ready_id])
   end
 
   test "flow_claim_due any partition drains higher priority across shards first" do
@@ -7008,6 +7138,41 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_reclaim("claim-limit-cap",
                worker: "worker-a",
                limit: 3
+             )
+  end
+
+  test "flow claim_due allows higher compact job limit without raising full record cap" do
+    original = Application.get_env(:ferricstore, :flow_max_claim_limit)
+    original_compact = Application.get_env(:ferricstore, :flow_max_compact_claim_limit)
+    Application.put_env(:ferricstore, :flow_max_claim_limit, 2)
+    Application.put_env(:ferricstore, :flow_max_compact_claim_limit, 4)
+
+    on_exit(fn ->
+      if is_nil(original) do
+        Application.delete_env(:ferricstore, :flow_max_claim_limit)
+      else
+        Application.put_env(:ferricstore, :flow_max_claim_limit, original)
+      end
+
+      if is_nil(original_compact) do
+        Application.delete_env(:ferricstore, :flow_max_compact_claim_limit)
+      else
+        Application.put_env(:ferricstore, :flow_max_compact_claim_limit, original_compact)
+      end
+    end)
+
+    assert {:error, "ERR flow limit exceeds maximum 2"} =
+             FerricStore.flow_claim_due("claim-limit-cap",
+               worker: "worker-a",
+               limit: 3,
+               return: :jobs
+             )
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due("claim-limit-cap",
+               worker: "worker-a",
+               limit: 3,
+               return: :jobs_compact
              )
   end
 

@@ -5,8 +5,9 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
 
   @native_src Path.expand("../../native/ferricstore_bitcask/src", __DIR__)
   @source Path.join(@native_src, "lib.rs")
+  @bloom_source Path.join(@native_src, "bloom.rs")
 
-  test "Bitcask Rust NIFs do not use dirty schedulers" do
+  test "Bitcask Rust NIFs use dirty schedulers only for approved blocking IO paths" do
     offenders =
       @native_src
       |> Path.join("**/*.rs")
@@ -18,14 +19,26 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
         |> Enum.with_index(1)
         |> Enum.filter(fn {line, line_no} ->
           line =~ ~r/^\s*#\[rustler::nif\(schedule = "Dirty(?:Io|Cpu)"\)\]/ and
-            not lmdb_nif?(path, line_no)
+            not approved_dirty_nif?(path, line_no)
         end)
         |> Enum.map(fn {line, line_no} -> "#{Path.relative_to_cwd(path)}:#{line_no}:#{line}" end)
       end)
 
     assert offenders == [],
-           "Rust NIFs must stay on Normal schedulers; move long I/O to Tokio async instead:\n" <>
+           "Unexpected dirty scheduler NIFs; only approved blocking IO paths may use them:\n" <>
              Enum.join(offenders, "\n")
+  end
+
+  test "blocking Bloom write/fsync NIFs use dirty IO schedulers" do
+    source = File.read!(@bloom_source)
+
+    for function <- [
+          "bloom_file_create",
+          "bloom_file_add",
+          "bloom_file_madd"
+        ] do
+      assert_nif_schedule(source, function, "DirtyIo")
+    end
   end
 
   test "blocking Bitcask write/fsync NIFs stay on normal schedulers" do
@@ -108,7 +121,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
 
   defp assert_nif_schedule(source, function, schedule) do
     pattern =
-      ~r/#\[rustler::nif\(schedule = "#{schedule}"\)\]\s*(?:#\[allow\([^\]]+\)\]\s*)?fn #{function}\b/
+      ~r/#\[rustler::nif\(schedule = "#{schedule}"\)\]\s*(?:#\[allow\([^\]]+\)\]\s*)?(?:pub\s+)?fn #{function}\b/
 
     assert source =~ pattern,
            "expected #{function}/N to use #[rustler::nif(schedule = \"#{schedule}\")]"
@@ -120,11 +133,16 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     body
   end
 
-  defp lmdb_nif?(path, schedule_line_no) do
+  defp approved_dirty_nif?(path, schedule_line_no) do
     path
     |> File.read!()
     |> String.split("\n")
     |> Enum.slice(schedule_line_no, 4)
-    |> Enum.any?(&String.match?(&1, ~r/^\s*fn lmdb_/))
+    |> Enum.any?(
+      &(String.match?(&1, ~r/^\s*fn lmdb_/) or
+          String.match?(&1, ~r/^\s*pub fn bloom_file_(create|add|madd)\b/) or
+          String.match?(&1, ~r/^\s*pub fn flow_record_plan_claims\b/) or
+          String.match?(&1, ~r/^\s*pub fn flow_records_terminal_after_noop\b/))
+    )
   end
 end

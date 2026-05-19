@@ -279,6 +279,25 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert_all_states(cancel_ids, partition, "cancelled")
   end
 
+  test "independent complete_many returns per-item success and completes valid jobs" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-independent-complete-#{suffix}"
+    type = "contract-independent-complete-type-#{suffix}"
+    ids = ["independent-complete-a-#{suffix}", "independent-complete-b-#{suffix}"]
+    claims = create_many_and_claim(partition, ids, type, now_ms)
+
+    assert {:ok, [:ok, :ok]} =
+             FerricStore.flow_complete_many(
+               partition,
+               claim_items(claims),
+               result: %{ok: true},
+               independent: true
+             )
+
+    assert_all_states(ids, partition, "completed")
+  end
+
   defp create_many_and_claim(partition, ids, type, now_ms) do
     assert :ok =
              FerricStore.flow_create_many(partition, ids,

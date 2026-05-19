@@ -1210,6 +1210,50 @@ transition only succeeds if current state is exactly expected
 
 That gives business operations compare-and-set semantics.
 
+#### FLOW.SIGNAL
+
+Atomic responsibilities:
+
+```text
+load flow record
+verify IF_STATE guard if present
+verify idempotency marker if IDEMPOTENCY/IDEMPOTENCY_KEY is present
+attach VALUE / VALUE_REF / DROP_VALUE / OVERRIDE_VALUE changes
+optionally transition to a non-terminal state
+optionally set run_at_ms and priority
+require IF_STATE when transitioning, so stale signals cannot advance wrong state
+preserve active lease when the signal does not transition state
+clear active lease when the signal transitions state
+append history event "signaled"
+persist idempotency marker until flow retention cleanup
+```
+
+Command shape:
+
+```text
+FLOW.SIGNAL <id>
+  SIGNAL <name>
+  [PARTITION <partition_key>]
+  [IDEMPOTENCY <key> | IDEMPOTENCY_KEY <key>]
+  [IF_STATE <state>]...
+  [TRANSITION_TO <state>]
+  [RUN_AT <ms>]
+  [PRIORITY <n|low|normal|high>]
+  [VALUE <name> <bytes>]...
+  [VALUE_REF <name> <ref>]...
+  [DROP_VALUE <name>]...
+  [OVERRIDE_VALUE <name>]...
+```
+
+Signal is for external facts arriving while a Flow is active: webhook received,
+human approval, child summary, agent tool output, IoT event, or fraud decision.
+Large bodies should use value refs, not inline metadata. Signal history stores
+compact metadata and refs; workers hydrate only requested values.
+
+Signal does not create terminal states. Terminal transitions must use
+`FLOW.COMPLETE`, `FLOW.FAIL`, or `FLOW.CANCEL`, so lifecycle semantics stay
+explicit and index cleanup remains simple.
+
 #### FLOW.RETRY
 
 Atomic responsibilities:

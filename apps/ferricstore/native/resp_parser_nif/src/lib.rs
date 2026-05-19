@@ -1562,6 +1562,8 @@ enum CommandAstKind {
     FlowCreate,
     FlowCreateMany,
     FlowValuePut,
+    FlowValueMget,
+    FlowSignal,
     FlowSpawnChildren,
     FlowGet,
     FlowPolicySet,
@@ -1813,6 +1815,8 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CREATE" => CommandAstKind::FlowCreate,
         b"FLOW.CREATE_MANY" => CommandAstKind::FlowCreateMany,
         b"FLOW.VALUE.PUT" => CommandAstKind::FlowValuePut,
+        b"FLOW.VALUE.MGET" => CommandAstKind::FlowValueMget,
+        b"FLOW.SIGNAL" => CommandAstKind::FlowSignal,
         b"FLOW.SPAWN_CHILDREN" => CommandAstKind::FlowSpawnChildren,
         b"FLOW.GET" => CommandAstKind::FlowGet,
         b"FLOW.POLICY.SET" => CommandAstKind::FlowPolicySet,
@@ -2261,6 +2265,8 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowValuePut => make_flow_value_put_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowValueMget => make_flow_value_mget_command_ast(env, args),
+        CommandAstKind::FlowSignal => make_flow_signal_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowSpawnChildren => {
             make_flow_spawn_children_command_ast(env, args, arg_bytes)
         }
@@ -5161,7 +5167,7 @@ fn make_flow_create_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.create")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 1, flow_create_option) {
+    match parse_flow_options_with_named_values(env, args, arg_bytes, 1, flow_create_option) {
         Ok(opts) => (tag, args[0], opts).encode(env),
         Err(err) => (tag, args[0], err).encode(env),
     }
@@ -5183,6 +5189,31 @@ fn make_flow_value_put_command_ast<'a>(
     }
 }
 
+fn make_flow_value_mget_command_ast<'a>(env: Env<'a>, args: &[Term<'a>]) -> Term<'a> {
+    let tag = atom(env, "flow_value_mget");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.value.mget")).encode(env);
+    }
+
+    (tag, args.to_vec()).encode(env)
+}
+
+fn make_flow_signal_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_signal");
+    if args.len() < 3 {
+        return (tag, wrong_number_error(env, b"flow.signal")).encode(env);
+    }
+
+    match parse_flow_options_with_named_values(env, args, arg_bytes, 1, flow_signal_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_create_many_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5196,7 +5227,7 @@ fn make_flow_create_many_command_ast<'a>(
     let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
     let auto = ascii_eq_ignore_case(arg_bytes[0], b"AUTO");
 
-    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+    let Some((items_idx, extended_items)) = flow_find_items_marker(arg_bytes, 1) else {
         return (
             tag,
             args[0],
@@ -5204,6 +5235,32 @@ fn make_flow_create_many_command_ast<'a>(
         )
             .encode(env);
     };
+
+    if extended_items {
+        let opts = match parse_flow_options_with_named_values(
+            env,
+            &args[..items_idx],
+            &arg_bytes[..items_idx],
+            1,
+            flow_create_many_option,
+        ) {
+            Ok(opts) => opts,
+            Err(err) => return (tag, args[0], err).encode(env),
+        };
+
+        let items = match parse_flow_create_many_extended_items(env, args, arg_bytes, items_idx) {
+            Ok(items) => items,
+            Err(err) => return (tag, args[0], err).encode(env),
+        };
+
+        let partition = if mixed || auto {
+            atoms::nil().encode(env)
+        } else {
+            args[0]
+        };
+
+        return (tag, partition, items, opts).encode(env);
+    }
 
     let shared_payload_ref = flow_has_option_until(arg_bytes, 1, items_idx, b"PAYLOAD_REF");
     let item_width = match (mixed, shared_payload_ref) {
@@ -5216,11 +5273,16 @@ fn make_flow_create_many_command_ast<'a>(
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
-    let opts =
-        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_create_many_option) {
-            Ok(opts) => opts,
-            Err(err) => return (tag, args[0], err).encode(env),
-        };
+    let opts = match parse_flow_options_with_named_values(
+        env,
+        &args[..items_idx],
+        &arg_bytes[..items_idx],
+        1,
+        flow_create_many_option,
+    ) {
+        Ok(opts) => opts,
+        Err(err) => return (tag, args[0], err).encode(env),
+    };
 
     let mut items = Vec::with_capacity((args.len() - items_idx - 1) / item_width);
     let mut idx = items_idx + 1;
@@ -5266,7 +5328,7 @@ fn make_flow_spawn_children_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.spawn_children")).encode(env);
     }
 
-    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+    let Some((items_idx, extended_items)) = flow_find_items_marker(arg_bytes, 1) else {
         return (
             tag,
             args[0],
@@ -5274,6 +5336,27 @@ fn make_flow_spawn_children_command_ast<'a>(
         )
             .encode(env);
     };
+
+    if extended_items {
+        let opts = match parse_flow_options_with_named_values(
+            env,
+            &args[..items_idx],
+            &arg_bytes[..items_idx],
+            1,
+            flow_spawn_children_option,
+        ) {
+            Ok(opts) => opts,
+            Err(err) => return (tag, args[0], err).encode(env),
+        };
+
+        let items = match parse_flow_spawn_children_extended_items(env, args, arg_bytes, items_idx)
+        {
+            Ok(items) => items,
+            Err(err) => return (tag, args[0], err).encode(env),
+        };
+
+        return (tag, args[0], items, opts).encode(env);
+    }
 
     let mixed =
         items_idx + 1 < args.len() && ascii_eq_ignore_case(arg_bytes[items_idx + 1], b"MIXED");
@@ -5284,12 +5367,11 @@ fn make_flow_spawn_children_command_ast<'a>(
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
-    let opts = match parse_flow_options_until(
+    let opts = match parse_flow_options_with_named_values(
         env,
-        args,
-        arg_bytes,
+        &args[..items_idx],
+        &arg_bytes[..items_idx],
         1,
-        items_idx,
         flow_spawn_children_option,
     ) {
         Ok(opts) => opts,
@@ -5316,6 +5398,138 @@ fn make_flow_spawn_children_command_ast<'a>(
     }
 
     (tag, args[0], items, opts).encode(env)
+}
+
+fn parse_flow_create_many_extended_items<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    items_idx: usize,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    let count_idx = items_idx + 1;
+    let Some(count) = parse_usize_bytes(arg_bytes.get(count_idx).copied()) else {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    };
+
+    let mut items = Vec::with_capacity(count);
+    let mut idx = count_idx + 1;
+    for _ in 0..count {
+        if idx + 3 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+
+        let id = args[idx];
+        let partition = args[idx + 1];
+        let partition_bytes = arg_bytes[idx + 1];
+        let payload = args[idx + 2];
+        idx += 3;
+
+        let (values, next_idx) = parse_flow_extended_named_pairs(env, args, arg_bytes, idx, false)?;
+        let (value_refs, next_idx) =
+            parse_flow_extended_named_pairs(env, args, arg_bytes, next_idx, true)?;
+        idx = next_idx;
+
+        let mut item_opts = vec![(atom(env, "payload"), payload).encode(env)];
+        if !ascii_eq_ignore_case(partition_bytes, b"-") {
+            item_opts.insert(0, (atom(env, "partition_key"), partition).encode(env));
+        }
+        if !values.is_empty() {
+            item_opts.push((atom(env, "values"), values).encode(env));
+        }
+        if !value_refs.is_empty() {
+            item_opts.push((atom(env, "value_refs"), value_refs).encode(env));
+        }
+        items.push((id, item_opts).encode(env));
+    }
+
+    if idx != args.len() {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    Ok(items)
+}
+
+fn parse_flow_spawn_children_extended_items<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    items_idx: usize,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    let count_idx = items_idx + 1;
+    let Some(count) = parse_usize_bytes(arg_bytes.get(count_idx).copied()) else {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    };
+
+    let mut items = Vec::with_capacity(count);
+    let mut idx = count_idx + 1;
+    for _ in 0..count {
+        if idx + 4 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+
+        let id = args[idx];
+        let partition = args[idx + 1];
+        let partition_bytes = arg_bytes[idx + 1];
+        let child_type = args[idx + 2];
+        let payload = args[idx + 3];
+        idx += 4;
+
+        let (values, next_idx) = parse_flow_extended_named_pairs(env, args, arg_bytes, idx, false)?;
+        let (value_refs, next_idx) =
+            parse_flow_extended_named_pairs(env, args, arg_bytes, next_idx, true)?;
+        idx = next_idx;
+
+        let mut item_opts = vec![
+            (atom(env, "type"), child_type).encode(env),
+            (atom(env, "payload"), payload).encode(env),
+        ];
+        if !ascii_eq_ignore_case(partition_bytes, b"-") {
+            item_opts.insert(0, (atom(env, "partition_key"), partition).encode(env));
+        }
+        if !values.is_empty() {
+            item_opts.push((atom(env, "values"), values).encode(env));
+        }
+        if !value_refs.is_empty() {
+            item_opts.push((atom(env, "value_refs"), value_refs).encode(env));
+        }
+        items.push((id, item_opts).encode(env));
+    }
+
+    if idx != args.len() {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    Ok(items)
+}
+
+fn parse_flow_extended_named_pairs<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+    refs: bool,
+) -> Result<(Vec<Term<'a>>, usize), Term<'a>> {
+    let Some(count) = parse_usize_bytes(arg_bytes.get(idx).copied()) else {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    };
+
+    let mut pairs = Vec::with_capacity(count);
+    let mut pair_idx = idx + 1;
+    for _ in 0..count {
+        if pair_idx + 1 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+        if refs && arg_bytes[pair_idx + 1].len() > FLOW_MAX_REF_SIZE {
+            return Err(generic_ast_error(
+                env,
+                b"ERR flow value_ref too large (max 4096 bytes)",
+            ));
+        }
+        pairs.push((args[pair_idx], args[pair_idx + 1]).encode(env));
+        pair_idx += 2;
+    }
+
+    Ok((pairs, pair_idx))
 }
 
 fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&[u8]]) -> Term<'a> {
@@ -5420,7 +5634,7 @@ fn make_flow_complete_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.complete")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 2, flow_terminal_option) {
+    match parse_flow_options_with_named_values(env, args, arg_bytes, 2, flow_terminal_option) {
         Ok(opts) => (tag, args[0], args[1], opts).encode(env),
         Err(err) => (tag, args[0], args[1], err).encode(env),
     }
@@ -5438,7 +5652,7 @@ fn make_flow_complete_many_command_ast<'a>(
 
     let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
 
-    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 1) else {
         return (
             tag,
             args[0],
@@ -5452,12 +5666,11 @@ fn make_flow_complete_many_command_ast<'a>(
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
-    let opts = match parse_flow_options_until(
+    let opts = match parse_flow_options_with_named_values(
         env,
-        args,
-        arg_bytes,
+        &args[..items_idx],
+        &arg_bytes[..items_idx],
         1,
-        items_idx,
         flow_complete_many_option,
     ) {
         Ok(opts) => opts,
@@ -5526,7 +5739,7 @@ fn make_flow_fail_many_command_ast<'a>(
 
     let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
 
-    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 1) else {
         return (
             tag,
             args[0],
@@ -5540,11 +5753,16 @@ fn make_flow_fail_many_command_ast<'a>(
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
-    let opts =
-        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_fail_many_option) {
-            Ok(opts) => opts,
-            Err(err) => return (tag, args[0], err).encode(env),
-        };
+    let opts = match parse_flow_options_with_named_values(
+        env,
+        &args[..items_idx],
+        &arg_bytes[..items_idx],
+        1,
+        flow_fail_many_option,
+    ) {
+        Ok(opts) => opts,
+        Err(err) => return (tag, args[0], err).encode(env),
+    };
 
     let mut items = Vec::with_capacity((args.len() - items_idx - 1) / item_width);
     let mut idx = items_idx + 1;
@@ -5622,12 +5840,11 @@ fn make_flow_retry_many_command_ast<'a>(
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
-    let opts = match parse_flow_options_until_with_retry_policy(
+    let opts = match parse_flow_options_with_named_values_and_retry_policy(
         env,
-        args,
-        arg_bytes,
+        &args[..items_idx],
+        &arg_bytes[..items_idx],
         1,
-        items_idx,
         flow_retry_many_option,
     ) {
         Ok(opts) => opts,
@@ -5710,12 +5927,16 @@ fn make_flow_cancel_many_command_ast<'a>(
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
-    let opts =
-        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_cancel_many_option)
-        {
-            Ok(opts) => opts,
-            Err(err) => return (tag, args[0], err).encode(env),
-        };
+    let opts = match parse_flow_options_with_named_values(
+        env,
+        &args[..items_idx],
+        &arg_bytes[..items_idx],
+        1,
+        flow_cancel_many_option,
+    ) {
+        Ok(opts) => opts,
+        Err(err) => return (tag, args[0], err).encode(env),
+    };
 
     let mut items = Vec::with_capacity((args.len() - items_idx - 1) / item_width);
     let mut idx = items_idx + 1;
@@ -5779,7 +6000,7 @@ fn make_flow_transition_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.transition")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 3, flow_transition_option) {
+    match parse_flow_options_with_named_values(env, args, arg_bytes, 3, flow_transition_option) {
         Ok(opts) => (tag, args[0], args[1], args[2], opts).encode(env),
         Err(err) => (tag, args[0], args[1], args[2], err).encode(env),
     }
@@ -5797,7 +6018,7 @@ fn make_flow_transition_many_command_ast<'a>(
 
     let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
 
-    let Some(items_idx) = flow_find_option(arg_bytes, 3, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 3) else {
         return (
             tag,
             args[0],
@@ -5820,12 +6041,11 @@ fn make_flow_transition_many_command_ast<'a>(
             .encode(env);
     }
 
-    let opts = match parse_flow_options_until(
+    let opts = match parse_flow_options_with_named_values(
         env,
-        args,
-        arg_bytes,
+        &args[..items_idx],
+        &arg_bytes[..items_idx],
         3,
-        items_idx,
         flow_transition_many_option,
     ) {
         Ok(opts) => opts,
@@ -5902,7 +6122,13 @@ fn make_flow_retry_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.retry")).encode(env);
     }
 
-    match parse_flow_options_with_retry_policy(env, args, arg_bytes, 2, flow_retry_option) {
+    match parse_flow_options_with_named_values_and_retry_policy(
+        env,
+        args,
+        arg_bytes,
+        2,
+        flow_retry_option,
+    ) {
         Ok(opts) => (tag, args[0], args[1], opts).encode(env),
         Err(err) => (tag, args[0], args[1], err).encode(env),
     }
@@ -5918,7 +6144,7 @@ fn make_flow_fail_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.fail")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 2, flow_fail_option) {
+    match parse_flow_options_with_named_values(env, args, arg_bytes, 2, flow_fail_option) {
         Ok(opts) => (tag, args[0], args[1], opts).encode(env),
         Err(err) => (tag, args[0], args[1], err).encode(env),
     }
@@ -5934,7 +6160,7 @@ fn make_flow_cancel_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.cancel")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 1, flow_cancel_option) {
+    match parse_flow_options_with_named_values(env, args, arg_bytes, 1, flow_cancel_option) {
         Ok(opts) => (tag, args[0], opts).encode(env),
         Err(err) => (tag, args[0], err).encode(env),
     }
@@ -6119,6 +6345,126 @@ fn parse_flow_options<'a>(
     Ok(opts)
 }
 
+fn parse_flow_options_with_named_values<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    parser: FlowOptionParser<'a>,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    parse_flow_options_with_named_values_inner(env, args, arg_bytes, start, parser, false)
+}
+
+fn parse_flow_options_with_named_values_and_retry_policy<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    parser: FlowOptionParser<'a>,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    parse_flow_options_with_named_values_inner(env, args, arg_bytes, start, parser, true)
+}
+
+fn parse_flow_options_with_named_values_inner<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    parser: FlowOptionParser<'a>,
+    retry_policy: bool,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    let mut opts = Vec::with_capacity((args.len().saturating_sub(start)) / 2 + 4);
+    let mut values = Vec::new();
+    let mut value_refs = Vec::new();
+    let mut drop_values = Vec::new();
+    let mut override_values = Vec::new();
+    let mut retry_opts = Vec::new();
+    let mut backoff_opts = Vec::new();
+    let mut idx = start;
+
+    while idx < args.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE") {
+            if idx + 2 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            values.push((args[idx + 1], args[idx + 2]).encode(env));
+            idx += 3;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE_REF") {
+            if idx + 2 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            if arg_bytes[idx + 2].len() > FLOW_MAX_REF_SIZE {
+                return Err(generic_ast_error(
+                    env,
+                    b"ERR flow value_ref too large (max 4096 bytes)",
+                ));
+            }
+            value_refs.push((args[idx + 1], args[idx + 2]).encode(env));
+            idx += 3;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"DROP_VALUE") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            drop_values.push(args[idx + 1]);
+            idx += 2;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"OVERRIDE_VALUE") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            override_values.push(args[idx + 1]);
+            idx += 2;
+            continue;
+        }
+
+        if idx + 1 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+
+        if retry_policy && flow_retry_policy_option_name(arg_bytes[idx]) {
+            let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
+            if is_backoff {
+                backoff_opts.push(term);
+            } else {
+                retry_opts.push(term);
+            }
+        } else if let Some(opt) = parser(env, args, arg_bytes, idx)? {
+            opts.push(opt);
+        }
+
+        idx += 2;
+    }
+
+    if !values.is_empty() {
+        opts.push((atom(env, "values"), values).encode(env));
+    }
+    if !value_refs.is_empty() {
+        opts.push((atom(env, "value_refs"), value_refs).encode(env));
+    }
+    if !drop_values.is_empty() {
+        opts.push((atom(env, "drop_values"), drop_values).encode(env));
+    }
+    if !override_values.is_empty() {
+        opts.push((atom(env, "override_values"), override_values).encode(env));
+    }
+    if !backoff_opts.is_empty() {
+        retry_opts.push((atom(env, "backoff"), backoff_opts).encode(env));
+    }
+    if !retry_opts.is_empty() {
+        opts.push((atom(env, "retry"), retry_opts).encode(env));
+    }
+
+    Ok(opts)
+}
+
 fn parse_flow_read_options<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -6158,10 +6504,26 @@ fn parse_flow_read_options<'a>(
         }
 
         if ascii_eq_ignore_case(arg_bytes[idx], b"PAYLOAD") {
-            opts.push((atom(env, "payload"), true).encode(env));
+            let payload_enabled = if idx + 1 < args.len() {
+                match parse_bool_bytes(arg_bytes[idx + 1]) {
+                    Some(value) => {
+                        idx += 2;
+                        value
+                    }
+                    None => {
+                        idx += 1;
+                        true
+                    }
+                }
+            } else {
+                idx += 1;
+                true
+            };
 
-            if idx + 1 < args.len() && ascii_eq_ignore_case(arg_bytes[idx + 1], b"MAXBYTES") {
-                if idx + 2 >= args.len() {
+            opts.push((atom(env, "payload"), payload_enabled).encode(env));
+
+            if idx < args.len() && ascii_eq_ignore_case(arg_bytes[idx], b"MAXBYTES") {
+                if idx + 1 >= args.len() {
                     return Err(generic_ast_error(env, b"ERR syntax error"));
                 }
 
@@ -6169,17 +6531,73 @@ fn parse_flow_read_options<'a>(
                     env,
                     "payload_max_bytes",
                     FlowOptType::NonNegative,
-                    args[idx + 2],
-                    arg_bytes[idx + 2],
+                    args[idx + 1],
+                    arg_bytes[idx + 1],
                 )? {
                     opts.push(opt);
                 }
 
-                idx += 3;
-            } else {
-                idx += 1;
+                idx += 2;
             }
 
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+
+            opts.push((atom(env, "values"), args[idx + 1]).encode(env));
+            idx += 2;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE_MAX_BYTES") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+
+            if let Some(opt) = flow_option_value(
+                env,
+                "value_max_bytes",
+                FlowOptType::NonNegative,
+                args[idx + 1],
+                arg_bytes[idx + 1],
+            )? {
+                opts.push(opt);
+            }
+
+            idx += 2;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITIONS") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+
+            let Some(count) = parse_int_bytes(arg_bytes[idx + 1]) else {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            };
+
+            if count <= 0 {
+                return Err(generic_ast_error(
+                    env,
+                    b"ERR flow partition_keys must be a non-empty list",
+                ));
+            }
+
+            let count = count as usize;
+            let first = idx + 2;
+            let end = first + count;
+
+            if end > args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+
+            opts.push((atom(env, "partition_keys"), args[first..end].to_vec()).encode(env));
+            idx = end;
             continue;
         }
 
@@ -6191,82 +6609,6 @@ fn parse_flow_read_options<'a>(
             opts.push(opt);
         }
         idx += 2;
-    }
-
-    Ok(opts)
-}
-
-fn parse_flow_options_until<'a>(
-    env: Env<'a>,
-    args: &[Term<'a>],
-    arg_bytes: &[&[u8]],
-    start: usize,
-    end: usize,
-    parser: FlowOptionParser<'a>,
-) -> Result<Vec<Term<'a>>, Term<'a>> {
-    if (end - start) % 2 != 0 {
-        return Err(generic_ast_error(env, b"ERR syntax error"));
-    }
-
-    let mut opts = Vec::with_capacity((end - start) / 2);
-    let mut idx = start;
-    while idx < end {
-        if let Some(opt) = parser(env, args, arg_bytes, idx)? {
-            opts.push(opt);
-        }
-        idx += 2;
-    }
-    Ok(opts)
-}
-
-fn parse_flow_options_with_retry_policy<'a>(
-    env: Env<'a>,
-    args: &[Term<'a>],
-    arg_bytes: &[&[u8]],
-    start: usize,
-    parser: FlowOptionParser<'a>,
-) -> Result<Vec<Term<'a>>, Term<'a>> {
-    parse_flow_options_until_with_retry_policy(env, args, arg_bytes, start, args.len(), parser)
-}
-
-fn parse_flow_options_until_with_retry_policy<'a>(
-    env: Env<'a>,
-    args: &[Term<'a>],
-    arg_bytes: &[&[u8]],
-    start: usize,
-    end: usize,
-    parser: FlowOptionParser<'a>,
-) -> Result<Vec<Term<'a>>, Term<'a>> {
-    if (end - start) % 2 != 0 {
-        return Err(generic_ast_error(env, b"ERR syntax error"));
-    }
-
-    let mut opts = Vec::with_capacity((end - start) / 2);
-    let mut retry_opts = Vec::new();
-    let mut backoff_opts = Vec::new();
-    let mut idx = start;
-
-    while idx < end {
-        if flow_retry_policy_option_name(arg_bytes[idx]) {
-            let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
-            if is_backoff {
-                backoff_opts.push(term);
-            } else {
-                retry_opts.push(term);
-            }
-        } else if let Some(opt) = parser(env, args, arg_bytes, idx)? {
-            opts.push(opt);
-        }
-
-        idx += 2;
-    }
-
-    if !backoff_opts.is_empty() {
-        retry_opts.push((atom(env, "backoff"), backoff_opts).encode(env));
-    }
-
-    if !retry_opts.is_empty() {
-        opts.push((atom(env, "retry"), retry_opts).encode(env));
     }
 
     Ok(opts)
@@ -6288,6 +6630,45 @@ fn flow_find_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> Option<us
             return Some(idx);
         }
         idx += 2;
+    }
+    None
+}
+
+fn flow_find_items_option(arg_bytes: &[&[u8]], start: usize) -> Option<usize> {
+    let mut idx = start;
+    while idx < arg_bytes.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"ITEMS") {
+            return Some(idx);
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE")
+            || ascii_eq_ignore_case(arg_bytes[idx], b"VALUE_REF")
+        {
+            idx += 3;
+        } else {
+            idx += 2;
+        }
+    }
+    None
+}
+
+fn flow_find_items_marker(arg_bytes: &[&[u8]], start: usize) -> Option<(usize, bool)> {
+    let mut idx = start;
+    while idx < arg_bytes.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"ITEMS") {
+            return Some((idx, false));
+        }
+        if ascii_eq_ignore_case(arg_bytes[idx], b"ITEMS_EXT") {
+            return Some((idx, true));
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE")
+            || ascii_eq_ignore_case(arg_bytes[idx], b"VALUE_REF")
+        {
+            idx += 3;
+        } else {
+            idx += 2;
+        }
     }
     None
 }
@@ -6421,6 +6802,8 @@ fn flow_value_put_option<'a>(
                 "owner_flow_id",
                 FlowOptType::Ref(b"owner_flow_id"),
             ),
+            (b"NAME", "name", FlowOptType::Binary),
+            (b"OVERRIDE", "override", FlowOptType::Boolean),
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"TTL_MS", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
@@ -6472,6 +6855,39 @@ fn flow_spawn_children_option<'a>(
                 "history_max_events",
                 FlowOptType::Positive(b"history_max_events"),
             ),
+        ],
+    )
+}
+
+fn flow_signal_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"SIGNAL", "signal", FlowOptType::Binary),
+            (
+                b"IDEMPOTENCY",
+                "idempotency_key",
+                FlowOptType::Ref(b"idempotency_key"),
+            ),
+            (
+                b"IDEMPOTENCY_KEY",
+                "idempotency_key",
+                FlowOptType::Ref(b"idempotency_key"),
+            ),
+            (b"IF_STATE", "if_state", FlowOptType::Binary),
+            (b"TRANSITION_TO", "transition_to", FlowOptType::Binary),
+            (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PRIORITY", "priority", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
     )
 }
@@ -6746,6 +7162,13 @@ fn flow_claim_due_option<'a>(
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
             (b"RETURN", "return", FlowOptType::Binary),
+            (b"PAYLOAD", "payload", FlowOptType::Boolean),
+            (
+                b"PAYLOAD_MAX_BYTES",
+                "payload_max_bytes",
+                FlowOptType::NonNegative,
+            ),
+            (b"MAXBYTES", "payload_max_bytes", FlowOptType::NonNegative),
             (b"RECLAIM_EXPIRED", "reclaim_expired", FlowOptType::Boolean),
             (b"RECLAIM_RATIO", "reclaim_ratio", FlowOptType::NonNegative),
         ],
@@ -7658,6 +8081,8 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE_MANY" => flow_create_many_key_indices(arg_bytes),
         b"FLOW.VALUE.PUT" => flow_partition_key_indices(arg_bytes, 1),
+        b"FLOW.VALUE.MGET" => all_indices(argc),
+        b"FLOW.SIGNAL" => flow_partition_or_first_key_indices(arg_bytes, 1),
         b"FLOW.SPAWN_CHILDREN" => flow_spawn_children_key_indices(arg_bytes),
         b"FLOW.COMPLETE_MANY" => flow_complete_many_key_indices(arg_bytes),
         b"FLOW.RETRY_MANY" => flow_retry_many_key_indices(arg_bytes),
@@ -7893,6 +8318,18 @@ fn flow_partition_key_indices_until(
     while idx + 1 < end {
         if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITION") {
             keys.push(idx + 1);
+        } else if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITIONS") {
+            if let Some(count) = parse_int_bytes(arg_bytes[idx + 1]) {
+                if count > 0 {
+                    let first = idx + 2;
+                    let last = first + count as usize;
+                    if last <= end {
+                        for key_idx in first..last {
+                            keys.push(key_idx);
+                        }
+                    }
+                }
+            }
         }
         idx += 1;
     }
@@ -7915,9 +8352,36 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
         return vec![0];
     }
 
-    let Some(items_idx) = option_index(arg_bytes, 1, b"ITEMS") else {
+    let Some((items_idx, extended_items)) = flow_find_items_marker(arg_bytes, 1) else {
         return vec![0];
     };
+
+    if extended_items {
+        let Some(count) = parse_usize_bytes(arg_bytes.get(items_idx + 1).copied()) else {
+            return vec![0];
+        };
+
+        let mut keys = Vec::new();
+        let mut idx = items_idx + 2;
+        for _ in 0..count {
+            if idx + 3 >= arg_bytes.len() {
+                return vec![0];
+            }
+            if !ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+                keys.push(idx + 1);
+            }
+            idx += 3;
+            let Some(values_count) = parse_usize_bytes(arg_bytes.get(idx).copied()) else {
+                return vec![0];
+            };
+            idx += 1 + values_count.saturating_mul(2);
+            let Some(refs_count) = parse_usize_bytes(arg_bytes.get(idx).copied()) else {
+                return vec![0];
+            };
+            idx += 1 + refs_count.saturating_mul(2);
+        }
+        return if keys.is_empty() { vec![0] } else { keys };
+    }
 
     let shared_payload_ref = flow_has_option_until(arg_bytes, 1, items_idx, b"PAYLOAD_REF");
     let item_width = if shared_payload_ref { 2 } else { 3 };
@@ -7931,10 +8395,33 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
 }
 
 fn flow_spawn_children_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
-    let option_end = option_index(arg_bytes, 1, b"ITEMS").unwrap_or(arg_bytes.len());
+    let marker = flow_find_items_marker(arg_bytes, 1);
+    let option_end = marker.map(|(idx, _)| idx).unwrap_or(arg_bytes.len());
     let mut partition_keys = flow_partition_key_indices_until(arg_bytes, 1, option_end);
 
-    if option_end + 1 < arg_bytes.len() && ascii_eq_ignore_case(arg_bytes[option_end + 1], b"MIXED")
+    if let Some((items_idx, true)) = marker {
+        if let Some(count) = parse_usize_bytes(arg_bytes.get(items_idx + 1).copied()) {
+            let mut idx = items_idx + 2;
+            for _ in 0..count {
+                if idx + 4 >= arg_bytes.len() {
+                    break;
+                }
+                if !ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+                    partition_keys.push(idx + 1);
+                }
+                idx += 4;
+                let Some(values_count) = parse_usize_bytes(arg_bytes.get(idx).copied()) else {
+                    break;
+                };
+                idx += 1 + values_count.saturating_mul(2);
+                let Some(refs_count) = parse_usize_bytes(arg_bytes.get(idx).copied()) else {
+                    break;
+                };
+                idx += 1 + refs_count.saturating_mul(2);
+            }
+        }
+    } else if option_end + 1 < arg_bytes.len()
+        && ascii_eq_ignore_case(arg_bytes[option_end + 1], b"MIXED")
     {
         let mut idx = option_end + 2;
         while idx + 3 < arg_bytes.len() {
@@ -8535,6 +9022,15 @@ fn parse_int_bytes(data: &[u8]) -> Option<i64> {
     }
 
     Some(result)
+}
+
+fn parse_usize_bytes(data: Option<&[u8]>) -> Option<usize> {
+    let value = parse_int_bytes(data?)?;
+    if value < 0 {
+        None
+    } else {
+        usize::try_from(value).ok()
+    }
 }
 
 fn parse_bool_bytes(data: &[u8]) -> Option<bool> {
@@ -9578,6 +10074,10 @@ mod tests {
             CommandAstKind::FlowValuePut
         );
         assert_eq!(
+            classify_command_ast(b"FLOW.SIGNAL", 0),
+            CommandAstKind::FlowSignal
+        );
+        assert_eq!(
             classify_command_ast(b"FLOW.SPAWN_CHILDREN", 0),
             CommandAstKind::FlowSpawnChildren
         );
@@ -9996,6 +10496,22 @@ mod tests {
         assert_eq!(
             command_key_indices(b"FLOW.POLICY.SET", &[b"checkout", b"MAX_RETRIES", b"3"]),
             vec![0]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.SIGNAL",
+                &[
+                    b"flow-1",
+                    b"PARTITION",
+                    b"tenant-a",
+                    b"SIGNAL",
+                    b"payment_received",
+                    b"VALUE",
+                    b"payment_event",
+                    b"payload",
+                ]
+            ),
+            vec![2]
         );
         assert_eq!(
             command_key_indices(

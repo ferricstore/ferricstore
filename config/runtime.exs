@@ -22,6 +22,10 @@ if config_env() == :prod do
     port: String.to_integer(System.get_env("FERRICSTORE_PORT", "6379")),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
+    flow_max_claim_limit:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_MAX_CLAIM_LIMIT", "1000")),
+    flow_max_compact_claim_limit:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_MAX_COMPACT_CLAIM_LIMIT", "5000")),
     shard_count:
       (
         count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")

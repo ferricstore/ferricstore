@@ -39,8 +39,33 @@ defmodule Ferricstore.Store.SlotMap do
   end
 
   @spec slot_for_key(binary()) :: non_neg_integer()
+  def slot_for_key("f:{" <> rest = key) do
+    slot_for_flow_tag(rest, key)
+  end
+
+  def slot_for_key("X:f:{" <> rest = key) do
+    slot_for_flow_tag(rest, key)
+  end
+
   def slot_for_key(key) do
     hash_input = Ferricstore.Store.Router.extract_hash_tag(key) || key
+    slot_for_hash_input(hash_input)
+  end
+
+  defp slot_for_flow_tag(rest, fallback_key) do
+    case :binary.match(rest, "}") do
+      {end_pos, 1} when end_pos > 0 ->
+        rest
+        |> binary_part(0, end_pos)
+        |> slot_for_hash_input()
+
+      _ ->
+        hash_input = Ferricstore.Store.Router.extract_hash_tag(fallback_key) || fallback_key
+        slot_for_hash_input(hash_input)
+    end
+  end
+
+  defp slot_for_hash_input(hash_input) do
     :erlang.crc32(hash_input) |> band(@slot_mask)
   end
 

@@ -372,6 +372,23 @@ defmodule FerricStore do
   def flow_create(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
+  Appends a durable signal to a Flow record.
+
+  Required option: `:signal`.
+  Common options: `:values`, `:value_refs`, `:idempotency_key`, `:if_state`,
+  `:transition_to`, `:run_at_ms`.
+  """
+  @spec flow_signal(binary(), keyword()) :: :ok | {:error, binary()}
+  def flow_signal(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.signal(default_ctx(), id, opts)
+  end
+
+  def flow_signal(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_signal(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
   Stores a reusable Flow value and returns a `:ref` that can be passed as
   `:payload_ref` to Flow create/transition commands.
   """
@@ -383,6 +400,15 @@ defmodule FerricStore do
   end
 
   def flow_value_put(_value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @spec flow_value_mget([binary()], keyword()) :: {:ok, list()} | {:error, binary()}
+  def flow_value_mget(refs, opts \\ [])
+
+  def flow_value_mget(refs, opts) when is_list(refs) and is_list(opts) do
+    Ferricstore.Flow.value_mget(default_ctx(), refs, opts)
+  end
+
+  def flow_value_mget(_refs, _opts), do: {:error, "ERR flow refs must be a list"}
 
   @doc """
   Creates a durable batch of Flow records.
