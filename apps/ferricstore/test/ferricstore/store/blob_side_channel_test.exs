@@ -1590,6 +1590,107 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     end
   end
 
+  test "blob garbage sweep fails closed when Ra replay metrics are invalid", %{
+    ctx: ctx,
+    shard: shard
+  } do
+    payload = "dead-but-invalid-raft-replay-metrics"
+    ref = BlobRef.from_payload(payload)
+    path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+    original_state = :sys.get_state(shard)
+
+    :sys.replace_state(shard, fn state ->
+      %{
+        state
+        | raft?: true,
+          instance_ctx: %{
+            state.instance_ctx
+            | last_applied_index: {:not, :atomics},
+              last_released_cursor_index: {:not, :atomics}
+          }
+      }
+    end)
+
+    try do
+      assert {:ok,
+              %{
+                deleted_files: 0,
+                deleted_bytes: 0,
+                kept_files: 0,
+                skipped: true,
+                reason: :missing_raft_replay_metrics
+              }} = Router.sweep_blob_garbage(ctx)
+
+      assert File.exists?(path)
+    after
+      :sys.replace_state(shard, fn _state -> original_state end)
+    end
+  end
+
+  test "blob garbage sweep fails closed when a live cold location cannot be read", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    attach_blob_gc_handler()
+
+    payload = "dead-but-live-ref-scan-fails"
+    ref = BlobRef.from_payload(payload)
+    path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+    live_key = "blob:gc:missing-live-location"
+
+    :ets.insert(keydir, {live_key, nil, 0, LFU.initial(), 999_999, 0, BlobRef.encoded_size()})
+
+    try do
+      assert {:error, {0, {:blob_gc_live_ref_scan_failed, ^live_key, _reason}}} =
+               Router.sweep_blob_garbage(ctx)
+
+      assert_receive {:blob_gc_failed, [:ferricstore, :blob, :gc, :failed], %{count: 1},
+                      %{
+                        shard_index: 0,
+                        reason: {:blob_gc_live_ref_scan_failed, ^live_key, _reason}
+                      }}
+
+      assert File.exists?(path)
+    after
+      :ets.delete(keydir, live_key)
+      :sys.replace_state(shard, fn state -> state end)
+    end
+  end
+
+  test "blob garbage sweep does not delete a blob written after live-ref scan starts", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    parent = self()
+    key = "blob:gc:concurrent-large-write"
+    payload = :binary.copy("W", 1024)
+
+    Process.put(:ferricstore_blob_gc_after_live_refs_hook, fn _ctx, 0, _live_refs ->
+      task =
+        Task.async(fn ->
+          result = Router.put(ctx, key, payload, 0)
+          send(parent, {:blob_gc_writer_done, result})
+          result
+        end)
+
+      send(parent, {:blob_gc_writer_task, task})
+
+      refute_receive {:blob_gc_writer_done, :ok}, 50
+
+      :ok
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_gc_after_live_refs_hook) end)
+
+    assert {:ok, _stats} = Router.sweep_blob_garbage(ctx)
+    assert_receive {:blob_gc_writer_task, task}, 1_000
+    assert :ok = Task.await(task, 1_000)
+    assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, key)
+    assert File.exists?(BlobRef.path(ctx.data_dir, 0, ref))
+    assert payload == Router.get(ctx, key)
+  end
+
   test "blob garbage sweep fails closed when the active Bitcask file cannot fsync", %{
     ctx: ctx,
     shard: shard,

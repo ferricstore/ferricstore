@@ -165,11 +165,9 @@ defmodule Ferricstore.Health do
   @spec check_raft_leaders(non_neg_integer()) :: boolean()
   defp check_raft_leaders(shard_count) do
     Enum.all?(0..(shard_count - 1), fn i ->
-      server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-
       try do
-        case :ra.members(server_id, 1_000) do
-          {:ok, _members, _leader} -> true
+        case Ferricstore.Raft.Cluster.members(i, 1_000) do
+          {:ok, _members, leader} when leader not in [nil, :undefined] -> true
           _ -> false
         end
       catch

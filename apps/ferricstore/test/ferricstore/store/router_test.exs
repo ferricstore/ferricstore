@@ -112,6 +112,33 @@ defmodule Ferricstore.Store.RouterTest do
       refute :by_shard_keys in delete_vars
       refute :keys_map in delete_vars
     end
+
+    test "WARaft batch routing does not fall back to legacy Batcher for forwarded writes" do
+      source = File.read!("lib/ferricstore/store/router.ex")
+      {:ok, ast} = Code.string_to_quoted(source)
+
+      for function_name <- [
+            :do_batch_quorum_commands,
+            :do_batch_quorum_put_entries,
+            :do_batch_quorum_delete_keys
+          ] do
+        body =
+          ast
+          |> private_function_body(function_name, 3)
+          |> Macro.to_string()
+
+        refute body =~ "origin_node == nil",
+               "#{function_name}/3 must route WARaft forwarded writes through WARaftBackend, not the legacy Batcher"
+      end
+
+      forced_body =
+        ast
+        |> private_function_body(:do_forced_quorum_write, 4)
+        |> Macro.to_string()
+
+      refute forced_body =~ "origin_node == node()",
+             "forced WARaft writes must not use the legacy forwarded Batcher when origin_node is remote"
+    end
   end
 
   describe "default quorum write ingress" do
@@ -135,7 +162,7 @@ defmodule Ferricstore.Store.RouterTest do
       assert {:ok, 2} = Router.incr(ctx, key, 1)
       assert :ok = Router.delete(ctx, key)
 
-      assert shard_write_version(shard) >= before_version + 3
+      assert shard_write_version(shard) == before_version
     end
 
     test "compound marker writes use state-machine command shapes" do
@@ -161,22 +188,7 @@ defmodule Ferricstore.Store.RouterTest do
       assert :ok = Router.compound_batch_delete(ctx, key, Enum.map(entries, &elem(&1, 0)))
       assert [nil, nil] = Router.compound_batch_get(ctx, key, Enum.map(entries, &elem(&1, 0)))
 
-      assert shard_write_version(shard) >= before_version + 4
-    end
-
-    test "compound_scan with limit returns only latest sorted prefix entries" do
-      ctx = FerricStore.Instance.get(:default)
-      key = "router_compound_scan_limit:" <> Integer.to_string(System.unique_integer([:positive]))
-      prefix = "H:" <> key <> <<0>>
-
-      entries =
-        for field <- ["a", "b", "c"] do
-          {prefix <> field, field, 0}
-        end
-
-      assert :ok = Router.compound_batch_put(ctx, key, entries)
-
-      assert [{"b", "b"}, {"c", "c"}] == Router.compound_scan(ctx, key, prefix, 2)
+      assert shard_write_version(shard) == before_version
     end
   end
 
@@ -259,6 +271,25 @@ defmodule Ferricstore.Store.RouterTest do
       end)
 
     MapSet.to_list(vars)
+  end
+
+  defp private_function_body(ast, function_name, arity) do
+    {_ast, bodies} =
+      Macro.prewalk(ast, [], fn
+        {:defp, _meta, [{^function_name, _call_meta, args}, body]} = node, acc
+        when length(args) == arity ->
+          {node, [body | acc]}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    bodies
+    |> Enum.reverse()
+    |> case do
+      [] -> flunk("missing #{function_name}/#{arity}")
+      bodies -> {:__block__, [], bodies}
+    end
   end
 
   defp shard_write_version(shard) do

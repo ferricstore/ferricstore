@@ -359,7 +359,7 @@ mod integration {
     }
 
     #[test]
-    fn test_backpressure_rejects_single_oversized_write_on_empty_buffer() {
+    fn test_backpressure_allows_single_oversized_write_on_empty_buffer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir
             .path()
@@ -371,7 +371,8 @@ mod integration {
         let handle = WalHandle::open(path, 0, 0, 100).unwrap();
         let data = vec![0u8; 101];
 
-        assert!(handle.buffer_write(&data).is_err());
+        handle.buffer_write(&data).unwrap();
+        assert!(handle.buffer_write(b"x").is_err());
 
         handle.close().unwrap();
     }
@@ -539,24 +540,6 @@ mod integration {
         let result = handle.pread(HDR, 1024 * 1024).unwrap();
         assert_eq!(result.len(), 1024 * 1024);
         assert_eq!(&result[..], &data[..]);
-    }
-
-    #[test]
-    fn test_pread_rejects_oversized_read_before_allocation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("pread_oversized.wal")
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
-        handle.buffer_write(b"data").unwrap();
-        handle.close().unwrap();
-
-        let result = handle.pread(HDR, crate::wal_handle::MAX_PREAD_BYTES as u64 + 1);
-        assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------

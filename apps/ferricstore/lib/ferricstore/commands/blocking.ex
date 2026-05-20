@@ -238,17 +238,17 @@ defmodule Ferricstore.Commands.Blocking do
           if count == 1, do: [key], else: [key, to_string(count)]
         end
 
-        Enum.find_value(keys, fn key ->
+        Enum.reduce_while(keys, nil, fn key, _acc ->
           case List.handle(pop_cmd, pop_args_fn.(key), store) do
             nil ->
-              nil
+              {:cont, nil}
 
-            {:error, _} ->
-              nil
+            {:error, _} = err ->
+              {:halt, err}
 
             value ->
               elements = if is_list(value), do: value, else: [value]
-              [key, elements]
+              {:halt, [key, elements]}
           end
         end)
 

@@ -19,6 +19,9 @@ defmodule Ferricstore.Raft.Cluster do
   require quorum (2 of 3) acknowledgement before commit.
   """
 
+  alias Ferricstore.Raft.Backend
+  alias Ferricstore.Raft.WARaftBackend
+
   require Logger
 
   @ra_system :ferricstore_raft
@@ -41,6 +44,14 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec start_system(binary()) :: :ok | {:error, term()}
   def start_system(data_dir) do
+    if Backend.waraft?() do
+      :ok
+    else
+      start_legacy_system(data_dir)
+    end
+  end
+
+  defp start_legacy_system(data_dir) do
     ra_dir_str = Path.join(data_dir, "ra")
     created? = not Ferricstore.FS.dir?(ra_dir_str)
     Ferricstore.FS.mkdir_p!(ra_dir_str)
@@ -132,6 +143,14 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec stop_system() :: :ok | {:error, term()}
   def stop_system do
+    if Backend.waraft?() do
+      :ok
+    else
+      stop_legacy_system()
+    end
+  end
+
+  defp stop_legacy_system do
     case :ra_system.stop(@ra_system) do
       :ok ->
         :ok
@@ -178,6 +197,30 @@ defmodule Ferricstore.Raft.Cluster do
         cluster_members,
         opts \\ []
       ) do
+    if Backend.waraft?() do
+      {:error, :unsupported_waraft_shard_start}
+    else
+      join_legacy_shard_server(
+        shard_index,
+        shard_data_path,
+        active_file_id,
+        active_file_path,
+        ets,
+        cluster_members,
+        opts
+      )
+    end
+  end
+
+  defp join_legacy_shard_server(
+         shard_index,
+         shard_data_path,
+         active_file_id,
+         active_file_path,
+         ets,
+         cluster_members,
+         opts
+       ) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
 
@@ -255,7 +298,45 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec add_member(non_neg_integer(), node(), atom()) :: :ok | {:error, term()}
   def add_member(shard_index, node, membership \\ :voter) do
-    add_member_with_retry(shard_index, node, membership, 10)
+    if Backend.waraft?() do
+      waraft_add_member(shard_index, node, membership)
+    else
+      add_member_with_retry(shard_index, node, membership, 10)
+    end
+  end
+
+  defp waraft_add_member(shard_index, node, :voter) do
+    case WARaftBackend.add_member(shard_index, node) do
+      {:ok, _position} -> :ok
+      :already_member -> :ok
+      {:error, :already_member} -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, other}
+    end
+  end
+
+  defp waraft_add_member(shard_index, node, :promotable) do
+    case WARaftBackend.adjust_membership(shard_index, :remove_membership, node) do
+      {:ok, _position} -> :ok
+      {:error, :not_a_member} -> waraft_add_participant(shard_index, node)
+      {:error, _reason} = error -> error
+      other -> {:error, other}
+    end
+  end
+
+  defp waraft_add_member(shard_index, node, :non_voter) do
+    waraft_add_member(shard_index, node, :promotable)
+  end
+
+  defp waraft_add_member(_shard_index, _node, membership),
+    do: {:error, {:unsupported_waraft_membership, membership}}
+
+  defp waraft_add_participant(shard_index, node) do
+    case WARaftBackend.add_participant(shard_index, node) do
+      {:ok, _position} -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, other}
+    end
   end
 
   defp add_member_with_retry(_shard_index, _node, _membership, 0) do
@@ -302,14 +383,28 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec remove_member(non_neg_integer(), node()) :: :ok | {:error, term()}
   def remove_member(shard_index, node) do
-    leader = shard_server_id(shard_index)
-    member = shard_server_id_on(shard_index, node)
+    if Backend.waraft?() do
+      waraft_remove_member(shard_index, node)
+    else
+      leader = shard_server_id(shard_index)
+      member = shard_server_id_on(shard_index, node)
 
-    case :ra.remove_member(leader, member) do
-      {_, _, _leader} -> :ok
+      case :ra.remove_member(leader, member) do
+        {_, _, _leader} -> :ok
+        {:error, :not_member} -> :ok
+        {:error, reason} -> {:error, reason}
+        {:timeout, _} -> {:error, :timeout}
+      end
+    end
+  end
+
+  defp waraft_remove_member(shard_index, node) do
+    case WARaftBackend.adjust_membership(shard_index, :remove_membership, node) do
+      {:ok, _position} -> :ok
       {:error, :not_member} -> :ok
-      {:error, reason} -> {:error, reason}
-      {:timeout, _} -> {:error, :timeout}
+      {:error, :not_a_member} -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, other}
     end
   end
 
@@ -318,7 +413,169 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec members(non_neg_integer()) :: {:ok, list(), term()} | {:error, term()}
   def members(shard_index) do
-    :ra.members(shard_server_id(shard_index))
+    members(shard_index, :default)
+  end
+
+  @spec members(non_neg_integer(), timeout() | :default) ::
+          {:ok, list(), term()} | {:error, term()}
+  def members(shard_index, timeout) do
+    if Backend.waraft?() do
+      waraft_members(shard_index, timeout)
+    else
+      legacy_members(shard_index, timeout)
+    end
+  end
+
+  defp legacy_members(shard_index, :default), do: :ra.members(shard_server_id(shard_index))
+
+  defp legacy_members(shard_index, timeout),
+    do: :ra.members(shard_server_id(shard_index), timeout)
+
+  defp waraft_members(shard_index, :default), do: blocking_waraft_members(shard_index)
+
+  defp waraft_members(shard_index, timeout) when is_integer(timeout) and timeout >= 0 do
+    case WARaftBackend.cached_members(shard_index) do
+      {:ok, _members, _leader} = result ->
+        result
+
+      _miss ->
+        timed_waraft_members(shard_index, timeout)
+    end
+  end
+
+  defp waraft_members(shard_index, _timeout), do: blocking_waraft_members(shard_index)
+
+  defp timed_waraft_members(shard_index, timeout) do
+    parent = self()
+    ref = make_ref()
+
+    pid =
+      spawn(fn ->
+        send(parent, {ref, blocking_waraft_members(shard_index)})
+      end)
+
+    receive do
+      {^ref, result} ->
+        result
+    after
+      timeout ->
+        Process.exit(pid, :kill)
+        {:error, :timeout}
+    end
+  end
+
+  defp blocking_waraft_members(shard_index) do
+    case WARaftBackend.membership(shard_index) do
+      members when is_list(members) ->
+        leader =
+          case WARaftBackend.status(shard_index) do
+            status when is_list(status) ->
+              leader_node = Keyword.get(status, :leader_id)
+              Enum.find(members, fn {_server, node} -> node == leader_node end)
+
+            _other ->
+              nil
+          end
+
+        {:ok, members, leader}
+
+      {:error, _reason} = error ->
+        error
+
+      other ->
+        {:error, other}
+    end
+  end
+
+  @doc """
+  Returns the local Ra member overview for a shard.
+
+  This is intentionally routed through the cluster facade so operational code
+  does not accidentally bypass the selected Raft backend. WARaft does not expose
+  a legacy ra snapshot overview, so callers should treat the returned error as
+  "no legacy overview available".
+  """
+  @spec member_overview(non_neg_integer() | :ra.server_id()) ::
+          {:ok, map()} | {:ok, map(), term()} | {:error, term()}
+  def member_overview(shard_index) when is_integer(shard_index) and shard_index >= 0 do
+    if Backend.waraft?() do
+      {:error, :unsupported_waraft_member_overview}
+    else
+      legacy_member_overview_on(node(), shard_server_id(shard_index))
+    end
+  end
+
+  def member_overview(server_id), do: member_overview_on(node(), server_id)
+
+  @doc """
+  Returns a Ra member overview from `target_node` through the backend facade.
+
+  Remote legacy calls stay here so WARaft replacement guards can prevent
+  scattered `:erpc.call(node, :ra, ...)` probes in production code.
+  """
+  @spec member_overview_on(node(), :ra.server_id()) ::
+          {:ok, map()} | {:ok, map(), term()} | {:error, term()}
+  def member_overview_on(target_node, server_id) do
+    if Backend.waraft?() do
+      {:error, :unsupported_waraft_member_overview}
+    else
+      legacy_member_overview_on(target_node, server_id)
+    end
+  end
+
+  defp legacy_member_overview_on(target_node, server_id) do
+    if target_node == node() do
+      :ra.member_overview(server_id)
+    else
+      try do
+        :erpc.call(target_node, :ra, :member_overview, [server_id])
+      catch
+        _, _ -> :error
+      end
+    end
+  end
+
+  @doc """
+  Stops a legacy Ra server on `target_node`.
+
+  Kept behind this facade so cluster-management code does not use remote
+  `:erpc.call(node, :ra, ...)` directly when WARaft is selected.
+  """
+  @spec stop_server_on(node(), atom(), :ra.server_id()) :: term()
+  def stop_server_on(target_node, ra_sys, server_id) do
+    if Backend.waraft?() do
+      {:error, :unsupported_waraft_shard_stop}
+    else
+      legacy_stop_server_on(target_node, ra_sys, server_id)
+    end
+  end
+
+  @doc """
+  Force-deletes a legacy Ra server on `target_node` through the Raft facade.
+  """
+  @spec force_delete_server_on(node(), atom(), :ra.server_id()) :: term()
+  def force_delete_server_on(target_node, ra_sys, server_id) do
+    if Backend.waraft?() do
+      {:error, :unsupported_waraft_shard_delete}
+    else
+      legacy_force_delete_server_on(target_node, ra_sys, server_id)
+    end
+  end
+
+  defp legacy_stop_server_on(target_node, ra_sys, server_id) do
+    if target_node == node() do
+      :ra.stop_server(ra_sys, server_id)
+    else
+      :erpc.call(target_node, :ra, :stop_server, [ra_sys, server_id], 5_000)
+    end
+  end
+
+  defp legacy_force_delete_server_on(target_node, ra_sys, server_id) do
+    if target_node == node() do
+      :ra.force_delete_server(ra_sys, server_id)
+    else
+      :erpc.call(target_node, :ra, :force_delete_server, [ra_sys, server_id], 5_000)
+    end
   end
 
   @doc """
@@ -326,9 +583,13 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec transfer_leadership(non_neg_integer(), node()) :: :ok | {:error, term()}
   def transfer_leadership(shard_index, target_node) do
-    server_id = shard_server_id(shard_index)
-    target_id = shard_server_id_on(shard_index, target_node)
-    :ra.transfer_leadership(server_id, target_id)
+    if Backend.waraft?() do
+      WARaftBackend.transfer_leadership(shard_index, target_node)
+    else
+      server_id = shard_server_id(shard_index)
+      target_id = shard_server_id_on(shard_index, target_node)
+      :ra.transfer_leadership(server_id, target_id)
+    end
   end
 
   @doc """
@@ -373,6 +634,28 @@ defmodule Ferricstore.Raft.Cluster do
         ets,
         opts \\ []
       ) do
+    if Backend.waraft?() do
+      {:error, :unsupported_waraft_shard_start}
+    else
+      start_legacy_shard_server(
+        shard_index,
+        shard_data_path,
+        active_file_id,
+        active_file_path,
+        ets,
+        opts
+      )
+    end
+  end
+
+  defp start_legacy_shard_server(
+         shard_index,
+         shard_data_path,
+         active_file_id,
+         active_file_path,
+         ets,
+         opts
+       ) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
     instance_name = Keyword.get(opts, :instance_name, :default)
@@ -507,6 +790,14 @@ defmodule Ferricstore.Raft.Cluster do
 
   def trigger_shard_elections_parallel(shard_count, opts)
       when is_integer(shard_count) and shard_count > 0 do
+    if Backend.waraft?() do
+      trigger_waraft_shard_elections_parallel(shard_count, opts)
+    else
+      trigger_legacy_shard_elections_parallel(shard_count, opts)
+    end
+  end
+
+  defp trigger_legacy_shard_elections_parallel(shard_count, opts) do
     timeout = Keyword.get(opts, :timeout, 120_000)
     max_concurrency = Keyword.get(opts, :max_concurrency, shard_count)
 
@@ -657,6 +948,62 @@ defmodule Ferricstore.Raft.Cluster do
     )
   end
 
+  defp trigger_waraft_shard_elections_parallel(shard_count, opts) do
+    timeout = Keyword.get(opts, :timeout, 120_000)
+    max_concurrency = Keyword.get(opts, :max_concurrency, shard_count)
+
+    0..(shard_count - 1)
+    |> Task.async_stream(
+      fn shard_index ->
+        with :ok <- normalize_waraft_election(safe_waraft_trigger_election(shard_index)),
+             :ok <- wait_for_waraft_leader(shard_index) do
+          :ok
+        else
+          {:error, reason} -> {:error, {shard_index, reason}}
+          other -> {:error, {shard_index, other}}
+        end
+      end,
+      max_concurrency: max_concurrency,
+      ordered: false,
+      timeout: timeout,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce_while(:ok, fn
+      {:ok, :ok}, :ok ->
+        {:cont, :ok}
+
+      {:ok, {:error, reason}}, :ok ->
+        {:halt, {:error, reason}}
+
+      {:exit, reason}, :ok ->
+        {:halt, {:error, {:election_task_exit, reason}}}
+    end)
+  end
+
+  defp safe_waraft_trigger_election(shard_index) do
+    WARaftBackend.trigger_election(shard_index)
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp normalize_waraft_election(:ok), do: :ok
+  defp normalize_waraft_election({:error, _reason} = error), do: error
+  defp normalize_waraft_election(other), do: {:error, other}
+
+  defp wait_for_waraft_leader(shard_index, attempts \\ 200)
+  defp wait_for_waraft_leader(_shard_index, 0), do: {:error, :leader_election_timeout}
+
+  defp wait_for_waraft_leader(shard_index, attempts) do
+    case blocking_waraft_members(shard_index) do
+      {:ok, _members, {_name, _node}} ->
+        :ok
+
+      _other ->
+        Process.sleep(50)
+        wait_for_waraft_leader(shard_index, attempts - 1)
+    end
+  end
+
   defp handle_join_start_error_action(
          _ra_sys,
          _server_id,
@@ -693,6 +1040,14 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec stop_shard_server(non_neg_integer()) :: :ok | {:error, term()}
   def stop_shard_server(shard_index) do
+    if Backend.waraft?() do
+      {:error, :unsupported_waraft_shard_stop}
+    else
+      stop_legacy_shard_server(shard_index)
+    end
+  end
+
+  defp stop_legacy_shard_server(shard_index) do
     server_id = shard_server_id(shard_index)
 
     case :ra.stop_server(@ra_system, server_id) do

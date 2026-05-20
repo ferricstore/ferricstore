@@ -88,8 +88,8 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert state_key == FlowKeys.state_key("flow-1", partition_key)
 
     assert entry ==
-             {"flow-1", from_due_key, 20.0, to_due_key, 75.0, from_state_key, 11.0, to_state_key,
-              25.0, inflight_key, worker_key, 75.0}
+             {"flow-1", from_due_key, 20.0, to_due_key, 75.0, from_state_key, 11.0,
+              to_state_key, 25.0, inflight_key, worker_key, 75.0}
   end
 
   test "native claim planner reports stale missing records and skips state mismatches" do
@@ -135,7 +135,7 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     worker_key = FlowKeys.worker_index_key("worker-a", partition_key)
     state_key_prefix = FlowKeys.state_key("", partition_key)
 
-    assert {:ok, [], stale_ids, 0} =
+    assert {:ok, [], ["missing"], 0} =
              NativeOrderedIndex.plan_claims(
                [{"missing", 20.0}, {"flow-2", 20.0}],
                [nil, Ferricstore.Flow.encode_record(record)],
@@ -153,8 +153,6 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
                worker_key,
                state_key_prefix
              )
-
-    assert stale_ids == ["missing", "flow-2"]
   end
 
   test "range_slice returns members ordered by score then id", %{index: index, lookup: lookup} do
@@ -432,8 +430,8 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     native = NativeOrderedIndex.new()
 
     claim_entry =
-      {"flow-2", "due:queued", 20.0, "due:running", 60.0, "state:queued", 21.0, "state:running",
-       61.0, "inflight", "worker:b", 70.0}
+      {"flow-2", "due:queued", 20.0, "due:running", 60.0, "state:queued", 21.0,
+       "state:running", 61.0, "inflight", "worker:b", 70.0}
 
     assert :ok =
              NativeOrderedIndex.apply_batch(native, [

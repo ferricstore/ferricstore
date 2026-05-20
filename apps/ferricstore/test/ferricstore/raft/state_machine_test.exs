@@ -257,24 +257,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
   end
 
-  defp assert_blob_backed_entry(state, ets, key, expected_value) do
-    encoded_ref_size = BlobRef.encoded_size()
-
-    assert [{^key, nil, 0, _lfu, file_id, offset, ^encoded_ref_size}] =
-             :ets.lookup(ets, key)
-
-    path =
-      state.shard_data_path
-      |> Path.join("#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
-
-    assert {:ok, encoded_ref} = NIF.v2_pread_at(path, offset)
-    assert {:ok, %BlobRef{size: size} = ref} = BlobRef.decode(encoded_ref)
-    assert size == byte_size(expected_value)
-    assert {:ok, ^expected_value} = BlobStore.get(state.data_dir, state.shard_index, ref)
-
-    {file_id, offset}
-  end
-
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
@@ -625,7 +607,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
                         %{shard_index: ^shard_index, status: :ok}},
                        500
 
-        assert measurements.batch_size == 3
+        assert measurements.batch_size == 6
         assert measurements.delete_count == 0
         assert measurements.batch_bytes > 0
 
@@ -640,7 +622,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       [_, body] =
         Regex.run(
-          ~r/defp flow_apply_claim_batch\(state, due_key, plans, stale_due_ids, restore_due_entries, now_ms\) do(.*?)\n  end\n\n  defp flow_claim_move_indexes/s,
+          ~r/defp flow_apply_claim_batch\(state, due_key, plans, stale_due_ids, now_ms\) do(.*?)\n  end\n\n  defp flow_claim_move_indexes/s,
           source
         )
 
@@ -799,8 +781,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
       Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
       Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
 
-      state = %{state | flow_lmdb_mirror?: true}
-
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
       :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
       :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
@@ -908,8 +888,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
       Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
       Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
       Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
-
-      state = %{state | flow_lmdb_mirror?: true}
 
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
       :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
@@ -1028,8 +1006,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
       Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
       Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
       Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
-
-      state = %{state | flow_lmdb_mirror?: true}
 
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
       :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
@@ -1349,8 +1325,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_state2, :ok} =
         StateMachine.apply(%{}, {:async, node(), {:put, key, new_value, 0}}, state)
 
-      {_file_id, new_offset} = assert_blob_backed_entry(state, ets, key, new_value)
+      assert [{^key, nil, 0, _lfu, 0, new_offset, 70_000}] = :ets.lookup(ets, key)
       refute new_offset == old_offset
+      assert {:ok, ^new_value} = NIF.v2_pread_at(active_file_path, new_offset)
     end
 
     test "does not duplicate an already-applied origin large PUT", %{
@@ -1487,7 +1464,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
         assert expected_size == byte_size(expected)
         assert_receive :state_machine_cold_location_retry_hook, 500
-        {fid, _off} = assert_blob_backed_entry(state, ets, key, expected)
+        assert [{^key, nil, 0, _lfu, fid, off, ^expected_size}] = :ets.lookup(ets, key)
+        assert {:ok, ^expected} = NIF.v2_pread_at(state.active_file_path, off)
         assert fid == state.active_file_id
       after
         Process.delete(:ferricstore_state_machine_cold_location_miss_hook)
@@ -1828,8 +1806,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
         )
 
       assert expected_size == byte_size(expected_value)
-      {_file_id, new_offset} = assert_blob_backed_entry(state, ets, key, expected_value)
+      assert [{^key, nil, 0, _lfu, 0, new_offset, value_size}] = :ets.lookup(ets, key)
+      assert value_size == byte_size(expected_value)
       refute new_offset == old_offset
+      assert {:ok, ^expected_value} = NIF.v2_pread_at(active_file_path, new_offset)
     end
 
     test "replays origin async DELETE when recovery still has an older value", %{
@@ -2487,15 +2467,15 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      encoded_ref_size = BlobRef.encoded_size()
+      value_size = byte_size(large_value)
 
-      assert {:ok, [{"cross_large", offset, ^encoded_ref_size, 0, false}]} =
+      assert {:ok, [{"cross_large", offset, ^value_size, 0, false}]} =
                NIF.v2_scan_file(active_file_path)
 
-      assert [{"cross_large", nil, 0, _, 0, ^offset, ^encoded_ref_size}] =
+      assert [{"cross_large", nil, 0, _, 0, ^offset, ^value_size}] =
                :ets.lookup(ets, "cross_large")
 
-      assert_blob_backed_entry(state, ets, "cross_large", large_value)
+      assert {:ok, ^large_value} = NIF.v2_pread_at(active_file_path, offset)
     end
 
     test "cross-shard dispatched PEXPIRE uses stamped HLC time for relative expiry", %{
@@ -3224,6 +3204,39 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert old_a == :ets.lookup(ets, existing_a)
       assert old_b == :ets.lookup(ets, existing_b)
       assert [] == :ets.lookup(ets, missing)
+    end
+
+    test "compound_put appends one Bitcask record", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      handler_id = {:compound_put_single_append, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :bitcask, :append],
+          &__MODULE__.relay_compound_put_append_telemetry/4,
+          self()
+        )
+
+      redis_key = "compound_single_append_hash"
+      field_key = CompoundKey.hash_field(redis_key, "field")
+
+      try do
+        {_new_state, :ok} =
+          StateMachine.apply(%{}, {:compound_put, field_key, "value", 0}, state)
+
+        assert_receive {:compound_put_append, measurements,
+                        %{shard_index: ^shard_index, status: :ok}},
+                       500
+
+        assert measurements.batch_size == 1
+        assert measurements.delete_count == 0
+        refute_receive {:compound_put_append, _measurements, _metadata}, 100
+      after
+        :telemetry.detach(handler_id)
+      end
     end
 
     test "emits bounded apply and Bitcask append telemetry", %{
@@ -4215,7 +4228,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
     test "RMW command in same batch reads prior pending large put", %{
       state: state,
-      ets: ets
+      ets: ets,
+      active_file_path: active_file_path
     } do
       key = "batch_large_then_append"
       large = String.duplicate("L", 70_000)
@@ -4227,7 +4241,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert results == [:ok, {:ok, byte_size(expected)}]
       assert new_state.applied_count == 2
 
-      assert_blob_backed_entry(state, ets, key, expected)
+      assert [{^key, nil, 0, _, 0, offset, value_size}] = :ets.lookup(ets, key)
+      assert value_size == byte_size(expected)
+      assert {:ok, ^expected} = NIF.v2_pread_at(active_file_path, offset)
     end
 
     test "probabilistic command in batch does not drop earlier pending puts", %{
@@ -5844,6 +5860,60 @@ defmodule Ferricstore.Raft.StateMachineTest do
                     %{request: ^request, reason: :keydir_unavailable, source: :raft_apply}}
   end
 
+  test "SPOP removes the type marker when the final set member is popped", %{
+    state: state,
+    ets: ets
+  } do
+    key = "spop:type-marker"
+    type_key = CompoundKey.type_key(key)
+    member_key = CompoundKey.set_member(key, "only")
+
+    :ets.insert(ets, {
+      type_key,
+      CompoundKey.encode_type(:set),
+      0,
+      LFU.initial(),
+      0,
+      0,
+      byte_size("set")
+    })
+
+    :ets.insert(ets, {member_key, "1", 0, LFU.initial(), 0, 0, 1})
+
+    result = apply_result_value(StateMachine.apply(%{index: 1}, {:spop, key, 1}, state))
+
+    assert result == ["only"]
+    assert [] == :ets.lookup(ets, member_key)
+    assert [] == :ets.lookup(ets, type_key)
+  end
+
+  test "ZPOPMIN removes the type marker when the final zset member is popped", %{
+    state: state,
+    ets: ets
+  } do
+    key = "zpop:type-marker"
+    type_key = CompoundKey.type_key(key)
+    member_key = CompoundKey.zset_member(key, "only")
+
+    :ets.insert(ets, {
+      type_key,
+      CompoundKey.encode_type(:zset),
+      0,
+      LFU.initial(),
+      0,
+      0,
+      byte_size("zset")
+    })
+
+    :ets.insert(ets, {member_key, "1.0", 0, LFU.initial(), 0, 0, byte_size("1.0")})
+
+    result = apply_result_value(StateMachine.apply(%{index: 1}, {:zpop, key, 1, :min}, state))
+
+    assert result == ["only", "1.0"]
+    assert [] == :ets.lookup(ets, member_key)
+    assert [] == :ets.lookup(ets, type_key)
+  end
+
   test "standalone sync append reports NIF errors instead of raising case clauses" do
     missing_path =
       Path.join(
@@ -5857,5 +5927,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
              ])
 
     assert reason != %CaseClauseError{}
+  end
+
+  def relay_compound_put_append_telemetry(_event, measurements, metadata, test_pid) do
+    send(test_pid, {:compound_put_append, measurements, metadata})
   end
 end

@@ -33,8 +33,13 @@ defmodule Ferricstore.Commands.Server do
 
   alias Ferricstore.AuditLog
   alias Ferricstore.Commands.Catalog
+  alias Ferricstore.Raft.Backend, as: RaftBackend
+  alias Ferricstore.Raft.Cluster, as: RaftCluster
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
   alias Ferricstore.Stats
+
+  @waraft_table :ferricstore_waraft_backend
 
   @doc """
   Handles a server command.
@@ -292,48 +297,7 @@ defmodule Ferricstore.Commands.Server do
         ctx = FerricStore.Instance.get(:default)
         shard_count = ctx.shard_count
 
-        batcher_parts =
-          for i <- 0..(shard_count - 1) do
-            name = :"Ferricstore.Raft.Batcher.#{i}"
-
-            case Process.whereis(name) do
-              nil ->
-                "B#{i}=down"
-
-              pid ->
-                info = Process.info(pid, [:message_queue_len, :reductions])
-                "B#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-            end
-          end
-
-        wal_name = :ra_ferricstore_raft_log_wal
-
-        wal_part =
-          case Process.whereis(wal_name) do
-            nil ->
-              "WAL=down"
-
-            pid ->
-              info = Process.info(pid, [:message_queue_len, :reductions])
-              "WAL:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-          end
-
-        ra_parts =
-          for i <- 0..(shard_count - 1) do
-            name = :"ferricstore_shard_#{i}"
-
-            case Process.whereis(name) do
-              nil ->
-                "R#{i}=down"
-
-              pid ->
-                info = Process.info(pid, [:message_queue_len, :reductions])
-                "R#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-            end
-          end
-
-        all = batcher_parts ++ [wal_part] ++ ra_parts
-        {:simple, Enum.join(all, " | ")}
+        {:simple, debug_batcher_stats(shard_count)}
 
       "SET-ACTIVE-EXPIRE" when length(rest) == 1 ->
         :ok
@@ -491,6 +455,96 @@ defmodule Ferricstore.Commands.Server do
   # ===========================================================================
 
   # ---------------------------------------------------------------------------
+  # DEBUG helpers
+  # ---------------------------------------------------------------------------
+
+  defp debug_batcher_stats(shard_count) do
+    if RaftBackend.waraft?() do
+      debug_waraft_stats(shard_count)
+    else
+      debug_legacy_batcher_stats(shard_count)
+    end
+  end
+
+  defp debug_legacy_batcher_stats(shard_count) do
+    if shard_count <= 0 do
+      ""
+    else
+      batcher_parts =
+        for i <- 0..(shard_count - 1) do
+          name = :"Ferricstore.Raft.Batcher.#{i}"
+
+          legacy_process_stat("B#{i}", name)
+        end
+
+      wal_name = :ra_ferricstore_raft_log_wal
+      wal_part = legacy_process_stat("WAL", wal_name)
+
+      ra_parts =
+        for i <- 0..(shard_count - 1) do
+          name = :"ferricstore_shard_#{i}"
+
+          legacy_process_stat("R#{i}", name)
+        end
+
+      all = batcher_parts ++ [wal_part] ++ ra_parts
+      Enum.join(all, " | ")
+    end
+  end
+
+  defp debug_waraft_stats(shard_count) do
+    if shard_count <= 0 do
+      ""
+    else
+      0..(shard_count - 1)
+      |> Enum.map(&debug_waraft_shard_stats/1)
+      |> Enum.join(" | ")
+    end
+  end
+
+  defp debug_waraft_shard_stats(shard_index) do
+    partition = shard_index + 1
+
+    components = [
+      {"server", :wa_raft_server.registered_name(@waraft_table, partition)},
+      {"acceptor", :wa_raft_acceptor.registered_name(@waraft_table, partition)},
+      {"queue", :wa_raft_queue.registered_name(@waraft_table, partition)},
+      {"storage", :wa_raft_storage.registered_name(@waraft_table, partition)}
+    ]
+
+    body =
+      components
+      |> Enum.map(fn {label, name} -> "#{label}=#{component_process_stat(name)}" end)
+      |> Kernel.++(["inflight_bytes=#{WARaftBackend.inflight_commit_bytes(shard_index)}"])
+      |> Enum.join(",")
+
+    "WA#{shard_index}:#{body}"
+  end
+
+  defp legacy_process_stat(label, name) do
+    case process_stat(name) do
+      :down -> "#{label}=down"
+      {mq, reductions} -> "#{label}:mq=#{mq},r=#{reductions}"
+    end
+  end
+
+  defp component_process_stat(name) do
+    case process_stat(name) do
+      :down -> "down"
+      {mq, reductions} -> "mq=#{mq},r=#{reductions}"
+    end
+  end
+
+  defp process_stat(name) do
+    with pid when is_pid(pid) <- Process.whereis(name),
+         info when is_list(info) <- Process.info(pid, [:message_queue_len, :reductions]) do
+      {Keyword.get(info, :message_queue_len, 0), Keyword.get(info, :reductions, 0)}
+    else
+      _ -> :down
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # SAVE helpers
   # ---------------------------------------------------------------------------
 
@@ -531,13 +585,17 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp flush_raft_batchers(%{name: :default, shard_count: shard_count}) do
-    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
-      case Ferricstore.Raft.Batcher.flush(i, 30_000) do
-        :ok -> {:cont, :ok}
-        {:error, _} = err -> {:halt, err}
-        other -> {:halt, {:error, {:batcher_flush_failed, i, other}}}
-      end
-    end)
+    if RaftBackend.waraft?() do
+      :ok
+    else
+      Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+        case Ferricstore.Raft.Batcher.flush(i, 30_000) do
+          :ok -> {:cont, :ok}
+          {:error, _} = err -> {:halt, err}
+          other -> {:halt, {:error, {:batcher_flush_failed, i, other}}}
+        end
+      end)
+    end
   end
 
   defp flush_raft_batchers(_ctx), do: :ok
@@ -882,23 +940,14 @@ defmodule Ferricstore.Commands.Server do
 
     fields =
       Enum.flat_map(0..(shard_count - 1), fn i ->
-        shard_id = {:"ferricstore_shard_#{i}", node()}
-
         try do
-          case :ra.members(shard_id) do
+          case RaftCluster.members(i, 1_000) do
             {:ok, _members, leader} ->
-              # Get counters from ra_counters
-              counters =
-                try do
-                  :ra_counters.overview(shard_id)
-                rescue
-                  _ -> %{}
-                catch
-                  _, _ -> %{}
-                end
+              local_id = local_raft_member_id(i)
+              {commit_index, last_applied, current_term} = raft_section_counters(i, local_id)
 
               role =
-                if leader == shard_id do
+                if leader == local_id do
                   "leader"
                 else
                   "follower"
@@ -910,17 +959,13 @@ defmodule Ferricstore.Commands.Server do
                   _ -> "unknown"
                 end
 
-              commit_index = Map.get(counters, :commit_index, 0)
-              last_applied = Map.get(counters, :last_applied, 0)
-              current_term = Map.get(counters, :term, 0)
-
               [
                 {"shard_#{i}_role", role},
                 {"shard_#{i}_current_term", Integer.to_string(current_term)},
                 {"shard_#{i}_commit_index", Integer.to_string(commit_index)},
                 {"shard_#{i}_last_applied", Integer.to_string(last_applied)},
                 {"shard_#{i}_leader_node", leader_node_str}
-              ]
+              ] ++ waraft_info_fields(i)
 
             _ ->
               [
@@ -929,7 +974,7 @@ defmodule Ferricstore.Commands.Server do
                 {"shard_#{i}_commit_index", "0"},
                 {"shard_#{i}_last_applied", "0"},
                 {"shard_#{i}_leader_node", "unknown"}
-              ]
+              ] ++ waraft_info_fields(i)
           end
         rescue
           _ ->
@@ -939,7 +984,7 @@ defmodule Ferricstore.Commands.Server do
               {"shard_#{i}_commit_index", "0"},
               {"shard_#{i}_last_applied", "0"},
               {"shard_#{i}_leader_node", "unknown"}
-            ]
+            ] ++ waraft_info_fields(i)
         catch
           _, _ ->
             [
@@ -948,7 +993,7 @@ defmodule Ferricstore.Commands.Server do
               {"shard_#{i}_commit_index", "0"},
               {"shard_#{i}_last_applied", "0"},
               {"shard_#{i}_leader_node", "unknown"}
-            ]
+            ] ++ waraft_info_fields(i)
         end
       end)
 
@@ -1096,16 +1141,8 @@ defmodule Ferricstore.Commands.Server do
 
     raft_committed =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
-        shard_id = {:"ferricstore_shard_#{i}", node()}
-
-        try do
-          counters = :ra_counters.overview(shard_id)
-          acc + Map.get(counters, :last_applied, 0)
-        rescue
-          _ -> acc
-        catch
-          _, _ -> acc
-        end
+        {_commit_index, last_applied, _term} = raft_section_counters(i, local_raft_member_id(i))
+        acc + last_applied
       end)
 
     hot_cache_evictions =
@@ -1183,6 +1220,63 @@ defmodule Ferricstore.Commands.Server do
     fields = [{"distinct_prefixes", Integer.to_string(distinct_prefixes)} | prefix_fields]
 
     format_section("Keydir_Analysis", fields)
+  end
+
+  defp waraft_info_fields(shard_index) do
+    if RaftBackend.waraft?() do
+      [
+        {"shard_#{shard_index}_waraft_inflight_commit_bytes",
+         Integer.to_string(WARaftBackend.inflight_commit_bytes(shard_index))}
+      ]
+    else
+      []
+    end
+  end
+
+  defp local_raft_member_id(shard_index) do
+    if RaftBackend.waraft?() do
+      {:"raft_server_ferricstore_waraft_backend_#{shard_index + 1}", node()}
+    else
+      RaftCluster.shard_server_id(shard_index)
+    end
+  end
+
+  defp raft_section_counters(shard_index, local_id) do
+    if RaftBackend.waraft?() do
+      waraft_section_counters(shard_index)
+    else
+      legacy_raft_section_counters(local_id)
+    end
+  end
+
+  defp legacy_raft_section_counters(local_id) do
+    counters =
+      try do
+        :ra_counters.overview(local_id)
+      rescue
+        _ -> %{}
+      catch
+        _, _ -> %{}
+      end
+
+    {
+      Map.get(counters, :commit_index, 0),
+      Map.get(counters, :last_applied, 0),
+      Map.get(counters, :term, 0)
+    }
+  end
+
+  defp waraft_section_counters(shard_index) do
+    {last_applied, term_from_position} =
+      case WARaftBackend.storage_position(shard_index) do
+        {:ok, {:raft_log_pos, index, term}} when is_integer(index) and is_integer(term) ->
+          {index, term}
+
+        _other ->
+          {0, 0}
+      end
+
+    {last_applied, last_applied, term_from_position}
   end
 
   defp emit_info_bitcask_scan_failed(phase, shard_index, path, reason) do

@@ -408,7 +408,8 @@ defmodule Ferricstore.MetricsTest do
         "ferricstore_bitcask_pending_release_cursor_checkpoint_count",
         "ferricstore_bitcask_release_cursor_blocked_apply_count",
         "ferricstore_bitcask_checkpoint_dirty",
-        "ferricstore_bitcask_checkpoint_in_flight"
+        "ferricstore_bitcask_checkpoint_in_flight",
+        "ferricstore_waraft_inflight_commit_bytes"
       ]
 
       for metric <- expected_metrics do

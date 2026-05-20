@@ -49,8 +49,9 @@ defmodule Ferricstore.Store.Shard do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
-  alias Ferricstore.Store.BlobValue
+  alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
@@ -269,7 +270,8 @@ defmodule Ferricstore.Store.Shard do
       # Only the default application instance owns Raft. Custom embedded shards
       # run local/direct, and direct shard tests pass non-default instance_ctx.
       raft? =
-        if ctx && ctx.name == :default && Ferricstore.ReplicationMode.raft?() do
+        if ctx && ctx.name == :default && Ferricstore.ReplicationMode.raft?() &&
+             Ferricstore.Raft.Backend.selected() == :ra do
           profile_startup_phase(index, :start_raft, fn ->
             ShardLifecycle.start_raft_if_available(
               index,
@@ -561,9 +563,11 @@ defmodule Ferricstore.Store.Shard do
   # Delete all entries matching a compound key prefix.
   # Uses :ets.select match spec instead of :ets.foldl full-table scan.
   def handle_call({:delete_prefix, prefix}, _from, state) do
-    prefix
-    |> ShardWrites.handle_delete_prefix(state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:delete_prefix, prefix}, state, fn ->
+      prefix
+      |> ShardWrites.handle_delete_prefix(state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:put, _key, _value, _expire_at_ms}, _from, %{writes_paused: true} = state) do
@@ -576,12 +580,16 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:standalone_commit, command}, from, state) do
-    state =
-      state
-      |> enqueue_standalone_commit(from, command)
-      |> maybe_flush_full_standalone_batch()
+    if default_waraft_write_state?(state) do
+      reply_default_waraft_write(command, state)
+    else
+      state =
+        state
+        |> enqueue_standalone_commit(from, command)
+        |> maybe_flush_full_standalone_batch()
 
-    {:noreply, state}
+      {:noreply, state}
+    end
   end
 
   def handle_call(:standalone_cross_shard_barrier_acquire, _from, state) do
@@ -635,34 +643,39 @@ defmodule Ferricstore.Store.Shard do
         _from,
         state
       ) do
-    state = drain_standalone_commits_for_sync(state)
+    if default_waraft_write_state?(state) do
+      reply_default_waraft_write(command, state)
+    else
+      state = drain_standalone_commits_for_sync(state)
 
-    cond do
-      state.writes_paused ->
-        {:reply, {:error, {:standalone_durability_failed, :prior_standalone_write_failed}}, state}
+      cond do
+        state.writes_paused ->
+          {:reply, {:error, {:standalone_durability_failed, :prior_standalone_write_failed}},
+           state}
 
-      state.last_flush_error != nil ->
-        {:reply, {:error, {:standalone_durability_failed, state.last_flush_error}},
-         %{state | writes_paused: true}}
+        state.last_flush_error != nil ->
+          {:reply, {:error, {:standalone_durability_failed, state.last_flush_error}},
+           %{state | writes_paused: true}}
 
-      true ->
-        sm_state = direct_sm_state(state)
+        true ->
+          sm_state = direct_sm_state(state)
 
-        case run_standalone_command(command, sm_state) do
-          {:ok, new_sm_state, result} ->
-            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+          case run_standalone_command(command, sm_state) do
+            {:ok, new_sm_state, result} ->
+              {:reply, result, apply_direct_sm_state(state, new_sm_state)}
 
-          {:error, new_sm_state, reason} ->
-            state =
-              if new_sm_state do
-                apply_direct_sm_state(state, new_sm_state)
-              else
-                state
-              end
+            {:error, new_sm_state, reason} ->
+              state =
+                if new_sm_state do
+                  apply_direct_sm_state(state, new_sm_state)
+                else
+                  state
+                end
 
-            {:reply, {:error, {:standalone_durability_failed, reason}},
-             %{state | writes_paused: true}}
-        end
+              {:reply, {:error, {:standalone_durability_failed, reason}},
+               %{state | writes_paused: true}}
+          end
+      end
     end
   end
 
@@ -694,7 +707,11 @@ defmodule Ferricstore.Store.Shard do
     Process.put(:ferricstore_forward_origin, origin_node)
 
     try do
-      handle_forwarded_quorum(command, forwarded_from, state)
+      if default_waraft_write_state?(state) do
+        reply_default_waraft_write(command, state)
+      else
+        handle_forwarded_quorum(command, forwarded_from, state)
+      end
     after
       if previous_origin == nil do
         Process.delete(:ferricstore_forward_origin)
@@ -705,70 +722,88 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:put, key, value, expire_at_ms}, from, state) do
-    key
-    |> ShardWrites.handle_put(value, expire_at_ms, from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:put, key, value, expire_at_ms}, state, fn ->
+      key
+      |> ShardWrites.handle_put(value, expire_at_ms, from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Atomic increment: reads current value, parses as integer, adds delta, writes back.
   # Returns {:ok, new_integer} or {:error, reason}.
   def handle_call({:incr, key, delta}, from, state) do
-    key
-    |> ShardWrites.handle_incr(delta, from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:incr, key, delta}, state, fn ->
+      key
+      |> ShardWrites.handle_incr(delta, from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Atomic float increment: reads current value, parses as float, adds delta, writes back.
   # Returns {:ok, new_float_string} or {:error, reason}.
   def handle_call({:incr_float, key, delta}, from, state) do
-    key
-    |> ShardWrites.handle_incr_float(delta, from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:incr_float, key, delta}, state, fn ->
+      key
+      |> ShardWrites.handle_incr_float(delta, from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Atomic append: reads current value (or ""), appends suffix, writes back.
   # Returns {:ok, new_byte_length}.
   def handle_call({:append, key, suffix}, from, state) do
-    key
-    |> ShardWrites.handle_append(suffix, from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:append, key, suffix}, state, fn ->
+      key
+      |> ShardWrites.handle_append(suffix, from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Atomic get-and-set: returns old value (or nil), sets new value.
   def handle_call({:getset, key, new_value}, from, state) do
-    key
-    |> ShardWrites.handle_getset(new_value, from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:getset, key, new_value}, state, fn ->
+      key
+      |> ShardWrites.handle_getset(new_value, from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Atomic get-and-delete: returns value (or nil), deletes key.
   def handle_call({:getdel, key}, from, state) do
-    key
-    |> ShardWrites.handle_getdel(from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:getdel, key}, state, fn ->
+      key
+      |> ShardWrites.handle_getdel(from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Atomic get-and-update-expiry: returns value, updates TTL.
   # expire_at_ms = 0 means PERSIST (remove expiry).
   def handle_call({:getex, key, expire_at_ms}, from, state) do
-    key
-    |> ShardWrites.handle_getex(expire_at_ms, from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:getex, key, expire_at_ms}, state, fn ->
+      key
+      |> ShardWrites.handle_getex(expire_at_ms, from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Atomic set-range: overwrites portion of string at offset with value.
   # Zero-pads if key doesn't exist or string is shorter than offset.
   # Returns {:ok, new_byte_length}.
   def handle_call({:setrange, key, offset, value}, from, state) do
-    key
-    |> ShardWrites.handle_setrange(offset, value, from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:setrange, key, offset, value}, state, fn ->
+      key
+      |> ShardWrites.handle_setrange(offset, value, from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:delete, key}, from, state) do
-    key
-    |> ShardWrites.handle_delete(from, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:delete, key}, state, fn ->
+      key
+      |> ShardWrites.handle_delete(from, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # -------------------------------------------------------------------
@@ -792,35 +827,59 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:compound_put, redis_key, compound_key, value, expire_at_ms}, _from, state) do
-    redis_key
-    |> ShardCompound.handle_compound_put(compound_key, value, expire_at_ms, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write(
+      {:compound_put, redis_key, compound_key, value, expire_at_ms},
+      state,
+      fn ->
+        redis_key
+        |> ShardCompound.handle_compound_put(compound_key, value, expire_at_ms, state)
+        |> track_write_version_result(state)
+      end
+    )
   end
 
   def handle_call({:compound_batch_put, redis_key, entries}, _from, state) do
-    redis_key
-    |> ShardCompound.handle_compound_batch_put(entries, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:compound_batch_put, redis_key, entries}, state, fn ->
+      redis_key
+      |> ShardCompound.handle_compound_batch_put(entries, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:compound_delete, redis_key, compound_key}, _from, state) do
-    redis_key
-    |> ShardCompound.handle_compound_delete(compound_key, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:compound_delete, redis_key, compound_key}, state, fn ->
+      redis_key
+      |> ShardCompound.handle_compound_delete(compound_key, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:compound_batch_delete, redis_key, compound_keys}, _from, state) do
-    redis_key
-    |> ShardCompound.handle_compound_batch_delete(compound_keys, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write(
+      {:compound_batch_delete, redis_key, compound_keys},
+      state,
+      fn ->
+        redis_key
+        |> ShardCompound.handle_compound_batch_delete(compound_keys, state)
+        |> track_write_version_result(state)
+      end
+    )
+  end
+
+  def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
+    maybe_route_default_waraft_write({:compound_delete_prefix, redis_key, prefix}, state, fn ->
+      redis_key
+      |> ShardCompound.handle_compound_delete_prefix(prefix, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:compound_scan, redis_key, prefix}, _from, state) do
     ShardCompound.handle_compound_scan(redis_key, prefix, state)
   end
 
-  def handle_call({:compound_scan, redis_key, prefix, limit}, _from, state) do
-    ShardCompound.handle_compound_scan(redis_key, prefix, state, limit)
+  def handle_call({:compound_fields, redis_key, prefix}, _from, state) do
+    ShardCompound.handle_compound_fields(redis_key, prefix, state)
   end
 
   def handle_call({:compound_count, redis_key, prefix}, _from, state) do
@@ -980,90 +1039,48 @@ defmodule Ferricstore.Store.Shard do
     {:reply, reply, state}
   end
 
-  defp native_flow_index_for_count_many(_state, []), do: :not_native_or_mixed
-
-  defp native_flow_index_for_count_many(state, keys) do
-    case native_flow_index_for_read(state, hd(keys)) do
-      :not_native ->
-        :not_native_or_mixed
-
-      :unavailable ->
-        :unavailable
-
-      {:ok, native} ->
-        Enum.reduce_while(keys, {:ok, native}, fn key, {:ok, first_native} ->
-          case native_flow_index_for_read(state, key) do
-            {:ok, ^first_native} -> {:cont, {:ok, first_native}}
-            :unavailable -> {:halt, :unavailable}
-            _other -> {:halt, :not_native_or_mixed}
-          end
-        end)
-        |> case do
-          {:ok, native} -> {:ok, native}
-          :unavailable -> :unavailable
-          :not_native_or_mixed -> :not_native_or_mixed
-        end
-    end
-  end
-
-  defp native_flow_index_for_read(state, key) do
-    if native_flow_lifecycle_index_key?(key) do
-      case NativeFlowIndex.get(state.flow_index, state.flow_lookup) do
-        nil -> :unavailable
-        native -> {:ok, native}
-      end
-    else
-      :not_native
-    end
-  end
-
-  defp native_flow_lifecycle_index_key?(key) when is_binary(key) do
-    :binary.match(key, "}:d:") != :nomatch or
-      :binary.match(key, "}:i:s:") != :nomatch or
-      :binary.match(key, "}:i:r:") != :nomatch or
-      :binary.match(key, "}:i:w:") != :nomatch
-  end
-
-  defp native_flow_lifecycle_index_key?(_key), do: false
-
-  def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
-    redis_key
-    |> ShardCompound.handle_compound_delete_prefix(prefix, state)
-    |> track_write_version_result(state)
-  end
-
   # -------------------------------------------------------------------
   # handle_call — native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD
   # -------------------------------------------------------------------
 
   def handle_call({:cas, key, expected, new_value, ttl_ms}, _from, state) do
-    key
-    |> ShardNativeOps.handle_cas(expected, new_value, ttl_ms, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:cas, key, expected, new_value, ttl_ms}, state, fn ->
+      key
+      |> ShardNativeOps.handle_cas(expected, new_value, ttl_ms, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:lock, key, owner, ttl_ms}, _from, state) do
-    key
-    |> ShardNativeOps.handle_lock(owner, ttl_ms, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:lock, key, owner, ttl_ms}, state, fn ->
+      key
+      |> ShardNativeOps.handle_lock(owner, ttl_ms, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:unlock, key, owner}, _from, state) do
-    key
-    |> ShardNativeOps.handle_unlock(owner, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:unlock, key, owner}, state, fn ->
+      key
+      |> ShardNativeOps.handle_unlock(owner, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:extend, key, owner, ttl_ms}, _from, state) do
-    key
-    |> ShardNativeOps.handle_extend(owner, ttl_ms, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:extend, key, owner, ttl_ms}, state, fn ->
+      key
+      |> ShardNativeOps.handle_extend(owner, ttl_ms, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:ratelimit_add, key, window_ms, max, count}, _from, state) do
-    key
-    |> ShardNativeOps.handle_ratelimit_add(window_ms, max, count, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:ratelimit_add, key, window_ms, max, count}, state, fn ->
+      key
+      |> ShardNativeOps.handle_ratelimit_add(window_ms, max, count, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # 6-tuple variant: includes pre-computed now_ms from Router.raft_write.
@@ -1072,9 +1089,15 @@ defmodule Ferricstore.Store.Shard do
   # only and other nodes never see the increment. Falls back to direct in
   # non-Raft mode.
   def handle_call({:ratelimit_add, key, window_ms, max, count, _now_ms}, _from, state) do
-    key
-    |> ShardNativeOps.handle_ratelimit_add(window_ms, max, count, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write(
+      {:ratelimit_add, key, window_ms, max, count},
+      state,
+      fn ->
+        key
+        |> ShardNativeOps.handle_ratelimit_add(window_ms, max, count, state)
+        |> track_write_version_result(state)
+      end
+    )
   end
 
   # -------------------------------------------------------------------
@@ -1082,15 +1105,23 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   def handle_call({:list_op, key, operation}, _from, state) do
-    key
-    |> ShardNativeOps.handle_list_op(operation, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:list_op, key, operation}, state, fn ->
+      key
+      |> ShardNativeOps.handle_list_op(operation, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   def handle_call({:list_op_lmove, src_key, dst_key, from_dir, to_dir}, _from, state) do
-    src_key
-    |> ShardNativeOps.handle_list_op_lmove(dst_key, from_dir, to_dir, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write(
+      {:list_op_lmove, src_key, dst_key, from_dir, to_dir},
+      state,
+      fn ->
+        src_key
+        |> ShardNativeOps.handle_list_op_lmove(dst_key, from_dir, to_dir, state)
+        |> track_write_version_result(state)
+      end
+    )
   end
 
   # -------------------------------------------------------------------
@@ -1098,9 +1129,11 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   def handle_call({:tx_execute, queue, sandbox_namespace}, _from, state) do
-    queue
-    |> ShardTransaction.handle_tx_execute(sandbox_namespace, state)
-    |> track_write_version_result(state)
+    maybe_route_default_waraft_write({:tx_execute, queue, sandbox_namespace}, state, fn ->
+      queue
+      |> ShardTransaction.handle_tx_execute(sandbox_namespace, state)
+      |> track_write_version_result(state)
+    end)
   end
 
   # Check if a redis_key has been promoted to dedicated storage.
@@ -1470,23 +1503,74 @@ defmodule Ferricstore.Store.Shard do
   # raft_apply_hook, etc.). Routes through Batcher → Raft when Raft is
   # enabled, or directly to state machine when Raft is disabled.
   def handle_call(command, from, state) when is_tuple(command) do
-    if state.raft? do
-      # Forward through Batcher for Raft consensus, same as put/delete.
-      Ferricstore.Raft.Batcher.write_async(state.index, command, from)
-      {:noreply, state}
-    else
-      # No Raft — apply directly via state machine.
-      sm_state = direct_sm_state(state)
+    cond do
+      default_waraft_write_state?(state) ->
+        reply_default_waraft_write(command, state)
 
-      case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do
-        {new_sm_state, result} ->
-          {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+      state.raft? ->
+        # Forward through Batcher for Raft consensus, same as put/delete.
+        Ferricstore.Raft.Batcher.write_async(state.index, command, from)
+        {:noreply, state}
 
-        {new_sm_state, result, _effects} ->
-          {:reply, result, apply_direct_sm_state(state, new_sm_state)}
-      end
+      true ->
+        # No Raft — apply directly via state machine.
+        sm_state = direct_sm_state(state)
+
+        case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do
+          {new_sm_state, result} ->
+            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+
+          {new_sm_state, result, _effects} ->
+            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+        end
     end
   end
+
+  defp native_flow_index_for_count_many(_state, []), do: :not_native_or_mixed
+
+  defp native_flow_index_for_count_many(state, keys) do
+    case native_flow_index_for_read(state, hd(keys)) do
+      :not_native ->
+        :not_native_or_mixed
+
+      :unavailable ->
+        :unavailable
+
+      {:ok, native} ->
+        Enum.reduce_while(keys, {:ok, native}, fn key, {:ok, first_native} ->
+          case native_flow_index_for_read(state, key) do
+            {:ok, ^first_native} -> {:cont, {:ok, first_native}}
+            :unavailable -> {:halt, :unavailable}
+            _other -> {:halt, :not_native_or_mixed}
+          end
+        end)
+        |> case do
+          {:ok, native} -> {:ok, native}
+          :unavailable -> :unavailable
+          :not_native_or_mixed -> :not_native_or_mixed
+        end
+    end
+  end
+
+  defp native_flow_index_for_read(state, key) do
+    if native_flow_lifecycle_index_key?(key) do
+      case NativeFlowIndex.get(state.flow_index, state.flow_lookup) do
+        nil -> :unavailable
+        native -> {:ok, native}
+      end
+    else
+      :not_native
+    end
+  end
+
+  defp native_flow_lifecycle_index_key?(key) when is_binary(key) do
+    :binary.match(key, "}:d:") != :nomatch or
+      :binary.match(key, "}:i:s:") != :nomatch or
+      :binary.match(key, "}:i:r:") != :nomatch or
+      :binary.match(key, "}:i:w:") != :nomatch
+  end
+
+  defp native_flow_lifecycle_index_key?(_key), do: false
 
   defp maybe_emit_compaction_crc_mismatch(state, fid, source, dest, reason) do
     if compaction_crc_mismatch?(reason) do
@@ -2062,6 +2146,38 @@ defmodule Ferricstore.Store.Shard do
     right_keys = standalone_command_keys(right)
 
     standalone_entry_conflicts?({nil, left, left_keys}, right_keys)
+  end
+
+  defp maybe_route_default_waraft_write(command, state, local_fun) do
+    if default_waraft_write_state?(state) do
+      reply_default_waraft_write(command, state)
+    else
+      local_fun.()
+    end
+  end
+
+  defp default_waraft_write_state?(%{instance_ctx: %{name: :default}}), do: RaftBackend.waraft?()
+  defp default_waraft_write_state?(_state), do: false
+
+  defp reply_default_waraft_write(command, state) do
+    result =
+      case command do
+        {:batch, commands} when is_list(commands) ->
+          RaftBackend.write_batch(state.index, commands)
+
+        _other ->
+          RaftBackend.write(state.index, command)
+      end
+
+    case result do
+      {:error, _reason} ->
+        {:reply, result, state}
+
+      _ok ->
+        new_state = %{state | write_version: state.write_version + 1}
+        bump_shared_write_version(new_state, 1)
+        {:reply, result, new_state}
+    end
   end
 
   defp shared_write_version(%{instance_ctx: %{write_version: write_version}, index: index}) do
@@ -2767,7 +2883,7 @@ defmodule Ferricstore.Store.Shard do
             # Simple GET cold-read completion. Warm only if the ETS entry still
             # points at the same disk location read by this request.
             if value != nil do
-              case materialize_blob_read_value(state, value) do
+              case materialize_pending_cold_value(state, value) do
                 {:ok, materialized} ->
                   ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
                   GenServer.reply(from, materialized)
@@ -2792,7 +2908,7 @@ defmodule Ferricstore.Store.Shard do
             # GET_META cold-read completion. The reply may linearize before a
             # later overwrite, but ETS warming must still be location-checked.
             if value != nil do
-              case materialize_blob_read_value(state, value) do
+              case materialize_pending_cold_value(state, value) do
                 {:ok, materialized} ->
                   ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
                   GenServer.reply(from, {materialized, exp})
@@ -2884,13 +3000,6 @@ defmodule Ferricstore.Store.Shard do
     {:noreply, state}
   end
 
-  defp materialize_blob_read_value(%{data_dir: data_dir, index: shard_index} = state, value) do
-    BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
-  end
-
-  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
-  defp blob_side_channel_threshold(_state), do: 0
-
   defp pop_pending_read(pending_reads, corr_id, timer_action) do
     case Map.pop(pending_reads, corr_id) do
       {{:pending_read, entry, timer_ref}, rest_pending} ->
@@ -2908,6 +3017,17 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp maybe_cancel_pending_timer(_timer_action, _timer_ref), do: :ok
+
+  defp materialize_pending_cold_value(%{data_dir: data_dir, index: shard_index} = state, value) do
+    BlobValue.maybe_materialize(
+      data_dir,
+      shard_index,
+      BlobValue.threshold(Map.get(state, :instance_ctx)),
+      value
+    )
+  end
+
+  defp materialize_pending_cold_value(_state, value), do: {:ok, value}
 
   defp emit_pending_read_error(state, {_from, _key, _exp, fid, _off, _vsize}, reason) do
     emit_pending_read_error_for_fid(state, fid, reason)

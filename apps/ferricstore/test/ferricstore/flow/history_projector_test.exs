@@ -5,11 +5,6 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Flow.OrderedIndex
 
-  test "name falls back to default for checkpoint-only instance maps" do
-    assert HistoryProjector.name(%{checkpoint_flags: :atomics.new(1, signed: false)}, 0) ==
-             HistoryProjector.name(nil, 0)
-  end
-
   test "sync projection writes dedicated history log, updates index, and advances watermark" do
     unique = System.unique_integer([:positive])
     instance_name = :"history_projector_test_#{unique}"

@@ -331,6 +331,22 @@ defmodule Ferricstore.Store.CompoundKey do
     "X:" <> redis_key <> @separator
   end
 
+  @doc """
+  Builds the durable consumer-group metadata key for a stream group.
+  """
+  @spec stream_group(binary(), binary()) :: binary()
+  def stream_group(redis_key, group) do
+    "XG:" <> redis_key <> @separator <> group
+  end
+
+  @doc """
+  Returns the scan prefix for all durable consumer-group metadata of a stream.
+  """
+  @spec stream_group_prefix(binary()) :: binary()
+  def stream_group_prefix(redis_key) do
+    "XG:" <> redis_key <> @separator
+  end
+
   # -------------------------------------------------------------------
   # Extraction helpers
   # -------------------------------------------------------------------

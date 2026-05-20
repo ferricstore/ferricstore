@@ -26,6 +26,7 @@ defmodule Ferricstore.Metrics do
   | `ferricstore_slowlog_entries`            | gauge   | `SlowLog.len/0`              |
   | `ferricstore_namespace_window_ms`        | gauge   | `NamespaceConfig.get_all/0`   |
   | `ferricstore_bitcask_*`                  | gauge   | per-shard checkpoint atomics  |
+  | `ferricstore_waraft_inflight_commit_bytes` | gauge | WARaft byte admission counters |
   | `ferricstore_prefix_*`                   | mixed   | `PrefixMetricsCache`          |
   | `ferricstore_quorum_*`                   | counter | `QuorumMetrics` telemetry     |
   | `ferricstore_flow_lmdb_*`                | gauge   | per-shard projection atomics  |
@@ -40,6 +41,7 @@ defmodule Ferricstore.Metrics do
   """
 
   alias Ferricstore.Stats
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.BlobStore
 
   @type metric_type :: :counter | :gauge
@@ -375,6 +377,11 @@ defmodule Ferricstore.Metrics do
         "ferricstore_bitcask_checkpoint_in_flight",
         "Whether a Bitcask fsync checkpoint is currently in flight",
         fn shard -> atomic_metric(ctx, :checkpoint_in_flight, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_waraft_inflight_commit_bytes",
+        "WARaft commit bytes currently admitted and awaiting reply per shard",
+        fn shard -> WARaftBackend.inflight_commit_bytes(shard) end
       )
     ]
     |> Enum.join("\n")

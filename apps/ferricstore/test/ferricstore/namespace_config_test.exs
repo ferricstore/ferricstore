@@ -31,6 +31,29 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert entry.window_ms == 10
     end
 
+    test "tracks whether namespace overrides exist for hot-path routing" do
+      refute NamespaceConfig.has_overrides?()
+
+      assert :ok = NamespaceConfig.set("rate", "window_ms", "10")
+      assert NamespaceConfig.has_overrides?()
+
+      assert :ok = NamespaceConfig.reset("rate")
+      refute NamespaceConfig.has_overrides?()
+    end
+
+    test "sets window_ms under WARaft native namespace windows" do
+      previous_backend = Application.get_env(:ferricstore, :raft_backend)
+      Application.put_env(:ferricstore, :raft_backend, :waraft)
+
+      on_exit(fn ->
+        restore_backend(previous_backend)
+      end)
+
+      assert :ok = NamespaceConfig.set("rate", "window_ms", "10")
+      {:ok, entry} = NamespaceConfig.get("rate")
+      assert entry.window_ms == 10
+    end
+
     test "rejects removed durability field for a prefix" do
       assert {:error, msg} = NamespaceConfig.set("ts", "durability", "async")
       assert msg =~ "unknown namespace config field 'durability'"
@@ -639,4 +662,7 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert "admin" in cmd.flags
     end
   end
+
+  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
+  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
 end

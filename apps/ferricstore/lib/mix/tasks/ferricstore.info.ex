@@ -71,7 +71,7 @@ defmodule Mix.Tasks.Ferricstore.Info do
         end
 
       raft_info =
-        case safe_ra_members(Ferricstore.Raft.Cluster.shard_server_id(i)) do
+        case safe_raft_members(i) do
           {:ok, _members, leader} ->
             "leader=#{inspect(leader)}"
 
@@ -89,8 +89,8 @@ defmodule Mix.Tasks.Ferricstore.Info do
     Mix.Task.run("app.start")
   end
 
-  defp safe_ra_members(server_id) do
-    :ra.members(server_id)
+  defp safe_raft_members(shard_index) do
+    Ferricstore.Raft.Cluster.members(shard_index, 1_000)
   catch
     :exit, _ -> :error
   end

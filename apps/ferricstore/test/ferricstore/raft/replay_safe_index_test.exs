@@ -1,5 +1,5 @@
 defmodule Ferricstore.Raft.ReplaySafeIndexTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
   import ExUnit.CaptureLog
 
   alias Ferricstore.Raft.{Batcher, ReplaySafeIndex, ReplaySafeIndexWriter}
@@ -90,6 +90,38 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 321)
     assert_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 321}}}, 1_000
     assert ReplaySafeIndex.read(dir) == 321
+
+    GenServer.stop(writer)
+  end
+
+  test "writer does not poke legacy raft batcher in WARaft mode" do
+    old_backend = Application.get_env(:ferricstore, :raft_backend)
+    Application.put_env(:ferricstore, :raft_backend, :waraft)
+
+    shard_index = 120_000 + System.unique_integer([:positive])
+    batcher_name = Batcher.batcher_name(shard_index)
+    writer_name = ReplaySafeIndexWriter.process_name(shard_index, nil)
+    dir = tmp_dir()
+    parent = self()
+
+    Process.register(parent, batcher_name)
+
+    on_exit(fn ->
+      restore_env(:raft_backend, old_backend)
+      if Process.whereis(batcher_name) == parent, do: Process.unregister(batcher_name)
+      File.rm_rf(dir)
+    end)
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        name: writer_name
+      )
+
+    assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 654)
+    assert wait_until(fn -> ReplaySafeIndex.read(dir) == 654 end)
+    refute_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 654}}}, 100
 
     GenServer.stop(writer)
   end
@@ -268,6 +300,9 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     suffix = "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive])}"
     Path.join(System.tmp_dir!(), "replay_safe_index_#{suffix}")
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   defp wait_until(fun, timeout_ms \\ 1_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms

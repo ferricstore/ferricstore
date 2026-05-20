@@ -241,6 +241,203 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
+  test "compound_get waits through a delayed compaction ETS update without shard fallback", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    redis_key =
+      "cold_compound_gap:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    compound_key = CompoundKey.hash_field(redis_key, "field")
+    value = "compound-delayed-compacted-value"
+
+    {_old_offset, new_offset, value_size} =
+      insert_replaced_cold_compound_row(ctx, keydir, compound_key, value, 0)
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:compound_get_compaction_misses, 0) + 1
+      Process.put(:compound_get_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 0, new_offset, value_size})
+      end
+    end)
+
+    try do
+      with_unregistered_shard(ctx, shard, fn ->
+        assert ^value = Router.compound_get(ctx, redis_key, compound_key)
+      end)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:compound_get_compaction_misses)
+    end
+  end
+
+  test "compound_batch_get waits through a delayed compaction ETS update without shard fallback",
+       %{
+         ctx: ctx,
+         shard: shard,
+         keydir: keydir
+       } do
+    redis_key =
+      "cold_compound_batch_gap:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    compound_key = CompoundKey.hash_field(redis_key, "field")
+    value = "compound-batch-delayed-compacted-value"
+
+    {_old_offset, new_offset, value_size} =
+      insert_replaced_cold_compound_row(ctx, keydir, compound_key, value, 0)
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:compound_batch_get_compaction_misses, 0) + 1
+      Process.put(:compound_batch_get_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 0, new_offset, value_size})
+      end
+    end)
+
+    try do
+      with_waraft_backend(fn ->
+        with_unregistered_shard(ctx, shard, fn ->
+          assert [^value] = Router.compound_batch_get(ctx, redis_key, [compound_key])
+        end)
+      end)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:compound_batch_get_compaction_misses)
+    end
+  end
+
+  test "compound_get_meta waits through a delayed compaction ETS update without shard fallback",
+       %{
+         ctx: ctx,
+         shard: shard,
+         keydir: keydir
+       } do
+    redis_key =
+      "cold_compound_meta_gap:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    compound_key = CompoundKey.hash_field(redis_key, "field")
+    value = "compound-meta-delayed-compacted-value"
+    expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+    {_old_offset, new_offset, value_size} =
+      insert_replaced_cold_compound_row(ctx, keydir, compound_key, value, expire_at_ms)
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:compound_get_meta_compaction_misses, 0) + 1
+      Process.put(:compound_get_meta_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(
+          keydir,
+          {compound_key, nil, expire_at_ms, LFU.initial(), 0, new_offset, value_size}
+        )
+      end
+    end)
+
+    try do
+      with_unregistered_shard(ctx, shard, fn ->
+        assert {^value, ^expire_at_ms} =
+                 Router.compound_get_meta(ctx, redis_key, compound_key)
+      end)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:compound_get_meta_compaction_misses)
+    end
+  end
+
+  test "compound_batch_get_meta waits through a delayed compaction ETS update without shard fallback",
+       %{
+         ctx: ctx,
+         shard: shard,
+         keydir: keydir
+       } do
+    redis_key =
+      "cold_compound_batch_meta_gap:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    compound_key = CompoundKey.hash_field(redis_key, "field")
+    value = "compound-batch-meta-delayed-compacted-value"
+    expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+    {_old_offset, new_offset, value_size} =
+      insert_replaced_cold_compound_row(ctx, keydir, compound_key, value, expire_at_ms)
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:compound_batch_get_meta_compaction_misses, 0) + 1
+      Process.put(:compound_batch_get_meta_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(
+          keydir,
+          {compound_key, nil, expire_at_ms, LFU.initial(), 0, new_offset, value_size}
+        )
+      end
+    end)
+
+    try do
+      with_waraft_backend(fn ->
+        with_unregistered_shard(ctx, shard, fn ->
+          assert [{^value, ^expire_at_ms}] =
+                   Router.compound_batch_get_meta(ctx, redis_key, [compound_key])
+        end)
+      end)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:compound_batch_get_meta_compaction_misses)
+    end
+  end
+
+  test "string batch install clears compound data when cold type marker moves during compaction",
+       %{
+         ctx: ctx,
+         keydir: keydir
+       } do
+    redis_key =
+      "cold_compound_marker_gap:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    marker_key = CompoundKey.type_key(redis_key)
+    field_key = CompoundKey.hash_field(redis_key, "field")
+    value_size = byte_size("hash")
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    current_path = Path.join(shard_path, "00001.log")
+
+    {:ok, {current_offset, _record_size}} =
+      NIF.v2_append_record(current_path, marker_key, "hash", 0)
+
+    :ets.insert(keydir, {marker_key, nil, 0, LFU.initial(), 9, 0, value_size})
+    :ets.insert(keydir, {field_key, "old-field-value", 0, LFU.initial(), :pending, 0, 15})
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:compound_marker_compaction_misses, 0) + 1
+      Process.put(:compound_marker_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(keydir, {marker_key, nil, 0, LFU.initial(), 1, current_offset, value_size})
+      end
+    end)
+
+    try do
+      Router.__install_batch_entries_for_test__(
+        ctx,
+        0,
+        [{redis_key, "string-value", "string-value"}],
+        %{}
+      )
+
+      assert [] == :ets.lookup(keydir, marker_key)
+      assert [] == :ets.lookup(keydir, field_key)
+
+      assert [{^redis_key, "string-value", 0, _lfu, :pending, 0, 12}] =
+               :ets.lookup(keydir, redis_key)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:compound_marker_compaction_misses)
+    end
+  end
+
   test "failed direct cold GET increments keyspace misses", %{ctx: ctx, keydir: keydir} do
     key = "cold_missing_get_stats:" <> Integer.to_string(:erlang.unique_integer([:positive]))
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 99, 0, 5})
@@ -1108,4 +1305,58 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
   end
+
+  defp insert_replaced_cold_compound_row(ctx, keydir, compound_key, value, expire_at_ms) do
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {_dead_offset, _dead_record_size}} =
+      NIF.v2_append_record(path, compound_key <> ":dead", "old", 0)
+
+    {:ok, {old_offset, _old_record_size}} =
+      NIF.v2_append_record(path, compound_key, value, expire_at_ms)
+
+    File.rm!(path)
+
+    {:ok, {new_offset, _new_record_size}} =
+      NIF.v2_append_record(path, compound_key, value, expire_at_ms)
+
+    :ets.insert(
+      keydir,
+      {compound_key, nil, expire_at_ms, LFU.initial(), 0, old_offset, value_size}
+    )
+
+    {old_offset, new_offset, value_size}
+  end
+
+  defp with_unregistered_shard(ctx, shard, fun) when is_function(fun, 0) do
+    shard_name = elem(ctx.shard_names, 0)
+
+    if Process.whereis(shard_name) != nil do
+      Process.unregister(shard_name)
+    end
+
+    try do
+      fun.()
+    after
+      if Process.alive?(shard) and Process.whereis(shard_name) == nil do
+        Process.register(shard, shard_name)
+      end
+    end
+  end
+
+  defp with_waraft_backend(fun) when is_function(fun, 0) do
+    previous_backend = Application.get_env(:ferricstore, :raft_backend)
+    Application.put_env(:ferricstore, :raft_backend, :waraft)
+
+    try do
+      fun.()
+    after
+      restore_env(:raft_backend, previous_backend)
+    end
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

@@ -1151,6 +1151,70 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 123
   end
 
+  test "mirror writer does not poke legacy raft batcher in WARaft mode" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_backend = Application.get_env(:ferricstore, :raft_backend)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :raft_backend, :waraft)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_waraft_marker_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 52
+    batcher_name = Ferricstore.Raft.Batcher.batcher_name(shard_index)
+    instance_name = :"flow_lmdb_writer_waraft_marker_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    key = "flow:{flow:test}:state:waraft-marker"
+    atomics_size = shard_index + 1
+    durable = :atomics.new(atomics_size, signed: false)
+    requested = :atomics.new(atomics_size, signed: false)
+    failures = :atomics.new(atomics_size, signed: false)
+    parent = self()
+
+    Process.register(parent, batcher_name)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_replay_safe_index: durable,
+      flow_lmdb_replay_safe_requested_index: requested,
+      flow_lmdb_replay_safe_persist_failures: failures
+    }
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:raft_backend, old_backend)
+      if Process.whereis(batcher_name) == parent, do: Process.unregister(batcher_name)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index,
+       data_dir: data_dir,
+       instance_ctx: instance_ctx,
+       instance_name: instance_name}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v1"}])
+
+    assert :requested =
+             Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 222)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert :atomics.get(durable, shard_index + 1) == 222
+    assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 222
+    refute_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 222}}}, 100
+  end
+
   test "mirror writer refuses replay-safe marker while shard is degraded" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)

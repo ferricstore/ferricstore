@@ -3,7 +3,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
 
   use GenServer
 
-  alias Ferricstore.Raft.ReplaySafeIndex
+  alias Ferricstore.Raft.{Backend, ReplaySafeIndex}
 
   require Logger
 
@@ -145,7 +145,12 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
   end
 
   defp poke_release_cursor(state, index) do
-    Ferricstore.Raft.Batcher.origin_submit(state.shard_index, {:release_cursor_poke, index})
+    # Legacy Ra needs a tiny command to re-check release_cursor after this
+    # marker fsyncs. WARaft stores its applied position in its own segment log,
+    # so poking the absent legacy batcher would only hit stale infrastructure.
+    unless Backend.waraft?() do
+      Ferricstore.Raft.Batcher.origin_submit(state.shard_index, {:release_cursor_poke, index})
+    end
   catch
     :exit, _reason -> :ok
   end

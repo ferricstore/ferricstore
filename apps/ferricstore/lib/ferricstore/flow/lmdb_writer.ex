@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   alias Ferricstore.Flow
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
+  alias Ferricstore.Raft.Backend, as: RaftBackend
 
   require Logger
 
@@ -1256,7 +1257,11 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp poke_release_cursor(state, index) do
-    Ferricstore.Raft.Batcher.origin_submit(state.shard_index, {:release_cursor_poke, index})
+    # This poke is only for legacy Ra log release. WARaft persists/replays from
+    # its own segment log and should not depend on a legacy batcher being alive.
+    unless RaftBackend.waraft?() do
+      Ferricstore.Raft.Batcher.origin_submit(state.shard_index, {:release_cursor_poke, index})
+    end
   catch
     :exit, _reason -> :ok
   end

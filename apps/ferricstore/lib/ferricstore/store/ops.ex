@@ -896,6 +896,16 @@ defmodule Ferricstore.Store.Ops do
   def compound_scan(store, redis_key, prefix) when is_map(store),
     do: store.compound_scan.(redis_key, prefix)
 
+  @spec compound_fields(store(), binary(), binary()) :: [binary()]
+  def compound_fields(%FerricStore.Instance{} = ctx, redis_key, prefix),
+    do: Router.compound_fields(ctx, redis_key, prefix)
+
+  def compound_fields(store, redis_key, prefix) do
+    store
+    |> compound_scan(redis_key, prefix)
+    |> Enum.map(fn {field, _value} -> field end)
+  end
+
   @spec compound_count(store(), binary(), binary()) :: non_neg_integer()
   def compound_count(%FerricStore.Instance{} = ctx, redis_key, prefix),
     do: Router.compound_count(ctx, redis_key, prefix)

@@ -1866,7 +1866,7 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp single_member_raft_group?(shard_index) do
-    case Ferricstore.Raft.Cluster.members(shard_index) do
+    case Ferricstore.Raft.Cluster.members(shard_index, 0) do
       {:ok, members, _leader} when is_list(members) -> length(members) == 1
       _other -> false
     end

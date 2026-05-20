@@ -10,6 +10,7 @@ defmodule Ferricstore.Cluster.DataSync do
   require Logger
 
   alias Ferricstore.Raft.Batcher
+  alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @default_max_retries 3
@@ -85,6 +86,14 @@ defmodule Ferricstore.Cluster.DataSync do
 
   @spec needs_resync?(non_neg_integer(), node(), node()) :: :wal_bridgeable | :needs_resync
   def needs_resync?(shard_index, target_node, leader_node) do
+    if RaftBackend.waraft?() do
+      :needs_resync
+    else
+      do_needs_resync?(shard_index, target_node, leader_node)
+    end
+  end
+
+  defp do_needs_resync?(shard_index, target_node, leader_node) do
     # Check if the TARGET node has data files for this shard.
     # A node with an empty/missing data dir always needs a full resync.
     target_has_data =
@@ -120,7 +129,7 @@ defmodule Ferricstore.Cluster.DataSync do
 
       target_index =
         try do
-          case :erpc.call(target_node, :ra, :member_overview, [target_server_id]) do
+          case RaftCluster.member_overview_on(target_node, target_server_id) do
             {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
             _ -> 0
           end
@@ -130,7 +139,7 @@ defmodule Ferricstore.Cluster.DataSync do
 
       leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
 
-      case :erpc.call(leader_node, :ra, :member_overview, [leader_server_id]) do
+      case RaftCluster.member_overview_on(leader_node, leader_server_id) do
         {:ok, overview, _} ->
           first_index = Map.get(overview, :first_index, 0)
 
@@ -222,14 +231,18 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec sync_shard(non_neg_integer(), node(), FerricStore.Instance.t()) ::
           {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
   def sync_shard(shard_index, target_node, ctx) do
-    leader_node = find_leader_for(shard_index)
+    if RaftBackend.waraft?() do
+      {:error, :unsupported_waraft_data_sync}
+    else
+      leader_node = find_leader_for(shard_index)
 
-    case needs_resync?(shard_index, target_node, leader_node) do
-      :wal_bridgeable ->
-        {:ok, :wal_bridgeable}
+      case needs_resync?(shard_index, target_node, leader_node) do
+        :wal_bridgeable ->
+          {:ok, :wal_bridgeable}
 
-      :needs_resync ->
-        do_sync_shard(shard_index, target_node, leader_node, ctx)
+        :needs_resync ->
+          do_sync_shard(shard_index, target_node, leader_node, ctx)
+      end
     end
   end
 
@@ -247,25 +260,29 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec retry_sync_shard(non_neg_integer(), node(), FerricStore.Instance.t(), non_neg_integer()) ::
           {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
   def retry_sync_shard(shard_index, target_node, ctx, max_retries \\ @default_max_retries) do
-    Enum.reduce_while(1..max_retries, {:error, :not_attempted}, fn attempt, _acc ->
-      case sync_shard(shard_index, target_node, ctx) do
-        {:ok, _} = ok ->
-          {:halt, ok}
+    if RaftBackend.waraft?() do
+      {:error, :unsupported_waraft_data_sync}
+    else
+      Enum.reduce_while(1..max_retries, {:error, :not_attempted}, fn attempt, _acc ->
+        case sync_shard(shard_index, target_node, ctx) do
+          {:ok, _} = ok ->
+            {:halt, ok}
 
-        {:error, reason} ->
-          Logger.warning(
-            "Shard #{shard_index} sync attempt #{attempt}/#{max_retries} failed: #{inspect(reason)}"
-          )
+          {:error, reason} ->
+            Logger.warning(
+              "Shard #{shard_index} sync attempt #{attempt}/#{max_retries} failed: #{inspect(reason)}"
+            )
 
-          cleanup_partial_sync(shard_index, target_node, ctx)
+            cleanup_partial_sync(shard_index, target_node, ctx)
 
-          if attempt < max_retries do
-            {:cont, {:error, reason}}
-          else
-            {:halt, {:error, reason}}
-          end
-      end
-    end)
+            if attempt < max_retries do
+              {:cont, {:error, reason}}
+            else
+              {:halt, {:error, reason}}
+            end
+        end
+      end)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -286,6 +303,14 @@ defmodule Ferricstore.Cluster.DataSync do
   """
   @spec sync_all_shards(node(), FerricStore.Instance.t()) :: {:ok, map()} | {:error, term()}
   def sync_all_shards(target_node, ctx) do
+    if RaftBackend.waraft?() do
+      {:error, :unsupported_waraft_data_sync}
+    else
+      do_sync_all_shards(target_node, ctx)
+    end
+  end
+
+  defp do_sync_all_shards(target_node, ctx) do
     Logger.info("DataSync: starting sync of #{ctx.shard_count} shards to #{target_node}")
 
     results =
@@ -354,7 +379,7 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec find_leader_for(non_neg_integer()) :: node()
   @doc false
   def find_leader_for(shard_index) do
-    case RaftCluster.members(shard_index) do
+    case RaftCluster.members(shard_index, 5_000) do
       {:ok, _members, {_name, leader_node}} -> leader_node
       _ -> node()
     end
@@ -436,20 +461,30 @@ defmodule Ferricstore.Cluster.DataSync do
   end
 
   defp pause_batcher(node, shard_index) do
-    if node == node() do
-      Batcher.pause_writes_for_sync(shard_index, 30_000)
-    else
-      :erpc.call(node, Batcher, :pause_writes_for_sync, [shard_index, 30_000], 35_000)
+    cond do
+      RaftBackend.waraft?() ->
+        {:error, :unsupported_waraft_data_sync}
+
+      node == node() ->
+        Batcher.pause_writes_for_sync(shard_index, 30_000)
+
+      true ->
+        :erpc.call(node, Batcher, :pause_writes_for_sync, [shard_index, 30_000], 35_000)
     end
   catch
     kind, reason -> {:error, {:pause_batcher_failed, {kind, reason}}}
   end
 
   defp resume_batcher(node, shard_index) do
-    if node == node() do
-      Batcher.resume_writes_for_sync(shard_index, 5_000)
-    else
-      :erpc.call(node, Batcher, :resume_writes_for_sync, [shard_index, 5_000], 10_000)
+    cond do
+      RaftBackend.waraft?() ->
+        :ok
+
+      node == node() ->
+        Batcher.resume_writes_for_sync(shard_index, 5_000)
+
+      true ->
+        :erpc.call(node, Batcher, :resume_writes_for_sync, [shard_index, 5_000], 10_000)
     end
   catch
     _, _ -> :ok
@@ -492,16 +527,20 @@ defmodule Ferricstore.Cluster.DataSync do
   end
 
   defp get_raft_index_with_detail(leader_node, server_id) do
-    overview_result =
-      if leader_node == node() do
-        :ra.member_overview(server_id)
-      else
-        try do
-          :erpc.call(leader_node, :ra, :member_overview, [server_id])
-        catch
-          _, _ -> :error
-        end
+    if Ferricstore.Raft.Backend.waraft?() do
+      shard_index = shard_index_from_server_id(server_id)
+
+      case waraft_storage_position(leader_node, shard_index) do
+        {:ok, {:raft_log_pos, index, term}} -> {index, "(waraft_term=#{term})"}
+        _ -> {0, "(no overview)"}
       end
+    else
+      legacy_raft_index_with_detail(leader_node, server_id)
+    end
+  end
+
+  defp legacy_raft_index_with_detail(leader_node, server_id) do
+    overview_result = RaftCluster.member_overview_on(leader_node, server_id)
 
     case overview_result do
       {:ok, overview, _} ->
@@ -512,6 +551,27 @@ defmodule Ferricstore.Cluster.DataSync do
       _ ->
         {0, "(no overview)"}
     end
+  end
+
+  defp waraft_storage_position(leader_node, shard_index) do
+    if leader_node == node() do
+      Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+    else
+      try do
+        :erpc.call(leader_node, Ferricstore.Raft.WARaftBackend, :storage_position, [shard_index])
+      catch
+        _, _ -> :error
+      end
+    end
+  end
+
+  defp shard_index_from_server_id({name, _node}) when is_atom(name) do
+    name
+    |> Atom.to_string()
+    |> String.trim_leading("ferricstore_shard_")
+    |> String.to_integer()
+  rescue
+    _ -> 0
   end
 
   # ---------------------------------------------------------------------------

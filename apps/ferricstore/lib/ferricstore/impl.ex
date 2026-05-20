@@ -443,14 +443,6 @@ defmodule FerricStore.Impl do
 
   def flow_create(ctx, id, opts), do: Ferricstore.Flow.create(ctx, id, opts)
 
-  def flow_signal(ctx, id, opts), do: Ferricstore.Flow.signal(ctx, id, opts)
-
-  def flow_value_put(ctx, value, opts \\ []),
-    do: Ferricstore.Flow.value_put(ctx, value, opts)
-
-  def flow_value_mget(ctx, refs, opts \\ []),
-    do: Ferricstore.Flow.value_mget(ctx, refs, opts)
-
   def flow_create_many(ctx, partition_key, items, opts),
     do: Ferricstore.Flow.create_many(ctx, partition_key, items, opts)
 
@@ -469,9 +461,6 @@ defmodule FerricStore.Impl do
   def flow_complete(ctx, id, lease_token, opts \\ []),
     do: Ferricstore.Flow.complete(ctx, id, lease_token, opts)
 
-  def flow_complete_many(ctx, partition_key, items, opts \\ []),
-    do: Ferricstore.Flow.complete_many(ctx, partition_key, items, opts)
-
   def flow_transition(ctx, id, from_state, to_state, opts \\ []),
     do: Ferricstore.Flow.transition(ctx, id, from_state, to_state, opts)
 
@@ -481,20 +470,10 @@ defmodule FerricStore.Impl do
   def flow_retry(ctx, id, lease_token, opts),
     do: Ferricstore.Flow.retry(ctx, id, lease_token, opts)
 
-  def flow_retry_many(ctx, partition_key, items, opts \\ []),
-    do: Ferricstore.Flow.retry_many(ctx, partition_key, items, opts)
-
   def flow_fail(ctx, id, lease_token, opts \\ []),
     do: Ferricstore.Flow.fail(ctx, id, lease_token, opts)
 
-  def flow_fail_many(ctx, partition_key, items, opts \\ []),
-    do: Ferricstore.Flow.fail_many(ctx, partition_key, items, opts)
-
   def flow_cancel(ctx, id, opts \\ []), do: Ferricstore.Flow.cancel(ctx, id, opts)
-
-  def flow_cancel_many(ctx, partition_key, items, opts \\ []),
-    do: Ferricstore.Flow.cancel_many(ctx, partition_key, items, opts)
-
   def flow_rewind(ctx, id, opts), do: Ferricstore.Flow.rewind(ctx, id, opts)
   def flow_list(ctx, type, opts \\ []), do: Ferricstore.Flow.list(ctx, type, opts)
   def flow_terminals(ctx, type, opts \\ []), do: Ferricstore.Flow.terminals(ctx, type, opts)
@@ -512,8 +491,6 @@ defmodule FerricStore.Impl do
   def flow_info(ctx, type, opts \\ []), do: Ferricstore.Flow.info(ctx, type, opts)
   def flow_stuck(ctx, type, opts \\ []), do: Ferricstore.Flow.stuck(ctx, type, opts)
   def flow_history(ctx, id, opts \\ []), do: Ferricstore.Flow.history(ctx, id, opts)
-
-  def flow_retention_cleanup(ctx, opts \\ []), do: Ferricstore.Flow.retention_cleanup(ctx, opts)
 
   # ---------------------------------------------------------------
   # Sorted Set

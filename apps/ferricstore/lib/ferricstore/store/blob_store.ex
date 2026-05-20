@@ -935,6 +935,29 @@ defmodule Ferricstore.Store.BlobStore do
     end)
   end
 
+  @doc false
+  @spec sweep_unreferenced_with_live_refs(
+          binary(),
+          non_neg_integer(),
+          (-> {:ok, Enumerable.t()} | {:error, term()})
+        ) ::
+          {:ok,
+           %{
+             deleted_files: non_neg_integer(),
+             deleted_bytes: non_neg_integer(),
+             kept_files: non_neg_integer()
+           }}
+          | {:error, term()}
+  def sweep_unreferenced_with_live_refs(data_dir, shard_index, live_refs_fun)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_function(live_refs_fun, 0) do
+    with_blob_lock(data_dir, shard_index, fn ->
+      with {:ok, live_refs} <- live_refs_fun.() do
+        do_sweep_unreferenced(data_dir, shard_index, live_refs)
+      end
+    end)
+  end
+
   @doc """
   Returns current blob side-channel storage usage for metrics and diagnostics.
 
@@ -1131,10 +1154,15 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp write_file(io, iodata) do
-    case Process.get(:ferricstore_blob_store_write_hook) do
+    case blob_store_write_hook() do
       fun when is_function(fun, 2) -> fun.(io, iodata)
       _ -> :file.write(io, iodata)
     end
+  end
+
+  defp blob_store_write_hook do
+    Process.get(:ferricstore_blob_store_write_hook) ||
+      Application.get_env(:ferricstore, :blob_store_write_hook)
   end
 
   defp prepare_payload_batch(payloads) do

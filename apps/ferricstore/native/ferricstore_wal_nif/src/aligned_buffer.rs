@@ -105,7 +105,6 @@ impl AlignedBuffer {
             ptr: old_ptr,
             logical_len: old_len,
             padded_len,
-            capacity: self.capacity,
         }
     }
 
@@ -154,8 +153,6 @@ pub struct TakenBuffer {
     pub logical_len: usize,
     /// Length padded to ALIGNMENT for O_DIRECT writes.
     pub padded_len: usize,
-    /// Original allocation size. Must be used for deallocation layout.
-    capacity: usize,
 }
 
 unsafe impl Send for TakenBuffer {}
@@ -166,7 +163,6 @@ impl TakenBuffer {
             ptr: ptr::null_mut(),
             logical_len: 0,
             padded_len: 0,
-            capacity: 0,
         }
     }
 
@@ -191,17 +187,15 @@ impl TakenBuffer {
         }
         unsafe { std::slice::from_raw_parts(self.ptr, self.logical_len) }
     }
-
-    #[cfg(test)]
-    pub fn allocation_capacity(&self) -> usize {
-        self.capacity
-    }
 }
 
 impl Drop for TakenBuffer {
     fn drop(&mut self) {
-        if !self.ptr.is_null() && self.capacity > 0 {
-            free_aligned(self.ptr, self.capacity);
+        if !self.ptr.is_null() && self.padded_len > 0 {
+            free_aligned(
+                self.ptr,
+                round_up(self.padded_len, ALIGNMENT).max(ALIGNMENT),
+            );
         }
     }
 }
@@ -239,18 +233,6 @@ mod tests {
         let buf = AlignedBuffer::new();
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
-    }
-
-    #[test]
-    fn test_taken_buffer_remembers_original_allocation_capacity() {
-        let mut buf = AlignedBuffer::with_capacity(8192);
-        buf.extend(b"x");
-
-        let taken = buf.take();
-
-        assert_eq!(taken.logical_len, 1);
-        assert_eq!(taken.padded_len, ALIGNMENT);
-        assert_eq!(taken.allocation_capacity(), 8192);
     }
 
     #[test]

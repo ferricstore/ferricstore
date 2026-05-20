@@ -13,6 +13,49 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   @batch_size 512
   @cold_read_timeout_ms 30_000
 
+  def rebuild_active_indexes_from_keydir(
+        shard_path,
+        keydir,
+        shard_index,
+        instance_ctx,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index \\ nil,
+        flow_lookup \\ nil
+      ) do
+    Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
+
+    stats =
+      keydir
+      |> select_state_entries()
+      |> Enum.reduce(%{seen: 0, active: 0, terminal: 0, cold_read_errors: 0}, fn entries, acc ->
+        entries
+        |> read_and_decode(shard_path, shard_index, instance_ctx)
+        |> Enum.reduce(%{acc | seen: acc.seen + length(entries)}, fn {_key, _value, _expire_at_ms,
+                                                                      record},
+                                                                     next_acc ->
+          if LMDB.terminal_state?(Map.get(record, :state)) do
+            %{next_acc | terminal: next_acc.terminal + 1}
+          else
+            rebuild_active_indexes(zset_score_index, zset_score_lookup, record)
+            rebuild_active_flow_indexes(flow_index, flow_lookup, record)
+            %{next_acc | active: next_acc.active + 1}
+          end
+        end)
+      end)
+      |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
+
+    Process.delete(:flow_lmdb_rebuild_cold_read_errors)
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :active_index_rebuild],
+      stats,
+      %{shard_index: shard_index}
+    )
+
+    :ok
+  end
+
   def reconcile_shard(
         shard_path,
         keydir,
@@ -336,7 +379,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           with {:ok, state_key} <- terminal_state_key_from_reverse_key(reverse_key),
                false <- terminal_state_key?(keydir, shard_path, state_key),
                true <- is_binary(terminal_key) do
-            [{:delete, reverse_key} | LMDB.terminal_index_delete_ops(lmdb_path, terminal_key, nil)]
+            [
+              {:delete, reverse_key}
+              | LMDB.terminal_index_delete_ops(lmdb_path, terminal_key, nil)
+            ]
           else
             _ -> []
           end
@@ -347,9 +393,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     end
   end
 
-  defp terminal_state_key_from_reverse_key(
-         <<"flow-terminal-by-state:", state_key::binary>>
-       )
+  defp terminal_state_key_from_reverse_key(<<"flow-terminal-by-state:", state_key::binary>>)
        when byte_size(state_key) > 0,
        do: {:ok, state_key}
 
@@ -607,7 +651,11 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     |> maybe_add_running_index_entries(record, partition_key)
   end
 
-  defp maybe_add_due_index_entry(entries, %{next_run_at_ms: next_run_at_ms} = record, partition_key)
+  defp maybe_add_due_index_entry(
+         entries,
+         %{next_run_at_ms: next_run_at_ms} = record,
+         partition_key
+       )
        when is_integer(next_run_at_ms) do
     priority = Map.get(record, :priority, 0)
     due_key = Flow.Keys.due_key(record.type, record.state, priority, partition_key)

@@ -151,24 +151,11 @@ defmodule Ferricstore.InstanceTest do
 
       assert {:ok, _pid} = EmbeddedFlow.start_link(data_dir: root, shard_count: 1)
 
-      assert function_exported?(EmbeddedFlow, :flow_signal, 2)
-      assert function_exported?(EmbeddedFlow, :flow_value_put, 2)
-      assert function_exported?(EmbeddedFlow, :flow_value_mget, 1)
-      assert function_exported?(EmbeddedFlow, :flow_policy_set, 2)
-      assert function_exported?(EmbeddedFlow, :flow_policy_get, 1)
-      assert function_exported?(EmbeddedFlow, :flow_complete_many, 3)
-      assert function_exported?(EmbeddedFlow, :flow_retry_many, 3)
-      assert function_exported?(EmbeddedFlow, :flow_fail_many, 3)
-      assert function_exported?(EmbeddedFlow, :flow_cancel_many, 3)
-      assert function_exported?(EmbeddedFlow, :flow_terminals, 2)
-      assert function_exported?(EmbeddedFlow, :flow_failures, 2)
-      assert function_exported?(EmbeddedFlow, :flow_retention_cleanup, 1)
-
       id = "embedded-flow-1"
       type = "embedded-flow"
       partition = "tenant-a"
 
-      assert :ok =
+      assert {:ok, %{id: ^id, state: "queued"}} =
                EmbeddedFlow.flow_create(id,
                  type: type,
                  run_at_ms: 1_000,
@@ -179,9 +166,7 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 1_000
                )
 
-      assert {:ok, %{id: ^id, state: "queued"}} =
-               EmbeddedFlow.flow_get(id, partition_key: partition)
-
+      assert {:ok, %{id: ^id}} = EmbeddedFlow.flow_get(id, partition_key: partition)
       assert {:ok, [%{id: ^id}]} = EmbeddedFlow.flow_list(type, partition_key: partition)
 
       assert {:ok, [%{id: ^id}]} =
@@ -207,18 +192,12 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 1_000
                )
 
-      assert {:ok, %{id: ^id, state: "running", lease_deadline_ms: 6_000}} =
-               EmbeddedFlow.flow_get(id, partition_key: partition)
-
-      assert :ok =
+      assert {:ok, %{id: ^id, state: "completed"}} =
                EmbeddedFlow.flow_complete(id, claimed.lease_token,
                  fencing_token: claimed.fencing_token,
                  partition_key: partition,
                  now_ms: 2_000
                )
-
-      assert {:ok, %{id: ^id, state: "completed"}} =
-               EmbeddedFlow.flow_get(id, partition_key: partition)
 
       assert {:ok, %{completed: 1, inflight: 0}} =
                EmbeddedFlow.flow_info(type, partition_key: partition)
@@ -229,7 +208,7 @@ defmodule Ferricstore.InstanceTest do
       spawn_parent = "embedded-spawn-parent-1"
       spawn_child = "embedded-spawn-child-1"
 
-      assert :ok =
+      assert {:ok, created_parent} =
                EmbeddedFlow.flow_create(spawn_parent,
                  type: "embedded-parent",
                  state: "dispatch",
@@ -237,10 +216,7 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 3_000
                )
 
-      assert {:ok, created_parent} =
-               EmbeddedFlow.flow_get(spawn_parent, partition_key: partition)
-
-      assert :ok =
+      assert {:ok, %{id: ^spawn_parent, state: "dispatched"}} =
                EmbeddedFlow.flow_spawn_children(
                  spawn_parent,
                  [%{id: spawn_child, type: "embedded-child", payload: "child-payload"}],
@@ -255,78 +231,8 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 3_010
                )
 
-      assert {:ok, %{id: ^spawn_parent, state: "dispatched"}} =
-               EmbeddedFlow.flow_get(spawn_parent, partition_key: partition)
-
       assert {:ok, [%{id: ^spawn_child, parent_flow_id: ^spawn_parent}]} =
                EmbeddedFlow.flow_by_parent(spawn_parent, partition_key: partition)
-
-      assert {:ok, %{ref: profile_ref}} =
-               EmbeddedFlow.flow_value_put("profile-bytes",
-                 owner_flow_id: spawn_child,
-                 partition_key: partition,
-                 name: "profile",
-                 now_ms: 3_020
-               )
-
-      assert {:ok, ["profile-bytes"]} = EmbeddedFlow.flow_value_mget([profile_ref])
-
-      assert :ok =
-               EmbeddedFlow.flow_signal(spawn_child,
-                 partition_key: partition,
-                 signal: "child-ready",
-                 if_state: "queued",
-                 transition_to: "ready",
-                 now_ms: 3_030
-               )
-
-      assert {:ok, %{state: "ready"}} =
-               EmbeddedFlow.flow_get(spawn_child, partition_key: partition)
-
-      assert {:ok, [%{id: ^spawn_child, lease_token: child_lease, fencing_token: child_fence}]} =
-               EmbeddedFlow.flow_claim_due("embedded-child",
-                 worker: "worker-child",
-                 partition_key: partition,
-                 state: "ready",
-                 now_ms: 3_030
-               )
-
-      assert :ok =
-               EmbeddedFlow.flow_retry_many(
-                 partition,
-                 [
-                   %{
-                     id: spawn_child,
-                     lease_token: child_lease,
-                     fencing_token: child_fence
-                   }
-                 ],
-                 now_ms: 3_040
-               )
-
-      assert {:ok, [%{id: ^spawn_child, lease_token: child_lease2, fencing_token: child_fence2}]} =
-               EmbeddedFlow.flow_claim_due("embedded-child",
-                 worker: "worker-child",
-                 partition_key: partition,
-                 state: "ready",
-                 now_ms: 10_000
-               )
-
-      assert :ok =
-               EmbeddedFlow.flow_complete_many(
-                 partition,
-                 [
-                   %{
-                     id: spawn_child,
-                     lease_token: child_lease2,
-                     fencing_token: child_fence2
-                   }
-                 ],
-                 now_ms: 10_010
-               )
-
-      assert {:ok, %{flows: _, history: _, values: _}} =
-               EmbeddedFlow.flow_retention_cleanup(limit: 1, now_ms: 10_010)
     end
   end
 

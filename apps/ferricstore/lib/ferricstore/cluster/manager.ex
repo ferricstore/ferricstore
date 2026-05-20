@@ -19,9 +19,13 @@ defmodule Ferricstore.Cluster.Manager do
   alias Ferricstore.Cluster.DataSync
   alias Ferricstore.Cluster.JoinIdentity
   alias Ferricstore.Cluster.TargetMarker
+  alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Raft.Cluster, as: RaftCluster
+  alias Ferricstore.Raft.WARaftBackend
 
   @default_remove_delay_ms 60_000
+  @membership_probe_timeout_ms 1_000
+  @membership_operation_timeout_ms 5_000
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -47,7 +51,22 @@ defmodule Ferricstore.Cluster.Manager do
   @doc "Returns a map of all known nodes and their status."
   @spec node_status() :: map()
   def node_status do
-    GenServer.call(__MODULE__, :node_status)
+    node_status(:default)
+  end
+
+  @doc """
+  Returns a map of all known nodes and their status using a bounded per-shard
+  membership probe timeout.
+  """
+  @spec node_status(:default | non_neg_integer()) :: map()
+  def node_status(membership_timeout) do
+    call_timeout =
+      case membership_timeout do
+        timeout when is_integer(timeout) and timeout >= 0 -> max(5_000, timeout + 1_000)
+        _ -> 5_000
+      end
+
+    GenServer.call(__MODULE__, {:node_status, membership_timeout}, call_timeout)
   end
 
   @doc """
@@ -133,28 +152,11 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   def handle_call(:node_status, _from, state) do
-    status =
-      for shard_idx <- 0..(state.shard_count - 1), into: %{} do
-        case RaftCluster.members(shard_idx) do
-          {:ok, members, leader} ->
-            {shard_idx, %{members: members, leader: leader}}
+    {:reply, build_node_status(state, :default), state}
+  end
 
-          {:error, reason} ->
-            {shard_idx, %{error: reason}}
-        end
-      end
-
-    {:reply,
-     %{
-       mode: state.mode,
-       role: state.role,
-       node: node(),
-       connected_nodes: Node.list(),
-       known_nodes: MapSet.to_list(state.known_nodes),
-       sync_status: state.sync_status,
-       shard_sync_status: state.shard_sync_status,
-       shards: status
-     }, state}
+  def handle_call({:node_status, membership_timeout}, _from, state) do
+    {:reply, build_node_status(state, membership_timeout), state}
   end
 
   def handle_call({:add_node, target_node, role}, from, state) do
@@ -192,13 +194,50 @@ defmodule Ferricstore.Cluster.Manager do
 
   def handle_call({:remove_node, target_node}, _from, state) do
     result = do_remove_node(target_node, state)
-    new_known = MapSet.delete(state.known_nodes, target_node)
-    {:reply, result, %{state | known_nodes: new_known}}
+
+    new_state =
+      case result do
+        :ok -> %{state | known_nodes: MapSet.delete(state.known_nodes, target_node)}
+        _ -> state
+      end
+
+    {:reply, result, new_state}
   end
 
   def handle_call(:leave, _from, state) do
     result = do_leave(state)
-    {:reply, result, %{state | mode: :standalone}}
+
+    new_state =
+      case result do
+        :ok -> %{state | mode: :standalone}
+        _ -> state
+      end
+
+    {:reply, result, new_state}
+  end
+
+  defp build_node_status(state, membership_timeout) do
+    status =
+      for shard_idx <- 0..(state.shard_count - 1), into: %{} do
+        case RaftCluster.members(shard_idx, membership_timeout) do
+          {:ok, members, leader} ->
+            {shard_idx, %{members: members, leader: leader}}
+
+          {:error, reason} ->
+            {shard_idx, %{error: reason}}
+        end
+      end
+
+    %{
+      mode: state.mode,
+      role: state.role,
+      node: node(),
+      connected_nodes: Node.list(),
+      known_nodes: MapSet.to_list(state.known_nodes),
+      sync_status: state.sync_status,
+      shard_sync_status: state.shard_sync_status,
+      shards: status
+    }
   end
 
   # ---------------------------------------------------------------------------
@@ -221,7 +260,7 @@ defmodule Ferricstore.Cluster.Manager do
 
         has_leaders =
           Enum.any?(0..(state.shard_count - 1), fn i ->
-            case RaftCluster.members(i) do
+            case RaftCluster.members(i, @membership_probe_timeout_ms) do
               {:ok, members, _leader} -> length(members) > 1
               _ -> false
             end
@@ -376,6 +415,14 @@ defmodule Ferricstore.Cluster.Manager do
 
     ctx = FerricStore.Instance.get(:default)
 
+    if RaftBackend.waraft?() do
+      do_join_node_remote_waraft(target_node, membership, state, ctx, replace?)
+    else
+      do_join_node_remote_legacy(target_node, membership, state, ctx, replace?)
+    end
+  end
+
+  defp do_join_node_remote_legacy(target_node, membership, state, ctx, replace?) do
     with {:ok, target_has_data} <- target_has_data?(target_node, state.shard_count),
          :ok <- validate_target_data_identity(target_node, ctx, target_has_data, replace?),
          {:ok, preexisting_membership} <- target_membership_by_shard(target_node, state) do
@@ -407,6 +454,28 @@ defmodule Ferricstore.Cluster.Manager do
           preexisting_membership
         )
       end
+    else
+      {:error, reason} = error ->
+        Logger.error("ClusterManager: refusing join for #{target_node}: #{inspect(reason)}")
+        error
+    end
+  end
+
+  defp do_join_node_remote_waraft(target_node, membership, state, ctx, replace?) do
+    with {:ok, target_has_data} <- target_has_data?(target_node, state.shard_count),
+         :ok <- validate_target_data_identity(target_node, ctx, target_has_data, replace?),
+         {:ok, preexisting_membership} <- target_membership_by_shard(target_node, state),
+         :ok <- maybe_cleanup_replace_target(target_node, state, replace?, target_has_data) do
+      cleanup_data_on_failure? = replace? or not target_has_data
+
+      add_node_and_persist_waraft_target_marker(
+        target_node,
+        membership,
+        state,
+        ctx,
+        cleanup_data_on_failure?,
+        preexisting_membership
+      )
     else
       {:error, reason} = error ->
         Logger.error("ClusterManager: refusing join for #{target_node}: #{inspect(reason)}")
@@ -595,6 +664,137 @@ defmodule Ferricstore.Cluster.Manager do
     end
   end
 
+  defp add_node_and_persist_waraft_target_marker(
+         target_node,
+         membership,
+         state,
+         ctx,
+         cleanup_data_on_failure?,
+         preexisting_membership
+       ) do
+    {raft_result, shard_results} = do_add_node(target_node, membership, state)
+
+    case raft_result do
+      :ok ->
+        with {:ok, barrier_indices} <- waraft_barrier_indices(state.shard_count),
+             :ok <- write_target_cluster_marker(target_node, ctx, barrier_indices) do
+          kickstart_replication(target_node, state.shard_count)
+          Logger.info("ClusterManager: #{target_node} joined through WARaft snapshot replication")
+          :ok
+        else
+          {:error, _reason} = err ->
+            rollback_waraft_join_after_marker_failure(
+              target_node,
+              state,
+              err,
+              preexisting_membership,
+              cleanup_data_on_failure?
+            )
+        end
+
+      {:error, _} = err ->
+        Logger.error("ClusterManager: WARaft add failed for #{target_node}: #{inspect(err)}")
+
+        rollback_waraft_join_after_add_failure(
+          target_node,
+          state,
+          err,
+          cleanup_data_on_failure?,
+          preexisting_membership,
+          shard_results
+        )
+    end
+  end
+
+  defp waraft_barrier_indices(shard_count) do
+    case Process.get(:ferricstore_cluster_manager_waraft_barrier_indices_hook) do
+      hook when is_function(hook, 1) ->
+        hook.(shard_count)
+
+      _ ->
+        read_waraft_barrier_indices(shard_count)
+    end
+  end
+
+  defp read_waraft_barrier_indices(shard_count) do
+    Enum.reduce_while(0..(shard_count - 1), {:ok, %{}}, fn shard_idx, {:ok, acc} ->
+      case WARaftBackend.storage_position(shard_idx) do
+        {:ok, {:raft_log_pos, index, _term}} when is_integer(index) and index >= 0 ->
+          {:cont, {:ok, Map.put(acc, shard_idx, index)}}
+
+        {:ok, position} ->
+          {:halt, {:error, {:waraft_barrier_index_unavailable, shard_idx, position}}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:waraft_barrier_index_unavailable, shard_idx, reason}}}
+
+        other ->
+          {:halt, {:error, {:waraft_barrier_index_unavailable, shard_idx, other}}}
+      end
+    end)
+  end
+
+  defp rollback_waraft_join_after_marker_failure(
+         target_node,
+         state,
+         marker_error,
+         preexisting_membership,
+         cleanup_data_on_failure?
+       ) do
+    Logger.error(
+      "ClusterManager: WARaft target marker write failed for #{target_node}: #{inspect(marker_error)}; rolling back membership"
+    )
+
+    membership_rollback = remove_join_added_members(target_node, state, preexisting_membership)
+
+    target_rollback =
+      cleanup_waraft_target_join_state(target_node, state, cleanup_data_on_failure?)
+
+    case {membership_rollback, target_rollback} do
+      {:ok, :ok} ->
+        marker_error
+
+      {membership_error, target_error} ->
+        Logger.error(
+          "ClusterManager: WARaft rollback after target marker failure failed for #{target_node}: #{inspect({membership_error, target_error})}"
+        )
+
+        {:error,
+         {:waraft_target_marker_failed_rollback_failed, marker_error, membership_error,
+          target_error}}
+    end
+  end
+
+  defp rollback_waraft_join_after_add_failure(
+         target_node,
+         state,
+         add_error,
+         cleanup_data_on_failure?,
+         preexisting_membership,
+         _shard_results
+       ) do
+    membership_rollback = remove_join_added_members(target_node, state, preexisting_membership)
+
+    target_rollback =
+      cleanup_waraft_target_join_state(target_node, state, cleanup_data_on_failure?)
+
+    case {membership_rollback, target_rollback} do
+      {:ok, :ok} ->
+        add_error
+
+      {membership_error, target_error} ->
+        {:error, {:waraft_add_failed_rollback_failed, add_error, membership_error, target_error}}
+    end
+  end
+
+  defp cleanup_waraft_target_join_state(target_node, state, cleanup_data?) do
+    if cleanup_data? do
+      cleanup_target_data(target_node, state.shard_count)
+    else
+      :ok
+    end
+  end
+
   defp rollback_join_membership_after_marker_failure(
          target_node,
          state,
@@ -695,7 +895,7 @@ defmodule Ferricstore.Cluster.Manager do
     do: {:error, {:target_membership_snapshot_failed, target_node, {:unexpected_result, other}}}
 
   defp target_member?(target_node, shard_idx) do
-    case RaftCluster.members(shard_idx) do
+    case RaftCluster.members(shard_idx, @membership_operation_timeout_ms) do
       {:ok, members, _leader} ->
         {:ok, Enum.any?(members, &(member_node(&1) == target_node))}
 
@@ -712,6 +912,17 @@ defmodule Ferricstore.Cluster.Manager do
   defp member_node({_name, node}), do: node
   defp member_node(%{id: {_name, node}}), do: node
   defp member_node(_member), do: nil
+
+  defp transfer_target_from_members(members, target_node) when is_list(members) do
+    members
+    |> Enum.map(&member_node/1)
+    |> Enum.find(fn
+      node when is_atom(node) and not is_nil(node) -> node != target_node
+      _other -> false
+    end)
+  end
+
+  defp transfer_target_from_members(_members, _target_node), do: nil
 
   defp remove_join_added_members(target_node, state, preexisting_membership) do
     rollback_results =
@@ -987,9 +1198,21 @@ defmodule Ferricstore.Cluster.Manager do
     # REPLACE join must remove every shard-owned side store. Leaving an old
     # blob tree behind could make future large-value refs resolve to unrelated
     # target data after the new cluster baseline is copied.
-    Enum.each(["dedicated", "blob"], fn dir ->
+    Enum.each(["dedicated", "blob", "prob"], fn dir ->
       :erpc.call(target_node, File, :rm_rf!, [Path.join(data_dir, dir)], 30_000)
     end)
+
+    # WARaft replacement/failure cleanup must also remove backend-local state
+    # and durable mode markers. Otherwise a target can restart with stale Raft
+    # identity or a marker from an unrelated cluster before the new baseline is
+    # copied.
+    Enum.each(["ra", "waraft"], fn dir ->
+      :erpc.call(target_node, File, :rm_rf!, [Path.join(data_dir, dir)], 30_000)
+    end)
+
+    marker_path = Ferricstore.ReplicationMode.marker_path(data_dir)
+    :erpc.call(target_node, File, :rm, [marker_path], 30_000)
+    :erpc.call(target_node, File, :rm, [marker_path <> ".tmp"], 30_000)
 
     :ok
   end
@@ -1156,56 +1379,108 @@ defmodule Ferricstore.Cluster.Manager do
   defp do_remove_node_real(target_node, state) do
     Logger.info("ClusterManager: removing #{target_node} from all #{state.shard_count} shards")
 
-    for shard_idx <- 0..(state.shard_count - 1) do
-      # If the target is leader for this shard, transfer leadership first
-      case RaftCluster.members(shard_idx) do
-        {:ok, _members, {_name, ^target_node}} ->
-          # Target is leader — transfer before removing
-          other_voters = Node.list() -- [target_node]
-
-          if other_voters != [] do
-            RaftCluster.transfer_leadership(shard_idx, hd(other_voters))
-            Process.sleep(100)
+    shard_results =
+      for shard_idx <- 0..(state.shard_count - 1), into: %{} do
+        result =
+          with :ok <- maybe_transfer_target_leadership(shard_idx, target_node, 100) do
+            cluster_remove_member(shard_idx, target_node)
           end
 
-        _ ->
-          :ok
+        {shard_idx, normalize_cluster_operation_result(result)}
       end
 
-      RaftCluster.remove_member(shard_idx, target_node)
-    end
+    failed = Enum.filter(shard_results, fn {_shard_idx, result} -> result != :ok end)
 
-    :ok
+    if failed == [] do
+      :ok
+    else
+      {:error, {:partial_remove, shard_results}}
+    end
   end
 
   defp do_leave(state) do
     Logger.info("ClusterManager: leaving cluster")
 
-    for shard_idx <- 0..(state.shard_count - 1) do
-      # Transfer leadership away from us if we're the leader
-      case RaftCluster.members(shard_idx) do
-        {:ok, _members, {_name, node}} when node == node() ->
-          other_voters = Node.list()
+    local_node = node()
 
-          if other_voters != [] do
-            Logger.info(
-              "ClusterManager: transferring shard #{shard_idx} leadership to #{hd(other_voters)}"
-            )
-
-            RaftCluster.transfer_leadership(shard_idx, hd(other_voters))
-            Process.sleep(200)
+    shard_results =
+      for shard_idx <- 0..(state.shard_count - 1), into: %{} do
+        result =
+          with :ok <- maybe_transfer_target_leadership(shard_idx, local_node, 200) do
+            cluster_remove_member(shard_idx, local_node)
           end
 
-        _ ->
-          :ok
+        {shard_idx, normalize_cluster_operation_result(result)}
       end
 
-      # Remove ourselves from the Raft group
-      RaftCluster.remove_member(shard_idx, node())
-    end
+    failed = Enum.filter(shard_results, fn {_shard_idx, result} -> result != :ok end)
 
-    :ok
+    if failed == [] do
+      :ok
+    else
+      {:error, {:partial_leave, shard_results}}
+    end
   end
+
+  defp maybe_transfer_target_leadership(shard_idx, target_node, sleep_ms) do
+    case cluster_members(shard_idx) do
+      {:ok, members, {_name, ^target_node}} ->
+        case transfer_target_from_members(members, target_node) do
+          nil -> :ok
+          replacement -> transfer_target_leadership(shard_idx, replacement, sleep_ms)
+        end
+
+      {:ok, _members, _leader} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:members_failed, reason}}
+
+      other ->
+        {:error, {:members_failed, other}}
+    end
+  end
+
+  defp transfer_target_leadership(shard_idx, target_node, sleep_ms) do
+    Logger.info("ClusterManager: transferring shard #{shard_idx} leadership to #{target_node}")
+
+    case cluster_transfer_leadership(shard_idx, target_node) do
+      :ok ->
+        Process.sleep(sleep_ms)
+        :ok
+
+      {:error, reason} ->
+        {:error, {:transfer_failed, reason}}
+
+      other ->
+        {:error, {:transfer_failed, other}}
+    end
+  end
+
+  defp cluster_members(shard_idx) do
+    case Process.get(:ferricstore_cluster_manager_members_hook) do
+      hook when is_function(hook, 1) -> hook.(shard_idx)
+      _ -> RaftCluster.members(shard_idx, @membership_operation_timeout_ms)
+    end
+  end
+
+  defp cluster_transfer_leadership(shard_idx, target_node) do
+    case Process.get(:ferricstore_cluster_manager_transfer_leadership_hook) do
+      hook when is_function(hook, 2) -> hook.(shard_idx, target_node)
+      _ -> RaftCluster.transfer_leadership(shard_idx, target_node)
+    end
+  end
+
+  defp cluster_remove_member(shard_idx, target_node) do
+    case Process.get(:ferricstore_cluster_manager_remove_member_hook) do
+      hook when is_function(hook, 2) -> hook.(shard_idx, target_node)
+      _ -> RaftCluster.remove_member(shard_idx, target_node)
+    end
+  end
+
+  defp normalize_cluster_operation_result(:ok), do: :ok
+  defp normalize_cluster_operation_result({:error, _reason} = error), do: error
+  defp normalize_cluster_operation_result(other), do: {:error, other}
 
   # ---------------------------------------------------------------------------
   # Private: helpers
@@ -1234,7 +1509,15 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp do_stop_raft_on_target(target_node, shard_count) do
-    Logger.info("ClusterManager: stopping Raft on #{target_node} before join")
+    if RaftBackend.waraft?() do
+      :ok
+    else
+      do_stop_legacy_raft_on_target(target_node, shard_count)
+    end
+  end
+
+  defp do_stop_legacy_raft_on_target(target_node, shard_count) do
+    Logger.info("ClusterManager: stopping legacy Raft on #{target_node} before join")
 
     ra_sys = Ferricstore.Raft.Cluster.system_name()
 
@@ -1260,7 +1543,7 @@ defmodule Ferricstore.Cluster.Manager do
 
   defp stop_target_raft_server(target_node, ra_sys, server_id) do
     target_node
-    |> :erpc.call(:ra, :stop_server, [ra_sys, server_id], 5_000)
+    |> RaftCluster.stop_server_on(ra_sys, server_id)
     |> normalize_target_raft_stop_result()
   catch
     kind, reason -> {:error, {:stop_server, {kind, reason}}}
@@ -1268,7 +1551,7 @@ defmodule Ferricstore.Cluster.Manager do
 
   defp delete_target_raft_server(target_node, ra_sys, server_id) do
     target_node
-    |> :erpc.call(:ra, :force_delete_server, [ra_sys, server_id], 5_000)
+    |> RaftCluster.force_delete_server_on(ra_sys, server_id)
     |> normalize_target_raft_delete_result()
   catch
     kind, reason -> {:error, {:force_delete_server, {kind, reason}}}
@@ -1338,7 +1621,7 @@ defmodule Ferricstore.Cluster.Manager do
     # Shard 0 Raft membership is the authoritative cluster membership source.
     # Unknown membership must abort join rather than seeding target Raft with
     # arbitrary connected Erlang nodes.
-    case RaftCluster.members(0) do
+    case RaftCluster.members(0, @membership_operation_timeout_ms) do
       {:ok, members, _leader} ->
         nodes = Enum.map(members, &member_node/1) |> Enum.reject(&is_nil/1) |> Enum.uniq()
         {:ok, if(target_node in nodes, do: nodes, else: [target_node | nodes])}
@@ -1445,26 +1728,20 @@ defmodule Ferricstore.Cluster.Manager do
   defp kickstart_replication(_target_node, shard_count) do
     Process.sleep(100)
 
-    for shard_idx <- 0..(shard_count - 1) do
-      local_id = RaftCluster.shard_server_id(shard_idx)
-
-      has_leader? =
+    needs_election? =
+      Enum.any?(0..(shard_count - 1), fn shard_idx ->
         try do
-          case :ra.members(local_id, 2_000) do
-            {:ok, _members, _leader} -> true
-            _ -> false
-          end
+          not match?(
+            {:ok, _members, _leader},
+            RaftCluster.members(shard_idx, @membership_probe_timeout_ms)
+          )
         catch
-          _, _ -> false
+          _, _ -> true
         end
+      end)
 
-      unless has_leader? do
-        try do
-          :ra.trigger_election(local_id)
-        catch
-          _, _ -> :ok
-        end
-      end
+    if needs_election? do
+      _ = RaftCluster.trigger_shard_elections_parallel(shard_count, timeout: 10_000)
     end
   end
 

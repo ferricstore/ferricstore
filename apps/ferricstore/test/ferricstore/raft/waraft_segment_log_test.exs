@@ -1,0 +1,148 @@
+defmodule Ferricstore.Raft.WARaftSegmentLogTest do
+  use ExUnit.Case, async: false
+
+  def handle_corrupt_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:segment_log_corrupt, event, measurements, metadata})
+  end
+
+  test "projection writer persists projected keydir entries as segment-log records" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-#{System.unique_integer([:positive])}"
+      )
+
+    File.rm_rf!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    position = {:raft_log_pos, 42, 7}
+    entries = [{"a", "1", 0}, {"b", "2", 123}]
+
+    assert :ok =
+             :ferricstore_waraft_spike_segment_log.write_projection(
+               to_charlist(root),
+               position,
+               entries
+             )
+
+    assert File.dir?(Path.join([root, "segment_log"]))
+    refute File.exists?(Path.join(root, "segment_projected_keydir.term"))
+
+    assert {:ok, records} =
+             :ferricstore_waraft_spike_segment_log.fold_disk(
+               to_charlist(root),
+               fn index, entry, acc -> [{index, entry} | acc] end,
+               []
+             )
+
+    assert Enum.reverse(records) == [
+             {0, {0, {:ferricstore_segment_projection_header, position, 2}}},
+             {1, {0, {:ferricstore_segment_projection_entry, "a", "1", 0}}},
+             {2, {0, {:ferricstore_segment_projection_entry, "b", "2", 123}}}
+           ]
+  end
+
+  test "point disk reads only the target segment for cold value lookups" do
+    previous = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-point-read-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
+      File.rm_rf!(root)
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      entries = [
+        {"k0", "v0", 0},
+        {"k1", "v1", 0},
+        {"k2", "v2", 0},
+        {"k3", "v3", 0},
+        {"k4", "v4", 0}
+      ]
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection(
+                 to_charlist(root),
+                 {:raft_log_pos, 10, 1},
+                 entries
+               )
+
+      segment_dir = Path.join(root, "segment_log")
+      assert File.exists?(Path.join(segment_dir, "0.seg"))
+      assert File.exists?(Path.join(segment_dir, "1.seg"))
+      assert File.exists?(Path.join(segment_dir, "2.seg"))
+
+      File.write!(Path.join(segment_dir, "0.seg"), "corrupt unrelated segment")
+
+      assert {:ok, {0, {:ferricstore_segment_projection_entry, "k2", "v2", 0}}} =
+               :ferricstore_waraft_spike_segment_log.read_disk(to_charlist(root), 3)
+
+      assert :not_found =
+               :ferricstore_waraft_spike_segment_log.read_disk(to_charlist(root), 99)
+    after
+      if previous == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_records_per_segment)
+      else
+        Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, previous)
+      end
+    end
+  end
+
+  test "point disk reads emit corruption telemetry for target segment corruption" do
+    previous = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+    parent = self()
+    handler_id = {__MODULE__, :point_corrupt, make_ref()}
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-point-corrupt-#{System.unique_integer([:positive])}"
+      )
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log_corrupt],
+      &__MODULE__.handle_corrupt_telemetry/4,
+      parent
+    )
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
+      File.rm_rf!(root)
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection(
+                 to_charlist(root),
+                 {:raft_log_pos, 10, 1},
+                 [{"k0", "v0", 0}, {"k1", "v1", 0}, {"k2", "v2", 0}]
+               )
+
+      segment_path = Path.join([root, "segment_log", "1.seg"])
+      assert File.exists?(segment_path)
+      File.write!(segment_path, "corrupt target segment")
+
+      assert {:error, _reason} =
+               :ferricstore_waraft_spike_segment_log.read_disk(to_charlist(root), 3)
+
+      assert_receive {:segment_log_corrupt, [:ferricstore, :waraft, :segment_log_corrupt],
+                      %{count: 1}, %{path: path, reason: reason}},
+                     1_000
+
+      assert path == segment_path
+      assert reason != nil
+    after
+      :telemetry.detach(handler_id)
+
+      if previous == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_records_per_segment)
+      else
+        Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, previous)
+      end
+    end
+  end
+end

@@ -74,7 +74,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
   def name(nil, shard_index), do: :"ferricstore_flow_history_projector_#{shard_index}"
   def name(%{name: :default}, shard_index), do: name(nil, shard_index)
   def name(%{name: name}, shard_index), do: :"#{name}_flow_history_projector_#{shard_index}"
-  def name(%{}, shard_index), do: name(nil, shard_index)
 
   @spec enqueue(map() | nil, non_neg_integer(), [entry()], non_neg_integer() | nil) ::
           :ok | {:error, :not_started}
@@ -148,33 +147,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
         entries,
         requested_index \\ nil
       ) do
-    write_entries_sync(instance_ctx, shard_index, shard_data_path, entries, requested_index, nil)
-  end
-
-  @spec write_entries_sync(
-          map() | nil,
-          non_neg_integer(),
-          binary(),
-          [entry()],
-          non_neg_integer() | nil,
-          :ets.tid() | atom() | nil
-        ) :: :ok | {:error, term()}
-  def write_entries_sync(
-        instance_ctx,
-        shard_index,
-        shard_data_path,
-        entries,
-        requested_index,
-        keydir_override
-      ) do
-    do_project(
-      instance_ctx,
-      shard_index,
-      shard_data_path,
-      entries,
-      requested_index,
-      keydir_override
-    )
+    do_project(instance_ctx, shard_index, shard_data_path, entries, requested_index)
   end
 
   @impl true
@@ -258,8 +231,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
            state.shard_index,
            state.shard_data_path,
            entries,
-           state.requested_index,
-           nil
+           state.requested_index
          ) do
       :ok ->
         %{state | pending: [], pending_count: 0, requested_index: nil}
@@ -276,14 +248,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-  defp do_project(
-         instance_ctx,
-         shard_index,
-         shard_data_path,
-         [],
-         requested_index,
-         _keydir_override
-       ) do
+  defp do_project(instance_ctx, shard_index, shard_data_path, [], requested_index) do
     case requested_index do
       index when is_integer(index) and index >= 0 ->
         with {:ok, _file_id, file_path} <- history_active_file(shard_data_path),
@@ -296,16 +261,9 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-  defp do_project(
-         instance_ctx,
-         shard_index,
-         shard_data_path,
-         entries,
-         requested_index,
-         keydir_override
-       ) do
+  defp do_project(instance_ctx, shard_index, shard_data_path, entries, requested_index) do
     with {:ok, file_id, file_path} <- history_active_file(shard_data_path),
-         keydir <- keydir(instance_ctx, shard_index, keydir_override),
+         keydir <- keydir(instance_ctx, shard_index),
          encoded_entries <- Enum.map(entries, &encode_entry/1),
          batch <- Enum.map(encoded_entries, &{&1.key, &1.value, &1.expire_at_ms}),
          {:ok, locations} <- append_batch(file_path, batch),
@@ -593,10 +551,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
     case NIF.v2_scan_file(file_path) do
       {:ok, records} ->
         keydir = keydir_override || keydir(instance_ctx, shard_index)
-
-        {flow_index, flow_lookup} =
-          FlowIndex.table_names(instance_name(instance_ctx), shard_index)
-
+        {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
         native = NativeFlowIndex.get(flow_index, flow_lookup)
 
         Enum.each(records, fn
@@ -629,7 +584,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
               :error ->
                 :ok
             end
-        end)
+          end)
 
         :ok
 
@@ -740,12 +695,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp keydir(%{keydir_refs: refs}, shard_index) when is_tuple(refs), do: elem(refs, shard_index)
   defp keydir(_instance_ctx, shard_index), do: :"keydir_#{shard_index}"
-
-  defp keydir(_instance_ctx, _shard_index, override)
-       when (is_atom(override) and not is_nil(override)) or is_reference(override),
-       do: override
-
-  defp keydir(instance_ctx, shard_index, _override), do: keydir(instance_ctx, shard_index)
 
   defp instance_name(%{name: name}), do: name
   defp instance_name(_instance_ctx), do: :default

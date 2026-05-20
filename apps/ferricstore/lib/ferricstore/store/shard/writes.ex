@@ -5,12 +5,12 @@ defmodule Ferricstore.Store.Shard.Writes do
   These handlers remain for custom/direct instances and for the staged migration
   away from using `Shard` as a pass-through default quorum write proxy. For the
   default application instance, write ingress should go through
-  `Ferricstore.Raft.Batcher` and be serialized by
-  `Ferricstore.Raft.StateMachine.apply/3`.
+  `Ferricstore.Store.Router` or `Ferricstore.Raft.Backend` and be serialized by
+  the selected Raft state machine.
 
   Do not add new default-instance write paths here. If a command is durable and
-  user-visible, route it to the Batcher so read-modify-write behavior is decided
-  in Raft apply order.
+  user-visible, route it to the Raft backend so read-modify-write behavior is
+  decided in apply order.
   """
 
   alias Ferricstore.Bitcask.NIF
