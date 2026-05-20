@@ -32,6 +32,7 @@ defmodule Ferricstore.Test.MockStore do
     bloom_registry = make_registry(bloom_pid, prob_dir, ".bloom")
 
     %{
+      __flow_default_instance__: true,
       cms_registry: cms_registry,
       cuckoo_registry: cuckoo_registry,
       bloom_registry: bloom_registry,

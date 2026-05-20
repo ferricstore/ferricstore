@@ -109,7 +109,12 @@ struct LmdbStore {
     db: heed::Database<heed::types::Bytes, heed::types::Bytes>,
 }
 
-static LMDB_STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<LmdbStore>>>> =
+struct CachedLmdbStore {
+    map_size: usize,
+    store: Arc<LmdbStore>,
+}
+
+static LMDB_STORES: OnceLock<Mutex<std::collections::HashMap<String, CachedLmdbStore>>> =
     OnceLock::new();
 
 #[allow(non_local_definitions)]
@@ -2109,18 +2114,23 @@ fn v2_append_ops_batch_nosync<'a>(
 
 fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
     let stores = LMDB_STORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
 
-    {
-        let guard = stores
-            .lock()
-            .map_err(|_| "lmdb cache poisoned".to_string())?;
-        if let Some(store) = guard.get(path) {
-            return Ok(Arc::clone(store));
+    let mut guard = stores
+        .lock()
+        .map_err(|_| "lmdb cache poisoned".to_string())?;
+
+    if let Some(cached) = guard.get(path) {
+        if cached.map_size != map_size {
+            return Err(format!(
+                "lmdb map_size mismatch for cached path: requested {map_size}, existing {}",
+                cached.map_size
+            ));
         }
+        return Ok(Arc::clone(&cached.store));
     }
 
     std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-    let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
 
     let env = unsafe {
         heed::EnvOpenOptions::new()
@@ -2137,12 +2147,14 @@ fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
     wtxn.commit().map_err(|e| e.to_string())?;
 
     let store = Arc::new(LmdbStore { env, db });
-    let mut guard = stores
-        .lock()
-        .map_err(|_| "lmdb cache poisoned".to_string())?;
-    Ok(Arc::clone(
-        guard.entry(path.to_string()).or_insert_with(|| store),
-    ))
+    guard.insert(
+        path.to_string(),
+        CachedLmdbStore {
+            map_size,
+            store: Arc::clone(&store),
+        },
+    );
+    Ok(store)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -3314,6 +3326,23 @@ mod audit_fix_tests {
         // Verify unwrap_or_else recovers the inner value
         let guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(*guard, 42, "recovered value must be intact");
+    }
+
+    #[test]
+    fn lmdb_store_rejects_cached_path_with_different_map_size() {
+        let dir = tmp();
+        let path = dir.path().join("lmdb-cache-map-size");
+        let path = path.to_string_lossy().to_string();
+
+        assert!(
+            lmdb_store(&path, 8 * 1024 * 1024).is_ok(),
+            "first LMDB open should succeed"
+        );
+
+        match lmdb_store(&path, 16 * 1024 * 1024) {
+            Ok(_) => panic!("cached LMDB path reopened with different map_size"),
+            Err(err) => assert!(err.contains("map_size"), "unexpected error: {err}"),
+        }
     }
 }
 

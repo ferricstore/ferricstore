@@ -330,5 +330,98 @@ defmodule Ferricstore.Commands.CatalogTest do
     test "handles empty args for no-key command" do
       assert {:ok, []} = Catalog.get_keys("COMMAND", [])
     end
+
+    test "flow broad-scan commands without partition report coordinator keys" do
+      assert {:ok, ["email"]} =
+               Catalog.get_keys("FLOW.CLAIM_DUE", [
+                 "email",
+                 "WORKER",
+                 "w1",
+                 "LEASE_MS",
+                 "30000",
+                 "LIMIT",
+                 "100"
+               ])
+
+      assert {:ok, ["email"]} = Catalog.get_keys("FLOW.RECLAIM", ["email", "WORKER", "w1"])
+      assert {:ok, ["email"]} = Catalog.get_keys("FLOW.LIST", ["email"])
+      assert {:ok, ["parent-1"]} = Catalog.get_keys("FLOW.BY_PARENT", ["parent-1"])
+      assert {:ok, ["email"]} =
+               Catalog.get_keys("FLOW.CLAIM_DUE", ["email", "PARTITION", "GLOBAL", "WORKER", "w1"])
+
+      assert {:ok, ["parent-1"]} =
+               Catalog.get_keys("FLOW.BY_PARENT", ["parent-1", "PARTITION", "GLOBAL"])
+    end
+
+    test "flow broad-scan commands with explicit partitions report partition keys" do
+      assert {:ok, ["p1", "p2"]} =
+               Catalog.get_keys("FLOW.CLAIM_DUE", [
+                 "email",
+                 "PARTITIONS",
+                 "2",
+                 "p1",
+                 "p2",
+                 "WORKER",
+                 "w1"
+               ])
+
+      assert {:ok, ["tenant-a"]} =
+               Catalog.get_keys("FLOW.BY_PARENT", ["parent-1", "PARTITION", "tenant-a"])
+    end
+
+    test "flow single-partition read commands reject partitions option in getkeys" do
+      for command <- [
+            "FLOW.LIST",
+            "FLOW.TERMINALS",
+            "FLOW.FAILURES",
+            "FLOW.INFO",
+            "FLOW.STUCK",
+            "FLOW.BY_PARENT",
+            "FLOW.BY_ROOT",
+            "FLOW.BY_CORRELATION"
+          ] do
+        assert {:error, reason} = Catalog.get_keys(command, ["email", "PARTITIONS", "2", "p1", "p2"])
+        assert reason =~ "supports PARTITION, not PARTITIONS"
+      end
+
+      for args <- [
+            ["email", "NOPAYLOAD", "PARTITIONS", "2", "p1", "p2"],
+            ["email", "PAYLOAD", "false", "PARTITIONS", "2", "p1", "p2"],
+            ["email", "FULL", "true", "PARTITIONS", "2", "p1", "p2"]
+          ] do
+        assert {:error, reason} = Catalog.get_keys("FLOW.INFO", args)
+        assert reason =~ "supports PARTITION, not PARTITIONS"
+      end
+    end
+
+    test "flow command info arities match parser minimums" do
+      assert {:ok, %{arity: -2}} = Catalog.lookup("flow.value.put")
+      assert {:ok, %{arity: -6}} = Catalog.lookup("flow.spawn_children")
+      assert {:ok, %{arity: -5}} = Catalog.lookup("flow.cancel_many")
+      assert {:ok, %{arity: -4}} = Catalog.lookup("flow.reclaim")
+    end
+
+    test "flow dynamic-key commands are cataloged as movable keys" do
+      for name <- [
+            "flow.claim_due",
+            "flow.reclaim",
+            "flow.list",
+            "flow.by_parent",
+            "flow.by_root",
+            "flow.by_correlation",
+            "flow.info",
+            "flow.stuck"
+          ] do
+        assert {:ok, %{flags: flags}} = Catalog.lookup(name)
+        assert "movablekeys" in flags
+      end
+    end
+
+    test "flow signal and value commands are in command catalog" do
+      for name <- ["flow.signal", "flow.value.put", "flow.value.mget"] do
+        assert {:ok, %{name: ^name}} = Catalog.lookup(name)
+        assert name in Catalog.names()
+      end
+    end
   end
 end

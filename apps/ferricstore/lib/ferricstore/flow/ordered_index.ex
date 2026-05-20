@@ -332,7 +332,9 @@ defmodule Ferricstore.Flow.OrderedIndex do
   end
 
   defp due_key?(key) when is_binary(key) do
-    String.starts_with?(key, "f:{f") and match?({_pos, _len}, :binary.match(key, "}:d:"))
+    String.starts_with?(key, "f:{f") and
+      (match?({_pos, _len}, :binary.match(key, "}:d:")) or
+         match?({_pos, _len}, :binary.match(key, "}:da:")))
   end
 
   defp due_key?(_key), do: false

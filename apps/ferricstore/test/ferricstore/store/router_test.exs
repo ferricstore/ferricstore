@@ -135,7 +135,7 @@ defmodule Ferricstore.Store.RouterTest do
       assert {:ok, 2} = Router.incr(ctx, key, 1)
       assert :ok = Router.delete(ctx, key)
 
-      assert shard_write_version(shard) == before_version
+      assert shard_write_version(shard) >= before_version + 3
     end
 
     test "compound marker writes use state-machine command shapes" do
@@ -161,7 +161,22 @@ defmodule Ferricstore.Store.RouterTest do
       assert :ok = Router.compound_batch_delete(ctx, key, Enum.map(entries, &elem(&1, 0)))
       assert [nil, nil] = Router.compound_batch_get(ctx, key, Enum.map(entries, &elem(&1, 0)))
 
-      assert shard_write_version(shard) == before_version
+      assert shard_write_version(shard) >= before_version + 4
+    end
+
+    test "compound_scan with limit returns only latest sorted prefix entries" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "router_compound_scan_limit:" <> Integer.to_string(System.unique_integer([:positive]))
+      prefix = "H:" <> key <> <<0>>
+
+      entries =
+        for field <- ["a", "b", "c"] do
+          {prefix <> field, field, 0}
+        end
+
+      assert :ok = Router.compound_batch_put(ctx, key, entries)
+
+      assert [{"b", "b"}, {"c", "c"}] == Router.compound_scan(ctx, key, prefix, 2)
     end
   end
 

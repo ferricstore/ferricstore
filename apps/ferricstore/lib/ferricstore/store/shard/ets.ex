@@ -423,7 +423,20 @@ defmodule Ferricstore.Store.Shard.ETS do
   def prefix_scan_entries(keydir, prefix, shard_data_path),
     do: do_prefix_scan_entries(nil, keydir, prefix, shard_data_path)
 
-  defp do_prefix_scan_entries(state, keydir, prefix, shard_data_path) do
+  def prefix_scan_entries(_state, _prefix, _shard_data_path, limit)
+      when not is_integer(limit) or limit <= 0,
+      do: []
+
+  def prefix_scan_entries(%{keydir: keydir} = state, prefix, shard_data_path, limit),
+    do: do_prefix_scan_entries(state, keydir, prefix, shard_data_path, limit)
+
+  def prefix_scan_entries(keydir, prefix, shard_data_path, limit),
+    do: do_prefix_scan_entries(nil, keydir, prefix, shard_data_path, limit)
+
+  defp do_prefix_scan_entries(state, keydir, prefix, shard_data_path),
+    do: do_prefix_scan_entries(state, keydir, prefix, shard_data_path, :all)
+
+  defp do_prefix_scan_entries(state, keydir, prefix, shard_data_path, limit) do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     # Select all 7-tuple fields so we can cold-read nil values
@@ -437,7 +450,9 @@ defmodule Ferricstore.Store.Shard.ETS do
     ]
 
     {tokens, {cold_entries, _cold_count}} =
-      :ets.select(keydir, ms)
+      keydir
+      |> :ets.select(ms)
+      |> maybe_limit_prefix_scan(limit)
       |> Enum.reduce({[], {[], 0}}, fn {key, value, exp, fid, off, vsize},
                                        {tokens, {cold_entries, cold_count}} ->
         cond do
@@ -481,6 +496,14 @@ defmodule Ferricstore.Store.Shard.ETS do
           result -> [result]
         end
     end)
+  end
+
+  defp maybe_limit_prefix_scan(entries, :all), do: entries
+
+  defp maybe_limit_prefix_scan(entries, limit) do
+    entries
+    |> Enum.sort_by(fn {key, _value, _exp, _fid, _off, _vsize} -> key end)
+    |> Enum.take(-limit)
   end
 
   defp prefix_field(key) do

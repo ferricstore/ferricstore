@@ -617,6 +617,32 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_scan(binary(), binary(), map(), non_neg_integer()) ::
+          {:reply, [{binary(), binary()}], map()}
+  @doc false
+  def handle_compound_scan(_redis_key, _prefix, state, limit)
+      when not is_integer(limit) or limit <= 0,
+      do: {:reply, [], state}
+
+  def handle_compound_scan(redis_key, prefix, state, limit) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        state =
+          if ShardETS.prefix_has_pending_cold?(state.keydir, prefix) do
+            ShardFlush.flush_pending_for_read(state)
+          else
+            state
+          end
+
+        results = ShardETS.prefix_scan_entries(state, prefix, state.shard_data_path, limit)
+        {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
+
+      dedicated_path ->
+        results = ShardETS.prefix_scan_entries(state, prefix, dedicated_path, limit)
+        {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
+    end
+  end
+
   @spec handle_compound_count(binary(), binary(), map()) :: {:reply, non_neg_integer(), map()}
   @doc false
   def handle_compound_count(redis_key, prefix, state) do
@@ -2196,8 +2222,23 @@ defmodule Ferricstore.Store.Shard.Compound do
     )
   end
 
-  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_side_channel_threshold(%{instance_ctx: ctx} = state) do
+    effective_blob_threshold(BlobValue.threshold(ctx), ShardETS.hot_cache_threshold(state))
+  end
+
   defp blob_side_channel_threshold(_state), do: 0
+
+  defp effective_blob_threshold(blob_threshold, hot_cache_threshold)
+       when is_integer(blob_threshold) and blob_threshold > 0 and is_integer(hot_cache_threshold) and
+              hot_cache_threshold > 0 do
+    min(blob_threshold, hot_cache_threshold)
+  end
+
+  defp effective_blob_threshold(blob_threshold, _hot_cache_threshold)
+       when is_integer(blob_threshold) and blob_threshold > 0,
+       do: blob_threshold
+
+  defp effective_blob_threshold(_blob_threshold, _hot_cache_threshold), do: 0
 
   # -- Off-heap binary byte tracking --
 

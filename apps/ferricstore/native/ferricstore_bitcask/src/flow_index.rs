@@ -224,7 +224,10 @@ pub fn flow_index_score_of<'a>(
 ) -> NifResult<Term<'a>> {
     let index = resource.inner.lock().expect("flow index mutex poisoned");
 
-    match index.lookup.get(&(key.as_slice().to_vec(), member.as_slice().to_vec())) {
+    match index
+        .lookup
+        .get(&(key.as_slice().to_vec(), member.as_slice().to_vec()))
+    {
         Some(score) => Ok((crate::atoms::ok(), *score).encode(env)),
         None => Ok(crate::atoms::miss().encode(env)),
     }
@@ -280,10 +283,7 @@ pub fn flow_index_claim_due_candidates<'a>(
     max_scan: usize,
 ) -> NifResult<Term<'a>> {
     let index = resource.inner.lock().expect("flow index mutex poisoned");
-    let key_refs = keys
-        .iter()
-        .map(|key| key.as_slice())
-        .collect::<Vec<_>>();
+    let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
     let rows = index.claim_due_candidates(&key_refs, max_score, limit, max_scan);
 
     encode_owned_key_member_scores(env, rows)
@@ -295,7 +295,12 @@ pub fn flow_index_count_all<'a>(
     key: Binary<'a>,
 ) -> i64 {
     let index = resource.inner.lock().expect("flow index mutex poisoned");
-    index.counts.get(key.as_slice()).copied().unwrap_or(0).max(0)
+    index
+        .counts
+        .get(key.as_slice())
+        .copied()
+        .unwrap_or(0)
+        .max(0)
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -306,7 +311,14 @@ pub fn flow_index_count_many<'a>(
     let index = resource.inner.lock().expect("flow index mutex poisoned");
 
     keys.into_iter()
-        .map(|key| index.counts.get(key.as_slice()).copied().unwrap_or(0).max(0))
+        .map(|key| {
+            index
+                .counts
+                .get(key.as_slice())
+                .copied()
+                .unwrap_or(0)
+                .max(0)
+        })
         .collect()
 }
 
@@ -319,7 +331,13 @@ pub fn flow_index_count_keys<'a>(
     let keys = index
         .counts
         .iter()
-        .filter_map(|(key, count)| if *count > 0 { Some(key.as_slice()) } else { None })
+        .filter_map(|(key, count)| {
+            if *count > 0 {
+                Some(key.as_slice())
+            } else {
+                None
+            }
+        })
         .collect::<Vec<_>>();
 
     encode_binaries(env, keys)
@@ -504,7 +522,9 @@ pub fn flow_record_plan_claims<'a>(
     let flow_type = flow_type.as_slice();
     let expected_state = expected_state.as_slice();
     let worker = worker.as_slice();
-    let deadline_ms = now_ms.saturating_add(lease_ms);
+    let Some(deadline_ms) = now_ms.checked_add(lease_ms) else {
+        return Ok(crate::atoms::fallback().encode(env));
+    };
     let plan_capacity = remaining.min(candidates.len());
     let mut plan_terms = Vec::with_capacity(plan_capacity);
     let mut stale_terms = Vec::new();
@@ -531,7 +551,7 @@ pub fn flow_record_plan_claims<'a>(
         }
 
         if record.flow_type != flow_type {
-            continue;
+            return Ok(crate::atoms::fallback().encode(env));
         }
 
         if record.state != expected_state {
@@ -544,11 +564,11 @@ pub fn flow_record_plan_claims<'a>(
         }
 
         let Some(next_run_at_ms) = record.next_run_at_ms else {
-            continue;
+            return Ok(crate::atoms::fallback().encode(env));
         };
 
         if next_run_at_ms > now_ms {
-            continue;
+            return Ok(crate::atoms::fallback().encode(env));
         }
 
         let Some(version) = record.version else {
@@ -564,10 +584,14 @@ pub fn flow_record_plan_claims<'a>(
             return Ok(crate::atoms::fallback().encode(env));
         }
 
-        let next_version = version.saturating_add(1);
-        let next_fencing_token = fencing_token.saturating_add(1);
+        let Some(next_version) = version.checked_add(1) else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
+        let Some(next_fencing_token) = fencing_token.checked_add(1) else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
         let lease_token = claim_lease_token(worker, now_ms, next_fencing_token);
-        let next_value = encode_claimed_record(
+        let Some(next_value) = encode_claimed_record(
             &record,
             worker,
             &lease_token,
@@ -575,7 +599,9 @@ pub fn flow_record_plan_claims<'a>(
             now_ms,
             next_version,
             next_fencing_token,
-        );
+        ) else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
 
         let mut state_key = Vec::with_capacity(state_key_prefix.as_slice().len() + id.len());
         state_key.extend_from_slice(state_key_prefix.as_slice());
@@ -602,15 +628,17 @@ pub fn flow_record_plan_claims<'a>(
             worker_key.clone(),
             deadline_score,
         )
-            .encode(env);
+        .encode(env);
 
-        plan_terms.push((
-            next_value_term,
-            entry_term,
-            state_key_term,
-            previous_history_ms,
-        )
-            .encode(env));
+        plan_terms.push(
+            (
+                next_value_term,
+                entry_term,
+                state_key_term,
+                previous_history_ms,
+            )
+                .encode(env),
+        );
         accepted += 1;
     }
 
@@ -675,18 +703,18 @@ pub fn flow_record_encode<'a>(
     encode_bin(&mut out, optional_bin_slice(id.as_ref()));
     encode_bin(&mut out, optional_bin_slice(flow_type.as_ref()));
     encode_bin(&mut out, optional_bin_slice(state.as_ref()));
-    encode_int(&mut out, version);
-    encode_int(&mut out, attempts);
-    encode_int(&mut out, fencing_token);
-    encode_int(&mut out, created_at_ms);
-    encode_int(&mut out, updated_at_ms);
-    encode_int(&mut out, next_run_at_ms);
-    encode_int(&mut out, priority);
-    encode_int(&mut out, ttl_ms);
-    encode_int(&mut out, history_hot_max_events);
-    encode_int(&mut out, history_max_events);
-    encode_int(&mut out, retention_ttl_ms);
-    encode_int(&mut out, terminal_retention_until_ms);
+    encode_int_nif(&mut out, version)?;
+    encode_int_nif(&mut out, attempts)?;
+    encode_int_nif(&mut out, fencing_token)?;
+    encode_int_nif(&mut out, created_at_ms)?;
+    encode_int_nif(&mut out, updated_at_ms)?;
+    encode_int_nif(&mut out, next_run_at_ms)?;
+    encode_int_nif(&mut out, priority)?;
+    encode_int_nif(&mut out, ttl_ms)?;
+    encode_int_nif(&mut out, history_hot_max_events)?;
+    encode_int_nif(&mut out, history_max_events)?;
+    encode_int_nif(&mut out, retention_ttl_ms)?;
+    encode_int_nif(&mut out, terminal_retention_until_ms)?;
     encode_bin(&mut out, optional_bin_slice(partition_key.as_ref()));
     encode_bin(&mut out, optional_bin_slice(payload_ref.as_ref()));
     encode_bin(&mut out, optional_bin_slice(parent_flow_id.as_ref()));
@@ -697,7 +725,7 @@ pub fn flow_record_encode<'a>(
     encode_bin(&mut out, optional_bin_slice(error_ref.as_ref()));
     encode_bin(&mut out, optional_bin_slice(lease_owner.as_ref()));
     encode_bin(&mut out, optional_bin_slice(lease_token.as_ref()));
-    encode_int(&mut out, lease_deadline_ms);
+    encode_int_nif(&mut out, lease_deadline_ms)?;
     encode_bin(&mut out, optional_bin_slice(run_state.as_ref()));
     encode_bin(&mut out, optional_bin_slice(rewound_to_event_id.as_ref()));
     out.extend_from_slice(child_groups_encoded.as_slice());
@@ -807,18 +835,18 @@ pub fn flow_history_encode<'a>(
 
     out.extend_from_slice(FLOW_HISTORY_MAGIC);
     encode_bin(&mut out, Some(event.as_slice()));
-    encode_int(&mut out, version);
-    encode_int(&mut out, now_ms);
+    encode_int_nif(&mut out, version)?;
+    encode_int_nif(&mut out, now_ms)?;
     encode_bin(&mut out, optional_bin_slice(id.as_ref()));
     encode_bin(&mut out, optional_bin_slice(flow_type.as_ref()));
     encode_bin(&mut out, optional_bin_slice(state.as_ref()));
-    encode_int(&mut out, priority);
-    encode_int(&mut out, attempts);
-    encode_int(&mut out, fencing_token);
-    encode_int(&mut out, created_at_ms);
-    encode_int(&mut out, updated_at_ms);
-    encode_int(&mut out, next_run_at_ms);
-    encode_int(&mut out, lease_deadline_ms);
+    encode_int_nif(&mut out, priority)?;
+    encode_int_nif(&mut out, attempts)?;
+    encode_int_nif(&mut out, fencing_token)?;
+    encode_int_nif(&mut out, created_at_ms)?;
+    encode_int_nif(&mut out, updated_at_ms)?;
+    encode_int_nif(&mut out, next_run_at_ms)?;
+    encode_int_nif(&mut out, lease_deadline_ms)?;
     encode_bin(&mut out, optional_bin_slice(lease_owner.as_ref()));
     encode_bin(&mut out, optional_bin_slice(payload_ref.as_ref()));
     encode_bin(&mut out, optional_bin_slice(parent_flow_id.as_ref()));
@@ -910,8 +938,14 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
         return Ok(crate::atoms::error().encode(env));
     };
 
-    let mut fields =
-        Vec::with_capacity(42usize.saturating_add(usize::try_from(meta_count).unwrap_or(0) * 2));
+    let Some(capacity) = history_fields_capacity(meta_count, rest.len()) else {
+        return Ok(crate::atoms::error().encode(env));
+    };
+    let Ok(meta_count) = usize::try_from(meta_count) else {
+        return Ok(crate::atoms::error().encode(env));
+    };
+
+    let mut fields = Vec::with_capacity(capacity);
     push_history_binary_field(env, &mut fields, b"event", event)?;
     push_history_int_field(env, &mut fields, b"version", version, false)?;
     push_history_int_field(env, &mut fields, b"at", at, false)?;
@@ -939,7 +973,12 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
         b"parent_flow_id",
         parent_flow_id.unwrap_or(&[]),
     )?;
-    push_history_binary_field(env, &mut fields, b"root_flow_id", root_flow_id.unwrap_or(&[]))?;
+    push_history_binary_field(
+        env,
+        &mut fields,
+        b"root_flow_id",
+        root_flow_id.unwrap_or(&[]),
+    )?;
     push_history_binary_field(
         env,
         &mut fields,
@@ -1044,30 +1083,47 @@ impl FlowOrderedIndex {
 
     fn move_member(&mut self, from_key: &[u8], to_key: &[u8], member: &[u8], score: f64) {
         if from_key == to_key {
-            if let Some(old_score) = self.lookup.get(&(from_key.to_vec(), member.to_vec())).copied()
-            {
-                self.ordered.remove(&OrderedEntry {
-                    key: from_key.to_vec(),
-                    score: Score(old_score),
-                    member: member.to_vec(),
-                });
-            }
+            let Some(old_score) = self
+                .lookup
+                .get(&(from_key.to_vec(), member.to_vec()))
+                .copied()
+            else {
+                return;
+            };
 
-            self.put(to_key, member, score, false);
+            self.ordered.remove(&OrderedEntry {
+                key: from_key.to_vec(),
+                score: Score(old_score),
+                member: member.to_vec(),
+            });
+
+            self.ordered.insert(OrderedEntry {
+                key: to_key.to_vec(),
+                score: Score(score),
+                member: member.to_vec(),
+            });
+            self.lookup
+                .insert((to_key.to_vec(), member.to_vec()), score);
             return;
         }
 
-        let _source_exists = self.delete(from_key, member).is_some();
-        let _destination_exists = self.delete(to_key, member).is_some();
+        if self.delete(from_key, member).is_none() {
+            return;
+        }
+
+        let destination_exists = self.delete_without_count(to_key, member);
 
         self.ordered.insert(OrderedEntry {
             key: to_key.to_vec(),
             score: Score(score),
             member: member.to_vec(),
         });
-        self.lookup.insert((to_key.to_vec(), member.to_vec()), score);
+        self.lookup
+            .insert((to_key.to_vec(), member.to_vec()), score);
 
-        self.increment_count(to_key, 1);
+        if !destination_exists {
+            self.increment_count(to_key, 1);
+        }
     }
 
     fn increment_count(&mut self, key: &[u8], delta: i64) {
@@ -1106,10 +1162,26 @@ impl FlowOrderedIndex {
         let mut rows = Vec::new();
         let mut skipped = 0usize;
         let unlimited = count < 0;
-        let limit = if unlimited { usize::MAX } else { count as usize };
+        let limit = if unlimited {
+            usize::MAX
+        } else {
+            count as usize
+        };
+        let lower = OrderedEntry {
+            key: key.to_vec(),
+            score: Score(f64::NEG_INFINITY),
+            member: Vec::new(),
+        };
+        let mut upper_key = key.to_vec();
+        upper_key.push(0);
+        let upper = OrderedEntry {
+            key: upper_key,
+            score: Score(f64::NEG_INFINITY),
+            member: Vec::new(),
+        };
 
         if reverse {
-            for entry in self.ordered.iter().rev() {
+            for entry in self.ordered.range(lower..upper).rev() {
                 if entry.key.as_slice() != key {
                     continue;
                 }
@@ -1130,7 +1202,7 @@ impl FlowOrderedIndex {
                 rows.push((entry.member.as_slice(), entry.score.0));
             }
         } else {
-            for entry in &self.ordered {
+            for entry in self.ordered.range(lower..upper) {
                 if entry.key.as_slice() != key {
                     continue;
                 }
@@ -1289,7 +1361,7 @@ impl Bound {
 }
 
 fn due_key(key: &[u8]) -> bool {
-    key.starts_with(b"f:{f")
+    (key.starts_with(b"f:{f") || key.starts_with(b"f:{fa:"))
         && (key.windows(4).any(|window| window == b"}:d:")
             || key.windows(5).any(|window| window == b"}:da:"))
 }
@@ -1489,24 +1561,24 @@ fn encode_claimed_record(
     now_ms: u64,
     next_version: u64,
     next_fencing_token: u64,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(estimate_claimed_record_size(record, worker, lease_token));
     out.extend_from_slice(FLOW_RECORD_MAGIC);
     encode_bin(&mut out, Some(record.id));
     encode_bin(&mut out, Some(record.flow_type));
     encode_bin(&mut out, Some(RUNNING_STATE));
-    encode_int(&mut out, Some(next_version));
-    encode_int(&mut out, record.attempts);
-    encode_int(&mut out, Some(next_fencing_token));
-    encode_int(&mut out, record.created_at_ms);
-    encode_int(&mut out, Some(now_ms));
-    encode_int(&mut out, Some(deadline_ms));
-    encode_int(&mut out, record.priority);
-    encode_int(&mut out, None);
-    encode_int(&mut out, record.history_hot_max_events);
-    encode_int(&mut out, record.history_max_events);
-    encode_int(&mut out, record.retention_ttl_ms);
-    encode_int(&mut out, None);
+    encode_int_option(&mut out, Some(next_version))?;
+    encode_int_option(&mut out, record.attempts)?;
+    encode_int_option(&mut out, Some(next_fencing_token))?;
+    encode_int_option(&mut out, record.created_at_ms)?;
+    encode_int_option(&mut out, Some(now_ms))?;
+    encode_int_option(&mut out, Some(deadline_ms))?;
+    encode_int_option(&mut out, record.priority)?;
+    encode_int_option(&mut out, None)?;
+    encode_int_option(&mut out, record.history_hot_max_events)?;
+    encode_int_option(&mut out, record.history_max_events)?;
+    encode_int_option(&mut out, record.retention_ttl_ms)?;
+    encode_int_option(&mut out, None)?;
     encode_bin(&mut out, record.partition_key);
     encode_bin(&mut out, record.payload_ref);
     encode_bin(&mut out, record.parent_flow_id);
@@ -1517,11 +1589,11 @@ fn encode_claimed_record(
     encode_bin(&mut out, record.error_ref);
     encode_bin(&mut out, Some(worker));
     encode_bin(&mut out, Some(lease_token));
-    encode_int(&mut out, Some(deadline_ms));
+    encode_int_option(&mut out, Some(deadline_ms))?;
     encode_bin(&mut out, Some(flow_claim_run_state(record)));
     encode_bin(&mut out, record.rewound_to_event_id);
     out.extend_from_slice(record.child_groups_encoded);
-    out
+    Some(out)
 }
 
 fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -1533,11 +1605,16 @@ fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-fn encode_int(out: &mut Vec<u8>, value: Option<u64>) {
+fn encode_int_nif(out: &mut Vec<u8>, value: Option<u64>) -> NifResult<()> {
+    encode_int_option(out, value).ok_or_else(|| rustler::Error::Term(Box::new("integer_too_large")))
+}
+
+fn encode_int_option(out: &mut Vec<u8>, value: Option<u64>) -> Option<()> {
     match value {
-        Some(value) => encode_varint(out, value.saturating_add(1)),
+        Some(value) => encode_varint(out, value.checked_add(1)?),
         None => out.push(0),
     }
+    Some(())
 }
 
 fn encode_bin(out: &mut Vec<u8>, value: Option<&[u8]>) {
@@ -1562,6 +1639,97 @@ fn option_binary_term<'a>(env: Env<'a>, value: Option<&[u8]>) -> NifResult<Term<
     match value {
         Some(value) => binary_term(env, value),
         None => Ok(crate::atoms::nil().encode(env)),
+    }
+}
+
+fn history_fields_capacity(meta_count: u64, remaining_bytes: usize) -> Option<usize> {
+    let meta_count = usize::try_from(meta_count).ok()?;
+    let minimum_meta_bytes = meta_count.checked_mul(2)?;
+
+    if minimum_meta_bytes > remaining_bytes {
+        return None;
+    }
+
+    42usize.checked_add(meta_count.checked_mul(2)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_fields_capacity_rejects_counts_that_cannot_fit_remaining_input() {
+        assert_eq!(history_fields_capacity(1_000_000, 0), None);
+        assert_eq!(history_fields_capacity(u64::MAX, usize::MAX), None);
+    }
+
+    #[test]
+    fn history_fields_capacity_accepts_bounded_metadata_count() {
+        assert_eq!(history_fields_capacity(2, 8), Some(46));
+    }
+
+    #[test]
+    fn due_key_matches_user_and_auto_partition_due_indexes() {
+        assert!(due_key(b"f:{f:tenant-a}:d:checkout:queued:p0"));
+        assert!(due_key(b"f:{f:tenant-a}:da:checkout:p0"));
+        assert!(due_key(b"f:{fa:42}:d:checkout:queued:p0"));
+        assert!(due_key(b"f:{fa:42}:da:checkout:p0"));
+
+        assert!(!due_key(b"f:{f:tenant-a}:s:flow-1"));
+        assert!(!due_key(b"f:{fa:42}:s:flow-1"));
+        assert!(!due_key(b"z:{tenant-a}:d:checkout:queued:p0"));
+    }
+
+    #[test]
+    fn encode_int_rejects_unrepresentable_u64_max() {
+        let mut out = Vec::new();
+
+        assert_eq!(encode_int_option(&mut out, Some(u64::MAX)), None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn encode_int_round_trips_largest_representable_value() {
+        let mut out = Vec::new();
+
+        assert_eq!(encode_int_option(&mut out, Some(u64::MAX - 1)), Some(()));
+        assert_eq!(decode_int(&out), Some((Some(u64::MAX - 1), [].as_slice())));
+    }
+
+    #[test]
+    fn move_member_noops_when_source_missing() {
+        let mut index = FlowOrderedIndex::default();
+
+        index.move_member(b"from", b"to", b"member", 123.0);
+
+        assert_eq!(index.lookup.get(&(b"to".to_vec(), b"member".to_vec())), None);
+        assert_eq!(index.counts.get(b"to".as_slice()).copied(), None);
+    }
+
+    #[test]
+    fn move_member_same_key_noops_when_member_missing() {
+        let mut index = FlowOrderedIndex::default();
+
+        index.move_member(b"key", b"key", b"member", 123.0);
+
+        assert_eq!(index.lookup.get(&(b"key".to_vec(), b"member".to_vec())), None);
+        assert_eq!(index.counts.get(b"key".as_slice()).copied(), None);
+    }
+
+    #[test]
+    fn move_member_keeps_destination_count_when_destination_exists() {
+        let mut index = FlowOrderedIndex::default();
+
+        index.put(b"from", b"member", 1.0, false);
+        index.put(b"to", b"member", 2.0, false);
+        index.move_member(b"from", b"to", b"member", 123.0);
+
+        assert_eq!(
+            index.lookup.get(&(b"to".to_vec(), b"member".to_vec())),
+            Some(&123.0)
+        );
+        assert_eq!(index.counts.get(b"from".as_slice()).copied(), Some(0));
+        assert_eq!(index.counts.get(b"to".as_slice()).copied(), Some(1));
     }
 }
 

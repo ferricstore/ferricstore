@@ -12,7 +12,9 @@ defmodule FerricstoreServer.Connection.Store do
 
     %{
       raw
-      | get: fn key -> raw.get.(ns <> key) end,
+      | __sandbox_namespace__: ns,
+        __flow_default_instance__: false,
+        get: fn key -> raw.get.(ns <> key) end,
         get_meta: fn key -> raw.get_meta.(ns <> key) end,
         batch_get: fn keys -> raw.batch_get.(namespace_keys(ns, keys)) end,
         value_size: fn key -> raw.value_size.(ns <> key) end,
@@ -119,6 +121,8 @@ defmodule FerricstoreServer.Connection.Store do
   defp raw_store_complete?(store, ctx) do
     Map.get(store, :__ctx_identity__) == raw_store_identity(ctx) and
       Map.get(store, :__instance_ctx__) == ctx and
+      Map.has_key?(store, :__sandbox_namespace__) and
+      Map.has_key?(store, :__flow_default_instance__) and
       is_function(Map.get(store, :batch_get), 1) and
       is_function(Map.get(store, :value_size), 1) and
       is_function(Map.get(store, :object_lfu), 1) and
@@ -146,6 +150,8 @@ defmodule FerricstoreServer.Connection.Store do
     %{
       __ctx_identity__: raw_store_identity(ctx),
       __instance_ctx__: ctx,
+      __sandbox_namespace__: nil,
+      __flow_default_instance__: false,
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,

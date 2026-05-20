@@ -1712,6 +1712,41 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   ]}, ["tenant-a"]},
                 {:command, "FLOW.VALUE.MGET", ["ref-a", "ref-b"],
                  {:flow_value_mget, ["ref-a", "ref-b"]}, ["ref-a", "ref-b"]},
+                {:command, "FLOW.SIGNAL",
+                 [
+                   "flow-1",
+                   "PARTITION",
+                   "tenant-a",
+                   "SIGNAL",
+                   "payment_received",
+                   "IDEMPOTENCY",
+                   "stripe_evt_1",
+                   "IF_STATE",
+                   "manual_review",
+                   "IF_STATE",
+                   "waiting_payment",
+                   "TRANSITION_TO",
+                   "verify_payment",
+                   "RUN_AT",
+                   "1250",
+                   "NOW",
+                   "1100",
+                   "VALUE",
+                   "payment_event",
+                   "payment-bytes"
+                 ],
+                 {:flow_signal, "flow-1",
+                  [
+                    partition_key: "tenant-a",
+                    signal: "payment_received",
+                    idempotency_key: "stripe_evt_1",
+                    if_state: "manual_review",
+                    if_state: "waiting_payment",
+                    transition_to: "verify_payment",
+                    run_at_ms: 1250,
+                    now_ms: 1100,
+                    values: [{"payment_event", "payment-bytes"}]
+                  ]}, ["tenant-a"]},
                 {:command, "FLOW.CLAIM_DUE",
                  [
                    "checkout",
@@ -1802,12 +1837,13 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   ]}, ["flow-1"]}
               ], ""} =
                Parser.parse_commands(
-                 "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a RETENTION_TTL 5000 HISTORY_MAX_EVENTS 10 IDEMPOTENT true\r\n" <>
-                   "flow.value.put shared-payload PARTITION tenant-a OWNER_FLOW_ID flow-1 NAME order OVERRIDE true\r\n" <>
-                   "flow.value.mget ref-a ref-b\r\n" <>
-                   "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
-                   "flow.reclaim checkout WORKER worker-b LEASE_MS 30000 LIMIT 10 NOW 2000\r\n" <>
-                   "flow.complete flow-1 lease-1 FENCING 1 RESULT result-1\r\n" <>
+                  "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a RETENTION_TTL 5000 HISTORY_MAX_EVENTS 10 IDEMPOTENT true\r\n" <>
+                    "flow.value.put shared-payload PARTITION tenant-a OWNER_FLOW_ID flow-1 NAME order OVERRIDE true\r\n" <>
+                    "flow.value.mget ref-a ref-b\r\n" <>
+                    "flow.signal flow-1 PARTITION tenant-a SIGNAL payment_received IDEMPOTENCY stripe_evt_1 IF_STATE manual_review IF_STATE waiting_payment TRANSITION_TO verify_payment RUN_AT 1250 NOW 1100 VALUE payment_event payment-bytes\r\n" <>
+                    "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
+                    "flow.reclaim checkout WORKER worker-b LEASE_MS 30000 LIMIT 10 NOW 2000\r\n" <>
+                    "flow.complete flow-1 lease-1 FENCING 1 RESULT result-1\r\n" <>
                    "flow.transition flow-1 queued running FENCING 1 LEASE_TOKEN lease-1\r\n" <>
                    "flow.transition_many tenant-a queued running PAYLOAD_REF payload-ref RUN_AT 2000 NOW 1000 ITEMS flow-1 1 - flow-2 2 lease-2\r\n" <>
                    "flow.retry flow-1 lease-1 FENCING 1 RUN_AT 2000\r\n" <>
@@ -1955,6 +1991,105 @@ defmodule FerricstoreServer.Resp.ParserTest do
                )
     end
 
+    test "extracts Flow read VALUE and VALUE.MGET MAX_BYTES keys" do
+      assert {:ok,
+              [
+                {:command, "FLOW.GET",
+                 ["flow-1", "VALUE", "order", "PARTITION", "tenant-a"],
+                 {:flow_get, "flow-1", [values: "order", partition_key: "tenant-a"]},
+                 ["tenant-a"]},
+                {:command, "FLOW.VALUE.MGET", ["ref-a", "ref-b", "MAX_BYTES", "1024"],
+                 {:flow_value_mget, ["ref-a", "ref-b"], [max_bytes: 1024]},
+                 ["ref-a", "ref-b"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.get flow-1 VALUE order PARTITION tenant-a\r\n" <>
+                   "flow.value.mget ref-a ref-b MAX_BYTES 1024\r\n"
+               )
+    end
+
+    test "rejects FLOW.GET PARTITIONS and keeps ACL keys on the flow id" do
+      assert {:ok,
+              [
+                {:command, "FLOW.GET", ["flow-1", "PARTITIONS", "2", "tenant-a", "tenant-b"],
+                 {:flow_get, "flow-1", {:error, _}}, []}
+              ], ""} =
+               Parser.parse_commands("flow.get flow-1 PARTITIONS 2 tenant-a tenant-b\r\n")
+    end
+
+    test "rejects FLOW.HISTORY PARTITIONS without fanout keys" do
+      assert {:ok,
+              [
+                {:command, "FLOW.HISTORY", ["flow-1", "PARTITIONS", "2", "tenant-a", "tenant-b"],
+                 {:flow_history, "flow-1", {:error, _}}, []}
+              ], ""} =
+               Parser.parse_commands("flow.history flow-1 PARTITIONS 2 tenant-a tenant-b\r\n")
+    end
+
+    test "parses FLOW.CREATE_MANY MIXED dash partition as auto item" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE_MANY", _args,
+                 {:flow_create_many, nil, [{"flow-a", [payload: "payload-a"]}], [type: "iot"]},
+                 ["flow-a"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create_many MIXED TYPE iot ITEMS flow-a - payload-a\r\n"
+               )
+    end
+
+    test "rejects FLOW.CREATE_MANY AUTO extended items with explicit partitions" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE_MANY", _args,
+                 {:flow_create_many, "AUTO", {:error, _}}, ["flow-a"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create_many AUTO TYPE iot ITEMS_EXT 1 flow-a tenant-a payload-a 0 0\r\n"
+               )
+    end
+
+    test "extracts Flow create_many auto partition keys from item ids" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE_MANY", _args,
+                 {:flow_create_many, nil, items, _opts}, ["flow-a", "flow-b"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create_many MIXED TYPE iot ITEMS_EXT 2 flow-a - payload-a 0 0 flow-b - payload-b 0 0\r\n"
+               )
+
+      assert length(items) == 2
+    end
+
+    test "extracts Flow create_many AUTO keys from item ids" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE_MANY", _args,
+                 {:flow_create_many, nil, items, opts}, ["flow-a", "flow-b"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create_many AUTO TYPE iot PAYLOAD_REF ref-a ITEMS flow-a flow-b\r\n"
+               )
+
+      assert length(items) == 2
+      assert Keyword.get(opts, :payload_ref) == "ref-a"
+    end
+
+    test "parses FLOW.CREATE_MANY shared payload ref after named values" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE_MANY", _args,
+                 {:flow_create_many, nil, items, opts}, ["tenant-a", "tenant-b"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create_many MIXED TYPE checkout STATE queued VALUE meta value PAYLOAD_REF ref-1 ITEMS flow-a tenant-a flow-b tenant-b\r\n"
+               )
+
+      assert length(items) == 2
+      assert Keyword.get(opts, :payload_ref) == "ref-1"
+    end
+
     test "parses mixed-partition Flow many commands into typed Rust AST" do
       assert {:ok,
               [
@@ -2022,7 +2157,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   [
                     {:id, "flow-auto-1", :payload, "payload-1"},
                     {:id, "flow-auto-2", :payload, "payload-2"}
-                  ], [type: "iot", independent: true]}, ["AUTO"]},
+                  ], [type: "iot", independent: true]}, ["flow-auto-1", "flow-auto-2"]},
                 {:command, "FLOW.TRANSITION_MANY",
                  [
                    "MIXED",

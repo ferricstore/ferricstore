@@ -830,7 +830,7 @@ default behavior should fan out to all shards and return due work from anywhere.
 Default simple model:
 
 ```text
-FLOW.CLAIM_DUE checkout worker-a 30000 100 STATE payment_pending
+FLOW.CLAIM_DUE checkout STATE payment_pending WORKER worker-a LEASE_MS 30000 LIMIT 100
 
 router:
   asks every shard concurrently
@@ -884,7 +884,7 @@ worker-d -> shards 12,13,14,15
 Then:
 
 ```text
-FLOW.CLAIM_DUE checkout worker-a 30000 100 STATE payment_pending
+FLOW.CLAIM_DUE checkout STATE payment_pending WORKER worker-a LEASE_MS 30000 LIMIT 100
 ```
 
 checks only:
@@ -941,7 +941,7 @@ pubsub hint + bounded scan:
 The API can remain:
 
 ```text
-FLOW.CLAIM_DUE <type> <worker_id> <lease_ms> <limit>
+FLOW.CLAIM_DUE <type> WORKER <worker_id> LEASE_MS <ms> LIMIT <n>
 ```
 
 but implementation should include internal options such as:
@@ -1077,29 +1077,32 @@ MyApp.FlowStore.Flow.cancel("checkout:123",
 ### RESP API
 
 ```text
-FLOW.CREATE <id> TYPE <type> STATE <state> DATA <bytes> TTL <ms> [NX] [RUN_AT <ms>] [PRIORITY <n|low|normal|high>]
-FLOW.GET <id>
-FLOW.CLAIM_DUE <type> <worker_id> <lease_ms> <limit> [STATE <state> | STATES <state,...>] [PRIORITY <n|low|normal|high> | MINPRIORITY <n|low|normal|high>] [WORKER_MAX_INFLIGHT <n>] [TYPE_MAX_INFLIGHT <n>] [RATE <n> PER <ms>] [SCOPE <scope> SCOPE_MAX_INFLIGHT <n>]
-FLOW.TRANSITION <id> FROM <expected_state> TO <next_state> [PATCH <bytes>] [RUN_AT <ms>]
-FLOW.RETRY <id> ERROR <bytes> RUN_AT <ms>
-FLOW.COMPLETE <id> RESULT <bytes> TTL <ms>
-FLOW.FAIL <id> ERROR <bytes> TTL <ms>
-FLOW.CANCEL <id> REASON <bytes>
-FLOW.REWIND <id> TO_EVENT <event_id> [RUN_AT <ms>] [REASON <bytes>] [EXPECT_STATE <state>] [DRYRUN]
-FLOW.HISTORY <id> [COUNT <n>] [START <stream_id>] [END <stream_id>] [REV] [FULL]
-FLOW.EXPLAIN <id> [COUNT <n>] [FULL]
-FLOW.INFO <type>
+FLOW.CREATE <id> TYPE <type> [STATE <state>] [PARTITION <key>] [PAYLOAD <bytes>] [RUN_AT <ms>] [PRIORITY <n>] [IDEMPOTENT true|false] [VALUE <name> <bytes>] [VALUE_REF <name> <ref>]
+FLOW.CREATE_MANY <partition|MIXED|AUTO> TYPE <type> [STATE <state>] [RUN_AT <ms>] [PRIORITY <n>] [INDEPENDENT true|false] ITEMS ...
+FLOW.SPAWN_CHILDREN <parent_id> GROUP <group_id> WAIT <all|none> [PARTITION <key>] [FROM_STATE <state>] [ON_CHILD_FAILED <policy>] [ON_PARENT_CLOSED <policy>] ITEMS ...
+FLOW.GET <id> [PARTITION <key>] [PAYLOAD true|false] [PAYLOAD_MAX_BYTES <n>] [VALUE <name>] [VALUE_MAX_BYTES <n>]
+FLOW.CLAIM_DUE <type> [STATE <state>] [PARTITION <key> | PARTITIONS <n> <key...>] WORKER <worker_id> LEASE_MS <ms> LIMIT <n> [PRIORITY <n>] [RETURN JOBS_COMPACT] [PAYLOAD true|false] [PAYLOAD_MAX_BYTES <n>] [VALUE <name>] [VALUE_MAX_BYTES <n>]
+FLOW.RECLAIM <type> ...same response controls as FLOW.CLAIM_DUE...
+FLOW.TRANSITION <id> <expected_state> <next_state> LEASE_TOKEN <token> FENCING <n> [PARTITION <key>] [PAYLOAD <bytes>] [RUN_AT <ms>] [PRIORITY <n>] [VALUE <name> <bytes>] [VALUE_REF <name> <ref>] [DROP_VALUE <name>]
+FLOW.COMPLETE <id> <lease_token> FENCING <n> [PARTITION <key>] [RESULT <bytes>] [PAYLOAD <bytes>] [TTL <ms>] [VALUE <name> <bytes>] [VALUE_REF <name> <ref>] [DROP_VALUE <name>]
+FLOW.RETRY <id> <lease_token> FENCING <n> [PARTITION <key>] [ERROR <bytes>] [PAYLOAD <bytes>] [RUN_AT <ms>] [TTL <ms>]
+FLOW.FAIL <id> <lease_token> FENCING <n> [PARTITION <key>] [ERROR <bytes>] [PAYLOAD <bytes>] [TTL <ms>]
+FLOW.CANCEL <id> [PARTITION <key>] [LEASE_TOKEN <token>] [FENCING <n>] [REASON <bytes>] [TTL <ms>]
+FLOW.REWIND <id> TO_EVENT <event_id> [PARTITION <key>] [RUN_AT <ms>] [REASON <bytes>] [EXPECT_STATE <state>] [DRYRUN true|false]
+FLOW.HISTORY <id> [PARTITION <key>] [COUNT <n>] [REV true|false] [VALUES true|false] [VALUE_MAX_BYTES <n>]
+FLOW.INFO <type> [PARTITION <key>]
 ```
 
 Example response shapes:
 
 ```text
-["ok", "created", id]
-["ok", "exists", id, state]
-["ok", "claimed", id, state, data, fencing_token]
-["err", "wrong_state", current_state]
-["err", "leased", lease_owner, lease_until_ms]
-["err", "missing"]
+OK
+[:ok | {:error, reason}, ...]          # *_MANY with INDEPENDENT true
+[{id, state, lease_token, fencing_token, ...}]
+[{id, partition_key, lease_token, fencing_token}]
+ERR wrong_state ...
+ERR flow is terminal; use FLOW.REWIND
+ERR missing
 ```
 
 ## Atomicity Model
@@ -1419,7 +1422,7 @@ claim 2 -> token 42
 Then transition/complete can require the token:
 
 ```text
-FLOW.COMPLETE checkout:123 TOKEN 42 ...
+FLOW.COMPLETE checkout:123 <lease_token> FENCING 42 ...
 ```
 
 If worker A submits token 41 after worker B has token 42, FerricStore rejects
@@ -1673,11 +1676,11 @@ payload read fails:
 Command-level overrides:
 
 ```text
-FLOW.GET id PAYLOAD MAXBYTES 2097152
-FLOW.GET id NOPAYLOAD
+FLOW.GET id PAYLOAD true PAYLOAD_MAX_BYTES 2097152
+FLOW.GET id PAYLOAD false
 
-FLOW.CLAIM_DUE type WORKER w1 LIMIT 100 PAYLOAD MAXBYTES 2097152
-FLOW.CLAIM_DUE type WORKER w1 LIMIT 100 NOPAYLOAD
+FLOW.CLAIM_DUE type WORKER w1 LEASE_MS 30000 LIMIT 100 PAYLOAD true PAYLOAD_MAX_BYTES 2097152
+FLOW.CLAIM_DUE type WORKER w1 LEASE_MS 30000 LIMIT 100 PAYLOAD false
 ```
 
 The global default should be safe, but applications can opt into Temporal-style
@@ -1734,31 +1737,31 @@ result_ref=flow_result:...
 
 `FLOW.GET id` should return the payload by default when it is under the payload
 return cap. Larger bodies remain available through `payload_ref` or explicit
-`PAYLOAD MAXBYTES`.
+`PAYLOAD true PAYLOAD_MAX_BYTES`.
 
 ### Patch vs Replace
 
 Transition data changes must have explicit semantics.
 
-Recommended command shapes:
+Current command shapes:
 
 ```text
-FLOW.TRANSITION <id> FROM <state> TO <state> PATCH <bytes>
-FLOW.TRANSITION <id> FROM <state> TO <state> REPLACE_DATA <bytes>
-FLOW.TRANSITION <id> FROM <state> TO <state> DATA_REF <ref>
+FLOW.TRANSITION <id> <from_state> <to_state> LEASE_TOKEN <token> FENCING <n> PAYLOAD <bytes>
+FLOW.TRANSITION <id> <from_state> <to_state> LEASE_TOKEN <token> FENCING <n> VALUE <name> <bytes>
+FLOW.TRANSITION <id> <from_state> <to_state> LEASE_TOKEN <token> FENCING <n> VALUE_REF <name> <ref>
 ```
 
-MVP should avoid magical deep merge. Use one of:
+Flow avoids magical deep merge. Use one of:
 
 ```text
-REPLACE_DATA:
-  replace working data with supplied bytes/ref
+PAYLOAD:
+  replace the current working payload with supplied bytes
 
-PATCH:
-  shallow merge for structured map/JSON only, or app-defined patch stored as ref
+VALUE:
+  store or replace a named value owned by the flow
 
-DATA_REF:
-  point metadata to a new large working-data body
+VALUE_REF:
+  point a named value at an existing Flow value ref
 ```
 
 Whatever is chosen must be deterministic inside the state-machine apply.
@@ -3189,14 +3192,14 @@ Examples:
 
 ```text
 Python worker:
-  FLOW.CLAIM_DUE image worker-py-1 30000 10
+  FLOW.CLAIM_DUE image WORKER worker-py-1 LEASE_MS 30000 LIMIT 10
   process image
-  FLOW.COMPLETE image:123 RESULT ...
+  FLOW.COMPLETE image:123 <lease_token> FENCING <n> RESULT ...
 
 Go worker:
-  FLOW.CLAIM_DUE webhook worker-go-7 30000 100
+  FLOW.CLAIM_DUE webhook WORKER worker-go-7 LEASE_MS 30000 LIMIT 100
   call external API
-  FLOW.RETRY webhook:event_456 ERROR ... RUN_AT ...
+  FLOW.RETRY webhook:event_456 <lease_token> FENCING <n> ERROR ... RUN_AT ...
 ```
 
 The application owns serialization and business logic. FerricStore owns the
@@ -3861,33 +3864,38 @@ FLOW.CLAIM_DUE:
 Claim command shape:
 
 ```text
-FLOW.CLAIM_DUE <type> <worker_id> <lease_ms> <limit>
-  [STATE <state> | STATES <state,...>]
-  [PRIORITY <n|low|normal|high> | MINPRIORITY <n|low|normal|high>]
-  [WORKER_MAX_INFLIGHT <n>]
-  [TYPE_MAX_INFLIGHT <n>]
-  [RATE <n> PER <ms>]
-  [SCOPE <scope> SCOPE_MAX_INFLIGHT <n>]
+FLOW.CLAIM_DUE <type>
+  [STATE <state>]...
+  [PARTITION <key> | PARTITIONS <n> <key...>]
+  WORKER <worker_id>
+  LEASE_MS <ms>
+  LIMIT <n>
+  [PRIORITY <n>]
+  [RETURN JOBS_COMPACT]
+  [PAYLOAD true|false]
+  [PAYLOAD_MAX_BYTES <n>]
+  [VALUE <name>]...
+  [VALUE_MAX_BYTES <n>]
 ```
 
 Examples:
 
 ```text
-FLOW.CLAIM_DUE checkout worker-1 30000 100 WORKER_MAX_INFLIGHT 500
+FLOW.CLAIM_DUE checkout WORKER worker-1 LEASE_MS 30000 LIMIT 100 RETURN JOBS_COMPACT
 
-FLOW.CLAIM_DUE checkout worker-1 30000 100 STATE payment_pending
+FLOW.CLAIM_DUE checkout STATE payment_pending WORKER worker-1 LEASE_MS 30000 LIMIT 100
 
-FLOW.CLAIM_DUE checkout worker-1 30000 100 STATES payment_pending,email_pending
+FLOW.CLAIM_DUE checkout STATE payment_pending STATE email_pending WORKER worker-1 LEASE_MS 30000 LIMIT 100
 
-FLOW.CLAIM_DUE checkout worker-1 30000 100 STATE payment_pending PRIORITY high
+FLOW.CLAIM_DUE checkout STATE payment_pending WORKER worker-1 LEASE_MS 30000 LIMIT 100 PRIORITY 10
 
-FLOW.CLAIM_DUE checkout worker-1 30000 100 STATE payment_pending MINPRIORITY normal
+FLOW.CLAIM_DUE checkout STATE payment_pending WORKER worker-1 LEASE_MS 30000 LIMIT 100 PAYLOAD false
 
-FLOW.CLAIM_DUE checkout worker-1 30000 100 TYPE_MAX_INFLIGHT 5000
+FLOW.CLAIM_DUE checkout WORKER worker-1 LEASE_MS 30000 LIMIT 100 PAYLOAD true PAYLOAD_MAX_BYTES 65536
 
-FLOW.CLAIM_DUE webhook worker-7 30000 50 RATE 1000 PER 1000
+FLOW.CLAIM_DUE webhook WORKER worker-7 LEASE_MS 30000 LIMIT 50 PARTITIONS 2 tenant-a tenant-b
 
-FLOW.CLAIM_DUE email worker-2 30000 20 SCOPE tenant:42 SCOPE_MAX_INFLIGHT 100
+FLOW.CLAIM_DUE email STATE queued WORKER worker-2 LEASE_MS 30000 LIMIT 20 VALUE template VALUE_MAX_BYTES 65536
 ```
 
 These limits must be checked and updated atomically with the claim.
@@ -4092,12 +4100,12 @@ flow_error:{id}:{attempt}
 
 ```text
 FLOW.GET id
-  returns metadata and payload if payload_size <= flow_payload_return_max_bytes
+  returns metadata and refs only
 
-FLOW.GET id NOPAYLOAD
+FLOW.GET id PAYLOAD false
   returns metadata + refs only
 
-FLOW.GET id PAYLOAD MAXBYTES <n>
+FLOW.GET id PAYLOAD true PAYLOAD_MAX_BYTES <n>
   resolves payload up to an explicit per-command cap
 ```
 
@@ -4108,10 +4116,10 @@ case. It should hydrate payloads by default only up to a safe cap:
 FLOW.CLAIM_DUE ... LIMIT 100
   returns claimed metadata and payloads up to flow_payload_return_max_bytes
 
-FLOW.CLAIM_DUE ... LIMIT 100 NOPAYLOAD
+FLOW.CLAIM_DUE ... LIMIT 100 PAYLOAD false
   returns claimed metadata + refs only
 
-FLOW.CLAIM_DUE ... LIMIT 10 PAYLOAD MAXBYTES 2097152
+FLOW.CLAIM_DUE ... LIMIT 10 PAYLOAD true PAYLOAD_MAX_BYTES 2097152
   explicitly allows larger payload hydration
 ```
 
@@ -4215,7 +4223,7 @@ flow:{application-chosen-id}
 Workers can claim by application label:
 
 ```text
-FLOW.CLAIM_DUE checkout worker-1 30000 100
+FLOW.CLAIM_DUE checkout WORKER worker-1 LEASE_MS 30000 LIMIT 100
 ```
 
 ### Hash Tags

@@ -146,7 +146,7 @@ fn encode_file_error(env: Env, fe: FileError) -> Term {
 
 /// Create a new bloom filter file at the given path.
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_create(
     env: Env,
@@ -212,7 +212,7 @@ pub fn bloom_file_create(
 /// Add an element to a bloom filter file via pread/pwrite.
 /// Returns `{:ok, 1}` if any bit was newly set, `{:ok, 0}` if all bits were already set.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
     let file = match crate::open_random_rw(Path::new(&path)) {
@@ -277,7 +277,7 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
 /// Add multiple elements to a bloom filter file via pread/pwrite.
 /// Returns `{:ok, [0|1, ...]}` with one result per element.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_madd<'a>(
     env: Env<'a>,

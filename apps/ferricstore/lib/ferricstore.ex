@@ -358,10 +358,11 @@ defmodule FerricStore do
 
   Required option: `:type`.
   Common options: `:state`, `:payload`, `:run_at_ms`, `:priority`.
-  When `:payload` is provided, Flow stores the value internally and returns a
-  generated `:payload_ref`.
+  When `:payload` is provided, Flow stores the value internally and records a
+  generated payload ref. Create is ack-only; call `flow_get/2` when the caller
+  needs the created record.
   """
-  @spec flow_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @spec flow_create(binary(), keyword()) :: :ok | {:error, binary()}
   def flow_create(id, opts) when is_binary(id) and is_list(opts) do
     Ferricstore.Flow.create(default_ctx(), id, opts)
   end
@@ -416,9 +417,12 @@ defmodule FerricStore do
   When `partition_key` is set, the batch is all-or-nothing because every item
   routes to the same shard. When `partition_key` is `nil`, each item must carry
   `:partition_key`; items are grouped by shard and each shard group is atomic.
-  Required option: `:type`.
+  Required option: `:type`. The normal write response is ack-only; when
+  `independent: true` is used, the response is `{:ok, per_item_results}`. Use
+  `flow_get/2`, `flow_list/2`, or `flow_claim_due/2` to read records.
   """
-  @spec flow_create_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  @spec flow_create_many(binary() | nil, list(), keyword()) ::
+          :ok | {:ok, list()} | {:error, binary()}
   def flow_create_many(partition_key, items, opts \\ [])
 
   def flow_create_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -436,7 +440,7 @@ defmodule FerricStore do
   `exhaust_to.success`; `wait: :all` keeps the parent in `wait_state` until all
   direct children are terminal.
   """
-  @spec flow_spawn_children(binary(), list(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @spec flow_spawn_children(binary(), list(), keyword()) :: :ok | {:error, binary()}
   def flow_spawn_children(parent_id, children, opts \\ [])
 
   def flow_spawn_children(parent_id, children, opts)
@@ -558,8 +562,8 @@ defmodule FerricStore do
   def flow_extend_lease(_id, _lease_token, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc "Completes a claimed Flow record when `lease_token` matches."
-  @spec flow_complete(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @doc "Completes a claimed Flow record when `lease_token` matches. Returns `:ok` on success."
+  @spec flow_complete(binary(), binary(), keyword()) :: :ok | {:error, binary()}
   def flow_complete(id, lease_token, opts \\ [])
 
   def flow_complete(id, lease_token, opts)
@@ -585,7 +589,7 @@ defmodule FerricStore do
   Each item must provide `:id`, `:lease_token`, and `:fencing_token`.
   """
   @spec flow_complete_many(binary() | nil, list(), keyword()) ::
-          {:ok, [map()]} | {:error, binary()}
+          :ok | {:ok, list()} | {:error, binary()}
   def flow_complete_many(partition_key, items, opts \\ [])
 
   def flow_complete_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -595,9 +599,8 @@ defmodule FerricStore do
   def flow_complete_many(_partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc "Moves a Flow record from one state to another, optionally guarded by a lease token."
-  @spec flow_transition(binary(), binary(), binary(), keyword()) ::
-          {:ok, map()} | {:error, binary()}
+  @doc "Moves a Flow record from one state to another, optionally guarded by a lease token. Returns `:ok` on success."
+  @spec flow_transition(binary(), binary(), binary(), keyword()) :: :ok | {:error, binary()}
   def flow_transition(id, from_state, to_state, opts \\ [])
 
   def flow_transition(id, from_state, to_state, opts)
@@ -626,7 +629,7 @@ defmodule FerricStore do
   Each item must provide `:id` and `:fencing_token`; `:lease_token` is optional.
   """
   @spec flow_transition_many(binary() | nil, binary(), binary(), list(), keyword()) ::
-          {:ok, [map()]} | {:error, binary()}
+          :ok | {:ok, list()} | {:error, binary()}
   def flow_transition_many(partition_key, from_state, to_state, items, opts \\ [])
 
   def flow_transition_many(partition_key, from_state, to_state, items, opts)
@@ -659,7 +662,7 @@ defmodule FerricStore do
   payload; omitting `:payload` preserves the payload currently stored on the
   Flow record.
   """
-  @spec flow_retry(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @spec flow_retry(binary(), binary(), keyword()) :: :ok | {:error, binary()}
   def flow_retry(id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
     Ferricstore.Flow.retry(default_ctx(), id, lease_token, opts)
@@ -681,7 +684,8 @@ defmodule FerricStore do
   `:partition_key`; items are grouped by shard and each shard group is atomic.
   Each item must provide `:id`, `:lease_token`, and `:fencing_token`.
   """
-  @spec flow_retry_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  @spec flow_retry_many(binary() | nil, list(), keyword()) ::
+          :ok | {:ok, list()} | {:error, binary()}
   def flow_retry_many(partition_key, items, opts \\ [])
 
   def flow_retry_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -691,8 +695,8 @@ defmodule FerricStore do
   def flow_retry_many(_partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc "Fails a running Flow record when `lease_token` matches."
-  @spec flow_fail(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @doc "Fails a running Flow record when `lease_token` matches. Returns `:ok` on success."
+  @spec flow_fail(binary(), binary(), keyword()) :: :ok | {:error, binary()}
   def flow_fail(id, lease_token, opts \\ [])
 
   def flow_fail(id, lease_token, opts)
@@ -716,7 +720,8 @@ defmodule FerricStore do
   `:partition_key`; items are grouped by shard and each shard group is atomic.
   Each item must provide `:id`, `:lease_token`, and `:fencing_token`.
   """
-  @spec flow_fail_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  @spec flow_fail_many(binary() | nil, list(), keyword()) ::
+          :ok | {:ok, list()} | {:error, binary()}
   def flow_fail_many(partition_key, items, opts \\ [])
 
   def flow_fail_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -726,8 +731,8 @@ defmodule FerricStore do
   def flow_fail_many(_partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc "Cancels a Flow record, optionally guarded by a lease token."
-  @spec flow_cancel(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @doc "Cancels a Flow record, optionally guarded by a lease token. Returns `:ok` on success."
+  @spec flow_cancel(binary(), keyword()) :: :ok | {:error, binary()}
   def flow_cancel(id, opts \\ [])
 
   def flow_cancel(id, opts) when is_binary(id) and is_list(opts) do
@@ -747,7 +752,8 @@ defmodule FerricStore do
   `:partition_key`; items are grouped by shard and each shard group is atomic.
   Each item must provide `:id` and `:fencing_token`; `:lease_token` is optional.
   """
-  @spec flow_cancel_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  @spec flow_cancel_many(binary() | nil, list(), keyword()) ::
+          :ok | {:ok, list()} | {:error, binary()}
   def flow_cancel_many(partition_key, items, opts \\ [])
 
   def flow_cancel_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -772,8 +778,8 @@ defmodule FerricStore do
 
   def flow_retention_cleanup(_opts), do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc "Rewinds a Flow record to a previous history event without rewriting history."
-  @spec flow_rewind(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @doc "Rewinds a Flow record to a previous history event without rewriting history. Returns `:ok` on success."
+  @spec flow_rewind(binary(), keyword()) :: :ok | {:error, binary()}
   def flow_rewind(id, opts) when is_binary(id) and is_list(opts) do
     Ferricstore.Flow.rewind(default_ctx(), id, opts)
   end

@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.FlowTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.Dispatcher
-  alias Ferricstore.Test.{MockStore, ShardHelpers}
+  alias Ferricstore.Test.{IsolatedInstance, MockStore, ShardHelpers}
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -16,6 +16,44 @@ defmodule Ferricstore.Commands.FlowTest do
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
+  defp flow_get(id, args \\ []),
+    do: Dispatcher.dispatch("FLOW.GET", [id | args], MockStore.make())
+
+  test "dispatches Flow commands through the supplied instance context" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+    id = uid("flow-command-instance")
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", "instance-flow", "STATE", "queued", "NOW", "1000"],
+               ctx
+             )
+
+    assert {:ok, %{id: ^id}} = Ferricstore.Flow.get(ctx, id)
+    assert {:ok, nil} = Ferricstore.Flow.get(FerricStore.Instance.get(:default), id)
+  end
+
+  test "rejects Flow commands in sandbox store maps instead of leaking into default instance" do
+    ctx = FerricStore.Instance.get(:default)
+    id = uid("flow-command-sandbox")
+
+    store = %{
+      __instance_ctx__: ctx,
+      __sandbox_namespace__: "sandbox:#{System.unique_integer([:positive])}:"
+    }
+
+    assert {:error, "ERR FLOW commands are not supported in sandbox mode"} =
+             Ferricstore.Commands.Flow.handle_ast(
+               {:flow_create, id, [type: "sandbox-flow"]},
+               store
+             )
+
+    assert {:ok, nil} = Ferricstore.Flow.get(ctx, id)
+  end
+
   test "dispatches Flow value put and payload refs through Rust AST" do
     assert %{"ref" => shared_ref} =
              Dispatcher.dispatch(
@@ -26,12 +64,14 @@ defmodule Ferricstore.Commands.FlowTest do
 
     id = uid("ref-create")
 
-    assert %{"id" => ^id, "payload_ref" => ^shared_ref} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", "checkout", "PARTITION", "tenant-a", "PAYLOAD_REF", shared_ref],
                MockStore.make()
              )
+
+    assert %{"id" => ^id, "payload_ref" => ^shared_ref} = flow_get(id, ["PARTITION", "tenant-a"])
 
     assert %{"payload" => "shared-payload"} =
              Dispatcher.dispatch(
@@ -43,10 +83,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_a = uid("ref-create-many-a")
     id_b = uid("ref-create-many-b")
 
-    assert [
-             %{"id" => ^id_a, "payload_ref" => ^shared_ref},
-             %{"id" => ^id_b, "payload_ref" => ^shared_ref}
-           ] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [
@@ -64,6 +101,12 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"id" => ^id_a, "payload_ref" => ^shared_ref} =
+             flow_get(id_a, ["PARTITION", "tenant-a"])
+
+    assert %{"id" => ^id_b, "payload_ref" => ^shared_ref} =
+             flow_get(id_b, ["PARTITION", "tenant-b"])
+
     assert [%{"id" => ^id, "fencing_token" => fencing_token, "lease_token" => lease_token}] =
              Dispatcher.dispatch(
                "FLOW.CLAIM_DUE",
@@ -71,7 +114,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert [%{"id" => ^id, "payload_ref" => ^shared_ref}] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.TRANSITION_MANY",
                [
@@ -85,8 +128,38 @@ defmodule Ferricstore.Commands.FlowTest do
                  Integer.to_string(fencing_token),
                  lease_token
                ],
-             MockStore.make()
-           )
+               MockStore.make()
+             )
+
+    assert %{"id" => ^id, "payload_ref" => ^shared_ref, "state" => "waiting"} =
+             flow_get(id, ["PARTITION", "tenant-a"])
+  end
+
+  test "rejects keyless shared Flow value puts" do
+    assert {:error, "ERR flow value partition or owner_flow_id is required"} =
+             Dispatcher.dispatch("FLOW.VALUE.PUT", ["shared-payload"], MockStore.make())
+
+    assert {:error, "ERR flow value partition or owner_flow_id is required"} =
+             FerricStore.flow_value_put("shared-payload")
+  end
+
+  test "routes Flow parser arity errors for all Flow tuple shapes" do
+    store = MockStore.make()
+
+    for {ast, command} <- [
+          {{:flow_spawn_children,
+            {:error, "ERR wrong number of arguments for 'flow.spawn_children' command"}},
+           "flow.spawn_children"},
+          {{:flow_extend_lease,
+            {:error, "ERR wrong number of arguments for 'flow.extend_lease' command"}},
+           "flow.extend_lease"},
+          {{:flow_transition_many,
+            {:error, "ERR wrong number of arguments for 'flow.transition_many' command"}},
+           "flow.transition_many"}
+        ] do
+      expected = "ERR wrong number of arguments for '#{command}' command"
+      assert {:error, ^expected} = Dispatcher.dispatch_ast(ast, store)
+    end
   end
 
   test "dispatches flow claim_due payload return options through Rust AST" do
@@ -159,7 +232,7 @@ defmodule Ferricstore.Commands.FlowTest do
   test "dispatches Flow create/get/list/history through Rust AST" do
     id = uid("flow-command")
 
-    assert %{"id" => ^id, "type" => "checkout", "state" => "queued", "priority" => 2} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -185,6 +258,9 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert %{"id" => ^id, "type" => "checkout", "state" => "queued", "priority" => 2} =
+             flow_get(id)
 
     assert %{
              "root_flow_id" => "checkout-root",
@@ -237,7 +313,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id = uid("flow-command-failures")
     type = uid("flow-command-failures-type")
 
-    assert %{"id" => ^id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", type, "RUN_AT", "1000", "NOW", "1000"],
@@ -251,12 +327,14 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "failed"} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.FAIL",
                [id, lease_token, "FENCING", Integer.to_string(fencing_token), "NOW", "1500"],
                MockStore.make()
              )
+
+    assert %{"id" => ^id, "state" => "failed"} = flow_get(id)
 
     assert [%{"id" => ^id, "state" => "failed"}] =
              Dispatcher.dispatch(
@@ -304,7 +382,7 @@ defmodule Ferricstore.Commands.FlowTest do
   test "dispatches Flow full values through Rust AST" do
     id = uid("flow-command-values")
 
-    assert %{"id" => ^id, "payload_ref" => payload_ref} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -323,6 +401,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"payload_ref" => payload_ref} = flow_get(id)
     assert is_binary(payload_ref)
     assert payload_ref != "create-payload"
 
@@ -343,7 +422,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"state" => "completed", "result_ref" => result_ref} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.COMPLETE",
                [
@@ -359,6 +438,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"state" => "completed", "result_ref" => result_ref} = flow_get(id)
     assert is_binary(result_ref)
     assert result_ref != "complete-result"
 
@@ -383,7 +463,7 @@ defmodule Ferricstore.Commands.FlowTest do
     child_b = uid("flow-command-spawn-child-b")
     partition = uid("tenant-command")
 
-    assert %{"id" => ^parent, "fencing_token" => fencing_token} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -400,7 +480,10 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^parent, "state" => "waiting_children", "child_groups" => child_groups} =
+    assert %{"id" => ^parent, "fencing_token" => fencing_token} =
+             flow_get(parent, ["PARTITION", partition])
+
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.SPAWN_CHILDREN",
                [
@@ -444,6 +527,9 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"id" => ^parent, "state" => "waiting_children", "child_groups" => child_groups} =
+             flow_get(parent, ["PARTITION", partition])
+
     assert child_groups["fanout"]["wait"] == "any"
     assert child_groups["fanout"]["children"][child_a] == "running"
     assert child_groups["fanout"]["children"][child_b] == "running"
@@ -475,7 +561,7 @@ defmodule Ferricstore.Commands.FlowTest do
     transition_id = uid("flow-command-transition-value")
     fail_id = uid("flow-command-fail-value")
 
-    assert %{"id" => ^transition_id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -501,7 +587,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"state" => "waiting", "payload_ref" => transition_payload_ref} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.TRANSITION",
                [
@@ -521,6 +607,9 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert %{"state" => "waiting", "payload_ref" => transition_payload_ref} =
+             flow_get(transition_id)
 
     assert transition_payload_ref != "transition-payload"
 
@@ -544,11 +633,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{
-             "state" => "waiting",
-             "error_ref" => retry_error_ref,
-             "payload_ref" => retry_payload_ref
-           } =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.RETRY",
                [
@@ -568,13 +653,19 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{
+             "state" => "waiting",
+             "error_ref" => retry_error_ref,
+             "payload_ref" => retry_payload_ref
+           } = flow_get(transition_id)
+
     assert retry_error_ref != "retry-error"
     assert retry_payload_ref != "retry-payload"
 
     assert %{"error" => "retry-error", "payload" => "retry-payload"} =
              Dispatcher.dispatch("FLOW.GET", [transition_id, "FULL"], MockStore.make())
 
-    assert %{"id" => ^fail_id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -594,11 +685,21 @@ defmodule Ferricstore.Commands.FlowTest do
     assert [%{"lease_token" => fail_lease, "fencing_token" => fail_fencing}] =
              Dispatcher.dispatch(
                "FLOW.CLAIM_DUE",
-               ["mutation-values", "WORKER", "worker-c", "LEASE_MS", "30000", "NOW", "4000"],
+               [
+                 "mutation-values",
+                 "STATE",
+                 "queued",
+                 "WORKER",
+                 "worker-c",
+                 "LEASE_MS",
+                 "30000",
+                 "NOW",
+                 "4000"
+               ],
                MockStore.make()
              )
 
-    assert %{"state" => "failed", "error_ref" => fail_error_ref} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.FAIL",
                [
@@ -614,6 +715,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"state" => "failed", "error_ref" => fail_error_ref} = flow_get(fail_id)
     assert fail_error_ref != "fail-error"
 
     assert %{"payload" => "fail-payload", "error" => "fail-error"} =
@@ -626,7 +728,7 @@ defmodule Ferricstore.Commands.FlowTest do
     child = uid("flow-command-child")
     correlation = uid("order")
 
-    assert %{"id" => ^root} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -643,7 +745,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^child} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -717,10 +819,15 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "Flow reclaim requires worker option through Rust AST" do
+    assert {:error, "ERR wrong number of arguments for 'flow.reclaim' command"} =
+             Dispatcher.dispatch("FLOW.RECLAIM", ["reclaim-command"], MockStore.make())
+  end
+
   test "dispatches Flow reclaim through Rust AST" do
     id = uid("flow-command-reclaim")
 
-    assert %{"id" => ^id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", "reclaim-command", "RUN_AT", "1000"],
@@ -754,7 +861,7 @@ defmodule Ferricstore.Commands.FlowTest do
     expired_id = uid("flow-command-expired")
     fresh_id = uid("flow-command-fresh")
 
-    assert %{"id" => ^expired_id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [expired_id, "TYPE", type, "RUN_AT", "1000"],
@@ -768,7 +875,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^fresh_id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [fresh_id, "TYPE", type, "RUN_AT", "1050"],
@@ -798,7 +905,7 @@ defmodule Ferricstore.Commands.FlowTest do
   test "dispatches Flow extend_lease through Rust AST" do
     id = uid("flow-command-extend-lease")
 
-    assert %{"id" => ^id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", "extend-command", "RUN_AT", "1000"],
@@ -827,6 +934,8 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert %{"id" => ^id, "lease_deadline_ms" => 1520} = flow_get(id)
   end
 
   test "dispatches Flow create_many through Rust AST" do
@@ -835,10 +944,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_a = uid("flow-command-bulk-a")
     id_b = uid("flow-command-bulk-b")
 
-    assert [
-             %{"id" => ^id_a, "type" => ^type, "partition_key" => ^partition},
-             %{"id" => ^id_b, "type" => ^type, "partition_key" => ^partition}
-           ] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [
@@ -892,11 +998,13 @@ defmodule Ferricstore.Commands.FlowTest do
       "payload:" <> id_b
     ]
 
-    assert [%{"id" => ^id_a}, %{"id" => ^id_b}] =
-             Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
+    assert "OK" = Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
+    assert %{"id" => ^id_a} = flow_get(id_a, ["PARTITION", partition])
+    assert %{"id" => ^id_b} = flow_get(id_b, ["PARTITION", partition])
 
-    assert [%{"id" => ^id_a}, %{"id" => ^id_b}] =
-             Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
+    assert "OK" = Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
+    assert %{"id" => ^id_a} = flow_get(id_a, ["PARTITION", partition])
+    assert %{"id" => ^id_b} = flow_get(id_b, ["PARTITION", partition])
   end
 
   test "dispatches mixed-partition Flow create_many through Rust AST" do
@@ -906,10 +1014,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_a = uid("flow-command-mixed-a")
     id_b = uid("flow-command-mixed-b")
 
-    assert [
-             %{"id" => ^id_a, "type" => ^type, "partition_key" => ^partition_a},
-             %{"id" => ^id_b, "type" => ^type, "partition_key" => ^partition_b}
-           ] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [
@@ -930,12 +1035,18 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert %{"id" => ^id_a, "type" => ^type, "partition_key" => ^partition_a} =
+             flow_get(id_a, ["PARTITION", partition_a])
+
+    assert %{"id" => ^id_b, "type" => ^type, "partition_key" => ^partition_b} =
+             flow_get(id_b, ["PARTITION", partition_b])
   end
 
   test "dispatches Flow claim and complete through Rust AST" do
     id = uid("flow-command-complete")
 
-    assert %{"id" => ^id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", "email", "RUN_AT", "1000"],
@@ -956,7 +1067,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "completed", "result_ref" => result_ref} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.COMPLETE",
                [
@@ -970,6 +1081,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"id" => ^id, "state" => "completed", "result_ref" => result_ref} = flow_get(id)
     assert is_binary(result_ref)
     assert result_ref != "result:1"
   end
@@ -980,7 +1092,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_a = uid("flow-command-complete-many-a")
     id_b = uid("flow-command-complete-many-b")
 
-    assert [_a, _b] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [
@@ -1010,10 +1122,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert [
-             %{"id" => ^id_a, "state" => "completed", "result_ref" => result_ref_a},
-             %{"id" => ^id_b, "state" => "completed", "result_ref" => result_ref_b}
-           ] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.COMPLETE_MANY",
                [
@@ -1032,6 +1141,12 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert %{"id" => ^id_a, "state" => "completed", "result_ref" => result_ref_a} =
+             flow_get(id_a, ["PARTITION", partition])
+
+    assert %{"id" => ^id_b, "state" => "completed", "result_ref" => result_ref_b} =
+             flow_get(id_b, ["PARTITION", partition])
 
     assert is_binary(result_ref_a)
     assert is_binary(result_ref_b)
@@ -1095,14 +1210,17 @@ defmodule Ferricstore.Commands.FlowTest do
     partition = uid("flow-command-cancel-reason-tenant")
     reason = "cancelled by operator"
 
-    assert %{"id" => ^id, "fencing_token" => fencing_token} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", "cancel-reason", "PARTITION", partition],
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "cancelled", "error_ref" => error_ref} =
+    assert %{"id" => ^id, "fencing_token" => fencing_token} =
+             flow_get(id, ["PARTITION", partition])
+
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CANCEL",
                [
@@ -1117,6 +1235,9 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"id" => ^id, "state" => "cancelled", "error_ref" => error_ref} =
+             flow_get(id, ["PARTITION", partition])
+
     assert is_binary(error_ref)
     assert error_ref != reason
 
@@ -1130,7 +1251,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_a = uid("flow-command-fail-many-a")
     id_b = uid("flow-command-fail-many-b")
 
-    assert [_a, _b] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [
@@ -1160,10 +1281,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert [
-             %{"id" => ^id_a, "state" => "failed", "error_ref" => error_ref_a},
-             %{"id" => ^id_b, "state" => "failed", "error_ref" => error_ref_b}
-           ] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.FAIL_MANY",
                [
@@ -1183,6 +1301,12 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"id" => ^id_a, "state" => "failed", "error_ref" => error_ref_a} =
+             flow_get(id_a, ["PARTITION", partition])
+
+    assert %{"id" => ^id_b, "state" => "failed", "error_ref" => error_ref_b} =
+             flow_get(id_b, ["PARTITION", partition])
+
     assert is_binary(error_ref_a)
     assert is_binary(error_ref_b)
     assert error_ref_a != "error:batch"
@@ -1195,7 +1319,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_a = uid("flow-command-retry-many-a")
     id_b = uid("flow-command-retry-many-b")
 
-    assert [_a, _b] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [
@@ -1225,10 +1349,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert [
-             %{"id" => ^id_a, "state" => "queued", "error_ref" => error_ref_a},
-             %{"id" => ^id_b, "state" => "queued", "error_ref" => error_ref_b}
-           ] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.RETRY_MANY",
                [
@@ -1254,6 +1375,12 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"id" => ^id_a, "state" => "queued", "error_ref" => error_ref_a} =
+             flow_get(id_a, ["PARTITION", partition])
+
+    assert %{"id" => ^id_b, "state" => "queued", "error_ref" => error_ref_b} =
+             flow_get(id_b, ["PARTITION", partition])
+
     assert is_binary(error_ref_a)
     assert is_binary(error_ref_b)
     assert error_ref_a != "retry:batch"
@@ -1264,7 +1391,7 @@ defmodule Ferricstore.Commands.FlowTest do
     type = uid("flow-command-retry-policy")
     id = uid("flow-command-retry-policy-id")
 
-    assert %{"id" => ^id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", type, "STATE", "charge_card", "RUN_AT", "1000", "NOW", "1000"],
@@ -1278,7 +1405,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "payment_failed"} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.RETRY",
                [
@@ -1295,6 +1422,8 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert %{"id" => ^id, "state" => "payment_failed"} = flow_get(id)
   end
 
   test "dispatches Flow claim_due with job-only return through Rust AST" do
@@ -1347,14 +1476,14 @@ defmodule Ferricstore.Commands.FlowTest do
     ready_id = uid("flow-command-claim-any-ready")
     held_id = uid("flow-command-claim-any-held")
 
-    assert %{"id" => ^queued_id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [queued_id, "TYPE", type, "RUN_AT", "1000", "NOW", "1000"],
                MockStore.make()
              )
 
-    assert %{"id" => ^ready_id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -1373,7 +1502,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^held_id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [
@@ -1422,7 +1551,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_a = uid("flow-command-cancel-many-a")
     id_b = uid("flow-command-cancel-many-b")
 
-    assert [_a, _b] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [
@@ -1442,10 +1571,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert [
-             %{"id" => ^id_a, "state" => "cancelled", "error_ref" => error_ref_a},
-             %{"id" => ^id_b, "state" => "cancelled", "error_ref" => error_ref_b}
-           ] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CANCEL_MANY",
                [
@@ -1463,6 +1589,12 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert %{"id" => ^id_a, "state" => "cancelled", "error_ref" => error_ref_a} =
+             flow_get(id_a, ["PARTITION", partition])
+
+    assert %{"id" => ^id_b, "state" => "cancelled", "error_ref" => error_ref_b} =
+             flow_get(id_b, ["PARTITION", partition])
+
     assert is_binary(error_ref_a)
     assert is_binary(error_ref_b)
     assert error_ref_a != "cancel:batch"
@@ -1472,7 +1604,7 @@ defmodule Ferricstore.Commands.FlowTest do
   test "dispatches Flow rewind through Rust AST" do
     id = uid("flow-command-rewind")
 
-    assert %{"id" => ^id} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.CREATE",
                [id, "TYPE", "email", "RUN_AT", "1000", "NOW", "1000"],
@@ -1489,14 +1621,16 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"state" => "completed"} =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.COMPLETE",
                [id, lease_token, "FENCING", Integer.to_string(fencing_token), "NOW", "2000"],
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "queued", "next_run_at_ms" => 5000} =
+    assert %{"state" => "completed"} = flow_get(id)
+
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.REWIND",
                [
@@ -1512,6 +1646,8 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert %{"id" => ^id, "state" => "queued", "next_run_at_ms" => 5000} = flow_get(id)
   end
 
   test "dispatches Flow AST parse errors without calling embedded API" do

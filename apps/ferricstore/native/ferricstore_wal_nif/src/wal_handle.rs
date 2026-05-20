@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+pub const MAX_PREAD_BYTES: usize = 64 * 1024 * 1024;
+
 pub struct WalHandle {
     /// Shared write buffer. NIF write() appends here, background thread takes.
     buffer: Arc<Mutex<AlignedBuffer>>,
@@ -95,6 +97,10 @@ impl WalHandle {
         }
     }
 
+    pub fn max_buffer_bytes(&self) -> u64 {
+        self.max_buffer_bytes
+    }
+
     /// Append data to the shared write buffer.
     /// Returns Err if thread is dead or buffer exceeds max size (backpressure).
     pub fn buffer_write(&self, data: &[u8]) -> Result<(), rustler::Error> {
@@ -109,9 +115,11 @@ impl WalHandle {
         let incoming = data.len() as u64;
 
         // A single write larger than the configured limit can never become
-        // acceptable by retrying. Treat the limit as soft only while the buffer
-        // is empty, then apply normal backpressure until the WAL thread drains.
-        if buffered > 0 && buffered + incoming > self.max_buffer_bytes {
+        // acceptable by retrying. Reject it before copying into the shared
+        // buffer, then apply normal backpressure until the WAL thread drains.
+        if incoming > self.max_buffer_bytes
+            || buffered > self.max_buffer_bytes.saturating_sub(incoming)
+        {
             return Err(rustler::Error::Term(Box::new("backpressure")));
         }
 
@@ -210,12 +218,19 @@ impl WalHandle {
 
     /// Read bytes from the WAL at offset. For recovery.
     pub fn pread(&self, offset: u64, len: u64) -> Result<Vec<u8>, rustler::Error> {
+        let len_usize =
+            usize::try_from(len).map_err(|_| rustler::Error::Term(Box::new("pread_too_large")))?;
+
+        if len_usize > MAX_PREAD_BYTES {
+            return Err(rustler::Error::Term(Box::new("pread_too_large")));
+        }
+
         let mut file = self
             .read_file
             .lock()
             .map_err(|_| rustler::Error::Term(Box::new("read_mutex_poisoned")))?;
 
-        background_thread::pread_from_file(&mut file, offset, len)
+        background_thread::pread_from_file(&mut file, offset, len_usize as u64)
             .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))
     }
 }

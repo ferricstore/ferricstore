@@ -340,6 +340,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Creates a workflow record."
     },
     %{
+      name: "flow.signal",
+      arity: -4,
+      flags: ["write", "denyoom"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Appends a signal to a workflow record and optionally transitions it."
+    },
+    %{
       name: "flow.create_many",
       arity: -7,
       flags: ["write", "denyoom"],
@@ -350,7 +359,7 @@ defmodule Ferricstore.Commands.Catalog do
     },
     %{
       name: "flow.spawn_children",
-      arity: -4,
+      arity: -6,
       flags: ["write", "denyoom"],
       first_key: 1,
       last_key: 1,
@@ -365,6 +374,24 @@ defmodule Ferricstore.Commands.Catalog do
       last_key: 1,
       step: 1,
       summary: "Returns a workflow record."
+    },
+    %{
+      name: "flow.value.put",
+      arity: -2,
+      flags: ["write", "denyoom", "movablekeys"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Stores a named Flow value and returns a value reference."
+    },
+    %{
+      name: "flow.value.mget",
+      arity: -2,
+      flags: ["readonly", "movablekeys"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Returns one or more Flow values by value reference."
     },
     %{
       name: "flow.policy.set",
@@ -396,7 +423,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.claim_due",
       arity: -4,
-      flags: ["write"],
+      flags: ["write", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -405,7 +432,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.reclaim",
       arity: -4,
-      flags: ["write"],
+      flags: ["write", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -458,7 +485,7 @@ defmodule Ferricstore.Commands.Catalog do
     },
     %{
       name: "flow.cancel_many",
-      arity: -6,
+      arity: -5,
       flags: ["write"],
       first_key: 1,
       last_key: 1,
@@ -522,7 +549,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.list",
       arity: -2,
-      flags: ["readonly"],
+      flags: ["readonly", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -531,7 +558,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.failures",
       arity: -2,
-      flags: ["readonly"],
+      flags: ["readonly", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -540,7 +567,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.terminals",
       arity: -2,
-      flags: ["readonly"],
+      flags: ["readonly", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -549,7 +576,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.by_parent",
       arity: -2,
-      flags: ["readonly"],
+      flags: ["readonly", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -558,7 +585,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.by_root",
       arity: -2,
-      flags: ["readonly"],
+      flags: ["readonly", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -567,7 +594,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.by_correlation",
       arity: -2,
-      flags: ["readonly"],
+      flags: ["readonly", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -576,7 +603,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.info",
       arity: -2,
-      flags: ["readonly", "fast"],
+      flags: ["readonly", "fast", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -585,7 +612,7 @@ defmodule Ferricstore.Commands.Catalog do
     %{
       name: "flow.stuck",
       arity: -2,
-      flags: ["readonly"],
+      flags: ["readonly", "movablekeys"],
       first_key: 0,
       last_key: 0,
       step: 0,
@@ -855,13 +882,30 @@ defmodule Ferricstore.Commands.Catalog do
     do: {:ok, args_at(args, flow_transition_many_key_indices(args))}
 
   defp flow_dynamic_keys("FLOW.VALUE.PUT", args),
-    do: {:ok, args_at(args, flow_partition_key_indices(args, 1))}
+    do: {:ok, args_at(args, flow_value_put_key_indices(args))}
 
-  defp flow_dynamic_keys("FLOW.VALUE.MGET", args), do: {:ok, args}
+  defp flow_dynamic_keys("FLOW.VALUE.MGET", args),
+    do: {:ok, args_at(args, flow_value_mget_key_indices(args))}
 
   defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.CREATE", "FLOW.SIGNAL", "FLOW.GET", "FLOW.HISTORY"],
+       when name in ["FLOW.CREATE", "FLOW.SIGNAL"],
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
+
+  defp flow_dynamic_keys(name, args)
+       when name in [
+              "FLOW.GET",
+              "FLOW.HISTORY",
+              "FLOW.BY_PARENT",
+              "FLOW.BY_ROOT",
+              "FLOW.BY_CORRELATION",
+              "FLOW.LIST",
+              "FLOW.TERMINALS",
+              "FLOW.FAILURES",
+              "FLOW.INFO",
+              "FLOW.STUCK"
+            ] do
+    flow_single_partition_read_keys(name, args)
+  end
 
   defp flow_dynamic_keys(name, args)
        when name in ["FLOW.COMPLETE", "FLOW.RETRY", "FLOW.FAIL", "FLOW.EXTEND_LEASE"],
@@ -875,20 +919,8 @@ defmodule Ferricstore.Commands.Catalog do
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
 
   defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.BY_PARENT", "FLOW.BY_ROOT", "FLOW.BY_CORRELATION"],
-       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
-
-  defp flow_dynamic_keys(name, args)
-       when name in [
-              "FLOW.CLAIM_DUE",
-              "FLOW.RECLAIM",
-              "FLOW.LIST",
-              "FLOW.TERMINALS",
-              "FLOW.FAILURES",
-              "FLOW.INFO",
-              "FLOW.STUCK"
-            ],
-       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
+       when name in ["FLOW.CLAIM_DUE", "FLOW.RECLAIM"],
+       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1, 2))}
 
   defp flow_dynamic_keys(name, args)
        when name in ["FLOW.POLICY.SET", "FLOW.POLICY.GET"],
@@ -896,88 +928,334 @@ defmodule Ferricstore.Commands.Catalog do
 
   defp flow_dynamic_keys(_name, _args), do: :not_flow
 
-  defp flow_partition_or_first_key_indices([], _option_start), do: []
+  defp flow_single_partition_read_keys(name, args) do
+    if flow_option_present_until?(args, 1, length(args), "PARTITIONS", 2) do
+      {:error, "ERR #{name} supports PARTITION, not PARTITIONS"}
+    else
+      {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1, 2, false))}
+    end
+  end
 
-  defp flow_partition_or_first_key_indices(args, option_start) do
-    case flow_partition_key_indices(args, option_start) do
+  defp flow_partition_or_first_key_indices(
+         args,
+         option_start,
+         value_width \\ 3,
+         allow_partitions \\ true
+       )
+
+  defp flow_partition_or_first_key_indices([], _option_start, _value_width, _allow_partitions),
+    do: []
+
+  defp flow_partition_or_first_key_indices(args, option_start, value_width, allow_partitions) do
+    case flow_partition_key_indices(args, option_start, value_width, allow_partitions) do
       [] -> [0]
       indices -> dedup_indices(indices)
     end
   end
 
-  defp flow_partition_key_indices(args, option_start) do
-    flow_partition_key_indices_until(args, option_start, length(args))
+  defp flow_partition_key_indices(args, option_start, value_width \\ 3, allow_partitions \\ true) do
+    flow_partition_key_indices_until(
+      args,
+      option_start,
+      length(args),
+      value_width,
+      allow_partitions
+    )
   end
 
-  defp flow_partition_key_indices_until(args, option_start, option_end) do
+  defp flow_partition_key_indices_until(
+         args,
+         option_start,
+         option_end,
+         value_width \\ 3,
+         allow_partitions \\ true
+       ) do
     option_end = min(option_end, length(args))
 
-    option_start..max(option_start, option_end - 1)
-    |> Enum.reduce([], fn idx, acc ->
-      cond do
-        idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITION") ->
-          [idx + 1 | acc]
-
-        idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITIONS") ->
-          flow_partition_count_indices(args, idx + 1, option_end) ++ acc
-
-        true ->
-          acc
-      end
-    end)
-    |> Enum.reverse()
+    do_flow_partition_key_indices_until(
+      args,
+      option_start,
+      option_end,
+      value_width,
+      allow_partitions,
+      []
+    )
   end
 
-  defp flow_partition_count_indices(args, count_idx, option_end) do
-    with count_arg when not is_nil(count_arg) <- Enum.at(args, count_idx),
-         {count, ""} when count > 0 <- Integer.parse(to_string(count_arg)),
-         true <- count_idx + count < option_end do
-      Enum.to_list((count_idx + 1)..(count_idx + count))
+  defp do_flow_partition_key_indices_until(
+         _args,
+         idx,
+         option_end,
+         _value_width,
+         _allow_partitions,
+         acc
+       )
+       when idx >= option_end,
+       do: Enum.reverse(acc)
+
+  defp do_flow_partition_key_indices_until(
+         args,
+         idx,
+         option_end,
+         value_width,
+         allow_partitions,
+         acc
+       ) do
+    cond do
+      idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITION") ->
+        acc =
+          if arg_eq?(Enum.at(args, idx + 1), "GLOBAL") do
+            acc
+          else
+            [idx + 1 | acc]
+          end
+
+        do_flow_partition_key_indices_until(
+          args,
+          idx + 2,
+          option_end,
+          value_width,
+          allow_partitions,
+          acc
+        )
+
+      idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITIONS") ->
+        count = arg_to_non_neg_integer(Enum.at(args, idx + 1))
+        first = idx + 2
+        last = min(option_end, first + count)
+
+        indices =
+          if allow_partitions and first < last, do: Enum.to_list(first..(last - 1)), else: []
+
+        do_flow_partition_key_indices_until(
+          args,
+          last,
+          option_end,
+          value_width,
+          allow_partitions,
+          Enum.reverse(indices) ++ acc
+        )
+
+      arg_eq?(Enum.at(args, idx), "VALUE") or arg_eq?(Enum.at(args, idx), "VALUE_REF") ->
+        do_flow_partition_key_indices_until(
+          args,
+          idx + value_width,
+          option_end,
+          value_width,
+          allow_partitions,
+          acc
+        )
+
+      value_width == 2 and arg_eq?(Enum.at(args, idx), "FULL") ->
+        next_idx =
+          if idx + 1 < option_end and read_flag_boolean?(Enum.at(args, idx + 1)) do
+            idx + 2
+          else
+            idx + 1
+          end
+
+        do_flow_partition_key_indices_until(
+          args,
+          next_idx,
+          option_end,
+          value_width,
+          allow_partitions,
+          acc
+        )
+
+      value_width == 2 and arg_eq?(Enum.at(args, idx), "NOPAYLOAD") ->
+        do_flow_partition_key_indices_until(
+          args,
+          idx + 1,
+          option_end,
+          value_width,
+          allow_partitions,
+          acc
+        )
+
+      value_width == 2 and arg_eq?(Enum.at(args, idx), "PAYLOAD") ->
+        do_flow_partition_key_indices_until(
+          args,
+          next_after_read_payload_flag(args, idx, option_end),
+          option_end,
+          value_width,
+          allow_partitions,
+          acc
+        )
+
+      true ->
+        do_flow_partition_key_indices_until(
+          args,
+          idx + 2,
+          option_end,
+          value_width,
+          allow_partitions,
+          acc
+        )
+    end
+  end
+
+  defp read_flag_boolean?(value) when is_binary(value) do
+    value in ["1", "0"] or String.downcase(value) in ["true", "false"]
+  end
+
+  defp read_flag_boolean?(_value), do: false
+
+  defp next_after_read_payload_flag(args, idx, option_end) do
+    next_idx =
+      if idx + 1 < option_end and read_flag_boolean?(Enum.at(args, idx + 1)) do
+        idx + 2
+      else
+        idx + 1
+      end
+
+    if next_idx < option_end and arg_eq?(Enum.at(args, next_idx), "MAXBYTES") do
+      next_idx + 2
     else
-      _ -> []
+      next_idx
+    end
+  end
+
+  defp flow_value_mget_key_indices(args) do
+    len = length(args)
+
+    ref_count =
+      if len >= 2 and
+           (arg_eq?(Enum.at(args, len - 2), "MAX_BYTES") or
+              arg_eq?(Enum.at(args, len - 2), "VALUE_MAX_BYTES")) do
+        len - 2
+      else
+        len
+      end
+
+    if ref_count <= 0, do: [], else: Enum.to_list(0..(ref_count - 1))
+  end
+
+  defp flow_value_put_key_indices(args) do
+    case flow_partition_key_indices(args, 1) do
+      [] ->
+        case flow_option_index(args, 1, "OWNER_FLOW_ID") do
+          idx when is_integer(idx) and idx + 1 < length(args) -> [idx + 1]
+          _ -> []
+        end
+
+      indices ->
+        indices
     end
   end
 
   defp flow_create_many_key_indices([]), do: []
 
   defp flow_create_many_key_indices(args) do
-    if not arg_eq?(hd(args), "MIXED") do
+    mixed? = arg_eq?(hd(args), "MIXED")
+    auto? = arg_eq?(hd(args), "AUTO")
+
+    if not mixed? and not auto? do
       [0]
     else
-      case option_index(args, 1, "ITEMS") do
+      case flow_items_marker(args, 1) do
         nil ->
           [0]
 
-        items_idx ->
-          item_width =
-            if flow_option_present_until?(args, 1, items_idx, "PAYLOAD_REF"), do: 2, else: 3
+        {items_idx, true} ->
+          partition_keys = flow_items_ext_partition_indices(args, items_idx, 3, auto?)
+          if partition_keys == [], do: [0], else: partition_keys
 
-          repeated_item_partition_indices(args, items_idx + 1, item_width)
+        {items_idx, false} ->
+          item_width =
+            case {auto?, flow_option_present_until?(args, 1, items_idx, "PAYLOAD_REF")} do
+              {true, true} -> 1
+              {true, false} -> 2
+              {false, true} -> 2
+              {false, false} -> 3
+            end
+
+          repeated_item_partition_indices(args, items_idx + 1, item_width, auto?)
       end
     end
   end
 
-  defp flow_option_present_until?(args, start, option_end, option) do
-    start..max(start, option_end - 1)
-    |> Enum.any?(fn idx ->
-      rem(idx - start, 2) == 0 and idx < option_end and arg_eq?(Enum.at(args, idx), option)
-    end)
+  defp flow_option_present_until?(args, start, option_end, option, value_width \\ 3) do
+    flow_option_index(args, start, option, option_end, value_width) != nil
   end
 
   defp flow_spawn_children_key_indices(args) do
-    option_end = option_index(args, 1, "ITEMS") || length(args)
+    marker = flow_items_marker(args, 1)
+    option_end = if marker == nil, do: length(args), else: elem(marker, 0)
     partition_keys = flow_partition_key_indices_until(args, 1, option_end)
 
     partition_keys =
-      if option_end + 1 < length(args) and arg_eq?(Enum.at(args, option_end + 1), "MIXED") do
-        partition_keys ++ repeated_item_partition_indices(args, option_end + 2, 4)
-      else
-        partition_keys
+      cond do
+        marker == {option_end, true} ->
+          partition_keys ++ flow_items_ext_partition_indices(args, option_end, 4)
+
+        option_end + 1 < length(args) and arg_eq?(Enum.at(args, option_end + 1), "MIXED") ->
+          partition_keys ++ repeated_item_partition_indices(args, option_end + 2, 4)
+
+        true ->
+          partition_keys
       end
 
     case partition_keys do
-      [] -> Enum.take(0..(length(args) - 1), min(length(args), 1))
+      [] -> if length(args) == 0, do: [], else: [0]
       keys -> dedup_indices(keys)
+    end
+  end
+
+  defp flow_items_ext_partition_indices(args, items_idx, prefix_width, auto? \\ false) do
+    count = arg_to_non_neg_integer(Enum.at(args, items_idx + 1))
+    do_flow_items_ext_partition_indices(args, items_idx + 2, count, prefix_width, auto?, [])
+  end
+
+  defp do_flow_items_ext_partition_indices(_args, _idx, count, _prefix_width, _auto?, acc)
+       when count <= 0,
+       do: Enum.reverse(acc)
+
+  defp do_flow_items_ext_partition_indices(args, idx, count, prefix_width, auto?, acc) do
+    if idx + prefix_width >= length(args) do
+      Enum.reverse(acc)
+    else
+      partition_acc =
+        if auto? or arg_eq?(Enum.at(args, idx + 1), "-") do
+          [idx | acc]
+        else
+          [idx + 1 | acc]
+        end
+
+      values_idx = idx + prefix_width
+      values_count = arg_to_non_neg_integer(Enum.at(args, values_idx))
+      refs_idx = values_idx + 1 + values_count * 2
+      refs_count = arg_to_non_neg_integer(Enum.at(args, refs_idx))
+      next_idx = refs_idx + 1 + refs_count * 2
+
+      do_flow_items_ext_partition_indices(
+        args,
+        next_idx,
+        count - 1,
+        prefix_width,
+        auto?,
+        partition_acc
+      )
+    end
+  end
+
+  defp flow_items_marker(args, start) do
+    items_idx = flow_option_index(args, start, "ITEMS")
+    items_ext_idx = flow_option_index(args, start, "ITEMS_EXT")
+
+    cond do
+      is_nil(items_idx) and is_nil(items_ext_idx) -> nil
+      is_nil(items_ext_idx) -> {items_idx, false}
+      is_nil(items_idx) -> {items_ext_idx, true}
+      items_ext_idx < items_idx -> {items_ext_idx, true}
+      true -> {items_idx, false}
+    end
+  end
+
+  defp arg_to_non_neg_integer(value) do
+    case Integer.parse(to_string(value || "0")) do
+      {parsed, ""} when parsed >= 0 -> parsed
+      _ -> 0
     end
   end
 
@@ -987,7 +1265,7 @@ defmodule Ferricstore.Commands.Catalog do
     if not arg_eq?(hd(args), "MIXED") do
       [0]
     else
-      case option_index(args, 3, "ITEMS") do
+      case flow_option_index(args, 3, "ITEMS") do
         nil -> [0]
         items_idx -> repeated_item_partition_indices(args, items_idx + 1, 4)
       end
@@ -1000,7 +1278,7 @@ defmodule Ferricstore.Commands.Catalog do
     if not arg_eq?(hd(args), "MIXED") do
       [0]
     else
-      case option_index(args, 1, "ITEMS") do
+      case flow_option_index(args, 1, "ITEMS") do
         nil -> [0]
         items_idx -> repeated_item_partition_indices(args, items_idx + 1, 4)
       end
@@ -1013,34 +1291,61 @@ defmodule Ferricstore.Commands.Catalog do
     if not arg_eq?(hd(args), "MIXED") do
       [0]
     else
-      case option_index(args, 1, "ITEMS") do
+      case flow_option_index(args, 1, "ITEMS") do
         nil -> [0]
         items_idx -> repeated_item_partition_indices(args, items_idx + 1, 3)
       end
     end
   end
 
-  defp repeated_item_partition_indices(args, start_idx, step) do
-    do_repeated_item_partition_indices(args, start_idx, step, [])
+  defp repeated_item_partition_indices(args, start_idx, step, auto? \\ false) do
+    do_repeated_item_partition_indices(args, start_idx, step, auto?, [])
   end
 
-  defp do_repeated_item_partition_indices(args, idx, step, acc) do
+  defp do_repeated_item_partition_indices(args, idx, step, auto?, acc) do
     if idx + step - 1 < length(args) do
-      do_repeated_item_partition_indices(args, idx + step, step, [idx + 1 | acc])
+      partition_idx = if auto? or arg_eq?(Enum.at(args, idx + 1), "-"), do: idx, else: idx + 1
+      do_repeated_item_partition_indices(args, idx + step, step, auto?, [partition_idx | acc])
     else
       Enum.reverse(acc)
     end
   end
 
-  defp option_index(args, start, name), do: option_index(args, start, name, length(args))
+  defp flow_option_index(args, start, name),
+    do: flow_option_index(args, start, name, length(args), 3)
 
-  defp option_index(_args, idx, _name, len) when idx >= len, do: nil
+  defp flow_option_index(_args, idx, _name, len, _value_width) when idx >= len, do: nil
 
-  defp option_index(args, idx, name, len) do
-    if arg_eq?(Enum.at(args, idx), name) do
-      idx
-    else
-      option_index(args, idx + 2, name, len)
+  defp flow_option_index(args, idx, name, len, value_width) do
+    cond do
+      arg_eq?(Enum.at(args, idx), name) ->
+        idx
+
+      arg_eq?(Enum.at(args, idx), "VALUE") or arg_eq?(Enum.at(args, idx), "VALUE_REF") ->
+        flow_option_index(args, idx + value_width, name, len, value_width)
+
+      value_width == 2 and arg_eq?(Enum.at(args, idx), "FULL") ->
+        next_idx =
+          if idx + 1 < len and read_flag_boolean?(Enum.at(args, idx + 1)) do
+            idx + 2
+          else
+            idx + 1
+          end
+
+        flow_option_index(args, next_idx, name, len, value_width)
+
+      value_width == 2 and arg_eq?(Enum.at(args, idx), "NOPAYLOAD") ->
+        flow_option_index(args, idx + 1, name, len, value_width)
+
+      value_width == 2 and arg_eq?(Enum.at(args, idx), "PAYLOAD") ->
+        flow_option_index(args, next_after_read_payload_flag(args, idx, len), name, len, value_width)
+
+      arg_eq?(Enum.at(args, idx), "PARTITIONS") ->
+        count = arg_to_non_neg_integer(Enum.at(args, idx + 1))
+        flow_option_index(args, idx + 2 + count, name, len, value_width)
+
+      true ->
+        flow_option_index(args, idx + 2, name, len, value_width)
     end
   end
 

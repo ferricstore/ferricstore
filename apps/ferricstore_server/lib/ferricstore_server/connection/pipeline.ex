@@ -746,7 +746,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # terminal state.
 
   defp try_batch_flow_write_fast_path(commands, state, send_response_fn) do
-    if requires_auth?(state) or state.multi_state == :queuing do
+    if requires_auth?(state) or state.multi_state == :queuing or
+         not flow_pipeline_fast_paths_enabled?(state) do
       :fallback
     else
       if full_acl_fast_path?(state.acl_cache) do
@@ -800,8 +801,40 @@ defmodule FerricstoreServer.Connection.Pipeline do
        do: extract_flow_writes(rest, [{:transition, id, from_state, to_state, opts} | acc])
 
   defp extract_flow_writes(
-         [{:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
-          | rest],
+         [{:command, "FLOW.SIGNAL", _args, {:flow_signal, id, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_list(opts),
+       do: extract_flow_writes(rest, [{:signal, id, opts} | acc])
+
+  defp extract_flow_writes(
+         [
+           {:command, "FLOW.EXTEND_LEASE", _args, {:flow_extend_lease, id, lease_token, opts},
+            _keys}
+           | rest
+         ],
+         acc
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: extract_flow_writes(rest, [{:extend_lease, id, lease_token, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.VALUE.PUT", _args, {:flow_value_put, value, opts}, _keys} | rest],
+         acc
+       )
+       when is_list(opts) do
+    if owned_flow_value_put_opts?(opts) do
+      extract_flow_writes(rest, [{:value_put, value, opts} | acc])
+    else
+      :fallback
+    end
+  end
+
+  defp extract_flow_writes(
+         [
+           {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
+           | rest
+         ],
          acc
        )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
@@ -848,21 +881,37 @@ defmodule FerricstoreServer.Connection.Pipeline do
        when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
        do: {:ok, {:transition, id, from_state, to_state, opts}}
 
+  defp flow_write_op({:command, "FLOW.SIGNAL", _args, {:flow_signal, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:signal, id, opts}}
+
+  defp flow_write_op(
+         {:command, "FLOW.EXTEND_LEASE", _args, {:flow_extend_lease, id, lease_token, opts},
+          _keys}
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: {:ok, {:extend_lease, id, lease_token, opts}}
+
+  defp flow_write_op({:command, "FLOW.VALUE.PUT", _args, {:flow_value_put, value, opts}, _keys})
+       when is_list(opts) do
+    if owned_flow_value_put_opts?(opts) do
+      {:ok, {:value_put, value, opts}}
+    else
+      :fallback
+    end
+  end
+
   defp flow_write_op(
          {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
        )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
        do: {:ok, {:complete, id, lease_token, opts}}
 
-  defp flow_write_op(
-         {:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys}
-       )
+  defp flow_write_op({:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys})
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
        do: {:ok, {:retry, id, lease_token, opts}}
 
-  defp flow_write_op(
-         {:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys}
-       )
+  defp flow_write_op({:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys})
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
        do: {:ok, {:fail, id, lease_token, opts}}
 
@@ -875,6 +924,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
        do: {:ok, {:rewind, id, opts}}
 
   defp flow_write_op(_command), do: :fallback
+
+  defp owned_flow_value_put_opts?(opts) when is_list(opts) do
+    is_binary(Keyword.get(opts, :owner_flow_id)) and is_binary(Keyword.get(opts, :name))
+  end
+
+  defp owned_flow_value_put_opts?(_opts), do: false
 
   defp flow_claim_due_op(
          {:command, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, type, opts}, _keys}
@@ -892,9 +947,25 @@ defmodule FerricstoreServer.Connection.Pipeline do
        when is_binary(id) and is_list(opts),
        do: {:ok, {:history, id, opts}}
 
+  defp flow_read_op({:command, "FLOW.VALUE.MGET", _args, {:flow_value_mget, refs}, _keys})
+       when is_list(refs),
+       do: {:ok, {:value_mget, refs, []}}
+
+  defp flow_read_op({:command, "FLOW.VALUE.MGET", _args, {:flow_value_mget, refs, opts}, _keys})
+       when is_list(refs) and is_list(opts),
+       do: {:ok, {:value_mget, refs, opts}}
+
   defp flow_read_op({:command, "FLOW.LIST", _args, {:flow_list, type, opts}, _keys})
        when is_binary(type) and is_list(opts),
        do: {:ok, {:list, type, opts}}
+
+  defp flow_read_op({:command, "FLOW.TERMINALS", _args, {:flow_terminals, type, opts}, _keys})
+       when is_binary(type) and is_list(opts),
+       do: {:ok, {:terminals, type, opts}}
+
+  defp flow_read_op({:command, "FLOW.FAILURES", _args, {:flow_failures, type, opts}, _keys})
+       when is_binary(type) and is_list(opts),
+       do: {:ok, {:failures, type, opts}}
 
   defp flow_read_op({:command, "FLOW.BY_PARENT", _args, {:flow_by_parent, id, opts}, _keys})
        when is_binary(id) and is_list(opts),
@@ -1027,14 +1098,16 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp dispatch_pure_segments([{cmd, idx} | rest], state, store, prefetched_reads, acc) do
-    case flow_write_op(cmd) do
+    flow_fast_paths? = flow_pipeline_fast_paths_enabled?(state)
+
+    case maybe_flow_write_op(cmd, flow_fast_paths?) do
       {:ok, op} ->
         {ops, rest} = take_flow_write_segment(rest, [op])
         entries = dispatch_flow_write_segment(Enum.reverse(ops), state)
         dispatch_pure_segments(rest, state, store, prefetched_reads, Enum.reverse(entries) ++ acc)
 
       :fallback ->
-        case flow_claim_due_op(cmd) do
+        case maybe_flow_claim_due_op(cmd, flow_fast_paths?) do
           {:ok, op} ->
             {ops, rest} = take_flow_claim_due_segment(rest, [op])
             entries = dispatch_flow_claim_due_segment(Enum.reverse(ops), state)
@@ -1048,7 +1121,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
             )
 
           :fallback ->
-            case flow_read_op(cmd) do
+            case maybe_flow_read_op(cmd, flow_fast_paths?) do
               {:ok, op} ->
                 {ops, rest} = take_flow_read_segment(rest, [op])
                 entries = dispatch_flow_read_segment(Enum.reverse(ops), state)
@@ -1096,6 +1169,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
         end
     end
   end
+
+  defp flow_pipeline_fast_paths_enabled?(%{sandbox_namespace: nil}), do: true
+  defp flow_pipeline_fast_paths_enabled?(_state), do: false
+
+  defp maybe_flow_write_op(cmd, true), do: flow_write_op(cmd)
+  defp maybe_flow_write_op(_cmd, false), do: :fallback
+
+  defp maybe_flow_claim_due_op(cmd, true), do: flow_claim_due_op(cmd)
+  defp maybe_flow_claim_due_op(_cmd, false), do: :fallback
+
+  defp maybe_flow_read_op(cmd, true), do: flow_read_op(cmd)
+  defp maybe_flow_read_op(_cmd, false), do: :fallback
 
   defp take_flow_write_segment([{cmd, idx} | rest], acc) do
     case flow_write_op(cmd) do
@@ -1894,7 +1979,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp dispatch_store_command(name, args, ast, store, _ctx, _namespace)
-       when is_tuple(ast) and tuple_size(ast) in 2..5 do
+       when is_tuple(ast) and tuple_size(ast) in 2..6 do
     case Dispatcher.dispatch_ast(ast, store) do
       {:error, "ERR unsupported command AST"} ->
         {:error,

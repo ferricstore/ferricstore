@@ -67,10 +67,14 @@ fn open(
 fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
     handle.check_alive()?;
 
-    // Collect iodata into bytes
-    let bytes = iodata_to_bytes(iodata)?;
+    let bytes = iodata_to_binary(iodata)?;
+    let incoming = bytes.as_slice().len() as u64;
 
-    handle.buffer_write(&bytes)?;
+    if incoming > handle.max_buffer_bytes() {
+        return Err(rustler::Error::Term(Box::new("backpressure")));
+    }
+
+    handle.buffer_write(bytes.as_slice())?;
     Ok(atoms::ok())
 }
 
@@ -160,9 +164,8 @@ fn pread<'a>(
 /// flat binaries, deeply nested lists, improper lists like `[H | <<tail>>]`, and
 /// integer bytes. Our previous hand-rolled flattener returned `:badarg` on
 /// improper lists, which crashed the ra WAL on every flush of a real batch.
-fn iodata_to_bytes(term: Term) -> NifResult<Vec<u8>> {
-    let bin = term.decode_as_binary()?;
-    Ok(bin.as_slice().to_vec())
+fn iodata_to_binary<'a>(term: Term<'a>) -> NifResult<Binary<'a>> {
+    term.decode_as_binary()
 }
 
 // ---------------------------------------------------------------------------

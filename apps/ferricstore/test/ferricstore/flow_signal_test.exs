@@ -165,6 +165,46 @@ defmodule Ferricstore.FlowSignalTest do
     assert fetched.fencing_token == claimed.fencing_token
   end
 
+  test "signal cannot transition an already terminal flow" do
+    id = uid("signal-terminal-source")
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: "signal-terminal-source",
+               partition_key: "tenant-a",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("signal-terminal-source",
+               partition_key: "tenant-a",
+               worker: "worker-a",
+               lease_ms: 10_000,
+               payload: false,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: "tenant-a",
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_100
+             )
+
+    assert {:error, "ERR flow is terminal; use FLOW.REWIND"} =
+             FerricStore.flow_signal(id,
+               partition_key: "tenant-a",
+               signal: "external_event",
+               if_state: "completed",
+               transition_to: "queued",
+               now_ms: 1_200
+             )
+
+    assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: "tenant-a")
+    assert fetched.state == "completed"
+  end
+
   test "signal if_state guard rejects stale state without value writes" do
     id = uid("signal-guard")
 

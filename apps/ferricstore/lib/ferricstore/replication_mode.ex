@@ -96,11 +96,11 @@ defmodule Ferricstore.ReplicationMode do
   end
 
   defp decode(binary) do
-    case :erlang.binary_to_term(binary) do
+    case :erlang.binary_to_term(binary, [:safe]) do
       {:ferricstore_cluster_state_v1, payload, checksum}
       when is_binary(payload) and is_binary(checksum) ->
         if :crypto.hash(:sha256, payload) == checksum do
-          case :erlang.binary_to_term(payload) do
+          case :erlang.binary_to_term(payload, [:safe]) do
             {:ferricstore_cluster_state, data} when is_map(data) -> {:ok, data}
             other -> {:error, {:invalid_payload, other}}
           end

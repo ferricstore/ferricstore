@@ -167,6 +167,9 @@ mod atoms {
 
 const MAX_ARRAY_COUNT: i64 = 1_048_576;
 const MAX_RESP_NESTING_DEPTH: usize = 128;
+const MAX_SCALAR_BYTES: usize = 1_048_576;
+const MAX_INLINE_BYTES: usize = 1_048_576;
+const INITIAL_AGGREGATE_RESERVE_CAP: usize = 1024;
 const FLOW_MAX_REF_SIZE: usize = 4_096;
 
 // =========================================================================
@@ -273,8 +276,8 @@ mod resp {
             }
             b'*' => parse_array_resp(buf, pos + 1, max_value_size, depth),
             b'$' => parse_bulk_string_resp(buf, pos + 1, max_value_size),
-            b'+' => parse_simple_string_resp(buf, pos + 1),
-            b'-' => parse_simple_error_resp(buf, pos + 1),
+            b'+' => parse_simple_string_resp(buf, pos + 1, max_value_size),
+            b'-' => parse_simple_error_resp(buf, pos + 1, max_value_size),
             b':' => parse_integer_resp(buf, pos + 1),
             b'_' => parse_null_resp(buf, pos + 1),
             b'#' | b',' | b'(' | b'!' | b'=' | b'%' | b'~' | b'>' | b'|' => RespParseResult::Error(
@@ -314,7 +317,7 @@ mod resp {
             return RespParseResult::Error(RespError::InvalidArrayCount(lossy_str(line)));
         }
 
-        let mut elements = Vec::with_capacity(count as usize);
+        let mut elements = Vec::with_capacity(aggregate_initial_capacity(count as usize));
         let mut cur = after_crlf;
 
         for _ in 0..count {
@@ -362,7 +365,15 @@ mod resp {
             });
         }
 
-        let needed = after_crlf + len + 2;
+        let needed = match after_crlf.checked_add(len).and_then(|n| n.checked_add(2)) {
+            Some(needed) => needed,
+            None => {
+                return RespParseResult::Error(RespError::ValueTooLarge {
+                    len,
+                    max: max_value_size,
+                });
+            }
+        };
         if needed > buf.len() {
             return RespParseResult::Incomplete;
         }
@@ -377,19 +388,41 @@ mod resp {
         )
     }
 
-    fn parse_simple_string_resp(buf: &[u8], pos: usize) -> RespParseResult<'_> {
+    fn parse_simple_string_resp(
+        buf: &[u8],
+        pos: usize,
+        max_value_size: usize,
+    ) -> RespParseResult<'_> {
         let (line_end, after_crlf) = match find_crlf(buf, pos) {
             Some(v) => v,
             None => return RespParseResult::Incomplete,
         };
+        let len = line_end - pos;
+        if len > max_value_size {
+            return RespParseResult::Error(RespError::ValueTooLarge {
+                len,
+                max: max_value_size,
+            });
+        }
         RespParseResult::Ok(RespValue::SimpleString(&buf[pos..line_end]), after_crlf)
     }
 
-    fn parse_simple_error_resp(buf: &[u8], pos: usize) -> RespParseResult<'_> {
+    fn parse_simple_error_resp(
+        buf: &[u8],
+        pos: usize,
+        max_value_size: usize,
+    ) -> RespParseResult<'_> {
         let (line_end, after_crlf) = match find_crlf(buf, pos) {
             Some(v) => v,
             None => return RespParseResult::Incomplete,
         };
+        let len = line_end - pos;
+        if len > max_value_size {
+            return RespParseResult::Error(RespError::ValueTooLarge {
+                len,
+                max: max_value_size,
+            });
+        }
         RespParseResult::Ok(RespValue::SimpleError(&buf[pos..line_end]), after_crlf)
     }
 
@@ -400,6 +433,12 @@ mod resp {
         };
 
         let line = &buf[pos..cr_pos];
+        if line.len() > MAX_SCALAR_BYTES {
+            return RespParseResult::Error(RespError::ValueTooLarge {
+                len: line.len(),
+                max: MAX_SCALAR_BYTES,
+            });
+        }
         match parse_int_bytes(line) {
             Some(n) => RespParseResult::Ok(RespValue::Integer(n), after_crlf),
             None => RespParseResult::Error(RespError::InvalidInteger(lossy_str(line))),
@@ -426,7 +465,7 @@ mod resp {
         };
 
         let line = &buf[pos..cr_pos];
-        if line.len() > 1_048_576 {
+        if line.len() > MAX_INLINE_BYTES {
             return RespParseResult::Error(RespError::InlineTooLong);
         }
 
@@ -544,8 +583,8 @@ fn parse_one<'a>(
         }
         b'*' => parse_array(env, data, buf, pos + 1, max_value_size, depth),
         b'$' => parse_bulk_string(env, data, buf, pos + 1, max_value_size),
-        b'+' => parse_simple_string(env, data, buf, pos + 1),
-        b'-' => parse_simple_error(env, data, buf, pos + 1),
+        b'+' => parse_simple_string(env, data, buf, pos + 1, max_value_size),
+        b'-' => parse_simple_error(env, data, buf, pos + 1, max_value_size),
         b':' => parse_integer(env, buf, pos + 1),
         b'_' => parse_null(env, buf, pos + 1),
         b'#' => parse_boolean(env, buf, pos + 1),
@@ -640,8 +679,9 @@ fn parse_command_array<'a>(
 
     let cmd_bytes = uppercase_bytes(&buf[cmd_start..cmd_start + cmd_len]);
     let cmd = make_uppercase_term(env, data, buf, cmd_start, cmd_len);
-    let mut args: Vec<Term<'a>> = Vec::with_capacity(count.saturating_sub(1));
-    let mut arg_bytes: Vec<&[u8]> = Vec::with_capacity(count.saturating_sub(1));
+    let arg_capacity = aggregate_initial_capacity(count.saturating_sub(1));
+    let mut args: Vec<Term<'a>> = Vec::with_capacity(arg_capacity);
+    let mut arg_bytes: Vec<&[u8]> = Vec::with_capacity(arg_capacity);
 
     for _ in 1..count {
         match parse_command_bulk_arg(env, buf, cur, max_value_size, true) {
@@ -673,7 +713,7 @@ fn parse_inline_command<'a>(
     };
 
     let line = &buf[pos..line_end];
-    if line.len() > 1_048_576 {
+    if line.len() > MAX_INLINE_BYTES {
         return ParseResult::Error(make_binary_term(
             env,
             b"ERR protocol error: inline command too long",
@@ -754,7 +794,8 @@ fn parse_array<'a>(
         );
     }
 
-    let mut elements: Vec<Term<'a>> = Vec::with_capacity(count as usize);
+    let mut elements: Vec<Term<'a>> =
+        Vec::with_capacity(aggregate_initial_capacity(count as usize));
     let mut cur = after_crlf;
 
     for _ in 0..count {
@@ -804,7 +845,12 @@ fn parse_bulk_string<'a>(
         return ParseResult::Error((atoms::value_too_large(), len, max_value_size).encode(env));
     }
 
-    let needed = after_crlf + len + 2;
+    let needed = match after_crlf.checked_add(len).and_then(|n| n.checked_add(2)) {
+        Some(needed) => needed,
+        None => {
+            return ParseResult::Error((atoms::value_too_large(), len, max_value_size).encode(env));
+        }
+    };
     if needed > buf.len() {
         return ParseResult::Incomplete;
     }
@@ -822,11 +868,16 @@ fn parse_simple_string<'a>(
     data: &Binary<'a>,
     buf: &[u8],
     pos: usize,
+    max_value_size: usize,
 ) -> ParseResult<'a> {
     let (line_end, after_crlf) = match find_crlf(buf, pos) {
         Some(v) => v,
         None => return ParseResult::Incomplete,
     };
+    let len = line_end - pos;
+    if len > max_value_size {
+        return ParseResult::Error((atoms::value_too_large(), len, max_value_size).encode(env));
+    }
     let line = unsafe { data.make_subbinary_unchecked(pos, line_end - pos) }.encode(env);
     ParseResult::Ok((atoms::simple(), line).encode(env), after_crlf)
 }
@@ -836,11 +887,16 @@ fn parse_simple_error<'a>(
     data: &Binary<'a>,
     buf: &[u8],
     pos: usize,
+    max_value_size: usize,
 ) -> ParseResult<'a> {
     let (line_end, after_crlf) = match find_crlf(buf, pos) {
         Some(v) => v,
         None => return ParseResult::Incomplete,
     };
+    let len = line_end - pos;
+    if len > max_value_size {
+        return ParseResult::Error((atoms::value_too_large(), len, max_value_size).encode(env));
+    }
     let line = unsafe { data.make_subbinary_unchecked(pos, line_end - pos) }.encode(env);
     ParseResult::Ok((atoms::error(), line).encode(env), after_crlf)
 }
@@ -852,6 +908,11 @@ fn parse_integer<'a>(env: Env<'a>, buf: &[u8], pos: usize) -> ParseResult<'a> {
     };
 
     let line = &buf[pos..cr_pos];
+    if line.len() > MAX_SCALAR_BYTES {
+        return ParseResult::Error(
+            (atoms::value_too_large(), line.len(), MAX_SCALAR_BYTES).encode(env),
+        );
+    }
     match std::str::from_utf8(line)
         .ok()
         .and_then(|s| BigInt::from_str(s).ok())
@@ -916,6 +977,11 @@ fn parse_double<'a>(env: Env<'a>, buf: &[u8], pos: usize) -> ParseResult<'a> {
     };
 
     let line = &buf[pos..cr_pos];
+    if line.len() > MAX_SCALAR_BYTES {
+        return ParseResult::Error(
+            (atoms::value_too_large(), line.len(), MAX_SCALAR_BYTES).encode(env),
+        );
+    }
     match line {
         b"inf" => ParseResult::Ok(
             Atom::from_str(env, "infinity").unwrap().encode(env),
@@ -951,6 +1017,11 @@ fn parse_big_number<'a>(env: Env<'a>, buf: &[u8], pos: usize) -> ParseResult<'a>
     };
 
     let line = &buf[pos..cr_pos];
+    if line.len() > MAX_SCALAR_BYTES {
+        return ParseResult::Error(
+            (atoms::value_too_large(), line.len(), MAX_SCALAR_BYTES).encode(env),
+        );
+    }
     match std::str::from_utf8(line)
         .ok()
         .and_then(|s| BigInt::from_str(s).ok())
@@ -1133,7 +1204,7 @@ fn parse_inline<'a>(env: Env<'a>, buf: &[u8], pos: usize) -> ParseResult<'a> {
     };
 
     let line = &buf[pos..cr_pos];
-    if line.len() > 1_048_576 {
+    if line.len() > MAX_INLINE_BYTES {
         return ParseResult::Error(make_binary_term(
             env,
             b"ERR protocol error: inline command too long",
@@ -1198,7 +1269,7 @@ fn parse_counted_elements<'a>(
         }
     };
 
-    let mut elements: Vec<Term<'a>> = Vec::with_capacity(count);
+    let mut elements: Vec<Term<'a>> = Vec::with_capacity(aggregate_initial_capacity(count));
     let mut cur = after_crlf;
 
     for _ in 0..count {
@@ -1309,7 +1380,14 @@ fn parse_sized_payload_range<'a>(
         );
     }
 
-    let needed = after_crlf + len + 2;
+    let needed = match after_crlf.checked_add(len).and_then(|n| n.checked_add(2)) {
+        Some(needed) => needed,
+        None => {
+            return SizedPayloadRange::Error(
+                (atoms::value_too_large(), len, max_value_size).encode(env),
+            );
+        }
+    };
     if needed > buf.len() {
         return SizedPayloadRange::Incomplete;
     }
@@ -2265,7 +2343,7 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowValuePut => make_flow_value_put_command_ast(env, args, arg_bytes),
-        CommandAstKind::FlowValueMget => make_flow_value_mget_command_ast(env, args),
+        CommandAstKind::FlowValueMget => make_flow_value_mget_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowSignal => make_flow_signal_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowSpawnChildren => {
             make_flow_spawn_children_command_ast(env, args, arg_bytes)
@@ -5189,13 +5267,45 @@ fn make_flow_value_put_command_ast<'a>(
     }
 }
 
-fn make_flow_value_mget_command_ast<'a>(env: Env<'a>, args: &[Term<'a>]) -> Term<'a> {
+fn make_flow_value_mget_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
     let tag = atom(env, "flow_value_mget");
     if args.is_empty() {
         return (tag, wrong_number_error(env, b"flow.value.mget")).encode(env);
     }
 
-    (tag, args.to_vec()).encode(env)
+    let mut refs_end = args.len();
+    let mut opts = Vec::new();
+    if args.len() >= 2
+        && (ascii_eq_ignore_case(arg_bytes[args.len() - 2], b"MAX_BYTES")
+            || ascii_eq_ignore_case(arg_bytes[args.len() - 2], b"VALUE_MAX_BYTES"))
+    {
+        refs_end = args.len() - 2;
+        if refs_end == 0 {
+            return (tag, generic_ast_error(env, b"ERR flow refs are required")).encode(env);
+        }
+        match parse_int_bytes(arg_bytes[args.len() - 1]) {
+            Some(value) if value >= 0 => {
+                opts.push((atom(env, "max_bytes"), value).encode(env));
+            }
+            _ => {
+                return (
+                    tag,
+                    generic_ast_error(env, b"ERR value is not an integer or out of range"),
+                )
+                    .encode(env)
+            }
+        }
+    }
+
+    if opts.is_empty() {
+        (tag, args.to_vec()).encode(env)
+    } else {
+        (tag, args[..refs_end].to_vec(), opts).encode(env)
+    }
 }
 
 fn make_flow_signal_command_ast<'a>(
@@ -5248,10 +5358,11 @@ fn make_flow_create_many_command_ast<'a>(
             Err(err) => return (tag, args[0], err).encode(env),
         };
 
-        let items = match parse_flow_create_many_extended_items(env, args, arg_bytes, items_idx) {
-            Ok(items) => items,
-            Err(err) => return (tag, args[0], err).encode(env),
-        };
+        let items =
+            match parse_flow_create_many_extended_items(env, args, arg_bytes, items_idx, auto) {
+                Ok(items) => items,
+                Err(err) => return (tag, args[0], err).encode(env),
+            };
 
         let partition = if mixed || auto {
             atoms::nil().encode(env)
@@ -5288,7 +5399,10 @@ fn make_flow_create_many_command_ast<'a>(
     let mut idx = items_idx + 1;
     while idx < args.len() {
         if mixed {
-            let mut item_opts = vec![(atom(env, "partition_key"), args[idx + 1]).encode(env)];
+            let mut item_opts = Vec::new();
+            if !ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+                item_opts.push((atom(env, "partition_key"), args[idx + 1]).encode(env));
+            }
             if !shared_payload_ref {
                 item_opts.push((atom(env, "payload"), args[idx + 2]).encode(env));
             }
@@ -5405,6 +5519,7 @@ fn parse_flow_create_many_extended_items<'a>(
     args: &[Term<'a>],
     arg_bytes: &[&[u8]],
     items_idx: usize,
+    auto: bool,
 ) -> Result<Vec<Term<'a>>, Term<'a>> {
     let count_idx = items_idx + 1;
     let Some(count) = parse_usize_bytes(arg_bytes.get(count_idx).copied()) else {
@@ -5423,6 +5538,13 @@ fn parse_flow_create_many_extended_items<'a>(
         let partition_bytes = arg_bytes[idx + 1];
         let payload = args[idx + 2];
         idx += 3;
+
+        if auto && !ascii_eq_ignore_case(partition_bytes, b"-") {
+            return Err(generic_ast_error(
+                env,
+                b"ERR FLOW.CREATE_MANY AUTO ITEMS_EXT requires '-' partition",
+            ));
+        }
 
         let (values, next_idx) = parse_flow_extended_named_pairs(env, args, arg_bytes, idx, false)?;
         let (value_refs, next_idx) =
@@ -5537,6 +5659,14 @@ fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&
     if args.is_empty() {
         return (tag, wrong_number_error(env, b"flow.get")).encode(env);
     }
+    if flow_has_option_until_with_value_width(arg_bytes, 1, arg_bytes.len(), b"PARTITIONS", 2) {
+        return (
+            tag,
+            args[0],
+            generic_ast_error(env, b"ERR FLOW.GET supports PARTITION, not PARTITIONS"),
+        )
+            .encode(env);
+    }
 
     match parse_flow_read_options(env, args, arg_bytes, 1, flow_partition_option) {
         Ok(opts) => (tag, args[0], opts).encode(env),
@@ -5598,7 +5728,7 @@ fn make_flow_reclaim_command_ast<'a>(
     arg_bytes: &[&[u8]],
 ) -> Term<'a> {
     let tag = atom(env, "flow_reclaim");
-    if args.is_empty() {
+    if args.len() < 3 {
         return (tag, wrong_number_error(env, b"flow.reclaim")).encode(env);
     }
 
@@ -5826,7 +5956,7 @@ fn make_flow_retry_many_command_ast<'a>(
 
     let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
 
-    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 1) else {
         return (
             tag,
             args[0],
@@ -5913,7 +6043,7 @@ fn make_flow_cancel_many_command_ast<'a>(
 
     let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
 
-    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 1) else {
         return (
             tag,
             args[0],
@@ -6300,6 +6430,14 @@ fn make_flow_history_command_ast<'a>(
     if args.is_empty() {
         return (tag, wrong_number_error(env, b"flow.history")).encode(env);
     }
+    if flow_has_option_until_with_value_width(arg_bytes, 1, arg_bytes.len(), b"PARTITIONS", 2) {
+        return (
+            tag,
+            args[0],
+            generic_ast_error(env, b"ERR FLOW.HISTORY supports PARTITION, not PARTITIONS"),
+        )
+            .encode(env);
+    }
 
     match parse_flow_options(env, args, arg_bytes, 1, flow_history_option) {
         Ok(opts) => (tag, args[0], opts).encode(env),
@@ -6623,17 +6761,6 @@ fn flow_retry_policy_option_name(value: &[u8]) -> bool {
         || ascii_eq_ignore_case(value, b"EXHAUSTED_TO")
 }
 
-fn flow_find_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> Option<usize> {
-    let mut idx = start;
-    while idx < arg_bytes.len() {
-        if ascii_eq_ignore_case(arg_bytes[idx], name) {
-            return Some(idx);
-        }
-        idx += 2;
-    }
-    None
-}
-
 fn flow_find_items_option(arg_bytes: &[&[u8]], start: usize) -> Option<usize> {
     let mut idx = start;
     while idx < arg_bytes.len() {
@@ -6685,12 +6812,38 @@ fn flow_has_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> bool {
 }
 
 fn flow_has_option_until(arg_bytes: &[&[u8]], start: usize, end: usize, name: &[u8]) -> bool {
+    flow_has_option_until_with_value_width(arg_bytes, start, end, name, 3)
+}
+
+fn flow_has_option_until_with_value_width(
+    arg_bytes: &[&[u8]],
+    start: usize,
+    end: usize,
+    name: &[u8],
+    value_width: usize,
+) -> bool {
     let mut idx = start;
     while idx < end {
         if ascii_eq_ignore_case(arg_bytes[idx], name) {
             return true;
         }
-        idx += 2;
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE")
+            || ascii_eq_ignore_case(arg_bytes[idx], b"VALUE_REF")
+        {
+            idx += value_width;
+        } else if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITIONS") {
+            let mut next_idx = idx + 2;
+            if idx + 1 < end {
+                if let Some(count) = parse_int_bytes(arg_bytes[idx + 1]) {
+                    if count > 0 {
+                        next_idx = idx + 2 + count as usize;
+                    }
+                }
+            }
+            idx = next_idx;
+        } else {
+            idx += 2;
+        }
     }
     false
 }
@@ -6720,7 +6873,11 @@ fn flow_create_option<'a>(
             (b"TYPE", "type", FlowOptType::Binary),
             (b"STATE", "state", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
+            (
+                b"PAYLOAD_REF",
+                "payload_ref",
+                FlowOptType::Ref(b"payload_ref"),
+            ),
             (
                 b"PARENT_FLOW_ID",
                 "parent_flow_id",
@@ -7255,7 +7412,11 @@ fn flow_transition_option<'a>(
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
+            (
+                b"PAYLOAD_REF",
+                "payload_ref",
+                FlowOptType::Ref(b"payload_ref"),
+            ),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -7343,7 +7504,11 @@ fn flow_transition_many_option<'a>(
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
+            (
+                b"PAYLOAD_REF",
+                "payload_ref",
+                FlowOptType::Ref(b"payload_ref"),
+            ),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"INDEPENDENT", "independent", FlowOptType::Boolean),
         ],
@@ -8080,8 +8245,8 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE_MANY" => flow_create_many_key_indices(arg_bytes),
-        b"FLOW.VALUE.PUT" => flow_partition_key_indices(arg_bytes, 1),
-        b"FLOW.VALUE.MGET" => all_indices(argc),
+        b"FLOW.VALUE.PUT" => flow_value_put_key_indices(arg_bytes),
+        b"FLOW.VALUE.MGET" => flow_value_mget_key_indices(arg_bytes),
         b"FLOW.SIGNAL" => flow_partition_or_first_key_indices(arg_bytes, 1),
         b"FLOW.SPAWN_CHILDREN" => flow_spawn_children_key_indices(arg_bytes),
         b"FLOW.COMPLETE_MANY" => flow_complete_many_key_indices(arg_bytes),
@@ -8089,8 +8254,9 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"FLOW.FAIL_MANY" => flow_fail_many_key_indices(arg_bytes),
         b"FLOW.CANCEL_MANY" => flow_cancel_many_key_indices(arg_bytes),
         b"FLOW.TRANSITION_MANY" => flow_transition_many_key_indices(arg_bytes),
-        b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.HISTORY" => {
-            flow_partition_or_first_key_indices(arg_bytes, 1)
+        b"FLOW.CREATE" => flow_partition_or_first_key_indices(arg_bytes, 1),
+        b"FLOW.GET" | b"FLOW.HISTORY" => {
+            flow_partition_or_first_key_indices_read_single(arg_bytes, 1)
         }
         b"FLOW.COMPLETE" | b"FLOW.RETRY" | b"FLOW.FAIL" | b"FLOW.EXTEND_LEASE" => {
             flow_partition_or_first_key_indices(arg_bytes, 2)
@@ -8098,11 +8264,13 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"FLOW.TRANSITION" => flow_partition_or_first_key_indices(arg_bytes, 3),
         b"FLOW.CANCEL" | b"FLOW.REWIND" => flow_partition_or_first_key_indices(arg_bytes, 1),
         b"FLOW.BY_PARENT" | b"FLOW.BY_ROOT" | b"FLOW.BY_CORRELATION" => {
-            flow_partition_or_first_key_indices(arg_bytes, 1)
+            flow_partition_or_first_key_indices_read_single(arg_bytes, 1)
         }
-        b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" | b"FLOW.LIST" | b"FLOW.TERMINALS"
-        | b"FLOW.FAILURES" | b"FLOW.INFO" | b"FLOW.STUCK" => {
-            flow_partition_or_first_key_indices(arg_bytes, 1)
+        b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" => {
+            flow_partition_or_first_key_indices_read(arg_bytes, 1)
+        }
+        b"FLOW.LIST" | b"FLOW.TERMINALS" | b"FLOW.FAILURES" | b"FLOW.INFO" | b"FLOW.STUCK" => {
+            flow_partition_or_first_key_indices_read_single(arg_bytes, 1)
         }
         b"FLOW.POLICY.SET" | b"FLOW.POLICY.GET" => first_n_indices(arg_bytes.len(), 1),
         b"MEMORY" => {
@@ -8290,11 +8458,68 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
 }
 
 fn flow_partition_or_first_key_indices(arg_bytes: &[&[u8]], option_start: usize) -> Vec<usize> {
+    flow_partition_or_first_key_indices_with_value_width(arg_bytes, option_start, 3)
+}
+
+fn flow_partition_or_first_key_indices_read(
+    arg_bytes: &[&[u8]],
+    option_start: usize,
+) -> Vec<usize> {
+    flow_partition_or_first_key_indices_with_value_width(arg_bytes, option_start, 2)
+}
+
+fn flow_partition_or_first_key_indices_read_single(
+    arg_bytes: &[&[u8]],
+    option_start: usize,
+) -> Vec<usize> {
+    if flow_has_option_until_with_value_width(
+        arg_bytes,
+        option_start,
+        arg_bytes.len(),
+        b"PARTITIONS",
+        2,
+    ) {
+        return Vec::new();
+    }
+
+    flow_partition_or_first_key_indices_with_value_width_and_partitions(
+        arg_bytes,
+        option_start,
+        2,
+        false,
+    )
+}
+
+fn flow_partition_or_first_key_indices_with_value_width(
+    arg_bytes: &[&[u8]],
+    option_start: usize,
+    value_width: usize,
+) -> Vec<usize> {
+    flow_partition_or_first_key_indices_with_value_width_and_partitions(
+        arg_bytes,
+        option_start,
+        value_width,
+        true,
+    )
+}
+
+fn flow_partition_or_first_key_indices_with_value_width_and_partitions(
+    arg_bytes: &[&[u8]],
+    option_start: usize,
+    value_width: usize,
+    allow_partitions: bool,
+) -> Vec<usize> {
     if arg_bytes.is_empty() {
         return Vec::new();
     }
 
-    let partition_keys = flow_partition_key_indices(arg_bytes, option_start);
+    let partition_keys = flow_partition_key_indices_until_with_value_width(
+        arg_bytes,
+        option_start,
+        arg_bytes.len(),
+        value_width,
+        allow_partitions,
+    );
     if partition_keys.is_empty() {
         vec![0]
     } else {
@@ -8303,7 +8528,13 @@ fn flow_partition_or_first_key_indices(arg_bytes: &[&[u8]], option_start: usize)
 }
 
 fn flow_partition_key_indices(arg_bytes: &[&[u8]], option_start: usize) -> Vec<usize> {
-    flow_partition_key_indices_until(arg_bytes, option_start, arg_bytes.len())
+    flow_partition_key_indices_until_with_value_width(
+        arg_bytes,
+        option_start,
+        arg_bytes.len(),
+        3,
+        true,
+    )
 }
 
 fn flow_partition_key_indices_until(
@@ -8311,30 +8542,110 @@ fn flow_partition_key_indices_until(
     option_start: usize,
     option_end: usize,
 ) -> Vec<usize> {
+    flow_partition_key_indices_until_with_value_width(arg_bytes, option_start, option_end, 3, true)
+}
+
+fn flow_partition_key_indices_until_with_value_width(
+    arg_bytes: &[&[u8]],
+    option_start: usize,
+    option_end: usize,
+    value_width: usize,
+    allow_partitions: bool,
+) -> Vec<usize> {
     let mut keys = Vec::new();
     let mut idx = option_start;
     let end = option_end.min(arg_bytes.len());
 
-    while idx + 1 < end {
+    while idx < end {
         if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITION") {
-            keys.push(idx + 1);
+            if idx + 1 < end && !ascii_eq_ignore_case(arg_bytes[idx + 1], b"GLOBAL") {
+                keys.push(idx + 1);
+            }
+            idx += 2;
         } else if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITIONS") {
-            if let Some(count) = parse_int_bytes(arg_bytes[idx + 1]) {
-                if count > 0 {
-                    let first = idx + 2;
-                    let last = first + count as usize;
-                    if last <= end {
-                        for key_idx in first..last {
-                            keys.push(key_idx);
+            let mut next_idx = idx + 2;
+            if idx + 1 < end {
+                if let Some(count) = parse_int_bytes(arg_bytes[idx + 1]) {
+                    if count > 0 {
+                        let first = idx + 2;
+                        let last = first + count as usize;
+                        if allow_partitions && last <= end {
+                            for key_idx in first..last {
+                                keys.push(key_idx);
+                            }
                         }
+                        next_idx = last;
                     }
                 }
             }
+            idx = next_idx;
+        } else if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE")
+            || ascii_eq_ignore_case(arg_bytes[idx], b"VALUE_REF")
+        {
+            idx += value_width;
+        } else if value_width == 2 && ascii_eq_ignore_case(arg_bytes[idx], b"FULL") {
+            if idx + 1 < end && flow_read_flag_has_explicit_bool(arg_bytes[idx + 1]) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        } else if value_width == 2 && ascii_eq_ignore_case(arg_bytes[idx], b"NOPAYLOAD") {
+            idx += 1;
+        } else if value_width == 2 && ascii_eq_ignore_case(arg_bytes[idx], b"PAYLOAD") {
+            idx = flow_next_after_read_payload_flag(arg_bytes, idx, end);
+        } else {
+            idx += 2;
         }
-        idx += 1;
     }
 
     keys
+}
+
+fn flow_read_flag_has_explicit_bool(value: &[u8]) -> bool {
+    parse_bool_bytes(value).is_some()
+}
+
+fn flow_next_after_read_payload_flag(arg_bytes: &[&[u8]], idx: usize, end: usize) -> usize {
+    let mut next_idx = idx + 1;
+
+    if next_idx < end && flow_read_flag_has_explicit_bool(arg_bytes[next_idx]) {
+        next_idx += 1;
+    }
+
+    if next_idx < end && ascii_eq_ignore_case(arg_bytes[next_idx], b"MAXBYTES") {
+        return next_idx.saturating_add(2);
+    }
+
+    next_idx
+}
+
+fn flow_value_mget_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
+    let argc = arg_bytes.len();
+    if argc >= 2
+        && (ascii_eq_ignore_case(arg_bytes[argc - 2], b"MAX_BYTES")
+            || ascii_eq_ignore_case(arg_bytes[argc - 2], b"VALUE_MAX_BYTES"))
+    {
+        range_indices(0, argc - 2)
+    } else {
+        all_indices(argc)
+    }
+}
+
+fn flow_value_put_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
+    let partition_keys = flow_partition_key_indices(arg_bytes, 1);
+    if !partition_keys.is_empty() {
+        return dedup_indices(partition_keys);
+    }
+
+    let mut idx = 1;
+    while idx + 1 < arg_bytes.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"OWNER_FLOW_ID") {
+            return vec![idx + 1];
+        }
+        idx += 2;
+    }
+
+    Vec::new()
 }
 
 fn dedup_indices(indices: Vec<usize>) -> Vec<usize> {
@@ -8348,7 +8659,13 @@ fn dedup_indices(indices: Vec<usize>) -> Vec<usize> {
 }
 
 fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
-    if arg_bytes.is_empty() || !ascii_eq_ignore_case(arg_bytes[0], b"MIXED") {
+    if arg_bytes.is_empty() {
+        return Vec::new();
+    }
+
+    let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
+    let auto = ascii_eq_ignore_case(arg_bytes[0], b"AUTO");
+    if !mixed && !auto {
         return vec![0];
     }
 
@@ -8367,7 +8684,9 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
             if idx + 3 >= arg_bytes.len() {
                 return vec![0];
             }
-            if !ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+            if auto || ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+                keys.push(idx);
+            } else {
                 keys.push(idx + 1);
             }
             idx += 3;
@@ -8384,11 +8703,20 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
     }
 
     let shared_payload_ref = flow_has_option_until(arg_bytes, 1, items_idx, b"PAYLOAD_REF");
-    let item_width = if shared_payload_ref { 2 } else { 3 };
+    let item_width = match (auto, shared_payload_ref) {
+        (true, true) => 1,
+        (true, false) => 2,
+        (false, true) => 2,
+        (false, false) => 3,
+    };
     let mut keys = Vec::new();
     let mut idx = items_idx + 1;
     while idx + item_width - 1 < arg_bytes.len() {
-        keys.push(idx + 1);
+        if auto || ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+            keys.push(idx);
+        } else {
+            keys.push(idx + 1);
+        }
         idx += item_width;
     }
     keys
@@ -8406,7 +8734,9 @@ fn flow_spawn_children_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
                 if idx + 4 >= arg_bytes.len() {
                     break;
                 }
-                if !ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+                if ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+                    partition_keys.push(idx);
+                } else {
                     partition_keys.push(idx + 1);
                 }
                 idx += 4;
@@ -8425,7 +8755,11 @@ fn flow_spawn_children_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
     {
         let mut idx = option_end + 2;
         while idx + 3 < arg_bytes.len() {
-            partition_keys.push(idx + 1);
+            if ascii_eq_ignore_case(arg_bytes[idx + 1], b"-") {
+                partition_keys.push(idx);
+            } else {
+                partition_keys.push(idx + 1);
+            }
             idx += 4;
         }
     }
@@ -8442,7 +8776,7 @@ fn flow_transition_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
         return vec![0];
     }
 
-    let Some(items_idx) = option_index(arg_bytes, 3, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 3) else {
         return vec![0];
     };
 
@@ -8460,7 +8794,7 @@ fn flow_complete_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
         return vec![0];
     }
 
-    let Some(items_idx) = option_index(arg_bytes, 1, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 1) else {
         return vec![0];
     };
 
@@ -8486,7 +8820,7 @@ fn flow_cancel_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
         return vec![0];
     }
 
-    let Some(items_idx) = option_index(arg_bytes, 1, b"ITEMS") else {
+    let Some(items_idx) = flow_find_items_option(arg_bytes, 1) else {
         return vec![0];
     };
 
@@ -8497,17 +8831,6 @@ fn flow_cancel_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
         idx += 3;
     }
     keys
-}
-
-fn option_index(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> Option<usize> {
-    let mut idx = start;
-    while idx < arg_bytes.len() {
-        if ascii_eq_ignore_case(arg_bytes[idx], name) {
-            return Some(idx);
-        }
-        idx += 2;
-    }
-    None
 }
 
 fn all_indices(argc: usize) -> Vec<usize> {
@@ -8974,6 +9297,10 @@ fn parse_non_negative_count(data: &[u8]) -> Result<usize, String> {
         Some(n) if (0..=MAX_ARRAY_COUNT).contains(&n) => Ok(n as usize),
         _ => Err(lossy_str(data)),
     }
+}
+
+fn aggregate_initial_capacity(count: usize) -> usize {
+    count.min(INITIAL_AGGREGATE_RESERVE_CAP)
 }
 
 fn find_crlf(buf: &[u8], start: usize) -> Option<(usize, usize)> {
@@ -9799,6 +10126,26 @@ mod tests {
     }
 
     #[test]
+    fn edge_huge_bulk_length_is_handled_without_panicking() {
+        let input = b"$9223372036854775807\r\n";
+        let result = parse_one_resp(input, 0, usize::MAX);
+        assert_eq!(result, RespParseResult::Incomplete);
+    }
+
+    #[test]
+    fn edge_simple_string_obeys_value_size_cap() {
+        let mut input = b"+".to_vec();
+        input.extend_from_slice(b"hello");
+        input.extend_from_slice(b"\r\n");
+
+        let result = parse_one_resp(&input, 0, 4);
+        assert_eq!(
+            result,
+            RespParseResult::Error(RespError::ValueTooLarge { len: 5, max: 4 })
+        );
+    }
+
+    #[test]
     fn edge_array_at_max_count_boundary() {
         // Array count exactly at MAX_ARRAY_COUNT should be accepted (structurally)
         // but will be Incomplete since we don't provide the elements
@@ -9810,6 +10157,15 @@ mod tests {
         let input2 = format!("*{}\r\n", MAX_ARRAY_COUNT + 1);
         let result2 = parse_one_resp(input2.as_bytes(), 0, MAX_SIZE);
         assert_eq!(result2, RespParseResult::Error(RespError::ArrayTooLarge));
+    }
+
+    #[test]
+    fn edge_large_aggregate_reserve_is_capped() {
+        assert_eq!(aggregate_initial_capacity(8), 8);
+        assert_eq!(
+            aggregate_initial_capacity(MAX_ARRAY_COUNT as usize),
+            INITIAL_AGGREGATE_RESERVE_CAP
+        );
     }
 
     #[test]
@@ -10476,6 +10832,48 @@ mod tests {
                 &[b"flow-1", b"FULL", b"PARTITION", b"tenant-a"]
             ),
             vec![3]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.GET",
+                &[b"flow-1", b"FULL", b"true", b"PARTITION", b"tenant-a"]
+            ),
+            vec![4]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.GET",
+                &[b"flow-1", b"NOPAYLOAD", b"PARTITION", b"tenant-a"]
+            ),
+            vec![3]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.GET",
+                &[b"flow-1", b"NOPAYLOAD", b"PARTITION", b"GLOBAL"]
+            ),
+            vec![0]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.CLAIM_DUE",
+                &[b"checkout", b"PARTITION", b"GLOBAL", b"WORKER", b"w"]
+            ),
+            vec![0]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.CLAIM_DUE",
+                &[
+                    b"checkout",
+                    b"WORKER",
+                    b"w",
+                    b"PAYLOAD",
+                    b"PARTITION",
+                    b"tenant-a",
+                ]
+            ),
+            vec![5]
         );
         assert_eq!(
             command_key_indices(

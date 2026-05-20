@@ -478,7 +478,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(flow_create flow_value_put flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
+      when tag in ~w(flow_create flow_create_many flow_value_put flow_value_mget flow_signal flow_spawn_children flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_extend_lease flow_complete flow_complete_many flow_transition flow_transition_many flow_retry flow_retry_many flow_fail flow_fail_many flow_cancel flow_cancel_many flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history flow_retention_cleanup)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
@@ -486,7 +486,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history flow_create_many flow_complete_many flow_retry_many flow_fail_many flow_cancel_many)a,
+      when tag in ~w(flow_create flow_value_put flow_value_mget flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history flow_create_many flow_complete_many flow_retry_many flow_fail_many flow_cancel_many)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)

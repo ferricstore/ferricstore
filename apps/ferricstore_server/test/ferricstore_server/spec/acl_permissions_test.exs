@@ -435,6 +435,16 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
       assert {"FLOW.LIST", ["checkout"]} = parsed_command_keys("flow.list checkout\r\n")
     end
 
+    test "FLOW.VALUE.PUT uses owner flow id as ACL key when no partition is supplied" do
+      assert {"FLOW.VALUE.PUT", ["flow-1"]} =
+               parsed_command_keys("flow.value.put payload OWNER_FLOW_ID flow-1 NAME profile\r\n")
+
+      assert {"FLOW.VALUE.PUT", ["tenant-a"]} =
+               parsed_command_keys(
+                 "flow.value.put payload PARTITION tenant-a OWNER_FLOW_ID flow-1 NAME profile\r\n"
+               )
+    end
+
     test "explicit partition keys are enforced for Flow index commands" do
       :ok = Acl.set_user("flow_tenant_a", ["on", ">pass", "+@all", "~tenant-a"])
       cache = ConnAuth.build_acl_cache("flow_tenant_a")

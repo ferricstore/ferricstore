@@ -49,6 +49,7 @@ defmodule Ferricstore.Store.Shard do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
+  alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Router
@@ -818,6 +819,10 @@ defmodule Ferricstore.Store.Shard do
     ShardCompound.handle_compound_scan(redis_key, prefix, state)
   end
 
+  def handle_call({:compound_scan, redis_key, prefix, limit}, _from, state) do
+    ShardCompound.handle_compound_scan(redis_key, prefix, state, limit)
+  end
+
   def handle_call({:compound_count, redis_key, prefix}, _from, state) do
     ShardCompound.handle_compound_count(redis_key, prefix, state)
   end
@@ -882,7 +887,8 @@ defmodule Ferricstore.Store.Shard do
            )}
 
         {:ok, native} ->
-          {:ok, NativeFlowIndex.range_slice(native, key, min_bound, max_bound, reverse?, offset, count)}
+          {:ok,
+           NativeFlowIndex.range_slice(native, key, min_bound, max_bound, reverse?, offset, count)}
 
         :unavailable ->
           :unavailable
@@ -909,7 +915,8 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:flow_index_rank_range_many, requests}, _from, state) do
     reply =
-      Enum.reduce_while(requests, {:ok, []}, fn {key, start_idx, stop_idx, reverse?}, {:ok, acc} ->
+      Enum.reduce_while(requests, {:ok, []}, fn {key, start_idx, stop_idx, reverse?},
+                                                {:ok, acc} ->
         case native_flow_index_for_read(state, key) do
           :not_native ->
             result = FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)
@@ -2760,9 +2767,19 @@ defmodule Ferricstore.Store.Shard do
             # Simple GET cold-read completion. Warm only if the ETS entry still
             # points at the same disk location read by this request.
             if value != nil do
-              ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
-              GenServer.reply(from, value)
-              {:noreply, %{state | pending_reads: rest_pending}}
+              case materialize_blob_read_value(state, value) do
+                {:ok, materialized} ->
+                  ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
+                  GenServer.reply(from, materialized)
+                  {:noreply, %{state | pending_reads: rest_pending}}
+
+                {:error, _reason} ->
+                  retry_or_reply_nil_cold_read(
+                    %{state | pending_reads: rest_pending},
+                    {from, key, exp, fid, off, vsize},
+                    @cold_read_compaction_retry_attempts
+                  )
+              end
             else
               retry_or_reply_nil_cold_read(
                 %{state | pending_reads: rest_pending},
@@ -2775,9 +2792,19 @@ defmodule Ferricstore.Store.Shard do
             # GET_META cold-read completion. The reply may linearize before a
             # later overwrite, but ETS warming must still be location-checked.
             if value != nil do
-              ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
-              GenServer.reply(from, {value, exp})
-              {:noreply, %{state | pending_reads: rest_pending}}
+              case materialize_blob_read_value(state, value) do
+                {:ok, materialized} ->
+                  ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
+                  GenServer.reply(from, {materialized, exp})
+                  {:noreply, %{state | pending_reads: rest_pending}}
+
+                {:error, _reason} ->
+                  retry_or_reply_nil_cold_read(
+                    %{state | pending_reads: rest_pending},
+                    {from, key, :meta, exp, fid, off, vsize},
+                    @cold_read_compaction_retry_attempts
+                  )
+              end
             else
               retry_or_reply_nil_cold_read(
                 %{state | pending_reads: rest_pending},
@@ -2856,6 +2883,13 @@ defmodule Ferricstore.Store.Shard do
   def handle_info(_msg, state) do
     {:noreply, state}
   end
+
+  defp materialize_blob_read_value(%{data_dir: data_dir, index: shard_index} = state, value) do
+    BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
+  end
+
+  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_side_channel_threshold(_state), do: 0
 
   defp pop_pending_read(pending_reads, corr_id, timer_action) do
     case Map.pop(pending_reads, corr_id) do
