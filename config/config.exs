@@ -1,11 +1,13 @@
 import Config
 
+build_native? = System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
+
 config :ferricstore, Ferricstore.Bitcask.NIF,
-  skip_compilation?: true,
+  skip_compilation?: not build_native?,
   load_from: {:ferricstore, "priv/native/ferricstore_bitcask"}
 
 config :ferricstore, :ferricstore_wal_nif,
-  skip_compilation?: true,
+  skip_compilation?: not build_native?,
   load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
 
 config :ra, logger_module: Ferricstore.Raft.SafeRaLogger
