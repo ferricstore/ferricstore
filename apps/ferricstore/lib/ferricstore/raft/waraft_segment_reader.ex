@@ -83,7 +83,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         read_main_log_entry_from_disk_at(root_chars, wanted_index, offset, encoded_size)
 
       :not_found ->
-        read_main_log_entry_from_disk_scan(root_chars, wanted_index)
+        {:error, :segment_entry_not_found}
 
       {:error, _reason} = error ->
         error
@@ -97,14 +97,6 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
            offset,
            encoded_size
          ) do
-      {:ok, entry} -> {:ok, entry}
-      :not_found -> {:error, :segment_entry_not_found}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp read_main_log_entry_from_disk_scan(root, wanted_index) do
-    case :ferricstore_waraft_spike_segment_log.read_disk(root, wanted_index) do
       {:ok, entry} -> {:ok, entry}
       :not_found -> {:error, :segment_entry_not_found}
       {:error, reason} -> {:error, reason}
