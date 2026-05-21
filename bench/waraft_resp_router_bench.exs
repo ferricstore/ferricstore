@@ -108,6 +108,11 @@ defmodule WaraftRespRouterBench do
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
     put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
 
+    put_optional_int_env(
+      "WARAFT_SEGMENT_RECORDS_PER_SEGMENT",
+      :waraft_segment_log_records_per_segment
+    )
+
     Application.put_env(
       :ferricstore,
       :waraft_segment_log_io_mode,
