@@ -212,6 +212,41 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "unified segment put_batch publishes final segment locations directly", %{ctx: ctx} do
+    previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      small_key = "segment-keydir:batch-small"
+      large_key = "segment-keydir:batch-large"
+      large_value = :binary.copy("v", ctx.hot_cache_max_value_size + 1)
+
+      assert {:ok, [:ok, :ok]} =
+               WARaftBackend.write_put_batch(0, [
+                 {small_key, "small", 0},
+                 {large_key, large_value, 0}
+               ])
+
+      assert [{^small_key, "small", 0, _small_lfu, {:waraft_segment, index}, offset, 5}] =
+               :ets.lookup(elem(ctx.keydir_refs, 0), small_key)
+
+      assert [
+               {^large_key, nil, 0, _large_lfu, {:waraft_segment, ^index}, ^offset, large_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), large_key)
+
+      assert large_size == byte_size(large_value)
+      assert is_integer(index) and index > 0
+      assert is_integer(offset) and offset >= 0
+      assert "small" == Router.get(ctx, small_key)
+      assert large_value == Router.get(ctx, large_key)
+    after
+      restore_env(:waraft_storage_apply_mode, previous_mode)
+    end
+  end
+
   test "unified segment storage reads cold large values from the Raft segment", %{
     root: root,
     ctx: ctx
@@ -2352,6 +2387,53 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "WARaft hot put batcher collects the next slot while previous flush commits", %{ctx: ctx} do
+    previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
+    previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_hot_batch_window_ms, 1)
+      Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 1,
+                 commit_batch_max: 10_000
+               )
+
+      first =
+        Task.async(fn ->
+          WARaftBackend.write_put_batch(0, [{"hot-put-async-flush:1", "v1", 0}])
+        end)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, first_ref,
+                      first_worker},
+                     1_000
+
+      second =
+        Task.async(fn ->
+          WARaftBackend.write_put_batch(0, [{"hot-put-async-flush:2", "v2", 0}])
+        end)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, second_ref,
+                      second_worker},
+                     1_000
+
+      send(first_worker, {first_ref, :continue})
+      send(second_worker, {second_ref, :continue})
+
+      assert {:ok, [:ok]} = Task.await(first, 5_000)
+      assert {:ok, [:ok]} = Task.await(second, 5_000)
+
+      assert "v1" == Router.get(ctx, "hot-put-async-flush:1")
+      assert "v2" == Router.get(ctx, "hot-put-async-flush:2")
+    after
+      restore_env(:waraft_hot_batch_window_ms, previous_window)
+      restore_env(:waraft_backend_batcher_call_hook, previous_hook)
+    end
+  end
+
   test "Router multi-shard WARaft put batches still use hot per-shard coalescing", %{
     root: root
   } do
@@ -2957,6 +3039,39 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       restore_env(:waraft_storage_metadata_fsync_file_hook, previous_hook)
       restore_env(:waraft_storage_metadata_persist_every, previous_every)
+    end
+  end
+
+  test "segment-keydir storage does not persist full metadata on hot write interval by default",
+       %{ctx: ctx} do
+    parent = self()
+    previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+    previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+
+    previous_hook =
+      Application.get_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+      Application.delete_env(:ferricstore, :waraft_storage_metadata_persist_every)
+
+      Application.put_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook, fn path ->
+        send(parent, {:storage_metadata_fsync, path})
+        :ok
+      end)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+      drain_storage_metadata_fsyncs()
+
+      for index <- 1..140 do
+        assert :ok = WARaftBackend.write(0, {:put, "segment-metadata-default:#{index}", "v", 0})
+      end
+
+      refute_receive {:storage_metadata_fsync, _path}, 100
+    after
+      restore_env(:waraft_storage_apply_mode, previous_mode)
+      restore_env(:waraft_storage_metadata_persist_every, previous_every)
+      restore_env(:waraft_storage_metadata_fsync_file_hook, previous_hook)
     end
   end
 

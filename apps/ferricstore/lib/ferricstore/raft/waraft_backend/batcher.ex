@@ -161,7 +161,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   end
 
   def handle_call(:stop, _from, state) do
-    state = flush_all_slots(state)
+    state = flush_all_slots(state, :sync)
     {:stop, :normal, :ok, state}
   end
 
@@ -229,18 +229,18 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     }
   end
 
-  defp flush_all_slots(state) do
+  defp flush_all_slots(state, mode) do
     state =
       state.slots
       |> Map.keys()
-      |> Enum.reduce(state, &flush_slot(&2, &1))
+      |> Enum.reduce(state, fn prefix, acc -> flush_slot(acc, prefix, mode) end)
 
     state
-    |> flush_hot_put_slot()
-    |> flush_hot_delete_slot()
+    |> flush_hot_put_slot(mode)
+    |> flush_hot_delete_slot(mode)
   end
 
-  defp flush_slot(state, prefix) do
+  defp flush_slot(state, prefix, mode \\ :async) do
     case Map.pop(state.slots, prefix) do
       {nil, _slots} ->
         state
@@ -250,13 +250,17 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
         commands = Enum.reverse(slot.commands)
         froms = Enum.reverse(slot.froms)
-        result = backend_call(:write_batch, [state.shard_index, commands])
-        replies = replies_for_batch(result, length(commands))
+        flush_fun = fn ->
+          result = safe_backend_call(:write_batch, [state.shard_index, commands])
+          replies = replies_for_batch(result, length(commands))
 
-        Enum.zip(froms, replies)
-        |> Enum.each(fn {from, reply} -> GenServer.reply(from, reply) end)
+          Enum.zip(froms, replies)
+          |> Enum.each(fn {from, reply} -> GenServer.reply(from, reply) end)
 
-        emit_flush_telemetry(state, prefix, slot, result)
+          emit_flush_telemetry(state, prefix, slot, result)
+        end
+
+        run_flush(mode, flush_fun)
         %{state | slots: slots}
     end
   end
@@ -300,28 +304,55 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     }
   end
 
-  defp flush_hot_put_slot(%{put_slot: nil} = state), do: state
+  defp flush_hot_put_slot(state, mode \\ :async)
+  defp flush_hot_put_slot(%{put_slot: nil} = state, _mode), do: state
 
-  defp flush_hot_put_slot(%{put_slot: slot} = state) do
+  defp flush_hot_put_slot(%{put_slot: slot} = state, mode) do
     cancel_timer(slot.timer_ref)
     groups = Enum.reverse(slot.groups)
     entries = hot_batch_items(groups)
-    result = backend_call(:__commit_put_batch_direct__, [state.shard_index, entries])
-    reply_hot_batch_groups(groups, result)
-    emit_hot_flush_telemetry(state, :put_batch, slot, result)
+    flush_fun = fn ->
+      result = safe_backend_call(:__commit_put_batch_direct__, [state.shard_index, entries])
+      reply_hot_batch_groups(groups, result)
+      emit_hot_flush_telemetry(state, :put_batch, slot, result)
+    end
+
+    run_flush(mode, flush_fun)
     %{state | put_slot: nil}
   end
 
-  defp flush_hot_delete_slot(%{delete_slot: nil} = state), do: state
+  defp flush_hot_delete_slot(state, mode \\ :async)
+  defp flush_hot_delete_slot(%{delete_slot: nil} = state, _mode), do: state
 
-  defp flush_hot_delete_slot(%{delete_slot: slot} = state) do
+  defp flush_hot_delete_slot(%{delete_slot: slot} = state, mode) do
     cancel_timer(slot.timer_ref)
     groups = Enum.reverse(slot.groups)
     keys = hot_batch_items(groups)
-    result = backend_call(:__commit_delete_batch_direct__, [state.shard_index, keys])
-    reply_hot_batch_groups(groups, result)
-    emit_hot_flush_telemetry(state, :delete_batch, slot, result)
+    flush_fun = fn ->
+      result = safe_backend_call(:__commit_delete_batch_direct__, [state.shard_index, keys])
+      reply_hot_batch_groups(groups, result)
+      emit_hot_flush_telemetry(state, :delete_batch, slot, result)
+    end
+
+    run_flush(mode, flush_fun)
     %{state | delete_slot: nil}
+  end
+
+  defp run_flush(:sync, fun), do: fun.()
+
+  defp run_flush(:async, fun) do
+    {:ok, _pid} =
+      Task.start(fn ->
+        try do
+          fun.()
+        rescue
+          _ -> :ok
+        catch
+          _, _ -> :ok
+        end
+      end)
+
+    :ok
   end
 
   defp hot_batch_items(groups) do
@@ -378,7 +409,32 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   end
 
   defp backend_call(function, args) do
+    maybe_run_backend_call_hook(function)
     apply(Ferricstore.Raft.WARaftBackend, function, args)
+  end
+
+  defp safe_backend_call(function, args) do
+    backend_call(function, args)
+  catch
+    :exit, reason -> {:error, {:backend_exit, reason}}
+    kind, reason -> {:error, {:backend_error, kind, reason}}
+  end
+
+  defp maybe_run_backend_call_hook(function) do
+    case Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook) do
+      {:block, notify} when is_pid(notify) ->
+        ref = make_ref()
+        send(notify, {:waraft_backend_batcher_call, function, ref, self()})
+
+        receive do
+          {^ref, :continue} -> :ok
+        after
+          @call_timeout -> exit({:backend_call_hook_timeout, function})
+        end
+
+      _ ->
+        :ok
+    end
   end
 
   defp emit_flush_telemetry(state, prefix, slot, result) do

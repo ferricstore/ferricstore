@@ -568,9 +568,12 @@ defmodule Ferricstore.Raft.WARaftStorage do
     if Enum.all?(entries, fn {key, value, expire_at_ms} ->
          segment_projectable_put?(sm_state, key, value, expire_at_ms)
        end) do
+      file_id = {:waraft_segment, position_index(position)}
+      offset = segment_record_offset(sm_state, position)
+
       new_sm_state =
         Enum.reduce(entries, sm_state, fn {key, value, expire_at_ms}, acc ->
-          segment_project_put(acc, key, value, expire_at_ms, position)
+          segment_project_put_at_location(acc, key, value, expire_at_ms, file_id, offset)
         end)
 
       {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(entries))}, length(entries)}
@@ -909,10 +912,26 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_project_put(sm_state, key, value, expire_at_ms, position) do
+    file_id = {:waraft_segment, position_index(position)}
+    offset = segment_record_offset(sm_state, position)
+    segment_project_put_at_location(sm_state, key, value, expire_at_ms, file_id, offset)
+  end
+
+  defp segment_project_put_at_location(sm_state, key, value, expire_at_ms, file_id, offset) do
     sm_state = segment_project_clear_compound_for_string_put(sm_state, key)
     shard_state = shard_ets_state_from_sm(sm_state)
-    true = ShardETS.ets_insert(shard_state, key, value, expire_at_ms)
-    install_main_segment_location(sm_state, key, value, position)
+
+    true =
+      ShardETS.ets_insert_with_location(
+        shard_state,
+        key,
+        value,
+        expire_at_ms,
+        file_id,
+        offset,
+        byte_size(value)
+      )
+
     sm_state
   end
 
@@ -1129,12 +1148,6 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_blob_ref_value?(_value), do: false
-
-  defp install_main_segment_location(sm_state, key, value, position) do
-    file_id = {:waraft_segment, position_index(position)}
-    offset = segment_record_offset(sm_state, position)
-    install_segment_location(sm_state, key, value, file_id, offset)
-  end
 
   defp install_segment_location(%{ets: keydir}, key, value, file_id, offset)
        when valid_segment_backed_file_id(file_id) and is_integer(offset) and offset >= 0 do
@@ -1406,12 +1419,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp maybe_mark_clean_position(handle), do: handle
 
   defp storage_metadata_persist_due?(new_handle) do
-    interval =
-      Application.get_env(
-        :ferricstore,
-        :waraft_storage_metadata_persist_every,
-        @default_metadata_persist_every
-      )
+    interval = storage_metadata_persist_every()
 
     case {interval, Map.get(new_handle, :position)} do
       {:never, _position} ->
@@ -1422,6 +1430,20 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
       {_other, _position} ->
         true
+    end
+  end
+
+  defp storage_metadata_persist_every do
+    case Application.fetch_env(:ferricstore, :waraft_storage_metadata_persist_every) do
+      {:ok, interval} ->
+        interval
+
+      :error ->
+        if segment_bitcask_apply?() do
+          :never
+        else
+          @default_metadata_persist_every
+        end
     end
   end
 

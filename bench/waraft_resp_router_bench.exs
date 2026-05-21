@@ -94,6 +94,8 @@ defmodule WaraftRespRouterBench do
     File.rm_rf!(data_dir)
     File.mkdir_p!(data_dir)
 
+    maybe_attach_segment_append_trace()
+
     Application.put_env(:libcluster, :topologies, [])
     Application.put_env(:ferricstore, :data_dir, data_dir)
     Application.put_env(:ferricstore, :port, 0)
@@ -107,6 +109,11 @@ defmodule WaraftRespRouterBench do
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
     put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
+
+    put_optional_interval_env(
+      "WARAFT_STORAGE_METADATA_PERSIST_EVERY",
+      :waraft_storage_metadata_persist_every
+    )
 
     put_optional_int_env(
       "WARAFT_SEGMENT_RECORDS_PER_SEGMENT",
@@ -143,6 +150,19 @@ defmodule WaraftRespRouterBench do
     end
   end
 
+  defp put_optional_interval_env(env, app_key) do
+    case System.get_env(env) do
+      nil ->
+        :ok
+
+      value when value in ["never", ":never"] ->
+        Application.put_env(:ferricstore, app_key, :never)
+
+      value ->
+        Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
   defp put_optional_atom_env(env, app_key, allowed) do
     case System.get_env(env) do
       nil ->
@@ -156,6 +176,56 @@ defmodule WaraftRespRouterBench do
         end
 
         Application.put_env(:ferricstore, app_key, atom)
+    end
+  end
+
+  defp maybe_attach_segment_append_trace do
+    if System.get_env("TRACE_WARAFT_SEGMENT_APPEND") in ["1", "true", "TRUE"] do
+      {:ok, _} = Application.ensure_all_started(:telemetry)
+
+      table = :waraft_resp_router_segment_append_trace
+
+      case :ets.whereis(table) do
+        :undefined -> :ets.new(table, [:named_table, :public, :set])
+        _tid -> :ets.delete_all_objects(table)
+      end
+
+      :ets.insert(table, {:events, 0})
+      :ets.insert(table, {:records, 0})
+      :ets.insert(table, {:bytes, 0})
+      :ets.insert(table, {:duration_native, 0})
+
+      _ = :telemetry.detach("waraft-resp-router-segment-append-trace")
+
+      :ok =
+        :telemetry.attach(
+          "waraft-resp-router-segment-append-trace",
+          [:ferricstore, :waraft, :segment_log, :append],
+          fn _event, measurements, metadata, _config ->
+            :ets.update_counter(table, :events, {2, 1}, {:events, 0})
+
+            :ets.update_counter(
+              table,
+              :records,
+              {2, Map.get(measurements, :count, 0)},
+              {:records, 0}
+            )
+
+            :ets.update_counter(table, :bytes, {2, Map.get(measurements, :bytes, 0)}, {:bytes, 0})
+
+            :ets.update_counter(
+              table,
+              :duration_native,
+              {2, Map.get(measurements, :duration, 0)},
+              {:duration_native, 0}
+            )
+
+            if Map.get(metadata, :new_segment) do
+              :ets.update_counter(table, :new_segments, {2, 1}, {:new_segments, 0})
+            end
+          end,
+          nil
+        )
     end
   end
 
@@ -175,6 +245,47 @@ defmodule WaraftRespRouterBench do
     batch_p999_ms=#{Float.round(result.batch_p999_us / 1000, 3)}
     approx_op_p99_ms=#{Float.round(result.batch_p99_us / max(config.pipeline, 1) / 1000, 3)}
     """)
+
+    print_segment_append_trace()
+  end
+
+  defp print_segment_append_trace do
+    table = :waraft_resp_router_segment_append_trace
+
+    case :ets.whereis(table) do
+      :undefined ->
+        :ok
+
+      _tid ->
+        events = lookup_trace(table, :events)
+        records = lookup_trace(table, :records)
+        bytes = lookup_trace(table, :bytes)
+        duration_native = lookup_trace(table, :duration_native)
+        new_segments = lookup_trace(table, :new_segments)
+
+        avg_records =
+          if events > 0 do
+            Float.round(records / events, 2)
+          else
+            0.0
+          end
+
+        IO.puts("""
+        waraft_segment_append_events=#{events}
+        waraft_segment_append_records=#{records}
+        waraft_segment_append_avg_records=#{avg_records}
+        waraft_segment_append_bytes=#{bytes}
+        waraft_segment_append_new_segments=#{new_segments}
+        waraft_segment_append_total_ms=#{Float.round(System.convert_time_unit(duration_native, :native, :microsecond) / 1000, 3)}
+        """)
+    end
+  end
+
+  defp lookup_trace(table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] when is_integer(value) -> value
+      _ -> 0
+    end
   end
 
   defp env_backend(name, default) do
