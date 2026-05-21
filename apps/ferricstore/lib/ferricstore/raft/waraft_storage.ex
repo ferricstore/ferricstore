@@ -2386,16 +2386,45 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp relocate_segment_projection_keydir(ctx, shard_index, projection_root, relocations) do
     keydir = elem(ctx.keydir_refs, shard_index)
 
-    relocations
-    |> Enum.with_index(1)
-    |> Enum.reduce_while(:ok, fn {relocation, projection_index}, :ok ->
-      case relocate_segment_projection_row(keydir, projection_root, projection_index, relocation) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
+    with :ok <-
+           maybe_run_segment_projection_before_relocate_hook(
+             shard_index,
+             projection_root,
+             relocations
+           ) do
+      relocations
+      |> Enum.with_index(1)
+      |> Enum.reduce_while(:ok, fn {relocation, projection_index}, :ok ->
+        case relocate_segment_projection_row(
+               keydir,
+               projection_root,
+               projection_index,
+               relocation
+             ) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+    end
   rescue
     error -> {:error, {:relocate_segment_projection_keydir_failed, error}}
+  end
+
+  defp maybe_run_segment_projection_before_relocate_hook(
+         shard_index,
+         projection_root,
+         relocations
+       ) do
+    case Application.get_env(:ferricstore, :waraft_segment_projection_before_relocate_hook) do
+      hook when is_function(hook, 3) ->
+        case hook.(shard_index, projection_root, relocations) do
+          :ok -> :ok
+          other -> {:error, {:segment_projection_before_relocate_hook, other}}
+        end
+
+      _ ->
+        :ok
+    end
   end
 
   defp relocate_segment_projection_row(

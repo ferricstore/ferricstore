@@ -316,6 +316,57 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "unified segment trim does not relocate a keydir row changed after projection", %{
+    ctx: ctx
+  } do
+    previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+    previous_hook =
+      Application.get_env(:ferricstore, :waraft_segment_projection_before_relocate_hook)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      key = "segment-keydir:trim-race"
+      old_value = :binary.copy("o", ctx.hot_cache_max_value_size + 1)
+
+      assert :ok = WARaftBackend.write(0, {:put, key, old_value, 0})
+
+      assert [
+               {^key, nil, 0, _lfu, {:waraft_segment, value_index}, _value_offset, old_value_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+      test_pid = self()
+
+      Application.put_env(:ferricstore, :waraft_segment_projection_before_relocate_hook, fn
+        0, _projection_root, relocations ->
+          assert Enum.any?(relocations, fn {{relocated_key, _value, _expire_at_ms}, _row} ->
+                   relocated_key == key
+                 end)
+
+          :ets.insert(elem(ctx.keydir_refs, 0), {key, "new-hot", 0, 0, :pending, nil, 0})
+          send(test_pid, :projection_relocation_hook_ran)
+          :ok
+      end)
+
+      assert :ok = WARaftBackend.write(0, {:put, "segment-keydir:trim-race-fence", "v2", 0})
+
+      log = waraft_segment_log_record(0)
+      assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, value_index + 1, %{})
+      assert_receive :projection_relocation_hook_ran
+
+      assert [{^key, "new-hot", 0, _lfu_after, :pending, nil, 0}] =
+               :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+      assert old_value_size == byte_size(old_value)
+    after
+      restore_env(:waraft_segment_projection_before_relocate_hook, previous_hook)
+      restore_env(:waraft_storage_apply_mode, previous_mode)
+    end
+  end
+
   test "unified segment storage reads cold values from a batched Raft segment record", %{
     root: root,
     ctx: ctx
