@@ -6,7 +6,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
   require Logger
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Flow
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.HistoryProjectedIndex
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
@@ -74,6 +73,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   def name(nil, shard_index), do: :"ferricstore_flow_history_projector_#{shard_index}"
   def name(%{name: :default}, shard_index), do: name(nil, shard_index)
   def name(%{name: name}, shard_index), do: :"#{name}_flow_history_projector_#{shard_index}"
+  def name(%{}, shard_index), do: name(nil, shard_index)
 
   @spec enqueue(map() | nil, non_neg_integer(), [entry()], non_neg_integer() | nil) ::
           :ok | {:error, :not_started}
@@ -138,16 +138,25 @@ defmodule Ferricstore.Flow.HistoryProjector do
           non_neg_integer(),
           binary(),
           [entry()],
-          non_neg_integer() | nil
+          non_neg_integer() | nil,
+          keyword()
         ) :: :ok | {:error, term()}
   def write_entries_sync(
         instance_ctx,
         shard_index,
         shard_data_path,
         entries,
-        requested_index \\ nil
+        requested_index \\ nil,
+        opts \\ []
       ) do
-    do_project(instance_ctx, shard_index, shard_data_path, entries, requested_index)
+    do_project(
+      instance_ctx,
+      shard_index,
+      shard_data_path,
+      entries,
+      requested_index,
+      Keyword.get(opts, :keydir)
+    )
   end
 
   @impl true
@@ -231,7 +240,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
            state.shard_index,
            state.shard_data_path,
            entries,
-           state.requested_index
+           state.requested_index,
+           nil
          ) do
       :ok ->
         %{state | pending: [], pending_count: 0, requested_index: nil}
@@ -248,7 +258,14 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-  defp do_project(instance_ctx, shard_index, shard_data_path, [], requested_index) do
+  defp do_project(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         [],
+         requested_index,
+         _keydir_override
+       ) do
     case requested_index do
       index when is_integer(index) and index >= 0 ->
         with {:ok, _file_id, file_path} <- history_active_file(shard_data_path),
@@ -261,9 +278,16 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-  defp do_project(instance_ctx, shard_index, shard_data_path, entries, requested_index) do
+  defp do_project(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         entries,
+         requested_index,
+         keydir_override
+       ) do
     with {:ok, file_id, file_path} <- history_active_file(shard_data_path),
-         keydir <- keydir(instance_ctx, shard_index),
+         keydir <- keydir_override || keydir(instance_ctx, shard_index),
          encoded_entries <- Enum.map(entries, &encode_entry/1),
          batch <- Enum.map(encoded_entries, &{&1.key, &1.value, &1.expire_at_ms}),
          {:ok, locations} <- append_batch(file_path, batch),
@@ -360,14 +384,14 @@ defmodule Ferricstore.Flow.HistoryProjector do
     dir = history_dir(shard_data_path)
     path = history_file_path(shard_data_path, 0)
 
-    with :ok <- File.mkdir_p(dir),
+    with :ok <- Ferricstore.FS.mkdir_p(dir),
          :ok <- touch_if_missing(path) do
       :ok
     end
   end
 
   defp touch_if_missing(path) do
-    if File.exists?(path), do: :ok, else: File.touch(path)
+    if Ferricstore.FS.exists?(path), do: :ok, else: Ferricstore.FS.touch(path)
   end
 
   defp append_batch(file_path, batch), do: NIF.v2_append_batch_nosync(file_path, batch)
@@ -399,12 +423,16 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defp encode_entry(%{value: value} = entry) when is_binary(value), do: entry
 
   defp encode_entry(%{snapshot: snapshot} = entry) do
-    Map.put(entry, :value, Flow.encode_history_snapshot(snapshot))
+    Map.put(entry, :value, flow_call(:encode_history_snapshot, [snapshot]))
   end
 
   defp encode_entry(%{record: record, event: event, now_ms: now_ms} = entry) do
-    value = Flow.encode_history_fields(record, event, now_ms, Map.get(entry, :meta, %{}))
+    value = flow_call(:encode_history_fields, [record, event, now_ms, Map.get(entry, :meta, %{})])
     Map.put(entry, :value, value)
+  end
+
+  defp flow_call(function, args) do
+    apply(Ferricstore.Flow, function, args)
   end
 
   defp validate_locations(entries, locations) when length(entries) == length(locations), do: :ok
@@ -551,7 +579,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
     case NIF.v2_scan_file(file_path) do
       {:ok, records} ->
         keydir = keydir_override || keydir(instance_ctx, shard_index)
-        {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+
+        {flow_index, flow_lookup} =
+          FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+
         native = NativeFlowIndex.get(flow_index, flow_lookup)
 
         Enum.each(records, fn
@@ -584,7 +615,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
               :error ->
                 :ok
             end
-          end)
+        end)
 
         :ok
 

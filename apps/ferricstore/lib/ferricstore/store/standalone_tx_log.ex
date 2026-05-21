@@ -209,7 +209,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     dir = Path.dirname(path)
     line = encode_entry(entry) <> "\n"
 
-    with :ok <- File.mkdir_p(dir),
+    with :ok <- Ferricstore.FS.mkdir_p(dir),
          {:ok, io} <- File.open(path, [:append, :binary]),
          :ok <- IO.binwrite(io, line),
          :ok <- :file.sync(io),
@@ -226,9 +226,9 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     path = path(data_dir)
     dir = Path.dirname(path)
 
-    case File.rm(path) do
+    case Ferricstore.FS.rm(path) do
       :ok -> fsync_dir(dir)
-      {:error, :enoent} -> :ok
+      {:error, {:not_found, _}} -> :ok
       {:error, _reason} = error -> error
     end
   end
@@ -239,13 +239,13 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     tmp_path = path <> ".compact"
     data = Enum.map_join(entries, "", fn entry -> encode_entry(entry) <> "\n" end)
 
-    with :ok <- File.mkdir_p(dir),
+    with :ok <- Ferricstore.FS.mkdir_p(dir),
          {:ok, io} <- File.open(tmp_path, [:write, :binary]),
          :ok <- IO.binwrite(io, data),
          :ok <- :file.sync(io),
          :ok <- File.close(io),
          :ok <- fsync_dir(dir),
-         :ok <- File.rename(tmp_path, path),
+         :ok <- Ferricstore.FS.rename(tmp_path, path),
          :ok <- fsync_dir(dir) do
       :ok
     else

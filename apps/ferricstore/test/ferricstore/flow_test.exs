@@ -619,6 +619,34 @@ defmodule Ferricstore.FlowTest do
              flow_create_and_get(id, type: "checkout", state: "queued")
   end
 
+  test "flow_create and flow_transition accept payload_ref for shared payloads" do
+    id = uid("flow-shared-payload-ref")
+    initial_ref = "shared:payload:initial"
+    transition_ref = "shared:payload:transition"
+
+    assert {:ok, flow} =
+             flow_create_and_get(id,
+               type: "checkout",
+               state: "queued",
+               payload_ref: initial_ref,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert flow.payload_ref == initial_ref
+
+    assert {:ok, transitioned} =
+             flow_transition_and_get(id, "queued", "ready",
+               fencing_token: 0,
+               payload_ref: transition_ref,
+               run_at_ms: 2_000,
+               now_ms: 1_100
+             )
+
+    assert transitioned.state == "ready"
+    assert transitioned.payload_ref == transition_ref
+  end
+
   test "flow_get hydrates payload refs only when full or payload is requested" do
     id = uid("flow-get-payload")
     payload = "payload-body"
@@ -2968,9 +2996,6 @@ defmodule Ferricstore.FlowTest do
 
     assert {:error, "ERR key too large" <> _} =
              flow_create_and_get(large_id, type: "checkout")
-
-    assert {:error, "ERR flow payload_ref input is not supported; use payload"} =
-             flow_create_and_get("payload-ref-input", type: "checkout", payload_ref: "p")
 
     assert {:error, "ERR flow result_ref input is not supported; use result"} =
              flow_complete_and_get("flow", "token", fencing_token: 0, result_ref: "r")

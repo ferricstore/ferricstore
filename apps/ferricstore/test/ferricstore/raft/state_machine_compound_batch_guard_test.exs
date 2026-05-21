@@ -143,7 +143,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     # When WARaft/Bitcask become one segment file, replace this guard with a
     # crash test that proves the unified record is durable before metadata moves.
     assert dispatcher =~ "standalone_staged_apply?()"
-    assert dispatcher =~ "append_pending_batch_sync(file_path, batch)"
+    assert dispatcher =~ "append_pending_batch_sync(file_path, batch, has_delete?)"
 
     assert sync_body =~ "NIF.v2_append_batch(file_path, puts)"
 

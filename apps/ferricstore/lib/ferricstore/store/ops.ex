@@ -1227,7 +1227,7 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp clear_stream_tables do
-    Ferricstore.Commands.Stream.clear_local_state()
+    Ferricstore.Stream.LocalState.clear()
   end
 
   # --- On push callback (for Waiters notification) ---

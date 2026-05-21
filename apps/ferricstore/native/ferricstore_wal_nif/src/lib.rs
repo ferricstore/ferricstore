@@ -60,6 +60,20 @@ fn open(
     }
 }
 
+/// Open a generic append log file without the 5-byte Ra WAL header offset.
+#[rustler::nif(schedule = "Normal")]
+fn open_raw_append(
+    path: String,
+    commit_delay_us: u64,
+    max_buffer_bytes: u64,
+    start_offset: u64,
+) -> NifResult<(Atom, ResourceArc<WalHandle>)> {
+    match WalHandle::open_raw_append(path, commit_delay_us, max_buffer_bytes, start_offset) {
+        Ok(handle) => Ok((atoms::ok(), ResourceArc::new(handle))),
+        Err(e) => Err(rustler::Error::Term(Box::new(format!("{e}")))),
+    }
+}
+
 /// Write pre-formatted iodata to the WAL buffer.
 /// Copies bytes into the shared aligned buffer. Does NOT write to disk.
 /// Returns :ok | {:error, :wal_thread_dead} | {:error, :backpressure}
@@ -67,10 +81,8 @@ fn open(
 fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
     handle.check_alive()?;
 
-    // Collect iodata into bytes
-    let bytes = iodata_to_bytes(iodata)?;
-
-    handle.buffer_write(&bytes)?;
+    let bytes = iodata.decode_as_binary()?;
+    handle.buffer_write(bytes.as_slice())?;
     Ok(atoms::ok())
 }
 
@@ -149,21 +161,18 @@ fn pread<'a>(
     Ok((atoms::ok(), binary.release(env)))
 }
 
+/// Reserve disk space for an external segmented log without changing file size.
+#[rustler::nif(schedule = "Normal")]
+fn preallocate_keep_size<'a>(env: Env<'a>, path: String, bytes: u64) -> NifResult<Term<'a>> {
+    match background_thread::preallocate_keep_size_path(&path, bytes) {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Convert Erlang iodata (binary or iolist) to bytes.
-///
-/// Uses rustler's `decode_as_binary`, which calls `enif_inspect_iolist_as_binary`
-/// under the hood. That function correctly handles every shape of valid iodata —
-/// flat binaries, deeply nested lists, improper lists like `[H | <<tail>>]`, and
-/// integer bytes. Our previous hand-rolled flattener returned `:badarg` on
-/// improper lists, which crashed the ra WAL on every flush of a real batch.
-fn iodata_to_bytes(term: Term) -> NifResult<Vec<u8>> {
-    let bin = term.decode_as_binary()?;
-    Ok(bin.as_slice().to_vec())
-}
 
 // ---------------------------------------------------------------------------
 // NIF Registration

@@ -1803,7 +1803,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
       assert {:ok,
               [
                 {:command, "FLOW.GET", ["flow-1", "PARTITION", "GLOBAL"],
-                 {:flow_get, "flow-1", []}, ["GLOBAL"]},
+                 {:flow_get, "flow-1", []}, ["flow-1"]},
                 {:command, "FLOW.GET", ["flow-1", "NOPAYLOAD"],
                  {:flow_get, "flow-1", [payload: false]}, ["flow-1"]},
                 {:command, "FLOW.GET", ["flow-1", "PAYLOAD", "MAXBYTES", "4096"],
@@ -1971,7 +1971,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   [
                     {:id, "flow-auto-1", :payload, "payload-1"},
                     {:id, "flow-auto-2", :payload, "payload-2"}
-                  ], [type: "iot", independent: true]}, ["AUTO"]},
+                  ], [type: "iot", independent: true]}, ["flow-auto-1", "flow-auto-2"]},
                 {:command, "FLOW.TRANSITION_MANY",
                  [
                    "MIXED",

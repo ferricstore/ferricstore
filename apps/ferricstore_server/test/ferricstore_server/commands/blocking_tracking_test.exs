@@ -77,8 +77,8 @@ defmodule FerricstoreServer.Commands.BlockingTrackingTest do
     assert [] = Router.list_op(ctx, source, {:lrange, 0, -1})
     assert ["v1"] = Router.list_op(ctx, destination, {:lrange, 0, -1})
 
-    assert_receive {:tracking_invalidation, _payload, [^source]}
-    assert_receive {:tracking_invalidation, _payload, [^destination]}
+    assert_receive {:tracking_invalidation, _payload, invalidated}
+    assert MapSet.new(invalidated) == MapSet.new([source, destination])
     assert :ets.lookup(:ferricstore_tracking, source) == []
     assert :ets.lookup(:ferricstore_tracking, destination) == []
   end

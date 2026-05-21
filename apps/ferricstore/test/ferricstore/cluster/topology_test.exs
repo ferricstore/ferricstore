@@ -239,6 +239,7 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
 
     for shard <- 0..3 do
       leader = ClusterHelper.find_leader(alive_nodes, shard)
+
       assert leader in alive_names,
              "shard #{shard} leader #{inspect(leader)} should be an alive node"
     end
@@ -340,10 +341,10 @@ defmodule Ferricstore.Cluster.FailoverTest do
     assert result_pre == :ok, "CT-005: pre-kill write on n1 should succeed"
 
     # Kill n3
-    {_killed, _remaining} = ClusterHelper.kill_node(nodes, n3)
+    {_killed, remaining} = ClusterHelper.kill_node(nodes, n3)
 
-    # Allow distribution to settle
-    Process.sleep(500)
+    # Wait for failover to complete before asserting post-failover writes.
+    :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 15_000)
 
     # n1 and n2 should still serve writes
     result1 =
@@ -595,12 +596,18 @@ defmodule Ferricstore.Cluster.PartitionTest do
     end
 
     # n3 catches up via Raft log replay — eventually sees all 50 keys
-    eventually(fn ->
-      missing = Enum.count(1..50, fn i ->
-        remote_router(n3.name, :get, ["ct009:majority:#{i}"]) == nil
-      end)
-      assert missing == 0, "n3 still missing #{missing}/50 keys"
-    end, 60, 200)
+    eventually(
+      fn ->
+        missing =
+          Enum.count(1..50, fn i ->
+            remote_router(n3.name, :get, ["ct009:majority:#{i}"]) == nil
+          end)
+
+        assert missing == 0, "n3 still missing #{missing}/50 keys"
+      end,
+      60,
+      200
+    )
 
     # All nodes can write after rejoin
     :ok = remote_router(n1.name, :put, ["ct009:post:n1", "ok", 0])

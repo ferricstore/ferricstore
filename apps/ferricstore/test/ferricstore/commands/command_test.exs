@@ -360,8 +360,9 @@ defmodule Ferricstore.Commands.CommandTest do
 
   describe "DEBUG SLEEP" do
     test "DEBUG SLEEP 0 returns immediately" do
+      store = MockStore.make()
       start = System.monotonic_time(:millisecond)
-      result = Server.handle("DEBUG", ["SLEEP", "0"], MockStore.make())
+      result = Server.handle("DEBUG", ["SLEEP", "0"], store)
       elapsed = System.monotonic_time(:millisecond) - start
 
       assert result == :ok

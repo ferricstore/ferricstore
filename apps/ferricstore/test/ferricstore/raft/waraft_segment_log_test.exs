@@ -145,4 +145,64 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
       end
     end
   end
+
+  test "close tolerates writer registry disappearing during shutdown" do
+    previous_db = Application.get_env(:wa_raft, :raft_database)
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_writer_registry_hook)
+    registry = :ferricstore_waraft_segment_writer_registry
+    partition = System.unique_integer([:positive])
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-close-race-#{partition}"
+      )
+
+    if :ets.info(registry) != :undefined do
+      :ets.delete(registry)
+    end
+
+    try do
+      Application.put_env(:wa_raft, :raft_database, root)
+
+      :wa_raft_part_sup.prepare_spec(:ferricstore_waraft_backend, %{
+        table: :ferricstore_waraft_segment_log_test,
+        partition: partition
+      })
+
+      :ets.new(registry, [:named_table, :public, :set])
+
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_writer_registry_hook,
+        {:delete_once, :before_tab2list, self()}
+      )
+
+      log =
+        {:raft_log, :ferricstore_waraft_segment_log_test_log, :ferricstore_waraft_backend,
+         :ferricstore_waraft_segment_log_test, partition,
+         :ferricstore_waraft_spike_segment_log}
+
+      assert :ok = :ferricstore_waraft_spike_segment_log.close(log, %{})
+      assert_receive {:waraft_segment_log_writer_registry_hook, :before_tab2list}, 1_000
+    after
+      File.rm_rf!(root)
+
+      if :ets.info(registry) != :undefined do
+        :ets.delete(registry)
+      end
+
+      if previous_db == nil do
+        Application.delete_env(:wa_raft, :raft_database)
+      else
+        Application.put_env(:wa_raft, :raft_database, previous_db)
+      end
+
+      if previous_hook == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_writer_registry_hook)
+      else
+        Application.put_env(:ferricstore, :waraft_segment_log_writer_registry_hook, previous_hook)
+      end
+    end
+  end
 end

@@ -118,6 +118,7 @@ defmodule Ferricstore.Raft.Batcher do
   # 10s. Use 30s as a safety net: anything pending longer than 30s means
   # ra lost the ack entirely and the caller's own call has already errored.
   @quorum_pending_ttl_ms 30_000
+  @single_member_check_timeout_ms 100
 
   # Periodic sweep interval. Tight enough to catch stalls quickly, loose
   # enough not to burn CPU scanning an empty pending map.
@@ -691,42 +692,7 @@ defmodule Ferricstore.Raft.Batcher do
   """
   @spec extract_prefix(command()) :: binary()
   def extract_prefix(command) when is_tuple(command) do
-    key =
-      case command do
-        {:put_batch, [{first_key, _value, _expire_at_ms} | _rest]} ->
-          first_key
-
-        {:delete_batch, [first_key | _rest]} ->
-          first_key
-
-        {:origin_checked, key, _inner, _before_value, _before_exp, _expected_value, _expire_at_ms} ->
-          key
-
-        {:origin_checked, key, _inner, _expected_value, _expire_at_ms} ->
-          key
-
-        _ ->
-          elem(command, 1)
-      end
-
-    if is_binary(key) do
-      key
-      |> Ferricstore.Store.CompoundKey.extract_redis_key()
-      |> extract_namespace_prefix()
-    else
-      "_root"
-    end
-  end
-
-  defp extract_namespace_prefix("") do
-    "_root"
-  end
-
-  defp extract_namespace_prefix(key) do
-    case :binary.split(key, ":") do
-      [^key] -> "_root"
-      [prefix | _rest] -> prefix
-    end
+    Ferricstore.Raft.CommandPrefix.extract(command)
   end
 
   # ---------------------------------------------------------------------------
@@ -1866,7 +1832,10 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp single_member_raft_group?(shard_index) do
-    case Ferricstore.Raft.Cluster.members(shard_index, 0) do
+    # This path only runs for values large enough to be blob-side-channel
+    # candidates. A zero-timeout membership probe can race startup or a busy ra
+    # server and make one-node groups submit the full payload to Raft.
+    case Ferricstore.Raft.Cluster.members(shard_index, @single_member_check_timeout_ms) do
       {:ok, members, _leader} when is_list(members) -> length(members) == 1
       _other -> false
     end

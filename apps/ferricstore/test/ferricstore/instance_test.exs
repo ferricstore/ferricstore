@@ -155,7 +155,7 @@ defmodule Ferricstore.InstanceTest do
       type = "embedded-flow"
       partition = "tenant-a"
 
-      assert {:ok, %{id: ^id, state: "queued"}} =
+      assert :ok =
                EmbeddedFlow.flow_create(id,
                  type: type,
                  run_at_ms: 1_000,
@@ -166,7 +166,7 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 1_000
                )
 
-      assert {:ok, %{id: ^id}} = EmbeddedFlow.flow_get(id, partition_key: partition)
+      assert {:ok, %{id: ^id, state: "queued"}} = EmbeddedFlow.flow_get(id, partition_key: partition)
       assert {:ok, [%{id: ^id}]} = EmbeddedFlow.flow_list(type, partition_key: partition)
 
       assert {:ok, [%{id: ^id}]} =
@@ -192,12 +192,15 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 1_000
                )
 
-      assert {:ok, %{id: ^id, state: "completed"}} =
+      assert :ok =
                EmbeddedFlow.flow_complete(id, claimed.lease_token,
                  fencing_token: claimed.fencing_token,
                  partition_key: partition,
                  now_ms: 2_000
                )
+
+      assert {:ok, %{id: ^id, state: "completed"}} =
+               EmbeddedFlow.flow_get(id, partition_key: partition)
 
       assert {:ok, %{completed: 1, inflight: 0}} =
                EmbeddedFlow.flow_info(type, partition_key: partition)
@@ -208,7 +211,7 @@ defmodule Ferricstore.InstanceTest do
       spawn_parent = "embedded-spawn-parent-1"
       spawn_child = "embedded-spawn-child-1"
 
-      assert {:ok, created_parent} =
+      assert :ok =
                EmbeddedFlow.flow_create(spawn_parent,
                  type: "embedded-parent",
                  state: "dispatch",
@@ -216,7 +219,9 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 3_000
                )
 
-      assert {:ok, %{id: ^spawn_parent, state: "dispatched"}} =
+      assert {:ok, created_parent} = EmbeddedFlow.flow_get(spawn_parent, partition_key: partition)
+
+      assert :ok =
                EmbeddedFlow.flow_spawn_children(
                  spawn_parent,
                  [%{id: spawn_child, type: "embedded-child", payload: "child-payload"}],
@@ -230,6 +235,9 @@ defmodule Ferricstore.InstanceTest do
                  fencing_token: created_parent.fencing_token,
                  now_ms: 3_010
                )
+
+      assert {:ok, %{id: ^spawn_parent, state: "dispatched"}} =
+               EmbeddedFlow.flow_get(spawn_parent, partition_key: partition)
 
       assert {:ok, [%{id: ^spawn_child, parent_flow_id: ^spawn_parent}]} =
                EmbeddedFlow.flow_by_parent(spawn_parent, partition_key: partition)
@@ -389,6 +397,16 @@ defmodule Ferricstore.InstanceTest do
   end
 
   describe "FerricStore.Impl with default instance" do
+    setup do
+      # Restart-heavy suites can leave the default instance serving while Raft
+      # leaders are still electing. These tests exercise public quorum writes,
+      # so wait for readiness instead of racing the first command timeout.
+      FerricStore.await_ready(timeout: 60_000)
+      Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
+      Ferricstore.Test.ShardHelpers.flush_all_keys()
+      :ok
+    end
+
     test "set and get" do
       ctx = FerricStore.Instance.get(:default)
       assert :ok = FerricStore.Impl.set(ctx, "impl_key", "impl_value")

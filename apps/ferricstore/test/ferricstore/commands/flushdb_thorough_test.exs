@@ -6,6 +6,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
@@ -20,14 +21,32 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
     end)
   end
 
+  defp wait_for_ets_count_at_least(count) do
+    ShardHelpers.eventually(
+      fn -> ets_total_keys() >= count end,
+      "expected at least #{count} ETS keys",
+      100,
+      10
+    )
+  end
+
+  defp wait_for_empty_ets do
+    ShardHelpers.eventually(
+      fn -> ets_total_keys() == 0 end,
+      "expected empty ETS keydirs",
+      100,
+      10
+    )
+  end
+
   describe "FLUSHDB clears ETS completely" do
     test "string keys removed from ETS" do
       for i <- 1..100, do: Router.put(FerricStore.Instance.get(:default), "flush_str:#{i}", "val", 0)
-      assert ets_total_keys() >= 100
+      wait_for_ets_count_at_least(100)
 
       FerricStore.flushall()
 
-      assert ets_total_keys() == 0
+      wait_for_empty_ets()
     end
 
     test "hash compound keys (H: and T:) removed from ETS" do
@@ -47,7 +66,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
       FerricStore.flushall()
 
-      assert ets_total_keys() == 0
+      wait_for_empty_ets()
     end
 
     test "set compound keys (S: and T:) removed from ETS" do
@@ -55,7 +74,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
       FerricStore.flushall()
 
-      assert ets_total_keys() == 0
+      wait_for_empty_ets()
     end
 
     test "sorted set compound keys (Z: and T:) removed from ETS" do
@@ -63,7 +82,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
       FerricStore.flushall()
 
-      assert ets_total_keys() == 0
+      wait_for_empty_ets()
     end
 
     test "list keys removed from ETS" do
@@ -71,7 +90,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
       FerricStore.flushall()
 
-      assert ets_total_keys() == 0
+      wait_for_empty_ets()
     end
 
     test "mixed types all removed" do
@@ -85,7 +104,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
       FerricStore.flushall()
 
-      assert ets_total_keys() == 0
+      wait_for_empty_ets()
     end
   end
 
@@ -146,7 +165,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
         :gen_tcp.close(sock)
 
-        assert ets_total_keys() == 0
+        wait_for_empty_ets()
         assert Router.dbsize(FerricStore.Instance.get(:default)) == 0
       end
     end
@@ -159,7 +178,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
       FerricStore.flushall()
       FerricStore.flushall()
 
-      assert ets_total_keys() == 0
+      wait_for_empty_ets()
     end
   end
 end

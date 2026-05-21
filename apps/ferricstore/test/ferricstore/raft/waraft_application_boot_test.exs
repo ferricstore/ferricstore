@@ -4,6 +4,7 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Commands.Generic
   alias Ferricstore.Transaction.Coordinator
+  alias Ferricstore.Test.ShardHelpers
 
   test "WARaft backend selection does not build legacy Ra batcher children" do
     previous_backend = Application.get_env(:ferricstore, :raft_backend)
@@ -71,7 +72,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
       Application.put_env(:ferricstore, :raft_backend, :waraft)
-      Application.put_env(:ferricstore, :waraft_log_module, :wa_raft_log_ets)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -164,6 +164,45 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
     end
   end
 
+  test "strict default cleanup works when the running backend is WARaft" do
+    previous_backend = Application.get_env(:ferricstore, :raft_backend)
+    previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    previous_shard_count = Application.get_env(:ferricstore, :shard_count)
+    previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
+
+    tmp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      stop_ferricstore()
+      File.rm_rf!(tmp_dir)
+
+      Application.put_env(:ferricstore, :data_dir, tmp_dir)
+      Application.put_env(:ferricstore, :shard_count, 1)
+      Application.put_env(:ferricstore, :raft_backend, :waraft)
+
+      assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
+
+      ctx = FerricStore.Instance.get(:default)
+      assert :ok = Router.put(ctx, "cleanup:key", "value", 0)
+      assert "value" == Router.get(ctx, "cleanup:key")
+
+      assert :ok = ShardHelpers.flush_all_keys()
+      assert nil == Router.get(ctx, "cleanup:key")
+    after
+      stop_ferricstore()
+      restore_backend(previous_backend)
+      restore_env(:data_dir, previous_data_dir)
+      restore_env(:shard_count, previous_shard_count)
+      restore_env(:waraft_log_module, previous_waraft_log_module)
+      File.rm_rf!(tmp_dir)
+      assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
+    end
+  end
+
   test "WARaft bounded membership probes do not wait on slow status calls" do
     previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
@@ -183,7 +222,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
       Application.put_env(:ferricstore, :raft_backend, :waraft)
-      Application.put_env(:ferricstore, :waraft_log_module, :wa_raft_log_ets)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -228,7 +266,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
       Application.put_env(:ferricstore, :raft_backend, :waraft)
-      Application.put_env(:ferricstore, :waraft_log_module, :wa_raft_log_ets)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -277,7 +314,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 2)
       Application.put_env(:ferricstore, :raft_backend, :waraft)
-      Application.put_env(:ferricstore, :waraft_log_module, :wa_raft_log_ets)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -316,7 +352,10 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
 
     tmp_dir =
-      Path.join(System.tmp_dir!(), "ferricstore-waraft-watch-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-watch-#{System.unique_integer([:positive])}"
+      )
 
     try do
       stop_ferricstore()
@@ -325,7 +364,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
       Application.put_env(:ferricstore, :raft_backend, :waraft)
-      Application.put_env(:ferricstore, :waraft_log_module, :wa_raft_log_ets)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 

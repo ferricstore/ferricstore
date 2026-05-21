@@ -3,7 +3,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   use GenServer
 
-  alias Ferricstore.Flow
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
   alias Ferricstore.Raft.Backend, as: RaftBackend
@@ -451,7 +450,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp write_ops_chunked(_state, []), do: :ok
 
   defp write_ops_chunked(state, ops) do
-    chunk_size = normalize_positive_integer(Map.get(state, :flush_chunk_ops), @default_flush_chunk_ops)
+    chunk_size =
+      normalize_positive_integer(Map.get(state, :flush_chunk_ops), @default_flush_chunk_ops)
+
     pause_ms = normalize_non_negative_integer(Map.get(state, :flush_chunk_pause_ms), 0)
 
     ops
@@ -725,7 +726,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
       else
         count_ops =
           Enum.map(@terminal_states, fn terminal_state ->
-            state_index_key = Flow.Keys.state_index_key(type, terminal_state, partition_key)
+            state_index_key =
+              Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
+
             count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
 
             {:put_new, count_key, Ferricstore.Flow.LMDB.encode_count(0)}
@@ -748,13 +751,17 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp decode_flow_record_value(value) do
     case :erlang.binary_to_term(value, [:safe]) do
       {_expire_at_ms, encoded_record} when is_binary(encoded_record) ->
-        {:ok, Flow.decode_record(encoded_record)}
+        {:ok, flow_call(:decode_record, [encoded_record])}
 
       _ ->
         :error
     end
   rescue
     _ -> :error
+  end
+
+  defp flow_call(function, args) do
+    apply(Ferricstore.Flow, function, args)
   end
 
   defp terminal_value(path, terminal_key, acc) do
@@ -824,7 +831,14 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp history_project_from_native_entries(native, history_key) do
     native
-    |> Ferricstore.Flow.NativeOrderedIndex.range_slice(history_key, :neg_inf, :inf, false, 0, :all)
+    |> Ferricstore.Flow.NativeOrderedIndex.range_slice(
+      history_key,
+      :neg_inf,
+      :inf,
+      false,
+      0,
+      :all
+    )
     |> history_project_normalize_entries()
   rescue
     ArgumentError -> []
@@ -997,8 +1011,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
            event_id,
            event_ms,
            compound_key,
-          expire_at_ms
-        )}
+           expire_at_ms
+         )}
       ]
       |> maybe_history_expire_put(expire_at_ms, history_index_key)
       |> Enum.reverse()

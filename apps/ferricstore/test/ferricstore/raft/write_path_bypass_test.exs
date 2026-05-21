@@ -24,6 +24,10 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
 
   setup do
     ShardHelpers.flush_all_keys()
+    # Restart-heavy suites can leave Ra leaders elected but the public
+    # Batcher/Ra reply path still settling. This suite asserts the bypass
+    # write path itself, so first prove a public quorum write can round-trip.
+    ShardHelpers.wait_default_quorum_writable(60_000)
     on_exit(fn -> ShardHelpers.wait_shards_alive() end)
     :ok
   end

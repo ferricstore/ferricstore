@@ -104,45 +104,8 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
       # Brief pause to ensure OS-level cleanup completes
       Process.sleep(500)
 
-      # Phase 3: Restart ALL nodes from the same data directories
-      restarted_nodes =
-        Enum.map(node_info, fn info ->
-          # Start a new peer with the same name (different unique suffix)
-          unique = :erlang.unique_integer([:positive])
-          peer_name = :"ferric_restart_#{unique}"
-
-          code_paths =
-            Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
-
-          {:ok, new_peer, new_node_name} =
-            :peer.start(%{
-              name: peer_name,
-              args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
-            })
-
-          # Configure the remote node with the SAME data directory
-          configure_remote_node(new_node_name, info.data_dir, 4)
-
-          # Start the FerricStore application -- it should recover from WAL
-          case :rpc.call(new_node_name, Application, :ensure_all_started, [:ferricstore]) do
-            {:ok, _apps} ->
-              :ok
-
-            {:error, reason} ->
-              raise "Failed to restart FerricStore on #{new_node_name}: #{inspect(reason)}"
-
-            {:badrpc, reason} ->
-              raise "RPC to #{new_node_name} failed: #{inspect(reason)}"
-          end
-
-          %{
-            name: new_node_name,
-            peer: new_peer,
-            data_dir: info.data_dir,
-            index: info.index,
-            original_name: info.name
-          }
-        end)
+      # Phase 3: Restart ALL nodes from the same data directories.
+      restarted_nodes = restart_nodes_from_disk(node_info, 4)
 
       # Wait for shard leaders to be elected on restarted nodes
       :ok = ClusterHelper.wait_for_leaders(restarted_nodes, 4, timeout: 15_000)
@@ -193,9 +156,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
              "#{length(post_restart_violations)} writes lost after full cluster restart:\n" <>
                format_violations(post_restart_violations)
 
-      IO.puts(
-        "  #{length(acked_writes)} writes verified durable after full cluster restart"
-      )
+      IO.puts("  #{length(acked_writes)} writes verified durable after full cluster restart")
     end
 
     @tag :jepsen
@@ -239,31 +200,8 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
 
       Process.sleep(500)
 
-      # Restart all nodes
-      restarted_nodes =
-        Enum.map(node_info, fn info ->
-          unique = :erlang.unique_integer([:positive])
-          peer_name = :"ferric_restart_incr_#{unique}"
-          code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
-
-          {:ok, new_peer, new_node_name} =
-            :peer.start(%{
-              name: peer_name,
-              args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
-            })
-
-          configure_remote_node(new_node_name, info.data_dir, 4)
-
-          {:ok, _} =
-            :rpc.call(new_node_name, Application, :ensure_all_started, [:ferricstore])
-
-          %{
-            name: new_node_name,
-            peer: new_peer,
-            data_dir: info.data_dir,
-            index: info.index
-          }
-        end)
+      # Restart all nodes.
+      restarted_nodes = restart_nodes_from_disk(node_info, 4)
 
       :ok = ClusterHelper.wait_for_leaders(restarted_nodes, 4, timeout: 15_000)
 
@@ -305,12 +243,86 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp configure_remote_node(node_name, data_dir, shards) do
+  defp restart_nodes_from_disk(node_info, shards) do
+    restarted_nodes =
+      Enum.map(node_info, fn info ->
+        {new_peer, new_node_name} = start_peer_with_original_identity(info.name)
+
+        %{
+          name: new_node_name,
+          peer: new_peer,
+          data_dir: info.data_dir,
+          index: info.index,
+          original_name: info.name
+        }
+      end)
+
+    node_names = Enum.map(restarted_nodes, & &1.name)
+
+    for n1 <- node_names, n2 <- node_names, n1 != n2 do
+      :rpc.call(n1, Node, :connect, [n2])
+    end
+
+    Enum.each(restarted_nodes, fn node ->
+      configure_remote_node(node.name, node.data_dir, shards, node_names)
+    end)
+
+    # Application startup triggers Raft elections. Start every recovered node
+    # concurrently so a multi-node Raft group can form quorum during startup.
+    restarted_nodes
+    |> Enum.map(fn node ->
+      Task.async(fn -> ensure_started!(node.name) end)
+    end)
+    |> Enum.each(&Task.await(&1, 60_000))
+
+    restarted_nodes
+  end
+
+  defp start_peer_with_original_identity(original_name) do
+    peer_name = short_name(original_name)
+    code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
+
+    {:ok, new_peer, new_node_name} =
+      :peer.start(%{
+        name: peer_name,
+        args:
+          code_paths ++
+            [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())],
+        wait_boot: 120_000
+      })
+
+    {new_peer, new_node_name}
+  end
+
+  defp short_name(node_name) when is_atom(node_name) do
+    node_name
+    |> Atom.to_string()
+    |> String.split("@", parts: 2)
+    |> hd()
+    |> String.to_atom()
+  end
+
+  defp ensure_started!(node_name) do
+    case :rpc.call(node_name, Application, :ensure_all_started, [:ferricstore], 60_000) do
+      {:ok, _apps} ->
+        :ok
+
+      {:error, reason} ->
+        raise "Failed to restart FerricStore on #{node_name}: #{inspect(reason)}"
+
+      {:badrpc, reason} ->
+        raise "RPC to #{node_name} failed: #{inspect(reason)}"
+    end
+  end
+
+  defp configure_remote_node(node_name, data_dir, shards, cluster_nodes) do
     env_settings = [
       {:data_dir, data_dir},
       {:port, 0},
       {:health_port, 0},
       {:shard_count, shards},
+      {:cluster_nodes, cluster_nodes},
+      {:cluster_auto_join, true},
       {:memory_guard_interval_ms, 60_000},
       {:max_memory_bytes, 1_073_741_824},
       {:merge, [check_interval_ms: 600_000, fragmentation_threshold: 0.99]}

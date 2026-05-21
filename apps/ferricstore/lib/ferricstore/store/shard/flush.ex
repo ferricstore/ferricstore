@@ -257,6 +257,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   @doc false
   def update_ets_locations(state, batch, locations) do
     fid = state.active_file_id
+    batch = normalize_flush_location_batch(batch)
 
     last_index_by_key =
       batch
@@ -285,6 +286,13 @@ defmodule Ferricstore.Store.Shard.Flush do
       end)
 
     %{state | file_stats: new_file_stats}
+  end
+
+  defp normalize_flush_location_batch(batch) do
+    Enum.map(batch, fn
+      {key, persisted_value, exp, staged_value} -> {key, persisted_value, exp, staged_value}
+      {key, value, exp} -> {key, value, exp, value}
+    end)
   end
 
   defp update_single_ets_location(

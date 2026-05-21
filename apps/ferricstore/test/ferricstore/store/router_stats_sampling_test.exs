@@ -116,8 +116,6 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
 
     for {name, arity} <- [
           {:batch_get, 2},
-          {:batch_get_planned, 2},
-          {:do_batch_get_lookup_keys_with_file_refs, 4},
           {:do_batch_get_with_file_refs, 4},
           {:compound_batch_get, 3}
         ] do
@@ -129,6 +127,11 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
       assert contains_call?(body, :sampled_read_bookkeeping_batch, 3),
              "#{name}/#{arity} must use sampled_read_bookkeeping_batch/3"
     end
+
+    planned_body = find_function_body!(ast, :batch_get_planned, 2)
+
+    assert contains_call?(planned_body, :batch_get, 2),
+           "batch_get_planned/2 must delegate to batch_get/2 so planned reads keep batched bookkeeping"
   end
 
   test "read_sample_rate one keeps keyspace hits exact" do

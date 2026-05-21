@@ -11,7 +11,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.BlobCommand
-  alias Ferricstore.Raft.CommandClock
+  alias Ferricstore.Raft.CommandStamp
   alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
 
   @app :ferricstore_waraft_backend
@@ -96,8 +96,22 @@ defmodule Ferricstore.Raft.WARaftBackend do
   @spec default_log_module() :: module()
   def default_log_module, do: @default_log_module
 
+  @doc false
+  @spec default_commit_batch_interval_ms() :: non_neg_integer()
+  def default_commit_batch_interval_ms do
+    case Application.fetch_env(:ferricstore, :waraft_commit_batch_interval_ms) do
+      {:ok, value} ->
+        non_negative_integer_option!(:waraft_commit_batch_interval_ms, value)
+
+      :error ->
+        wal_commit_delay_floor_ms()
+    end
+  end
+
   @spec start(FerricStore.Instance.t(), keyword()) :: :ok | {:error, term()}
   def start(%FerricStore.Instance{} = ctx, opts \\ []) do
+    Ferricstore.Raft.WARaftStorage.validate_supported_apply_mode!()
+
     config = backend_config!(opts)
 
     :ok = ensure_started()
@@ -700,7 +714,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp maybe_namespace_window_write(shard_index, command) do
     if NamespaceConfig.has_overrides?() do
-      prefix = Ferricstore.Raft.Batcher.extract_prefix(command)
+      prefix = Ferricstore.Raft.CommandPrefix.extract(command)
       window_ms = NamespaceConfig.window_for(prefix)
 
       if window_ms > NamespaceConfig.default_window_ms() do
@@ -720,7 +734,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
         with {:ok, prepared_command} <- prepare_commit_command(shard_index, command) do
           acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
           acceptor_pid = Process.whereis(acceptor)
-          stamped = CommandClock.to_ttb(prepared_command)
+          stamped = CommandStamp.to_ttb(prepared_command)
 
           acceptor
           |> commit_safely(acceptor_pid, {make_ref(), stamped})
@@ -827,7 +841,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
             reply_ref = make_ref()
             reply_alias = :erlang.alias([:reply])
             command_ref = make_ref()
-            stamped = CommandClock.to_ttb(prepared_command)
+            stamped = CommandStamp.to_ttb(prepared_command)
 
             case commit_async_safely(
                    acceptor,
@@ -1258,15 +1272,14 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp finish_start_partition(shard_index, opts) do
     server = :wa_raft_server.registered_name(@table, partition(shard_index))
+    bootstrap? = Keyword.get(opts, :bootstrap, true)
+    replay_target = segment_log_last_index(shard_index)
 
-    with {:ok, status} <- wait_status(server, 100) do
-      case finish_start_status(server, status, Keyword.get(opts, :bootstrap, true)) do
-        :ok ->
-          maybe_cache_current_config(shard_index)
-
-        {:error, _reason} = error ->
-          error
-      end
+    with {:ok, status} <- wait_status(server, 100),
+         :ok <- finish_start_status(server, status, bootstrap?),
+         :ok <- wait_log_replayed(server, replay_target, 100),
+         :ok <- wait_storage_replayed(shard_index, replay_target, 100) do
+      maybe_cache_current_config(shard_index)
     end
   end
 
@@ -1837,6 +1850,88 @@ defmodule Ferricstore.Raft.WARaftBackend do
     end
   end
 
+  defp wait_log_replayed(server, target_index, attempts),
+    do: wait_log_replayed(server, target_index, attempts, nil)
+
+  defp wait_log_replayed(_server, target_index, 0, status),
+    do: {:error, {:replay_timeout, target_index, status}}
+
+  defp wait_log_replayed(server, target_index, attempts, _status) do
+    case wait_status(server, 1) do
+      {:ok, status} ->
+        if log_replayed?(status, target_index) do
+          :ok
+        else
+          Process.sleep(10)
+          wait_log_replayed(server, target_index, attempts - 1, status)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp log_replayed?(status, target_index) when is_list(status) do
+    last_applied = Keyword.get(status, :last_applied)
+    log_last = Keyword.get(status, :log_last)
+    target_index = max_integer(log_last, target_index)
+
+    is_integer(last_applied) and last_applied >= target_index
+  end
+
+  defp log_replayed?(_status, _target_index), do: false
+
+  defp wait_storage_replayed(_shard_index, target_index, _attempts)
+       when not is_integer(target_index) or target_index <= 0,
+       do: :ok
+
+  defp wait_storage_replayed(shard_index, target_index, attempts),
+    do: wait_storage_replayed(shard_index, target_index, attempts, nil)
+
+  defp wait_storage_replayed(_shard_index, target_index, 0, position),
+    do: {:error, {:storage_replay_timeout, target_index, position}}
+
+  defp wait_storage_replayed(shard_index, target_index, attempts, _position) do
+    case storage_position(shard_index) do
+      {:ok, {:raft_log_pos, index, _term} = position} when is_integer(index) ->
+        if index >= target_index do
+          :ok
+        else
+          Process.sleep(10)
+          wait_storage_replayed(shard_index, target_index, attempts - 1, position)
+        end
+
+      other ->
+        Process.sleep(10)
+        wait_storage_replayed(shard_index, target_index, attempts - 1, other)
+    end
+  end
+
+  defp segment_log_last_index(shard_index) do
+    root_dir =
+      @table
+      |> :wa_raft_part_sup.registered_partition_path(partition(shard_index))
+      |> to_string()
+
+    case :ferricstore_waraft_spike_segment_log.fold_disk(
+           root_dir,
+           fn index, _entry, acc -> max(index, acc) end,
+           0
+         ) do
+      {:ok, index} when is_integer(index) and index >= 0 -> index
+      _other -> 0
+    end
+  rescue
+    _ -> 0
+  catch
+    _, _ -> 0
+  end
+
+  defp max_integer(left, right) when is_integer(left) and is_integer(right), do: max(left, right)
+  defp max_integer(left, _right) when is_integer(left), do: max(left, 0)
+  defp max_integer(_left, right) when is_integer(right), do: max(right, 0)
+  defp max_integer(_left, _right), do: 0
+
   defp wait_status(_server, 0), do: {:error, :status_timeout}
 
   defp wait_status(server, attempts) do
@@ -2047,12 +2142,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp module_options!(opts) do
     %{
-      log_module:
-        required_module_option!(
-          :log_module,
-          Keyword.get(opts, :log_module, @default_log_module),
-          @log_module_callbacks
-        ),
+      log_module: log_module_option!(Keyword.get(opts, :log_module, @default_log_module)),
       label_module:
         optional_module_option!(
           :label_module,
@@ -2060,6 +2150,15 @@ defmodule Ferricstore.Raft.WARaftBackend do
           @label_module_callbacks
         )
     }
+  end
+
+  defp log_module_option!(:wa_raft_log_ets) do
+    raise ArgumentError,
+          ":log_module does not support volatile ETS log; WARaft evaluation must use the durable segment/keydir log"
+  end
+
+  defp log_module_option!(module) do
+    required_module_option!(:log_module, module, @log_module_callbacks)
   end
 
   defp required_module_option!(source, module, callbacks) do
@@ -2176,13 +2275,27 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp commit_options!(opts) do
     {batch_interval_source, batch_interval_value} =
-      config_option(opts, :commit_batch_interval_ms, :waraft_commit_batch_interval_ms, 1)
+      config_option(
+        opts,
+        :commit_batch_interval_ms,
+        :waraft_commit_batch_interval_ms,
+        default_commit_batch_interval_ms()
+      )
 
     %{
       commit_batch_interval_ms:
         non_negative_integer_option!(batch_interval_source, batch_interval_value),
       commit_batch_max: throughput_option(opts, :commit_batch_max, :waraft_commit_batch_max, 1024)
     }
+  end
+
+  defp wal_commit_delay_floor_ms do
+    delay_us =
+      :ferricstore
+      |> Application.get_env(:wal_commit_delay_us, 6_000)
+      |> then(&non_negative_integer_option!(:wal_commit_delay_us, &1))
+
+    if delay_us == 0, do: 0, else: 1
   end
 
   defp max_inflight_commit_bytes_option!(opts) do

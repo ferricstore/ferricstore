@@ -87,7 +87,7 @@ defmodule Ferricstore.Raft.CommandClockTest do
 
       try do
         Application.put_env(:ferricstore, :raft_backend, :waraft)
-        assert :ok = WARaftBackend.start(ctx, log_module: :wa_raft_log_ets)
+        assert :ok = WARaftBackend.start(ctx)
 
         shard_id = RaftCluster.shard_server_id(0)
 

@@ -22,16 +22,18 @@ defmodule Ferricstore.FlowWorkflowDemoTest do
 
     log_step("1 create queued workflow")
 
-    assert {:ok, created} =
+    assert :ok =
              FerricStore.flow_create(id,
                type: type,
                partition_key: partition,
                state: "queued",
-               payload_ref: "payload:#{id}",
+               payload: "payload:#{id}",
                correlation_id: correlation,
                run_at_ms: now,
                now_ms: now
              )
+
+    assert {:ok, created} = FerricStore.flow_get(id, partition_key: partition)
 
     log_flow("created", created)
 
@@ -51,13 +53,15 @@ defmodule Ferricstore.FlowWorkflowDemoTest do
 
     log_step("3 worker completes workflow")
 
-    assert {:ok, completed} =
+    assert :ok =
              FerricStore.flow_complete(id, claimed.lease_token,
                partition_key: partition,
                fencing_token: claimed.fencing_token,
-               result_ref: "result:#{id}",
+               result: "result:#{id}",
                now_ms: now + 10
              )
+
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: partition)
 
     log_flow("completed", completed)
 

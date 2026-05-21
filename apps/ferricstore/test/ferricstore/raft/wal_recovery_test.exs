@@ -10,7 +10,10 @@ defmodule Ferricstore.Raft.WalRecoveryTest do
   in the ra directory and verifying the system starts.
   """
 
-  use ExUnit.Case, async: true
+  # This test writes into the application-wide Ra WAL directory and verifies the
+  # default instance through Router, so it must not race with async flush/write
+  # tests that share the same booted application.
+  use ExUnit.Case, async: false
 
   describe "the original bug pattern" do
     test "file:read on empty file returns eof (the trigger)" do

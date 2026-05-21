@@ -14,6 +14,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       {:error, :segment_entry_not_found} ->
         read_projection_value(ctx, shard_index, key)
 
+      {:error, :key_not_in_segment_entry} ->
+        read_projection_value(ctx, shard_index, key)
+
       other ->
         other
     end

@@ -1,6 +1,8 @@
 defmodule Ferricstore.Raft.WARaftSpikeTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   @moduletag :waraft_spike
 
   setup do
@@ -27,7 +29,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     assert {:ok, "v1"} = :ferricstore_waraft_spike.get("k1")
   end
 
-  test "volatile mode supports async pipelined SET replies", %{root: root} do
+  test "segment-log toy mode supports async pipelined SET replies", %{root: root} do
     assert :ok = :ferricstore_waraft_spike.start_volatile(root)
 
     for i <- 1..50 do
@@ -58,7 +60,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     assert :not_found = :ferricstore_waraft_spike.storage_get("blocked:k1")
   end
 
-  test "volatile mode supports one async Raft command for a SET batch", %{root: root} do
+  test "segment-log toy mode supports one async Raft command for a SET batch", %{root: root} do
     assert :ok = :ferricstore_waraft_spike.start_volatile(root)
 
     entries =
@@ -114,7 +116,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     assert function_exported?(:wa_raft_part_sup, :prepare_spec, 2)
   end
 
-  test "volatile mode can run the local batched load driver", %{root: root} do
+  test "segment-log toy mode can run the local batched load driver", %{root: root} do
     assert :ok = :ferricstore_waraft_spike.start_volatile(root)
 
     assert {:ok, result} = :ferricstore_waraft_spike_load.run(1_000, 10, 10, 16, 100)
@@ -125,7 +127,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     assert value == :binary.copy("x", 16)
   end
 
-  test "volatile mode can run the mixed GET and SET load driver", %{root: root} do
+  test "segment-log toy mode can run the mixed GET and SET load driver", %{root: root} do
     assert :ok = :ferricstore_waraft_spike.start_volatile(root)
 
     assert {:ok, result} = :ferricstore_waraft_spike_load.run_mixed(1_000, 10, 10, 16, 100)
@@ -139,7 +141,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     assert value == :binary.copy("x", 16)
   end
 
-  test "volatile mode can run multiple WARaft partitions", %{root: root} do
+  test "segment-log toy mode can run multiple WARaft partitions", %{root: root} do
     assert :ok = :ferricstore_waraft_spike.start_multi_volatile(root, 2)
 
     assert :ok = :ferricstore_waraft_spike.put_on(1, "partition:k1", "v1")
@@ -159,7 +161,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     assert :not_found = :ferricstore_waraft_spike.storage_get_on(2, "partition:k1")
   end
 
-  test "volatile mode can run the multi-partition load driver", %{root: root} do
+  test "segment-log toy mode can run the multi-partition load driver", %{root: root} do
     assert :ok = :ferricstore_waraft_spike.start_multi_volatile(root, 2)
 
     assert {:ok, result} = :ferricstore_waraft_spike_load.run_multi(1_000, 10, 10, 16, 100, 2)
@@ -500,21 +502,6 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     refute existing_atom?(atom_name)
   end
 
-  test "default WARaft ETS log rejects unsafe binary append entries", %{root: root} do
-    assert :ok = :ferricstore_waraft_spike.start_volatile(root)
-
-    atom_name = "ferricstore_waraft_ets_append_#{System.unique_integer([:positive])}"
-    refute existing_atom?(atom_name)
-
-    status = :ferricstore_waraft_spike.status()
-    view = waraft_log_view(status)
-
-    assert {:error, {:bad_entry_term, _reason}} =
-             :wa_raft_log.append(view, [unknown_atom_payload(atom_name)])
-
-    refute existing_atom?(atom_name)
-  end
-
   test "WARaft heartbeat comparison decodes binary entries safely", %{root: root} do
     assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
 
@@ -757,6 +744,322 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
       assert Path.extname(path) == ".seg"
     after
       restore_env(:waraft_segment_log_file_sync_hook, previous_hook)
+    end
+  end
+
+  test "custom durable segment log uses datasync for appended data", %{root: root} do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+    previous_method = Application.get_env(:ferricstore, :waraft_segment_log_sync_method)
+
+    try do
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+
+      Application.put_env(:ferricstore, :waraft_segment_log_sync_method, :datasync)
+
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_file_sync_hook,
+        {:notify_with_method, self()}
+      )
+
+      entry =
+        {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:datasync", "value"}}}
+
+      assert {:ok, _new_view} = :wa_raft_log.append(view, [entry])
+      assert_receive {:waraft_segment_log_file_sync, _path, :datasync}, 1_000
+    after
+      restore_env(:waraft_segment_log_file_sync_hook, previous_hook)
+      restore_env(:waraft_segment_log_sync_method, previous_method)
+    end
+  end
+
+  test "custom durable segment log can append through the WAL NIF raw async writer", %{root: root} do
+    previous_io_mode = Application.get_env(:ferricstore, :waraft_segment_log_io_mode)
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_wal_nif_sync_hook)
+    previous_delay = Application.get_env(:ferricstore, :waraft_segment_log_sync_delay_us)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_io_mode, :wal_nif)
+      Application.put_env(:ferricstore, :waraft_segment_log_sync_delay_us, 0)
+
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+      Application.put_env(:ferricstore, :waraft_segment_log_wal_nif_sync_hook, {:notify, self()})
+
+      entry =
+        {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:wal-nif", "value"}}}
+
+      assert {:ok, _new_view} = :wa_raft_log.append(view, [entry])
+      segment_dir = segment_log_dir(root)
+      assert_receive {:waraft_segment_log_wal_nif_sync, path, 0}, 1_000
+      assert String.starts_with?(path, segment_dir)
+
+      first_segment =
+        segment_dir
+        |> Path.join("*.seg")
+        |> Path.wildcard()
+        |> Enum.sort()
+        |> hd()
+
+      refute File.read!(first_segment) |> String.starts_with?("RAWA")
+
+      assert :ok = :ferricstore_waraft_spike.stop()
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      assert {:ok, "value"} = :ferricstore_waraft_spike.storage_get("segment:wal-nif")
+    after
+      restore_env(:waraft_segment_log_io_mode, previous_io_mode)
+      restore_env(:waraft_segment_log_wal_nif_sync_hook, previous_hook)
+      restore_env(:waraft_segment_log_sync_delay_us, previous_delay)
+    end
+  end
+
+  test "custom durable segment log does not double-apply wal_commit_delay_us to WAL NIF sync", %{
+    root: root
+  } do
+    previous_io_mode = Application.get_env(:ferricstore, :waraft_segment_log_io_mode)
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_wal_nif_sync_hook)
+    previous_delay = Application.get_env(:ferricstore, :waraft_segment_log_sync_delay_us)
+    previous_wal_delay = Application.get_env(:ferricstore, :wal_commit_delay_us)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_io_mode, :wal_nif)
+      Application.delete_env(:ferricstore, :waraft_segment_log_sync_delay_us)
+      Application.put_env(:ferricstore, :wal_commit_delay_us, 1_234)
+
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+      Application.put_env(:ferricstore, :waraft_segment_log_wal_nif_sync_hook, {:notify, self()})
+
+      entry =
+        {term,
+         {make_ref(), {:write, :ferricstore_waraft_spike, "segment:wal-nif-delay", "value"}}}
+
+      assert {:ok, _new_view} = :wa_raft_log.append(view, [entry])
+      assert_receive {:waraft_segment_log_wal_nif_sync, _path, 0}, 1_000
+    after
+      restore_env(:waraft_segment_log_io_mode, previous_io_mode)
+      restore_env(:waraft_segment_log_wal_nif_sync_hook, previous_hook)
+      restore_env(:waraft_segment_log_sync_delay_us, previous_delay)
+      restore_env(:wal_commit_delay_us, previous_wal_delay)
+    end
+  end
+
+  test "custom durable segment log rolls back WAL NIF bytes when async sync fails", %{root: root} do
+    previous_io_mode = Application.get_env(:ferricstore, :waraft_segment_log_io_mode)
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_wal_nif_sync_hook)
+    previous_delay = Application.get_env(:ferricstore, :waraft_segment_log_sync_delay_us)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_io_mode, :wal_nif)
+      Application.put_env(:ferricstore, :waraft_segment_log_sync_delay_us, 0)
+
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      last_before = Keyword.fetch!(status, :log_last)
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_wal_nif_sync_hook,
+        {:fail_once, self()}
+      )
+
+      entry =
+        {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:wal-nif-fail", "value"}}}
+
+      assert {:error, {:wal_nif_sync_hook, path, 0}} = :wa_raft_log.append(view, [entry])
+      assert_receive {:waraft_segment_log_wal_nif_sync, ^path, 0}, 1_000
+
+      assert :ok = :ferricstore_waraft_spike.stop()
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      assert :not_found = :ferricstore_waraft_spike.storage_get("segment:wal-nif-fail")
+      assert Keyword.fetch!(:ferricstore_waraft_spike.status(), :log_last) <= last_before + 1
+    after
+      restore_env(:waraft_segment_log_io_mode, previous_io_mode)
+      restore_env(:waraft_segment_log_wal_nif_sync_hook, previous_hook)
+      restore_env(:waraft_segment_log_sync_delay_us, previous_delay)
+    end
+  end
+
+  test "custom durable segment log stays quiet when telemetry app is not started", %{root: root} do
+    telemetry_started? = telemetry_started?()
+
+    if telemetry_started? do
+      Application.stop(:telemetry)
+    end
+
+    on_exit(fn ->
+      if telemetry_started? do
+        Application.ensure_all_started(:telemetry)
+      end
+    end)
+
+    assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+    status = :ferricstore_waraft_spike.status()
+    term = Keyword.fetch!(status, :current_term)
+    view = segment_log_view(status)
+
+    entry =
+      {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:no-telemetry", "value"}}}
+
+    log =
+      capture_log(fn ->
+        assert {:ok, _new_view} = :wa_raft_log.append(view, [entry])
+      end)
+
+    refute log =~ "Failed to lookup telemetry handlers"
+  end
+
+  test "custom durable segment log rejects invalid sync method config", %{root: root} do
+    previous_method = Application.get_env(:ferricstore, :waraft_segment_log_sync_method)
+
+    try do
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+
+      Application.put_env(:ferricstore, :waraft_segment_log_sync_method, :bad_sync_method)
+
+      entry =
+        {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:bad-sync", "value"}}}
+
+      assert {:error, {:bad_segment_sync_method, :bad_sync_method}} =
+               :wa_raft_log.append(view, [entry])
+
+      {:log_view, log, _first, _last, _config} = view
+      assert :not_found = :ferricstore_waraft_spike_segment_log.get(log, log_view_last(view) + 1)
+    after
+      restore_env(:waraft_segment_log_sync_method, previous_method)
+    end
+  end
+
+  test "custom durable segment log preallocates new segments without extending EOF", %{
+    root: root
+  } do
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+
+    previous_preallocate =
+      Application.get_env(:ferricstore, :waraft_segment_log_preallocate_bytes)
+
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_preallocate_hook)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
+
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+      view = advance_to_next_segment_boundary!(view, term, 2)
+
+      Application.put_env(:ferricstore, :waraft_segment_log_preallocate_bytes, 4096)
+      Application.put_env(:ferricstore, :waraft_segment_log_preallocate_hook, {:notify, self()})
+
+      entry =
+        {term, {make_ref(), {:write, :ferricstore_waraft_spike, "segment:preallocate", "value"}}}
+
+      assert {:ok, _new_view} = :wa_raft_log.append(view, [entry])
+
+      segment_dir = segment_log_dir(root)
+      assert_receive {:waraft_segment_log_preallocate, path, 4096}, 1_000
+      assert String.starts_with?(path, segment_dir)
+      assert Path.extname(path) == ".seg"
+      assert File.stat!(path).size < 4096
+    after
+      restore_env(:waraft_segment_log_records_per_segment, previous_records)
+      restore_env(:waraft_segment_log_preallocate_bytes, previous_preallocate)
+      restore_env(:waraft_segment_log_preallocate_hook, previous_hook)
+    end
+  end
+
+  test "custom durable segment log rejects invalid preallocation config", %{
+    root: root
+  } do
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+
+    previous_preallocate =
+      Application.get_env(:ferricstore, :waraft_segment_log_preallocate_bytes)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
+
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+      view = advance_to_next_segment_boundary!(view, term, 2)
+      failed_index = log_view_last(view) + 1
+
+      Application.put_env(:ferricstore, :waraft_segment_log_preallocate_bytes, -1)
+
+      entry =
+        {term,
+         {make_ref(), {:write, :ferricstore_waraft_spike, "segment:bad-preallocate", "value"}}}
+
+      assert {:error, {:bad_segment_preallocate_bytes, -1}} = :wa_raft_log.append(view, [entry])
+
+      {:log_view, log, _first, _last, _config} = view
+      assert :not_found = :ferricstore_waraft_spike_segment_log.get(log, failed_index)
+    after
+      restore_env(:waraft_segment_log_records_per_segment, previous_records)
+      restore_env(:waraft_segment_log_preallocate_bytes, previous_preallocate)
+    end
+  end
+
+  test "custom durable segment log rejects append when new segment preallocation fails", %{
+    root: root
+  } do
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+
+    previous_preallocate =
+      Application.get_env(:ferricstore, :waraft_segment_log_preallocate_bytes)
+
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_preallocate_hook)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
+
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      status = :ferricstore_waraft_spike.status()
+      term = Keyword.fetch!(status, :current_term)
+      view = segment_log_view(status)
+      view = advance_to_next_segment_boundary!(view, term, 2)
+      failed_index = log_view_last(view) + 1
+
+      Application.put_env(:ferricstore, :waraft_segment_log_preallocate_bytes, 4096)
+
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_preallocate_hook,
+        {:fail_once, self()}
+      )
+
+      entry =
+        {term,
+         {make_ref(), {:write, :ferricstore_waraft_spike, "segment:preallocate-failed", "value"}}}
+
+      assert {:error, {:preallocate_hook, path, 4096}} = :wa_raft_log.append(view, [entry])
+      assert_receive {:waraft_segment_log_preallocate, ^path, 4096}, 1_000
+
+      {:log_view, log, _first, _last, _config} = view
+      assert :not_found = :ferricstore_waraft_spike_segment_log.get(log, failed_index)
+
+      assert :ok = :ferricstore_waraft_spike.stop()
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+      assert :not_found = :ferricstore_waraft_spike.storage_get("segment:preallocate-failed")
+    after
+      restore_env(:waraft_segment_log_records_per_segment, previous_records)
+      restore_env(:waraft_segment_log_preallocate_bytes, previous_preallocate)
+      restore_env(:waraft_segment_log_preallocate_hook, previous_hook)
     end
   end
 
@@ -1505,6 +1808,17 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     new_view
   end
 
+  defp advance_to_next_segment_boundary!(view, term, records_per_segment) do
+    next_index = log_view_last(view) + 1
+
+    if rem(next_index, records_per_segment) == 0 do
+      view
+    else
+      entry = {term, {make_ref(), :noop}}
+      advance_to_next_segment_boundary!(append_entries!(view, [entry]), term, records_per_segment)
+    end
+  end
+
   defp log_view_last({:log_view, _log, _first, last, _config}), do: last
 
   defp existing_atom?(atom_name) do
@@ -1512,6 +1826,12 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     true
   rescue
     ArgumentError -> false
+  end
+
+  defp telemetry_started? do
+    Enum.any?(Application.started_applications(), fn {app, _description, _version} ->
+      app == :telemetry
+    end)
   end
 
   defp decode_segment_records(<<len::32, crc::32, rest::binary>>, acc)
@@ -1524,14 +1844,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
   defp decode_segment_records(_tail, acc), do: Enum.reverse(acc)
 
   defp ensure_distribution! do
-    case Node.self() do
-      :nonode@nohost ->
-        node_name = :"waraft_runner_#{:erlang.unique_integer([:positive])}"
-        assert {:ok, _} = Node.start(node_name, :shortnames)
-
-      _ ->
-        :ok
-    end
+    Ferricstore.Test.ShardHelpers.ensure_distribution_started!(:waraft_runner)
   end
 
   defp rewind_spike_storage!(root, keys_to_delete, position) do

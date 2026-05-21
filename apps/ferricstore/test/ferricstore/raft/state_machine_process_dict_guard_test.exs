@@ -41,7 +41,7 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
       )
 
     assert source =~ "@sm_pending_write_keys"
-    assert with_pending_body =~ "init_pending_write_process_state()"
+    assert with_pending_body =~ "init_pending_write_process_state(state)"
     assert with_pending_body =~ "clear_pending_write_process_state()"
 
     for key <- [

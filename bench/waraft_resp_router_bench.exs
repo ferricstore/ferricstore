@@ -9,6 +9,8 @@ defmodule WaraftRespRouterBench do
   alias Ferricstore.Bench.RespRouterLoad
 
   def run do
+    stop_started_apps()
+
     backend = env_backend("BACKEND", :ra)
     mode = env_atom("BENCH_MODE", :set, [:set, :get, :mixed])
     total = env_int("TOTAL", 200_000)
@@ -80,6 +82,14 @@ defmodule WaraftRespRouterBench do
     _ = Application.stop(:ferricstore)
   end
 
+  defp stop_started_apps do
+    # `mix run` starts OTP applications before evaluating this script. Stop any
+    # default boot first so the benchmark owns data_dir, shard_count, and backend.
+    for app <- [:ferricstore_server, :ferricstore_ecto, :ferricstore_session, :ferricstore] do
+      _ = Application.stop(app)
+    end
+  end
+
   defp configure_app(backend, data_dir, shards) do
     File.rm_rf!(data_dir)
     File.mkdir_p!(data_dir)
@@ -90,16 +100,57 @@ defmodule WaraftRespRouterBench do
     Application.put_env(:ferricstore, :health_port, 0)
     Application.put_env(:ferricstore, :shard_count, shards)
     Application.put_env(:ferricstore, :raft_backend, backend)
+    Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+    Application.delete_env(:ferricstore, :waraft_log_module)
+    put_optional_int_env("WAL_COMMIT_DELAY_US", :wal_commit_delay_us)
+    put_optional_int_env("WAL_MAX_BUFFER_BYTES", :wal_max_buffer_bytes)
+    put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
+    put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
+    put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
 
-    case {backend, System.get_env("WARAFT_LOG", "segment")} do
-      {:waraft, "ets"} ->
-        Application.put_env(:ferricstore, :waraft_log_module, :wa_raft_log_ets)
+    Application.put_env(
+      :ferricstore,
+      :waraft_segment_log_io_mode,
+      env_atom("WARAFT_SEGMENT_IO_MODE", :file, [:file, :wal_nif])
+    )
 
-      {:waraft, _segment} ->
-        Application.delete_env(:ferricstore, :waraft_log_module)
+    Application.put_env(
+      :ferricstore,
+      :waraft_segment_log_preallocate_bytes,
+      env_int("WARAFT_SEGMENT_PREALLOCATE_BYTES", 256 * 1024 * 1024)
+    )
 
-      _ ->
+    put_optional_atom_env("WARAFT_SEGMENT_SYNC_METHOD", :waraft_segment_log_sync_method, [
+      :datasync,
+      :sync,
+      :auto
+    ])
+
+    if backend == :waraft and System.get_env("WARAFT_LOG") do
+      raise "WARAFT_LOG is no longer supported; WARaft benchmarks use durable segment/keydir storage"
+    end
+  end
+
+  defp put_optional_int_env(env, app_key) do
+    case System.get_env(env) do
+      nil -> :ok
+      value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
+  defp put_optional_atom_env(env, app_key, allowed) do
+    case System.get_env(env) do
+      nil ->
         :ok
+
+      value ->
+        atom = String.to_existing_atom(value)
+
+        unless atom in allowed do
+          raise "unsupported #{env}=#{inspect(value)}; expected one of #{inspect(allowed)}"
+        end
+
+        Application.put_env(:ferricstore, app_key, atom)
     end
   end
 

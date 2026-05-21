@@ -505,6 +505,8 @@ defmodule Ferricstore.Commands.Strings do
 
   defp mget_keys(keys, store), do: Ops.batch_get(store, keys)
 
+  defp mset_args([], _store), do: {:error, "ERR wrong number of arguments for 'mset' command"}
+
   defp mset_args(args, store) do
     if even_length?(args) do
       case mset_validate(args) do
@@ -567,6 +569,8 @@ defmodule Ferricstore.Commands.Strings do
       end
     end
   end
+
+  defp msetnx_args([], _store), do: {:error, "ERR wrong number of arguments for 'msetnx' command"}
 
   defp msetnx_args(args, store) do
     if even_length?(args) do

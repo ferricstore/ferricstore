@@ -79,13 +79,47 @@ defmodule Ferricstore.Jepsen.StreamHelper do
   @spec exec(binary(), [binary()]) :: term()
   def exec(cmd, args) do
     ctx = FerricStore.Instance.get(:default)
+
+    # Match the production Stream store shape. Stream entries must use the
+    # compound API so every entry for one stream is routed by the stream key,
+    # not by each generated entry key.
     store = %{
       get: fn k -> Ferricstore.Store.Router.get(ctx, k) end,
       get_meta: fn k -> Ferricstore.Store.Router.get_meta(ctx, k) end,
       put: fn k, v, e -> Ferricstore.Store.Router.put(ctx, k, v, e) end,
       delete: fn k -> Ferricstore.Store.Router.delete(ctx, k) end,
       exists?: fn k -> Ferricstore.Store.Router.exists?(ctx, k) end,
-      keys: fn -> Ferricstore.Store.Router.keys(ctx) end
+      keys: fn -> Ferricstore.Store.Router.keys(ctx) end,
+      compound_get: fn redis_key, compound_key ->
+        Ferricstore.Store.Router.compound_get(ctx, redis_key, compound_key)
+      end,
+      compound_get_meta: fn redis_key, compound_key ->
+        Ferricstore.Store.Router.compound_get_meta(ctx, redis_key, compound_key)
+      end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        Ferricstore.Store.Router.compound_batch_get(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        Ferricstore.Store.Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
+      end,
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        Ferricstore.Store.Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
+      end,
+      compound_batch_put: fn redis_key, entries ->
+        Ferricstore.Store.Router.compound_batch_put(ctx, redis_key, entries)
+      end,
+      compound_delete: fn redis_key, compound_key ->
+        Ferricstore.Store.Router.compound_delete(ctx, redis_key, compound_key)
+      end,
+      compound_scan: fn redis_key, prefix ->
+        Ferricstore.Store.Router.compound_scan(ctx, redis_key, prefix)
+      end,
+      compound_count: fn redis_key, prefix ->
+        Ferricstore.Store.Router.compound_count(ctx, redis_key, prefix)
+      end,
+      compound_delete_prefix: fn redis_key, prefix ->
+        Ferricstore.Store.Router.compound_delete_prefix(ctx, redis_key, prefix)
+      end
     }
 
     Ferricstore.Commands.Stream.handle(cmd, args, store)

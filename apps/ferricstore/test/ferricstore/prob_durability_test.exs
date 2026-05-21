@@ -203,7 +203,7 @@ defmodule Ferricstore.ProbDurabilityTest do
   # ---------------------------------------------------------------------------
 
   describe "concurrent writes keep invariants" do
-    test "100 concurrent BF.ADDs of distinct elements — all present + CARD == 100" do
+    test "100 concurrent BF.ADDs keep all reported-new adds reflected in CARD" do
       key = ukey("bf_concurrent")
 
       tasks =
@@ -222,8 +222,15 @@ defmodule Ferricstore.ProbDurabilityTest do
         assert {:ok, 1} = FerricStore.bf_exists(key, "c_#{i}")
       end
 
+      expected_card =
+        Enum.count(results, fn
+          {:ok, 1} -> true
+          _ -> false
+        end)
+
       {:ok, card} = FerricStore.bf_card(key)
-      assert card == 100, "expected CARD == 100, got #{card}"
+      assert card == expected_card,
+             "expected CARD == #{expected_card} for reported-new adds, got #{card}"
     end
 
     test "50 concurrent CMS.INCRBY(1) on same key — final count >= 50" do

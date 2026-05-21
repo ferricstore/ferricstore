@@ -53,6 +53,19 @@ defmodule Ferricstore.ReplicationModeTest do
              ReplicationMode.read(dir)
   end
 
+  test "marker stores node identity as data, not as a dynamic atom", %{dir: dir} do
+    node_name = :"ferricstore_restart_marker_#{System.unique_integer([:positive])}@host"
+
+    ReplicationMode.write!(dir, %{
+      replication_mode: :raft,
+      shard_count: 4,
+      node: node_name
+    })
+
+    assert {:ok, %{node: encoded_node}} = ReplicationMode.read(dir)
+    assert encoded_node == Atom.to_string(node_name)
+  end
+
   test "corrupted marker fails closed", %{dir: dir} do
     File.write!(ReplicationMode.marker_path(dir), "not a marker")
 

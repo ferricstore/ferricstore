@@ -348,10 +348,14 @@ defmodule Ferricstore.Store.Router do
     do_quorum_write(ctx, idx, command)
   end
 
-  defp selected_waraft_ctx?(%{name: :default}), do: Ferricstore.Raft.Backend.waraft?()
+  defp selected_waraft_ctx?(%{name: :default}), do: Ferricstore.Raft.Backend.running_waraft?()
 
   defp selected_waraft_ctx?(ctx) do
-    Ferricstore.Raft.Backend.waraft?() and waraft_context_owner?(ctx)
+    # Default-instance routing must follow the backend pinned when the
+    # application started. Custom test/spike instances are different: when
+    # WARaftBackend.start(ctx) owns that exact context, writes for that context
+    # must route to WARaft even if the default app is still running Ra.
+    waraft_context_owner?(ctx)
   end
 
   defp waraft_context_owner?(ctx) do
@@ -980,7 +984,7 @@ defmodule Ferricstore.Store.Router do
         end
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
 
       :miss ->
@@ -1005,6 +1009,7 @@ defmodule Ferricstore.Store.Router do
           {:hot, binary()}
           | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
           | {:cold_value, binary()}
+          | {:error, binary()}
           | :miss
   def get_with_file_ref(ctx, key) do
     do_get_with_file_ref(ctx, key, true)
@@ -1047,7 +1052,7 @@ defmodule Ferricstore.Store.Router do
                 {:hot, value}
 
               :miss ->
-                Stats.incr_keyspace_misses(ctx)
+                record_keyspace_miss(ctx)
                 :miss
             end
         end
@@ -1061,7 +1066,7 @@ defmodule Ferricstore.Store.Router do
             {:cold_value, value}
 
           _ ->
-            Stats.incr_keyspace_misses(ctx)
+            record_keyspace_miss(ctx)
             :miss
         end
 
@@ -1071,13 +1076,17 @@ defmodule Ferricstore.Store.Router do
         shard_file_ref_or_value(ctx, idx, key)
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         :miss
 
       :miss ->
-        # Key not in ETS = doesn't exist. No GenServer needed.
-        Stats.incr_keyspace_misses(ctx)
-        :miss
+        if compound_data_structure_key?(ctx, keydir, key) do
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        else
+          # Key not in ETS = doesn't exist. No GenServer needed.
+          record_keyspace_miss(ctx)
+          :miss
+        end
 
       :no_table ->
         # ETS table unavailable (shard restarting). Fall back to GenServer.
@@ -1103,10 +1112,19 @@ defmodule Ferricstore.Store.Router do
           Stats.record_cold_read(ctx, key)
           {:cold_value, result}
         else
-          Stats.incr_keyspace_misses(ctx)
+          record_keyspace_miss(ctx)
           :miss
         end
     end
+  end
+
+  defp compound_data_structure_key?(ctx, keydir, key) do
+    case :ets.lookup(keydir, CompoundKey.type_key(key)) do
+      [] -> false
+      _ -> TypeRegistry.get_type(key, ctx) != "none"
+    end
+  rescue
+    _ -> false
   end
 
   defp file_ref_from_cold_location(ctx, idx, path, offset, key, value_size, validate_blob_ref?) do
@@ -1416,7 +1434,7 @@ defmodule Ferricstore.Store.Router do
                 value
 
               :miss ->
-                Stats.incr_keyspace_misses(ctx)
+                record_keyspace_miss(ctx)
                 nil
             end
         end
@@ -1430,7 +1448,7 @@ defmodule Ferricstore.Store.Router do
             value
 
           _ ->
-            Stats.incr_keyspace_misses(ctx)
+            record_keyspace_miss(ctx)
             nil
         end
 
@@ -1445,18 +1463,18 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          record_keyspace_miss(ctx)
         end
 
         result
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
 
       :miss ->
         # Key not in ETS at all — doesn't exist. No GenServer needed.
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
 
       :no_table ->
@@ -1470,7 +1488,7 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          record_keyspace_miss(ctx)
         end
 
         result
@@ -1482,6 +1500,7 @@ defmodule Ferricstore.Store.Router do
           {:hot, binary()}
           | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
           | {:cold_value, binary()}
+          | {:error, binary()}
           | :miss
   def get_with_deferred_blob_file_ref(ctx, key), do: do_get_with_file_ref(ctx, key, false)
 
@@ -1489,22 +1508,21 @@ defmodule Ferricstore.Store.Router do
   def batch_get(ctx, keys) do
     now = HLC.now_ms()
 
-    {results, {cold_entries, _cold_count}} =
-      Enum.map_reduce(keys, {[], 0}, fn key, {cold_entries, cold_count} ->
+    {results, {cold_entries, _cold_count, hot_hits}} =
+      Enum.map_reduce(keys, {[], 0, []}, fn key, {cold_entries, cold_count, hot_hits} ->
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
 
         case ets_get_full(ctx, idx, keydir, key, now) do
           {:hit, value, lfu} ->
-            sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
-            {{:value, value}, {cold_entries, cold_count}}
+            {{:value, value}, {cold_entries, cold_count, [{keydir, key, lfu} | hot_hits]}}
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) ->
             path = cold_file_path(ctx, idx, file_id)
 
             entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-            {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+            {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1, hot_hits}}
 
           {:cold, file_id, offset, value_size}
           when valid_waraft_segment_location(file_id, offset, value_size) ->
@@ -1516,11 +1534,11 @@ defmodule Ferricstore.Store.Router do
                   value
 
                 _ ->
-                  Stats.incr_keyspace_misses(ctx)
+                  record_keyspace_miss(ctx)
                   nil
               end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, hot_hits}}
 
           {:cold, _file_id, _offset, _value_size} ->
             result =
@@ -1532,18 +1550,18 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              record_keyspace_miss(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, hot_hits}}
 
           :expired ->
-            Stats.incr_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count}}
+            record_keyspace_miss(ctx)
+            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count}}
+            record_keyspace_miss(ctx)
+            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :no_table ->
             result =
@@ -1555,12 +1573,14 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              record_keyspace_miss(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, hot_hits}}
         end
       end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
 
     cold_values =
       cold_entries
@@ -1600,15 +1620,14 @@ defmodule Ferricstore.Store.Router do
   defp do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, validate_blob_ref?) do
     now = HLC.now_ms()
 
-    {results, {cold_entries, _cold_count}} =
-      Enum.map_reduce(keys, {[], 0}, fn key, {cold_entries, cold_count} ->
+    {results, {cold_entries, _cold_count, hot_hits}} =
+      Enum.map_reduce(keys, {[], 0, []}, fn key, {cold_entries, cold_count, hot_hits} ->
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
 
         case ets_get_full(ctx, idx, keydir, key, now) do
           {:hit, value, lfu} ->
-            sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
-            {{:value, value}, {cold_entries, cold_count}}
+            {{:value, value}, {cold_entries, cold_count, [{keydir, key, lfu} | hot_hits]}}
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) ->
@@ -1626,6 +1645,7 @@ defmodule Ferricstore.Store.Router do
               min_file_ref_size,
               cold_entries,
               cold_count,
+              hot_hits,
               now
             )
 
@@ -1639,11 +1659,11 @@ defmodule Ferricstore.Store.Router do
                   value
 
                 _ ->
-                  Stats.incr_keyspace_misses(ctx)
+                  record_keyspace_miss(ctx)
                   nil
               end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, hot_hits}}
 
           {:cold, _file_id, _offset, _value_size} ->
             result =
@@ -1655,18 +1675,18 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              record_keyspace_miss(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, hot_hits}}
 
           :expired ->
-            Stats.incr_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count}}
+            record_keyspace_miss(ctx)
+            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count}}
+            record_keyspace_miss(ctx)
+            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :no_table ->
             result =
@@ -1678,12 +1698,14 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              record_keyspace_miss(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, hot_hits}}
         end
       end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
 
     cold_values =
       cold_entries
@@ -1718,7 +1740,7 @@ defmodule Ferricstore.Store.Router do
            boolean()}
   def batch_get_with_deferred_blob_file_refs_and_presence(ctx, keys, min_file_ref_size) do
     results = do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, false)
-    {results, Enum.any?(results, &present_read_result?/1)}
+    {results, Enum.any?(results, &file_ref_read_result?/1)}
   end
 
   @doc false
@@ -1738,14 +1760,31 @@ defmodule Ferricstore.Store.Router do
     batch_get_with_deferred_blob_file_refs_and_presence(ctx, keys, min_file_ref_size)
   end
 
+  @doc false
+  @spec batch_get_with_deferred_blob_file_refs_planned(
+          FerricStore.Instance.t(),
+          [tuple()],
+          non_neg_integer()
+        ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
+  def batch_get_with_deferred_blob_file_refs_planned(ctx, planned_keys, min_file_ref_size) do
+    {results, _present?} =
+      batch_get_with_deferred_blob_file_refs_planned_and_presence(
+        ctx,
+        planned_keys,
+        min_file_ref_size
+      )
+
+    results
+  end
+
   defp planned_lookup_key({_original_key, lookup_key, _shard_index, _keydir})
        when is_binary(lookup_key),
        do: lookup_key
 
   defp planned_lookup_key(key) when is_binary(key), do: key
 
-  defp present_read_result?(nil), do: false
-  defp present_read_result?(_value), do: true
+  defp file_ref_read_result?({:file_ref, _path, _offset, _size}), do: true
+  defp file_ref_read_result?(_value), do: false
 
   defp maybe_file_ref_or_cold_entry(
          ctx,
@@ -1759,30 +1798,33 @@ defmodule Ferricstore.Store.Router do
          min_file_ref_size,
          cold_entries,
          cold_count,
+         hot_hits,
          now
        )
        when value_size >= min_file_ref_size do
     if blob_ref_candidate?(ctx, value_size) do
       entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-      {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+      {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1, hot_hits}}
     else
       case file_ref_from_cold_location(ctx, idx, path, offset, key, value_size, true) do
         {:ok, {file_ref_path, value_offset, size}} ->
           Stats.record_cold_read(ctx, key)
-          {{:file_ref, file_ref_path, value_offset, size}, {cold_entries, cold_count}}
+          {{:file_ref, file_ref_path, value_offset, size}, {cold_entries, cold_count, hot_hits}}
 
         nil ->
           case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
             {:cold_ref, retry_path, value_offset, retry_size} ->
               Stats.record_cold_read(ctx, key)
-              {{:file_ref, retry_path, value_offset, retry_size}, {cold_entries, cold_count}}
+
+              {{:file_ref, retry_path, value_offset, retry_size},
+               {cold_entries, cold_count, hot_hits}}
 
             {:hot, value} ->
-              {{:value, value}, {cold_entries, cold_count}}
+              {{:value, value}, {cold_entries, cold_count, hot_hits}}
 
             :miss ->
-              Stats.incr_keyspace_misses(ctx)
-              {{:value, nil}, {cold_entries, cold_count}}
+              record_keyspace_miss(ctx)
+              {{:value, nil}, {cold_entries, cold_count, hot_hits}}
           end
       end
     end
@@ -1800,10 +1842,11 @@ defmodule Ferricstore.Store.Router do
          _min_file_ref_size,
          cold_entries,
          cold_count,
+         hot_hits,
          _now
        ) do
     entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-    {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+    {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1, hot_hits}}
   end
 
   defp read_cold_batch_async([], _now), do: []
@@ -1906,7 +1949,7 @@ defmodule Ferricstore.Store.Router do
             value
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
+            record_keyspace_miss(ctx)
             nil
         end
     end)
@@ -2142,7 +2185,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
     end
   end
@@ -2408,7 +2451,7 @@ defmodule Ferricstore.Store.Router do
                 {value, retry_expire_at_ms}
 
               :miss ->
-                Stats.incr_keyspace_misses(ctx)
+                record_keyspace_miss(ctx)
                 nil
             end
         end
@@ -2422,7 +2465,7 @@ defmodule Ferricstore.Store.Router do
             {value, expire_at_ms}
 
           _ ->
-            Stats.incr_keyspace_misses(ctx)
+            record_keyspace_miss(ctx)
             nil
         end
 
@@ -2437,17 +2480,17 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          record_keyspace_miss(ctx)
         end
 
         result
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
 
       :no_table ->
@@ -2460,7 +2503,7 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          record_keyspace_miss(ctx)
         end
 
         result
@@ -2673,7 +2716,7 @@ defmodule Ferricstore.Store.Router do
             range_from_value(value, start_idx, end_idx)
 
           _ ->
-            Stats.incr_keyspace_misses(ctx)
+            record_keyspace_miss(ctx)
             nil
         end
 
@@ -2681,11 +2724,11 @@ defmodule Ferricstore.Store.Router do
         fallback_getrange(ctx, idx, key, start_idx, end_idx)
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
 
       :no_table ->
@@ -2846,7 +2889,7 @@ defmodule Ferricstore.Store.Router do
                 value
 
               :error ->
-                Stats.incr_keyspace_misses(ctx)
+                record_keyspace_miss(ctx)
                 nil
             end
         end
@@ -2855,7 +2898,7 @@ defmodule Ferricstore.Store.Router do
         range_from_value(value, start_idx, end_idx)
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        record_keyspace_miss(ctx)
         nil
     end
   end
@@ -2891,7 +2934,7 @@ defmodule Ferricstore.Store.Router do
       Stats.record_cold_read(ctx, key)
       range_from_value(result, start_idx, end_idx)
     else
-      Stats.incr_keyspace_misses(ctx)
+      record_keyspace_miss(ctx)
       nil
     end
   end
@@ -2959,13 +3002,59 @@ defmodule Ferricstore.Store.Router do
   # LFU counter already available from the initial ets_get_full lookup.
   # Eliminates the second ETS lookup that sampled_read_bookkeeping does.
   defp sampled_read_bookkeeping_fast(ctx, keydir, key, lfu) do
-    rate = ctx.read_sample_rate
+    sampled = Stats.sample_keyspace_hits(ctx)
 
-    if rate <= 1 or :rand.uniform(rate) == 1 do
-      Stats.incr_keyspace_hits(ctx)
+    if sampled > 0 do
       LFU.touch(ctx, keydir, key, lfu)
       Stats.record_hot_read(ctx, key)
     end
+  end
+
+  defp sampled_read_bookkeeping_batch(_ctx, [], _max_hits), do: :ok
+
+  defp sampled_read_bookkeeping_batch(ctx, hot_hits, max_hits)
+       when is_list(hot_hits) and is_integer(max_hits) and max_hits >= 0 do
+    sample_state = Stats.start_keyspace_hit_batch(ctx, max_hits)
+    touched = sampled_hit_entries(sample_state, hot_hits)
+
+    :ok = Stats.finish_keyspace_hit_batch(ctx, finish_hit_batch_state(sample_state, max_hits))
+
+    Enum.each(touched, fn {keydir, key, lfu} ->
+      LFU.touch(ctx, keydir, key, lfu)
+      Stats.record_hot_read(ctx, key)
+    end)
+  end
+
+  defp sampled_hit_entries({:exact, _count}, hot_hits), do: hot_hits
+
+  defp sampled_hit_entries({:sampled_no_touch, _rate, _previous, _count}, _hot_hits), do: []
+
+  defp sampled_hit_entries(
+         {:sampled_touch, rate, _previous, _count, next_sample_offset},
+         hot_hits
+       ) do
+    hot_hits
+    |> Enum.with_index(1)
+    |> Enum.flat_map(fn
+      {hit, offset}
+      when offset >= next_sample_offset and rem(offset - next_sample_offset, rate) == 0 ->
+        [hit]
+
+      _other ->
+        []
+    end)
+  end
+
+  defp finish_hit_batch_state({:exact, _count}, count), do: {:exact, count}
+
+  defp finish_hit_batch_state({:sampled_no_touch, rate, previous, _count}, count),
+    do: {:sampled_no_touch, rate, previous, count}
+
+  defp finish_hit_batch_state({:sampled_touch, rate, previous, _count, offset}, count),
+    do: {:sampled_touch, rate, previous, count, offset}
+
+  defp record_keyspace_miss(ctx) do
+    Stats.sample_keyspace_misses(ctx)
   end
 
   # After a cold read, promote the value back to ETS (hot) if it fits
@@ -3959,6 +4048,30 @@ defmodule Ferricstore.Store.Router do
     else
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_create, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_named_value_put(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_named_value_put, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_signal(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_signal, key, attrs})
     end
   end
 
@@ -5998,10 +6111,18 @@ defmodule Ferricstore.Store.Router do
         when value != nil and valid_cold_location(fid, off, vsize) ->
           {:hot, :erlang.phash2(value), fid, off, vsize, 0}
 
+        [{^key, value, 0, _lfu, fid, off, vsize}]
+        when value != nil and valid_waraft_segment_location(fid, off, vsize) ->
+          {:hot, :erlang.phash2(value), fid, off, vsize, 0}
+
         [{^key, value, 0, _lfu, :pending, _off, _vsize}] when value != nil ->
           {:version, get_version(ctx, key)}
 
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+          {:cold, fid, off, vsize, 0}
+
+        [{^key, nil, 0, _lfu, fid, off, vsize}]
+        when valid_waraft_segment_location(fid, off, vsize) ->
           {:cold, fid, off, vsize, 0}
 
         [{^key, nil, 0, _lfu, :pending, _off, _vsize}] ->
@@ -6011,11 +6132,19 @@ defmodule Ferricstore.Store.Router do
         when exp > now and value != nil and valid_cold_location(fid, off, vsize) ->
           {:hot, :erlang.phash2(value), fid, off, vsize, exp}
 
+        [{^key, value, exp, _lfu, fid, off, vsize}]
+        when exp > now and value != nil and valid_waraft_segment_location(fid, off, vsize) ->
+          {:hot, :erlang.phash2(value), fid, off, vsize, exp}
+
         [{^key, value, exp, _lfu, :pending, _off, _vsize}] when exp > now and value != nil ->
           {:version, get_version(ctx, key)}
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
+          {:cold, fid, off, vsize, exp}
+
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
           {:cold, fid, off, vsize, exp}
 
         [{^key, nil, exp, _lfu, :pending, _off, _vsize}] when exp > now ->
@@ -6194,12 +6323,11 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    {results, fallback_keys} =
-      Enum.map_reduce(compound_keys, [], fn compound_key, fallback_keys ->
+    {results, {fallback_keys, hot_hits}} =
+      Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
         case ets_get_full(ctx, idx, keydir, compound_key, now) do
           {:hit, value, lfu} ->
-            sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
-            {{:value, value}, fallback_keys}
+            {{:value, value}, {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) or
@@ -6214,14 +6342,16 @@ defmodule Ferricstore.Store.Router do
                    value_size,
                    now
                  ) do
-              {:ok, value} -> {{:value, value}, fallback_keys}
-              :fallback -> {:fallback, [compound_key | fallback_keys]}
+              {:ok, value} -> {{:value, value}, {fallback_keys, hot_hits}}
+              :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
             end
 
           _ ->
-            {:fallback, [compound_key | fallback_keys]}
+            {:fallback, {[compound_key | fallback_keys], hot_hits}}
         end
       end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
 
     fallback_values =
       case fallback_keys do
@@ -6296,46 +6426,42 @@ defmodule Ferricstore.Store.Router do
          value_size,
          now
        ) do
-    if selected_waraft_ctx?(ctx) do
-      case read_compound_cold_materialized(ctx, idx, file_id, offset, compound_key) do
-        {:ok, value} when is_binary(value) ->
-          Stats.record_cold_read(ctx, compound_key)
-          warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
-          {:ok, value}
+    case read_compound_cold_materialized(ctx, idx, file_id, offset, compound_key) do
+      {:ok, value} when is_binary(value) ->
+        Stats.record_cold_read(ctx, compound_key)
+        warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
+        {:ok, value}
 
-        _ ->
-          case retry_changed_cold_value(
-                 ctx,
-                 idx,
-                 keydir,
-                 compound_key,
-                 {file_id, offset, value_size},
-                 now
-               ) do
-            {:cold, value, retry_file_id, retry_offset} ->
-              Stats.record_cold_read(ctx, compound_key)
+      _ ->
+        case retry_changed_cold_value(
+               ctx,
+               idx,
+               keydir,
+               compound_key,
+               {file_id, offset, value_size},
+               now
+             ) do
+          {:cold, value, retry_file_id, retry_offset} ->
+            Stats.record_cold_read(ctx, compound_key)
 
-              warm_ets_after_cold_read(
-                ctx,
-                idx,
-                keydir,
-                compound_key,
-                value,
-                retry_file_id,
-                retry_offset
-              )
+            warm_ets_after_cold_read(
+              ctx,
+              idx,
+              keydir,
+              compound_key,
+              value,
+              retry_file_id,
+              retry_offset
+            )
 
-              {:ok, value}
+            {:ok, value}
 
-            {:hot, value} ->
-              {:ok, value}
+          {:hot, value} ->
+            {:ok, value}
 
-            :miss ->
-              :fallback
-          end
-      end
-    else
-      :fallback
+          :miss ->
+            :fallback
+        end
     end
   end
 
@@ -6395,45 +6521,61 @@ defmodule Ferricstore.Store.Router do
           [{binary(), non_neg_integer()} | nil]
   def compound_batch_get_meta(ctx, redis_key, compound_keys) do
     idx = shard_for(ctx, redis_key)
-
-    if selected_waraft_ctx?(ctx) do
-      direct_waraft_compound_batch_get_meta(ctx, idx, compound_keys)
-    else
-      case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, compound_keys}) do
-        {:ok, metas} -> metas
-        :unavailable -> List.duplicate(nil, length(compound_keys))
-      end
-    end
-  end
-
-  defp direct_waraft_compound_batch_get_meta(ctx, idx, compound_keys) do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    Enum.map(compound_keys, fn compound_key ->
-      case ets_get_meta_full(ctx, idx, keydir, compound_key, now) do
-        {:hit, value, expire_at_ms, lfu} ->
-          sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
-          {value, expire_at_ms}
+    {results, {fallback_keys, hot_hits}} =
+      Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
+        case ets_get_meta_full(ctx, idx, keydir, compound_key, now) do
+          {:hit, value, expire_at_ms, lfu} ->
+            {{:value, {value, expire_at_ms}},
+             {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
 
-        {:cold, file_id, offset, value_size, expire_at_ms}
-        when readable_cold_ref?(file_id, offset, value_size) ->
-          direct_waraft_compound_cold_get_meta(
-            ctx,
-            idx,
-            keydir,
-            compound_key,
-            file_id,
-            offset,
-            value_size,
-            now,
-            expire_at_ms
-          )
+          {:cold, file_id, offset, value_size, expire_at_ms}
+          when readable_cold_ref?(file_id, offset, value_size) ->
+            case direct_waraft_compound_cold_get_meta(
+                   ctx,
+                   idx,
+                   keydir,
+                   compound_key,
+                   file_id,
+                   offset,
+                   value_size,
+                   now,
+                   expire_at_ms
+                 ) do
+              {:ok, meta} -> {{:value, meta}, {fallback_keys, hot_hits}}
+              :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
+            end
 
-        _ ->
-          nil
+          _ ->
+            {:fallback, {[compound_key | fallback_keys], hot_hits}}
+        end
+      end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
+
+    fallback_values =
+      case fallback_keys do
+        [] ->
+          []
+
+        keys ->
+          pending_keys = Enum.reverse(keys)
+
+          case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, pending_keys}) do
+            {:ok, metas} -> metas
+            :unavailable -> List.duplicate(nil, length(pending_keys))
+          end
       end
-    end)
+
+    {values, []} =
+      Enum.map_reduce(results, fallback_values, fn
+        {:value, value}, remaining -> {value, remaining}
+        :fallback, [value | remaining] -> {value, remaining}
+      end)
+
+    values
   end
 
   defp direct_waraft_compound_cold_get_meta(
@@ -6451,7 +6593,7 @@ defmodule Ferricstore.Store.Router do
       {:ok, value} when is_binary(value) ->
         Stats.record_cold_read(ctx, compound_key)
         warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
-        {value, expire_at_ms}
+        {:ok, {value, expire_at_ms}}
 
       _ ->
         case retry_changed_cold_meta(
@@ -6475,13 +6617,13 @@ defmodule Ferricstore.Store.Router do
               retry_offset
             )
 
-            {value, retry_expire_at_ms}
+            {:ok, {value, retry_expire_at_ms}}
 
           {:hot, value, retry_expire_at_ms} ->
-            {value, retry_expire_at_ms}
+            {:ok, {value, retry_expire_at_ms}}
 
           :miss ->
-            nil
+            :fallback
         end
     end
   end

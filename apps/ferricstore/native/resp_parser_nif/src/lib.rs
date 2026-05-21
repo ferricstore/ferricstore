@@ -1562,6 +1562,7 @@ enum CommandAstKind {
     FlowCreate,
     FlowCreateMany,
     FlowValuePut,
+    FlowSignal,
     FlowSpawnChildren,
     FlowGet,
     FlowPolicySet,
@@ -1813,6 +1814,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CREATE" => CommandAstKind::FlowCreate,
         b"FLOW.CREATE_MANY" => CommandAstKind::FlowCreateMany,
         b"FLOW.VALUE.PUT" => CommandAstKind::FlowValuePut,
+        b"FLOW.SIGNAL" => CommandAstKind::FlowSignal,
         b"FLOW.SPAWN_CHILDREN" => CommandAstKind::FlowSpawnChildren,
         b"FLOW.GET" => CommandAstKind::FlowGet,
         b"FLOW.POLICY.SET" => CommandAstKind::FlowPolicySet,
@@ -2261,6 +2263,7 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowValuePut => make_flow_value_put_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowSignal => make_flow_signal_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowSpawnChildren => {
             make_flow_spawn_children_command_ast(env, args, arg_bytes)
         }
@@ -5183,6 +5186,22 @@ fn make_flow_value_put_command_ast<'a>(
     }
 }
 
+fn make_flow_signal_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_signal");
+    if args.len() < 3 {
+        return (tag, wrong_number_error(env, b"flow.signal")).encode(env);
+    }
+
+    match parse_flow_signal_options(env, args, arg_bytes, 1) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_create_many_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5217,7 +5236,8 @@ fn make_flow_create_many_command_ast<'a>(
     }
 
     let opts =
-        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_create_many_option) {
+        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_create_many_option)
+        {
             Ok(opts) => opts,
             Err(err) => return (tag, args[0], err).encode(env),
         };
@@ -6183,6 +6203,16 @@ fn parse_flow_read_options<'a>(
             continue;
         }
 
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+
+            opts.push((atom(env, "values"), vec![args[idx + 1]]).encode(env));
+            idx += 2;
+            continue;
+        }
+
         if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITIONS") {
             if idx + 1 >= args.len() {
                 return Err(generic_ast_error(env, b"ERR syntax error"));
@@ -6368,7 +6398,11 @@ fn flow_create_option<'a>(
             (b"TYPE", "type", FlowOptType::Binary),
             (b"STATE", "state", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
+            (
+                b"PAYLOAD_REF",
+                "payload_ref",
+                FlowOptType::Ref(b"payload_ref"),
+            ),
             (
                 b"PARENT_FLOW_ID",
                 "parent_flow_id",
@@ -6452,6 +6486,106 @@ fn flow_value_put_option<'a>(
             ),
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"TTL_MS", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+        ],
+    )
+}
+
+fn parse_flow_signal_options<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    let mut opts = Vec::with_capacity((args.len().saturating_sub(start)) / 2 + 2);
+    let mut values = Vec::new();
+    let mut value_refs = Vec::new();
+    let mut drop_values = Vec::new();
+    let mut override_values = Vec::new();
+    let mut idx = start;
+
+    while idx < args.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE") {
+            if idx + 2 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            values.push((args[idx + 1], args[idx + 2]).encode(env));
+            idx += 3;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"VALUE_REF") {
+            if idx + 2 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            value_refs.push((args[idx + 1], args[idx + 2]).encode(env));
+            idx += 3;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"DROP_VALUE") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            drop_values.push(args[idx + 1]);
+            idx += 2;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"OVERRIDE_VALUE") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            override_values.push(args[idx + 1]);
+            idx += 2;
+            continue;
+        }
+
+        if idx + 1 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+
+        if let Some(opt) = flow_signal_option(env, args, arg_bytes, idx)? {
+            opts.push(opt);
+        }
+        idx += 2;
+    }
+
+    if !values.is_empty() {
+        opts.push((atom(env, "values"), values).encode(env));
+    }
+    if !value_refs.is_empty() {
+        opts.push((atom(env, "value_refs"), value_refs).encode(env));
+    }
+    if !drop_values.is_empty() {
+        opts.push((atom(env, "drop_values"), drop_values).encode(env));
+    }
+    if !override_values.is_empty() {
+        opts.push((atom(env, "override_values"), override_values).encode(env));
+    }
+
+    Ok(opts)
+}
+
+fn flow_signal_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"SIGNAL", "signal", FlowOptType::Binary),
+            (b"IDEMPOTENCY", "idempotency_key", FlowOptType::Binary),
+            (b"IDEMPOTENCY_KEY", "idempotency_key", FlowOptType::Binary),
+            (b"IF_STATE", "if_state", FlowOptType::Binary),
+            (b"TRANSITION_TO", "transition_to", FlowOptType::Binary),
+            (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
@@ -6861,7 +6995,11 @@ fn flow_transition_option<'a>(
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
+            (
+                b"PAYLOAD_REF",
+                "payload_ref",
+                FlowOptType::Ref(b"payload_ref"),
+            ),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6949,7 +7087,11 @@ fn flow_transition_many_option<'a>(
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
+            (
+                b"PAYLOAD_REF",
+                "payload_ref",
+                FlowOptType::Ref(b"payload_ref"),
+            ),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"INDEPENDENT", "independent", FlowOptType::Boolean),
         ],
@@ -7687,6 +7829,7 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE_MANY" => flow_create_many_key_indices(arg_bytes),
         b"FLOW.VALUE.PUT" => flow_partition_key_indices(arg_bytes, 1),
+        b"FLOW.SIGNAL" => flow_partition_or_first_key_indices(arg_bytes, 1),
         b"FLOW.SPAWN_CHILDREN" => flow_spawn_children_key_indices(arg_bytes),
         b"FLOW.COMPLETE_MANY" => flow_complete_many_key_indices(arg_bytes),
         b"FLOW.RETRY_MANY" => flow_retry_many_key_indices(arg_bytes),
@@ -9617,6 +9760,10 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.VALUE.PUT", 0),
             CommandAstKind::FlowValuePut
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.SIGNAL", 0),
+            CommandAstKind::FlowSignal
         );
         assert_eq!(
             classify_command_ast(b"FLOW.SPAWN_CHILDREN", 0),

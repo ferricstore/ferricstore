@@ -46,215 +46,321 @@ defmodule Ferricstore.Application do
   @large_value_blob_ref_read_timeout_ms 1_000
 
   @impl true
-  @spec start(Application.start_type(), term()) :: {:ok, pid()} | {:error, term()}
+  @spec start(Application.start_type(), term()) ::
+          {:ok, pid()} | {:ok, pid(), term()} | {:error, term()}
   def start(_type, _args) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    mark_starting()
 
-    shard_count =
-      case Application.get_env(:ferricstore, :shard_count, 0) do
-        0 -> System.schedulers_online()
-        n when is_integer(n) and n > 0 -> n
-      end
+    try do
+      data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+      selected_backend = Ferricstore.Raft.Backend.selected()
+      :ok = Ferricstore.Raft.Backend.put_running!(selected_backend)
 
-    Logger.info("FerricStore starting")
-
-    # Create the on-disk directory layout (spec 2B.4) before any process
-    # tries to open shard directories or Raft WALs.
-    Ferricstore.DataDir.ensure_layout!(data_dir, shard_count)
-
-    replication_mode = Ferricstore.ReplicationMode.resolve!(data_dir, shard_count)
-
-    Ferricstore.ReplicationMode.put_current(replication_mode)
-
-    case Ferricstore.ReplicationMode.read(data_dir) do
-      {:error, :enoent} ->
-        :ok = Ferricstore.ReplicationMode.mark_raft!(data_dir, shard_count, 0, %{})
-
-      _ ->
-        :ok
-    end
-
-    # Cache LFU config in persistent_term for hot-path reads (~5ns vs ~250ns).
-    # Must run before any shard starts touching keys.
-    Ferricstore.Store.LFU.init_config_cache()
-
-    # Cache hot_cache_max_value_size in persistent_term for zero-overhead
-    # hot-path reads. Values larger than this threshold are stored as nil
-    # in ETS (cold) to avoid copying large binaries on every :ets.lookup.
-    :persistent_term.put(
-      :ferricstore_hot_cache_max_value_size,
-      Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536)
-    )
-
-    # Initialize per-shard atomic write version counters (used by WATCH/EXEC
-    # and the Shard-bypass quorum write path in Router).
-    Ferricstore.Store.WriteVersion.init(shard_count)
-
-    # Initialize per-shard disk pressure flags (reject writes on ENOSPC).
-    Ferricstore.Store.DiskPressure.init(shard_count)
-
-    # Initialize the active file registry (ETS + atomics generation counter).
-    # Replaces persistent_term for active file metadata to avoid global GC
-    # on file rotation — critical for embedded mode with many host processes.
-    Ferricstore.Store.ActiveFile.init(shard_count)
-
-    # Publish max_active_file_size once at startup. Shards read this via
-    # persistent_term.get (~5ns) at init. Never written again at runtime.
-    :persistent_term.put(
-      :ferricstore_max_active_file_size,
-      Application.get_env(:ferricstore, :max_active_file_size, 8 * 1024 * 1024 * 1024)
-    )
-
-    # Initialize MemoryGuard pressure flags as atomics (3 slots).
-    # Slot 1: keydir_full (reject new key writes at :reject level)
-    # Slot 2: reject_writes (reject ALL writes at :reject + :noeviction)
-    # Slot 3: skip_promotion (don't re-cache cold reads at :pressure level)
-    ref = :atomics.new(3, signed: false)
-    :persistent_term.put(:ferricstore_pressure_flags, ref)
-
-    # Initialize keyspace notification events config in persistent_term
-    # (default: empty string = disabled). Updated by Config.apply_side_effect
-    # when CONFIG SET notify-keyspace-events is called.
-    :persistent_term.put(:ferricstore_keyspace_events, "")
-
-    # Initialize the slot map BEFORE any shard starts. This builds
-    # a uniform 1024-slot -> shard mapping and stores it in persistent_term.
-    # Also sets :ferricstore_shard_count.
-    Ferricstore.Store.SlotMap.init(shard_count)
-
-    :persistent_term.put(
-      :ferricstore_promotion_threshold,
-      Application.get_env(:ferricstore, :promotion_threshold, 100)
-    )
-
-    :persistent_term.put(
-      :ferricstore_read_sample_rate,
-      Application.get_env(:ferricstore, :read_sample_rate, 100)
-    )
-
-    # Initialize waiter registry ETS for blocking commands
-    Ferricstore.Waiters.init()
-    # Client tracking ETS tables initialized by FerricstoreServer.ClientTracking
-    # Initialize stream metadata ETS tables (owned by this long-lived process)
-    Ferricstore.Commands.Stream.init_tables()
-    # Start Erlang distribution if cluster is configured.
-    # Must happen before the selected Raft backend starts so cluster backends
-    # can communicate across nodes.
-    maybe_start_distribution()
-
-    # Start the legacy Ra system before shards only when the current Ra backend
-    # is selected. WARaft owns its own supervisor and starts after the default
-    # instance context exists.
-    :ok = start_legacy_raft_system_if_selected(data_dir)
-
-    # Build the default instance context. This creates the Instance struct
-    # with all refs (atomics, counters, ETS tables) and caches it in
-    # persistent_term as {:FerricStore.Instance, :default}.
-    # All code that calls FerricStore.Instance.get(:default) will find it.
-    # Note: we pass the EXISTING refs (pressure_flags, etc.) rather than
-    # creating new ones, since the global init above already created them.
-    default_ctx =
-      FerricStore.Instance.build(:default,
-        data_dir: data_dir,
-        shard_count: shard_count,
-        max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
-        keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024),
-        eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
-        hot_cache_max_value_size:
-          Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536),
-        max_active_file_size:
-          Application.get_env(:ferricstore, :max_active_file_size, 8 * 1024 * 1024 * 1024),
-        read_sample_rate: Application.get_env(:ferricstore, :read_sample_rate, 100),
-        lfu_decay_time: Application.get_env(:ferricstore, :lfu_decay_time, 1),
-        lfu_log_factor: Application.get_env(:ferricstore, :lfu_log_factor, 10)
-      )
-
-    batcher_children = raft_batcher_children(shard_count)
-
-    # Background Bitcask writers — one per shard. Must start BEFORE the
-    # ShardSupervisor because StateMachine.apply sends casts to these
-    # processes during shard init/recovery when replaying the Raft log.
-    bitcask_writer_children =
-      Enum.map(0..(shard_count - 1), fn i ->
-        Supervisor.child_spec(
-          {Ferricstore.Store.BitcaskWriter, shard_index: i},
-          id: :"bitcask_writer_#{i}"
-        )
-      end)
-
-    flow_lmdb_writer_children =
-      Enum.map(0..(shard_count - 1), fn i ->
-        Supervisor.child_spec(
-          {Ferricstore.Flow.LMDBWriter,
-           shard_index: i, data_dir: data_dir, instance_ctx: default_ctx},
-          id: :"flow_lmdb_writer_#{i}"
-        )
-      end)
-
-    # Optional libcluster node discovery (DNS, Kubernetes labels, or gossip).
-    # When topologies are configured, Cluster.Supervisor is the first child so
-    # that node discovery begins before the store is ready to serve traffic.
-    # When no topologies are configured (nil or []), the supervisor is omitted.
-    cluster_children = cluster_supervisor_children()
-
-    # Core children: always started regardless of mode.
-    children =
-      cluster_children ++
-        [
-          Ferricstore.Stats,
-          Ferricstore.SlowLog,
-          Ferricstore.AuditLog,
-          Ferricstore.Config,
-          Ferricstore.NamespaceConfig,
-          Ferricstore.HLC,
-          Ferricstore.QuorumMetrics,
-          Ferricstore.PrefixMetricsCache,
-          Ferricstore.Store.BlobStore.TableOwner
-        ] ++
-        batcher_children ++
-        bitcask_writer_children ++
-        [{Ferricstore.Flow.LMDBFlushCoordinator, []}] ++
-        flow_lmdb_writer_children ++
-        [
-          {Ferricstore.Store.ShardSupervisor,
-           data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
-        ] ++
-        [
-          {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
-          Ferricstore.PubSub,
-          Ferricstore.FetchOrCompute,
-          Ferricstore.Flow.RetentionSweeper,
-          {Ferricstore.Store.BlobGCSweeper, instance_ctx: default_ctx},
-          {Ferricstore.MemoryGuard, memory_guard_opts()},
-          Ferricstore.Cluster.Manager
-        ]
-
-    {max_r, max_s} = Application.get_env(:ferricstore, :supervisor_max_restarts, {20, 10})
-
-    opts = [
-      strategy: :one_for_one,
-      name: Ferricstore.Supervisor,
-      max_restarts: max_r,
-      max_seconds: max_s
-    ]
-
-    case Supervisor.start_link(children, opts) do
-      {:ok, pid} = result ->
-        case start_selected_raft_backend(default_ctx, shard_count) do
-          :ok ->
-            mark_started(shard_count)
-            result
-
-          {:error, reason} ->
-            stop_started_supervisor(pid)
-            cleanup_failed_start()
-            {:error, {:raft_election_failed, reason}}
+      shard_count =
+        case Application.get_env(:ferricstore, :shard_count, 0) do
+          0 -> System.schedulers_online()
+          n when is_integer(n) and n > 0 -> n
         end
 
-      result ->
-        cleanup_failed_start()
-        result
+      app_state = %{raft_backend: selected_backend, data_dir: data_dir, shard_count: shard_count}
+
+      Logger.info("FerricStore starting")
+
+      # Create the on-disk directory layout (spec 2B.4) before any process
+      # tries to open shard directories or Raft WALs.
+      Ferricstore.DataDir.ensure_layout!(data_dir, shard_count)
+
+      replication_mode = Ferricstore.ReplicationMode.resolve!(data_dir, shard_count)
+
+      Ferricstore.ReplicationMode.put_current(replication_mode)
+
+      case Ferricstore.ReplicationMode.read(data_dir) do
+        {:error, :enoent} ->
+          :ok = Ferricstore.ReplicationMode.mark_raft!(data_dir, shard_count, 0, %{})
+
+        _ ->
+          :ok
+      end
+
+      # Cache LFU config in persistent_term for hot-path reads (~5ns vs ~250ns).
+      # Must run before any shard starts touching keys.
+      Ferricstore.Store.LFU.init_config_cache()
+
+      # Cache hot_cache_max_value_size in persistent_term for zero-overhead
+      # hot-path reads. Values larger than this threshold are stored as nil
+      # in ETS (cold) to avoid copying large binaries on every :ets.lookup.
+      :persistent_term.put(
+        :ferricstore_hot_cache_max_value_size,
+        Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536)
+      )
+
+      # Initialize per-shard atomic write version counters (used by WATCH/EXEC
+      # and the Shard-bypass quorum write path in Router).
+      Ferricstore.Store.WriteVersion.init(shard_count)
+
+      # Initialize per-shard disk pressure flags (reject writes on ENOSPC).
+      Ferricstore.Store.DiskPressure.init(shard_count)
+
+      # Initialize the active file registry (ETS + atomics generation counter).
+      # Replaces persistent_term for active file metadata to avoid global GC
+      # on file rotation — critical for embedded mode with many host processes.
+      Ferricstore.Store.ActiveFile.init(shard_count)
+
+      # Publish max_active_file_size once at startup. Shards read this via
+      # persistent_term.get (~5ns) at init. Never written again at runtime.
+      :persistent_term.put(
+        :ferricstore_max_active_file_size,
+        Application.get_env(:ferricstore, :max_active_file_size, 8 * 1024 * 1024 * 1024)
+      )
+
+      # Initialize MemoryGuard pressure flags as atomics (3 slots).
+      # Slot 1: keydir_full (reject new key writes at :reject level)
+      # Slot 2: reject_writes (reject ALL writes at :reject + :noeviction)
+      # Slot 3: skip_promotion (don't re-cache cold reads at :pressure level)
+      ref = :atomics.new(3, signed: false)
+      :persistent_term.put(:ferricstore_pressure_flags, ref)
+
+      # Initialize keyspace notification events config in persistent_term
+      # (default: empty string = disabled). Updated by Config.apply_side_effect
+      # when CONFIG SET notify-keyspace-events is called.
+      :persistent_term.put(:ferricstore_keyspace_events, "")
+
+      # Initialize the slot map BEFORE any shard starts. This builds
+      # a uniform 1024-slot -> shard mapping and stores it in persistent_term.
+      # Also sets :ferricstore_shard_count.
+      Ferricstore.Store.SlotMap.init(shard_count)
+
+      :persistent_term.put(
+        :ferricstore_promotion_threshold,
+        Application.get_env(:ferricstore, :promotion_threshold, 100)
+      )
+
+      :persistent_term.put(
+        :ferricstore_read_sample_rate,
+        Application.get_env(:ferricstore, :read_sample_rate, 100)
+      )
+
+      # Initialize waiter registry ETS for blocking commands
+      Ferricstore.Waiters.init()
+      # Client tracking ETS tables initialized by FerricstoreServer.ClientTracking
+      # Initialize stream metadata ETS tables (owned by this long-lived process)
+      Ferricstore.Commands.Stream.init_tables()
+      # Start Erlang distribution if cluster is configured.
+      # Must happen before the selected Raft backend starts so cluster backends
+      # can communicate across nodes.
+      maybe_start_distribution()
+
+      # Start the legacy Ra system before shards only when the current Ra backend
+      # is selected. WARaft owns its own supervisor and starts after the default
+      # instance context exists.
+      :ok = start_legacy_raft_system_if_selected(data_dir, selected_backend)
+
+      # Build the default instance context. This creates the Instance struct
+      # with all refs (atomics, counters, ETS tables) and caches it in
+      # persistent_term as {:FerricStore.Instance, :default}.
+      # All code that calls FerricStore.Instance.get(:default) will find it.
+      # Note: we pass the EXISTING refs (pressure_flags, etc.) rather than
+      # creating new ones, since the global init above already created them.
+      default_ctx =
+        FerricStore.Instance.build(:default,
+          data_dir: data_dir,
+          shard_count: shard_count,
+          max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
+          keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024),
+          eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
+          hot_cache_max_value_size:
+            Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536),
+          max_active_file_size:
+            Application.get_env(:ferricstore, :max_active_file_size, 8 * 1024 * 1024 * 1024),
+          read_sample_rate: Application.get_env(:ferricstore, :read_sample_rate, 100),
+          lfu_decay_time: Application.get_env(:ferricstore, :lfu_decay_time, 1),
+          lfu_log_factor: Application.get_env(:ferricstore, :lfu_log_factor, 10)
+        )
+
+      batcher_children = raft_batcher_children(shard_count, selected_backend)
+
+      # Background Bitcask writers — one per shard. Must start BEFORE the
+      # ShardSupervisor because StateMachine.apply sends casts to these
+      # processes during shard init/recovery when replaying the Raft log.
+      bitcask_writer_children =
+        Enum.map(0..(shard_count - 1), fn i ->
+          Supervisor.child_spec(
+            {Ferricstore.Store.BitcaskWriter, shard_index: i},
+            id: :"bitcask_writer_#{i}"
+          )
+        end)
+
+      flow_lmdb_writer_children =
+        Enum.map(0..(shard_count - 1), fn i ->
+          Supervisor.child_spec(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: i, data_dir: data_dir, instance_ctx: default_ctx},
+            id: :"flow_lmdb_writer_#{i}"
+          )
+        end)
+
+      # Optional libcluster node discovery (DNS, Kubernetes labels, or gossip).
+      # When topologies are configured, Cluster.Supervisor is the first child so
+      # that node discovery begins before the store is ready to serve traffic.
+      # When no topologies are configured (nil or []), the supervisor is omitted.
+      cluster_children = cluster_supervisor_children()
+
+      # Core children: always started regardless of mode.
+      children =
+        [
+          # Start first so supervisor shutdown stops it last. This gives the
+          # default instance the same cleanup guarantee as custom instances:
+          # no stale persistent_term context after the application is stopped.
+          Supervisor.child_spec({FerricStore.Instance.Cleanup, :default},
+            id: :default_instance_cleanup,
+            restart: :temporary
+          )
+        ] ++
+          cluster_children ++
+          [
+            Ferricstore.Stats,
+            Ferricstore.SlowLog,
+            Ferricstore.AuditLog,
+            Ferricstore.Config,
+            Ferricstore.NamespaceConfig,
+            Ferricstore.HLC,
+            Ferricstore.QuorumMetrics,
+            Ferricstore.PrefixMetricsCache,
+            Ferricstore.Store.BlobStore.TableOwner
+          ] ++
+          batcher_children ++
+          bitcask_writer_children ++
+          [{Ferricstore.Flow.LMDBFlushCoordinator, []}] ++
+          flow_lmdb_writer_children ++
+          [
+            {Ferricstore.Store.ShardSupervisor,
+             data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
+          ] ++
+          [
+            {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
+            Ferricstore.PubSub,
+            Ferricstore.FetchOrCompute,
+            Ferricstore.Flow.RetentionSweeper,
+            {Ferricstore.Store.BlobGCSweeper, instance_ctx: default_ctx},
+            {Ferricstore.MemoryGuard, memory_guard_opts()},
+            Ferricstore.Cluster.Manager
+          ]
+
+      {max_r, max_s} = Application.get_env(:ferricstore, :supervisor_max_restarts, {20, 10})
+
+      opts = [
+        strategy: :one_for_one,
+        name: Ferricstore.Supervisor,
+        max_restarts: max_r,
+        max_seconds: max_s
+      ]
+
+      case Supervisor.start_link(children, opts) do
+        {:ok, pid} ->
+          case start_selected_raft_backend(default_ctx, shard_count, selected_backend) do
+            :ok ->
+              mark_started(shard_count)
+              {:ok, pid, app_state}
+
+            {:error, reason} ->
+              stop_started_supervisor(pid)
+              cleanup_failed_start()
+              {:error, {:raft_election_failed, reason}}
+          end
+
+        result ->
+          cleanup_failed_start()
+          result
+      end
+    after
+      clear_starting()
     end
+  end
+
+  @doc false
+  @spec starting?() :: boolean()
+  def starting? do
+    :persistent_term.get({__MODULE__, :starting}, false)
+  end
+
+  @doc false
+  def raft_batcher_children(shard_count) do
+    raft_batcher_children(shard_count, Ferricstore.Raft.Backend.selected())
+  end
+
+  defp raft_batcher_children(shard_count, backend) do
+    if legacy_raft_backend?(backend) do
+      legacy_raft_batcher_children(shard_count)
+    else
+      []
+    end
+  end
+
+  @doc false
+  def legacy_raft_backend?, do: Ferricstore.Raft.Backend.selected() == :ra
+  defp legacy_raft_backend?(:ra), do: true
+  defp legacy_raft_backend?(_backend), do: false
+
+  defp legacy_raft_batcher_children(shard_count) do
+    Enum.map(0..(shard_count - 1), fn i ->
+      shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+
+      Supervisor.child_spec(
+        {Ferricstore.Raft.Batcher,
+         shard_index: i,
+         shard_id: shard_id,
+         max_pending_batches: Application.get_env(:ferricstore, :raft_batcher_max_pending, 256),
+         max_pending_bytes: Application.get_env(:ferricstore, :raft_batcher_max_pending_bytes, 0),
+         max_batch_bytes:
+           Application.get_env(:ferricstore, :raft_batcher_max_batch_bytes, 4 * 1024 * 1024)},
+        id: :"batcher_#{i}"
+      )
+    end)
+  end
+
+  defp start_legacy_raft_system_if_selected(data_dir, selected_backend) do
+    if legacy_raft_backend?(selected_backend) do
+      # Load the patched ra_log_wal with async fdatasync BEFORE starting
+      # the ra system, so the patched module is in place when the WAL starts.
+      # NOTE: When using the local ra fork (path dep), the fork already includes
+      # the async fdatasync changes directly in source. Skip hot-load to avoid
+      # overriding the fork's beam with a potentially stale patched version.
+      install_patched_wal()
+
+      # Ra formats one snapshot debug event with `~b` even though the size can be
+      # `undefined`; use our delegate so long debug/chaos runs do not spam
+      # formatter crashes while keeping the rest of Ra logging intact.
+      :ok = Ferricstore.Raft.SafeRaLogger.install_filter()
+      :ok = :ra_env.configure_logger(Ferricstore.Raft.SafeRaLogger)
+
+      :ok = Ferricstore.Raft.Cluster.start_system(data_dir, selected_backend)
+    else
+      :ok
+    end
+  end
+
+  defp start_selected_raft_backend(default_ctx, shard_count, selected_backend) do
+    if legacy_raft_backend?(selected_backend) do
+      Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count)
+    else
+      Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts())
+    end
+  end
+
+  defp waraft_backend_opts do
+    [
+      log_module: Ferricstore.Raft.WARaftBackend.default_log_module(),
+      commit_batch_interval_ms: Ferricstore.Raft.WARaftBackend.default_commit_batch_interval_ms(),
+      commit_batch_max: Application.get_env(:ferricstore, :waraft_commit_batch_max, 1024)
+    ]
+  end
+
+  defp mark_starting do
+    :persistent_term.put({__MODULE__, :starting}, true)
+  end
+
+  defp clear_starting do
+    :persistent_term.put({__MODULE__, :starting}, false)
   end
 
   defp mark_started(shard_count, ready? \\ true) do
@@ -277,78 +383,6 @@ defmodule Ferricstore.Application do
     check_large_values(shard_count)
   end
 
-  @doc false
-  def raft_batcher_children(shard_count) do
-    if legacy_raft_backend?() do
-      legacy_raft_batcher_children(shard_count)
-    else
-      []
-    end
-  end
-
-  @doc false
-  def legacy_raft_backend?, do: Ferricstore.Raft.Backend.selected() == :ra
-
-  defp legacy_raft_batcher_children(shard_count) do
-    Enum.map(0..(shard_count - 1), fn i ->
-      shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-
-      Supervisor.child_spec(
-        {Ferricstore.Raft.Batcher,
-         shard_index: i,
-         shard_id: shard_id,
-         max_pending_batches: Application.get_env(:ferricstore, :raft_batcher_max_pending, 256),
-         max_pending_bytes: Application.get_env(:ferricstore, :raft_batcher_max_pending_bytes, 0),
-         max_batch_bytes:
-           Application.get_env(:ferricstore, :raft_batcher_max_batch_bytes, 4 * 1024 * 1024)},
-        id: :"batcher_#{i}"
-      )
-    end)
-  end
-
-  defp start_legacy_raft_system_if_selected(data_dir) do
-    if legacy_raft_backend?() do
-      # Load the patched ra_log_wal with async fdatasync BEFORE starting
-      # the ra system, so the patched module is in place when the WAL starts.
-      # NOTE: When using the local ra fork (path dep), the fork already includes
-      # the async fdatasync changes directly in source. Skip hot-load to avoid
-      # overriding the fork's beam with a potentially stale patched version.
-      install_patched_wal()
-
-      # Ra formats one snapshot debug event with `~b` even though the size can be
-      # `undefined`; use our delegate so long debug/chaos runs do not spam
-      # formatter crashes while keeping the rest of Ra logging intact.
-      :ok = Ferricstore.Raft.SafeRaLogger.install_filter()
-      :ok = :ra_env.configure_logger(Ferricstore.Raft.SafeRaLogger)
-
-      Ferricstore.Raft.Cluster.start_system(data_dir)
-    else
-      :ok
-    end
-  end
-
-  defp start_selected_raft_backend(default_ctx, shard_count) do
-    if legacy_raft_backend?() do
-      Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count)
-    else
-      Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts())
-    end
-  end
-
-  defp waraft_backend_opts do
-    [
-      log_module:
-        Application.get_env(
-          :ferricstore,
-          :waraft_log_module,
-          Ferricstore.Raft.WARaftBackend.default_log_module()
-        ),
-      commit_batch_interval_ms:
-        Application.get_env(:ferricstore, :waraft_commit_batch_interval_ms, 1),
-      commit_batch_max: Application.get_env(:ferricstore, :waraft_commit_batch_max, 1024)
-    ]
-  end
-
   defp stop_started_supervisor(pid) do
     Supervisor.stop(pid)
   catch
@@ -369,9 +403,9 @@ defmodule Ferricstore.Application do
       %{}
     )
 
-    {shard_count, data_dir} = runtime_shutdown_config()
+    {shard_count, data_dir} = runtime_shutdown_config(state)
 
-    legacy_raft? = legacy_raft_backend?()
+    legacy_raft? = running_legacy_raft_backend?(state)
 
     batcher_result = if legacy_raft?, do: shutdown_flush_batchers(shard_count), else: :ok
     bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
@@ -398,20 +432,39 @@ defmodule Ferricstore.Application do
   end
 
   @impl true
-  def stop(_state) do
-    _ = Ferricstore.Raft.WARaftBackend.stop()
-    _ = Ferricstore.Raft.Cluster.stop_system()
+  def stop(state) do
+    case running_raft_backend(state) do
+      :waraft ->
+        _ = Ferricstore.Raft.WARaftBackend.stop()
+
+      :ra ->
+        _ = Ferricstore.Raft.Cluster.stop_system(:ra)
+
+      _unknown ->
+        _ = Ferricstore.Raft.WARaftBackend.stop()
+        _ = Ferricstore.Raft.Cluster.stop_system(:ra)
+    end
+
     FerricStore.Instance.cleanup(:default)
+    Ferricstore.Raft.Backend.clear_running()
     :ok
   end
 
   defp cleanup_failed_start do
     Ferricstore.Health.set_ready(false)
     _ = Ferricstore.Raft.WARaftBackend.stop()
-    _ = Ferricstore.Raft.Cluster.stop_system()
+    _ = Ferricstore.Raft.Cluster.stop_system(:ra)
     FerricStore.Instance.cleanup(:default)
+    Ferricstore.Raft.Backend.clear_running()
     :ok
   end
+
+  defp runtime_shutdown_config(%{shard_count: shard_count, data_dir: data_dir})
+       when is_integer(shard_count) and is_binary(data_dir) do
+    {shard_count, data_dir}
+  end
+
+  defp runtime_shutdown_config(_state), do: runtime_shutdown_config()
 
   defp runtime_shutdown_config do
     try do
@@ -432,6 +485,11 @@ defmodule Ferricstore.Application do
       _ -> 4
     end
   end
+
+  defp running_legacy_raft_backend?(state), do: running_raft_backend(state) == :ra
+
+  defp running_raft_backend(%{raft_backend: backend}) when backend in [:ra, :waraft], do: backend
+  defp running_raft_backend(_state), do: Ferricstore.Raft.Backend.selected()
 
   defp shutdown_flush_batchers(shard_count) do
     # Step 2: Flush all Raft batchers — drain pending commands to Raft

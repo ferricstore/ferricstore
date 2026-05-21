@@ -54,13 +54,13 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def get(path, key) when is_binary(path) and is_binary(key) do
-    if File.dir?(path), do: NIF.lmdb_get(path, key, map_size()), else: :not_found
+    if Ferricstore.FS.dir?(path), do: NIF.lmdb_get(path, key, map_size()), else: :not_found
   end
 
   def get_many(_path, []), do: {:ok, []}
 
   def get_many(path, keys) when is_binary(path) and is_list(keys) do
-    if File.dir?(path) do
+    if Ferricstore.FS.dir?(path) do
       NIF.lmdb_get_many(path, keys, map_size())
     else
       {:ok, Enum.map(keys, fn _key -> :not_found end)}
@@ -89,7 +89,7 @@ defmodule Ferricstore.Flow.LMDB do
 
   def prefix_entries(path, prefix, limit)
       when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
-    if File.dir?(path),
+    if Ferricstore.FS.dir?(path),
       do: NIF.lmdb_prefix_entries(path, prefix, limit, map_size()),
       else: {:ok, []}
   end
@@ -98,13 +98,15 @@ defmodule Ferricstore.Flow.LMDB do
 
   def prefix_entries(path, prefix, limit, true)
       when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
-    if File.dir?(path),
+    if Ferricstore.FS.dir?(path),
       do: NIF.lmdb_prefix_entries_reverse(path, prefix, limit, map_size()),
       else: {:ok, []}
   end
 
   def prefix_count(path, prefix) when is_binary(path) and is_binary(prefix) do
-    if File.dir?(path), do: NIF.lmdb_prefix_count(path, prefix, map_size()), else: {:ok, 0}
+    if Ferricstore.FS.dir?(path),
+      do: NIF.lmdb_prefix_count(path, prefix, map_size()),
+      else: {:ok, 0}
   end
 
   def terminal_state?(state) when state in ["completed", "failed", "cancelled"], do: true
@@ -688,7 +690,9 @@ defmodule Ferricstore.Flow.LMDB do
   defp normalize_mode(value) when value in ["lagged", "async", "batched"],
     do: :lagged
 
-  defp normalize_mode(value) when value in [true, "true", "TRUE", "1", "mirror", "on"], do: :mirror
+  defp normalize_mode(value) when value in [true, "true", "TRUE", "1", "mirror", "on"],
+    do: :mirror
+
   defp normalize_mode(value) when value in ["write_through", "write-through"], do: :mirror
   defp normalize_mode(_value), do: default_mode()
 

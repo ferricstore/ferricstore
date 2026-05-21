@@ -5,12 +5,17 @@ defmodule Ferricstore.Commands.ConfigLocalTest do
   alias Ferricstore.Commands.Server
   alias Ferricstore.Config
   alias Ferricstore.Config.Local, as: ConfigLocal
+  alias Ferricstore.MemoryGuard
   alias Ferricstore.Test.MockStore
 
   # Ensure the local config ETS table is clean before/after each test,
   # and restore the original Logger level.
   setup do
     original_level = Logger.level()
+    original_eviction = Application.get_env(:ferricstore, :eviction_policy)
+    original_memory_guard_state = :sys.get_state(MemoryGuard)
+    original_reject = MemoryGuard.reject_writes?()
+    original_keydir_full = MemoryGuard.keydir_full?()
 
     # Reset local config table if it exists
     ConfigLocal.reset_all()
@@ -18,10 +23,17 @@ defmodule Ferricstore.Commands.ConfigLocalTest do
     on_exit(fn ->
       ConfigLocal.reset_all()
       Logger.configure(level: original_level)
+      restore_env(:eviction_policy, original_eviction)
+      :sys.replace_state(MemoryGuard, fn _ -> original_memory_guard_state end)
+      MemoryGuard.set_reject_writes(original_reject)
+      MemoryGuard.set_keydir_full(original_keydir_full)
     end)
 
     :ok
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   # ===========================================================================
   # CONFIG SET LOCAL — happy paths

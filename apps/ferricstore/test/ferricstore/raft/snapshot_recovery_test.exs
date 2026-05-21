@@ -66,9 +66,14 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
 
       leader = wait_for_leader(members)
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        match?({:ok, _, _}, :ra.members(leader, 200))
-      end, "Raft leader not elected", 50, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          match?({:ok, _, _}, :ra.members(leader, 200))
+        end,
+        "Raft leader not elected",
+        50,
+        50
+      )
 
       # Write 2000 keys synchronously
       write_keys_sync(leader, prefix, 1..2000)
@@ -118,9 +123,14 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
       leader = wait_for_leader(members)
       followers = Enum.reject(members, &(&1 == leader))
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        match?({:ok, _, _}, :ra.members(leader, 200))
-      end, "Raft leader not elected", 50, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          match?({:ok, _, _}, :ra.members(leader, 200))
+        end,
+        "Raft leader not elected",
+        50,
+        50
+      )
 
       # Write 1000 keys on leader
       write_keys_sync(leader, prefix, 1..1000)
@@ -172,9 +182,14 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
       followers = Enum.reject(members, &(&1 == leader))
       [victim | _surviving_followers] = followers
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        match?({:ok, _, _}, :ra.members(leader, 200))
-      end, "Raft leader not elected", 50, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          match?({:ok, _, _}, :ra.members(leader, 200))
+        end,
+        "Raft leader not elected",
+        50,
+        50
+      )
 
       # Phase 1: Write 500 keys with all nodes up
       write_keys_sync(leader, prefix, 1..500)
@@ -244,20 +259,30 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
 
       leader = wait_for_leader(initial_members)
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        match?({:ok, _, _}, :ra.members(leader, 200))
-      end, "Raft leader not elected", 50, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          match?({:ok, _, _}, :ra.members(leader, 200))
+        end,
+        "Raft leader not elected",
+        50,
+        50
+      )
 
       # Write 2000 keys — this triggers ~10 release_cursor effects,
       # causing ra to take snapshots and truncate WAL
       write_keys_sync(leader, prefix, 1..2000)
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        case :ra.local_query(leader, &@snapshot_machine.count/1) do
-          {:ok, {_, 2000}, _} -> true
-          _ -> false
-        end
-      end, "leader should have all 2000 keys", 50, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          case :ra.local_query(leader, &@snapshot_machine.count/1) do
+            {:ok, {_, 2000}, _} -> true
+            _ -> false
+          end
+        end,
+        "leader should have all 2000 keys",
+        50,
+        50
+      )
 
       # Verify leader has all data before adding new member
       assert_key_count(leader, @snapshot_machine, 2000, label: "leader pre-add")
@@ -319,15 +344,21 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
 
       original_leader = wait_for_leader(members)
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        match?({:ok, _, _}, :ra.members(original_leader, 200))
-      end, "Raft leader not elected", 50, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          match?({:ok, _, _}, :ra.members(original_leader, 200))
+        end,
+        "Raft leader not elected",
+        50,
+        50
+      )
 
       # Phase 1: Write 500 keys on original leader
       write_keys_sync(original_leader, prefix, 1..500)
 
       # Wait for replication before killing leader
       surviving_members_pre = Enum.reject(members, &(&1 == original_leader))
+
       for member <- surviving_members_pre do
         wait_for_key_count(member, @simple_machine, 500,
           timeout: 15_000,
@@ -343,9 +374,14 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
       new_leader = wait_for_leader(surviving_members, 30)
       assert new_leader != original_leader
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        match?({:ok, _, _}, :ra.members(new_leader, 200))
-      end, "new Raft leader not ready", 50, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          match?({:ok, _, _}, :ra.members(new_leader, 200))
+        end,
+        "new Raft leader not ready",
+        50,
+        50
+      )
 
       # Phase 4: Write 500 more keys on new leader
       write_keys_sync(new_leader, prefix, 501..1000)
@@ -376,14 +412,7 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
   # ===========================================================================
 
   defp ensure_distribution! do
-    case Node.self() do
-      :nonode@nohost ->
-        unique = :erlang.unique_integer([:positive])
-        {:ok, _} = Node.start(:"snap_test_#{unique}", :shortnames)
-
-      _ ->
-        :ok
-    end
+    Ferricstore.Test.ShardHelpers.ensure_distribution_started!(:snap_test)
   end
 
   defp start_peers(n) do
@@ -418,6 +447,7 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
       end)
 
     peer_nodes = Enum.map(peers, fn {node_name, _pid} -> node_name end)
+
     for n1 <- peer_nodes, n2 <- peer_nodes, n1 != n2 do
       :rpc.call(n1, Node, :connect, [n2])
     end
@@ -516,14 +546,16 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
         :ok
 
       {:ok, {_, count}, _} when count < expected ->
-        Process.sleep(100) # intentional delay — polling loop with deadline
+        # intentional delay — polling loop with deadline
+        Process.sleep(100)
         do_wait_for_key_count(server_id, machine_mod, expected, label, deadline)
 
       {:ok, {_, count}, _} ->
         flunk("Expected #{expected} keys on #{label}, got #{count} (overshoot)")
 
       {:error, reason} ->
-        Process.sleep(200) # intentional delay — polling loop with deadline
+        # intentional delay — polling loop with deadline
+        Process.sleep(200)
 
         if System.monotonic_time(:millisecond) > deadline do
           flunk("Error querying #{label}: #{inspect(reason)}")
@@ -541,7 +573,8 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
         leader
 
       _ when attempts > 0 ->
-        Process.sleep(200) # intentional delay — polling loop for leader election
+        # intentional delay — polling loop for leader election
+        Process.sleep(200)
         wait_for_leader(members, attempts - 1)
 
       _ ->
@@ -564,6 +597,7 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
       end
     end)
 
-    Process.sleep(100) # intentional delay — grace period for ra cleanup
+    # intentional delay — grace period for ra cleanup
+    Process.sleep(100)
   end
 end

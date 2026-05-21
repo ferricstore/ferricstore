@@ -7,7 +7,7 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
     - WRONGTYPE prefix for type mismatches
     - NOAUTH for unauthenticated commands
     - OOM for memory limit (MemoryGuard noeviction rejection)
-    - BUSYKEY for COPY/RENAME conflicts
+    - BUSYKEY for RENAME conflicts
 
   These tests verify the error message format at the handler level (unit) and
   over TCP (integration) to ensure RESP encoding preserves the correct prefix.
@@ -247,7 +247,9 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
   # ---------------------------------------------------------------------------
 
   describe "NOAUTH for unauthenticated commands (spec 4.6)" do
-    test "commands return NOAUTH when requirepass is set and client not authenticated", %{port: port} do
+    test "commands return NOAUTH when requirepass is set and client not authenticated", %{
+      port: port
+    } do
       # Set a password
       Config.set("requirepass", "secret123")
 
@@ -307,42 +309,40 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Section 4.6: BUSYKEY for COPY/RENAME conflicts
+  # Section 4.6: COPY no-op result and BUSYKEY for RENAME conflicts
   # ---------------------------------------------------------------------------
 
-  describe "BUSYKEY for COPY conflicts (spec 4.6)" do
-    test "COPY to existing key without REPLACE returns error" do
-      store = MockStore.make(%{
-        "src" => {"value", 0},
-        "dst" => {"existing", 0}
-      })
+  describe "COPY no-op semantics (spec 4.6)" do
+    test "COPY to existing key without REPLACE returns 0" do
+      store =
+        MockStore.make(%{
+          "src" => {"value", 0},
+          "dst" => {"existing", 0}
+        })
 
       result = Generic.handle("COPY", ["src", "dst"], store)
-
-      # The spec says COPY to an existing key should return an error.
-      # FerricStore uses "ERR target key already exists" for this case.
-      assert {:error, msg} = result
-      assert msg =~ "target key" or msg =~ "BUSYKEY" or msg =~ "already exists"
+      assert result == 0
     end
 
     test "COPY to existing key with REPLACE succeeds" do
-      store = MockStore.make(%{
-        "src" => {"value", 0},
-        "dst" => {"existing", 0}
-      })
+      store =
+        MockStore.make(%{
+          "src" => {"value", 0},
+          "dst" => {"existing", 0}
+        })
 
       result = Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
       assert result == 1
     end
 
-    test "COPY from non-existent key returns ERR" do
+    test "COPY from non-existent key returns 0" do
       store = MockStore.make()
 
       result = Generic.handle("COPY", ["nonexistent", "dst"], store)
-      assert {:error, "ERR no such key"} = result
+      assert result == 0
     end
 
-    test "COPY error format preserved over TCP", %{port: port} do
+    test "COPY no-op result preserved over TCP", %{port: port} do
       sock = connect_and_hello(port)
       src = ukey("copy_src")
       dst = ukey("copy_dst")
@@ -354,12 +354,8 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       send_cmd(sock, ["SET", dst, "dv"])
       assert recv_response(sock) == {:simple, "OK"}
 
-      # COPY without REPLACE should fail
       send_cmd(sock, ["COPY", src, dst])
-      response = recv_response(sock)
-
-      assert {:error, msg} = response
-      assert msg =~ "target key" or msg =~ "BUSYKEY" or msg =~ "already exists"
+      assert recv_response(sock) == 0
 
       # Cleanup
       send_cmd(sock, ["DEL", src, dst])
@@ -434,7 +430,9 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       encoded2 = Encoder.encode({:error, "WRONGTYPE bad type"}) |> IO.iodata_to_binary()
       assert encoded2 == "-WRONGTYPE bad type\r\n"
 
-      encoded3 = Encoder.encode({:error, "NOAUTH Authentication required."}) |> IO.iodata_to_binary()
+      encoded3 =
+        Encoder.encode({:error, "NOAUTH Authentication required."}) |> IO.iodata_to_binary()
+
       assert encoded3 == "-NOAUTH Authentication required.\r\n"
     end
   end
@@ -452,7 +450,10 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn ->
-        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k ->
+          Router.delete(FerricStore.Instance.get(:default), k)
+        end)
+
         :ok
       end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
@@ -467,34 +468,71 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       lock: fn k, o, t -> Router.lock(FerricStore.Instance.get(:default), k, o, t) end,
       unlock: fn k, o -> Router.unlock(FerricStore.Instance.get(:default), k, o) end,
       extend: fn k, o, t -> Router.extend(FerricStore.Instance.get(:default), k, o, t) end,
-      ratelimit_add: fn k, w, m, c -> Router.ratelimit_add(FerricStore.Instance.get(:default), k, w, m, c) end,
+      ratelimit_add: fn k, w, m, c ->
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, w, m, c)
+      end,
       list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:get, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:get_meta, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:delete, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:scan_prefix, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:count_prefix, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:delete_prefix, prefix})
       end
     }

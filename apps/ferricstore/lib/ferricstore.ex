@@ -385,6 +385,30 @@ defmodule FerricStore do
   def flow_value_put(_value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
+  Reads reusable Flow values by reference, preserving request order.
+  """
+  @spec flow_value_mget([binary()]) :: {:ok, [term()]} | {:error, binary()}
+  def flow_value_mget(refs) when is_list(refs) do
+    Ferricstore.Flow.value_mget(default_ctx(), refs)
+  end
+
+  def flow_value_mget(_refs), do: {:error, "ERR flow refs must be a list"}
+
+  @doc """
+  Records an external Flow signal and optionally attaches named values or moves
+  the Flow through a guarded state transition.
+  """
+  @spec flow_signal(binary(), keyword()) :: :ok | {:error, binary()}
+  def flow_signal(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.signal(default_ctx(), id, opts)
+  end
+
+  def flow_signal(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_signal(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
   Creates a durable batch of Flow records.
 
   When `partition_key` is set, the batch is all-or-nothing because every item

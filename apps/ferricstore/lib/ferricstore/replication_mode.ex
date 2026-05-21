@@ -65,6 +65,7 @@ defmodule Ferricstore.ReplicationMode do
       |> put_cluster_id(data_dir)
       |> Map.put_new(:node, node())
       |> Map.put_new(:updated_at_ms, System.system_time(:millisecond))
+      |> normalize_marker_data()
 
     payload = :erlang.term_to_binary({:ferricstore_cluster_state, data})
     checksum = :crypto.hash(:sha256, payload)
@@ -78,7 +79,7 @@ defmodule Ferricstore.ReplicationMode do
         :ok = :file.sync(io)
       end)
 
-    File.rename!(tmp_path, path)
+    Ferricstore.FS.rename!(tmp_path, path)
     fsync_dir!(data_dir)
     :ok
   end
@@ -118,6 +119,12 @@ defmodule Ferricstore.ReplicationMode do
   defp cluster_id do
     Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
   end
+
+  defp normalize_marker_data(%{node: node_name} = data) when is_atom(node_name) do
+    Map.put(data, :node, Atom.to_string(node_name))
+  end
+
+  defp normalize_marker_data(data), do: data
 
   defp put_cluster_id(%{cluster_id: cluster_id} = data, _data_dir) when is_binary(cluster_id) do
     data

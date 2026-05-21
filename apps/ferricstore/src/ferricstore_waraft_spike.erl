@@ -51,7 +51,7 @@ start_volatile(DataDir) ->
     start(DataDir, ferricstore_waraft_spike_volatile_storage).
 
 start_multi_volatile(DataDir, PartitionCount) when PartitionCount > 0 ->
-    start_multi(DataDir, ferricstore_waraft_spike_volatile_storage, PartitionCount, wa_raft_log_ets).
+    start_multi(DataDir, ferricstore_waraft_spike_volatile_storage, PartitionCount, ferricstore_waraft_spike_segment_log).
 
 start_multi_volatile_segment_log(DataDir, PartitionCount) when PartitionCount > 0 ->
     start_multi(DataDir, ferricstore_waraft_spike_volatile_storage, PartitionCount, ferricstore_waraft_spike_segment_log).
@@ -72,7 +72,7 @@ start(DataDir, StorageModule) ->
     start(DataDir, StorageModule, auto_bootstrap).
 
 start(DataDir, StorageModule, BootstrapMode) ->
-    start(DataDir, StorageModule, BootstrapMode, wa_raft_log_ets).
+    start(DataDir, StorageModule, BootstrapMode, ferricstore_waraft_spike_segment_log).
 
 start(DataDir, StorageModule, BootstrapMode, LogModule) ->
     ok = ensure_started(),
@@ -396,7 +396,7 @@ configure_for_spike() ->
     application:set_env(?APP, raft_max_pending_reads, 100000),
     application:set_env(?APP, raft_max_pending_applies, 100000),
     application:set_env(?APP, raft_apply_queue_max_size, 100000),
-    application:set_env(?APP, raft_commit_batch_interval_ms, 1),
+    application:set_env(?APP, raft_commit_batch_interval_ms, 'Elixir.Ferricstore.Raft.WARaftBackend':default_commit_batch_interval_ms()),
     application:set_env(?APP, raft_commit_batch_max, 1024),
     application:set_env(?APP, raft_max_log_entries_per_heartbeat, 1024),
     application:set_env(?APP, raft_max_heartbeat_size, 16 * 1024 * 1024),

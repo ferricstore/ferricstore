@@ -292,16 +292,27 @@ defmodule Ferricstore.Cluster.Manager do
         {:noreply, %{state | known_nodes: new_known, mode: :cluster}}
 
       # Case 2: We don't know this node, but it might want to join us.
-      # Check if the remote node's cluster_nodes includes us.
+      # Check if the remote node's cluster_nodes includes us. The joiner's
+      # cluster_auto_join flag is the intent signal; the existing node does
+      # not need to have booted with cluster_nodes just to accept the request.
       # IMPORTANT: Only the lowest-named existing node handles the join
       # to prevent multiple nodes racing to join the same new node.
-      auto_join_enabled?() ->
+      true ->
         spawn(fn ->
           try do
             remote_nodes =
               :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_nodes, []], 5_000)
 
-            if node() in remote_nodes do
+            remote_auto_join? =
+              :erpc.call(
+                node,
+                Application,
+                :get_env,
+                [:ferricstore, :cluster_auto_join, false],
+                5_000
+              ) == true
+
+            if remote_auto_join? and node() in remote_nodes do
               # Deduplicate: only the lowest-named connected node performs the join.
               # All nodes see :nodeup, but only one should act.
               existing_nodes =
@@ -324,15 +335,16 @@ defmodule Ferricstore.Cluster.Manager do
                   "ClusterManager: #{node} wants to join us as #{remote_role}, initiating auto-join (coordinator: #{node()})"
                 )
 
-                result =
-                  GenServer.call(__MODULE__, {:add_node, node, remote_role, []}, 120_000)
-
-                Logger.info("ClusterManager: auto-join result for #{node}: #{inspect(result)}")
+                do_auto_join(node, remote_role)
               else
                 Logger.debug(
                   "ClusterManager: skipping join for #{node}, coordinator is #{coordinator}"
                 )
               end
+            else
+              Logger.debug(
+                "ClusterManager: ignoring #{node}; remote auto-join is disabled or does not target us"
+              )
             end
           catch
             kind, reason ->
@@ -341,13 +353,6 @@ defmodule Ferricstore.Cluster.Manager do
               )
           end
         end)
-
-        {:noreply, state}
-
-      true ->
-        Logger.debug(
-          "ClusterManager: ignoring remote-driven auto-join request from #{node}; cluster_auto_join is disabled"
-        )
 
         {:noreply, state}
     end
@@ -383,10 +388,6 @@ defmodule Ferricstore.Cluster.Manager do
 
   def handle_info(_msg, state) do
     {:noreply, state}
-  end
-
-  defp auto_join_enabled? do
-    Application.get_env(:ferricstore, :cluster_auto_join, false) == true
   end
 
   # ---------------------------------------------------------------------------
@@ -1296,24 +1297,38 @@ defmodule Ferricstore.Cluster.Manager do
   # so the dedup guard in handle_call prevents concurrent joins.
   defp do_auto_join(target_node, role) do
     Logger.info("ClusterManager: auto-joining #{target_node} as #{role}")
-    wait_for_remote_app(target_node)
 
-    case GenServer.call(__MODULE__, {:add_node, target_node, role}, 120_000) do
+    case wait_for_remote_app(target_node) do
       :ok ->
-        Logger.info("ClusterManager: auto-join complete for #{target_node}")
+        case GenServer.call(__MODULE__, {:add_node, target_node, role}, 120_000) do
+          :ok ->
+            Logger.info("ClusterManager: auto-join complete for #{target_node}")
+
+          {:error, reason} ->
+            Logger.error(
+              "ClusterManager: auto-join failed for #{target_node}: #{inspect(reason)}"
+            )
+        end
 
       {:error, reason} ->
-        Logger.error("ClusterManager: auto-join failed for #{target_node}: #{inspect(reason)}")
+        Logger.error(
+          "ClusterManager: auto-join failed for #{target_node}: remote app not ready #{inspect(reason)}"
+        )
     end
   end
 
   defp wait_for_remote_app(target_node, attempts \\ 20) do
     if attempts <= 0 do
       Logger.warning("ClusterManager: timed out waiting for FerricStore on #{target_node}")
+      {:error, :remote_app_not_ready}
     else
-      case :erpc.call(target_node, FerricStore.Instance, :get, [:default], 2_000) do
-        %{} -> :ok
-        _ -> wait_for_remote_app(target_node, attempts - 1)
+      with %{} <- :erpc.call(target_node, FerricStore.Instance, :get, [:default], 2_000),
+           true <- :erpc.call(target_node, Ferricstore.Health, :ready?, [], 2_000) do
+        :ok
+      else
+        _ ->
+          Process.sleep(200)
+          wait_for_remote_app(target_node, attempts - 1)
       end
     end
   catch

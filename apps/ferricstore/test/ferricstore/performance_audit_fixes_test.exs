@@ -9,7 +9,24 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
+    original_ctx = FerricStore.Instance.get(:default)
     ShardHelpers.flush_all_keys()
+
+    FerricStore.Instance.inject_callbacks(:default, process_rss_fn: nil)
+
+    Ferricstore.MemoryGuard.reconfigure(%{
+      max_memory_bytes: 1_000_000_000_000,
+      keydir_max_ram: 1_000_000_000_000,
+      eviction_policy: :volatile_lru
+    })
+
+    Ferricstore.MemoryGuard.reset_pressure_flags()
+
+    on_exit(fn ->
+      :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      ShardHelpers.flush_all_keys()
+    end)
+
     :ok
   end
 

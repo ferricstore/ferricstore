@@ -1269,7 +1269,7 @@ defmodule Ferricstore.Store.BlobStore do
              id: id,
              path: path,
              start_offset: 0,
-             file_existed?: File.exists?(path)
+             file_existed?: Ferricstore.FS.exists?(path)
            }}
 
         %{id: id, path: path, size: size} ->
@@ -1282,7 +1282,7 @@ defmodule Ferricstore.Store.BlobStore do
                id: new_id,
                path: new_path,
                start_offset: 0,
-               file_existed?: File.exists?(new_path)
+               file_existed?: Ferricstore.FS.exists?(new_path)
              }}
           else
             cache_active_segment(data_dir, shard_index, id, path, size)
@@ -1304,7 +1304,7 @@ defmodule Ferricstore.Store.BlobStore do
          id: new_id,
          path: path,
          start_offset: 0,
-         file_existed?: File.exists?(path)
+         file_existed?: Ferricstore.FS.exists?(path)
        }}
     end
   end

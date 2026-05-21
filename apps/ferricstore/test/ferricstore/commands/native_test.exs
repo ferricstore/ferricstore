@@ -8,6 +8,7 @@ defmodule Ferricstore.Commands.NativeTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.Native
+  alias Ferricstore.MemoryGuard
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -16,10 +17,60 @@ defmodule Ferricstore.Commands.NativeTest do
     :ok
   end
 
+  setup do
+    # These tests use the shared default instance, so reset leaked keyspace and
+    # MemoryGuard pressure before each case. Several commands read through a
+    # different layer than the seeding Router.put/4 call.
+    ShardHelpers.flush_all_keys()
+    force_memory_guard_ok()
+
+    on_exit(fn ->
+      ShardHelpers.reset_memory_guard_pressure()
+    end)
+
+    ShardHelpers.wait_shards_alive()
+    :ok
+  end
+
   # Generates a unique key to prevent cross-test interference.
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 
   defp dummy_store, do: FerricStore.Instance.get(:default)
+
+  defp default_ctx, do: FerricStore.Instance.get(:default)
+
+  defp force_memory_guard_ok do
+    try do
+      MemoryGuard.reconfigure(%{
+        max_memory_bytes: 100_000_000_000,
+        keydir_max_ram: 100_000_000_000,
+        hot_cache_min_ram: 0,
+        hot_cache_max_ram: :auto,
+        eviction_policy: :volatile_lru
+      })
+
+      :sys.replace_state(MemoryGuard, fn state ->
+        %{state | last_pressure_level: :ok, keydir_pressure_level: :ok}
+      end)
+
+      MemoryGuard.reset_pressure_flags()
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  defp put_existing!(key, value, expire_at_ms \\ 0) do
+    ctx = default_ctx()
+    force_memory_guard_ok()
+    assert :ok = Router.put(ctx, key, value, expire_at_ms)
+
+    ShardHelpers.eventually(
+      fn -> Router.get(ctx, key) == value end,
+      "native command test seed key #{inspect(key)} should be readable",
+      250,
+      10
+    )
+  end
 
   defp observed_store(parent \\ self()) do
     %{
@@ -105,21 +156,21 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "CAS with matching expected value returns 1 and sets new value" do
       key = ukey("cas_match")
-      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
+      put_existing!(key, "old")
       assert 1 == Native.handle("CAS", [key, "old", "new"], dummy_store())
       assert "new" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS with non-matching expected returns 0 and does not change value" do
       key = ukey("cas_mismatch")
-      Router.put(FerricStore.Instance.get(:default), key, "current", 0)
+      put_existing!(key, "current")
       assert 0 == Native.handle("CAS", [key, "wrong", "new"], dummy_store())
       assert "current" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS with EX sets TTL" do
       key = ukey("cas_ex")
-      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
+      put_existing!(key, "old")
       assert 1 == Native.handle("CAS", [key, "old", "new", "EX", "60"], dummy_store())
       assert "new" == Router.get(FerricStore.Instance.get(:default), key)
       # The key should have a TTL now
@@ -131,7 +182,7 @@ defmodule Ferricstore.Commands.NativeTest do
     test "CAS without EX preserves existing TTL" do
       key = ukey("cas_keep_ttl")
       future = System.os_time(:millisecond) + 120_000
-      Router.put(FerricStore.Instance.get(:default), key, "old", future)
+      put_existing!(key, "old", future)
       assert 1 == Native.handle("CAS", [key, "old", "new"], dummy_store())
       assert "new" == Router.get(FerricStore.Instance.get(:default), key)
       {_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), key)
@@ -149,20 +200,20 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "CAS with EX 0 returns error (TTL must be positive)" do
       key = ukey("cas_ex_zero")
-      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
+      put_existing!(key, "old")
       assert {:error, _} = Native.handle("CAS", [key, "old", "new", "EX", "0"], dummy_store())
     end
 
     test "CAS with EX non-integer returns error" do
       key = ukey("cas_ex_bad")
-      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
+      put_existing!(key, "old")
       assert {:error, _} = Native.handle("CAS", [key, "old", "new", "EX", "abc"], dummy_store())
     end
 
     test "CAS on expired key returns nil" do
       key = ukey("cas_expired")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(FerricStore.Instance.get(:default), key, "old", past)
+      assert :ok = Router.put(default_ctx(), key, "old", past)
       # Give ETS time to recognize expiry
       assert nil == Native.handle("CAS", [key, "old", "new"], dummy_store())
     end
@@ -198,7 +249,7 @@ defmodule Ferricstore.Commands.NativeTest do
       key = ukey("lock_expired")
       # Set a lock with a very short TTL
       past = System.os_time(:millisecond) - 1_000
-      Router.put(FerricStore.Instance.get(:default), key, "old_owner", past)
+      assert :ok = Router.put(default_ctx(), key, "old_owner", past)
       # Wait for it to expire
       assert :ok = Native.handle("LOCK", [key, "new_owner", "5000"], dummy_store())
       assert "new_owner" == Router.get(FerricStore.Instance.get(:default), key)
@@ -259,7 +310,7 @@ defmodule Ferricstore.Commands.NativeTest do
     test "UNLOCK after expiry returns 1 (already unlocked)" do
       key = ukey("unlock_after_exp")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(FerricStore.Instance.get(:default), key, "owner1", past)
+      assert :ok = Router.put(default_ctx(), key, "owner1", past)
       assert 1 == Native.handle("UNLOCK", [key, "owner1"], dummy_store())
     end
   end
@@ -297,7 +348,7 @@ defmodule Ferricstore.Commands.NativeTest do
     test "EXTEND on expired key returns error" do
       key = ukey("extend_expired")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(FerricStore.Instance.get(:default), key, "owner1", past)
+      assert :ok = Router.put(default_ctx(), key, "owner1", past)
       assert {:error, msg} = Native.handle("EXTEND", [key, "owner1", "5000"], dummy_store())
       assert msg =~ "DISTLOCK"
     end
@@ -439,14 +490,14 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "CAS is routed through dispatcher" do
       key = ukey("disp_cas")
-      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
+      put_existing!(key, "old")
       assert 1 == Dispatcher.dispatch("CAS", [key, "old", "new"], dummy_store())
       assert "new" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS is case-insensitive" do
       key = ukey("disp_cas_ci")
-      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
+      put_existing!(key, "old")
       assert 1 == Dispatcher.dispatch("cas", [key, "old", "new"], dummy_store())
     end
 
@@ -463,12 +514,7 @@ defmodule Ferricstore.Commands.NativeTest do
     test "EXTEND is routed through dispatcher" do
       key = ukey("disp_extend")
 
-      Router.put(
-        FerricStore.Instance.get(:default),
-        key,
-        "owner1",
-        System.os_time(:millisecond) + 5_000
-      )
+      put_existing!(key, "owner1", System.os_time(:millisecond) + 60_000)
 
       assert 1 == Dispatcher.dispatch("EXTEND", [key, "owner1", "10000"], dummy_store())
     end

@@ -239,14 +239,7 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
   end
 
   defp ensure_distribution! do
-    case Node.self() do
-      :nonode@nohost ->
-        unique = :erlang.unique_integer([:positive])
-        {:ok, _} = Node.start(:"mnbench_runner_#{unique}", :shortnames)
-
-      _ ->
-        :ok
-    end
+    Ferricstore.Test.ShardHelpers.ensure_distribution_started!(:mnbench_runner)
   end
 
   # ---------------------------------------------------------------------------

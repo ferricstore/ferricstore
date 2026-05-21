@@ -10,8 +10,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   use GenServer
 
-  alias Ferricstore.Raft.WARaftBackend
-
   @call_timeout 30_000
   @default_max_batch_size 1024
   @default_hot_batch_window_ms 1
@@ -84,7 +82,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         call_or_commit_put_batch_direct(shard_index, entries, window_ms)
 
       _disabled ->
-        WARaftBackend.__commit_put_batch_direct__(shard_index, entries)
+        backend_call(:__commit_put_batch_direct__, [shard_index, entries])
     end
   end
 
@@ -95,7 +93,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         call_or_commit_delete_batch_direct(shard_index, keys, window_ms)
 
       _disabled ->
-        WARaftBackend.__commit_delete_batch_direct__(shard_index, keys)
+        backend_call(:__commit_delete_batch_direct__, [shard_index, keys])
     end
   end
 
@@ -196,27 +194,27 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   defp call_or_commit_put_batch_direct(shard_index, entries, window_ms) do
     case Process.whereis(name(shard_index)) do
       nil ->
-        WARaftBackend.__commit_put_batch_direct__(shard_index, entries)
+        backend_call(:__commit_put_batch_direct__, [shard_index, entries])
 
       _pid ->
         GenServer.call(name(shard_index), {:write_put_batch, entries, window_ms}, @call_timeout)
     end
   catch
-    :exit, {:noproc, _} -> WARaftBackend.__commit_put_batch_direct__(shard_index, entries)
-    :exit, {:normal, _} -> WARaftBackend.__commit_put_batch_direct__(shard_index, entries)
+    :exit, {:noproc, _} -> backend_call(:__commit_put_batch_direct__, [shard_index, entries])
+    :exit, {:normal, _} -> backend_call(:__commit_put_batch_direct__, [shard_index, entries])
   end
 
   defp call_or_commit_delete_batch_direct(shard_index, keys, window_ms) do
     case Process.whereis(name(shard_index)) do
       nil ->
-        WARaftBackend.__commit_delete_batch_direct__(shard_index, keys)
+        backend_call(:__commit_delete_batch_direct__, [shard_index, keys])
 
       _pid ->
         GenServer.call(name(shard_index), {:write_delete_batch, keys, window_ms}, @call_timeout)
     end
   catch
-    :exit, {:noproc, _} -> WARaftBackend.__commit_delete_batch_direct__(shard_index, keys)
-    :exit, {:normal, _} -> WARaftBackend.__commit_delete_batch_direct__(shard_index, keys)
+    :exit, {:noproc, _} -> backend_call(:__commit_delete_batch_direct__, [shard_index, keys])
+    :exit, {:normal, _} -> backend_call(:__commit_delete_batch_direct__, [shard_index, keys])
   end
 
   defp new_slot(window_ms) do
@@ -252,7 +250,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
         commands = Enum.reverse(slot.commands)
         froms = Enum.reverse(slot.froms)
-        result = WARaftBackend.write_batch(state.shard_index, commands)
+        result = backend_call(:write_batch, [state.shard_index, commands])
         replies = replies_for_batch(result, length(commands))
 
         Enum.zip(froms, replies)
@@ -308,7 +306,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     cancel_timer(slot.timer_ref)
     groups = Enum.reverse(slot.groups)
     entries = hot_batch_items(groups)
-    result = WARaftBackend.__commit_put_batch_direct__(state.shard_index, entries)
+    result = backend_call(:__commit_put_batch_direct__, [state.shard_index, entries])
     reply_hot_batch_groups(groups, result)
     emit_hot_flush_telemetry(state, :put_batch, slot, result)
     %{state | put_slot: nil}
@@ -320,7 +318,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     cancel_timer(slot.timer_ref)
     groups = Enum.reverse(slot.groups)
     keys = hot_batch_items(groups)
-    result = WARaftBackend.__commit_delete_batch_direct__(state.shard_index, keys)
+    result = backend_call(:__commit_delete_batch_direct__, [state.shard_index, keys])
     reply_hot_batch_groups(groups, result)
     emit_hot_flush_telemetry(state, :delete_batch, slot, result)
     %{state | delete_slot: nil}
@@ -373,10 +371,14 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   defp replies_for_batch(result, expected), do: List.duplicate(result, expected)
 
   defp commit_single_direct(shard_index, command) do
-    case WARaftBackend.write_batch(shard_index, [command]) do
+    case backend_call(:write_batch, [shard_index, [command]]) do
       {:ok, [reply]} -> reply
       other -> other
     end
+  end
+
+  defp backend_call(function, args) do
+    apply(Ferricstore.Raft.WARaftBackend, function, args)
   end
 
   defp emit_flush_telemetry(state, prefix, slot, result) do

@@ -204,6 +204,10 @@ defmodule FerricstoreServer.ConnectionTest do
       "1000"
     ])
 
+    assert ["OK"] = recv_values(sock, 1)
+
+    send_command(sock, ["FLOW.GET", id, "PARTITION", partition])
+
     assert [%{"id" => ^id, "type" => "single-flow", "partition_key" => ^partition}] =
              recv_values(sock, 1)
 
@@ -268,11 +272,7 @@ defmodule FerricstoreServer.ConnectionTest do
 
     send_raw(sock, pipeline)
 
-    assert [
-             %{"id" => ^id_a},
-             {:error, "ERR flow already exists"},
-             %{"id" => ^id_b}
-           ] = recv_values(sock, 3)
+    assert ["OK", {:error, "ERR flow already exists"}, "OK"] = recv_values(sock, 3)
 
     assert_receive {:quorum_submit, [:ferricstore, :batcher, :quorum_submit],
                     %{batch_size: batch_size}, %{kind: :batch}},
@@ -556,7 +556,7 @@ defmodule FerricstoreServer.ConnectionTest do
       for idx <- 1..3 do
         id = "#{type}:#{idx}:#{System.unique_integer([:positive])}"
 
-        assert {:ok, %{id: ^id}} =
+        assert :ok =
                  FerricStore.flow_create(id,
                    type: type,
                    partition_key: partition,

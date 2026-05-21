@@ -48,7 +48,7 @@ defmodule Ferricstore.Bitcask.Async do
         after
           0 ->
             cleanup_alias(parent, ref)
-            send(proxy, {ref, :cancel})
+            stop_proxy(proxy, ref)
             {:error, :timeout}
         end
     end
@@ -79,6 +79,11 @@ defmodule Ferricstore.Bitcask.Async do
     after
       0 -> send(parent, {ref, result})
     end
+  end
+
+  defp stop_proxy(proxy, ref) do
+    send(proxy, {ref, :cancel})
+    Process.exit(proxy, :shutdown)
   end
 
   defp cleanup_alias(parent, ref) do

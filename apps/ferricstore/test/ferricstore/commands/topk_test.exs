@@ -5,6 +5,14 @@ defmodule Ferricstore.Commands.TopKTest do
   alias Ferricstore.Commands.TopK
   alias Ferricstore.Test.MockStore
 
+  defp temp_prob_dir(prefix, suffix) do
+    Path.join(System.tmp_dir!(), "#{prefix}_#{suffix}")
+  end
+
+  defp unique_suffix do
+    "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive, :monotonic])}"
+  end
+
   # ===========================================================================
   # TOPK.RESERVE
   # ===========================================================================
@@ -17,13 +25,11 @@ defmodule Ferricstore.Commands.TopKTest do
     end
 
     test "uses key-specific probabilistic directory when available" do
-      wrong_dir =
-        Path.join(System.tmp_dir!(), "topk_wrong_prob_#{System.unique_integer([:positive])}")
+      suffix = unique_suffix()
+      wrong_dir = temp_prob_dir("topk_wrong_prob", suffix)
+      right_dir = temp_prob_dir("topk_right_prob", suffix)
 
-      right_dir =
-        Path.join(System.tmp_dir!(), "topk_right_prob_#{System.unique_integer([:positive])}")
-
-      key = "key_specific_topk"
+      key = "key_specific_topk_#{suffix}"
       safe = Base.url_encode64(key, padding: false)
 
       store =
@@ -31,9 +37,14 @@ defmodule Ferricstore.Commands.TopKTest do
         |> Map.put(:prob_dir, fn -> wrong_dir end)
         |> Map.put(:prob_dir_for_key, fn ^key -> right_dir end)
 
-      assert :ok = TopK.handle("TOPK.RESERVE", [key, "10"], store)
-      assert File.exists?(Path.join(right_dir, "#{safe}.topk"))
-      refute File.exists?(Path.join(wrong_dir, "#{safe}.topk"))
+      try do
+        assert :ok = TopK.handle("TOPK.RESERVE", [key, "10"], store)
+        assert File.exists?(Path.join(right_dir, "#{safe}.topk"))
+        refute File.exists?(Path.join(wrong_dir, "#{safe}.topk"))
+      after
+        File.rm_rf!(wrong_dir)
+        File.rm_rf!(right_dir)
+      end
     end
 
     test "creates a Top-K tracker with custom dimensions" do

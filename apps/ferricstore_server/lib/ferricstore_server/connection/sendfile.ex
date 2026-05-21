@@ -107,6 +107,9 @@ defmodule FerricstoreServer.Connection.Sendfile do
       {:cold_value, value} ->
         encode_get_result(value, key, state)
 
+      {:error, _reason} = error ->
+        encode_get_result(error, key, state)
+
       :miss ->
         encode_get_result(nil, key, state)
     end

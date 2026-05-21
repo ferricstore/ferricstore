@@ -235,7 +235,7 @@ defmodule Ferricstore.FlowSignalTest do
 
     assert fetched.state == "waiting_inventory"
     refute Map.has_key?(fetched, :values)
-    refute Map.has_key?(fetched.value_refs, "payment_event")
+    refute Map.has_key?(Map.get(fetched, :value_refs, %{}), "payment_event")
   end
 
   test "signal idempotency key replays same digest and rejects conflicting digest" do

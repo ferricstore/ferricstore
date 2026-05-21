@@ -38,7 +38,7 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
       refute source =~ "restart_uid"
     end
 
-    test "application checks ra system startup result" do
+    test "application checks selected ra system startup result" do
       assert ok_match_to_start_system?(@application_path)
     end
 
@@ -67,18 +67,22 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
     test "application waits for parallel shard elections before readiness" do
       source = File.read!(@application_path)
 
-      election_pos =
-        :binary.match(source, "Ferricstore.Raft.Cluster.trigger_shard_elections_parallel")
+      backend_start_pos =
+        :binary.match(source, "start_selected_raft_backend(default_ctx, shard_count, selected_backend)")
 
       ready_pos = :binary.match(source, "mark_started(shard_count)")
 
-      assert match?({_, _}, election_pos)
-      assert match?({_, _}, ready_pos)
+      election_pos =
+        :binary.match(source, "Ferricstore.Raft.Cluster.trigger_shard_elections_parallel")
 
-      {election_offset, _} = election_pos
+      assert match?({_, _}, backend_start_pos)
+      assert match?({_, _}, ready_pos)
+      assert match?({_, _}, election_pos)
+
+      {backend_start_offset, _} = backend_start_pos
       {ready_offset, _} = ready_pos
 
-      assert election_offset < ready_offset
+      assert backend_start_offset < ready_offset
     end
   end
 
@@ -184,7 +188,8 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
           found? =
             acc or
               (Macro.to_string(left) == ":ok" and
-                 Macro.to_string(right) == "Ferricstore.Raft.Cluster.start_system(data_dir)")
+                 Macro.to_string(right) ==
+                   "Ferricstore.Raft.Cluster.start_system(data_dir, selected_backend)")
 
           {node, found?}
 

@@ -18,8 +18,14 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
     ShardHelpers.flush_all_keys()
 
     original_state = :sys.get_state(MemoryGuard)
+    original_ctx = FerricStore.Instance.get(:default)
     orig_reject = MemoryGuard.reject_writes?()
     orig_keydir = MemoryGuard.keydir_full?()
+
+    # This file tests keydir/flag behavior. In the full umbrella suite the
+    # server app may have injected a real RSS callback into the default
+    # instance, which makes these unit assertions depend on host memory.
+    FerricStore.Instance.inject_callbacks(:default, process_rss_fn: nil)
 
     on_exit(fn ->
       # Resume first in case a test suspended MemoryGuard
@@ -30,6 +36,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       end
 
       :sys.replace_state(MemoryGuard, fn _current -> original_state end)
+      :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
       MemoryGuard.set_reject_writes(orig_reject)
       MemoryGuard.set_keydir_full(orig_keydir)
       ShardHelpers.flush_all_keys()
@@ -87,7 +94,15 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       assert MemoryGuard.reject_writes?() == true
       assert MemoryGuard.keydir_full?() == true
 
-      # Reset the GenServer state back to ok (but leave persistent_term stale)
+      # Give this unit assertion a deliberately huge budget so a full-suite
+      # run cannot make it depend on allocator/RSS state left by earlier tests.
+      MemoryGuard.reconfigure(%{
+        max_memory_bytes: 1_000_000_000_000,
+        keydir_max_ram: 1_000_000_000_000,
+        eviction_policy: :volatile_lru
+      })
+
+      # Reset the GenServer state back to ok (but leave persistent_term stale).
       :sys.replace_state(MemoryGuard, fn state ->
         %{state | last_pressure_level: :ok, eviction_policy: :volatile_lru}
       end)
@@ -216,6 +231,12 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
       # Switch to reject with eviction enabled (volatile_lru, not noeviction).
       # But set keydir_full so check_keydir_full rejects new keys.
+      MemoryGuard.reconfigure(%{
+        max_memory_bytes: 1_000_000_000_000,
+        keydir_max_ram: 1_000_000_000_000,
+        eviction_policy: :volatile_lru
+      })
+
       :sys.replace_state(MemoryGuard, fn state ->
         %{state | last_pressure_level: :reject, eviction_policy: :volatile_lru}
       end)

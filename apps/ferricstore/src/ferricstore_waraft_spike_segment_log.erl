@@ -1,10 +1,10 @@
 %%% Copyright (c) FerricStore contributors.
 %%%
-%%% Minimal durable segmented WARaft log provider for the migration spike.
-%%% This is intentionally small and conservative: each append batch is written
-%%% as CRC-framed records and fsynced before the Raft append is acknowledged.
-%%% It is not the final FerricStore WAL, but it proves WARaft can use our own
-%%% durable log boundary instead of the default in-memory ETS log.
+%%% Durable segmented WARaft log provider for the migration spike.
+%%% Each append batch is written as CRC-framed records and data-synced before
+%%% the Raft append is acknowledged. Same-segment batches pay one data sync for
+%%% the group, new segments can reserve disk through keep-size preallocation,
+%%% and recovery fails closed on corrupt or ambiguous records.
 
 -module(ferricstore_waraft_spike_segment_log).
 
@@ -51,6 +51,10 @@
 -define(REWRITE_STAGING_PREFIX, ".rewrite.staging.").
 -define(REWRITE_BACKUP_PREFIX, ".rewrite.backup.").
 -define(APPEND_FAILURE_MARKER, "segment_log.append_failed.term").
+-define(DEFAULT_PREALLOCATE_BYTES, 0).
+-define(WRITER_REGISTRY, ferricstore_waraft_segment_writer_registry).
+-define(DEFAULT_WAL_NIF_SYNC_TIMEOUT_MS, 30000).
+-define(DEFAULT_WAL_NIF_MAX_BUFFER_BYTES, 67108864).
 
 first_index(#raft_log{name = Name}) ->
     case ets:first(Name) of
@@ -287,6 +291,7 @@ open(#raft_log{name = Name} = Log) ->
     end.
 
 close(Log, _State) ->
+    _ = close_writers_for_dir(log_dir(Log)),
     _ = persistent_term:erase(segment_config_cache_key(log_dir(Log))),
     ok.
 
@@ -296,10 +301,15 @@ reset(#raft_log{name = Name} = Log, #raft_log_pos{index = Index, term = Term}, S
     Dir = log_dir(Log),
     case check_append_failure_marker(Dir) of
         ok ->
-            case rewrite_records(Dir, [Record]) of
+            case close_writers_for_dir(Dir) of
                 ok ->
-                    true = ets:insert(Name, Record),
-                    {ok, State};
+                    case rewrite_records(Dir, [Record]) of
+                        ok ->
+                            true = ets:insert(Name, Record),
+                            {ok, State};
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
                 {error, _Reason} = Error ->
                     Error
             end;
@@ -313,29 +323,11 @@ truncate(#raft_log{name = Name} = Log, Index, State) ->
     Dir = log_dir(Log),
     case check_append_failure_marker(Dir) of
         ok ->
-            case rewrite_ets_records_before(Dir, Name, Index) of
+            case close_writers_for_dir(Dir) of
                 ok ->
-                    delete_from(Name, Index),
-                    {ok, State};
-                {error, _Reason} = Error ->
-                    Error
-            end;
-        {error, _Reason} = Error ->
-            Error
-    end.
-
-trim(#raft_log{name = Name} = Log, Index, State) ->
-    %% WARaft advances the in-memory log view after this asynchronous callback.
-    %% The provider must trim persisted records too, otherwise restart reloads
-    %% compacted entries and the segment log grows without bound.
-    Dir = log_dir(Log),
-    case prepare_segment_projection_for_trim(Dir, Index) of
-        ok ->
-            case check_append_failure_marker(Dir) of
-                ok ->
-                    case rewrite_ets_records_at_or_after(Dir, Name, Index) of
+                    case rewrite_ets_records_before(Dir, Name, Index) of
                         ok ->
-                            delete_before(Name, Index),
+                            delete_from(Name, Index),
                             {ok, State};
                         {error, _Reason} = Error ->
                             Error
@@ -347,23 +339,46 @@ trim(#raft_log{name = Name} = Log, Index, State) ->
             Error
     end.
 
-prepare_segment_projection_for_trim(Dir, Index) ->
-    case application:get_env(ferricstore, waraft_storage_apply_mode) of
-        {ok, segment_projected} ->
-            RootDir = unicode:characters_to_binary(filename:dirname(Dir)),
-            try 'Elixir.Ferricstore.Raft.WARaftStorage':prepare_segment_projection_for_trim(RootDir, Index) of
+trim(#raft_log{name = Name} = Log, Index, State) ->
+    %% WARaft advances the in-memory log view after this asynchronous callback.
+    %% The provider must trim persisted records too, otherwise restart reloads
+    %% compacted entries and the segment log grows without bound.
+    %% In segment_keydir mode the Raft segment itself is the Bitcask payload
+    %% location. Before trimming those records, the storage layer must persist
+    %% a projection checkpoint so cold keydir rows can still be rebuilt/read.
+    Dir = log_dir(Log),
+    case prepare_segment_projection_for_trim(Dir, Index) of
+        ok ->
+            case check_append_failure_marker(Dir) of
                 ok ->
-                    ok;
-                {error, Reason} ->
-                    {error, {segment_projection_before_trim, Reason}};
-                Other ->
-                    {error, {segment_projection_before_trim_bad_return, Other}}
-            catch
-                Class:Reason ->
-                    {error, {segment_projection_before_trim_exception, Class, Reason}}
+                    case close_writers_for_dir(Dir) of
+                        ok ->
+                            case rewrite_ets_records_at_or_after(Dir, Name, Index) of
+                                ok ->
+                                    delete_before(Name, Index),
+                                    {ok, State};
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
             end;
-        _Other ->
-            ok
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+prepare_segment_projection_for_trim(Dir, Index) ->
+    RootDir = unicode:characters_to_binary(filename:dirname(Dir)),
+    try 'Elixir.Ferricstore.Raft.WARaftStorage':prepare_segment_projection_for_trim(RootDir, Index) of
+        ok -> ok;
+        {error, _Reason} = Error -> Error;
+        Other -> {error, {prepare_segment_projection_for_trim, Other}}
+    catch
+        Class:Reason ->
+            {error, {prepare_segment_projection_for_trim, Class, Reason}}
     end.
 
 flush(_Log) ->
@@ -543,23 +558,102 @@ write_record_group_once(Dir, Segment, RecordsRev) ->
     end.
 
 open_record_group_once(Dir, Path, RecordsRev) ->
-    case file:open(Path, [append, raw, binary]) of
-        {ok, Fd} ->
-            case file:position(Fd, eof) of
-                {ok, OldSize} ->
+    case segment_io_mode() of
+        {ok, file} ->
+            open_record_group_once_file(Dir, Path, RecordsRev);
+        {ok, wal_nif} ->
+            open_record_group_once_wal_nif(Dir, Path, RecordsRev);
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+open_record_group_once_file(Dir, Path, RecordsRev) ->
+    case close_writer_for_path(Path) of
+        ok ->
+            case file:open(Path, [append, raw, binary]) of
+                {ok, Fd} ->
+                    case file:position(Fd, eof) of
+                        {ok, OldSize} ->
+                            case maybe_preallocate_new_segment(Path, OldSize =:= 0) of
+                                ok ->
+                                    Writes = [encode_record(Record) || Record <- lists:reverse(RecordsRev)],
+                                    case write_record_group_file(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
+                                        ok ->
+                                            {ok, {Path, OldSize}};
+                                        {error, Reason} ->
+                                            {error, Reason}
+                                    end;
+                                {error, Reason} ->
+                                    _ = file:close(Fd),
+                                    {error, Reason}
+                            end;
+                        {error, Reason} ->
+                            _ = file:close(Fd),
+                            {error, {position, Reason}}
+                    end;
+                {error, Reason} ->
+                    {error, {open, Reason}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+open_record_group_once_wal_nif(Dir, Path, RecordsRev) ->
+    case segment_file_size(Path) of
+        {ok, OldSize} ->
+            case maybe_preallocate_new_segment(Path, OldSize =:= 0) of
+                ok ->
                     Writes = [encode_record(Record) || Record <- lists:reverse(RecordsRev)],
-                    case write_record_group(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
+                    case write_record_group_wal_nif(Dir, Path, OldSize, Writes, OldSize =:= 0) of
                         ok ->
                             {ok, {Path, OldSize}};
                         {error, Reason} ->
                             {error, Reason}
                     end;
-                {error, Reason} ->
-                    _ = file:close(Fd),
-                    {error, {position, Reason}}
+                {error, _Reason} = Error ->
+                    Error
             end;
-        {error, Reason} ->
-            {error, {open, Reason}}
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+maybe_preallocate_new_segment(_Path, false) ->
+    ok;
+maybe_preallocate_new_segment(Path, true) ->
+    case segment_preallocate_bytes() of
+        {ok, 0} ->
+            ok;
+        {ok, Bytes} ->
+            BinaryPath = unicode:characters_to_binary(Path),
+            case maybe_run_preallocate_hook(BinaryPath, Bytes) of
+                ok -> preallocate_keep_size(BinaryPath, Bytes);
+                {error, _Reason} = Error -> Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+segment_preallocate_bytes() ->
+    case application:get_env(ferricstore, waraft_segment_log_preallocate_bytes, ?DEFAULT_PREALLOCATE_BYTES) of
+        Bytes when is_integer(Bytes), Bytes >= 0 -> {ok, Bytes};
+        Other -> {error, {bad_segment_preallocate_bytes, Other}}
+    end.
+
+preallocate_keep_size(BinaryPath, Bytes) ->
+    try ferricstore_wal_nif:preallocate_keep_size(BinaryPath, Bytes) of
+        ok -> ok;
+        {error, Reason} -> {error, {preallocate, BinaryPath, Reason}};
+        Other -> {error, {preallocate, BinaryPath, Other}}
+    catch
+        error:nif_not_loaded ->
+            preallocate_keep_size_unavailable(BinaryPath);
+        Class:Reason -> {error, {preallocate_exception, BinaryPath, Class, Reason}}
+    end.
+
+preallocate_keep_size_unavailable(_BinaryPath) ->
+    case os:type() of
+        {unix, darwin} -> ok;
+        _Other -> {error, {preallocate_unavailable, nif_not_loaded}}
     end.
 
 validate_segment_file_for_append(Path) ->
@@ -574,7 +668,7 @@ validate_segment_file_for_append(Path) ->
             {error, {read_segment_info, Reason}}
     end.
 
-write_record_group(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
+write_record_group_file(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
     StartedAt = erlang:monotonic_time(),
     Count = length(Writes),
     Bytes = iolist_size(Writes),
@@ -608,6 +702,55 @@ write_record_group(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
     end,
     emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment),
     Result.
+
+write_record_group_wal_nif(Dir, Path, OldSize, Writes, NewSegment) ->
+    StartedAt = erlang:monotonic_time(),
+    Count = length(Writes),
+    Bytes = iolist_size(Writes),
+    WriteResult = write_record_group_wal_nif_once(Dir, Path, OldSize, Writes, Bytes),
+    Result =
+        case WriteResult of
+            ok ->
+                maybe_sync_new_segment_dir(Dir, Path, OldSize, NewSegment);
+            {error, AppendError} ->
+                case close_writer_for_path(Path) of
+                    ok ->
+                        case rollback_append_path(Path, OldSize, AppendError) of
+                            {error, AppendError} -> {error, AppendError};
+                            {error, RollbackReason} -> {error, RollbackReason}
+                        end;
+                    {error, CloseReason} ->
+                        {error, {rollback_failed, AppendError, CloseReason}}
+                end
+        end,
+    emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment),
+    Result.
+
+write_record_group_wal_nif_once(Dir, Path, OldSize, Writes, Bytes) ->
+    case close_inactive_writers_for_dir(Dir, Path) of
+        ok ->
+            case segment_writer_handle(Path, OldSize) of
+                {ok, Handle} ->
+                    case wal_nif_write(Handle, Writes) of
+                        ok ->
+                            case maybe_run_append_hook(after_write) of
+                                ok ->
+                                    case sync_segment_wal_nif(Path, Handle) of
+                                        ok -> update_segment_writer_position(Path, OldSize + Bytes);
+                                        {error, _Reason} = Error -> Error
+                                    end;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
 
 maybe_sync_new_segment_dir(_Dir, _Path, _OldSize, false) ->
     ok;
@@ -661,6 +804,18 @@ rollback_append_fd(Path, Fd, OldSize) ->
             end;
         {error, _Reason} = Error ->
             Error
+    end.
+
+segment_file_size(Path) ->
+    case file:read_link_info(Path) of
+        {ok, #file_info{type = regular, size = Size}} ->
+            {ok, Size};
+        {ok, #file_info{type = Type}} ->
+            {error, {unsafe_segment_path, Path, Type}};
+        {error, enoent} ->
+            {ok, 0};
+        {error, Reason} ->
+            {error, {read_segment_info, Reason}}
     end.
 
 maybe_poison_after_append_rollback_failure(Dir, {rollback_failed, _OriginalReason, _RollbackReason} = Reason) ->
@@ -1731,9 +1886,257 @@ sync_dir(Path) ->
 
 sync_segment_file(Path, Fd) ->
     BinaryPath = unicode:characters_to_binary(Path),
-    case maybe_run_file_sync_hook(BinaryPath) of
-        ok -> file:sync(Fd);
+    case segment_sync_method() of
+        {ok, Method} ->
+            case maybe_run_file_sync_hook(BinaryPath, Method) of
+                ok -> sync_segment_fd(Method, Fd);
+                {error, _Reason} = Error -> Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+segment_sync_method() ->
+    case application:get_env(ferricstore, waraft_segment_log_sync_method, datasync) of
+        sync -> {ok, sync};
+        datasync -> {ok, datasync};
+        auto -> {ok, datasync};
+        Other -> {error, {bad_segment_sync_method, Other}}
+    end.
+
+sync_segment_fd(sync, Fd) ->
+    file:sync(Fd);
+sync_segment_fd(datasync, Fd) ->
+    file:datasync(Fd).
+
+segment_io_mode() ->
+    case application:get_env(ferricstore, waraft_segment_log_io_mode, file) of
+        file -> {ok, file};
+        wal_nif -> {ok, wal_nif};
+        Other -> {error, {bad_segment_io_mode, Other}}
+    end.
+
+segment_writer_handle(Path, OldSize) ->
+    Registry = ensure_writer_registry(),
+    Key = writer_key(Path),
+    case ets:lookup(Registry, Key) of
+        [{Key, _Dir, Handle, OldSize}] ->
+            {ok, Handle};
+        [{Key, _Dir, _Handle, _Position}] ->
+            case close_writer_for_path(Path) of
+                ok -> open_segment_writer(Path, OldSize);
+                {error, _Reason} = Error -> Error
+            end;
+        [] ->
+            open_segment_writer(Path, OldSize)
+    end.
+
+open_segment_writer(Path, OldSize) ->
+    case wal_nif_default_commit_delay_us() of
+        {ok, DelayUs} ->
+            case wal_nif_max_buffer_bytes() of
+                {ok, MaxBufferBytes} ->
+                    BinaryPath = unicode:characters_to_binary(Path),
+                    case wal_nif_open_raw_append(BinaryPath, DelayUs, MaxBufferBytes, OldSize) of
+                        {ok, Handle} ->
+                            Registry = ensure_writer_registry(),
+                            true = ets:insert(Registry, {writer_key(Path), writer_dir(Path), Handle, OldSize}),
+                            {ok, Handle};
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+wal_nif_open_raw_append(BinaryPath, DelayUs, MaxBufferBytes, OldSize) ->
+    try ferricstore_wal_nif:open_raw_append(BinaryPath, DelayUs, MaxBufferBytes, OldSize) of
+        {ok, Handle} -> {ok, Handle};
+        {error, Reason} -> {error, {wal_nif_open_raw_append, BinaryPath, Reason}};
+        Other -> {error, {wal_nif_open_raw_append, BinaryPath, Other}}
+    catch
+        error:nif_not_loaded -> {error, {wal_nif_open_raw_append, BinaryPath, nif_not_loaded}};
+        Class:Reason -> {error, {wal_nif_open_raw_append, BinaryPath, Class, Reason}}
+    end.
+
+wal_nif_write(Handle, Writes) ->
+    try ferricstore_wal_nif:write(Handle, Writes) of
+        ok -> ok;
+        {error, Reason} -> {error, {wal_nif_write, Reason}};
+        Other -> {error, {wal_nif_write, Other}}
+    catch
+        Class:Reason -> {error, {wal_nif_write, Class, Reason}}
+    end.
+
+sync_segment_wal_nif(Path, Handle) ->
+    BinaryPath = unicode:characters_to_binary(Path),
+    case wal_nif_sync_delay_us() of
+        {ok, DelayUs} ->
+            case wal_nif_sync_timeout_ms() of
+                {ok, TimeoutMs} ->
+                    case maybe_run_wal_nif_sync_hook(BinaryPath, DelayUs) of
+                        ok ->
+                            Ref = make_ref(),
+                            case wal_nif_request_sync(Handle, self(), Ref, DelayUs) of
+                                ok ->
+                                    receive
+                                        {wal_sync_complete, Ref, _SyncedPosition} ->
+                                            ok;
+                                        {wal_sync_error, Ref, Reason} ->
+                                            {error, {wal_nif_sync, BinaryPath, Reason}}
+                                    after TimeoutMs ->
+                                        {error, {wal_nif_sync_timeout, BinaryPath, TimeoutMs}}
+                                    end;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+wal_nif_request_sync(Handle, Pid, Ref, DelayUs) ->
+    try ferricstore_wal_nif:sync_with_delay(Handle, Pid, Ref, DelayUs) of
+        ok -> ok;
+        {error, Reason} -> {error, {wal_nif_sync_request, Reason}};
+        Other -> {error, {wal_nif_sync_request, Other}}
+    catch
+        Class:Reason -> {error, {wal_nif_sync_request, Class, Reason}}
+    end.
+
+update_segment_writer_position(Path, Position) ->
+    Registry = ensure_writer_registry(),
+    Key = writer_key(Path),
+    case ets:lookup(Registry, Key) of
+        [{Key, Dir, Handle, _OldPosition}] ->
+            true = ets:insert(Registry, {Key, Dir, Handle, Position}),
+            ok;
+        [] ->
+            {error, {segment_writer_missing, Path}}
+    end.
+
+close_inactive_writers_for_dir(Dir, ActivePath) ->
+    Registry = ensure_writer_registry(),
+    ActiveKey = writer_key(ActivePath),
+    WriterDir = writer_dir_from_dir(Dir),
+    maybe_run_writer_registry_hook(before_tab2list, Registry),
+    close_writer_entries(
+        [{Key, Handle} || {Key, WriterDir0, Handle, _Position} <- writer_registry_entries(Registry),
+                          WriterDir0 =:= WriterDir,
+                          Key =/= ActiveKey]
+    ).
+
+close_writers_for_dir(Dir) ->
+    Registry = ensure_writer_registry(),
+    WriterDir = writer_dir_from_dir(Dir),
+    maybe_run_writer_registry_hook(before_tab2list, Registry),
+    close_writer_entries(
+        [{Key, Handle} || {Key, WriterDir0, Handle, _Position} <- writer_registry_entries(Registry),
+                          WriterDir0 =:= WriterDir]
+    ).
+
+close_writer_for_path(Path) ->
+    Registry = ensure_writer_registry(),
+    Key = writer_key(Path),
+    case ets:lookup(Registry, Key) of
+        [{Key, _Dir, Handle, _Position}] -> close_writer_entry(Key, Handle);
+        [] -> ok
+    end.
+
+close_writer_entries([]) ->
+    ok;
+close_writer_entries([{Key, Handle} | Rest]) ->
+    case close_writer_entry(Key, Handle) of
+        ok -> close_writer_entries(Rest);
         {error, _Reason} = Error -> Error
+    end.
+
+close_writer_entry(Key, Handle) ->
+    Registry = ensure_writer_registry(),
+    Result =
+        try ferricstore_wal_nif:close(Handle) of
+            ok -> ok;
+            {error, Reason} -> {error, {wal_nif_close, Key, Reason}};
+            Other -> {error, {wal_nif_close, Key, Other}}
+        catch
+            Class:Reason -> {error, {wal_nif_close, Key, Class, Reason}}
+        end,
+    case Result of
+        ok ->
+            true = ets:delete(Registry, Key),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+ensure_writer_registry() ->
+    case ets:info(?WRITER_REGISTRY) of
+        undefined ->
+            try ets:new(?WRITER_REGISTRY, [named_table, public, set, {read_concurrency, true}]) of
+                Tid -> Tid
+            catch
+                error:badarg -> ?WRITER_REGISTRY
+            end;
+        _ ->
+            ?WRITER_REGISTRY
+    end.
+
+writer_registry_entries(Registry) ->
+    try ets:tab2list(Registry) of
+        Entries -> Entries
+    catch
+        %% The registry is a process-owned ETS table. During WARaft one-for-all
+        %% shutdown another log process may lose the table after ensure but
+        %% before traversal; close is best-effort in that already-cleaned state.
+        error:badarg -> []
+    end.
+
+writer_key(Path) ->
+    filename:absname(Path).
+
+writer_dir(Path) ->
+    writer_dir_from_dir(filename:dirname(Path)).
+
+writer_dir_from_dir(Dir) ->
+    filename:absname(Dir).
+
+wal_nif_default_commit_delay_us() ->
+    non_neg_int_env(wal_commit_delay_us, 6000, bad_wal_commit_delay_us).
+
+wal_nif_sync_delay_us() ->
+    case application:get_env(ferricstore, waraft_segment_log_sync_delay_us) of
+        {ok, Value} when is_integer(Value), Value >= 0 ->
+            {ok, Value};
+        {ok, Other} ->
+            {error, {bad_segment_sync_delay_us, Other}};
+        undefined ->
+            %% WARaft already uses wal_commit_delay_us to size its commit batch window.
+            %% Do not apply the same delay again at the segment fdatasync boundary.
+            {ok, 0}
+    end.
+
+wal_nif_sync_timeout_ms() ->
+    non_neg_int_env(
+        waraft_segment_log_wal_nif_sync_timeout_ms,
+        ?DEFAULT_WAL_NIF_SYNC_TIMEOUT_MS,
+        bad_segment_wal_nif_sync_timeout_ms
+    ).
+
+wal_nif_max_buffer_bytes() ->
+    non_neg_int_env(wal_max_buffer_bytes, ?DEFAULT_WAL_NIF_MAX_BUFFER_BYTES, bad_wal_max_buffer_bytes).
+
+non_neg_int_env(Key, Default, ErrorTag) ->
+    case application:get_env(ferricstore, Key, Default) of
+        Value when is_integer(Value), Value >= 0 -> {ok, Value};
+        Other -> {error, {ErrorTag, Other}}
     end.
 
 maybe_run_rewrite_hook(Phase) ->
@@ -1784,10 +2187,26 @@ maybe_run_rollback_hook(BinaryPath) ->
             ok
     end.
 
-maybe_run_file_sync_hook(BinaryPath) ->
+maybe_run_preallocate_hook(BinaryPath, Bytes) ->
+    case application:get_env(ferricstore, waraft_segment_log_preallocate_hook) of
+        {ok, {notify, Notify}} ->
+            Notify ! {waraft_segment_log_preallocate, BinaryPath, Bytes},
+            ok;
+        {ok, {fail_once, Notify}} ->
+            application:unset_env(ferricstore, waraft_segment_log_preallocate_hook),
+            Notify ! {waraft_segment_log_preallocate, BinaryPath, Bytes},
+            {error, {preallocate_hook, BinaryPath, Bytes}};
+        _ ->
+            ok
+    end.
+
+maybe_run_file_sync_hook(BinaryPath, Method) ->
     case application:get_env(ferricstore, waraft_segment_log_file_sync_hook) of
         {ok, {notify, Notify}} ->
             Notify ! {waraft_segment_log_file_sync, BinaryPath},
+            ok;
+        {ok, {notify_with_method, Notify}} ->
+            Notify ! {waraft_segment_log_file_sync, BinaryPath, Method},
             ok;
         {ok, {fail_once, Notify}} ->
             application:unset_env(ferricstore, waraft_segment_log_file_sync_hook),
@@ -1798,6 +2217,19 @@ maybe_run_file_sync_hook(BinaryPath) ->
         {ok, {fail_on_count, Target, Notify, Count0}}
             when is_integer(Target), Target > 0, is_integer(Count0) ->
             maybe_fail_file_sync_count(BinaryPath, Target, Notify, Count0 + 1);
+        _ ->
+            ok
+    end.
+
+maybe_run_wal_nif_sync_hook(BinaryPath, DelayUs) ->
+    case application:get_env(ferricstore, waraft_segment_log_wal_nif_sync_hook) of
+        {ok, {notify, Notify}} ->
+            Notify ! {waraft_segment_log_wal_nif_sync, BinaryPath, DelayUs},
+            ok;
+        {ok, {fail_once, Notify}} ->
+            application:unset_env(ferricstore, waraft_segment_log_wal_nif_sync_hook),
+            Notify ! {waraft_segment_log_wal_nif_sync, BinaryPath, DelayUs},
+            {error, {wal_nif_sync_hook, BinaryPath, DelayUs}};
         _ ->
             ok
     end.
@@ -1842,6 +2274,17 @@ maybe_fail_sync_dir_count(BinaryPath, Target, Notify, Count) ->
             ok
     end.
 
+maybe_run_writer_registry_hook(Phase, Registry) ->
+    case application:get_env(ferricstore, waraft_segment_log_writer_registry_hook) of
+        {ok, {delete_once, Phase, Notify}} ->
+            application:unset_env(ferricstore, waraft_segment_log_writer_registry_hook),
+            Notify ! {waraft_segment_log_writer_registry_hook, Phase},
+            catch ets:delete(Registry),
+            ok;
+        _ ->
+            ok
+    end.
+
 unique_suffix() ->
     integer_to_list(erlang:unique_integer([positive, monotonic])).
 
@@ -1850,11 +2293,7 @@ emit_corrupt_segment(Path, Reason) ->
         path => unicode:characters_to_binary(Path),
         reason => Reason
     },
-    try telemetry:execute([ferricstore, waraft, segment_log_corrupt], #{count => 1}, Metadata) of
-        _ -> ok
-    catch
-        _:_ -> ok
-    end.
+    emit_telemetry([ferricstore, waraft, segment_log_corrupt], #{count => 1}, Metadata).
 
 emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment) ->
     Duration = erlang:monotonic_time() - StartedAt,
@@ -1874,10 +2313,20 @@ emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment) ->
         bytes => Bytes,
         duration => Duration
     },
-    try telemetry:execute([ferricstore, waraft, segment_log, append], Measurements, Metadata) of
-        _ -> ok
-    catch
-        _:_ -> ok
+    emit_telemetry([ferricstore, waraft, segment_log, append], Measurements, Metadata).
+
+emit_telemetry(Event, Measurements, Metadata) ->
+    %% telemetry:execute/3 logs a warning when the telemetry application has not
+    %% booted yet. The segment append path is hot, so skip cleanly in that case.
+    case persistent_term:get(telemetry, undefined) of
+        undefined ->
+            ok;
+        _ ->
+            try telemetry:execute(Event, Measurements, Metadata) of
+                _ -> ok
+            catch
+                _:_ -> ok
+            end
     end.
 
 segment_append_result(ok) ->

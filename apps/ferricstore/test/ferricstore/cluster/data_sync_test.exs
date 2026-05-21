@@ -1,5 +1,5 @@
 defmodule Ferricstore.Cluster.DataSyncTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Ferricstore.Cluster.DataSync
 

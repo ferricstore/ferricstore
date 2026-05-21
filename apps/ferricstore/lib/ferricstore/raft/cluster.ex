@@ -44,14 +44,17 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec start_system(binary()) :: :ok | {:error, term()}
   def start_system(data_dir) do
-    if Backend.waraft?() do
-      :ok
-    else
-      start_legacy_system(data_dir)
-    end
+    start_system(data_dir, Backend.selected())
   end
 
+  @doc false
+  @spec start_system(binary(), :ra | :waraft) :: :ok | {:error, term()}
+  def start_system(data_dir, :ra), do: start_legacy_system(data_dir)
+  def start_system(_data_dir, :waraft), do: :ok
+
   defp start_legacy_system(data_dir) do
+    remember_local_raft_node!()
+
     ra_dir_str = Path.join(data_dir, "ra")
     created? = not Ferricstore.FS.dir?(ra_dir_str)
     Ferricstore.FS.mkdir_p!(ra_dir_str)
@@ -143,30 +146,36 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec stop_system() :: :ok | {:error, term()}
   def stop_system do
-    if Backend.waraft?() do
-      :ok
-    else
-      stop_legacy_system()
-    end
+    stop_system(Backend.selected())
   end
 
+  @doc false
+  @spec stop_system(:ra | :waraft) :: :ok | {:error, term()}
+  def stop_system(:ra), do: stop_legacy_system()
+  def stop_system(:waraft), do: :ok
+
   defp stop_legacy_system do
-    case :ra_system.stop(@ra_system) do
-      :ok ->
-        :ok
+    result =
+      case :ra_system.stop(@ra_system) do
+        :ok ->
+          :ok
 
-      {:error, {:not_found, _}} ->
-        :ok
+        {:error, {:not_found, _}} ->
+          :ok
 
-      {:error, :not_found} ->
-        :ok
+        {:error, :not_found} ->
+          :ok
 
-      {:error, reason} = error ->
-        Logger.warning("Failed to stop ra system #{inspect(@ra_system)}: #{inspect(reason)}")
-        error
-    end
+        {:error, reason} = error ->
+          Logger.warning("Failed to stop ra system #{inspect(@ra_system)}: #{inspect(reason)}")
+          error
+      end
+
+    Application.delete_env(:ferricstore, :raft_local_node)
+    result
   catch
     :exit, {:noproc, _} ->
+      Application.delete_env(:ferricstore, :raft_local_node)
       :ok
   end
 
@@ -237,6 +246,7 @@ defmodule Ferricstore.Raft.Cluster do
       ets: ets,
       data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
       instance_name: instance_name,
+      blob_side_channel_threshold_bytes: Keyword.get(opts, :blob_side_channel_threshold_bytes, 0),
       skip_below_index: skip_below_index,
       zset_score_index_name: Keyword.get(opts, :zset_score_index_name),
       zset_score_lookup_name: Keyword.get(opts, :zset_score_lookup_name),
@@ -673,6 +683,7 @@ defmodule Ferricstore.Raft.Cluster do
       ets: ets,
       data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
       instance_name: instance_name,
+      blob_side_channel_threshold_bytes: Keyword.get(opts, :blob_side_channel_threshold_bytes, 0),
       skip_below_index: skip_below_index,
       zset_score_index_name: Keyword.get(opts, :zset_score_index_name),
       zset_score_lookup_name: Keyword.get(opts, :zset_score_lookup_name),
@@ -680,18 +691,8 @@ defmodule Ferricstore.Raft.Cluster do
       flow_lookup_name: Keyword.get(opts, :flow_lookup_name)
     }
 
-    # In cluster mode, initial_members includes all configured nodes.
-    # In single-node mode (no cluster_nodes), just self.
     cluster_nodes = Application.get_env(:ferricstore, :cluster_nodes, [])
-
-    initial_members =
-      if cluster_nodes == [] do
-        [server_id]
-      else
-        Enum.map(cluster_nodes, fn node ->
-          shard_server_id_on(shard_index, node)
-        end)
-      end
+    initial_members = boot_initial_members(shard_index, server_id, cluster_nodes)
 
     server_config = %{
       id: server_id,
@@ -727,6 +728,27 @@ defmodule Ferricstore.Raft.Cluster do
   @spec wait_for_leader_on_start?(keyword()) :: boolean()
   def wait_for_leader_on_start?(opts) do
     Keyword.get(opts, :wait_for_leader, true)
+  end
+
+  @doc false
+  @spec boot_initial_members(non_neg_integer(), :ra.server_id(), [node()]) :: [:ra.server_id()]
+  def boot_initial_members(_shard_index, server_id, []), do: [server_id]
+
+  def boot_initial_members(shard_index, server_id, cluster_nodes) when is_list(cluster_nodes) do
+    if local_raft_node() in cluster_nodes do
+      # Initial cluster bootstrap: every configured node starts with the same
+      # full member set, so Ra can elect a quorum immediately.
+      Enum.map(cluster_nodes, fn node ->
+        shard_server_id_on(shard_index, node)
+      end)
+    else
+      # Auto-join/rejoin bootstrap: the node was pointed at an existing
+      # cluster, but it is not a member yet. Starting with remote initial
+      # members here creates a dead Ra group that cannot elect and races with
+      # the real join flow. Boot locally; Cluster.Manager will stop this local
+      # group after the app is ready, sync data, and join the real group.
+      [server_id]
+    end
   end
 
   @doc false
@@ -1069,12 +1091,25 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec shard_server_id(non_neg_integer()) :: :ra.server_id()
   def shard_server_id(shard_index) do
-    {:"ferricstore_shard_#{shard_index}", node()}
+    {:"ferricstore_shard_#{shard_index}", local_raft_node()}
   end
 
   # ---------------------------------------------------------------------------
   # Private
   # ---------------------------------------------------------------------------
+
+  @doc false
+  def local_raft_node do
+    Application.get_env(:ferricstore, :raft_local_node, node())
+  end
+
+  defp remember_local_raft_node! do
+    # Ra server IDs include the Erlang node name. If a test or embedded host
+    # starts distribution after FerricStore has booted, node() changes, but the
+    # already-started Ra servers keep the original ID. Keep the boot identity
+    # stable so membership APIs keep addressing the real local servers.
+    Application.put_env(:ferricstore, :raft_local_node, node())
+  end
 
   defp shard_uid(shard_index) do
     "ferricstore_shard_#{shard_index}"
@@ -1112,8 +1147,12 @@ defmodule Ferricstore.Raft.Cluster do
 
   defp wait_for_leader(server_id, attempts) do
     case :ra.members(server_id) do
-      {:ok, _members, _leader} ->
+      {:ok, _members, leader} when leader not in [nil, :undefined] ->
         :ok
+
+      {:ok, _members, _leader_not_ready} ->
+        Process.sleep(50)
+        wait_for_leader(server_id, attempts - 1)
 
       {:error, _} ->
         Process.sleep(50)

@@ -280,9 +280,12 @@ defmodule Ferricstore.Store.Shard do
               active_file_path,
               ets,
               ctx.name,
-              # Start all Ra servers first, then Application waits for all
-              # elections in parallel before marking the node ready.
-              wait_for_leader: false,
+              # During full application boot, start all Ra servers first and
+              # let Application elect/wait for every shard in parallel. During
+              # a supervised shard restart, this process is the only restart
+              # coordinator, so it must restore a writable Ra leader itself.
+              wait_for_leader: not Ferricstore.Application.starting?(),
+              blob_side_channel_threshold_bytes: ctx.blob_side_channel_threshold_bytes,
               zset_score_index_name: zset_score_index,
               zset_score_lookup_name: zset_score_lookup,
               flow_index_name: flow_index,
@@ -1174,6 +1177,11 @@ defmodule Ferricstore.Store.Shard do
         state.ets,
         if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
         wait_for_leader: false,
+        blob_side_channel_threshold_bytes:
+          if(state.instance_ctx,
+            do: state.instance_ctx.blob_side_channel_threshold_bytes,
+            else: 0
+          ),
         active_file_preallocated_to: state.active_file_preallocated_to,
         zset_score_index_name: state.zset_score_index,
         zset_score_lookup_name: state.zset_score_lookup,

@@ -9,11 +9,50 @@ defmodule Ferricstore.Raft.Backend do
 
   alias Ferricstore.Raft.WARaftBackend
 
+  @running_backend_key {__MODULE__, :running_backend}
+
   @spec selected() :: :ra | :waraft
   def selected do
     Application.get_env(:ferricstore, :raft_backend, :ra)
     |> normalize_selected()
   end
+
+  @doc false
+  @spec put_running!(:ra | :waraft) :: :ok
+  def put_running!(backend) when backend in [:ra, :waraft] do
+    :persistent_term.put(@running_backend_key, backend)
+    :ok
+  end
+
+  @doc false
+  @spec clear_running() :: :ok
+  def clear_running do
+    :persistent_term.erase(@running_backend_key)
+    :ok
+  end
+
+  @doc """
+  Returns the backend used by the currently running default application.
+
+  This is intentionally separate from `selected/0`: `selected/0` reads mutable
+  application env and is useful before startup, while default-instance runtime
+  routing must stay pinned to the backend that actually booted.
+  """
+  @spec running() :: :ra | :waraft | :undefined
+  def running do
+    :persistent_term.get(@running_backend_key, :undefined)
+  end
+
+  @spec running_or_selected() :: :ra | :waraft
+  def running_or_selected do
+    case running() do
+      backend when backend in [:ra, :waraft] -> backend
+      :undefined -> selected()
+    end
+  end
+
+  @spec running_waraft?() :: boolean()
+  def running_waraft?, do: running_or_selected() == :waraft
 
   defp normalize_selected(value) when value in [:ra, "ra"], do: :ra
   defp normalize_selected(value) when value in [:waraft, "waraft"], do: :waraft

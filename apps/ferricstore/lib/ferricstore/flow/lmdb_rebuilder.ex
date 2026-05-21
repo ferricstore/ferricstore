@@ -144,7 +144,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp persist_terminal_counts(%{terminal_counts: counts} = stats, lmdb_path) do
-    if map_size(counts) == 0 and not File.dir?(lmdb_path) do
+    if map_size(counts) == 0 and not Ferricstore.FS.dir?(lmdb_path) do
       stats
     else
       do_persist_terminal_counts(stats, counts, lmdb_path)

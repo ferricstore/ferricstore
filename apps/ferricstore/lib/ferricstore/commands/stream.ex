@@ -448,13 +448,7 @@ defmodule Ferricstore.Commands.Stream do
   """
   @spec clear_local_state() :: :ok
   def clear_local_state do
-    Enum.each([@meta_table, @groups_table, @index_table, @stream_waiters_table], fn table ->
-      if :ets.whereis(table) != :undefined do
-        :ets.delete_all_objects(table)
-      end
-    end)
-
-    :ok
+    Ferricstore.Stream.LocalState.clear()
   end
 
   @doc """
@@ -1054,10 +1048,12 @@ defmodule Ferricstore.Commands.Stream do
 
               {first_raw, last_raw} =
                 if first != "0-0" do
-                  [first_raw, last_raw] = Ops.batch_get(store, [prefix <> first, last_key])
+                  [first_raw, last_raw] =
+                    batch_get_stream_entries(store, key, [prefix <> first, last_key])
+
                   {first_raw, last_raw}
                 else
-                  [last_raw] = Ops.batch_get(store, [last_key])
+                  [last_raw] = batch_get_stream_entries(store, key, [last_key])
                   {nil, last_raw}
                 end
 
@@ -1303,8 +1299,7 @@ defmodule Ferricstore.Commands.Stream do
                   |> Enum.sort_by(fn {id, _} -> parse_id!(id) end)
                   |> maybe_take_tuples(count)
                   |> Enum.map(fn {id_str_inner, _} ->
-                    prefix = "X:#{key}" <> @sep
-                    raw = Ops.get(store, prefix <> id_str_inner)
+                    raw = get_stream_entry(store, key, stream_entry_key(key, id_str_inner))
 
                     case decode_stream_fields(raw) do
                       {:ok, fields} -> [id_str_inner | fields]
@@ -1489,6 +1484,22 @@ defmodule Ferricstore.Commands.Stream do
       Ops.compound_put(store, stream_key, compound_key, encoded, 0)
     else
       Ops.put(store, compound_key, encoded, 0)
+    end
+  end
+
+  defp get_stream_entry(store, stream_key, compound_key) do
+    if Ops.has_compound?(store) do
+      Ops.compound_get(store, stream_key, compound_key)
+    else
+      Ops.get(store, compound_key)
+    end
+  end
+
+  defp batch_get_stream_entries(store, stream_key, compound_keys) do
+    if Ops.has_compound?(store) do
+      Ops.compound_batch_get(store, stream_key, compound_keys)
+    else
+      Ops.batch_get(store, compound_keys)
     end
   end
 

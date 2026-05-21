@@ -21,6 +21,7 @@ config :ferricstore, :sync_flush_timeout_ms, 1_000
 
 # MemoryGuard: use large budget and slow interval to avoid noise in tests
 config :ferricstore, :max_memory_bytes, 1_073_741_824
+config :ferricstore, :keydir_max_ram, 100_000_000_000
 config :ferricstore, :eviction_policy, :volatile_lru
 config :ferricstore, :memory_guard_interval_ms, 5_000
 

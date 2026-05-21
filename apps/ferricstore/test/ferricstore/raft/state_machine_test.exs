@@ -14,6 +14,12 @@ defmodule Ferricstore.Raft.StateMachineTest do
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
+  def handle_flow_append_telemetry(_event, measurements, metadata, {test_pid, shard_index}) do
+    if metadata[:shard_index] == shard_index do
+      send(test_pid, {:flow_bitcask_append, measurements, metadata})
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Setup: create a temporary Bitcask store and ETS table for each test.
   # Also starts a BitcaskWriter for shard 0 so that background writes from
@@ -391,10 +397,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
         :telemetry.attach(
           handler_id,
           [:ferricstore, :bitcask, :append],
-          fn _event, measurements, metadata, test_pid ->
-            send(test_pid, {:flow_bitcask_append, measurements, metadata})
-          end,
-          self()
+          &__MODULE__.handle_flow_append_telemetry/4,
+          {self(), shard_index}
         )
 
       partition_key = "tenant-batched-append"
@@ -459,10 +463,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
         :telemetry.attach(
           handler_id,
           [:ferricstore, :bitcask, :append],
-          fn _event, measurements, metadata, test_pid ->
-            send(test_pid, {:flow_bitcask_append, measurements, metadata})
-          end,
-          self()
+          &__MODULE__.handle_flow_append_telemetry/4,
+          {self(), shard_index}
         )
 
       partition_key = "tenant-ra-batched-flow"
@@ -526,7 +528,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
-    test "claim_due stages state and history into one append batch", %{
+    test "claim_due stages claimed state records into one append batch", %{
       state: state,
       shard_index: shard_index
     } do
@@ -576,10 +578,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
         :telemetry.attach(
           handler_id,
           [:ferricstore, :bitcask, :append],
-          fn _event, measurements, metadata, test_pid ->
-            send(test_pid, {:flow_bitcask_append, measurements, metadata})
-          end,
-          self()
+          &__MODULE__.handle_flow_append_telemetry/4,
+          {self(), shard_index}
         )
 
       due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
@@ -607,7 +607,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
                         %{shard_index: ^shard_index, status: :ok}},
                        500
 
-        assert measurements.batch_size == 6
+        assert measurements.batch_size == 3
         assert measurements.delete_count == 0
         assert measurements.batch_bytes > 0
 
@@ -780,6 +780,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
       Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
       Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
+      state = %{state | flow_lmdb_mirror?: true}
 
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
       :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
@@ -888,6 +889,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
       Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
       Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
+      state = %{state | flow_lmdb_mirror?: true}
 
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
       :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
@@ -1006,6 +1008,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
       Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
       Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
+      state = %{state | flow_lmdb_mirror?: true}
 
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
       :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
@@ -3931,6 +3934,30 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, compound_key)
     end
 
+    test "mixed batch with multiple compound puts publishes every field after append", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "compound_batch_many_puts"
+      field_a = CompoundKey.hash_field(redis_key, "a")
+      field_b = CompoundKey.hash_field(redis_key, "b")
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:batch,
+           [
+             {:compound_batch_put, redis_key, [{field_a, "va", 0}]},
+             {:compound_batch_put, redis_key, [{field_b, "vb", 0}]}
+           ]},
+          state
+        )
+
+      assert result == {:ok, [:ok, :ok]}
+      assert [{^field_a, "va", 0, _lfu, _fid, _off, 2}] = :ets.lookup(ets, field_a)
+      assert [{^field_b, "vb", 0, _lfu, _fid, _off, 2}] = :ets.lookup(ets, field_b)
+    end
+
     test "compound blob batch put stores inline and blob ref entries", %{
       state: state,
       ets: ets
@@ -5062,9 +5089,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
       pending_release_cursor_checkpoint_count = :atomics.new(2, signed: false)
       replay_safe_index = :atomics.new(2, signed: false)
       flow_lmdb_replay_safe_index = :atomics.new(2, signed: false)
+      flow_history_projected_index = :atomics.new(2, signed: false)
 
       :atomics.put(replay_safe_index, shard0 + 1, 2)
       :atomics.put(flow_lmdb_replay_safe_index, shard0 + 1, 2)
+      :atomics.put(flow_history_projected_index, shard0 + 1, 2)
 
       state =
         init_state_for_release_cursor(ets,
@@ -5086,6 +5115,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
         pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,
         replay_safe_index: replay_safe_index,
         flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
+        flow_history_projected_index: flow_history_projected_index,
         hot_cache_max_value_size: 64
       }
 
@@ -5372,9 +5402,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
       last_released_cursor_index = :atomics.new(atomics_size, signed: false)
       replay_safe_index = :atomics.new(atomics_size, signed: false)
       flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
+      flow_history_projected_index = :atomics.new(atomics_size, signed: false)
 
       :atomics.put(replay_safe_index, shard_index + 1, marker_index)
       :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, marker_index)
+      :atomics.put(flow_history_projected_index, shard_index + 1, marker_index)
 
       state = %{
         state
@@ -5389,7 +5421,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
             last_applied_index: last_applied_index,
             last_released_cursor_index: last_released_cursor_index,
             replay_safe_index: replay_safe_index,
-            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index
+            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
+            flow_history_projected_index: flow_history_projected_index
           }
       }
 
@@ -5418,8 +5451,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
       last_released_cursor_index = :atomics.new(atomics_size, signed: false)
       replay_safe_index = :atomics.new(atomics_size, signed: false)
       flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
+      flow_history_projected_index = :atomics.new(atomics_size, signed: false)
 
       :atomics.put(replay_safe_index, shard_index + 1, marker_index)
+      :atomics.put(flow_history_projected_index, shard_index + 1, marker_index)
 
       state = %{
         state
@@ -5434,7 +5469,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
             last_applied_index: last_applied_index,
             last_released_cursor_index: last_released_cursor_index,
             replay_safe_index: replay_safe_index,
-            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index
+            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
+            flow_history_projected_index: flow_history_projected_index
           }
       }
 
@@ -5462,9 +5498,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
       last_released_cursor_index = :atomics.new(atomics_size, signed: false)
       replay_safe_index = :atomics.new(atomics_size, signed: false)
       flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
+      flow_history_projected_index = :atomics.new(atomics_size, signed: false)
 
       :atomics.put(replay_safe_index, shard_index + 1, marker_index)
       :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, marker_index)
+      :atomics.put(flow_history_projected_index, shard_index + 1, marker_index)
 
       state = %{
         state
@@ -5479,7 +5517,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
             last_applied_index: last_applied_index,
             last_released_cursor_index: last_released_cursor_index,
             replay_safe_index: replay_safe_index,
-            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index
+            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
+            flow_history_projected_index: flow_history_projected_index
           }
       }
 
@@ -5510,6 +5549,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       :atomics.put(instance_ctx.replay_safe_index, shard_index + 1, 77)
       :atomics.put(instance_ctx.flow_lmdb_replay_safe_index, shard_index + 1, 77)
+      :atomics.put(instance_ctx.flow_history_projected_index, shard_index + 1, 77)
 
       on_exit({:cursor_metric_instance, instance_name}, fn ->
         FerricStore.Instance.cleanup(instance_name)
@@ -5813,9 +5853,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
     atomics_size = shard_index + 1
     replay_safe_index = :atomics.new(atomics_size, signed: false)
     flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
+    flow_history_projected_index = :atomics.new(atomics_size, signed: false)
 
     :atomics.put(replay_safe_index, shard_index + 1, durable_index)
     :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, durable_index)
+    :atomics.put(flow_history_projected_index, shard_index + 1, durable_index)
 
     [
       checkpoint_flags: :atomics.new(atomics_size, signed: false),
@@ -5825,6 +5867,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       last_released_cursor_index: :atomics.new(atomics_size, signed: false),
       replay_safe_index: replay_safe_index,
       flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
+      flow_history_projected_index: flow_history_projected_index,
       hot_cache_max_value_size: 65_536
     ]
     |> Keyword.merge(overrides)

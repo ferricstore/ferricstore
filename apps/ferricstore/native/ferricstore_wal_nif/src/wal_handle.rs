@@ -86,6 +86,49 @@ impl WalHandle {
         })
     }
 
+    /// Open a generic append file without the Ra WAL header offset.
+    ///
+    /// Used by WARaft segment logs where byte 0 is the first segment record.
+    pub fn open_raw_append(
+        path: String,
+        commit_delay_us: u64,
+        max_buffer_bytes: u64,
+        start_offset: u64,
+    ) -> io::Result<Self> {
+        let (file, _o_direct) = background_thread::open_raw_append_file(&path, start_offset)?;
+
+        let read_file = std::fs::OpenOptions::new().read(true).open(&path)?;
+
+        let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
+        let (flush_tx, flush_rx) = crossbeam_channel::bounded(1024);
+        let alive = Arc::new(AtomicBool::new(true));
+        let file_size = Arc::new(AtomicU64::new(start_offset));
+        let config = ThreadConfig {
+            file,
+            buffer: buffer.clone(),
+            rx: flush_rx,
+            alive: alive.clone(),
+            file_size: file_size.clone(),
+            commit_delay: Duration::from_micros(commit_delay_us),
+            _use_o_direct: _o_direct,
+        };
+
+        let thread_handle = std::thread::Builder::new()
+            .name("ferricstore-wal".into())
+            .spawn(move || background_thread::thread_loop(config))?;
+
+        Ok(WalHandle {
+            buffer,
+            flush_tx,
+            alive,
+            file_size_counter: file_size,
+            max_buffer_bytes,
+            commit_delay: Duration::from_micros(commit_delay_us),
+            thread_handle: Mutex::new(Some(thread_handle)),
+            read_file: Mutex::new(read_file),
+        })
+    }
+
     /// Check if the background thread is alive. Returns Err if dead.
     pub fn check_alive(&self) -> Result<(), rustler::Error> {
         if self.alive.load(Ordering::Acquire) {
@@ -328,6 +371,20 @@ mod tests {
         let contents = std::fs::read(&path_clone).unwrap();
         assert!(contents.len() >= hdr + 18);
         assert_eq!(&contents[hdr..hdr + 18], b"first second third");
+    }
+
+    #[test]
+    fn raw_append_starts_at_requested_offset_without_wal_header_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment.seg").to_str().unwrap().to_string();
+        let path_clone = path.clone();
+
+        let handle = WalHandle::open_raw_append(path, 0, 64 * 1024 * 1024, 0).unwrap();
+        handle.buffer_write(b"segment-record").unwrap();
+        handle.close().unwrap();
+
+        assert_eq!(handle.file_size(), 14);
+        assert_eq!(std::fs::read(path_clone).unwrap(), b"segment-record");
     }
 
     #[test]

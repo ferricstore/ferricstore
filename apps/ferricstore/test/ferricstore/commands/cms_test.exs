@@ -5,6 +5,14 @@ defmodule Ferricstore.Commands.CMSTest do
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Test.ProbMockStore
 
+  defp temp_prob_dir(prefix, suffix) do
+    Path.join(System.tmp_dir!(), "#{prefix}_#{suffix}")
+  end
+
+  defp unique_suffix do
+    "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive, :monotonic])}"
+  end
+
   # ===========================================================================
   # CMS.INITBYDIM
   # ===========================================================================
@@ -25,13 +33,11 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "uses key-specific probabilistic directory when available" do
-      wrong_dir =
-        Path.join(System.tmp_dir!(), "cms_wrong_prob_#{System.unique_integer([:positive])}")
+      suffix = unique_suffix()
+      wrong_dir = temp_prob_dir("cms_wrong_prob", suffix)
+      right_dir = temp_prob_dir("cms_right_prob", suffix)
 
-      right_dir =
-        Path.join(System.tmp_dir!(), "cms_right_prob_#{System.unique_integer([:positive])}")
-
-      key = "key_specific_cms"
+      key = "key_specific_cms_#{suffix}"
       safe = Base.url_encode64(key, padding: false)
       wrong_path = Path.join(wrong_dir, "#{safe}.cms")
       right_path = Path.join(right_dir, "#{safe}.cms")

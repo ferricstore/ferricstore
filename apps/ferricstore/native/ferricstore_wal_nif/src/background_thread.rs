@@ -408,6 +408,65 @@ pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, b
     Ok((file, o_direct))
 }
 
+/// Open a generic append log file and seek to the supplied logical end.
+///
+/// WARaft segment files are self-framed from byte 0 and must not contain the
+/// 5-byte Ra WAL header gap. Segment preallocation is handled separately with
+/// KEEP_SIZE so recovery never scans zero-filled preallocated trailers.
+pub fn open_raw_append_file(path: &str, start_offset: u64) -> io::Result<(File, bool)> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(path)?;
+
+    file.seek(SeekFrom::Start(start_offset))?;
+    Ok((file, false))
+}
+
+/// Reserve disk space without changing the logical file length.
+///
+/// Segment logs append framed records and recover by scanning until EOF. Extending
+/// the visible file length during preallocation would leave zero-filled trailer
+/// bytes that look like a torn/corrupt record. Linux has a keep-size fallocate
+/// mode for this; other platforms keep the call as a safe no-op.
+pub fn preallocate_keep_size_path(path: &str, bytes: u64) -> io::Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(path)?;
+
+        let ret = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                bytes as libc::off_t,
+            )
+        };
+
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
     // Ra WAL files have a 5-byte header, so the first data write starts at
@@ -526,6 +585,18 @@ mod tests {
             target: FlushTarget::Test(tx),
             commit_delay,
         }
+    }
+
+    #[test]
+    fn preallocate_keep_size_does_not_extend_logical_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment.seg");
+        std::fs::write(&path, b"abc").unwrap();
+
+        preallocate_keep_size_path(path.to_str().unwrap(), 1024 * 1024).unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), 3);
     }
 
     #[test]

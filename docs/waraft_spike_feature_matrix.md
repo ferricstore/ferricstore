@@ -7,8 +7,8 @@ the current Ra path until both performance and feature contracts are proven.
 
 | Feature | WARaft Status | FerricStore Work Needed | Migration Risk |
 | --- | --- | --- | --- |
-| Custom segmented WAL | Supported by `log_module` in the partition spec and `wa_raft_log` callbacks. Spike provider `ferricstore_waraft_spike_segment_log` now proves CRC-framed fsynced append, recovery scan, persisted trim/rotation, crash-atomic trim rewrite, corruption telemetry, append/fsync telemetry, restart, multi-partition commit, and 3-node commit. | Replace spike provider with production WAL: larger segments, production group-fsync policy, byte backpressure, and integration with Bitcask/blob checkpoints. | High |
-| Snapshot install | Supported through storage snapshot callbacks and transport snapshot delivery. Spike test installs a snapshot into a stalled member and verifies state is readable. Backend tests now copy real Bitcask/blob/prob payload dirs, tolerate only payload dirs recorded as empty at snapshot creation, reject missing non-empty payload dirs, and cover partial install recovery. Segment-projected WARaft compound data is carried by the WARaft segment/projection log, not promoted dedicated dirs. | Map this into FerricStore cluster commands and add kill-during-transfer/load chaos tests. | High |
+| Custom segmented WAL | Supported by `log_module` in the partition spec and `wa_raft_log` callbacks. Spike provider `ferricstore_waraft_spike_segment_log` now proves CRC-framed grouped append, datasync-before-ack, keep-size preallocation hooks, recovery scan, persisted trim/rotation, crash-atomic trim rewrite, corruption telemetry, append/fsync telemetry, restart, multi-partition commit, and 3-node commit. | Replace the separate WAL + Bitcask payload files with the final unified segment format, then add byte backpressure and production tuning on real Azure runs. | High |
+| Snapshot install | Supported through storage snapshot callbacks and transport snapshot delivery. Spike test installs a snapshot into a stalled member and verifies state is readable. Backend tests now copy real Bitcask/blob/prob payload dirs, tolerate only payload dirs recorded as empty at snapshot creation, reject missing non-empty payload dirs, and cover partial install recovery. Segment-backed WARaft compound data is carried by the WARaft segment/projection log, not promoted dedicated dirs. | Map this into FerricStore cluster commands and add kill-during-transfer/load chaos tests. | High |
 | Membership changes | Supported by `wa_raft_server:adjust_membership/3,4` and participant/member/witness transitions. Backend tests now cover dynamic member removal and staged member add with participant config, snapshot transfer, readiness wait, promotion, and post-add writes. | Wrap with FerricStore cluster commands plus replace/reject rules for existing standalone data. | High |
 | Backpressure | Supported by commit/apply/read queue limits and queue inspection helpers. Spike test verifies tagged async `commit_queue_full` replies. The FerricStore backend maps WARaft queue/full-byte rejections to the existing `:overloaded` write error and has an optional per-shard in-flight command byte gate with telemetry on rejection. Current per-shard in-flight bytes are exposed in `INFO raft`, `DEBUG BATCHER-STATS`, and Prometheus metrics. | Tune byte limits for large values before replacement. | Medium |
 | Command correlation/replies | Supported by `wa_raft_acceptor:commit_async/4`; reply is sent after storage apply completes. Spike tests verify tagged replies and storage visibility after `:ok`. | Preserve FerricStore request ids, timeout/unknown handling, and protocol error mapping. | Medium |
@@ -54,6 +54,20 @@ Covered:
   prove the segment file fsync happens before append returns, failed file fsync
   rolls back unacknowledged bytes, and a same-segment multi-record append uses
   one file fsync for the group rather than one fsync per record.
+- Durable segmented log appends can use either the conservative Erlang
+  `file:write` + `file:datasync` path or `:waraft_segment_log_io_mode =
+  :wal_nif`. The WAL-NIF mode keeps one active raw append handle per segment,
+  writes records from byte 0 with no Ra WAL header gap, and completes fdatasync
+  on the Rust background I/O thread before the WARaft append returns. Tests
+  cover restart recovery and rollback when the async sync boundary fails.
+- The file writer uses `file:datasync/1` by default for data-record durability,
+  with `:waraft_segment_log_sync_method` available for forcing `:sync` in
+  experiments. Tests assert the sync method at the append boundary.
+- New segment preallocation is wired through the WAL NIF's keep-size fallocate
+  helper instead of Erlang `file:allocate/3`, because extending the logical file
+  size would leave zero trailer bytes that break deterministic segment recovery.
+  Tests cover successful preallocation, failure-before-append, and the keep-size
+  Rust helper.
 - Durable segmented log appends emit
   `[:ferricstore, :waraft, :segment_log, :append]` telemetry with record count,
   encoded bytes, duration, segment path, new-segment flag, and success/error
@@ -72,7 +86,7 @@ Covered:
   later application config change cannot silently alter the log's layout during
   compaction. Those rewrites stream kept ETS records into staging one segment
   group at a time instead of materializing the full retained log in memory.
-  Config lookup walks backward from the newest ordered-ETS log entry instead of
+  Config lookup walks backward from the newest in-memory segment index entry instead of
   folding the full in-memory log, so membership/config reads avoid O(log length)
   CPU in the common case. Append grouping is linear over monotonic Raft batches
   and avoids map allocation plus sorting on the commit hot path; out-of-order
@@ -105,17 +119,16 @@ Covered:
 - Multi-partition load driver and benchmark script.
 - Mixed GET/SET load driver using local applied storage reads for hot GET.
 - Local restart recovery timing script for segment-log replay.
-- Local benchmarks for one-node and three-node volatile paths.
+- Local benchmarks for one-node and three-node durable paths.
 - Guard test for the WARaft APIs and callback hooks this spike depends on.
 
 Current replacement-gate coverage:
 
 - `Ferricstore.Raft.WARaftBackend` starts one WARaft partition per FerricStore
   shard behind a selectable backend boundary.
-- The backend no longer defaults to WARaft's volatile ETS log. Tests may still
-  opt into `:wa_raft_log_ets`, but the application default is the durable
-  segment-log spike provider so an accidental `raft_backend: :waraft` boot is
-  not silently non-durable.
+- The backend rejects WARaft's volatile ETS log. WARaft evaluation now has a
+  single supported shape: the durable segment/keydir provider, so local
+  benchmarks cannot accidentally measure a non-durable in-memory log.
 - Raft backend selection fails closed for invalid config values. A typo like
   `:warft` now raises during backend selection instead of silently falling back
   to legacy Ra and invalidating replacement benchmarks.
@@ -146,12 +159,11 @@ Current replacement-gate coverage:
   paths (`SINTERSTORE`, `SDIFFSTORE`, `SPOP`, `SINTERCARD`, `SSCAN`), and
   sorted-set pop/range/scan paths (`ZPOPMIN`, `ZPOPMAX`, `ZRANGEBYSCORE`,
   `ZREVRANGEBYSCORE`, `ZMSCORE`, `ZSCAN`).
-- Segment-projected WARaft mode treats promoted/compound data as
-  segment-native. Snapshots omit the legacy `dedicated/` payload dir, compound
-  field reads/list/count paths recognize cold `{:waraft_segment, index}`
-  entries, and string `PUT`/blob `PUT` clears existing compound structures
-  before inserting the string value. This preserves Redis overwrite semantics
-  without reviving promoted dedicated files on the WARaft replacement path.
+- The obsolete `:segment_projected` / `:segment_bitcask` shortcuts are rejected
+  at startup. Replacement benchmarking now uses the explicit `:segment_keydir`
+  mode, where projectable commands install keydir locations pointing at the
+  WARaft segment itself. The conservative `:bitcask_keydir` mode remains useful
+  for parity/fallback coverage while projector coverage is incomplete.
 - Application boot honors `raft_backend: :waraft`: legacy Ra batchers are not
   started, legacy Ra elections are skipped, and the WARaft backend starts behind
   the default instance.
@@ -238,8 +250,9 @@ Current replacement-gate coverage:
   WARaft backend tests can route through the exact context registered with
   `WARaftBackend.start/2`; ordinary custom embedded instances stay local/direct
   even if the global backend selector is `:waraft`.
-- Restart recovery reopens real Bitcask state at the last durable storage
-  position.
+- Restart recovery reopens the durable storage position and rebuilds keydir
+  state from either normal Bitcask payload records or, in `:segment_keydir`,
+  the WARaft segment/projection checkpoint.
 - WARaft storage now treats Bitcask/blob/projection apply failures as
   infrastructure failures: it returns the error but does not advance the local
   storage replay position, so restart recovery replays the committed entry.
@@ -255,51 +268,16 @@ Current replacement-gate coverage:
   while the command is in flight, the backend returns
   `{:timeout, :unknown_outcome}` because the log append or apply outcome is now
   ambiguous.
-- Experimental replay-safe no-sync storage apply is now covered as a distinct
-  WARaft storage mode. In this mode the storage callback applies FerricStore
-  state through the normal Raft apply path but appends Bitcask payload records
-  without per-command payload fsync, then advances durable storage metadata only
-  after a payload frontier fsync. `status/1` reports both
-  `:applied_position` and `:durable_position`, plus `:payload_dirty?`, so
-  operators can distinguish volatile apply progress from replay-safe durable
-  progress.
-- Experimental segment-projected storage apply is now covered as the first
-  one-WAL/Bitcask-segment direction. In this mode simple `SET`/`DEL`,
-  `put_batch`, `delete_batch`, and generic batches containing only those simple
-  operations materialize directly from the durable WARaft segment log into the
-  keydir. They do not append duplicate bytes to the shard Bitcask payload file.
-  Values that fit the hot-cache threshold stay hot in ETS; larger non-blob
-  values stay as cold `{:waraft_segment, index}` keydir entries and are read
-  back from the WARaft segment by `GET`, `GET_META`, `MGET`/batch reads,
-  deferred file-ref reads, and `GETRANGE`. Cold segment reads now use a bounded
-  point lookup into the segment file implied by the index, so one cold value does
-  not scan the whole WAL after in-memory log entries are trimmed. Clean restart
-  rebuilds those keydir entries from the WARaft segment up to the durable storage
-  metadata position. Live WARaft log trim now writes a compacted segment
-  projection before deleting old records, and fails closed if any live cold
-  value cannot be read into that projection, so trimmed segment entries do not
-  make keydir locations unreadable.
-  Top-level blob-backed `put_blob_ref`/`put_blob_batch` writes and compound
-  `compound_put`, `compound_batch_put`, `compound_put_blob_ref`,
-  `compound_blob_batch_put`, `compound_batch_delete`, and
-  `compound_delete_prefix` also project into the WARaft segment. Blob-backed
-  projected entries store only the encoded blob ref in the segment keydir
-  location after verifying the blob side-channel ref at apply time; reads
-  materialize or stream from the blob store through the existing blob read
-  paths. This means production WARaft mode bypasses promoted dedicated files
-  for compound data; live log trim and snapshots preserve those records through
-  the compacted segment projection log. Mixed generic batches containing
-  blob-backed commands still fall back to the normal state-machine path until
-  rollback-safe projection staging exists for that shape. Flow still falls back
-  to the normal Bitcask state-machine apply path. Snapshot transfer and local
-  restart after snapshot install now persist projected keys as a
-  compacted CRC-framed segment log (`segment_projection_log/segment_log`)
-  instead of a raw term sidecar, so the recovery/snapshot path exercises the
-  same segment framing and corruption checks as the WARaft log provider. This is
-  a correctness slice for the unified durability boundary, not yet a production
-  Bitcask-compatible segment file format; the compacted projection stream still
-  needs to become the real merged segment format before this mode is used for
-  large keyspaces.
+- WARaft storage supports two durable apply paths. `:bitcask_keydir` applies
+  FerricStore state through the normal Raft apply path, appends Bitcask payload
+  records without per-command payload fsync, and advances durable storage
+  metadata only after a payload frontier fsync. `:segment_keydir` is the unified
+  "Raft WAL == Bitcask segment" path for projectable hot commands: keydir rows
+  point at `{:waraft_segment, index}`, cold reads load from the WARaft segment,
+  and trim writes a projection checkpoint before compacting away segment
+  records. `status/1` reports both `:applied_position` and `:durable_position`,
+  plus `:payload_dirty?`, so operators can distinguish volatile apply progress
+  from replay-safe durable progress.
 - Replay-safe no-sync metadata boundaries are tested: graceful close and
   membership/config metadata commits fsync dirty payload before publishing the
   newer storage metadata position. Frontier fsync emits
@@ -354,7 +332,7 @@ Current replacement-gate coverage:
   old label in storage state.
 - Snapshot creation and install copy real shard-owned Bitcask/blob/prob
   directories into a stalled backend member and rebuild the keydir from disk.
-  Segment-projected compound records are copied through the WARaft
+  Segment-backed compound records are copied through the WARaft
   projection log instead of promoted dedicated directories.
 - Snapshot install uses staged payload dirs plus an install marker. Tests now
   prove incomplete snapshot payloads fail before wiping live data, copy failure
@@ -631,45 +609,53 @@ Not covered yet:
 
 ## Local Benchmark Snapshot
 
-These are local spike numbers, not an apples-to-apples product benchmark. The
-current Ra numbers include RESP parsing, routing, Batcher, Bitcask/blob, and the
-production state machine. The WARaft numbers use a direct Erlang load driver
-against the isolated adapter.
+These are local development-machine numbers. The real RESP/router rows include
+RESP parsing, routing, the selected Raft backend, durable storage, and the
+production state machine. The 3-node row still uses the isolated WARaft cluster
+load driver and should not be compared directly to the RESP rows.
 
 | Case | Path | Log | Result |
 | --- | --- | --- | --- |
-| SET 256B, c=200/p=50 | Current Ra, real RESP server | current Ra WAL | ~551K ops/s, p99 ~29.6ms |
-| SET 1KB, c=200/p=50 | Current Ra, real RESP server | current Ra WAL | ~202K ops/s, p99 ~60.4ms |
-| Mixed GET/SET 256B, c=200/p=50 | Current Ra, real RESP server | current Ra WAL | ~79K ops/s, high latency on mixed path |
-| SET 256B | WARaft one partition | ETS log | ~793K ops/s |
-| SET 256B | WARaft one partition | spike segment log | ~72K ops/s |
-| SET 256B | WARaft 3 local peer nodes | ETS log | ~962K ops/s |
-| SET 256B | WARaft 3 local peer nodes | spike segment log | ~576K ops/s |
-| SET 1KB | WARaft 3 local peer nodes | ETS log | ~784K ops/s |
-| SET 1KB | WARaft 3 local peer nodes | spike segment log | ~419K ops/s |
-| Mixed GET/SET 256B | WARaft one partition | ETS log | ~327K ops/s |
-| Mixed GET/SET 256B | WARaft 3 local peer nodes | ETS log | ~1.12M ops/s |
-| Mixed GET/SET 256B | WARaft 3 local peer nodes | spike segment log | ~546K ops/s |
-| SET 256B | WARaft 4 local partitions | ETS log | ~849K ops/s |
-| SET 256B | WARaft 4 local partitions | spike segment log | ~66K ops/s |
+| SET 256B, c=200/p=50 | Current Ra, real RESP server | current Ra WAL | ~473K ops/s, p99 batch ~27.0ms |
+| SET 256B, c=200/p=50 | WARaft, real RESP server | segment/keydir, file datasync | ~622K ops/s, p99 batch ~19.5ms |
+| SET 1KB, c=200/p=50 | Current Ra, real RESP server | current Ra WAL | ~415K ops/s, ~406MB/s, p99 batch ~30.0ms |
+| SET 1KB, c=200/p=50 | WARaft, real RESP server | segment/keydir, file datasync | ~583K ops/s, ~570MB/s, p99 batch ~21.5ms |
+| Mixed GET/SET 256B, c=200/p=50 | Current Ra, real RESP server | current Ra WAL | ~342K ops/s, p99 batch ~44.6ms |
+| Mixed GET/SET 256B, c=200/p=50 | WARaft, real RESP server | segment/keydir, file datasync | ~371K ops/s, p99 batch ~38.7ms |
+| SET 256B, c=100/p=50 | WARaft 3 local peer nodes | spike segment log, file datasync | ~42K ops/s |
+| SET 256B, c=200/p=50 | WARaft, real RESP server | segment/keydir, WAL-NIF sync delay 0 | ~217K ops/s, p99 batch ~65.0ms |
 | Restart replay, 100K keys | Current Ra recovery task | current Ra WAL | ~591ms recovery |
 | Restart replay, 100K keys | WARaft spike recovery script | spike segment log + toy storage | ~107ms recovery |
 
 Important interpretation:
 
-- WARaft core looks worth deeper work. It clears the 5% bar in volatile/local
-  paths.
-- The spike segment log is intentionally conservative and fsyncs each append.
-  The 4-partition segment result proves a production WAL must group fsyncs
-  across batches/partitions before any migration decision.
-- The current WARaft backend is not yet the unified "Raft WAL == Bitcask"
-  design. It still persists the WARaft log, applies the real Bitcask state
-  machine, and advances a separate storage metadata position. That is
-  correctness-conservative for the spike, but it is not the final one-file /
-  one-fsync architecture. The replacement-grade storage design needs a segment
-  record that carries Raft term/index plus the materialized key/value/blob
-  record, and recovery must rebuild the keydir and Raft replay frontier from
-  that same segment stream.
+- WARaft core still needs deeper work on the real durable path. We no longer
+  count in-memory-log numbers as decision data.
+- The segment log groups all records in one same-segment Raft append behind one
+  data sync before returning. Cross-append group fsync is still delegated to
+  WARaft's commit batch window; the benchmark path now derives the default
+  WARaft window from the same `wal_commit_delay_us` knob used by the patched Ra
+  WAL, while preserving an explicit `:waraft_commit_batch_interval_ms` override.
+  WARaft only exposes millisecond state timeouts, so the Ra adaptive floor maps
+  to `0ms` when disabled or `1ms` when enabled unless the WARaft-specific knob is
+  set.
+- Replacement RESP/router benchmarks default to the production segment I/O mode
+  (`file:write` + `file:datasync`). On the local c=200/p=50 256B SET run, that
+  path reached ~622K ops/s with p99 batch latency ~19.5ms, versus current Ra at
+  ~473K ops/s. On the same local harness, 1KB SET reached ~583K ops/s
+  (~570MB/s) versus Ra at ~415K ops/s, and mixed 256B GET/SET reached ~371K
+  ops/s versus Ra at ~342K ops/s. The raw WAL-NIF segment path reached only
+  ~217K ops/s with segment sync delay forced to 0. It remains correctness-tested
+  and selectable with `WARAFT_SEGMENT_IO_MODE=wal_nif`, but it is not the
+  benchmark default until profiling proves it is faster than the file path on
+  Linux/NVMe.
+- The current WARaft replacement benchmark path uses `:segment_keydir` storage:
+  projectable hot-path records install ETS/keydir locations that point directly
+  at the WARaft segment (`{:waraft_segment, index}`), so the normal Bitcask
+  payload file stays empty for covered commands and cold large values are read
+  back from the Raft segment. This is the first unified "Raft WAL == Bitcask
+  segment" path. Commands that are not projectable still need either projector
+  coverage or a conservative fallback before this can replace the full Ra path.
 - Segment-log recovery now treats rewrite markers as untrusted local metadata:
   staging/backup paths must be direct children of the log parent with the
   expected rewrite prefixes. Corrupt record headers with impossible lengths emit

@@ -473,7 +473,7 @@ pub fn flow_index_rollback_claim_entries<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "Normal")]
 pub fn flow_record_plan_claims<'a>(
     env: Env<'a>,
     candidates: Vec<(Binary<'a>, f64)>,
@@ -746,7 +746,7 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
     Ok((crate::atoms::ok(), fields).encode(env))
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "Normal")]
 pub fn flow_records_terminal_after_noop(values: Vec<Binary<'_>>) -> Vec<bool> {
     values
         .iter()

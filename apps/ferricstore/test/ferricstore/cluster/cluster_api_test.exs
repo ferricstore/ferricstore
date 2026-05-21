@@ -44,9 +44,9 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
   # ---------------------------------------------------------------------------
 
   describe "shard_server_id/1" do
-    test "returns {name, node()} for the local node" do
+    test "returns {name, raft boot node} for the local node" do
       result = Cluster.shard_server_id(0)
-      assert result == {:ferricstore_shard_0, node()}
+      assert result == {:ferricstore_shard_0, Cluster.local_raft_node()}
     end
 
     test "returns different names for different shards" do
@@ -55,6 +55,66 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
       assert name0 != name1
       assert name0 == :ferricstore_shard_0
       assert name1 == :ferricstore_shard_1
+    end
+
+    test "keeps the raft boot node stable when distribution starts later" do
+      previous = Application.get_env(:ferricstore, :raft_local_node, :__missing__)
+      Application.put_env(:ferricstore, :raft_local_node, :boot_node@localhost)
+
+      on_exit(fn ->
+        case previous do
+          :__missing__ -> Application.delete_env(:ferricstore, :raft_local_node)
+          value -> Application.put_env(:ferricstore, :raft_local_node, value)
+        end
+      end)
+
+      assert Cluster.shard_server_id(0) == {:ferricstore_shard_0, :boot_node@localhost}
+    end
+  end
+
+  describe "boot_initial_members/3" do
+    test "uses full configured members only for initial bootstrap nodes" do
+      previous = Application.get_env(:ferricstore, :raft_local_node, :__missing__)
+      Application.put_env(:ferricstore, :raft_local_node, :node_a@localhost)
+
+      on_exit(fn ->
+        case previous do
+          :__missing__ -> Application.delete_env(:ferricstore, :raft_local_node)
+          value -> Application.put_env(:ferricstore, :raft_local_node, value)
+        end
+      end)
+
+      local = {:ferricstore_shard_0, :node_a@localhost}
+
+      assert Cluster.boot_initial_members(0, local, [
+               :node_a@localhost,
+               :node_b@localhost,
+               :node_c@localhost
+             ]) == [
+               {:ferricstore_shard_0, :node_a@localhost},
+               {:ferricstore_shard_0, :node_b@localhost},
+               {:ferricstore_shard_0, :node_c@localhost}
+             ]
+    end
+
+    test "joiner pointed at an existing cluster boots local-only until join sync" do
+      previous = Application.get_env(:ferricstore, :raft_local_node, :__missing__)
+      Application.put_env(:ferricstore, :raft_local_node, :joiner@localhost)
+
+      on_exit(fn ->
+        case previous do
+          :__missing__ -> Application.delete_env(:ferricstore, :raft_local_node)
+          value -> Application.put_env(:ferricstore, :raft_local_node, value)
+        end
+      end)
+
+      local = {:ferricstore_shard_1, :joiner@localhost}
+
+      assert Cluster.boot_initial_members(1, local, [
+               :node_a@localhost,
+               :node_b@localhost,
+               :node_c@localhost
+             ]) == [local]
     end
   end
 
@@ -73,6 +133,8 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
   # ---------------------------------------------------------------------------
 
   describe "members/1" do
+    setup :ensure_default_raft_booted_on_current_node
+
     test "returns members for shard 0" do
       Ferricstore.Test.ShardHelpers.eventually(
         fn ->
@@ -91,7 +153,7 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
       Ferricstore.Test.ShardHelpers.eventually(
         fn ->
           {:ok, _members, {_name, leader_node}} = Cluster.members(0)
-          assert leader_node == node()
+          assert leader_node == Cluster.local_raft_node()
         end,
         "shard 0 should have local leader",
         10,
@@ -140,7 +202,7 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
         )
 
       Application.put_env(:ferricstore, :raft_backend, :waraft)
-      assert :ok = WARaftBackend.start(ctx, log_module: :wa_raft_log_ets)
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       on_exit(fn ->
         _ = WARaftBackend.stop()
@@ -178,7 +240,7 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
       refute File.dir?(Path.join(legacy_root, "ra"))
     end
 
-    test "stop_system/0 is backend guarded and does not always stop legacy Ra" do
+    test "stop_system/0 delegates through selected backend and keeps WARaft no-op" do
       source = File.read!("lib/ferricstore/raft/cluster.ex")
       {:ok, ast} = Code.string_to_quoted(source)
 
@@ -187,8 +249,11 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
         |> function_body(:stop_system, 0)
         |> Macro.to_string()
 
-      assert body =~ "Backend.waraft?()",
-             "Cluster.stop_system/0 must be a no-op under WARaft; application shutdown stops WARaft separately"
+      assert body =~ "stop_system(Backend.selected())",
+             "Cluster.stop_system/0 must use the selected backend instead of always stopping legacy Ra"
+
+      assert source =~ "def stop_system(:waraft), do: :ok",
+             "Cluster.stop_system(:waraft) must be a no-op; application shutdown stops WARaft separately"
     end
 
     test "trigger_shard_elections_parallel/2 delegates to WARaft when selected" do
@@ -219,15 +284,17 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
   # ---------------------------------------------------------------------------
 
   describe "add_member/3" do
+    setup :ensure_default_raft_booted_on_current_node
+
     test "adding self as voter returns :ok (already member)" do
       # In single-node mode, self is already a voter -- ra returns :already_member -> :ok
-      result = Cluster.add_member(0, node(), :voter)
+      result = Cluster.add_member(0, Cluster.local_raft_node(), :voter)
       assert result == :ok
     end
 
     test "adding self with different membership updates membership type" do
       # ra accepts changing membership type of an existing member via add_member.
-      result = Cluster.add_member(0, node(), :promotable)
+      result = Cluster.add_member(0, Cluster.local_raft_node(), :promotable)
       assert result == :ok
     end
   end
@@ -237,6 +304,8 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
   # ---------------------------------------------------------------------------
 
   describe "remove_member/2" do
+    setup :ensure_default_raft_booted_on_current_node
+
     test "removing a non-member remote node returns error in single-node mode" do
       # In single-node Raft (nonode@nohost), ra rejects cluster changes to
       # nodes that aren't reachable. The error is :cluster_change_not_permitted.
@@ -259,6 +328,49 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
     case Enum.reverse(bodies) do
       [body | _] -> body
       [] -> flunk("missing #{function_name}/#{arity}")
+    end
+  end
+
+  defp ensure_default_raft_booted_on_current_node(_context) do
+    # ClusterHelper may start Erlang distribution after the test app already
+    # booted as nonode@nohost. Real clustered deployments start distribution
+    # before FerricStore. If the harness changes identity underneath legacy Ra,
+    # restart against a fresh test data dir so these tests exercise a valid
+    # product topology instead of mutating a stale nonode Ra group.
+    if default_raft_identity_stale?() do
+      Application.put_env(
+        :ferricstore,
+        :data_dir,
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_cluster_api_#{System.unique_integer([:positive])}"
+        )
+      )
+
+      :ok = Application.stop(:ferricstore)
+
+      case Application.ensure_all_started(:ferricstore) do
+        {:ok, _apps} ->
+          :ok
+
+        {:error, reason} ->
+          flunk("failed to restart FerricStore for cluster API test: #{inspect(reason)}")
+      end
+    end
+
+    :ok
+  end
+
+  defp default_raft_identity_stale? do
+    Application.get_env(:ferricstore, :raft_backend, :ra) == :ra and
+      node() != :nonode@nohost and
+      (Cluster.local_raft_node() != node() or local_leader_node(0) != node())
+  end
+
+  defp local_leader_node(shard_index) do
+    case Cluster.members(shard_index, 500) do
+      {:ok, _members, {_name, leader_node}} -> leader_node
+      _ -> :unknown
     end
   end
 end

@@ -13,6 +13,7 @@ defmodule Ferricstore.CrossShardOpTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.MemoryGuard
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
   alias Ferricstore.CrossShardOp
@@ -23,7 +24,51 @@ defmodule Ferricstore.CrossShardOpTest do
   setup do
     ShardHelpers.flush_all_keys()
     NamespaceConfig.reset_all()
+    force_memory_guard_ok()
+
+    on_exit(fn ->
+      ShardHelpers.reset_memory_guard_pressure()
+    end)
+
     :ok
+  end
+
+  defp default_ctx, do: FerricStore.Instance.get(:default)
+
+  defp force_memory_guard_ok do
+    try do
+      MemoryGuard.reconfigure(%{
+        max_memory_bytes: 100_000_000_000,
+        keydir_max_ram: 100_000_000_000,
+        hot_cache_min_ram: 0,
+        hot_cache_max_ram: :auto,
+        eviction_policy: :volatile_lru
+      })
+
+      :sys.replace_state(MemoryGuard, fn state ->
+        %{state | last_pressure_level: :ok, keydir_pressure_level: :ok}
+      end)
+
+      MemoryGuard.reset_pressure_flags()
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  defp put_existing!(key, value, expire_at_ms \\ 0) do
+    put_existing!(default_ctx(), key, value, expire_at_ms)
+  end
+
+  defp put_existing!(ctx, key, value, expire_at_ms) do
+    force_memory_guard_ok()
+    assert :ok = Router.put(ctx, key, value, expire_at_ms)
+
+    ShardHelpers.eventually(
+      fn -> Router.get(ctx, key) == value end,
+      "cross-shard test seed key #{inspect(key)} should be readable",
+      250,
+      10
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -131,7 +176,7 @@ defmodule Ferricstore.CrossShardOpTest do
                Router.shard_for(FerricStore.Instance.get(:default), new_key)
 
       # Create the old key with a value
-      Router.put(FerricStore.Instance.get(:default), old_key, "rename_value", 0)
+      put_existing!(old_key, "rename_value")
 
       # Call RENAME directly -- the handler calls CrossShardOp.execute internally
       result = Generic.handle("RENAME", [old_key, new_key], %{})
@@ -156,7 +201,7 @@ defmodule Ferricstore.CrossShardOpTest do
                Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source key
-      Router.put(FerricStore.Instance.get(:default), src, "copy_value", 0)
+      put_existing!(src, "copy_value")
 
       # Call COPY directly -- the handler calls CrossShardOp.execute internally
       result = Generic.handle("COPY", [src, dst], %{})
@@ -178,8 +223,8 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2, k3, k4] = ShardHelpers.keys_on_different_shards(4)
 
       # Set up source keys
-      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
-      Router.put(FerricStore.Instance.get(:default), k3, "v3", 0)
+      put_existing!(k1, "v1")
+      put_existing!(k3, "v3")
 
       # Run two independent cross-shard RENAMEs concurrently
       # Each command handler calls CrossShardOp.execute internally
@@ -214,7 +259,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "locks expire after TTL allowing subsequent operations" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "val", 0)
+      put_existing!(k1, "val")
 
       # Acquire locks with a very short TTL (200ms for testing)
       owner_ref = make_ref()
@@ -264,8 +309,8 @@ defmodule Ferricstore.CrossShardOpTest do
     test "overlapping cross-shard operations don't deadlock (ordered locking)" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
-      Router.put(FerricStore.Instance.get(:default), k2, "v2", 0)
+      put_existing!(k1, "v1")
+      put_existing!(k2, "v2")
 
       # Two tasks try to RENAME the SAME pair of keys in opposite directions.
       # CrossShardOp normalizes lock acquisition order by shard index.
@@ -345,7 +390,7 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), k1) ==
                Router.shard_for(FerricStore.Instance.get(:default), k2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "val1", 0)
+      put_existing!(k1, "val1")
 
       # Call RENAME directly -- handler calls CrossShardOp internally (same-shard fast path)
       result = Generic.handle("RENAME", [k1, k2], %{})
@@ -366,7 +411,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set a value first
-      Router.put(FerricStore.Instance.get(:default), k1, "before_lock", 0)
+      put_existing!(k1, "before_lock")
       assert Router.get(FerricStore.Instance.get(:default), k1) == "before_lock"
 
       # Lock the key with a long TTL
@@ -392,7 +437,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "Router.delete on a locked key returns {:error, :key_locked}" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "value", 0)
+      put_existing!(k1, "value")
 
       owner_ref = make_ref()
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
@@ -416,7 +461,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "reads on locked keys still work" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "readable", 0)
+      put_existing!(k1, "readable")
 
       owner_ref = make_ref()
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
@@ -476,7 +521,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "RENAME across shards works when called directly" do
       [old_key, new_key] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), old_key, "rename_test", 0)
+      put_existing!(old_key, "rename_test")
 
       result = Generic.handle("RENAME", [old_key, new_key], %{})
       assert result == :ok
@@ -488,7 +533,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "COPY across shards works when called directly" do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), src, "copy_test", 0)
+      put_existing!(src, "copy_test")
 
       result = Generic.handle("COPY", [src, dst], %{})
       assert result == 1
@@ -500,7 +545,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "RENAMENX across shards works when called directly" do
       [old_key, new_key] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), old_key, "renamenx_test", 0)
+      put_existing!(old_key, "renamenx_test")
 
       result = Generic.handle("RENAMENX", [old_key, new_key], %{})
       assert result == 1
@@ -562,7 +607,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up keys with known values
-      Router.put(FerricStore.Instance.get(:default), k1, "hash_test_value", 0)
+      put_existing!(k1, "hash_test_value")
 
       # Rename will write an intent with value hashes
       result = Generic.handle("RENAME", [k1, k2], %{})
@@ -591,7 +636,7 @@ defmodule Ferricstore.CrossShardOpTest do
       ctx = FerricStore.Instance.get(:default)
       value = :binary.copy("i", ctx.hot_cache_max_value_size + 1024)
 
-      Router.put(ctx, k1, value, 0)
+      put_existing!(ctx, k1, value, 0)
 
       ShardHelpers.eventually(fn ->
         match?({:ok, {_fid, _off, _vsize}}, Router.get_keydir_file_ref(ctx, k1))
@@ -608,7 +653,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up k1 with a value
-      Router.put(FerricStore.Instance.get(:default), k1, "intent_hash_test", 0)
+      put_existing!(k1, "intent_hash_test")
 
       # Write a stale intent with matching value hash
       owner_ref = make_ref()
@@ -643,7 +688,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up k1 with a value
-      Router.put(FerricStore.Instance.get(:default), k1, "current_value", 0)
+      put_existing!(k1, "current_value")
 
       # Write a stale intent with a DIFFERENT value hash (simulating data changed)
       owner_ref = make_ref()

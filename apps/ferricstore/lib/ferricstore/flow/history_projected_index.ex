@@ -31,9 +31,9 @@ defmodule Ferricstore.Flow.HistoryProjectedIndex do
     target = path(shard_data_path)
     tmp = target <> ".tmp"
 
-    with :ok <- File.mkdir_p(shard_data_path),
+    with :ok <- Ferricstore.FS.mkdir_p(shard_data_path),
          :ok <- File.write(tmp, Integer.to_string(index)),
-         :ok <- File.rename(tmp, target) do
+         :ok <- Ferricstore.FS.rename(tmp, target) do
       :ok
     end
   end
