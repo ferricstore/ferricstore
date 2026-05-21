@@ -292,6 +292,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert is_integer(projection_offset) and projection_offset > 0
       assert value == Router.get(ctx, key)
 
+      assert :not_found =
+               Ferricstore.Raft.WARaftSegmentReader.read_value(ctx, 0, value_index, key)
+
       assert :ok = WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
 

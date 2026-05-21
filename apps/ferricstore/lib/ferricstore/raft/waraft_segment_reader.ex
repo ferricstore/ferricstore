@@ -12,10 +12,10 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
              is_binary(key) do
     case read_main_log_value(ctx, shard_index, index, key) do
       {:error, :segment_entry_not_found} ->
-        read_projection_value(ctx, shard_index, key)
+        :not_found
 
       {:error, :key_not_in_segment_entry} ->
-        read_projection_value(ctx, shard_index, key)
+        :not_found
 
       other ->
         other
@@ -108,33 +108,6 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       {:ok, entry} -> {:ok, entry}
       :not_found -> {:error, :segment_entry_not_found}
       {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp read_projection_value(ctx, shard_index, key) do
-    projection_root = Path.join(storage_root(ctx, shard_index), @projection_dir)
-
-    try do
-      case :ferricstore_waraft_spike_segment_log.fold_disk(
-             to_charlist(projection_root),
-             fn
-               _index,
-               {0, {:ferricstore_segment_projection_entry, ^key, value, _expire_at_ms}},
-               _acc
-               when is_binary(value) ->
-                 throw({:found_projection_value, value})
-
-               _index, _entry, acc ->
-                 acc
-             end,
-             :not_found
-           ) do
-        {:ok, :not_found} -> :not_found
-        {:error, :enoent} -> :not_found
-        {:error, reason} -> {:error, reason}
-      end
-    catch
-      {:found_projection_value, value} -> {:ok, value}
     end
   end
 
