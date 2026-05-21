@@ -20,7 +20,9 @@
     term/2,
     config/1,
     fold_disk/3,
+    location_for_index/2,
     read_disk/2,
+    read_disk_at/4,
     write_projection/3
 ]).
 
@@ -41,7 +43,7 @@
 -include_lib("wa_raft/include/wa_raft.hrl").
 -include_lib("kernel/include/file.hrl").
 
--define(DEFAULT_SEGMENT_RECORDS, 4096).
+-define(DEFAULT_SEGMENT_RECORDS, 65536).
 -define(SEGMENT_EXT, ".seg").
 -define(SEGMENT_CONFIG_FILE, "segment_config.term").
 -define(RECORD_HEADER_SIZE, 8).
@@ -53,6 +55,7 @@
 -define(APPEND_FAILURE_MARKER, "segment_log.append_failed.term").
 -define(DEFAULT_PREALLOCATE_BYTES, 0).
 -define(WRITER_REGISTRY, ferricstore_waraft_segment_writer_registry).
+-define(OFFSET_REGISTRY, ferricstore_waraft_segment_offset_registry).
 -define(DEFAULT_WAL_NIF_SYNC_TIMEOUT_MS, 30000).
 -define(DEFAULT_WAL_NIF_MAX_BUFFER_BYTES, 67108864).
 
@@ -180,6 +183,56 @@ read_disk(RootDir, Index) when is_integer(Index), Index >= 0 ->
 read_disk(_RootDir, _Index) ->
     {error, bad_index}.
 
+location_for_index(RootDir, Index) when is_integer(Index), Index >= 0 ->
+    Dir = fold_disk_segment_dir(RootDir),
+    case lookup_offset(Dir, Index) of
+        {ok, Location} ->
+            {ok, Location};
+        not_found ->
+            case rebuild_offset_registry(Dir) of
+                ok -> lookup_offset(Dir, Index);
+                {error, enoent} -> not_found;
+                {error, _Reason} = Error -> Error
+            end
+    end;
+location_for_index(_RootDir, _Index) ->
+    {error, bad_index}.
+
+read_disk_at(RootDir, Index, Offset, EncodedSize)
+  when is_integer(Index), Index >= 0,
+       is_integer(Offset), Offset >= 0,
+       is_integer(EncodedSize), EncodedSize >= ?RECORD_HEADER_SIZE ->
+    Dir = fold_disk_segment_dir(RootDir),
+    case validate_segment_log_dir(Dir) of
+        ok ->
+            case recover_rewrite(Dir) of
+                ok ->
+                    case validate_segment_log_dir(Dir) of
+                        ok ->
+                            case existing_records_per_segment(Dir) of
+                                {ok, RecordsPerSegment} ->
+                                    read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment);
+                                not_found ->
+                                    not_found;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, enoent} ->
+                            not_found;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, enoent} ->
+            not_found;
+        {error, _Reason} = Error ->
+            Error
+    end;
+read_disk_at(_RootDir, _Index, _Offset, _EncodedSize) ->
+    {error, bad_location}.
+
 fold_loaded_disk_records(_Tid, '$end_of_table', _Fun, Acc) ->
     Acc;
 fold_loaded_disk_records(Tid, Index, Fun, Acc) ->
@@ -262,6 +315,8 @@ open(#raft_log{name = Name} = Log) ->
                                                     case preload_segment_config(Dir) of
                                                         ok ->
                                                             true = ets:delete_all_objects(Name),
+                                                            _ = ensure_offset_registry(),
+                                                            _ = clear_offset_registry_for_dir(Dir),
                                                             case load_segments(Dir, Name) of
                                                                 ok -> {ok, #{dir => Dir}};
                                                                 {error, _Reason} = Error ->
@@ -535,12 +590,15 @@ group_records_loop([{Index, _Entry} = Record | Rest], RecordsPerSegment, Ordinal
             {error, {non_monotonic_segment_group, Index, Ordinal, NextOrdinal}}
     end.
 
-write_record_group_list(_Dir, [], _Rollbacks) ->
-    ok;
-write_record_group_list(Dir, [{{_Ordinal, Segment}, RecordsRev} | Rest], Rollbacks) ->
+write_record_group_list(Dir, Groups, Rollbacks) ->
+    write_record_group_list(Dir, Groups, Rollbacks, []).
+
+write_record_group_list(_Dir, [], _Rollbacks, OffsetAcc) ->
+    register_offset_entries(lists:append(lists:reverse(OffsetAcc)));
+write_record_group_list(Dir, [{{_Ordinal, Segment}, RecordsRev} | Rest], Rollbacks, OffsetAcc) ->
     case write_record_group_once(Dir, Segment, RecordsRev) of
-        {ok, Rollback} ->
-            write_record_group_list(Dir, Rest, [Rollback | Rollbacks]);
+        {ok, Rollback, Offsets} ->
+            write_record_group_list(Dir, Rest, [Rollback | Rollbacks], [Offsets | OffsetAcc]);
         {error, Reason} ->
             case rollback_written_groups(Rollbacks) of
                 ok -> maybe_poison_after_append_rollback_failure(Dir, Reason);
@@ -576,10 +634,11 @@ open_record_group_once_file(Dir, Path, RecordsRev) ->
                         {ok, OldSize} ->
                             case maybe_preallocate_new_segment(Path, OldSize =:= 0) of
                                 ok ->
-                                    Writes = [encode_record(Record) || Record <- lists:reverse(RecordsRev)],
+                                    Records = lists:reverse(RecordsRev),
+                                    Writes = [encode_record(Record) || Record <- Records],
                                     case write_record_group_file(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
                                         ok ->
-                                            {ok, {Path, OldSize}};
+                                            {ok, {Path, OldSize}, offset_entries_for_records(Dir, Path, Records, OldSize, Writes)};
                                         {error, Reason} ->
                                             {error, Reason}
                                     end;
@@ -603,10 +662,11 @@ open_record_group_once_wal_nif(Dir, Path, RecordsRev) ->
         {ok, OldSize} ->
             case maybe_preallocate_new_segment(Path, OldSize =:= 0) of
                 ok ->
-                    Writes = [encode_record(Record) || Record <- lists:reverse(RecordsRev)],
+                    Records = lists:reverse(RecordsRev),
+                    Writes = [encode_record(Record) || Record <- Records],
                     case write_record_group_wal_nif(Dir, Path, OldSize, Writes, OldSize =:= 0) of
                         ok ->
-                            {ok, {Path, OldSize}};
+                            {ok, {Path, OldSize}, offset_entries_for_records(Dir, Path, Records, OldSize, Writes)};
                         {error, Reason} ->
                             {error, Reason}
                     end;
@@ -949,7 +1009,7 @@ rewrite_records_atomic(Dir, Records, RecordsPerSegment) ->
                         ok ->
                             case finish_rewrite(Dir, Backup) of
                                 ok ->
-                                    ok;
+                                    rebuild_offset_registry(Dir);
                                 {error, _Reason} = Error ->
                                     _ = rollback_rewrite(Dir, Paths),
                                     Error
@@ -979,7 +1039,7 @@ rewrite_ets_records_atomic(Dir, Name, StartKey, KeepFun, RecordsPerSegment) ->
                         ok ->
                             case finish_rewrite(Dir, Backup) of
                                 ok ->
-                                    ok;
+                                    rebuild_offset_registry(Dir);
                                 {error, _Reason} = Error ->
                                     _ = rollback_rewrite(Dir, Paths),
                                     Error
@@ -1121,7 +1181,7 @@ finish_streamed_record_group(_Dir, _Ordinal, [], Rollbacks) ->
 finish_streamed_record_group(Dir, Ordinal, RecordsRev, Rollbacks) ->
     Segment = segment_file_from_ordinal(Ordinal),
     case write_record_group_once(Dir, Segment, RecordsRev) of
-        {ok, Rollback} ->
+        {ok, Rollback, _Offsets} ->
             {ok, [Rollback | Rollbacks]};
         {error, Reason} ->
             _ = rollback_written_groups(Rollbacks),
@@ -1370,6 +1430,103 @@ read_disk_record(Dir, Index, RecordsPerSegment) ->
             {error, {read_segment_info, Reason}}
     end.
 
+read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) ->
+    Ordinal = segment_ordinal(Index, RecordsPerSegment),
+    Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
+    case file:read_link_info(Path) of
+        {ok, #file_info{type = regular, size = FileBytes}} ->
+            case file:open(Path, [read, raw, binary]) of
+                {ok, Fd} ->
+                    Result =
+                        try read_disk_record_at_fd(Fd, Path, Index, Offset, EncodedSize, FileBytes, Ordinal, RecordsPerSegment) of
+                            ReadResult -> ReadResult
+                        after
+                            _ = file:close(Fd)
+                        end,
+                    case Result of
+                        {error, Reason} ->
+                            emit_corrupt_segment(Path, Reason),
+                            Result;
+                        _Other ->
+                            Result
+                    end;
+                {error, Reason} ->
+                    {error, {open_segment, Reason}}
+            end;
+        {ok, #file_info{type = Type}} ->
+            {error, {unsafe_segment_path, Path, Type}};
+        {error, enoent} ->
+            not_found;
+        {error, Reason} ->
+            {error, {read_segment_info, Reason}}
+    end.
+
+read_disk_record_at_fd(Fd, Path, WantedIndex, Offset, EncodedSize, FileBytes, Ordinal, RecordsPerSegment) ->
+    case Offset + EncodedSize > FileBytes of
+        true ->
+            not_found;
+        false ->
+            case file:pread(Fd, Offset, ?RECORD_HEADER_SIZE) of
+                {ok, <<Len:32/unsigned-big, Crc:32/unsigned-big>>} ->
+                    ExpectedSize = ?RECORD_HEADER_SIZE + Len,
+                    case {Len > ?MAX_RECORD_BYTES, ExpectedSize =:= EncodedSize} of
+                        {true, _} ->
+                            {error, {record_too_large, Offset, Len}};
+                        {_, false} ->
+                            {error, {record_size_mismatch, Offset, EncodedSize, ExpectedSize}};
+                        {false, true} ->
+                            read_disk_record_at_payload(
+                                Fd,
+                                Path,
+                                WantedIndex,
+                                Offset,
+                                Ordinal,
+                                RecordsPerSegment,
+                                Len,
+                                Crc
+                            )
+                    end;
+                {ok, Header} ->
+                    {error, {short_record_header, Offset, byte_size(Header)}};
+                eof ->
+                    not_found;
+                {error, Reason} ->
+                    {error, {read_record_header, Offset, Reason}}
+            end
+    end.
+
+read_disk_record_at_payload(Fd, Path, WantedIndex, Offset, Ordinal, RecordsPerSegment, Len, Crc) ->
+    case file:pread(Fd, Offset + ?RECORD_HEADER_SIZE, Len) of
+        {ok, Payload} when byte_size(Payload) =:= Len ->
+            case erlang:crc32(Payload) of
+                Crc ->
+                    try binary_to_term(Payload, [safe]) of
+                        {Index, {_Term, _Op} = Entry} when is_integer(Index), Index >= 0 ->
+                            case validate_record_segment_ordinal(Path, Index, Ordinal, RecordsPerSegment) of
+                                ok when Index =:= WantedIndex ->
+                                    {ok, Entry};
+                                ok ->
+                                    {error, {record_index_mismatch, Offset, WantedIndex, Index}};
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        Other ->
+                            {error, {bad_record, Other}}
+                    catch
+                        _:Reason ->
+                            {error, {bad_term, Reason}}
+                    end;
+                _Mismatch ->
+                    {error, {crc_mismatch, Offset}}
+            end;
+        {ok, Payload} ->
+            {error, {short_record_read, Offset, Len, byte_size(Payload)}};
+        eof ->
+            not_found;
+        {error, Reason} ->
+            {error, {read_record_payload, Offset, Reason}}
+    end.
+
 read_disk_record_fd(Fd, Path, WantedIndex, Offset, FileBytes, Ordinal, RecordsPerSegment) ->
     case file:read(Fd, ?RECORD_HEADER_SIZE) of
         eof ->
@@ -1529,18 +1686,23 @@ load_segment_payload(Fd, Path, Name, PreviousIndex, Offset, FileBytes, Ordinal, 
                 {Index, {_Term, _Op} = Entry} when is_integer(Index), Index >= 0 ->
                     case validate_record_segment_ordinal(Path, Index, Ordinal, RecordsPerSegment) of
                         ok ->
-                            case insert_recovered_record(Name, {Index, Entry}, PreviousIndex) of
-                                {ok, LastIndex} ->
-                                    load_segment_fd(
-                                        Fd,
-                                        Path,
-                                        Name,
-                                        LastIndex,
-                                        Offset + ?RECORD_HEADER_SIZE + Len,
-                                        FileBytes,
-                                        Ordinal,
-                                        RecordsPerSegment
-                                    );
+                            case register_record_offset(filename:dirname(Path), Index, Ordinal, Offset, ?RECORD_HEADER_SIZE + Len) of
+                                ok ->
+                                    case insert_recovered_record(Name, {Index, Entry}, PreviousIndex) of
+                                        {ok, LastIndex} ->
+                                            load_segment_fd(
+                                                Fd,
+                                                Path,
+                                                Name,
+                                                LastIndex,
+                                                Offset + ?RECORD_HEADER_SIZE + Len,
+                                                FileBytes,
+                                                Ordinal,
+                                                RecordsPerSegment
+                                            );
+                                        {error, _Reason} = Error ->
+                                            Error
+                                    end;
                                 {error, _Reason} = Error ->
                                     Error
                             end;
@@ -1645,6 +1807,108 @@ encode_record({Index, Entry}) ->
     Len = byte_size(Payload),
     Crc = erlang:crc32(Payload),
     <<Len:32/unsigned-big, Crc:32/unsigned-big, Payload/binary>>.
+
+offset_entries_for_records(Dir, Path, Records, OldSize, Writes) ->
+    {ok, Ordinal} = parse_segment_ordinal(filename:basename(Path, ?SEGMENT_EXT)),
+    DirKey = offset_dir_key(Dir),
+    offset_entries_for_records(DirKey, Ordinal, Records, Writes, OldSize, []).
+
+offset_entries_for_records(_DirKey, _Ordinal, [], [], _Offset, Acc) ->
+    lists:reverse(Acc);
+offset_entries_for_records(DirKey, Ordinal, [{Index, _Entry} | Records], [Write | Writes], Offset, Acc) ->
+    EncodedSize = iolist_size(Write),
+    Entry = offset_entry(DirKey, Index, Ordinal, Offset, EncodedSize),
+    offset_entries_for_records(DirKey, Ordinal, Records, Writes, Offset + EncodedSize, [Entry | Acc]).
+
+offset_entry(DirKey, Index, Ordinal, Offset, EncodedSize) ->
+    {{DirKey, Index}, Ordinal, Offset, EncodedSize}.
+
+register_record_offset(Dir, Index, Ordinal, Offset, EncodedSize) ->
+    register_offset_entries([offset_entry(offset_dir_key(Dir), Index, Ordinal, Offset, EncodedSize)]).
+
+register_offset_entries([]) ->
+    ok;
+register_offset_entries(Entries) ->
+    case ensure_offset_registry() of
+        ok ->
+            true = ets:insert(?OFFSET_REGISTRY, Entries),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+lookup_offset(Dir, Index) ->
+    case ensure_offset_registry() of
+        ok ->
+            case ets:lookup(?OFFSET_REGISTRY, {offset_dir_key(Dir), Index}) of
+                [{{_DirKey, Index}, Ordinal, Offset, EncodedSize}] ->
+                    {ok, {Ordinal, Offset, EncodedSize}};
+                [] ->
+                    not_found
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+rebuild_offset_registry(Dir) ->
+    case ensure_offset_registry() of
+        ok ->
+            clear_offset_registry_for_dir(Dir),
+            Tid = ets:new(?MODULE, [ordered_set]),
+            try
+                case existing_records_per_segment(Dir) of
+                    {ok, RecordsPerSegment} ->
+                        case segment_paths(Dir) of
+                            {ok, Paths} ->
+                                case load_segment_paths(Paths, Tid, undefined, RecordsPerSegment) of
+                                    {ok, _LastIndex} -> ok;
+                                    {error, _Reason} = Error -> Error
+                                end;
+                            {error, enoent} -> ok;
+                            {error, _Reason} = Error -> Error
+                        end;
+                    not_found ->
+                        ok;
+                    {error, _Reason} = Error ->
+                        Error
+                end
+            after
+                ets:delete(Tid)
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+clear_offset_registry_for_dir(Dir) ->
+    DirKey = offset_dir_key(Dir),
+    ets:match_delete(?OFFSET_REGISTRY, {{DirKey, '_'}, '_', '_', '_'}),
+    ok.
+
+offset_dir_key(Dir) ->
+    unicode:characters_to_binary(filename:absname(Dir)).
+
+ensure_offset_registry() ->
+    case ets:info(?OFFSET_REGISTRY) of
+        undefined ->
+            try
+                ets:new(?OFFSET_REGISTRY, [
+                    named_table,
+                    public,
+                    set,
+                    {read_concurrency, true},
+                    {write_concurrency, true}
+                ]),
+                ok
+            catch
+                error:badarg ->
+                    case ets:info(?OFFSET_REGISTRY) of
+                        undefined -> {error, offset_registry_unavailable};
+                        _Info -> ok
+                    end
+            end;
+        _Info ->
+            ok
+    end.
 
 segment_paths(Dir) ->
     case file:list_dir(Dir) of

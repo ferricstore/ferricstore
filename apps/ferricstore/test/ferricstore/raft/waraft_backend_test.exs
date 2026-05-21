@@ -146,10 +146,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "v1" == Router.get(ctx, key)
 
       assert [
-               {^key, "v1", 0, _lfu, {:waraft_segment, index}, 0, 2}
+               {^key, "v1", 0, _lfu, {:waraft_segment, index}, offset, 2}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
 
       assert is_integer(index) and index > 0
+      assert is_integer(offset) and offset >= 0
       assert File.stat!(Path.join([root, "data", "shard_0", "00000.log"])).size == 0
 
       assert :ok = WARaftBackend.stop()
@@ -164,8 +165,48 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert "v1" == Router.get(restarted_ctx, key)
 
-      assert [{^key, "v1", 0, _lfu, {:waraft_segment, ^index}, 0, 2}] =
+      assert [{^key, "v1", 0, _lfu, restarted_file_id, restarted_offset, 2}] =
                :ets.lookup(elem(restarted_ctx.keydir_refs, 0), key)
+
+      case restarted_file_id do
+        {:waraft_segment, ^index} ->
+          :ok
+
+        {:waraft_projection, projection_index} ->
+          assert is_integer(projection_index) and projection_index > 0
+      end
+
+      assert is_integer(restarted_offset) and restarted_offset >= 0
+    after
+      restore_env(:waraft_storage_apply_mode, previous_mode)
+    end
+  end
+
+  test "unified segment storage records physical segment offsets in keydir", %{
+    ctx: ctx
+  } do
+    previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      assert :ok = WARaftBackend.write(0, {:put, "segment-keydir:offset-fence", "v1", 0})
+
+      key = "segment-keydir:offset-large"
+      value = :binary.copy("v", ctx.hot_cache_max_value_size + 1)
+
+      assert :ok = WARaftBackend.write(0, {:put, key, value, 0})
+
+      assert [
+               {^key, nil, 0, _lfu, {:waraft_segment, index}, offset, value_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+      assert is_integer(index) and index > 0
+      assert offset > 0
+      assert value_size == byte_size(value)
+      assert value == Router.get(ctx, key)
     after
       restore_env(:waraft_storage_apply_mode, previous_mode)
     end
@@ -188,11 +229,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert :ok = WARaftBackend.write(0, {:put, key, value, 0})
 
       assert [
-               {^key, nil, 0, _lfu, {:waraft_segment, index}, 0, value_size}
+               {^key, nil, 0, _lfu, {:waraft_segment, index}, offset, value_size}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
 
       assert value_size == byte_size(value)
       assert is_integer(index) and index > 0
+      assert is_integer(offset) and offset >= 0
       assert value == Router.get(ctx, key)
 
       assert :ok = WARaftBackend.stop()
@@ -213,6 +255,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   end
 
   test "unified segment storage keeps cold values readable after segment trim", %{
+    root: root,
     ctx: ctx
   } do
     previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
@@ -228,17 +271,46 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert :ok = WARaftBackend.write(0, {:put, key, value, 0})
 
       assert [
-               {^key, nil, 0, _lfu, {:waraft_segment, value_index}, 0, value_size}
+               {^key, nil, 0, _lfu, {:waraft_segment, value_index}, value_offset, value_size}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
 
       assert value_size == byte_size(value)
+      assert is_integer(value_offset) and value_offset >= 0
       assert :ok = WARaftBackend.write(0, {:put, "segment-keydir:trim-fence", "v2", 0})
 
       log = waraft_segment_log_record(0)
       assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, value_index + 1, %{})
 
       assert :not_found = :ferricstore_waraft_spike_segment_log.get(log, value_index)
+
+      assert [
+               {^key, nil, 0, _lfu_after, {:waraft_projection, projection_index},
+                projection_offset, ^value_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+      assert is_integer(projection_index) and projection_index > 0
+      assert is_integer(projection_offset) and projection_offset > 0
       assert value == Router.get(ctx, key)
+
+      assert :ok = WARaftBackend.stop()
+      FerricStore.Instance.cleanup(ctx.name)
+
+      restarted_ctx = build_ctx(root)
+      on_exit(fn -> FerricStore.Instance.cleanup(restarted_ctx.name) end)
+
+      assert :ok =
+               WARaftBackend.start(restarted_ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log
+               )
+
+      assert [
+               {^key, nil, 0, _lfu_restarted, {:waraft_projection, restarted_projection_index},
+                restarted_projection_offset, ^value_size}
+             ] = :ets.lookup(elem(restarted_ctx.keydir_refs, 0), key)
+
+      assert restarted_projection_index == projection_index
+      assert restarted_projection_offset == projection_offset
+      assert value == Router.get(restarted_ctx, key)
     after
       restore_env(:waraft_storage_apply_mode, previous_mode)
     end
@@ -264,13 +336,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                WARaftBackend.write_put_batch(0, [{key1, value1, 0}, {key2, value2, 0}])
 
       assert [
-               {^key1, nil, 0, _lfu1, {:waraft_segment, index}, 0, value1_size}
+               {^key1, nil, 0, _lfu1, {:waraft_segment, index}, offset, value1_size}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), key1)
 
       assert [
-               {^key2, nil, 0, _lfu2, {:waraft_segment, ^index}, 0, value2_size}
+               {^key2, nil, 0, _lfu2, {:waraft_segment, ^index}, ^offset, value2_size}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), key2)
 
+      assert is_integer(offset) and offset >= 0
       assert value1_size == byte_size(value1)
       assert value2_size == byte_size(value2)
       assert value1 == Router.get(ctx, key1)

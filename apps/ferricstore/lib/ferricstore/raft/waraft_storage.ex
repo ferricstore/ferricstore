@@ -34,6 +34,13 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @segment_keydir_apply :segment_keydir
   @default_storage_apply @bitcask_keydir_apply
   @segment_projection_registry :ferricstore_waraft_segment_projection_registry
+  @storage_root "ferricstore_waraft_backend"
+
+  defguardp valid_segment_backed_file_id(file_id)
+            when is_tuple(file_id) and tuple_size(file_id) == 2 and
+                   (elem(file_id, 0) == :waraft_segment or
+                      elem(file_id, 0) == :waraft_projection) and
+                   is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0
 
   @type handle :: map()
 
@@ -128,15 +135,25 @@ defmodule Ferricstore.Raft.WARaftStorage do
     root_dir = to_path(root_dir)
 
     if segment_bitcask_apply?() do
+      projection_root = segment_projection_root(root_dir)
+
       with {:ok, context} <- lookup_segment_projection_context(root_dir),
            :ok <- validate_segment_projection_trim_position(context.position, trim_index),
-           {:ok, entries} <-
-             collect_segment_projected_entries_strict(context.ctx, context.shard_index),
+           {:ok, relocations} <-
+             collect_segment_projection_relocations(context.ctx, context.shard_index),
+           entries = segment_projection_entries_from_relocations(relocations),
            :ok <-
              write_segment_projection(
-               segment_projection_root(root_dir),
+               projection_root,
                context.position,
                entries
+             ),
+           :ok <-
+             relocate_segment_projection_keydir(
+               context.ctx,
+               context.shard_index,
+               projection_root,
+               relocations
              ) do
         :ok
       end
@@ -245,10 +262,13 @@ defmodule Ferricstore.Raft.WARaftStorage do
            ) do
       position = Map.fetch!(metadata, :position)
 
+      projection_source =
+        segment_projection_apply_source(handle.root_dir, position, segment_projection_entries)
+
       sm_state =
         handle.ctx
         |> build_sm_state(handle.shard_index)
-        |> apply_segment_projection_entries(position, segment_projection_entries)
+        |> apply_segment_projection_entries(projection_source, segment_projection_entries)
 
       new_handle =
         handle
@@ -293,6 +313,11 @@ defmodule Ferricstore.Raft.WARaftStorage do
       end
     end
   end
+
+  defp segment_projection_apply_source(_root_dir, position, []), do: position
+
+  defp segment_projection_apply_source(root_dir, _position, _entries),
+    do: segment_projection_root(root_dir)
 
   @spec make_empty_snapshot(map(), charlist() | binary(), tuple(), term(), term()) ::
           :ok | {:error, term()}
@@ -887,13 +912,15 @@ defmodule Ferricstore.Raft.WARaftStorage do
     sm_state = segment_project_clear_compound_for_string_put(sm_state, key)
     shard_state = shard_ets_state_from_sm(sm_state)
     true = ShardETS.ets_insert(shard_state, key, value, expire_at_ms)
-    install_segment_projected_location(sm_state, key, value, position)
+    install_main_segment_location(sm_state, key, value, position)
     sm_state
   end
 
   defp segment_project_put_blob_ref(sm_state, key, encoded_ref, expire_at_ms, position) do
     sm_state = segment_project_clear_compound_for_string_put(sm_state, key)
     shard_state = shard_ets_state_from_sm(sm_state)
+    file_id = {:waraft_segment, position_index(position)}
+    offset = segment_record_offset(sm_state, position)
 
     true =
       ShardETS.ets_insert_with_location(
@@ -901,8 +928,8 @@ defmodule Ferricstore.Raft.WARaftStorage do
         key,
         nil,
         expire_at_ms,
-        {:waraft_segment, position_index(position)},
-        0,
+        file_id,
+        offset,
         byte_size(encoded_ref)
       )
 
@@ -958,9 +985,9 @@ defmodule Ferricstore.Raft.WARaftStorage do
         if live_expire_at?(expire_at_ms, now), do: value, else: nil
 
       [
-        {^key, nil, expire_at_ms, _lfu, {:waraft_segment, index} = file_id, _offset, _value_size}
+        {^key, nil, expire_at_ms, _lfu, file_id, _offset, _value_size}
       ]
-      when is_integer(index) and index > 0 ->
+      when valid_segment_backed_file_id(file_id) ->
         if live_expire_at?(expire_at_ms, now) do
           case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
                  ctx,
@@ -1017,6 +1044,28 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
   defp apply_segment_projection_entries(sm_state, _position, []), do: sm_state
 
+  defp apply_segment_projection_entries(sm_state, projection_root, entries)
+       when is_binary(projection_root) do
+    now = HLC.now_ms()
+
+    entries
+    |> Enum.with_index(1)
+    |> Enum.reduce(sm_state, fn {{key, value, expire_at_ms}, projection_index}, acc ->
+      if live_expire_at?(expire_at_ms, now) do
+        segment_project_recovered_projection_entry(
+          acc,
+          projection_root,
+          projection_index,
+          key,
+          value,
+          expire_at_ms
+        )
+      else
+        acc
+      end
+    end)
+  end
+
   defp apply_segment_projection_entries(sm_state, position, entries) do
     now = HLC.now_ms()
 
@@ -1027,6 +1076,44 @@ defmodule Ferricstore.Raft.WARaftStorage do
         acc
       end
     end)
+  end
+
+  defp segment_project_recovered_projection_entry(
+         sm_state,
+         projection_root,
+         projection_index,
+         key,
+         value,
+         expire_at_ms
+       ) do
+    offset = projection_record_offset(projection_root, projection_index)
+    sm_state = segment_project_clear_compound_for_string_put(sm_state, key)
+    shard_state = shard_ets_state_from_sm(sm_state)
+
+    if segment_blob_ref_value?(value) do
+      true =
+        ShardETS.ets_insert_with_location(
+          shard_state,
+          key,
+          nil,
+          expire_at_ms,
+          {:waraft_projection, projection_index},
+          offset,
+          byte_size(value)
+        )
+    else
+      true = ShardETS.ets_insert(shard_state, key, value, expire_at_ms)
+
+      install_segment_location(
+        sm_state,
+        key,
+        value,
+        {:waraft_projection, projection_index},
+        offset
+      )
+    end
+
+    sm_state
   end
 
   defp segment_project_recovered_entry(sm_state, key, value, expire_at_ms, position) do
@@ -1043,13 +1130,19 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
   defp segment_blob_ref_value?(_value), do: false
 
-  defp install_segment_projected_location(%{ets: keydir}, key, value, position) do
+  defp install_main_segment_location(sm_state, key, value, position) do
+    file_id = {:waraft_segment, position_index(position)}
+    offset = segment_record_offset(sm_state, position)
+    install_segment_location(sm_state, key, value, file_id, offset)
+  end
+
+  defp install_segment_location(%{ets: keydir}, key, value, file_id, offset)
+       when valid_segment_backed_file_id(file_id) and is_integer(offset) and offset >= 0 do
     case :ets.lookup(keydir, key) do
       [{^key, ets_value, expire_at_ms, lfu, _file_id, _offset, _value_size}] ->
         :ets.insert(
           keydir,
-          {key, ets_value, expire_at_ms, lfu, {:waraft_segment, position_index(position)}, 0,
-           byte_size(value)}
+          {key, ets_value, expire_at_ms, lfu, file_id, offset, byte_size(value)}
         )
 
       [] ->
@@ -1077,6 +1170,51 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
   defp position_index({:raft_log_pos, index, _term}) when is_integer(index), do: index
   defp position_index(_position), do: 0
+
+  defp segment_record_offset(
+         %{data_dir: data_dir, shard_index: shard_index},
+         {:raft_log_pos, index, _term}
+       )
+       when is_integer(index) and index > 0 do
+    root = Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"])
+
+    case :ferricstore_waraft_spike_segment_log.location_for_index(to_charlist(root), index) do
+      {:ok, {_ordinal, offset, _encoded_size}} when is_integer(offset) and offset >= 0 -> offset
+      _missing_or_error -> 0
+    end
+  end
+
+  defp segment_record_offset(_sm_state, _position), do: 0
+
+  defp projection_record_offset(projection_root, projection_index)
+       when is_binary(projection_root) and is_integer(projection_index) and projection_index > 0 do
+    case projection_record_location(projection_root, projection_index) do
+      {:ok, offset} -> offset
+      {:error, _reason} -> 0
+    end
+  end
+
+  defp projection_record_offset(_projection_root, _projection_index), do: 0
+
+  defp projection_record_location(projection_root, projection_index)
+       when is_binary(projection_root) and is_integer(projection_index) and projection_index > 0 do
+    case :ferricstore_waraft_spike_segment_log.location_for_index(
+           to_charlist(projection_root),
+           projection_index
+         ) do
+      {:ok, {_ordinal, offset, _encoded_size}} when is_integer(offset) and offset >= 0 ->
+        {:ok, offset}
+
+      :not_found ->
+        {:error, {:missing_segment_projection_offset, projection_index}}
+
+      {:error, reason} ->
+        {:error, {:segment_projection_offset_failed, projection_index, reason}}
+    end
+  end
+
+  defp projection_record_location(_projection_root, projection_index),
+    do: {:error, {:bad_segment_projection_index, projection_index}}
 
   defp apply_state_machine_command(command, position, sm_state) do
     meta = meta_from_position(position)
@@ -1601,7 +1739,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
               {:ok, sm_state, 0}
 
             _order ->
-              {:ok, apply_segment_projection_entries(sm_state, projection.position, entries),
+              {:ok, apply_segment_projection_entries(sm_state, projection_root, entries),
                position_index(projection.position)}
           end
         end
@@ -2158,16 +2296,6 @@ defmodule Ferricstore.Raft.WARaftStorage do
     end
   end
 
-  defp collect_segment_projected_entries_strict(ctx, shard_index) do
-    keydir = elem(ctx.keydir_refs, shard_index)
-
-    collect_segment_projected_entries_strict(%{
-      ets: keydir,
-      instance_ctx: ctx,
-      shard_index: shard_index
-    })
-  end
-
   defp collect_segment_projected_entries_strict(%{
          ets: keydir,
          instance_ctx: ctx,
@@ -2203,6 +2331,133 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
   defp collect_segment_projected_entries_strict(_sm_state),
     do: {:error, :bad_segment_projection_state}
+
+  defp collect_segment_projection_relocations(ctx, shard_index) do
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    collect_segment_projection_relocations(%{
+      ets: keydir,
+      instance_ctx: ctx,
+      shard_index: shard_index
+    })
+  end
+
+  defp collect_segment_projection_relocations(%{
+         ets: keydir,
+         instance_ctx: ctx,
+         shard_index: shard_index
+       }) do
+    now = HLC.now_ms()
+
+    case keydir_rows(keydir) do
+      :unavailable ->
+        {:error, {:segment_keydir_unavailable, shard_index}}
+
+      rows ->
+        rows
+        |> Enum.reduce_while({:ok, []}, fn row, {:ok, acc} ->
+          case segment_projection_entry_from_keydir_row(row, ctx, shard_index, now) do
+            {:ok, entry} -> {:cont, {:ok, [{entry, row} | acc]}}
+            :skip -> {:cont, {:ok, acc}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+        |> case do
+          {:ok, relocations} ->
+            {:ok, Enum.sort_by(relocations, fn {{key, _value, _expire_at_ms}, _row} -> key end)}
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  rescue
+    error -> {:error, {:collect_segment_projection_relocations_failed, error}}
+  end
+
+  defp collect_segment_projection_relocations(_sm_state),
+    do: {:error, :bad_segment_projection_state}
+
+  defp segment_projection_entries_from_relocations(relocations) do
+    Enum.map(relocations, fn {entry, _row} -> entry end)
+  end
+
+  defp relocate_segment_projection_keydir(_ctx, _shard_index, _projection_root, []), do: :ok
+
+  defp relocate_segment_projection_keydir(ctx, shard_index, projection_root, relocations) do
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    relocations
+    |> Enum.with_index(1)
+    |> Enum.reduce_while(:ok, fn {relocation, projection_index}, :ok ->
+      case relocate_segment_projection_row(keydir, projection_root, projection_index, relocation) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  rescue
+    error -> {:error, {:relocate_segment_projection_keydir_failed, error}}
+  end
+
+  defp relocate_segment_projection_row(
+         keydir,
+         projection_root,
+         projection_index,
+         {{key, value, expire_at_ms}, original_row}
+       ) do
+    with {:ok, projection_offset} <- projection_record_location(projection_root, projection_index) do
+      compare_and_relocate_segment_projection_row(
+        keydir,
+        key,
+        value,
+        expire_at_ms,
+        original_row,
+        projection_index,
+        projection_offset
+      )
+    end
+  end
+
+  defp compare_and_relocate_segment_projection_row(
+         keydir,
+         key,
+         projected_value,
+         expire_at_ms,
+         {key, original_value, expire_at_ms, _original_lfu, original_file_id, original_offset,
+          original_value_size},
+         projection_index,
+         projection_offset
+       ) do
+    case :ets.lookup(keydir, key) do
+      [
+        {^key, current_value, ^expire_at_ms, current_lfu, ^original_file_id, ^original_offset,
+         ^original_value_size}
+      ] ->
+        if original_value == nil or current_value == original_value do
+          :ets.insert(
+            keydir,
+            {key, current_value, expire_at_ms, current_lfu,
+             {:waraft_projection, projection_index}, projection_offset,
+             byte_size(projected_value)}
+          )
+        end
+
+        :ok
+
+      _changed_or_deleted ->
+        :ok
+    end
+  end
+
+  defp compare_and_relocate_segment_projection_row(
+         _keydir,
+         key,
+         _projected_value,
+         _expire_at_ms,
+         original_row,
+         _projection_index,
+         _projection_offset
+       ),
+       do: {:error, {:bad_segment_projection_relocation_row, key, original_row}}
 
   defp segment_projection_entry_from_keydir_row(
          {key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size},
@@ -2243,8 +2498,8 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
   defp segment_projection_entry_from_keydir_row(_row, _ctx, _shard_index, _now), do: :skip
 
-  defp read_keydir_cold_value(ctx, shard_index, key, {:waraft_segment, index} = file_id, _offset)
-       when is_integer(index) and index > 0 do
+  defp read_keydir_cold_value(ctx, shard_index, key, file_id, _offset)
+       when valid_segment_backed_file_id(file_id) do
     Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, shard_index, file_id, key)
   end
 

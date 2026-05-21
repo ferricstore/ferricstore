@@ -29,6 +29,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   def read_value_from_location(ctx, shard_index, {:waraft_segment, index}, key),
     do: read_value(ctx, shard_index, index, key)
 
+  def read_value_from_location(ctx, shard_index, {:waraft_projection, index}, key),
+    do: read_projection_value_at(ctx, shard_index, index, key)
+
   def read_value_from_location(_ctx, _shard_index, _file_id, _key),
     do: {:error, :not_waraft_segment_location}
 
@@ -73,7 +76,35 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   defp read_main_log_entry_from_disk(ctx, shard_index, wanted_index) do
     root = storage_root(ctx, shard_index)
 
-    case :ferricstore_waraft_spike_segment_log.read_disk(to_charlist(root), wanted_index) do
+    root_chars = to_charlist(root)
+
+    case :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, wanted_index) do
+      {:ok, {_ordinal, offset, encoded_size}} ->
+        read_main_log_entry_from_disk_at(root_chars, wanted_index, offset, encoded_size)
+
+      :not_found ->
+        read_main_log_entry_from_disk_scan(root_chars, wanted_index)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp read_main_log_entry_from_disk_at(root, wanted_index, offset, encoded_size) do
+    case :ferricstore_waraft_spike_segment_log.read_disk_at(
+           root,
+           wanted_index,
+           offset,
+           encoded_size
+         ) do
+      {:ok, entry} -> {:ok, entry}
+      :not_found -> {:error, :segment_entry_not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_main_log_entry_from_disk_scan(root, wanted_index) do
+    case :ferricstore_waraft_spike_segment_log.read_disk(root, wanted_index) do
       {:ok, entry} -> {:ok, entry}
       :not_found -> {:error, :segment_entry_not_found}
       {:error, reason} -> {:error, reason}
@@ -106,6 +137,41 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       {:found_projection_value, value} -> {:ok, value}
     end
   end
+
+  defp read_projection_value_at(ctx, shard_index, index, key)
+       when is_integer(index) and index > 0 and is_binary(key) do
+    projection_root = Path.join(storage_root(ctx, shard_index), @projection_dir)
+    root_chars = to_charlist(projection_root)
+
+    with {:ok, {_ordinal, offset, encoded_size}} <-
+           :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index),
+         {:ok, entry} <-
+           :ferricstore_waraft_spike_segment_log.read_disk_at(
+             root_chars,
+             index,
+             offset,
+             encoded_size
+           ) do
+      case entry do
+        {0, {:ferricstore_segment_projection_entry, ^key, value, _expire_at_ms}}
+        when is_binary(value) ->
+          {:ok, value}
+
+        {0, {:ferricstore_segment_projection_entry, _other_key, _value, _expire_at_ms}} ->
+          :not_found
+
+        _other ->
+          {:error, :bad_segment_projection_entry}
+      end
+    else
+      :not_found -> :not_found
+      {:error, :enoent} -> :not_found
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_projection_value_at(_ctx, _shard_index, _index, _key),
+    do: {:error, :bad_segment_projection_location}
 
   defp value_from_entry(entry, key) do
     case command_from_entry(entry) do

@@ -12,8 +12,10 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   defguardp valid_waraft_segment_location(file_id, offset, value_size)
             when is_tuple(file_id) and tuple_size(file_id) == 2 and
-                   elem(file_id, 0) == :waraft_segment and is_integer(elem(file_id, 1)) and
-                   elem(file_id, 1) > 0 and is_integer(offset) and offset >= 0 and
+                   (elem(file_id, 0) == :waraft_segment or
+                      elem(file_id, 0) == :waraft_projection) and
+                   is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
+                   is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
 
   # -------------------------------------------------------------------
@@ -100,7 +102,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def ets_lookup_warm(state, key) do
     case ets_lookup(state, key) do
-      {:cold, {:waraft_segment, _index} = fid, _off, _vsize, exp} ->
+      {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
         case read_waraft_segment_value(state, fid, key) do
           {:ok, value} when is_binary(value) ->
             cold_read_warm_ets(state, key, value)
@@ -382,7 +384,7 @@ defmodule Ferricstore.Store.Shard.ETS do
             nil
         end
 
-      [{^key, nil, exp, _lfu, {:waraft_segment, _index} = fid, off, vsize}]
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
       when valid_waraft_segment_location(fid, off, vsize) ->
         case read_waraft_segment_value(state, fid, key) do
           {:ok, value} when is_binary(value) ->
@@ -570,7 +572,9 @@ defmodule Ferricstore.Store.Shard.ETS do
     valid_waraft_segment_guard =
       {:andalso, {:is_tuple, :"$4"},
        {:andalso, {:==, {:tuple_size, :"$4"}, 2},
-        {:andalso, {:==, {:element, 1, :"$4"}, :waraft_segment},
+        {:andalso,
+         {:orelse, {:==, {:element, 1, :"$4"}, :waraft_segment},
+          {:==, {:element, 1, :"$4"}, :waraft_projection}},
          {:andalso, {:is_integer, {:element, 2, :"$4"}},
           {:andalso, {:>, {:element, 2, :"$4"}, 0},
            {:andalso, {:is_integer, :"$5"},
@@ -742,7 +746,9 @@ defmodule Ferricstore.Store.Shard.ETS do
     valid_waraft_segment_guard =
       {:andalso, {:is_tuple, :"$4"},
        {:andalso, {:==, {:tuple_size, :"$4"}, 2},
-        {:andalso, {:==, {:element, 1, :"$4"}, :waraft_segment},
+        {:andalso,
+         {:orelse, {:==, {:element, 1, :"$4"}, :waraft_segment},
+          {:==, {:element, 1, :"$4"}, :waraft_projection}},
          {:andalso, {:is_integer, {:element, 2, :"$4"}},
           {:andalso, {:>, {:element, 2, :"$4"}, 0},
            {:andalso, {:is_integer, :"$5"},

@@ -57,8 +57,10 @@ defmodule Ferricstore.Store.Router do
 
   defguardp valid_waraft_segment_location(file_id, offset, value_size)
             when is_tuple(file_id) and tuple_size(file_id) == 2 and
-                   elem(file_id, 0) == :waraft_segment and is_integer(elem(file_id, 1)) and
-                   elem(file_id, 1) > 0 and is_integer(offset) and offset >= 0 and
+                   (elem(file_id, 0) == :waraft_segment or
+                      elem(file_id, 0) == :waraft_projection) and
+                   is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
+                   is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
 
   defguardp readable_cold_ref?(file_id, offset, value_size)
@@ -2244,16 +2246,13 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp read_waraft_segment_materialized(ctx, idx, {:waraft_segment, index}, key)
-       when is_integer(index) and index > 0 do
-    with {:ok, value} <- Ferricstore.Raft.WARaftSegmentReader.read_value(ctx, idx, index, key),
+  defp read_waraft_segment_materialized(ctx, idx, file_id, key) do
+    with {:ok, value} <-
+           Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, file_id, key),
          {:ok, materialized} <- materialize_blob_value(ctx, idx, value) do
       {:ok, materialized}
     end
   end
-
-  defp read_waraft_segment_materialized(_ctx, _idx, _file_id, _key),
-    do: {:error, :not_waraft_segment_location}
 
   defp materialize_blob_value(ctx, idx, value) do
     BlobValue.maybe_materialize(ctx.data_dir, idx, BlobValue.threshold(ctx), value)
@@ -6468,10 +6467,13 @@ defmodule Ferricstore.Store.Router do
   defp read_compound_cold_materialized(
          ctx,
          idx,
-         {:waraft_segment, _index} = file_id,
+         file_id,
          _offset,
          key
-       ),
+       )
+       when is_tuple(file_id) and tuple_size(file_id) == 2 and
+              (elem(file_id, 0) == :waraft_segment or elem(file_id, 0) == :waraft_projection) and
+              is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0,
        do: read_waraft_segment_materialized(ctx, idx, file_id, key)
 
   defp read_compound_cold_materialized(ctx, idx, file_id, offset, key) do
