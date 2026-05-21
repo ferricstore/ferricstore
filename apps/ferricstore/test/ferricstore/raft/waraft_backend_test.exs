@@ -262,6 +262,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     refute source =~ "Enum.all?(entries, fn {key, value, expire_at_ms} ->"
   end
 
+  test "keydir location insert skips expiry accounting for no-ttl string puts" do
+    source = File.read!("lib/ferricstore/store/shard/ets.ex")
+
+    assert source =~ "adjust_expiry_for_insert(state, previous, expire_at_ms)"
+    assert source =~ "defp adjust_expiry_for_insert(_state, [], 0), do: :ok"
+    assert source =~ "defp adjust_expiry_for_insert(_state, [{_key, _value, 0"
+  end
+
   test "unified segment storage reads cold large values from the Raft segment", %{
     root: root,
     ctx: ctx

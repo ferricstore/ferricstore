@@ -190,7 +190,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     v = value_for_ets(value, threshold)
     {original_fid, original_vsize} = pending_original_location(key, previous)
     track_binary_insert(state, key, v, previous)
-    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
+    adjust_expiry_for_insert(state, previous, expire_at_ms)
 
     :ets.insert(
       state.keydir,
@@ -261,7 +261,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     threshold = hot_cache_threshold(state)
     v = value_for_ets(value, threshold)
     track_binary_insert(state, key, v, previous)
-    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
+    adjust_expiry_for_insert(state, previous, expire_at_ms)
     :ets.insert(state.keydir, {key, v, expire_at_ms, LFU.initial(), file_id, offset, value_size})
   end
 
@@ -929,6 +929,15 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   defp track_binary_insert(_, _, _, _), do: :ok
+
+  defp adjust_expiry_for_insert(_state, [], 0), do: :ok
+
+  defp adjust_expiry_for_insert(_state, [{_key, _value, 0, _lfu, _fid, _offset, _value_size}], 0),
+    do: :ok
+
+  defp adjust_expiry_for_insert(state, previous, expire_at_ms) do
+    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
+  end
 
   # Tracks bytes removed for delete. Must be called BEFORE :ets.delete.
   defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state, key)
