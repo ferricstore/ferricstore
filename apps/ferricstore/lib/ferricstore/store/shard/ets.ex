@@ -225,9 +225,41 @@ defmodule Ferricstore.Store.Shard.ETS do
         ) :: true
   @doc false
   def ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
+    ets_insert_with_location(
+      state,
+      key,
+      value,
+      expire_at_ms,
+      file_id,
+      offset,
+      value_size,
+      :ets.lookup(state.keydir, key)
+    )
+  end
+
+  @spec ets_insert_with_location(
+          map(),
+          binary(),
+          term(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          list()
+        ) :: true
+  @doc false
+  def ets_insert_with_location(
+        state,
+        key,
+        value,
+        expire_at_ms,
+        file_id,
+        offset,
+        value_size,
+        previous
+      ) do
     threshold = hot_cache_threshold(state)
     v = value_for_ets(value, threshold)
-    previous = :ets.lookup(state.keydir, key)
     track_binary_insert(state, key, v, previous)
     ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
     :ets.insert(state.keydir, {key, v, expire_at_ms, LFU.initial(), file_id, offset, value_size})

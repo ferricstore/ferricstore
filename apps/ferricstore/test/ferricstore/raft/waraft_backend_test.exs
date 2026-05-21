@@ -247,6 +247,21 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "unified segment string put reuses the keydir lookup before compound clear" do
+    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+
+    assert source =~ "previous = :ets.lookup(shard_state.keydir, key)"
+    assert source =~ "segment_project_clear_compound_for_string_put(sm_state, key, previous)"
+    assert source =~ "previous\n      )"
+  end
+
+  test "unified segment put_batch validates and applies entries in one pass" do
+    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+
+    assert source =~ "apply_segment_put_batch_entries(entries,"
+    refute source =~ "Enum.all?(entries, fn {key, value, expire_at_ms} ->"
+  end
+
   test "unified segment storage reads cold large values from the Raft segment", %{
     root: root,
     ctx: ctx

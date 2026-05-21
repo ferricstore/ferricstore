@@ -565,21 +565,10 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_project_command({:put_batch, entries}, position, sm_state) when is_list(entries) do
-    if Enum.all?(entries, fn {key, value, expire_at_ms} ->
-         segment_projectable_put?(sm_state, key, value, expire_at_ms)
-       end) do
-      file_id = {:waraft_segment, position_index(position)}
-      offset = segment_record_offset(sm_state, position)
+    file_id = {:waraft_segment, position_index(position)}
+    offset = segment_record_offset(sm_state, position)
 
-      new_sm_state =
-        Enum.reduce(entries, sm_state, fn {key, value, expire_at_ms}, acc ->
-          segment_project_put_at_location(acc, key, value, expire_at_ms, file_id, offset)
-        end)
-
-      {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(entries))}, length(entries)}
-    else
-      :unsupported
-    end
+    apply_segment_put_batch_entries(entries, sm_state, file_id, offset, 0)
   end
 
   defp segment_project_command({:put_blob_batch, entries}, position, sm_state)
@@ -769,6 +758,29 @@ defmodule Ferricstore.Raft.WARaftStorage do
     is_binary(key) and is_binary(value) and non_neg_integer?(expire_at_ms)
   end
 
+  defp apply_segment_put_batch_entries([], sm_state, _file_id, _offset, count) do
+    {:ok, sm_state, {:ok, List.duplicate(:ok, count)}, count}
+  end
+
+  defp apply_segment_put_batch_entries(
+         [{key, value, expire_at_ms} | rest],
+         sm_state,
+         file_id,
+         offset,
+         count
+       )
+       when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
+              expire_at_ms >= 0 do
+    sm_state =
+      segment_project_put_at_location(sm_state, key, value, expire_at_ms, file_id, offset)
+
+    apply_segment_put_batch_entries(rest, sm_state, file_id, offset, count + 1)
+  end
+
+  defp apply_segment_put_batch_entries(_invalid, _sm_state, _file_id, _offset, _count) do
+    :unsupported
+  end
+
   defp segment_projectable_compound_put?(redis_key, {compound_key, value, expire_at_ms}),
     do: segment_projectable_compound_put?(redis_key, compound_key, value, expire_at_ms)
 
@@ -918,8 +930,9 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_project_put_at_location(sm_state, key, value, expire_at_ms, file_id, offset) do
-    sm_state = segment_project_clear_compound_for_string_put(sm_state, key)
     shard_state = shard_ets_state_from_sm(sm_state)
+    previous = :ets.lookup(shard_state.keydir, key)
+    sm_state = segment_project_clear_compound_for_string_put(sm_state, key, previous)
 
     true =
       ShardETS.ets_insert_with_location(
@@ -929,15 +942,17 @@ defmodule Ferricstore.Raft.WARaftStorage do
         expire_at_ms,
         file_id,
         offset,
-        byte_size(value)
+        byte_size(value),
+        previous
       )
 
     sm_state
   end
 
   defp segment_project_put_blob_ref(sm_state, key, encoded_ref, expire_at_ms, position) do
-    sm_state = segment_project_clear_compound_for_string_put(sm_state, key)
     shard_state = shard_ets_state_from_sm(sm_state)
+    previous = :ets.lookup(shard_state.keydir, key)
+    sm_state = segment_project_clear_compound_for_string_put(sm_state, key, previous)
     file_id = {:waraft_segment, position_index(position)}
     offset = segment_record_offset(sm_state, position)
 
@@ -949,11 +964,30 @@ defmodule Ferricstore.Raft.WARaftStorage do
         expire_at_ms,
         file_id,
         offset,
-        byte_size(encoded_ref)
+        byte_size(encoded_ref),
+        previous
       )
 
     sm_state
   end
+
+  defp segment_project_clear_compound_for_string_put(sm_state, key, previous)
+       when is_binary(key) do
+    cond do
+      CompoundKey.internal_key?(key) ->
+        sm_state
+
+      # Existing plain string row means this SET cannot be overwriting a compound value.
+      # Reuse the lookup needed for ETS accounting and skip the marker probe.
+      match?([{^key, _value, _expire_at_ms, _lfu, _fid, _offset, _value_size}], previous) ->
+        sm_state
+
+      true ->
+        segment_project_clear_compound_for_string_put(sm_state, key)
+    end
+  end
+
+  defp segment_project_clear_compound_for_string_put(sm_state, _key, _previous), do: sm_state
 
   defp segment_project_clear_compound_for_string_put(sm_state, key) when is_binary(key) do
     if CompoundKey.internal_key?(key) do
