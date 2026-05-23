@@ -3,19 +3,23 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   use GenServer
 
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
   alias Ferricstore.Raft.Backend, as: RaftBackend
+  alias Ferricstore.Raft.WARaftSegmentReader
 
   require Logger
 
   @default_flush_interval_ms 100
-  @default_lagged_flush_interval_ms 30_000
-  @default_lagged_flush_jitter_ms 5_000
+  @default_lagged_flush_interval_ms 1_000
+  @default_lagged_flush_jitter_ms 250
   @default_max_ops 10_000
-  @default_lagged_max_ops 100_000
+  @default_lagged_max_ops 25_000
   @default_flush_chunk_ops 10_000
   @default_lagged_flush_chunk_pause_ms 1
+  @default_source_pending_retries 100
+  @default_source_pending_sleep_ms 1
   @terminal_states ["completed", "failed", "cancelled"]
 
   def start_link(opts) do
@@ -181,6 +185,38 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  def suspend_all(shard_count) when is_integer(shard_count) and shard_count >= 0 do
+    suspend_all(:default, shard_count)
+  end
+
+  def suspend_all(instance_name, shard_count)
+      when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
+    mark_instance_suspended(instance_name)
+
+    shard_indexes = if shard_count == 0, do: [], else: 0..(shard_count - 1)
+
+    Enum.each(shard_indexes, fn shard_index ->
+      _ = suspend(instance_name, shard_index)
+    end)
+
+    :ok
+  end
+
+  def suspend(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
+    mark_instance_suspended(instance_name)
+
+    case Process.whereis(name(instance_name, shard_index)) do
+      pid when is_pid(pid) ->
+        GenServer.call(pid, :suspend, 5_000)
+
+      nil ->
+        :ok
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
   def name(shard_index), do: :"Ferricstore.Flow.LMDBWriter.#{shard_index}"
 
   def name(:default, shard_index), do: name(shard_index)
@@ -189,13 +225,35 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :"Ferricstore.Flow.LMDBWriter.#{instance_name}.#{shard_index}"
   end
 
+  defp mark_instance_suspended(instance_name) when is_atom(instance_name) do
+    :persistent_term.put(suspend_key(instance_name), true)
+    :ok
+  end
+
+  defp clear_instance_suspended(instance_name) when is_atom(instance_name) do
+    :persistent_term.erase(suspend_key(instance_name))
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp instance_suspended?(instance_name) when is_atom(instance_name),
+    do: :persistent_term.get(suspend_key(instance_name), false)
+
+  defp suspend_key(instance_name), do: {__MODULE__, :suspended, instance_name}
+
   @impl true
   def init(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
     data_dir = Keyword.fetch!(opts, :data_dir)
+    instance_name = instance_name_from_opts(opts)
+
+    if shard_index == 0 do
+      clear_instance_suspended(instance_name)
+    end
 
     state = %{
-      instance_name: instance_name_from_opts(opts),
+      instance_name: instance_name,
       mode: Ferricstore.Flow.LMDB.mode(),
       shard_index: shard_index,
       shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, shard_index),
@@ -214,6 +272,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       requested_index: 0,
       terminal_count_inits: MapSet.new(),
       lmdb_ready: false,
+      suspended?: false,
       flush_interval_ms:
         Application.get_env(
           :ferricstore,
@@ -286,6 +345,21 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   @impl true
   def handle_cast({:enqueue, ops, after_flush}, state) do
+    if writer_suspended?(state) do
+      {:noreply, state}
+    else
+      handle_enqueue(ops, after_flush, state)
+    end
+  end
+
+  def handle_cast({:persist_replay_safe, index}, state) when is_integer(index) and index >= 0 do
+    requested_index = max(state.requested_index, index)
+    publish_requested(state.instance_ctx, state.shard_index, requested_index)
+
+    {:noreply, flush_pending(%{state | requested_index: requested_index})}
+  end
+
+  defp handle_enqueue(ops, after_flush, state) do
     now = System.monotonic_time()
 
     state =
@@ -308,25 +382,41 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  def handle_cast({:persist_replay_safe, index}, state) when is_integer(index) and index >= 0 do
-    requested_index = max(state.requested_index, index)
-    publish_requested(state.instance_ctx, state.shard_index, requested_index)
-
-    {:noreply, flush_pending(%{state | requested_index: requested_index})}
-  end
-
   @impl true
   def handle_call(:flush, _from, state) do
-    {state, reply} = flush_pending_with_reply(state)
-    {:reply, reply, state}
+    if writer_suspended?(state) do
+      {:reply, {:error, :writer_suspended}, state}
+    else
+      {state, reply} = flush_pending_with_reply(state)
+      {:reply, reply, state}
+    end
+  end
+
+  def handle_call(:suspend, _from, state) do
+    if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+    {:reply, :ok, %{state | timer_ref: nil, suspended?: true}}
   end
 
   @impl true
-  def handle_info(:flush, state), do: {:noreply, flush_pending(%{state | timer_ref: nil})}
+  def handle_info(:flush, %{suspended?: true} = state) do
+    {:noreply, %{state | timer_ref: nil}}
+  end
+
+  def handle_info(:flush, state) do
+    if writer_suspended?(state) do
+      {:noreply, %{state | timer_ref: nil, suspended?: true}}
+    else
+      {:noreply, flush_pending(%{state | timer_ref: nil})}
+    end
+  end
 
   def handle_info({:apply_after_flush, action}, state) do
     apply_after_flush(action)
     {:noreply, state}
+  end
+
+  defp writer_suspended?(state) do
+    state.suspended? or instance_suspended?(state.instance_name)
   end
 
   defp ensure_timer(%{timer_ref: nil, flush_interval_ms: interval} = state) do
@@ -336,15 +426,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp ensure_timer(state), do: state
 
-  defp ensure_enqueue_timer(%{mode: :lagged, timer_ref: timer_ref} = state)
-       when is_reference(timer_ref) do
-    Process.cancel_timer(timer_ref)
-    ensure_timer(%{state | timer_ref: nil})
-  end
-
   defp ensure_enqueue_timer(state), do: ensure_timer(state)
 
-  defp flush_on_max_ops?(%{mode: :lagged}), do: false
   defp flush_on_max_ops?(state), do: state.count >= state.max_ops
 
   defp flush_pending(state) do
@@ -395,18 +478,22 @@ defmodule Ferricstore.Flow.LMDBWriter do
         {state, :ok}
 
       {:error, reason, state} ->
-        record_persist_failure(state.instance_ctx, state.shard_index)
-        record_flush_failure(state.instance_ctx, state.shard_index)
-        mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
-        publish_backlog(state, pending_age_us)
-        emit_persist({:error, reason}, state, state.requested_index, started_at)
-        emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
+        if instance_suspended?(state.instance_name) do
+          {%{state | timer_ref: nil, suspended?: true}, :ok}
+        else
+          record_persist_failure(state.instance_ctx, state.shard_index)
+          record_flush_failure(state.instance_ctx, state.shard_index)
+          mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
+          publish_backlog(state, pending_age_us)
+          emit_persist({:error, reason}, state, state.requested_index, started_at)
+          emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
 
-        Logger.warning(
-          "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
-        )
+          Logger.warning(
+            "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
+          )
 
-        {ensure_timer(%{state | timer_ref: nil}), {:error, reason}}
+          {ensure_timer(%{state | timer_ref: nil}), {:error, reason}}
+        end
     end
   end
 
@@ -483,7 +570,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     }
 
     Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
-      case expand_op(state.path, op, acc) do
+      case expand_op(state, op, acc) do
         {:ok, acc} -> {:cont, {:ok, acc}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -509,7 +596,195 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp empty_terminal_count_cache, do: %{puts: %{}, refresh: MapSet.new()}
 
-  defp expand_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc)
+  defp expand_op(state, {:project_kv_from_source, key}, acc) when is_binary(key) do
+    case read_source_value(state, key) do
+      {:ok, value, expire_at_ms} ->
+        expand_path_op(
+          state.path,
+          {:put, key, Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)},
+          acc
+        )
+
+      :not_found ->
+        {:ok, prepend_ops(acc, [{:delete, key}])}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp expand_op(state, {:project_flow_state_from_source, key}, acc) when is_binary(key) do
+    case read_source_value(state, key) do
+      {:ok, value, expire_at_ms} ->
+        wrapper = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
+
+        with {:ok, acc} <- expand_path_op(state.path, {:put, key, wrapper}, acc) do
+          case decode_flow_record_value(wrapper) do
+            {:ok, record} ->
+              expand_flow_state_projection(state.path, key, expire_at_ms, record, acc)
+
+            :error ->
+              {:ok, acc}
+          end
+        end
+
+      :not_found ->
+        expand_missing_flow_state_projection(state.path, key, acc)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp expand_op(%{path: path}, op, acc), do: expand_path_op(path, op, acc)
+
+  defp expand_flow_state_projection(path, state_key, expire_at_ms, record, acc) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      expand_path_op(
+        path,
+        {:terminal_project, Map.fetch!(record, :id), Map.fetch!(record, :type),
+         Map.fetch!(record, :state), Map.get(record, :partition_key),
+         Map.get(record, :updated_at_ms, 0), state_key, expire_at_ms,
+         Map.get(record, :parent_flow_id), Map.get(record, :root_flow_id),
+         Map.get(record, :correlation_id)},
+        acc
+      )
+    else
+      maybe_expand_stale_terminal_delete(path, state_key, acc)
+    end
+  end
+
+  defp expand_missing_flow_state_projection(path, state_key, acc) do
+    with {:ok, acc} <- maybe_expand_stale_terminal_delete(path, state_key, acc) do
+      {:ok, prepend_ops(acc, [{:delete, state_key}])}
+    end
+  end
+
+  defp maybe_expand_stale_terminal_delete(path, state_key, acc) do
+    reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+
+    with {:ok, terminal_key} when is_binary(terminal_key) <-
+           Ferricstore.Flow.LMDB.get(path, reverse_key),
+         {:ok, terminal_value} <- Ferricstore.Flow.LMDB.get(path, terminal_key),
+         {:ok, count_key} <- Ferricstore.Flow.LMDB.terminal_index_count_key(terminal_value) do
+      expand_path_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
+    else
+      _ -> {:ok, acc}
+    end
+  end
+
+  defp read_source_value(state, key) do
+    read_source_value(state, key, source_pending_retries())
+  end
+
+  defp read_source_value(state, key, pending_retries) do
+    with keydir when not is_nil(keydir) <- source_keydir(state),
+         [{^key, cached_value, expire_at_ms, _lfu, file_id, offset, _value_size}] <-
+           :ets.lookup(keydir, key) do
+      case file_id do
+        :pending when pending_retries > 0 ->
+          Process.sleep(source_pending_sleep_ms())
+          read_source_value(state, key, pending_retries - 1)
+
+        :pending ->
+          {:error, {:source_pending, key}}
+
+        _ ->
+          read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
+      end
+    else
+      [] -> :not_found
+      nil -> {:error, :source_keydir_unavailable}
+      _ -> {:error, :source_keydir_bad_entry}
+    end
+  rescue
+    error -> {:error, {:source_read_failed, error}}
+  end
+
+  defp source_pending_retries do
+    :ferricstore
+    |> Application.get_env(:flow_lmdb_source_pending_retries, @default_source_pending_retries)
+    |> normalize_non_negative_integer(@default_source_pending_retries)
+  end
+
+  defp source_pending_sleep_ms do
+    :ferricstore
+    |> Application.get_env(:flow_lmdb_source_pending_sleep_ms, @default_source_pending_sleep_ms)
+    |> normalize_non_negative_integer(@default_source_pending_sleep_ms)
+  end
+
+  defp source_keydir(%{instance_ctx: ctx, shard_index: shard_index})
+       when is_map(ctx) and is_integer(shard_index) do
+    case Map.get(ctx, :keydir_refs) do
+      refs when is_tuple(refs) and shard_index >= 0 and shard_index < tuple_size(refs) ->
+        elem(refs, shard_index)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp source_keydir(_state), do: nil
+
+  defp read_source_location(state, _key, _cached_value, expire_at_ms, file_id, offset)
+       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 do
+    state.shard_data_path
+    |> bitcask_file_path(file_id)
+    |> NIF.v2_pread_at(offset)
+    |> source_read_result(expire_at_ms)
+  end
+
+  defp read_source_location(_state, _key, _cached_value, _expire_at_ms, :deleted, _offset),
+    do: :not_found
+
+  defp read_source_location(
+         %{instance_ctx: ctx, shard_index: shard_index},
+         key,
+         _cached_value,
+         expire_at_ms,
+         {:waraft_segment, _index} = file_id,
+         _offset
+       ) do
+    ctx
+    |> WARaftSegmentReader.read_value_from_location(shard_index, file_id, key)
+    |> source_segment_read_result(expire_at_ms)
+  end
+
+  defp read_source_location(
+         %{instance_ctx: ctx, shard_index: shard_index},
+         key,
+         _cached_value,
+         expire_at_ms,
+         {kind, _index} = file_id,
+         _offset
+       )
+       when kind in [:waraft_projection, :waraft_apply_projection] do
+    ctx
+    |> WARaftSegmentReader.read_value_from_location(shard_index, file_id, key)
+    |> source_segment_read_result(expire_at_ms)
+  end
+
+  defp read_source_location(_state, _key, _cached_value, _expire_at_ms, file_id, _offset),
+    do: {:error, {:source_location_unavailable, file_id}}
+
+  defp source_read_result({:ok, value}, expire_at_ms) when is_binary(value),
+    do: {:ok, value, expire_at_ms}
+
+  defp source_read_result({:error, reason}, _expire_at_ms), do: {:error, reason}
+  defp source_read_result(other, _expire_at_ms), do: {:error, {:bad_source_read, other}}
+
+  defp source_segment_read_result({:ok, value}, expire_at_ms) when is_binary(value),
+    do: {:ok, value, expire_at_ms}
+
+  defp source_segment_read_result(:not_found, _expire_at_ms), do: :not_found
+  defp source_segment_read_result({:error, reason}, _expire_at_ms), do: {:error, reason}
+  defp source_segment_read_result(other, _expire_at_ms), do: {:error, {:bad_source_read, other}}
+
+  defp bitcask_file_path(shard_data_path, file_id) do
+    Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+  end
+
+  defp expand_path_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc)
        when is_binary(terminal_key) and is_binary(value) and is_binary(state_key) and
               is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
@@ -538,7 +813,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp expand_op(path, {:terminal_put, terminal_key, value, nil, count_key}, acc)
+  defp expand_path_op(path, {:terminal_put, terminal_key, value, nil, count_key}, acc)
        when is_binary(terminal_key) and is_binary(value) and is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
          {:ok, count, acc} <- terminal_count(path, count_key, acc) do
@@ -564,7 +839,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp expand_op(
+  defp expand_path_op(
          path,
          {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
           expire_at_ms, parent_flow_id, root_flow_id, correlation_id},
@@ -586,7 +861,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       )
 
     with {:ok, acc} <-
-           expand_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc) do
+           expand_path_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc) do
       {:ok,
        prepend_ops(
          acc,
@@ -604,12 +879,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp expand_op(_path, {:query_put, query_key, value}, acc)
+  defp expand_path_op(_path, {:query_put, query_key, value}, acc)
        when is_binary(query_key) and is_binary(value) do
     {:ok, prepend_ops(acc, [{:put, query_key, value}])}
   end
 
-  defp expand_op(
+  defp expand_path_op(
          _path,
          {:history_project_from_index, flow_index, flow_lookup, id, partition_key, history_key,
           expire_at_ms},
@@ -625,7 +900,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
      )}
   end
 
-  defp expand_op(
+  defp expand_path_op(
          _path,
          {:history_put_many, id, partition_key, history_key, expire_at_ms, entries},
          acc
@@ -639,23 +914,23 @@ defmodule Ferricstore.Flow.LMDBWriter do
      )}
   end
 
-  defp expand_op(_path, {:query_delete, query_key}, acc) when is_binary(query_key) do
+  defp expand_path_op(_path, {:query_delete, query_key}, acc) when is_binary(query_key) do
     {:ok, prepend_ops(acc, [{:delete, query_key}])}
   end
 
-  defp expand_op(path, {:history_delete, history_index_key}, acc)
+  defp expand_path_op(path, {:history_delete, history_index_key}, acc)
        when is_binary(history_index_key) do
     {:ok,
      prepend_ops(acc, Ferricstore.Flow.LMDB.history_index_delete_ops(path, history_index_key))}
   end
 
-  defp expand_op(_path, {put_mode, key, value} = op, acc)
+  defp expand_path_op(_path, {put_mode, key, value} = op, acc)
        when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
     acc = maybe_init_terminal_counts_for_active_record(value, acc)
     {:ok, prepend_ops(acc, [op])}
   end
 
-  defp expand_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
+  defp expand_path_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
        when is_binary(terminal_key) and is_binary(state_key) and is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
          {:ok, count, acc} <- terminal_count(path, count_key, acc) do
@@ -684,7 +959,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp expand_op(path, {:terminal_delete, terminal_key, nil, count_key}, acc)
+  defp expand_path_op(path, {:terminal_delete, terminal_key, nil, count_key}, acc)
        when is_binary(terminal_key) and is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
          {:ok, count, acc} <- terminal_count(path, count_key, acc) do
@@ -711,7 +986,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp expand_op(_path, op, acc), do: {:ok, prepend_ops(acc, [op])}
+  defp expand_path_op(_path, op, acc), do: {:ok, prepend_ops(acc, [op])}
 
   defp maybe_init_terminal_counts_for_active_record(value, acc) do
     with {:ok, record} <- decode_flow_record_value(value),

@@ -82,22 +82,94 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     assert HistoryProjector.durable?(ctx, 0, dir, 42)
   end
 
+  test "sync projection evicts old hot history only after LMDB stores direct cold locations" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_hot_cap_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_hot_cap_#{unique}")
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_hot_cap_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    :ets.new(flow_index, [:ordered_set, :public, :named_table])
+    :ets.new(flow_lookup, [:set, :public, :named_table])
+
+    on_exit(fn ->
+      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
+      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
+      File.rm_rf(dir)
+    end)
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      data_dir: Path.dirname(dir),
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    history_key = Ferricstore.Flow.Keys.history_key("flow-hot-cap")
+
+    entries =
+      for version <- 1..3 do
+        event_ms = 1_000 + version
+        event_id = "#{event_ms}-#{version}"
+
+        %{
+          key: Ferricstore.Flow.Keys.stream_entry_key("flow-hot-cap", event_id, nil),
+          expire_at_ms: 0,
+          history_key: history_key,
+          event_id: event_id,
+          event_ms: event_ms,
+          version: version,
+          value: "history-#{version}",
+          history_hot_max_events: 1,
+          ra_index: 100 + version
+        }
+      end
+
+    assert :ok = HistoryProjector.write_entries_sync(ctx, 0, dir, entries, 103)
+
+    hot_key = Ferricstore.Flow.Keys.stream_entry_key("flow-hot-cap", "1003-3", nil)
+    cold_key = Ferricstore.Flow.Keys.stream_entry_key("flow-hot-cap", "1001-1", nil)
+
+    assert [{^hot_key, nil, 0, _lfu, {:flow_history, 0}, _offset, _size}] =
+             :ets.lookup(keydir, hot_key)
+
+    assert [] = :ets.lookup(keydir, cold_key)
+    assert OrderedIndex.count_all(flow_lookup, history_key) == 1
+
+    lmdb_path = Ferricstore.Flow.LMDB.path(dir)
+    lmdb_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1001-1", 1001)
+
+    assert {:ok, lmdb_value} = Ferricstore.Flow.LMDB.get(lmdb_path, lmdb_key)
+
+    assert {:ok,
+            {_event_id, _event_ms, _expire_at_ms, _compound_key, {:flow_history, 0}, offset,
+             value_size}} =
+             Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
+
+    assert value_size > 0
+    assert {:ok, "history-1"} = HistoryProjector.read_value(dir, {:flow_history, 0}, offset)
+    assert HistoryProjector.durable?(ctx, 0, dir, 103)
+  end
+
   test "recover returns an error and emits telemetry when history path is invalid" do
     unique = System.unique_integer([:positive])
     dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_error_#{unique}")
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "history"), "not-a-directory")
 
-    test_pid = self()
     handler_id = {:history_projector_recover_error, self(), make_ref()}
 
     :telemetry.attach(
       handler_id,
       [:ferricstore, :flow, :history_projector, :recover],
-      fn event, measurements, metadata, _config ->
-        send(test_pid, {:history_projector_recover_error, event, measurements, metadata})
-      end,
-      nil
+      &__MODULE__.handle_recover_telemetry/4,
+      self()
     )
 
     on_exit(fn ->
@@ -110,6 +182,10 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     assert_receive {:history_projector_recover_error,
                     [:ferricstore, :flow, :history_projector, :recover], %{errors: 1},
                     %{shard_index: 0, reason: _reason}}
+  end
+
+  def handle_recover_telemetry(event, measurements, metadata, test_pid) do
+    send(test_pid, {:history_projector_recover_error, event, measurements, metadata})
   end
 
   test "start_link can skip recovery when shard startup already imported history" do

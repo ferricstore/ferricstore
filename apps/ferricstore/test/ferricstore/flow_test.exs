@@ -771,11 +771,36 @@ defmodule Ferricstore.FlowTest do
                     %{count: 4, gets: 3, histories: 1}, %{source: :pipeline}}
   end
 
+  test "pipeline_read_batch accepts Rust Flow AST reads directly" do
+    ctx = FerricStore.Instance.get(:default)
+    partition_key = uid("pipeline-read-rust-ast")
+    id = uid("pipeline-read-rust-ast")
+
+    assert {:ok, _} =
+             flow_create_and_get(id,
+               type: "pipeline-read-rust-ast",
+               state: "queued",
+               partition_key: partition_key,
+               now_ms: 1,
+               run_at_ms: 1
+             )
+
+    assert [
+             {:ok, %{id: ^id, partition_key: ^partition_key}},
+             {:ok, [{_event_id, %{"event" => "created", "state" => "queued"}}]}
+           ] =
+             Ferricstore.Flow.pipeline_read_batch(ctx, [
+               {:flow_get, id, [partition_key: partition_key]},
+               {:flow_history, id, [partition_key: partition_key, count: 10]}
+             ])
+  end
+
   test "pipeline_write_batch_independent works in raft mode" do
     ctx = FerricStore.Instance.get(:default)
     partition_key = uid("flow-pipeline-write-standalone-partition")
     id_a = uid("flow-pipeline-write-standalone-a")
     id_b = uid("flow-pipeline-write-standalone-b")
+    attach_flow_telemetry([[:ferricstore, :flow, :pipeline_write, :stop]])
 
     assert [:ok, :ok] =
              Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
@@ -799,6 +824,35 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, %{id: ^id_a}} = FerricStore.flow_get(id_a, partition_key: partition_key)
     assert {:ok, %{id: ^id_b}} = FerricStore.flow_get(id_b, partition_key: partition_key)
+
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_write, :stop], %{count: 2},
+                    %{result: :ok, reason: nil}}
+  end
+
+  test "pipeline_write_batch_independent accepts Rust Flow AST writes directly" do
+    ctx = FerricStore.Instance.get(:default)
+    partition_key = uid("flow-pipeline-rust-ast-partition")
+    id = uid("flow-pipeline-rust-ast")
+
+    assert [:ok, :ok] =
+             Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
+               {:flow_create, id,
+                [
+                  type: "pipeline-rust-ast",
+                  state: "queued",
+                  run_at_ms: 1,
+                  now_ms: 1,
+                  partition_key: partition_key
+                ]},
+               {:flow_transition, id, "queued", "ready",
+                [
+                  fencing_token: 0,
+                  now_ms: 2,
+                  partition_key: partition_key
+                ]}
+             ])
+
+    assert {:ok, %{state: "ready"}} = FerricStore.flow_get(id, partition_key: partition_key)
   end
 
   test "pipeline_write_batch_independent terminal commands preserve per-command success" do
@@ -957,8 +1011,10 @@ defmodule Ferricstore.FlowTest do
     attach_flow_telemetry([[:ferricstore, :flow, :pipeline_claim_due_batch]])
 
     assert [
-             {:ok, [%{id: first_id, lease_token: first_lease, fencing_token: first_fence} = first]},
-             {:ok, [%{id: second_id, lease_token: second_lease, fencing_token: second_fence} = second]}
+             {:ok,
+              [%{id: first_id, lease_token: first_lease, fencing_token: first_fence} = first]},
+             {:ok,
+              [%{id: second_id, lease_token: second_lease, fencing_token: second_fence} = second]}
            ] =
              Ferricstore.Flow.pipeline_claim_due_batch(ctx, [
                {:claim_due, type,
@@ -989,6 +1045,32 @@ defmodule Ferricstore.FlowTest do
 
     assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_claim_due_batch],
                     %{commands: 2, groups: 1, coalesced_calls: 1}, %{source: :resp_pipeline}}
+  end
+
+  test "claim_due supports compact job responses" do
+    type = uid("claim-jobs-compact")
+    partition_key = uid("tenant")
+    id = uid("claim-jobs-compact")
+
+    assert {:ok, %{id: ^id}} =
+             flow_create_and_get(id,
+               type: type,
+               partition_key: partition_key,
+               now_ms: 1,
+               run_at_ms: 1
+             )
+
+    assert {:ok, [[^id, ^partition_key, lease_token, fencing_token]]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-compact",
+               partition_key: partition_key,
+               limit: 1,
+               now_ms: 2,
+               return: :jobs_compact
+             )
+
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
   end
 
   test "pipeline_claim_due_batch groups interleaved independent partitions" do
@@ -1038,6 +1120,74 @@ defmodule Ferricstore.FlowTest do
 
     assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_claim_due_batch],
                     %{commands: 4, groups: 2, coalesced_calls: 2}, %{source: :resp_pipeline}}
+  end
+
+  test "pipeline_claim_due_batch batches distinct partition claims without overclaiming" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("pipeline-claim-distinct")
+
+    partitions = Enum.map(1..4, &uid("tenant-distinct-#{&1}"))
+
+    expected_first_ids =
+      partitions
+      |> Enum.with_index(1)
+      |> Enum.map(fn {partition_key, idx} ->
+        first_id = uid("pipeline-claim-distinct-#{idx}-first")
+        second_id = uid("pipeline-claim-distinct-#{idx}-second")
+
+        assert {:ok, %{id: ^first_id}} =
+                 flow_create_and_get(first_id,
+                   type: type,
+                   partition_key: partition_key,
+                   now_ms: 1,
+                   run_at_ms: 1
+                 )
+
+        assert {:ok, %{id: ^second_id}} =
+                 flow_create_and_get(second_id,
+                   type: type,
+                   partition_key: partition_key,
+                   now_ms: 1,
+                   run_at_ms: 1
+                 )
+
+        {partition_key, first_id, second_id}
+      end)
+
+    attach_flow_telemetry([[:ferricstore, :flow, :pipeline_claim_due_batch]])
+
+    results =
+      Ferricstore.Flow.pipeline_claim_due_batch(
+        ctx,
+        Enum.map(partitions, fn partition_key ->
+          {:claim_due, type,
+           [worker: "worker-distinct", partition_key: partition_key, limit: 1, now_ms: 2]}
+        end)
+      )
+
+    assert Enum.all?(results, fn {:ok, records} -> length(records) == 1 end)
+
+    claimed_by_partition =
+      Map.new(results, fn {:ok, [record]} -> {record.partition_key, record.id} end)
+
+    Enum.each(expected_first_ids, fn {partition_key, first_id, second_id} ->
+      assert Map.fetch!(claimed_by_partition, partition_key) in [first_id, second_id]
+
+      assert {:ok, [remaining]} =
+               FerricStore.flow_claim_due(type,
+                 worker: "worker-distinct-followup",
+                 partition_key: partition_key,
+                 limit: 10,
+                 now_ms: 3
+               )
+
+      assert remaining.id in [first_id, second_id]
+      refute remaining.id == Map.fetch!(claimed_by_partition, partition_key)
+    end)
+
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_claim_due_batch],
+                    %{commands: 4, groups: 1, coalesced_calls: 0, batched_calls: 1},
+                    %{source: :resp_pipeline}}
   end
 
   test "pipeline_claim_due_batch accepts omitted NOW option" do
@@ -6549,11 +6699,11 @@ defmodule Ferricstore.FlowTest do
     shard = shard_for(history_key)
     {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 3
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 1
 
     assert Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 2, false)
            |> length() ==
-             3
+             1
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
   end
@@ -6860,25 +7010,37 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, _} =
              flow_complete_and_get(id, claimed.lease_token, fencing_token: claimed.fencing_token)
 
-    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
-    event_ids = Enum.map(events, fn {event_id, _fields} -> event_id end)
+    assert {:ok, all_events} = FerricStore.flow_history(id, count: 10)
 
-    assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
-    refute created_event_id in event_ids
+    assert Enum.map(all_events, fn {_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
+
+    assert {:ok, hot_events} = FerricStore.flow_history(id, count: 10, include_cold: false)
+    hot_event_ids = Enum.map(hot_events, fn {event_id, _fields} -> event_id end)
+
+    assert Enum.map(hot_events, fn {_id, fields} -> fields["event"] end) == [
+             "claimed",
+             "completed"
+           ]
+
+    refute created_event_id in hot_event_ids
 
     history_key = Ferricstore.Flow.Keys.history_key(id)
     shard = shard_for(history_key)
     {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 3
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 2
 
     assert Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 10, false)
            |> Enum.map(&elem(&1, 0)) ==
-             [created_event_id | event_ids]
+             hot_event_ids
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
 
-    assert [{^created_event_id, _score}] =
+    assert [] =
              Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 10, false)
              |> Enum.filter(fn {event_id, _score} -> event_id == created_event_id end)
   end
@@ -7039,8 +7201,24 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_200
              )
 
-    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+    assert {:ok, events} = FerricStore.flow_history(id, count: 10, include_cold: false)
     assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
+  end
+
+  test "flow history default hot max keeps only the latest event hot" do
+    original = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
+    restore_env(:flow_default_history_hot_max_events, nil)
+
+    on_exit(fn -> restore_env(:flow_default_history_hot_max_events, original) end)
+
+    assert {:ok, created} =
+             flow_create_and_get(uid("flow-history-default-hot-one"),
+               type: "audit-default-hot-one",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert created.history_hot_max_events == 1
   end
 
   test "flow history hot max rejects values above configured maximum" do

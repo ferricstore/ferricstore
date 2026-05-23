@@ -1638,8 +1638,17 @@ defmodule Ferricstore.Store.Shard do
       zset_score_lookup_name: state.zset_score_lookup,
       flow_index_name: state.flow_index,
       flow_lookup_name: state.flow_lookup,
-      flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path)
+      flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path),
+      flow_async_history: flow_async_history_enabled?()
     }
+  end
+
+  defp flow_async_history_enabled? do
+    case Application.get_env(:ferricstore, :flow_async_history) do
+      value when value in [true, "1", "true"] -> true
+      value when value in [false, "0", "false"] -> false
+      _ -> System.get_env("FLOW_ASYNC_HISTORY", "true") in ["1", "true"]
+    end
   end
 
   defp enqueue_standalone_commit(state, from, command) do

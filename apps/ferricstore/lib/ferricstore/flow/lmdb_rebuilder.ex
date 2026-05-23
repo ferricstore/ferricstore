@@ -115,7 +115,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
       |> Map.put(
         :history,
-        rebuild_flow_history_indexes(
+        maybe_rebuild_flow_history_indexes(
           keydir,
           shard_path,
           lmdb_path,
@@ -762,6 +762,38 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     )
 
     count
+  end
+
+  defp maybe_rebuild_flow_history_indexes(
+         keydir,
+         shard_path,
+         lmdb_path,
+         shard_index,
+         instance_ctx,
+         flow_index,
+         flow_lookup
+       ) do
+    if flow_async_history_enabled?() do
+      0
+    else
+      rebuild_flow_history_indexes(
+        keydir,
+        shard_path,
+        lmdb_path,
+        shard_index,
+        instance_ctx,
+        flow_index,
+        flow_lookup
+      )
+    end
+  end
+
+  defp flow_async_history_enabled? do
+    case Application.get_env(:ferricstore, :flow_async_history) do
+      value when value in [true, "1", "true"] -> true
+      value when value in [false, "0", "false"] -> false
+      _ -> System.get_env("FLOW_ASYNC_HISTORY", "true") in ["1", "true"]
+    end
   end
 
   defp trim_rebuilt_flow_history_indexes(

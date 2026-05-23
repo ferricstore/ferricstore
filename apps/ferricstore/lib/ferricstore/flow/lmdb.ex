@@ -6,7 +6,7 @@ defmodule Ferricstore.Flow.LMDB do
   @default_map_size 64 * 1024 * 1024 * 1024
   @terminal_count_cache :ferricstore_flow_lmdb_terminal_count_cache
 
-  def enabled?, do: mode() != :off
+  def enabled?, do: true
 
   def mirror? do
     mode() in [:mirror, :lagged]
@@ -18,9 +18,7 @@ defmodule Ferricstore.Flow.LMDB do
     |> normalize_mode()
   end
 
-  defp default_mode do
-    if Application.get_env(:ferricstore, :flow_lmdb_enabled, false), do: :mirror, else: :off
-  end
+  defp default_mode, do: :lagged
 
   def map_size do
     Application.get_env(:ferricstore, :flow_lmdb_map_size, @default_map_size)
@@ -207,6 +205,24 @@ defmodule Ferricstore.Flow.LMDB do
       when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
              is_binary(compound_key) do
     :erlang.term_to_binary({event_id, event_ms, expire_at_ms, compound_key})
+  end
+
+  def encode_history_index_value(
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms,
+        {:flow_history, file_id},
+        offset,
+        value_size
+      )
+      when is_binary(event_id) and is_integer(event_ms) and is_binary(compound_key) and
+             is_integer(expire_at_ms) and is_integer(file_id) and file_id >= 0 and
+             is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 do
+    :erlang.term_to_binary(
+      {event_id, event_ms, expire_at_ms, compound_key, {:flow_history, file_id}, offset,
+       value_size}
+    )
   end
 
   def encode_history_expire_value(history_index_key) when is_binary(history_index_key) do
@@ -635,6 +651,13 @@ defmodule Ferricstore.Flow.LMDB do
 
   def decode_history_index_value(blob) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
+      {event_id, event_ms, expire_at_ms, compound_key, {:flow_history, file_id}, offset,
+       value_size}
+      when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
+             is_binary(compound_key) and is_integer(file_id) and file_id >= 0 and
+             is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 ->
+        {:ok, {event_id, event_ms, expire_at_ms, compound_key}}
+
       {event_id, event_ms, expire_at_ms, compound_key}
       when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
              is_binary(compound_key) ->
@@ -643,6 +666,33 @@ defmodule Ferricstore.Flow.LMDB do
       {event_id, event_ms, compound_key}
       when is_binary(event_id) and is_integer(event_ms) and is_binary(compound_key) ->
         {:ok, {event_id, event_ms, 0, compound_key}}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  def decode_history_index_location(blob) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      {event_id, event_ms, expire_at_ms, compound_key, {:flow_history, file_id}, offset,
+       value_size}
+      when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
+             is_binary(compound_key) and is_integer(file_id) and file_id >= 0 and
+             is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 ->
+        {:ok,
+         {event_id, event_ms, expire_at_ms, compound_key, {:flow_history, file_id}, offset,
+          value_size}}
+
+      {event_id, event_ms, expire_at_ms, compound_key}
+      when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
+             is_binary(compound_key) ->
+        {:ok, {event_id, event_ms, expire_at_ms, compound_key, nil, nil, nil}}
+
+      {event_id, event_ms, compound_key}
+      when is_binary(event_id) and is_integer(event_ms) and is_binary(compound_key) ->
+        {:ok, {event_id, event_ms, 0, compound_key, nil, nil, nil}}
 
       _ ->
         :error
@@ -680,12 +730,14 @@ defmodule Ferricstore.Flow.LMDB do
 
   defp refresh_terminal_count_cache_after_delete(_path, :missing), do: :ok
 
-  defp normalize_mode(:off), do: :off
+  defp normalize_mode(:off), do: :lagged
   defp normalize_mode(:lagged), do: :lagged
   defp normalize_mode(:async), do: :lagged
   defp normalize_mode(:write_through), do: :mirror
   defp normalize_mode(:mirror), do: :mirror
-  defp normalize_mode(value) when value in [false, "false", "FALSE", "0", "off", nil], do: :off
+
+  defp normalize_mode(value) when value in [false, "false", "FALSE", "0", "off", nil],
+    do: :lagged
 
   defp normalize_mode(value) when value in ["lagged", "async", "batched"],
     do: :lagged

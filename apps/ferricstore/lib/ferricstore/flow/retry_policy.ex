@@ -15,7 +15,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   @default_retention %{
     ttl_ms: 604_800_000,
-    history_hot_max_events: 1_024,
+    history_hot_max_events: 1,
     history_max_events: 100_000
   }
 
