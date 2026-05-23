@@ -362,16 +362,12 @@ defmodule Ferricstore.Raft.WARaftStorage do
     do: persist_position(position, :ok, handle, maybe_update_label(handle, label_update))
 
   defp apply_command(command, position, handle, label_update) do
-    if segment_keydir_apply?() do
-      case apply_segment_projected_command(command, position, handle, label_update) do
-        :unsupported ->
-          apply_state_machine_command_and_persist(command, position, handle, label_update)
+    case apply_segment_projected_command(command, position, handle, label_update) do
+      :unsupported ->
+        apply_state_machine_command_and_persist(command, position, handle, label_update)
 
-        result ->
-          result
-      end
-    else
-      apply_state_machine_command_and_persist(command, position, handle, label_update)
+      result ->
+        result
     end
   end
 
@@ -1829,35 +1825,31 @@ defmodule Ferricstore.Raft.WARaftStorage do
     Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every, :never)
   end
 
-  defp segment_keydir_apply?, do: true
-
   defp register_segment_projection_context(%{root_dir: root_dir} = handle) do
-    if segment_keydir_apply?() do
-      ensure_segment_projection_registry!()
-      key = segment_projection_registry_key(root_dir)
+    ensure_segment_projection_registry!()
+    key = segment_projection_registry_key(root_dir)
 
-      case :ets.lookup(@segment_projection_registry, {key, :context}) do
-        [] ->
-          true =
-            :ets.insert(
-              @segment_projection_registry,
-              {{key, :context},
-               %{
-                 ctx: Map.fetch!(handle, :ctx),
-                 shard_index: Map.fetch!(handle, :shard_index)
-               }}
-            )
+    case :ets.lookup(@segment_projection_registry, {key, :context}) do
+      [] ->
+        true =
+          :ets.insert(
+            @segment_projection_registry,
+            {{key, :context},
+             %{
+               ctx: Map.fetch!(handle, :ctx),
+               shard_index: Map.fetch!(handle, :shard_index)
+             }}
+          )
 
-        _context ->
-          :ok
-      end
-
-      true =
-        :ets.insert(
-          @segment_projection_registry,
-          {{key, :position}, Map.fetch!(handle, :position)}
-        )
+      _context ->
+        :ok
     end
+
+    true =
+      :ets.insert(
+        @segment_projection_registry,
+        {{key, :position}, Map.fetch!(handle, :position)}
+      )
 
     handle
   end
@@ -2090,25 +2082,21 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp maybe_recover_segment_projected!(sm_state, root_dir, metadata) do
-    if segment_keydir_apply?() do
-      position = Map.get(metadata, :position, @zero_pos)
+    position = Map.get(metadata, :position, @zero_pos)
 
-      with {:ok, projected_sm_state, replay_after_index} <-
-             recover_segment_projection_log(root_dir, sm_state, position),
-           {:ok, recovered_sm_state} <-
-             recover_segment_projected_keydir(
-               root_dir,
-               projected_sm_state,
-               position,
-               replay_after_index
-             ) do
-        recovered_sm_state
-      else
-        {:error, reason} ->
-          raise "failed to recover WARaft segment-backed keydir: #{inspect(reason)}"
-      end
+    with {:ok, projected_sm_state, replay_after_index} <-
+           recover_segment_projection_log(root_dir, sm_state, position),
+         {:ok, recovered_sm_state} <-
+           recover_segment_projected_keydir(
+             root_dir,
+             projected_sm_state,
+             position,
+             replay_after_index
+           ) do
+      recovered_sm_state
     else
-      sm_state
+      {:error, reason} ->
+        raise "failed to recover WARaft segment-backed keydir: #{inspect(reason)}"
     end
   end
 
@@ -2293,14 +2281,10 @@ defmodule Ferricstore.Raft.WARaftStorage do
          position: position,
          sm_state: sm_state
        }) do
-    if segment_keydir_apply?() do
-      with {:ok, entries} <- collect_segment_projected_entries_strict(sm_state) do
-        root_dir
-        |> segment_projection_root()
-        |> write_segment_projection(position, entries)
-      end
-    else
-      :ok
+    with {:ok, entries} <- collect_segment_projected_entries_strict(sm_state) do
+      root_dir
+      |> segment_projection_root()
+      |> write_segment_projection(position, entries)
     end
   end
 
@@ -2657,33 +2641,29 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp segment_projection_root(root_dir), do: Path.join(root_dir, @segment_projection_dir)
 
   defp maybe_write_snapshot_segment_projection(snapshot_path, handle) do
-    if segment_keydir_apply?() do
-      with {:ok, entries} <- collect_segment_projected_entries_strict(handle.sm_state) do
-        case entries do
-          [] ->
-            {:ok, nil}
+    with {:ok, entries} <- collect_segment_projected_entries_strict(handle.sm_state) do
+      case entries do
+        [] ->
+          {:ok, nil}
 
-          _ ->
-            projection_root = Path.join(snapshot_path, @segment_projection_dir)
+        _ ->
+          projection_root = Path.join(snapshot_path, @segment_projection_dir)
 
-            case write_segment_projection(projection_root, handle.position, entries) do
-              :ok ->
-                {:ok,
-                 %{
-                   dir: @segment_projection_dir,
-                   format: :segment_log,
-                   count: length(entries)
-                 }}
+          case write_segment_projection(projection_root, handle.position, entries) do
+            :ok ->
+              {:ok,
+               %{
+                 dir: @segment_projection_dir,
+                 format: :segment_log,
+                 count: length(entries)
+               }}
 
-              {:error, reason} ->
-                {:error, {:write_segment_projection_snapshot, reason}}
-            end
-        end
-      else
-        {:error, reason} -> {:error, {:collect_segment_projection_snapshot, reason}}
+            {:error, reason} ->
+              {:error, {:write_segment_projection_snapshot, reason}}
+          end
       end
     else
-      {:ok, nil}
+      {:error, reason} -> {:error, {:collect_segment_projection_snapshot, reason}}
     end
   end
 
@@ -3397,13 +3377,9 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_log_payload_empty?(storage_root) do
-    if segment_keydir_apply?() do
-      storage_root
-      |> Path.join("segment_log")
-      |> dir_payload_empty()
-    else
-      {:ok, true}
-    end
+    storage_root
+    |> Path.join("segment_log")
+    |> dir_payload_empty()
   end
 
   defp payload_children_empty(_path, []), do: {:ok, true}
@@ -4025,30 +4001,14 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp shard_dir_specs(%{ctx: ctx, shard_index: shard_index}) do
-    base = [
+    [
       data: Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index),
-      blob: Ferricstore.DataDir.blob_shard_path(ctx.data_dir, shard_index)
+      blob: Ferricstore.DataDir.blob_shard_path(ctx.data_dir, shard_index),
+      prob: Path.join([ctx.data_dir, "prob", "shard_#{shard_index}"])
     ]
-
-    dedicated =
-      if copy_dedicated_payload?() do
-        [dedicated: Path.join([ctx.data_dir, "dedicated", "shard_#{shard_index}"])]
-      else
-        []
-      end
-
-    base ++ dedicated ++ [prob: Path.join([ctx.data_dir, "prob", "shard_#{shard_index}"])]
   end
 
-  defp snapshot_payload_kinds do
-    if copy_dedicated_payload?() do
-      [:data, :blob, :dedicated, :prob]
-    else
-      [:data, :blob, :prob]
-    end
-  end
-
-  defp copy_dedicated_payload?, do: not segment_keydir_apply?()
+  defp snapshot_payload_kinds, do: [:data, :blob, :prob]
 
   defp stage_snapshot_dirs(snapshot_path, staging_root, handle, empty_payload_dirs) do
     empty_payload_dirs = MapSet.new(empty_payload_dirs)

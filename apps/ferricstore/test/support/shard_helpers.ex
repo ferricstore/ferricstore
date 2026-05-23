@@ -24,19 +24,6 @@ defmodule Ferricstore.Test.ShardHelpers do
   def flush_all_shards do
     shard_count = shard_count()
 
-    # Drain Raft batchers first. With Raft enabled, Router.put sends writes
-    # to Batcher.write_async which pipelines them to ra. Batcher.flush
-    # submits all pending slots and waits for in-flight commands to apply.
-    # Without this, writes may still be in the Batcher pipeline when we
-    # flush shards and BitcaskWriter — the data never reaches Bitcask.
-    Enum.each(0..(shard_count - 1), fn i ->
-      try do
-        Ferricstore.Raft.Batcher.flush(i)
-      catch
-        :exit, _ -> :ok
-      end
-    end)
-
     Enum.each(0..(shard_count - 1), fn i ->
       name = :"Ferricstore.Store.Shard.#{i}"
 
@@ -96,47 +83,11 @@ defmodule Ferricstore.Test.ShardHelpers do
   @spec flush_all_keys() :: :ok
   def flush_all_keys do
     alias Ferricstore.Store.Router
-    alias Ferricstore.Raft.Batcher
 
     reset_memory_guard_pressure()
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-
-    # Under full-suite load, the batcher can be slow to respond.
-    # Use a generous timeout for test cleanup (production Batcher.flush uses 10s).
     flush_timeout = 30_000
-    running_backend = Ferricstore.Raft.Backend.running_or_selected()
-
-    # Ensure all ra shard processes are alive before flushing.
-    # A previous test may have crashed ra (e.g. FunctionClauseError under load),
-    # leaving the batcher blocked. Restart dead shards first.
-    if running_backend == :ra do
-      ensure_ra_shards_alive(shard_count)
-    end
-
-    # Before flushing, unstick any Batcher whose pending queue is blocked on
-    # orphan correlations from a prior test (ra leader crash, lost acks, etc).
-    # Without this, :flush can wait forever for replies that will never
-    # arrive, causing 60s setup timeouts that cascade through the suite.
-    if running_backend == :ra do
-      Enum.each(0..(shard_count - 1), fn i ->
-        Batcher.reset_pending(i)
-      end)
-    end
-
-    # Batcher.flush waits for internal origin-replay commands (tracked in
-    # `pending` with :origin_no_reply) to apply via ra_event before replying.
-    if running_backend == :ra do
-      Enum.each(0..(shard_count - 1), fn i ->
-        case flush_batcher_strict(i, flush_timeout) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            raise "Shard #{i} Ra batcher flush failed during cleanup: #{inspect(reason)}"
-        end
-      end)
-    end
 
     # Flush background BitcaskWriter so deferred writes are on disk
     # before we snapshot keys for deletion.
@@ -159,26 +110,12 @@ defmodule Ferricstore.Test.ShardHelpers do
           :exit, _ -> []
         end
 
-      delete_keys_on_shard(i, keys, flush_timeout, running_backend)
+      delete_keys_on_shard(i, keys)
     end)
 
-    # The deletes above go through the Raft batcher (async). Flush the
-    # pipeline again so the tombstones are applied before we return.
-    if running_backend == :ra do
-      Enum.each(0..(shard_count - 1), fn i ->
-        try do
-          GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
-        catch
-          :exit, _ -> :ok
-        end
-      end)
-    end
-
-    # Clear cross-shard locks and intents via Raft so tests start clean.
+    # Clear cross-shard locks and intents through WARaft so tests start clean.
     Enum.each(0..(shard_count - 1), fn i ->
-      shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-
-      case clear_locks_strict(shard_id, i, running_backend, 5_000) do
+      case clear_locks_strict(i) do
         :ok ->
           :ok
 
@@ -187,10 +124,8 @@ defmodule Ferricstore.Test.ShardHelpers do
       end
     end)
 
-    # A Ra leader can exist before the public pipeline/apply reply path is fully
-    # usable after restart-heavy tests. Prove the exact path used by
-    # MULTI/EXEC cross-shard transactions before handing control back.
-    wait_default_backend_ready(running_backend, flush_timeout)
+    # Prove the WARaft write/apply path is usable before handing control back.
+    wait_default_waraft_ready(flush_timeout)
 
     # Safety net: clear any remaining compound key entries from ETS.
     # After the per-shard deletes and drain above this should be a no-op,
@@ -227,36 +162,9 @@ defmodule Ferricstore.Test.ShardHelpers do
     reset_memory_guard_pressure()
   end
 
-  defp delete_keys_on_shard(_shard_index, [], _timeout, _backend), do: :ok
+  defp delete_keys_on_shard(_shard_index, []), do: :ok
 
-  defp delete_keys_on_shard(shard_index, keys, timeout, :ra) do
-    alias Ferricstore.Raft.{Batcher, ReplyAwaiter}
-
-    {from, token} = ReplyAwaiter.new()
-
-    case safe_write_delete_batch(shard_index, keys, from) do
-      :ok ->
-        case ReplyAwaiter.await(token, timeout, {:error, :timeout}) do
-          {:ok, results} when is_list(results) ->
-            if length(results) == length(keys) do
-              :ok
-            else
-              raise "Shard #{shard_index} delete cleanup returned #{length(results)} result(s) for #{length(keys)} key(s)"
-            end
-
-          {:error, reason} ->
-            raise "Shard #{shard_index} delete cleanup failed: #{inspect(reason)}"
-
-          other ->
-            raise "Shard #{shard_index} delete cleanup returned unexpected result: #{inspect(other)}"
-        end
-
-      {:error, reason} ->
-        raise "Shard #{shard_index} delete cleanup could not submit batch: #{inspect(reason)}"
-    end
-  end
-
-  defp delete_keys_on_shard(shard_index, keys, _timeout, :waraft) do
+  defp delete_keys_on_shard(shard_index, keys) do
     case Ferricstore.Raft.Backend.write_delete_batch(shard_index, keys) do
       {:ok, results} when is_list(results) ->
         if length(results) == length(keys) do
@@ -273,32 +181,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     end
   end
 
-  defp safe_write_delete_batch(shard_index, keys, from) do
-    Ferricstore.Raft.Batcher.write_delete_batch(shard_index, keys, from)
-  catch
-    :exit, reason -> {:error, {:exit, reason}}
-  end
-
-  defp flush_batcher_strict(shard_index, timeout) do
-    GenServer.call(Ferricstore.Raft.Batcher.batcher_name(shard_index), :flush, timeout)
-  catch
-    :exit, {:noproc, _} = reason -> {:error, reason}
-    :exit, reason -> {:error, reason}
-  end
-
-  defp clear_locks_strict(shard_id, _shard_index, :ra, timeout) do
-    case Ferricstore.Raft.CommandClock.process_command(shard_id, {:clear_locks}, timeout) do
-      :ok -> :ok
-      {:ok, :ok} -> :ok
-      {:ok, {:applied_at, _index, :ok}, _leader} -> :ok
-      {:ok, :ok, _leader} -> :ok
-      other -> {:error, other}
-    end
-  catch
-    :exit, reason -> {:error, {:exit, reason}}
-  end
-
-  defp clear_locks_strict(_shard_id, shard_index, :waraft, _timeout) do
+  defp clear_locks_strict(shard_index) do
     case Ferricstore.Raft.Backend.write(shard_index, {:clear_locks}) do
       :ok -> :ok
       {:ok, :ok} -> :ok
@@ -309,9 +192,6 @@ defmodule Ferricstore.Test.ShardHelpers do
   catch
     :exit, reason -> {:error, {:exit, reason}}
   end
-
-  defp wait_default_backend_ready(:ra, timeout_ms), do: wait_default_pipeline_ready(timeout_ms)
-  defp wait_default_backend_ready(:waraft, timeout_ms), do: wait_default_waraft_ready(timeout_ms)
 
   defp wait_default_waraft_ready(timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
@@ -357,67 +237,14 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   @doc """
-  Waits until every default-instance shard can accept and apply a Ra pipeline command.
+  Waits until every default-instance shard can accept and apply a WARaft command.
 
-  This is stricter than checking for a Ra leader: restart-heavy tests can observe
-  a leader before the applied-event path is ready. The command intentionally uses
-  `{:clear_locks}` because it is idempotent and does not create user keys.
+  This keeps the historical helper name for existing tests, but WARaft is now
+  the only default backend. The probe command is idempotent and does not create
+  user keys.
   """
   @spec wait_default_pipeline_ready(non_neg_integer()) :: :ok
-  def wait_default_pipeline_ready(timeout_ms \\ 60_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-
-    Enum.each(0..(shard_count() - 1), fn shard_index ->
-      wait_shard_pipeline_ready(shard_index, deadline)
-    end)
-  end
-
-  defp wait_shard_pipeline_ready(shard_index, deadline) do
-    shard_id = Ferricstore.Raft.Cluster.shard_server_id(shard_index)
-    corr = make_ref()
-
-    result =
-      try do
-        case Ferricstore.Raft.CommandClock.pipeline_command(shard_id, {:clear_locks}, corr, :low) do
-          :ok -> await_pipeline_ready_reply(corr, 500)
-          {:error, reason} -> {:error, reason}
-          other -> {:error, other}
-        end
-      catch
-        :exit, reason -> {:error, reason}
-      end
-
-    case result do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        if System.monotonic_time(:millisecond) > deadline do
-          raise "Shard #{shard_index} Ra pipeline did not become ready before timeout: #{inspect(reason)}"
-        end
-
-        Process.sleep(100)
-        wait_shard_pipeline_ready(shard_index, deadline)
-    end
-  end
-
-  defp await_pipeline_ready_reply(corr, timeout_ms) do
-    receive do
-      {:ra_event, _leader, {:applied, applied_list}} ->
-        case List.keyfind(applied_list, corr, 0) do
-          {^corr, _result} -> :ok
-          nil -> await_pipeline_ready_reply(corr, timeout_ms)
-        end
-
-      {:ra_event, _from, {:rejected, {:not_leader, _leader, ^corr}}} ->
-        {:error, :not_leader}
-
-      {:ra_event, _from, {:rejected, {_reason, _hint, ^corr}}} ->
-        {:error, :rejected}
-    after
-      timeout_ms -> {:error, :timeout}
-    end
-  end
+  def wait_default_pipeline_ready(timeout_ms \\ 60_000), do: wait_default_waraft_ready(timeout_ms)
 
   defp reset_keydir_binary_counters(%{keydir_binary_bytes: ref}, shard_count)
        when is_reference(ref) do
@@ -634,12 +461,7 @@ defmodule Ferricstore.Test.ShardHelpers do
       end
     end)
 
-    # The legacy Ra backend needs the per-shard ra server leader elected before
-    # the Batcher write path can answer. WARaft owns a separate backend
-    # supervisor, so probing legacy ra process names here is a false failure.
-    if Ferricstore.Raft.Backend.running_or_selected() == :ra do
-      wait_raft_leaders(deadline)
-    end
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -712,117 +534,11 @@ defmodule Ferricstore.Test.ShardHelpers do
     {key_a, "nskey_#{i}"}
   end
 
-  # ---------------------------------------------------------------------------
-  # Internal
-  # ---------------------------------------------------------------------------
-
-  # Checks that all ra shard processes are alive and have a leader.
-  # If a ra process crashed (e.g. FunctionClauseError under load),
-  # restart it so subsequent tests don't cascade-fail with batcher timeouts.
-  defp ensure_ra_shards_alive(shard_count) do
-    alias Ferricstore.Raft.Cluster
-    system = Cluster.system_name()
-
-    Enum.each(0..(shard_count - 1), fn i ->
-      server_id = Cluster.shard_server_id(i)
-      {shard_name, _node} = server_id
-
-      case Process.whereis(shard_name) do
-        nil ->
-          # ra process is dead — restart it via ra:restart_server
-          # which recovers from WAL (the data is still on disk)
-          try do
-            :ra.restart_server(system, server_id)
-          catch
-            _, _ -> :ok
-          end
-
-          # Wait for leader election
-          eventually(
-            fn -> ra_leader_ready?(server_id) end,
-            "shard #{i} ra restart",
-            20,
-            200
-          )
-
-        pid when is_pid(pid) ->
-          # Process exists but might be in a bad state — verify it responds
-          if ra_leader_ready?(server_id) do
-            :ok
-          else
-            # No leader — trigger election and wait for it to complete.
-            # A bare Process.sleep(200) is not enough under full-suite load;
-            # elections can take longer, and flush_all_keys relies on a
-            # healthy leader to receive ra_event replies.
-            try do
-              :ra.trigger_election(server_id)
-            catch
-              _, _ -> :ok
-            end
-
-            eventually(
-              fn -> ra_leader_ready?(server_id) end,
-              "shard #{i} leader election",
-              20,
-              200
-            )
-          end
-      end
-    end)
-  end
-
   defp shard_count do
     :persistent_term.get(
       :ferricstore_shard_count,
       Application.get_env(:ferricstore, :shard_count, 4)
     )
-  end
-
-  # Polls ra.members/1 for each shard until all ra servers report a leader.
-  defp wait_raft_leaders(deadline) do
-    alias Ferricstore.Raft.Cluster
-    shard_count = shard_count()
-
-    Enum.each(0..(shard_count - 1), fn i ->
-      server_id = Cluster.shard_server_id(i)
-
-      try do
-        :ra.trigger_election(server_id)
-      catch
-        _, _ -> :ok
-      end
-
-      result =
-        Enum.reduce_while(Stream.repeatedly(fn -> Process.sleep(20) end), :waiting, fn _, _ ->
-          cond do
-            ra_leader_ready?(server_id) ->
-              {:halt, :ok}
-
-            System.monotonic_time(:millisecond) > deadline ->
-              {:halt, {:timeout, i}}
-
-            true ->
-              {:cont, :waiting}
-          end
-        end)
-
-      case result do
-        :ok ->
-          :ok
-
-        {:timeout, shard_index} ->
-          raise "Shard #{shard_index} Ra leader did not become ready before timeout"
-      end
-    end)
-  end
-
-  defp ra_leader_ready?(server_id) do
-    case :ra.members(server_id) do
-      {:ok, _members, leader} when leader not in [nil, :undefined] -> true
-      _ -> false
-    end
-  catch
-    _, _ -> false
   end
 
   # ---------------------------------------------------------------------------

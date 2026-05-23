@@ -5,7 +5,6 @@ defmodule FlowLMDBSoak do
   @moduledoc false
 
   def run do
-    backend = atom_env("BACKEND", :waraft, [:ra, :waraft])
     duration_s = int_env("DURATION_SECONDS", 1_800)
     flows_per_run = int_env("FLOWS_PER_RUN", 5_000)
     target_fps = int_env("TARGET_FLOWS_PER_SEC", 5_000)
@@ -18,7 +17,7 @@ defmodule FlowLMDBSoak do
         Path.join(System.tmp_dir!(), "ferricstore-flow-lmdb-soak-#{unique()}")
 
     stop_started_apps()
-    configure_app(backend, data_dir, shards)
+    configure_app(data_dir, shards)
 
     started_native = System.monotonic_time()
     deadline_native = started_native + System.convert_time_unit(duration_s, :second, :native)
@@ -43,7 +42,7 @@ defmodule FlowLMDBSoak do
       port = FerricstoreServer.Listener.port()
 
       IO.puts(
-        "flow_lmdb_soak backend=#{backend} port=#{port} data_dir=#{data_dir} " <>
+        "flow_lmdb_soak backend=waraft port=#{port} data_dir=#{data_dir} " <>
           "duration_s=#{duration_s} flows_per_run=#{flows_per_run} target_fps=#{target_fps} " <>
           "shards=#{shards} lmdb_projection=lagged " <>
           "flush_interval_ms=#{Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)} " <>
@@ -332,7 +331,7 @@ defmodule FlowLMDBSoak do
     _ -> nil
   end
 
-  defp configure_app(backend, data_dir, shards) do
+  defp configure_app(data_dir, shards) do
     remove_data_dir(data_dir)
     File.mkdir_p!(data_dir)
 
@@ -341,7 +340,6 @@ defmodule FlowLMDBSoak do
     Application.put_env(:ferricstore, :port, 0)
     Application.put_env(:ferricstore, :health_port, 0)
     Application.put_env(:ferricstore, :shard_count, shards)
-    Application.put_env(:ferricstore, :raft_backend, backend)
     Application.put_env(:ferricstore, :protected_mode, false)
     Application.put_env(:ferricstore, :max_memory_bytes, int_env("FERRICSTORE_MAX_MEMORY", 0))
     Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
@@ -404,12 +402,10 @@ defmodule FlowLMDBSoak do
     )
 
     Application.delete_env(:ferricstore, :waraft_log_module)
-    put_optional_bool_env("WARAFT_ASYNC_LOG_APPEND", :waraft_async_log_append)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
     put_optional_int_env("WARAFT_APPLY_LOG_BATCH_SIZE", :waraft_apply_log_batch_size)
     put_optional_int_env("WARAFT_APPLY_BATCH_MAX_BYTES", :waraft_apply_batch_max_bytes)
-    put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
 
     put_optional_limit_env(
       ["WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES"],
@@ -434,25 +430,6 @@ defmodule FlowLMDBSoak do
     put_optional_int_env(
       "WARAFT_SEGMENT_RECORDS_PER_SEGMENT",
       :waraft_segment_log_records_per_segment
-    )
-
-    put_optional_atom_env("WARAFT_SEGMENT_IO_MODE", :waraft_segment_log_io_mode, [:file, :wal_nif])
-
-    put_optional_atom_env("WARAFT_SEGMENT_SYNC_METHOD", :waraft_segment_log_sync_method, [
-      :datasync,
-      :sync,
-      :auto
-    ])
-
-    put_optional_atom_env("WARAFT_FILE_WRITER_MODE", :waraft_segment_log_file_writer_mode, [
-      :direct,
-      :persistent,
-      :process
-    ])
-
-    put_optional_int_env(
-      "WARAFT_FILE_WRITER_GROUP_DELAY_MS",
-      :waraft_segment_log_file_writer_group_delay_ms
     )
   end
 
@@ -521,17 +498,6 @@ defmodule FlowLMDBSoak do
     |> String.to_integer()
   end
 
-  defp atom_env(name, default, allowed) do
-    value = env(name, Atom.to_string(default))
-    atom = String.to_existing_atom(value)
-
-    if atom in allowed do
-      atom
-    else
-      raise "unsupported #{name}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-    end
-  end
-
   defp put_optional_int_env(env_name, app_key) do
     case System.get_env(env_name) do
       nil -> :ok
@@ -574,22 +540,6 @@ defmodule FlowLMDBSoak do
 
       value ->
         raise "unsupported #{env_name}=#{inspect(value)}; expected boolean"
-    end
-  end
-
-  defp put_optional_atom_env(env_name, app_key, allowed) do
-    case System.get_env(env_name) do
-      nil ->
-        :ok
-
-      value ->
-        atom = String.to_existing_atom(value)
-
-        if atom in allowed do
-          Application.put_env(:ferricstore, app_key, atom)
-        else
-          raise "unsupported #{env_name}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-        end
     end
   end
 end

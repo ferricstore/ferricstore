@@ -15,7 +15,4 @@ config :ferricstore, :ferricstore_wal_nif,
 config :ferricstore, :port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_bench"
 
-config :ferricstore,
-  raft_backend: :waraft,
-  waraft_async_log_append: true,
-  flow_async_history: true
+config :ferricstore, flow_async_history: true

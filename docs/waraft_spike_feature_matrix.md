@@ -54,28 +54,16 @@ Covered:
   prove the segment file fsync happens before append returns, failed file fsync
   rolls back unacknowledged bytes, and a same-segment multi-record append uses
   one file fsync for the group rather than one fsync per record.
-- Durable segmented log appends can use either the conservative Erlang
-  `file:write` + `file:datasync` path or `:waraft_segment_log_io_mode =
-  :wal_nif`. The WAL-NIF mode keeps one active raw append handle per segment,
-  writes records from byte 0 with no Ra WAL header gap, and completes fdatasync
-  on the Rust background I/O thread before the WARaft append returns. Tests
-  cover restart recovery and rollback when the async sync boundary fails.
-- The file writer uses `file:datasync/1` by default for data-record durability,
-  with `:waraft_segment_log_sync_method` available for forcing `:sync` in
-  experiments. Tests assert the sync method at the append boundary.
+- Durable segmented log appends use one production I/O path: Erlang
+  `file:write` followed by `file:datasync` before the append is acknowledged.
+  Earlier WAL-NIF and alternate writer experiments are no longer user-facing
+  modes because the extra selectors made benchmarks and deploys ambiguous.
 - Segment-log append atomicity invariant: a Raft entry is not inserted into the
   in-memory log table, applied to FerricStore storage, or acknowledged to the
   client until the segment append has written the bytes and the segment file
   sync has completed. A blocked-sync test keeps the fsync suspended and proves
   the write remains invisible and the caller remains waiting until the sync is
   released.
-- Experimental `:waraft_segment_log_file_writer_mode = :persistent` keeps a
-  lifecycle-safe Erlang file handle open across same-segment appends to remove
-  per-append open/close churn while preserving the same sync-before-ack
-  boundary. It intentionally does not use a raw fd because raw fd ownership is
-  process-local; raw persistent ownership remains in the writer-process or
-  WAL-NIF paths. Local Flow profiling did not show this mode beating `:direct`,
-  so it is not a default.
 - New segment preallocation is wired through the WAL NIF's keep-size fallocate
   helper instead of Erlang `file:allocate/3`, because extending the logical file
   size would leave zero trailer bytes that break deterministic segment recovery.
@@ -158,9 +146,8 @@ Current replacement-gate coverage:
   TopK, TDigest, Stream XADD/XDEL/XTRIM restart durability, and stream
   consumer-group create/read-pending/ack restart durability.
 - Default compound writes use `Ferricstore.Store.CompoundCommand` compact terms
-  before entering the selected Raft backend. This avoids carrying Shard-only
-  `redis_key` metadata through the default replicated write path and keeps Ra
-  and WARaft command shapes aligned.
+  before entering WARaft. This avoids carrying Shard-only `redis_key` metadata
+  through the default replicated write path and keeps the command shape compact.
 - Hash command coverage proves field TTL and advanced read-modify-write
   mutations work through WARaft direct keydir/cold-file recovery, including
   `HSETEX`, `HPTTL`, `HMGET`, `HGETEX`, `HINCRBY`, `HINCRBYFLOAT`, `HSETNX`,
@@ -172,14 +159,12 @@ Current replacement-gate coverage:
   paths (`SINTERSTORE`, `SDIFFSTORE`, `SPOP`, `SINTERCARD`, `SSCAN`), and
   sorted-set pop/range/scan paths (`ZPOPMIN`, `ZPOPMAX`, `ZRANGEBYSCORE`,
   `ZREVRANGEBYSCORE`, `ZMSCORE`, `ZSCAN`).
-- The obsolete `:segment_projected` / `:segment_bitcask` shortcuts are rejected
-  at startup. Replacement benchmarking now uses the explicit `:segment_keydir`
-  mode, where projectable commands install keydir locations pointing at the
-  WARaft segment itself. The conservative `:bitcask_keydir` mode remains useful
-  for parity/fallback coverage while projector coverage is incomplete.
-- Application boot honors `raft_backend: :waraft`: legacy Ra batchers are not
-  started, legacy Ra elections are skipped, and the WARaft backend starts behind
-  the default instance.
+- The obsolete projected/dual-Bitcask shortcuts are rejected at startup.
+  Replacement benchmarking uses the unified segment/keydir path: projectable
+  commands install keydir locations pointing at the WARaft segment itself.
+- Application boot always uses WARaft: legacy Ra batchers are not started,
+  legacy Ra elections are skipped, and the WARaft backend starts behind the
+  default instance.
 - Ordered per-command replies are preserved for hot batch terms.
 - Backend queue limits are configurable and tested to surface WARaft
   backpressure as FerricStore-compatible `{:error, :overloaded}` without
@@ -248,9 +233,9 @@ Current replacement-gate coverage:
   definite `ERR shard not available`.
 - A real RESP/router benchmark gate now exists at
   `bench/waraft_resp_router_bench.exs`. It runs through the FerricStore server,
-  current key hashing, Router, selected Raft backend, and Bitcask apply path
-  with selectable `BACKEND=ra|waraft`, `BENCH_MODE=set|get|mixed`,
-  `CONCURRENCY`, `PIPELINE`, `DATA_SIZE`, `SHARDS`, and `KEY_COUNT`.
+  current key hashing, Router, WARaft, and the segment/keydir apply path with
+  selectable workload shape (`BENCH_MODE=set|get|mixed`) plus `CONCURRENCY`,
+  `PIPELINE`, `DATA_SIZE`, `SHARDS`, and `KEY_COUNT`.
 - Missing local WARaft acceptors are normalized to `ERR shard not available`
   instead of leaking WARaft's internal `:unreachable` atom.
 - Multi-shard Router batches route each key to the matching WARaft partition and
@@ -258,14 +243,12 @@ Current replacement-gate coverage:
 - Multi-shard Router batches now submit WARaft shard groups concurrently while
   preserving ordered replies. The single-shard path stays synchronous to avoid
   adding Task overhead to the common one-partition case.
-- Router WARaft selection is now instance-scoped. Production default-instance
-  traffic can use WARaft when `raft_backend: :waraft` is selected, and isolated
-  WARaft backend tests can route through the exact context registered with
-  `WARaftBackend.start/2`; ordinary custom embedded instances stay local/direct
-  even if the global backend selector is `:waraft`.
+- Router WARaft routing is now instance-scoped. Production default-instance
+  traffic uses WARaft, and isolated WARaft backend tests can route through the
+  exact context registered with `WARaftBackend.start/2`; ordinary custom
+  embedded instances stay local/direct.
 - Restart recovery reopens the durable storage position and rebuilds keydir
-  state from either normal Bitcask payload records or, in `:segment_keydir`,
-  the WARaft segment/projection checkpoint.
+  state from the WARaft segment/projection checkpoint.
 - WARaft storage now treats Bitcask/blob/projection apply failures as
   infrastructure failures: it returns the error but does not advance the local
   storage replay position, so restart recovery replays the committed entry.
@@ -281,16 +264,13 @@ Current replacement-gate coverage:
   while the command is in flight, the backend returns
   `{:timeout, :unknown_outcome}` because the log append or apply outcome is now
   ambiguous.
-- WARaft storage supports two durable apply paths. `:bitcask_keydir` applies
-  FerricStore state through the normal Raft apply path, appends Bitcask payload
-  records without per-command payload fsync, and advances durable storage
-  metadata only after a payload frontier fsync. `:segment_keydir` is the unified
-  "Raft WAL == Bitcask segment" path for projectable hot commands: keydir rows
-  point at `{:waraft_segment, index}`, cold reads load from the WARaft segment,
-  and trim writes a projection checkpoint before compacting away segment
-  records. `status/1` reports both `:applied_position` and `:durable_position`,
-  plus `:payload_dirty?`, so operators can distinguish volatile apply progress
-  from replay-safe durable progress.
+- WARaft storage uses the unified "Raft WAL == Bitcask segment" path for
+  projectable hot commands: keydir rows point at `{:waraft_segment, index}`,
+  cold reads load from the WARaft segment, and trim writes a projection
+  checkpoint before compacting away segment records. `status/1` reports both
+  `:applied_position` and `:durable_position`, plus `:payload_dirty?`, so
+  operators can distinguish volatile apply progress from replay-safe durable
+  progress.
 - Replay-safe no-sync metadata boundaries are tested: graceful close and
   membership/config metadata commits fsync dirty payload before publishing the
   newer storage metadata position. Frontier fsync emits
@@ -623,9 +603,9 @@ Not covered yet:
 ## Local Benchmark Snapshot
 
 These are local development-machine numbers. The real RESP/router rows include
-RESP parsing, routing, the selected Raft backend, durable storage, and the
-production state machine. The 3-node row still uses the isolated WARaft cluster
-load driver and should not be compared directly to the RESP rows.
+RESP parsing, routing, WARaft, durable storage, and the production state
+machine. The 3-node row still uses the isolated WARaft cluster load driver and
+should not be compared directly to the RESP rows.
 
 | Case | Path | Log | Result |
 | --- | --- | --- | --- |
@@ -652,23 +632,20 @@ Important interpretation:
   WARaft only exposes millisecond state timeouts, so the Ra adaptive floor maps
   to `0ms` when disabled or `1ms` when enabled unless the WARaft-specific knob is
   set.
-- Replacement RESP/router benchmarks default to the production segment I/O mode
+- Replacement RESP/router benchmarks use the production segment I/O mode
   (`file:write` + `file:datasync`). On the local c=200/p=50 256B SET run, that
   path reached ~622K ops/s with p99 batch latency ~19.5ms, versus current Ra at
   ~473K ops/s. On the same local harness, 1KB SET reached ~583K ops/s
   (~570MB/s) versus Ra at ~415K ops/s, and mixed 256B GET/SET reached ~371K
   ops/s versus Ra at ~342K ops/s. The raw WAL-NIF segment path reached only
-  ~217K ops/s with segment sync delay forced to 0. It remains correctness-tested
-  and selectable with `WARAFT_SEGMENT_IO_MODE=wal_nif`, but it is not the
-  benchmark default until profiling proves it is faster than the file path on
-  Linux/NVMe.
-- The current WARaft replacement benchmark path uses `:segment_keydir` storage:
+  ~217K ops/s in experiments, so it is not exposed as a benchmark or runtime
+  mode.
+- The current WARaft replacement benchmark path uses segment/keydir storage:
   projectable hot-path records install ETS/keydir locations that point directly
   at the WARaft segment (`{:waraft_segment, index}`), so the normal Bitcask
   payload file stays empty for covered commands and cold large values are read
-  back from the Raft segment. This is the first unified "Raft WAL == Bitcask
-  segment" path. Commands that are not projectable still need either projector
-  coverage or a conservative fallback before this can replace the full Ra path.
+  back from the Raft segment. Commands that are not projectable still need
+  projector coverage before this can replace the full Ra path.
 - Segment-log recovery now treats rewrite markers as untrusted local metadata:
   staging/backup paths must be direct children of the log parent with the
   expected rewrite prefixes. Corrupt record headers with impossible lengths emit
@@ -810,8 +787,8 @@ Important interpretation:
   multi-member leaders. Before this fork patch, the server applied single-node
   commits before checking `raft_commit_batch_interval_ms`, so concurrent
   one-node durable writes could still produce one segment fsync per write.
-- Single-member WARaft leaders can also opt into
-  `:waraft_async_log_append`. In that mode, local segment append+fsync runs on a
+- Single-member WARaft leaders use async segment append by default. Local
+  segment append+fsync runs on a
   background process while the server keeps accepting more commands into the
   next batch. The server does not advance `log_view`, apply storage, or reply to
   callers until the durable append completion message returns. Tests block the

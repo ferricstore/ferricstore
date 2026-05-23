@@ -8,14 +8,12 @@ listed with each code change.
 
 Benchmark shape unless noted:
 
-- `BACKEND=waraft`
 - `BENCH_MODE=set`
 - `TOTAL=1_000_000`
 - `CONCURRENCY=200`
 - `PIPELINE=50`
 - `DATA_SIZE=256`
 - `SHARDS=4`
-- `WARAFT_ASYNC_LOG_APPEND=true`
 - command: `mix run --no-start bench/waraft_resp_router_bench.exs`
 
 | Iteration | Change | Result | Notes |
@@ -137,7 +135,7 @@ Benchmark shape used for the current worker-style WARaft flow profile:
 | Iteration | Change | Result | Notes |
 | --- | --- | --- | --- |
 | Baseline | WARaft flow profile, async append disabled | `89,681 workflows/sec`, create `91,035/sec`, process `89,755/sec` | Flow path dominated by Bitcask/Flow apply records. |
-| Flow-1 | `WARAFT_ASYNC_LOG_APPEND=true` | `92,133 workflows/sec`, create `93,265/sec`, process `92,214/sec` | About `2.7%` better locally. The profile showed about `5M` Bitcask append records for `1M` workflows, so WAL async alone is not the main limiter. |
+| Flow-1 | WARaft async append path | `92,133 workflows/sec`, create `93,265/sec`, process `92,214/sec` | About `2.7%` better locally. The profile showed about `5M` Bitcask append records for `1M` workflows, so WAL async alone is not the main limiter. This is now the only WARaft mode. |
 | Flow-2 | `flow_new_named_value_refs/4` skips named-value normalization when no named values/refs are present | `92,498 workflows/sec`, create `93,409/sec`, process `92,582/sec` | Correct but not a proven win. Encoding already omits empty `value_refs`, so this mainly saves a small branch/empty-map path. |
 | Flow-3 | Router Flow many/create-pipeline grouping uses fixed shard tuple buckets instead of map grouping | `94,195 workflows/sec`, create `94,828/sec`, process `94,286/sec` | Targets `FLOW.CREATE_MANY`/pipeline-style independent creates and mixed-partition many commands. |
 | Flow-4 | Router Flow create-pipeline result reassembly uses an ordered tuple instead of an index map | `95,405 workflows/sec`, create `96,252/sec`, process `95,491/sec` | Removes per-result map hashing while preserving response order. |
@@ -154,16 +152,16 @@ Benchmark shape used for the current worker-style WARaft flow profile:
 | Profile after Flow-14 | Worker-style Flow Python profile, `FLOWS=100000`, `transport=many`, `SHARDS=16` | `49,420 workflows/sec` end-to-end; create `51,335/sec`; process `49,457/sec` | Telemetry still points at storage append volume, not Elixir list assembly: `500K` Bitcask records over `758` appends, avg batch `660`, plus `707` same-segment WARaft appends. |
 | Flow-15 | Put-new Flow indexes record rollback originals as known-missing instead of probing each member score | `49,987 workflows/sec` end-to-end; create `52,362/sec`; process `50,042/sec` | Keeps rollback count snapshots, but skips per-member ETS score lookups where `FlowIndex.put_new_*` already has absent-member semantics. Bitcask record count is unchanged at `500K`; claim/complete telemetry improved. |
 | Flow-16 | Fast-create state records record pending originals as known-missing and track keydir bytes without an ETS lookup | `49,950 workflows/sec` end-to-end; create `51,654/sec`; process `49,994/sec` | Correctness fallback remains for non-fast paths. Local result is neutral versus Flow-15, so this is kept as an apply-work reduction rather than a proven throughput win. |
-| Worker 1M check | Python worker profile at `FLOWS=1000000`, `SHARDS=16`, `TRANSPORT=many`, `WARAFT_ASYNC_LOG_APPEND=true` | `92,289 workflows/sec` end-to-end; create `93,004/sec`; process `92,375/sec` | Completed `1,000,000` created/claimed/completed with `0` duplicate completions. This run used the current WARaft worker path and should be compared to the same 1M worker shape, not the earlier 100K local profile rows. |
+| Worker 1M check | Python worker profile at `FLOWS=1000000`, `SHARDS=16`, `TRANSPORT=many` | `92,289 workflows/sec` end-to-end; create `93,004/sec`; process `92,375/sec` | Completed `1,000,000` created/claimed/completed with `0` duplicate completions. This run used the current WARaft worker path and should be compared to the same 1M worker shape, not the earlier 100K local profile rows. |
 | Flow-17 | RESP Flow pipeline passes typed Rust AST write/read tuples directly into Flow batch helpers | `FLOW.CREATE x100`: `13,774 cmds/sec`; `FLOW.CLAIM_DUE x100`: `12,508 cmds/sec`; `FLOW.TRANSITION x100`: `16,616 cmds/sec` | Removes the TCP pipeline remap from Rust AST tuples into second Flow-only op shapes. Core still accepts the older op tuples for internal callers. Read AST pass-through is covered by targeted tests; the benchmark shown is the existing write-focused RESP pipeline shape. |
-| Flow-17 Python 1M check | Python worker profile at `FLOWS=1000000`, `SHARDS=16`, `TRANSPORT=many`, `WARAFT_ASYNC_LOG_APPEND=true` | `94,837 workflows/sec` end-to-end; create `95,651/sec`; process `94,918/sec` | Completed `1,000,000` created/claimed/completed with `0` duplicate completions. Telemetry: `5,000,000` Bitcask records over `3,072` appends, avg append batch `1,627`, `3,088` WARaft same-segment writes. |
+| Flow-17 Python 1M check | Python worker profile at `FLOWS=1000000`, `SHARDS=16`, `TRANSPORT=many` | `94,837 workflows/sec` end-to-end; create `95,651/sec`; process `94,918/sec` | Completed `1,000,000` created/claimed/completed with `0` duplicate completions. Telemetry: `5,000,000` Bitcask records over `3,072` appends, avg append batch `1,627`, `3,088` WARaft same-segment writes. |
 | Long-history soak 1 | `bench/flow_state_lmdb_soak.exs`, `5KB` payloads, normal flows `50` states, one long failure flow target `10K` states, `SHARDS=16`, `WORKERS=32`, `PRODUCERS=8`, `TARGET_OPS_PER_SEC=50000` | Stopped early at `901.5s`; `12,311,930` Flow ops, `24,312,877` write ops, `13,657 Flow ops/sec`, `26,969 writes/sec` | Did not hit disk/memory guards. Max LMDB pending `65,306`, oldest lag `949ms`, replay lag `27,202`, so LMDB projection was behind but not the main limiter. Max BEAM memory `70.6GB`, binary memory `38.9GB`, ETS `30.3GB`, keydir entries `36.9M`, disk `27.9GB` (`15GB` data, `11GB` WARaft, `1.4GB` blob). Failure mode was write timeout/unknown outcome plus one LMDB env-open warning; added WARAFT commit-timeout telemetry afterward. |
 
 Long-history soak command:
 
 ```sh
 rm -rf /tmp/ferricstore_flow_long_soak /tmp/ferricstore_flow_long_soak.log
-FERRICSTORE_BUILD=1 MIX_ENV=bench BACKEND=waraft \
+FERRICSTORE_BUILD=1 MIX_ENV=bench \
   DATA_DIR=/tmp/ferricstore_flow_long_soak KEEP_DATA_DIR=true DURATION_SECONDS=3600 \
   TARGET_OPS_PER_SEC=50000 PAYLOAD_BYTES=5000 BLOB_SIDE_CHANNEL_THRESHOLD_BYTES=4096 \
   NORMAL_STEPS=50 LONG_FLOWS=1 LONG_STEPS=10000 SAMPLE_INTERVAL_SECONDS=60 \
@@ -347,7 +345,7 @@ Result: `4 tests, 0 failures`.
 Dedicated RESP Flow pipeline bench:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=bench BACKEND=waraft WARAFT_ASYNC_LOG_APPEND=true \
+FERRICSTORE_BUILD=1 MIX_ENV=bench \
   FLOW_RESP_BACKLOG=10000 FLOW_RESP_ITER=30 FLOW_RESP_BATCH=100 \
   FLOW_RESP_SHARDS=16 FLOW_RESP_PARTITIONS=1024 \
   mix run --no-start bench/flow_resp_pipeline_bench.exs

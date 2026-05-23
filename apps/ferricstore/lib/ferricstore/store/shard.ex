@@ -261,36 +261,11 @@ defmodule Ferricstore.Store.Shard do
       end)
 
       keydir = publish_rebuilt_keydir(keydir, keydir_name)
-      ets = keydir
 
-      # Only the default application instance owns Raft. Custom embedded shards
-      # run local/direct, and direct shard tests pass non-default instance_ctx.
-      raft? =
-        if ctx && ctx.name == :default && Ferricstore.ReplicationMode.raft?() &&
-             Ferricstore.Raft.Backend.selected() == :ra do
-          profile_startup_phase(index, :start_raft, fn ->
-            ShardLifecycle.start_raft_if_available(
-              index,
-              path,
-              active_file_id,
-              active_file_path,
-              ets,
-              ctx.name,
-              # During full application boot, start all Ra servers first and
-              # let Application elect/wait for every shard in parallel. During
-              # a supervised shard restart, this process is the only restart
-              # coordinator, so it must restore a writable Ra leader itself.
-              wait_for_leader: not Ferricstore.Application.starting?(),
-              blob_side_channel_threshold_bytes: ctx.blob_side_channel_threshold_bytes,
-              zset_score_index_name: zset_score_index,
-              zset_score_lookup_name: zset_score_lookup,
-              flow_index_name: flow_index,
-              flow_lookup_name: flow_lookup
-            )
-          end)
-        else
-          false
-        end
+      # Default-instance replication is owned by WARaftBackend. Shard GenServers
+      # still own local keydir/read/recovery state, but they no longer start a
+      # legacy Ra server during init.
+      raft? = false
 
       # Recover promoted collection instances
       promoted =

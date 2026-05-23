@@ -14,7 +14,6 @@ defmodule WaraftSpikeClusterBench do
     pipeline = env_int("PIPELINE", @default_pipeline)
     data_size = env_int("DATA_SIZE", @default_data_size)
     warmup = env_int("WARMUP", @default_warmup)
-    log = System.get_env("LOG", "segment")
     mode = System.get_env("BENCH_MODE", "set")
 
     ensure_distribution!()
@@ -25,7 +24,7 @@ defmodule WaraftSpikeClusterBench do
     try do
       names = Enum.map(nodes, & &1.name)
       connect_all(names)
-      start_cluster_members(nodes, log, waraft_wal_env())
+      start_cluster_members(nodes, waraft_wal_env())
       bootstrap_all(names)
       :ok = :rpc.call(hd(names), :ferricstore_waraft_spike, :trigger_election, [])
       leader = wait_for_leader(names)
@@ -41,7 +40,7 @@ defmodule WaraftSpikeClusterBench do
 
       IO.puts("""
       WARaft spike 3-node quorum #{mode}
-      log=#{log} mode=#{mode} leader=#{leader}
+      mode=#{mode} leader=#{leader}
       total=#{result.ops} concurrency=#{concurrency} pipeline=#{pipeline} data_size=#{data_size} warmup=#{warmup}
       reads=#{Map.get(result, :reads, 0)} writes=#{Map.get(result, :writes, result.ops)}
       elapsed_ms=#{Float.round(result.elapsed_us / 1000, 2)}
@@ -90,18 +89,12 @@ defmodule WaraftSpikeClusterBench do
     end
   end
 
-  defp start_cluster_members(nodes, log, wal_env) do
-    start_fun =
-      case log do
-        "segment" -> :start_cluster_member_segment_log
-        other -> raise("unsupported LOG=#{inspect(other)}; expected segment")
-      end
-
+  defp start_cluster_members(nodes, wal_env) do
     for node <- nodes do
       configure_waraft_wal_env_on(node.name, wal_env)
 
       :ok =
-        :rpc.call(node.name, :ferricstore_waraft_spike, start_fun, [
+        :rpc.call(node.name, :ferricstore_waraft_spike, :start_cluster_member_segment_log, [
           String.to_charlist(node.data_dir)
         ])
     end
@@ -173,58 +166,16 @@ defmodule WaraftSpikeClusterBench do
     |> maybe_put_int_env("WAL_MAX_BUFFER_BYTES", :wal_max_buffer_bytes)
     |> maybe_put_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     |> maybe_put_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
-    |> maybe_put_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
-    |> Keyword.put(
-      :waraft_segment_log_io_mode,
-      env_atom("WARAFT_SEGMENT_IO_MODE", :file, [:file, :wal_nif])
-    )
     |> Keyword.put(
       :waraft_segment_log_preallocate_bytes,
       env_int("WARAFT_SEGMENT_PREALLOCATE_BYTES", 256 * 1024 * 1024)
     )
-    |> maybe_put_atom_env("WARAFT_SEGMENT_SYNC_METHOD", :waraft_segment_log_sync_method, [
-      :datasync,
-      :sync,
-      :auto
-    ])
   end
 
   defp maybe_put_int_env(acc, env, app_key) do
     case System.get_env(env) do
       nil -> acc
       value -> [{app_key, String.to_integer(value)} | acc]
-    end
-  end
-
-  defp env_atom(name, default, allowed) do
-    case System.get_env(name) do
-      nil ->
-        default
-
-      value ->
-        atom = String.to_existing_atom(value)
-
-        unless atom in allowed do
-          raise "unsupported #{name}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-        end
-
-        atom
-    end
-  end
-
-  defp maybe_put_atom_env(acc, env, app_key, allowed) do
-    case System.get_env(env) do
-      nil ->
-        acc
-
-      value ->
-        atom = String.to_existing_atom(value)
-
-        unless atom in allowed do
-          raise "unsupported #{env}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-        end
-
-        [{app_key, atom} | acc]
     end
   end
 end

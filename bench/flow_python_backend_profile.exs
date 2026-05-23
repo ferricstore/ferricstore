@@ -21,13 +21,7 @@ defmodule FlowPythonBackendProfile do
   ]
 
   def run do
-    backends =
-      "BACKENDS"
-      |> env("ra,waraft")
-      |> String.split(",", trim: true)
-      |> Enum.map(&backend!/1)
-
-    Enum.each(backends, &run_backend/1)
+    run_backend(:waraft)
   end
 
   defp run_backend(backend) do
@@ -45,7 +39,7 @@ defmodule FlowPythonBackendProfile do
         "ferricstore-flow-python-profile-#{backend}-#{System.unique_integer([:positive])}"
       )
 
-    configure_app(backend, data_dir)
+    configure_app(data_dir)
 
     started = System.monotonic_time()
 
@@ -72,7 +66,7 @@ defmodule FlowPythonBackendProfile do
     end
   end
 
-  defp configure_app(backend, data_dir) do
+  defp configure_app(data_dir) do
     File.rm_rf!(data_dir)
     File.mkdir_p!(data_dir)
 
@@ -81,7 +75,6 @@ defmodule FlowPythonBackendProfile do
     Application.put_env(:ferricstore, :port, 0)
     Application.put_env(:ferricstore, :health_port, 0)
     Application.put_env(:ferricstore, :shard_count, int_env("SHARDS", 16))
-    Application.put_env(:ferricstore, :raft_backend, backend)
     Application.put_env(:ferricstore, :protected_mode, false)
     Application.put_env(:ferricstore, :max_memory_bytes, 100_000_000_000)
     Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
@@ -111,7 +104,6 @@ defmodule FlowPythonBackendProfile do
     Application.delete_env(:ferricstore, :waraft_log_module)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
-    put_optional_bool_env("WARAFT_ASYNC_LOG_APPEND", :waraft_async_log_append)
 
     put_optional_int_env(
       "WARAFT_MAX_LOG_ENTRIES_PER_HEARTBEAT",
@@ -121,7 +113,6 @@ defmodule FlowPythonBackendProfile do
     put_optional_int_env("WARAFT_MAX_HEARTBEAT_SIZE", :waraft_max_heartbeat_size)
     put_optional_int_env("WARAFT_APPLY_LOG_BATCH_SIZE", :waraft_apply_log_batch_size)
     put_optional_int_env("WARAFT_APPLY_BATCH_MAX_BYTES", :waraft_apply_batch_max_bytes)
-    put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
 
     put_optional_limit_env(
       ["WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES"],
@@ -146,25 +137,6 @@ defmodule FlowPythonBackendProfile do
     put_optional_int_env(
       "WARAFT_SEGMENT_RECORDS_PER_SEGMENT",
       :waraft_segment_log_records_per_segment
-    )
-
-    put_optional_atom_env("WARAFT_SEGMENT_IO_MODE", :waraft_segment_log_io_mode, [:file, :wal_nif])
-
-    put_optional_atom_env("WARAFT_SEGMENT_SYNC_METHOD", :waraft_segment_log_sync_method, [
-      :datasync,
-      :sync,
-      :auto
-    ])
-
-    put_optional_atom_env("WARAFT_FILE_WRITER_MODE", :waraft_segment_log_file_writer_mode, [
-      :direct,
-      :persistent,
-      :process
-    ])
-
-    put_optional_int_env(
-      "WARAFT_FILE_WRITER_GROUP_DELAY_MS",
-      :waraft_segment_log_file_writer_group_delay_ms
     )
   end
 
@@ -519,10 +491,6 @@ defmodule FlowPythonBackendProfile do
     end
   end
 
-  defp backend!("ra"), do: :ra
-  defp backend!("waraft"), do: :waraft
-  defp backend!(other), do: raise("unsupported backend #{inspect(other)}")
-
   defp python, do: env("PYTHON", Path.join(sdk_dir(), ".venv/bin/python"))
   defp sdk_dir, do: env("SDK_DIR", "/Users/yoavgea/repos/ferricstore-python")
 
@@ -576,22 +544,6 @@ defmodule FlowPythonBackendProfile do
 
       value ->
         raise "unsupported #{env_name}=#{inspect(value)}; expected boolean"
-    end
-  end
-
-  defp put_optional_atom_env(env_name, app_key, allowed) do
-    case System.get_env(env_name) do
-      nil ->
-        :ok
-
-      value ->
-        atom = String.to_existing_atom(value)
-
-        if atom in allowed do
-          Application.put_env(:ferricstore, app_key, atom)
-        else
-          raise "unsupported #{env_name}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-        end
     end
   end
 end

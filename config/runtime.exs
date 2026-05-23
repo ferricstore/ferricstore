@@ -51,13 +51,6 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   # Memory & Eviction
   # ---------------------------------------------------------------------------
-  raft_backend =
-    case String.downcase(System.get_env("FERRICSTORE_RAFT_BACKEND", "waraft")) do
-      "ra" -> :ra
-      "waraft" -> :waraft
-      other -> raise "invalid FERRICSTORE_RAFT_BACKEND=#{inspect(other)}; expected ra or waraft"
-    end
-
   config :ferricstore,
     max_memory_bytes: String.to_integer(System.get_env("FERRICSTORE_MAX_MEMORY", "0")),
     keydir_max_ram: String.to_integer(System.get_env("FERRICSTORE_KEYDIR_MAX_RAM", "268435456")),
@@ -184,7 +177,6 @@ if config_env() == :prod do
   # Raft / Internals
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    raft_backend: raft_backend,
     release_cursor_interval:
       String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")),
     ra_segment_max_entries:
@@ -214,8 +206,6 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_KEEP", "100000")),
     waraft_max_retained_entries:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES", "100000")),
-    waraft_async_log_append:
-      System.get_env("FERRICSTORE_WARAFT_ASYNC_LOG_APPEND", "true") in ["1", "true", "TRUE"],
     ra_min_snapshot_interval:
       String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "10000000")),
     ra_min_checkpoint_interval:

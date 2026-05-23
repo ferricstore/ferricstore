@@ -16,7 +16,6 @@ defmodule WaraftSpikeMultiBench do
     data_size = env_int("DATA_SIZE", @default_data_size)
     warmup = env_int("WARMUP", @default_warmup)
     partitions = env_int("PARTITIONS", @default_partitions)
-    log = System.get_env("LOG", "segment")
 
     root =
       Path.join(
@@ -29,7 +28,7 @@ defmodule WaraftSpikeMultiBench do
 
     try do
       configure_waraft_wal_env()
-      start!(log, root, partitions)
+      start!(root, partitions)
 
       {:ok, result} =
         :ferricstore_waraft_spike_load.run_multi(
@@ -42,7 +41,7 @@ defmodule WaraftSpikeMultiBench do
         )
 
       IO.puts("""
-      WARaft spike #{partitions}-partition set log=#{log}
+      WARaft spike #{partitions}-partition set
       total=#{total} concurrency=#{concurrency} pipeline=#{pipeline} data_size=#{data_size} warmup=#{warmup}
       elapsed_ms=#{Float.round(result.elapsed_us / 1000, 2)}
       ops_per_sec=#{Float.round(result.ops_per_sec, 2)}
@@ -54,16 +53,12 @@ defmodule WaraftSpikeMultiBench do
     end
   end
 
-  defp start!("segment", root, partitions) do
+  defp start!(root, partitions) do
     :ok =
       :ferricstore_waraft_spike.start_multi_volatile_segment_log(
         String.to_charlist(root),
         partitions
       )
-  end
-
-  defp start!(other, _root, _partitions) do
-    raise("unsupported LOG=#{inspect(other)}; expected segment")
   end
 
   defp env_int(name, default) do
@@ -78,63 +73,18 @@ defmodule WaraftSpikeMultiBench do
     put_optional_int_env("WAL_MAX_BUFFER_BYTES", :wal_max_buffer_bytes)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
-    put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
-
-    Application.put_env(
-      :ferricstore,
-      :waraft_segment_log_io_mode,
-      env_atom("WARAFT_SEGMENT_IO_MODE", :file, [:file, :wal_nif])
-    )
 
     Application.put_env(
       :ferricstore,
       :waraft_segment_log_preallocate_bytes,
       env_int("WARAFT_SEGMENT_PREALLOCATE_BYTES", 256 * 1024 * 1024)
     )
-
-    put_optional_atom_env("WARAFT_SEGMENT_SYNC_METHOD", :waraft_segment_log_sync_method, [
-      :datasync,
-      :sync,
-      :auto
-    ])
   end
 
   defp put_optional_int_env(env, app_key) do
     case System.get_env(env) do
       nil -> :ok
       value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
-    end
-  end
-
-  defp put_optional_atom_env(env, app_key, allowed) do
-    case System.get_env(env) do
-      nil ->
-        :ok
-
-      value ->
-        atom = String.to_existing_atom(value)
-
-        unless atom in allowed do
-          raise "unsupported #{env}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-        end
-
-        Application.put_env(:ferricstore, app_key, atom)
-    end
-  end
-
-  defp env_atom(name, default, allowed) do
-    case System.get_env(name) do
-      nil ->
-        default
-
-      value ->
-        atom = String.to_existing_atom(value)
-
-        unless atom in allowed do
-          raise "unsupported #{name}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-        end
-
-        atom
     end
   end
 end

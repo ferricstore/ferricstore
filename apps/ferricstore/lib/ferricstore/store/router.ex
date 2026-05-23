@@ -5871,14 +5871,14 @@ defmodule Ferricstore.Store.Router do
         [{^key, val, 0, _lfu, _fid, _off, _vsize}] when val != nil ->
           true
 
-        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when readable_cold_ref?(fid, off, vsize) ->
           true
 
         [{^key, val, exp, _lfu, _fid, _off, _vsize}] when exp > now and val != nil ->
           true
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
-        when exp > now and valid_cold_location(fid, off, vsize) ->
+        when exp > now and readable_cold_ref?(fid, off, vsize) ->
           true
 
         [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
@@ -5914,14 +5914,14 @@ defmodule Ferricstore.Store.Router do
         [{^key, val, 0, _lfu, _fid, _off, _vsize}] when val != nil ->
           true
 
-        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when readable_cold_ref?(fid, off, vsize) ->
           true
 
         [{^key, val, exp, _lfu, _fid, _off, _vsize}] when exp > now and val != nil ->
           true
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
-        when exp > now and valid_cold_location(fid, off, vsize) ->
+        when exp > now and readable_cold_ref?(fid, off, vsize) ->
           true
 
         [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->

@@ -11,7 +11,6 @@ defmodule WaraftRespRouterBench do
   def run do
     stop_started_apps()
 
-    backend = env_backend("BACKEND", :ra)
     mode = env_atom("BENCH_MODE", :set, [:set, :get, :mixed])
     total = env_int("TOTAL", 200_000)
     concurrency = env_int("CONCURRENCY", 200)
@@ -25,10 +24,10 @@ defmodule WaraftRespRouterBench do
     data_dir =
       Path.join(
         System.tmp_dir!(),
-        "ferricstore-waraft-resp-#{backend}-#{System.unique_integer([:positive])}"
+        "ferricstore-waraft-resp-#{System.unique_integer([:positive])}"
       )
 
-    configure_app(backend, data_dir, shards)
+    configure_app(data_dir, shards)
 
     {:ok, _} = Application.ensure_all_started(:ferricstore_server)
     port = FerricstoreServer.Listener.port()
@@ -72,7 +71,7 @@ defmodule WaraftRespRouterBench do
     profile_after = maybe_profile_snapshot()
 
     print_result(result, %{
-      backend: backend,
+      backend: :waraft,
       mode: mode,
       total: total,
       concurrency: concurrency,
@@ -94,13 +93,13 @@ defmodule WaraftRespRouterBench do
 
   defp stop_started_apps do
     # `mix run` starts OTP applications before evaluating this script. Stop any
-    # default boot first so the benchmark owns data_dir, shard_count, and backend.
+    # default boot first so the benchmark owns data_dir and shard_count.
     for app <- [:ferricstore_server, :ferricstore_ecto, :ferricstore_session, :ferricstore] do
       _ = Application.stop(app)
     end
   end
 
-  defp configure_app(backend, data_dir, shards) do
+  defp configure_app(data_dir, shards) do
     File.rm_rf!(data_dir)
     File.mkdir_p!(data_dir)
 
@@ -111,14 +110,11 @@ defmodule WaraftRespRouterBench do
     Application.put_env(:ferricstore, :port, 0)
     Application.put_env(:ferricstore, :health_port, 0)
     Application.put_env(:ferricstore, :shard_count, shards)
-    Application.put_env(:ferricstore, :raft_backend, backend)
     Application.delete_env(:ferricstore, :waraft_log_module)
     put_optional_int_env("WAL_COMMIT_DELAY_US", :wal_commit_delay_us)
     put_optional_int_env("WAL_MAX_BUFFER_BYTES", :wal_max_buffer_bytes)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
-    put_optional_bool_env("WARAFT_ASYNC_LOG_APPEND", :waraft_async_log_append)
-    put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
 
     put_optional_interval_env(
       "WARAFT_STORAGE_METADATA_PERSIST_EVERY",
@@ -132,23 +128,11 @@ defmodule WaraftRespRouterBench do
 
     Application.put_env(
       :ferricstore,
-      :waraft_segment_log_io_mode,
-      env_atom("WARAFT_SEGMENT_IO_MODE", :file, [:file, :wal_nif])
-    )
-
-    Application.put_env(
-      :ferricstore,
       :waraft_segment_log_preallocate_bytes,
       env_int("WARAFT_SEGMENT_PREALLOCATE_BYTES", 256 * 1024 * 1024)
     )
 
-    put_optional_atom_env("WARAFT_SEGMENT_SYNC_METHOD", :waraft_segment_log_sync_method, [
-      :datasync,
-      :sync,
-      :auto
-    ])
-
-    if backend == :waraft and System.get_env("WARAFT_LOG") do
+    if System.get_env("WARAFT_LOG") do
       raise "WARAFT_LOG is no longer supported; WARaft benchmarks use durable segment/keydir storage"
     end
   end
@@ -186,22 +170,6 @@ defmodule WaraftRespRouterBench do
 
       value ->
         Application.put_env(:ferricstore, app_key, String.to_integer(value))
-    end
-  end
-
-  defp put_optional_atom_env(env, app_key, allowed) do
-    case System.get_env(env) do
-      nil ->
-        :ok
-
-      value ->
-        atom = String.to_existing_atom(value)
-
-        unless atom in allowed do
-          raise "unsupported #{env}=#{inspect(value)}; expected one of #{inspect(allowed)}"
-        end
-
-        Application.put_env(:ferricstore, app_key, atom)
     end
   end
 
@@ -421,15 +389,6 @@ defmodule WaraftRespRouterBench do
       apply(:eprof, :analyze, [:total])
       apply(:eprof, :stop, [])
       Process.delete(:waraft_resp_router_eprof_started?)
-    end
-  end
-
-  defp env_backend(name, default) do
-    case System.get_env(name) do
-      nil -> default
-      "ra" -> :ra
-      "waraft" -> :waraft
-      other -> raise "unsupported #{name}=#{inspect(other)}; expected ra or waraft"
     end
   end
 

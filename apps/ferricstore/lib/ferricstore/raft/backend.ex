@@ -1,24 +1,22 @@
 defmodule Ferricstore.Raft.Backend do
   @moduledoc """
-  Runtime write-backend selector.
+  Runtime write backend.
 
-  WARaft is the production default. The legacy `:ra` backend remains selectable
-  only for explicit comparison tests and benchmarks.
+  WARaft is the only supported production path. The old Ra implementation may
+  still exist in reference/test modules, but normal runtime selection is fixed
+  here so deploys and benchmarks do not drift via config flags.
   """
 
   alias Ferricstore.Raft.WARaftBackend
 
   @running_backend_key {__MODULE__, :running_backend}
 
-  @spec selected() :: :ra | :waraft
-  def selected do
-    Application.get_env(:ferricstore, :raft_backend, :waraft)
-    |> normalize_selected()
-  end
+  @spec selected() :: :waraft
+  def selected, do: :waraft
 
   @doc false
-  @spec put_running!(:ra | :waraft) :: :ok
-  def put_running!(backend) when backend in [:ra, :waraft] do
+  @spec put_running!(:waraft) :: :ok
+  def put_running!(:waraft = backend) do
     :persistent_term.put(@running_backend_key, backend)
     :ok
   end
@@ -37,15 +35,15 @@ defmodule Ferricstore.Raft.Backend do
   application env and is useful before startup, while default-instance runtime
   routing must stay pinned to the backend that actually booted.
   """
-  @spec running() :: :ra | :waraft | :undefined
+  @spec running() :: :waraft | :undefined
   def running do
     :persistent_term.get(@running_backend_key, :undefined)
   end
 
-  @spec running_or_selected() :: :ra | :waraft
+  @spec running_or_selected() :: :waraft
   def running_or_selected do
     case running() do
-      backend when backend in [:ra, :waraft] -> backend
+      :waraft -> :waraft
       :undefined -> selected()
     end
   end
@@ -53,16 +51,8 @@ defmodule Ferricstore.Raft.Backend do
   @spec running_waraft?() :: boolean()
   def running_waraft?, do: running_or_selected() == :waraft
 
-  defp normalize_selected(value) when value in [:ra, "ra"], do: :ra
-  defp normalize_selected(value) when value in [:waraft, "waraft"], do: :waraft
-
-  defp normalize_selected(value) do
-    raise ArgumentError,
-          "invalid :ferricstore :raft_backend #{inspect(value)}; expected :ra or :waraft"
-  end
-
   @spec waraft?() :: boolean()
-  def waraft?, do: selected() == :waraft
+  def waraft?, do: true
 
   @spec write(non_neg_integer(), tuple()) :: term()
   def write(shard_index, command),

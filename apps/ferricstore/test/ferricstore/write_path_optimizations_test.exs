@@ -112,7 +112,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       key = "lfu_ldt_test"
       # Use a past minute so the current minute is different
-      old_min = (LFU.now_minutes() - 2) &&& 0xFFFF
+      old_min = LFU.now_minutes() - 2 &&& 0xFFFF
       packed = LFU.pack(old_min, 100)
 
       :ets.insert(table, {key, "val", 0, packed, 1, 0, 3})
@@ -127,7 +127,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     end
 
     test "effective_counter applies decay based on elapsed time" do
-      old_min = (LFU.now_minutes() - 5) &&& 0xFFFF
+      old_min = LFU.now_minutes() - 5 &&& 0xFFFF
       packed = LFU.pack(old_min, 100)
 
       effective = LFU.effective_counter(packed)
@@ -283,7 +283,9 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       test "bulk string exceeding custom limit returns error" do
         # Set a very small limit
         data = "$100\r\n" <> String.duplicate("x", 100) <> "\r\n"
-        assert {:error, {:value_too_large, 100, 50}} = FerricstoreServer.Resp.Parser.parse(data, 50)
+
+        assert {:error, {:value_too_large, 100, 50}} =
+                 FerricstoreServer.Resp.Parser.parse(data, 50)
       end
 
       test "hard cap of 64MB enforced regardless of config" do
@@ -292,7 +294,9 @@ defmodule Ferricstore.WritePathOptimizationsTest do
         # Even with a huge limit, 64MB+ is rejected
         huge_len = 67_108_865
         data = "$#{huge_len}\r\n"
-        assert {:error, {:value_too_large, ^huge_len, _}} = FerricstoreServer.Resp.Parser.parse(data, 100_000_000)
+
+        assert {:error, {:value_too_large, ^huge_len, _}} =
+                 FerricstoreServer.Resp.Parser.parse(data, 100_000_000)
       end
 
       test "bulk string at exact limit parses successfully" do
@@ -309,19 +313,20 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   end
 
   # =========================================================================
-  # Application patched WAL loading
+  # Application WARaft loading
   # =========================================================================
 
-  describe "application patched WAL loading" do
-    test "install_patched_wal loaded the module during app start" do
-      # Verify ra_log_wal is loaded (would fail if compilation failed)
-      loaded_modules = :code.all_loaded() |> Enum.map(fn {mod, _} -> mod end)
-      assert :ra_log_wal in loaded_modules
+  describe "application WARaft loading" do
+    test "WARaft is the only selected backend" do
+      assert Ferricstore.Raft.Backend.selected() == :waraft
+      assert Ferricstore.Raft.Backend.running_or_selected() == :waraft
     end
 
-    test "ra system is running" do
-      # Raft is always on -- verify a batcher process exists for shard 0
-      assert Process.whereis(Ferricstore.Raft.Batcher.batcher_name(0)) != nil
+    test "legacy Ra batchers are not application-supervised" do
+      refute Process.whereis(Ferricstore.Raft.Batcher.batcher_name(0))
+
+      acceptor = :wa_raft_acceptor.registered_name(:ferricstore_waraft_backend, 1)
+      assert is_pid(Process.whereis(acceptor))
     end
   end
 
@@ -337,7 +342,10 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     end
 
     test "returns false for non-existent key" do
-      assert Router.exists_fast?(FerricStore.Instance.get(:default), "nonexistent_key_#{:rand.uniform(999_999)}") == false
+      assert Router.exists_fast?(
+               FerricStore.Instance.get(:default),
+               "nonexistent_key_#{:rand.uniform(999_999)}"
+             ) == false
     end
 
     test "returns false for expired key" do

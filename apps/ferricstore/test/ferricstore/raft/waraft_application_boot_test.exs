@@ -6,44 +6,15 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   alias Ferricstore.Transaction.Coordinator
   alias Ferricstore.Test.ShardHelpers
 
-  test "WARaft backend selection does not build legacy Ra batcher children" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
-    try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-      assert Ferricstore.Application.legacy_raft_backend?() == false
-      assert Ferricstore.Application.raft_batcher_children(4) == []
-    after
-      restore_backend(previous_backend)
-    end
-  end
-
-  test "Ra backend selection keeps legacy Ra batcher children" do
+  test "WARaft backend is fixed even if old env config is set" do
     previous_backend = Application.get_env(:ferricstore, :raft_backend)
 
     try do
       Application.put_env(:ferricstore, :raft_backend, :ra)
 
-      assert Ferricstore.Application.legacy_raft_backend?() == true
-
-      children = Ferricstore.Application.raft_batcher_children(2)
-      assert length(children) == 2
-      assert Enum.all?(children, &match?(%{id: _}, &1))
-    after
-      restore_backend(previous_backend)
-    end
-  end
-
-  test "invalid Raft backend config fails closed" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
-    try do
-      Application.put_env(:ferricstore, :raft_backend, :warft)
-
-      assert_raise ArgumentError, ~r/invalid :ferricstore :raft_backend/, fn ->
-        Ferricstore.Raft.Backend.selected()
-      end
+      assert Ferricstore.Raft.Backend.selected() == :waraft
+      assert Ferricstore.Raft.Backend.running_or_selected() == :waraft
+      assert Ferricstore.Raft.Backend.waraft?()
     after
       restore_backend(previous_backend)
     end

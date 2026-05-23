@@ -1,11 +1,9 @@
 defmodule Ferricstore.Raft.WARaftBackend do
   @moduledoc """
-  Candidate WARaft backend boundary.
+  Production WARaft backend boundary.
 
-  This module is intentionally separate from the production `:ra` path. It is
-  the replacement gate: WARaft must prove it can run the real FerricStore state
-  machine, preserve restart semantics, install snapshots, and expose the same
-  write shapes before Router can select it in production.
+  WARaft is the only default-instance runtime backend. Keep old Ra-facing code
+  as reference/test-only code, not as a deploy-time mode switch.
   """
 
   alias Ferricstore.ErrorReasons
@@ -2427,13 +2425,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
         non_negative_integer_option!(batch_interval_source, batch_interval_value),
       commit_batch_max:
         throughput_option(opts, :commit_batch_max, :waraft_commit_batch_max, 1024),
-      async_log_append:
-        boolean_option(
-          opts,
-          :async_log_append,
-          :waraft_async_log_append,
-          true
-        )
+      async_log_append: true
     }
   end
 
@@ -2479,17 +2471,6 @@ defmodule Ferricstore.Raft.WARaftBackend do
   defp non_negative_integer_option!(source, value) do
     raise ArgumentError,
           "#{inspect(source)} must be a non-negative integer, got: #{inspect(value)}"
-  end
-
-  defp boolean_option(opts, opt_key, app_key, default) do
-    {source, value} = config_option(opts, opt_key, app_key, default)
-    boolean_option!(source, value)
-  end
-
-  defp boolean_option!(_source, value) when is_boolean(value), do: value
-
-  defp boolean_option!(source, value) do
-    raise ArgumentError, "#{inspect(source)} must be a boolean, got: #{inspect(value)}"
   end
 
   defp registered_partition_count do

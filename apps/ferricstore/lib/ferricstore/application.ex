@@ -18,7 +18,7 @@ defmodule Ferricstore.Application do
   ├── Ferricstore.NamespaceConfig         (per-namespace overrides)
   ├── (ACL moved to ferricstore_server)
   ├── Ferricstore.HLC                     (Hybrid Logical Clock)
-  ├── Ferricstore.Raft.Batcher (x N)     (group-commit batchers)
+  ├── Ferricstore.Raft.WARaftBackend      (durable Raft backend)
   ├── Ferricstore.Store.BitcaskWriter (x N) (background Bitcask flushers)
   ├── Ferricstore.Store.ShardSupervisor   (one_for_one over N Shard GenServers)
   ├── Ferricstore.Merge.Supervisor        (Semaphore + N Scheduler GenServers)
@@ -53,8 +53,7 @@ defmodule Ferricstore.Application do
 
     try do
       data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-      selected_backend = Ferricstore.Raft.Backend.selected()
-      :ok = Ferricstore.Raft.Backend.put_running!(selected_backend)
+      :ok = Ferricstore.Raft.Backend.put_running!(:waraft)
 
       shard_count =
         case Application.get_env(:ferricstore, :shard_count, 0) do
@@ -62,7 +61,7 @@ defmodule Ferricstore.Application do
           n when is_integer(n) and n > 0 -> n
         end
 
-      app_state = %{raft_backend: selected_backend, data_dir: data_dir, shard_count: shard_count}
+      app_state = %{data_dir: data_dir, shard_count: shard_count}
 
       Logger.info("FerricStore starting")
 
@@ -146,14 +145,9 @@ defmodule Ferricstore.Application do
       # Initialize stream metadata ETS tables (owned by this long-lived process)
       Ferricstore.Commands.Stream.init_tables()
       # Start Erlang distribution if cluster is configured.
-      # Must happen before the selected Raft backend starts so cluster backends
-      # can communicate across nodes.
+      # Must happen before WARaft starts so cluster peers can communicate
+      # across nodes.
       maybe_start_distribution()
-
-      # Start the legacy Ra system before shards only when the current Ra backend
-      # is selected. WARaft owns its own supervisor and starts after the default
-      # instance context exists.
-      :ok = start_legacy_raft_system_if_selected(data_dir, selected_backend)
 
       # Build the default instance context. This creates the Instance struct
       # with all refs (atomics, counters, ETS tables) and caches it in
@@ -176,8 +170,6 @@ defmodule Ferricstore.Application do
           lfu_decay_time: Application.get_env(:ferricstore, :lfu_decay_time, 1),
           lfu_log_factor: Application.get_env(:ferricstore, :lfu_log_factor, 10)
         )
-
-      batcher_children = raft_batcher_children(shard_count, selected_backend)
 
       # Background Bitcask writers — one per shard. Must start BEFORE the
       # ShardSupervisor because StateMachine.apply sends casts to these
@@ -228,7 +220,6 @@ defmodule Ferricstore.Application do
             Ferricstore.PrefixMetricsCache,
             Ferricstore.Store.BlobStore.TableOwner
           ] ++
-          batcher_children ++
           bitcask_writer_children ++
           [{Ferricstore.Flow.LMDBFlushCoordinator, []}] ++
           flow_lmdb_writer_children ++
@@ -257,7 +248,7 @@ defmodule Ferricstore.Application do
 
       case Supervisor.start_link(children, opts) do
         {:ok, pid} ->
-          case start_selected_raft_backend(default_ctx, shard_count, selected_backend) do
+          case Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts()) do
             :ok ->
               mark_started(shard_count)
               {:ok, pid, app_state}
@@ -281,70 +272,6 @@ defmodule Ferricstore.Application do
   @spec starting?() :: boolean()
   def starting? do
     :persistent_term.get({__MODULE__, :starting}, false)
-  end
-
-  @doc false
-  def raft_batcher_children(shard_count) do
-    raft_batcher_children(shard_count, Ferricstore.Raft.Backend.selected())
-  end
-
-  defp raft_batcher_children(shard_count, backend) do
-    if legacy_raft_backend?(backend) do
-      legacy_raft_batcher_children(shard_count)
-    else
-      []
-    end
-  end
-
-  @doc false
-  def legacy_raft_backend?, do: Ferricstore.Raft.Backend.selected() == :ra
-  defp legacy_raft_backend?(:ra), do: true
-  defp legacy_raft_backend?(_backend), do: false
-
-  defp legacy_raft_batcher_children(shard_count) do
-    Enum.map(0..(shard_count - 1), fn i ->
-      shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-
-      Supervisor.child_spec(
-        {Ferricstore.Raft.Batcher,
-         shard_index: i,
-         shard_id: shard_id,
-         max_pending_batches: Application.get_env(:ferricstore, :raft_batcher_max_pending, 256),
-         max_pending_bytes: Application.get_env(:ferricstore, :raft_batcher_max_pending_bytes, 0),
-         max_batch_bytes:
-           Application.get_env(:ferricstore, :raft_batcher_max_batch_bytes, 4 * 1024 * 1024)},
-        id: :"batcher_#{i}"
-      )
-    end)
-  end
-
-  defp start_legacy_raft_system_if_selected(data_dir, selected_backend) do
-    if legacy_raft_backend?(selected_backend) do
-      # Load the patched ra_log_wal with async fdatasync BEFORE starting
-      # the ra system, so the patched module is in place when the WAL starts.
-      # NOTE: When using the local ra fork (path dep), the fork already includes
-      # the async fdatasync changes directly in source. Skip hot-load to avoid
-      # overriding the fork's beam with a potentially stale patched version.
-      install_patched_wal()
-
-      # Ra formats one snapshot debug event with `~b` even though the size can be
-      # `undefined`; use our delegate so long debug/chaos runs do not spam
-      # formatter crashes while keeping the rest of Ra logging intact.
-      :ok = Ferricstore.Raft.SafeRaLogger.install_filter()
-      :ok = :ra_env.configure_logger(Ferricstore.Raft.SafeRaLogger)
-
-      :ok = Ferricstore.Raft.Cluster.start_system(data_dir, selected_backend)
-    else
-      :ok
-    end
-  end
-
-  defp start_selected_raft_backend(default_ctx, shard_count, selected_backend) do
-    if legacy_raft_backend?(selected_backend) do
-      Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count)
-    else
-      Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts())
-    end
   end
 
   defp waraft_backend_opts do
@@ -405,15 +332,12 @@ defmodule Ferricstore.Application do
 
     {shard_count, data_dir} = runtime_shutdown_config(state)
 
-    legacy_raft? = running_legacy_raft_backend?(state)
-
-    batcher_result = if legacy_raft?, do: shutdown_flush_batchers(shard_count), else: :ok
+    batcher_result = :ok
     bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
     shutdown_flush_flow_lmdb_writers(shard_count)
     bitcask_fsync_result = shutdown_fsync_bitcask(shard_count, data_dir)
     shutdown_flush_shards(shard_count)
-    wal_rollover_result = if legacy_raft?, do: shutdown_wal_rollover(data_dir), else: :ok
-    if legacy_raft?, do: shutdown_check_snapshots(shard_count)
+    wal_rollover_result = :ok
 
     elapsed = System.monotonic_time(:millisecond) - t0
 
@@ -433,17 +357,8 @@ defmodule Ferricstore.Application do
 
   @impl true
   def stop(state) do
-    case running_raft_backend(state) do
-      :waraft ->
-        _ = Ferricstore.Raft.WARaftBackend.stop()
-
-      :ra ->
-        _ = Ferricstore.Raft.Cluster.stop_system(:ra)
-
-      _unknown ->
-        _ = Ferricstore.Raft.WARaftBackend.stop()
-        _ = Ferricstore.Raft.Cluster.stop_system(:ra)
-    end
+    _ = state
+    _ = Ferricstore.Raft.WARaftBackend.stop()
 
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
@@ -484,31 +399,6 @@ defmodule Ferricstore.Application do
       n when is_integer(n) and n > 0 -> n
       _ -> 4
     end
-  end
-
-  defp running_legacy_raft_backend?(state), do: running_raft_backend(state) == :ra
-
-  defp running_raft_backend(%{raft_backend: backend}) when backend in [:ra, :waraft], do: backend
-  defp running_raft_backend(_state), do: Ferricstore.Raft.Backend.selected()
-
-  defp shutdown_flush_batchers(shard_count) do
-    # Step 2: Flush all Raft batchers — drain pending commands to Raft
-    result =
-      try do
-        Ferricstore.Raft.Batcher.flush_all(shard_count)
-      catch
-        :exit, reason -> {:error, {:flush_all_exit, reason}}
-      end
-
-    case result do
-      :ok ->
-        Logger.info("Shutdown: batchers flushed")
-
-      {:error, reason} ->
-        Logger.warning("Shutdown: batcher flush incomplete: #{inspect(reason)}")
-    end
-
-    result
   end
 
   defp shutdown_flush_bitcask_writers(shard_count) do
@@ -669,22 +559,6 @@ defmodule Ferricstore.Application do
     Logger.info("Shutdown: shards flushed")
   end
 
-  defp shutdown_wal_rollover(data_dir) do
-    # Step 5: Force WAL rollover and poll until segment writer finishes.
-    # After force_roll_over, the old WAL file is handed to the segment writer.
-    # When the segment writer finishes processing it, the old WAL file is deleted.
-    # We poll for the old file's deletion — concrete, no side effects.
-    case wal_rollover_for_shutdown(data_dir) do
-      :ok ->
-        Logger.info("Shutdown: WAL rolled over")
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("Shutdown: WAL rollover incomplete: #{inspect(reason)}")
-        {:error, reason}
-    end
-  end
-
   @doc false
   def wal_rollover_for_shutdown(data_dir, opts \\ []) do
     force_rollover =
@@ -734,27 +608,6 @@ defmodule Ferricstore.Application do
     end
   end
 
-  defp shutdown_check_snapshots(shard_count) do
-    # Step 6: Check snapshot state for each shard and log warning if
-    # there are many entries since last snapshot (will need replay on restart)
-    for i <- 0..(shard_count - 1) do
-      try do
-        case Ferricstore.Raft.Cluster.member_overview(i) do
-          {:ok, overview} ->
-            check_snapshot_gap(i, overview)
-
-          {:ok, overview, _leader} ->
-            check_snapshot_gap(i, overview)
-
-          _ ->
-            :ok
-        end
-      catch
-        _, _ -> :ok
-      end
-    end
-  end
-
   defp list_wal_files(ra_dir) do
     case Ferricstore.FS.ls(ra_dir) do
       {:ok, files} -> Enum.filter(files, &String.ends_with?(&1, ".wal"))
@@ -782,24 +635,6 @@ defmodule Ferricstore.Application do
     else
       Process.sleep(interval)
       do_await_wal_files_consumed(ra_dir, remaining, attempts - 1, interval, list_fun)
-    end
-  end
-
-  defp check_snapshot_gap(shard_index, overview) do
-    last_applied = Map.get(overview, :last_applied, 0)
-    snapshot_index = Map.get(overview, :snapshot_index, 0)
-    # -1 means no snapshot ever taken
-    snapshot_index = if snapshot_index == -1, do: 0, else: snapshot_index
-    gap = last_applied - snapshot_index
-
-    if gap > 5_000 do
-      Logger.warning(
-        "Shutdown: shard #{shard_index} has #{gap} entries since last snapshot " <>
-          "(last_applied=#{last_applied}, snapshot_index=#{snapshot_index}). " <>
-          "Next restart will replay these entries. Consider reducing release_cursor_interval."
-      )
-    else
-      Logger.info("Shutdown: shard #{shard_index} snapshot gap=#{gap} (ok)")
     end
   end
 
@@ -1019,45 +854,6 @@ defmodule Ferricstore.Application do
     case Application.get_env(:ferricstore, :memory_guard_interval_ms) do
       nil -> opts
       val -> Keyword.put(opts, :interval_ms, val)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Patched ra_log_wal (async fdatasync)
-  # ---------------------------------------------------------------------------
-
-  # Compiles and hot-loads a patched version of ra_log_wal that decouples
-  # fdatasync from the batch processing loop. The patched module:
-  #
-  # 1. Writes data to the kernel buffer synchronously (fast)
-  # 2. Spawns a linked process to run fdatasync asynchronously
-  # 3. While fdatasync runs, keeps accepting new entries
-  # 4. When fdatasync completes, notifies ALL accumulated writers
-  #
-  # Writers are ONLY notified AFTER fdatasync, preserving Raft durability.
-  #
-  # This must be called BEFORE ra_system:start/1 so the patched module is
-  # loaded before the WAL process starts.
-  # Check if ra is a local path dependency (fork) vs hex package.
-
-  @spec install_patched_wal() :: :ok | :error
-  defp install_patched_wal do
-    priv_dir = :code.priv_dir(:ferricstore)
-    beam_path = Path.join(priv_dir, "patched/ra_log_wal.beam")
-
-    if Ferricstore.FS.exists?(beam_path) do
-      binary = File.read!(beam_path)
-      :code.purge(:ra_log_wal)
-      {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)
-      Logger.info("Loaded patched ra_log_wal with async fdatasync")
-      :ok
-    else
-      Logger.error(
-        "Patched ra_log_wal.beam not found at #{beam_path}. " <>
-          "Run `mix compile` to generate it from priv/patched/ra_log_wal.erl"
-      )
-
-      :error
     end
   end
 end

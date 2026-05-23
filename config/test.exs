@@ -10,12 +10,6 @@ config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.ge
 # Production defaults to System.schedulers_online().
 config :ferricstore, :shard_count, 4
 
-# Keep the broad historical test app on legacy Ra unless a test explicitly opts
-# into WARaft. Production and benchmark configs default to WARaft.
-config :ferricstore,
-  raft_backend: :ra,
-  waraft_async_log_append: false
-
 # High supervisor restart limits for test — shard-kill tests need many restarts.
 # Production default: {20, 10} (20 restarts in 10 seconds).
 config :ferricstore, :supervisor_max_restarts, {1000, 60}

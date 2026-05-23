@@ -501,9 +501,9 @@ defmodule Ferricstore.Raft.Cluster do
   Returns the local Ra member overview for a shard.
 
   This is intentionally routed through the cluster facade so operational code
-  does not accidentally bypass the selected Raft backend. WARaft does not expose
-  a legacy ra snapshot overview, so callers should treat the returned error as
-  "no legacy overview available".
+  does not accidentally bypass WARaft. WARaft does not expose a legacy ra
+  snapshot overview, so callers should treat the returned error as "no legacy
+  overview available".
   """
   @spec member_overview(non_neg_integer() | :ra.server_id()) ::
           {:ok, map()} | {:ok, map(), term()} | {:error, term()}

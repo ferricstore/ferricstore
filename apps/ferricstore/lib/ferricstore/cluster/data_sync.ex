@@ -9,7 +9,6 @@ defmodule Ferricstore.Cluster.DataSync do
 
   require Logger
 
-  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
@@ -460,35 +459,14 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
-  defp pause_batcher(node, shard_index) do
-    cond do
-      RaftBackend.waraft?() ->
-        {:error, :unsupported_waraft_data_sync}
-
-      node == node() ->
-        Batcher.pause_writes_for_sync(shard_index, 30_000)
-
-      true ->
-        :erpc.call(node, Batcher, :pause_writes_for_sync, [shard_index, 30_000], 35_000)
-    end
-  catch
-    kind, reason -> {:error, {:pause_batcher_failed, {kind, reason}}}
+  defp pause_batcher(_node, _shard_index) do
+    # DataSync currently fails closed before reaching this legacy Ra copy path
+    # under the production WARaft backend. Keep the helper conditional so this
+    # dead branch does not look like a successful WARaft sync primitive.
+    if RaftBackend.waraft?(), do: {:error, :unsupported_waraft_data_sync}, else: :ok
   end
 
-  defp resume_batcher(node, shard_index) do
-    cond do
-      RaftBackend.waraft?() ->
-        :ok
-
-      node == node() ->
-        Batcher.resume_writes_for_sync(shard_index, 5_000)
-
-      true ->
-        :erpc.call(node, Batcher, :resume_writes_for_sync, [shard_index, 5_000], 10_000)
-    end
-  catch
-    _, _ -> :ok
-  end
+  defp resume_batcher(_node, _shard_index), do: :ok
 
   defp pause_shard(node, shard_name) do
     if node == node() do
