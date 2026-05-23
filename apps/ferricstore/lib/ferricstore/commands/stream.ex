@@ -751,41 +751,36 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xread(stream_ids, count, store) do
     ensure_meta_table()
 
-    results =
-      Enum.map(stream_ids, fn {key, id_str} ->
-        # Handle "$" -- resolve to current last ID of the stream.
-        resolved_id =
-          if id_str == "$" do
-            case stream_meta_entries(key, store) do
-              [{^key, _len, _first, last, _ms, _seq}] -> last
-              [] -> "0-0"
-            end
-          else
-            id_str
-          end
-
-        # For XREAD, the start is exclusive (entries > id).
-        start_id = parse_exclusive_start(resolved_id)
-
-        case start_id do
-          {:ok, excl_start} ->
-            entries = do_xrange(key, excl_start, :max, count, store)
-
-            if entries == [] do
-              nil
-            else
-              [key, entries]
-            end
-
-          {:error, _} = err ->
-            err
-        end
-      end)
-
-    # Check for errors first.
-    case Enum.find(results, &match?({:error, _}, &1)) do
+    case xread_results(stream_ids, count, store, []) do
       {:error, _} = err -> err
-      nil -> Enum.reject(results, &is_nil/1)
+      results -> Enum.reverse(results)
+    end
+  end
+
+  defp xread_results([], _count, _store, acc), do: acc
+
+  defp xread_results([{key, id_str} | rest], count, store, acc) do
+    # Handle "$" -- resolve to current last ID of the stream.
+    resolved_id =
+      if id_str == "$" do
+        case stream_meta_entries(key, store) do
+          [{^key, _len, _first, last, _ms, _seq}] -> last
+          [] -> "0-0"
+        end
+      else
+        id_str
+      end
+
+    # For XREAD, the start is exclusive (entries > id).
+    case parse_exclusive_start(resolved_id) do
+      {:ok, excl_start} ->
+        case do_xrange(key, excl_start, :max, count, store) do
+          [] -> xread_results(rest, count, store, acc)
+          entries -> xread_results(rest, count, store, [[key, entries] | acc])
+        end
+
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -955,13 +950,19 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
+  defp delete_stream_ids(_key, [], _store), do: {:ok, 0}
+
   defp delete_stream_ids(key, ids, store) do
-    Enum.reduce_while(ids, {:ok, 0}, fn id_str, {:ok, deleted_count} ->
-      case delete_stream_entry(store, key, stream_entry_key(key, id_str)) do
-        :ok -> {:cont, {:ok, deleted_count + 1}}
-        {:error, reason} -> {:halt, {:error, reason, deleted_count}}
-      end
-    end)
+    compound_keys = delete_stream_entry_keys(key, ids)
+
+    case delete_stream_entries(store, key, compound_keys) do
+      :ok ->
+        delete_stream_index_ids(key, ids)
+        {:ok, length(compound_keys)}
+
+      {:error, reason} ->
+        {:error, reason, 0}
+    end
   end
 
   defp update_meta_after_trim(key, []) do
@@ -990,21 +991,17 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xdel(key, ids, store) do
     ensure_meta_table()
 
-    prefix = "X:#{key}" <> @sep
+    unique_ids = Enum.uniq(ids)
+    compound_keys = delete_stream_entry_keys(key, unique_ids)
+    raw_values = batch_get_stream_entries(store, key, compound_keys)
+
+    existing_ids = existing_stream_ids(unique_ids, raw_values, [])
 
     delete_result =
-      Enum.reduce_while(ids, 0, fn id_str, acc ->
-        compound_key = prefix <> id_str
-
-        if stream_entry_exists?(store, key, compound_key) do
-          case delete_stream_entry(store, key, compound_key) do
-            :ok -> {:cont, acc + 1}
-            {:error, _} = error -> {:halt, error}
-          end
-        else
-          {:cont, acc}
-        end
-      end)
+      case delete_stream_ids(key, existing_ids, store) do
+        {:ok, deleted} -> deleted
+        {:error, reason, _deleted_count} -> {:error, reason}
+      end
 
     case delete_result do
       {:error, _} = error ->
@@ -1016,14 +1013,6 @@ defmodule Ferricstore.Commands.Stream do
         end
 
         deleted
-    end
-  end
-
-  defp stream_entry_exists?(store, stream_key, compound_key) do
-    if Ops.has_compound?(store) do
-      Ops.compound_get(store, stream_key, compound_key) != nil
-    else
-      Ops.exists?(store, compound_key)
     end
   end
 
@@ -1231,97 +1220,151 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xreadgroup(group, consumer, stream_ids, count, store) do
     ensure_meta_table()
 
-    results =
-      Enum.map(stream_ids, fn {key, id_str} ->
-        case lookup_group(store, key, group) do
-          :missing ->
-            {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
+    case xreadgroup_results(group, consumer, stream_ids, count, store, []) do
+      {:error, _} = err -> err
+      results -> Enum.reverse(results)
+    end
+  end
 
-          {:ok, last_delivered, consumers, pending} ->
-            case id_str do
-              ">" ->
-                # Deliver new messages after last_delivered_id.
-                start_id = parse_exclusive_start(last_delivered)
+  defp xreadgroup_results(_group, _consumer, [], _count, _store, acc), do: acc
 
-                case start_id do
-                  {:ok, excl_start} ->
-                    entries = do_xrange(key, excl_start, :max, count, store)
+  defp xreadgroup_results(group, consumer, [{key, id_str} | rest], count, store, acc) do
+    case xreadgroup_stream_result(group, consumer, key, id_str, count, store) do
+      {:error, _} = err -> err
+      nil -> xreadgroup_results(group, consumer, rest, count, store, acc)
+      result -> xreadgroup_results(group, consumer, rest, count, store, [result | acc])
+    end
+  end
 
-                    if entries == [] do
-                      nil
-                    else
-                      # Update last_delivered_id and pending entries.
-                      last_entry = List.last(entries)
-                      new_last_delivered = hd(last_entry)
+  defp xreadgroup_stream_result(group, consumer, key, id_str, count, store) do
+    case lookup_group(store, key, group) do
+      :missing ->
+        {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
 
-                      new_pending =
-                        Enum.reduce(entries, pending, fn [id | _], acc ->
-                          Map.put(acc, id, {consumer, CommandTime.now_ms()})
-                        end)
+      {:ok, last_delivered, consumers, pending} ->
+        xreadgroup_known_group_result(
+          group,
+          consumer,
+          key,
+          id_str,
+          count,
+          store,
+          last_delivered,
+          consumers,
+          pending
+        )
+    end
+  end
 
-                      new_consumers = Map.put(consumers, consumer, CommandTime.now_ms())
+  defp xreadgroup_known_group_result(
+         group,
+         consumer,
+         key,
+         ">",
+         count,
+         store,
+         last_delivered,
+         consumers,
+         pending
+       ) do
+    # Deliver new messages after last_delivered_id.
+    case parse_exclusive_start(last_delivered) do
+      {:ok, excl_start} ->
+        case do_xrange(key, excl_start, :max, count, store) do
+          [] ->
+            nil
 
-                      case persist_group_state(
-                             store,
-                             key,
-                             group,
-                             new_last_delivered,
-                             new_consumers,
-                             new_pending
-                           ) do
-                        :ok -> [key, entries]
-                        {:error, _reason} = error -> error
-                      end
-                    end
+          entries ->
+            # Update last_delivered_id and pending entries.
+            last_entry = List.last(entries)
+            new_last_delivered = hd(last_entry)
+            now_ms = CommandTime.now_ms()
 
-                  {:error, _} = err ->
-                    err
-                end
+            new_pending =
+              Enum.reduce(entries, pending, fn [id | _], acc ->
+                Map.put(acc, id, {consumer, now_ms})
+              end)
 
-              _ ->
-                # Return pending entries for this consumer with id >= id_str.
-                pending_start =
-                  if id_str == "0" or id_str == "0-0" do
-                    :min
-                  else
-                    parse_id!(id_str)
-                  end
+            new_consumers = Map.put(consumers, consumer, now_ms)
 
-                pending_entries =
-                  pending
-                  |> Enum.filter(fn {_id, {owner, _ts}} -> owner == consumer end)
-                  |> Enum.filter(fn {id, _} ->
-                    case pending_start do
-                      :min -> true
-                      start -> id_cmp(parse_id!(id), start) != :lt
-                    end
-                  end)
-                  |> Enum.sort_by(fn {id, _} -> parse_id!(id) end)
-                  |> maybe_take_tuples(count)
-                  |> Enum.map(fn {id_str_inner, _} ->
-                    raw = get_stream_entry(store, key, stream_entry_key(key, id_str_inner))
-
-                    case decode_stream_fields(raw) do
-                      {:ok, fields} -> [id_str_inner | fields]
-                      :error -> nil
-                    end
-                  end)
-                  |> Enum.reject(&is_nil/1)
-
-                if pending_entries == [] do
-                  nil
-                else
-                  [key, pending_entries]
-                end
+            case persist_group_state(
+                   store,
+                   key,
+                   group,
+                   new_last_delivered,
+                   new_consumers,
+                   new_pending
+                 ) do
+              :ok -> [key, entries]
+              {:error, _reason} = error -> error
             end
         end
-      end)
 
-    # Check for errors.
-    case Enum.find(results, &match?({:error, _}, &1)) do
-      {:error, _} = err -> err
-      nil -> Enum.reject(results, &is_nil/1)
+      {:error, _} = err ->
+        err
     end
+  end
+
+  defp xreadgroup_known_group_result(
+         _group,
+         consumer,
+         key,
+         id_str,
+         count,
+         store,
+         _last_delivered,
+         _consumers,
+         pending
+       ) do
+    # Return pending entries for this consumer with id >= id_str.
+    pending_start =
+      if id_str == "0" or id_str == "0-0" do
+        :min
+      else
+        parse_id!(id_str)
+      end
+
+    pending_ids = xreadgroup_pending_ids(pending, consumer, pending_start, count)
+
+    pending_compound_keys = Enum.map(pending_ids, &stream_entry_key(key, &1))
+
+    pending_entries =
+      store
+      |> batch_get_stream_entries(key, pending_compound_keys)
+      |> Enum.zip(pending_ids)
+      |> Enum.reduce([], fn {raw, id_str_inner}, acc ->
+        case decode_stream_fields(raw) do
+          {:ok, fields} -> [[id_str_inner | fields] | acc]
+          :error -> acc
+        end
+      end)
+      |> Enum.reverse()
+
+    if pending_entries == [] do
+      nil
+    else
+      [key, pending_entries]
+    end
+  end
+
+  defp xreadgroup_pending_ids(pending, consumer, pending_start, count) do
+    pending
+    |> Enum.reduce([], fn
+      {id, {^consumer, _ts}}, acc ->
+        parsed_id = parse_id!(id)
+
+        if pending_start == :min or id_cmp(parsed_id, pending_start) != :lt do
+          [{parsed_id, id} | acc]
+        else
+          acc
+        end
+
+      _other, acc ->
+        acc
+    end)
+    |> Enum.sort_by(fn {parsed_id, _id} -> parsed_id end)
+    |> maybe_take_tuples(count)
+    |> Enum.map(fn {_parsed_id, id} -> id end)
   end
 
   # ---------------------------------------------------------------------------
@@ -1475,6 +1518,21 @@ defmodule Ferricstore.Commands.Stream do
     "X:#{stream_key}" <> @sep <> id_str
   end
 
+  defp delete_stream_entry_keys(stream_key, ids) do
+    prefix = stream_entry_prefix(stream_key)
+    Enum.map(ids, &(prefix <> &1))
+  end
+
+  defp existing_stream_ids([_id | ids], [nil | raws], acc) do
+    existing_stream_ids(ids, raws, acc)
+  end
+
+  defp existing_stream_ids([id | ids], [_raw | raws], acc) do
+    existing_stream_ids(ids, raws, [id | acc])
+  end
+
+  defp existing_stream_ids(_ids, _raws, acc), do: Enum.reverse(acc)
+
   defp stream_group_key(stream_key, group) do
     CompoundKey.stream_group(stream_key, group)
   end
@@ -1487,14 +1545,6 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp get_stream_entry(store, stream_key, compound_key) do
-    if Ops.has_compound?(store) do
-      Ops.compound_get(store, stream_key, compound_key)
-    else
-      Ops.get(store, compound_key)
-    end
-  end
-
   defp batch_get_stream_entries(store, stream_key, compound_keys) do
     if Ops.has_compound?(store) do
       Ops.compound_batch_get(store, stream_key, compound_keys)
@@ -1503,14 +1553,18 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp delete_stream_entry(store, stream_key, compound_key) do
+  defp delete_stream_entries(_store, _stream_key, []), do: :ok
+
+  defp delete_stream_entries(store, stream_key, compound_keys) do
     if Ops.has_compound?(store) do
-      with :ok <- Ops.compound_delete(store, stream_key, compound_key) do
-        delete_stream_index_entry(stream_key, compound_key)
-        :ok
-      end
+      Ops.compound_batch_delete(store, stream_key, compound_keys)
     else
-      Ops.delete(store, compound_key)
+      Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
+        case Ops.delete(store, compound_key) do
+          :ok -> {:cont, :ok}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
     end
   end
 
@@ -1595,14 +1649,11 @@ defmodule Ferricstore.Commands.Stream do
     :ets.insert(@index_table, {{stream_key, ms, seq}, id_str, compound_key})
   end
 
-  defp delete_stream_index_entry(stream_key, compound_key) do
-    prefix = stream_entry_prefix(stream_key)
-
-    if String.starts_with?(compound_key, prefix) do
-      id_str = String.replace_prefix(compound_key, prefix, "")
+  defp delete_stream_index_ids(stream_key, ids) do
+    Enum.each(ids, fn id_str ->
       {ms, seq} = parse_id!(id_str)
       :ets.delete(@index_table, {stream_key, ms, seq})
-    end
+    end)
   end
 
   defp stream_index_slice(_stream_key, _range_start, _range_end, 0, _reverse?), do: []
@@ -1780,21 +1831,32 @@ defmodule Ferricstore.Commands.Stream do
   defp decode_indexed_stream_entries([], _stream_key, _store), do: []
 
   defp decode_indexed_stream_entries(index_entries, stream_key, store) do
-    compound_keys = Enum.map(index_entries, fn {_id_str, compound_key} -> compound_key end)
+    {compound_keys, ids} = indexed_stream_keys_and_ids(index_entries, [], [])
     raw_values = Ops.compound_batch_get(store, stream_key, compound_keys)
+    decode_indexed_stream_raw(ids, raw_values, [])
+  end
 
-    index_entries
-    |> Enum.zip(raw_values)
-    |> Enum.flat_map(fn
-      {{id_str, _compound_key}, raw} when is_binary(raw) ->
-        case decode_stream_fields(raw) do
-          {:ok, fields} -> [[id_str | fields]]
-          :error -> []
-        end
+  defp indexed_stream_keys_and_ids([], compound_keys, ids) do
+    {Enum.reverse(compound_keys), Enum.reverse(ids)}
+  end
 
-      _missing ->
-        []
-    end)
+  defp indexed_stream_keys_and_ids([{id_str, compound_key} | rest], compound_keys, ids) do
+    indexed_stream_keys_and_ids(rest, [compound_key | compound_keys], [id_str | ids])
+  end
+
+  defp decode_indexed_stream_raw([id_str | ids], [raw | raws], acc) when is_binary(raw) do
+    case decode_stream_fields(raw) do
+      {:ok, fields} -> decode_indexed_stream_raw(ids, raws, [[id_str | fields] | acc])
+      :error -> decode_indexed_stream_raw(ids, raws, acc)
+    end
+  end
+
+  defp decode_indexed_stream_raw([_id_str | ids], [_raw | raws], acc) do
+    decode_indexed_stream_raw(ids, raws, acc)
+  end
+
+  defp decode_indexed_stream_raw(_ids, _raws, acc) do
+    Enum.reverse(acc)
   end
 
   defp decode_stream_fields(raw) when is_binary(raw) do

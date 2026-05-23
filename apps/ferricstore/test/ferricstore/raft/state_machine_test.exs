@@ -10,7 +10,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Raft.StateMachine
+  alias Ferricstore.Raft.{BlobCommand, StateMachine}
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
@@ -240,6 +240,20 @@ defmodule Ferricstore.Raft.StateMachineTest do
     ArgumentError -> :ok
   end
 
+  defp setup_flow_indexes(state) do
+    :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+    :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+    :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+    :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+    on_exit(fn ->
+      safe_delete_ets(state.zset_score_index_name)
+      safe_delete_ets(state.zset_score_lookup_name)
+      safe_delete_ets(state.flow_index_name)
+      safe_delete_ets(state.flow_lookup_name)
+    end)
+  end
+
   defp flow_record!(state, state_key) do
     case :ets.lookup(state.ets, state_key) do
       [{^state_key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}]
@@ -263,8 +277,78 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
   end
 
+  defp flow_value!(state, value_key) do
+    case :ets.lookup(state.ets, value_key) do
+      [{^value_key, nil, _expire_at_ms, _lfu, file_id, offset, _value_size}] ->
+        path =
+          Path.join(
+            state.shard_data_path,
+            "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
+          )
+
+        case NIF.v2_pread_at(path, offset) do
+          {:ok, value} when is_binary(value) -> value
+          other -> flunk("expected cold Flow value at #{path}:#{offset}, got: #{inspect(other)}")
+        end
+
+      other ->
+        flunk("expected cold Flow value for #{inspect(value_key)}, got: #{inspect(other)}")
+    end
+  end
+
+  defp assert_flow_blob_value!(state, value_key, expected_payload) do
+    disk_value = flow_value!(state, value_key)
+    assert BlobRef.encoded_size?(byte_size(disk_value))
+
+    assert {:ok, materialized} =
+             Ferricstore.Store.BlobValue.maybe_materialize(
+               state.data_dir,
+               state.shard_index,
+               128,
+               disk_value
+             )
+
+    assert Ferricstore.Flow.decode_value(materialized) == expected_payload
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  describe "Flow blob side-channel apply" do
+    test "prepared Flow create payload stores a ref in the Raft/Bitcask value record", %{
+      state: state
+    } do
+      setup_flow_indexes(state)
+
+      id = "flow-blob-create"
+      type = "blob-flow"
+      partition_key = "tenant-blob-flow"
+      payload = :binary.copy("flow-payload", 1024)
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      command =
+        {:flow_create, state_key,
+         %{id: id, type: type, state: "queued", partition_key: partition_key, payload: payload}}
+
+      assert {:ok, prepared} =
+               BlobCommand.prepare(
+                 %{data_dir: state.data_dir, blob_side_channel_threshold_bytes: 128},
+                 state.shard_index,
+                 command,
+                 single_member?: true
+               )
+
+      refute prepared == command
+
+      {state, {:applied_at, 1, :ok}, _effects} =
+        StateMachine.apply(%{index: 1, system_time: 1_000}, prepared, state)
+
+      record = flow_record!(state, state_key)
+
+      assert is_binary(record.payload_ref)
+      assert_flow_blob_value!(state, record.payload_ref, payload)
+    end
+  end
 
   describe "Flow command time" do
     test "uses stamped apply time when Flow attrs omit now_ms", %{state: state} do
@@ -4209,6 +4293,30 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:batch, commands}" do
+    test "WARaft projection apply keeps normal Raft staging semantics", %{state: state} do
+      parent = self()
+
+      writer = fn
+        [{:put, "waraft_projection_stage", "value", 0}] ->
+          send(
+            parent,
+            {:projection_writer_standalone_staged?, Process.get(:sm_standalone_staged_apply)}
+          )
+
+          {:ok, {:waraft_apply_projection, 1}, [{:put, 0, byte_size("value")}]}
+      end
+
+      assert {_new_state, {:applied_at, 1, :ok}, _effects} =
+               StateMachine.apply_waraft_segment_command(
+                 {:put, "waraft_projection_stage", "value", 0},
+                 %{index: 1, term: 1},
+                 state,
+                 writer
+               )
+
+      assert_receive {:projection_writer_standalone_staged?, nil}, 500
+    end
+
     test "uses raft meta system_time for TTL checks inside batch read-modify-write", %{
       state: state,
       ets: ets

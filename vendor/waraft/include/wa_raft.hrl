@@ -200,6 +200,12 @@
 %% be at most equal to the maximum number of log entries permitted per heartbeat.
 -define(RAFT_COMMIT_BATCH_MAX_ENTRIES, raft_commit_batch_max).
 -define(RAFT_COMMIT_BATCH_MAX_ENTRIES(App, Table), ?RAFT_TABLE_CONFIG(App, Table, ?RAFT_COMMIT_BATCH_MAX_ENTRIES, 15)).
+%% When enabled for a single-member cluster, the leader writes the local log on
+%% a background process and only advances log_view/apply/replies after the
+%% durable append completes. This mirrors group-commit WAL designs without
+%% weakening the sync-before-ack boundary.
+-define(RAFT_ASYNC_LOG_APPEND, raft_async_log_append).
+-define(RAFT_ASYNC_LOG_APPEND(App, Table), (?RAFT_TABLE_CONFIG(App, Table, ?RAFT_ASYNC_LOG_APPEND, false) =:= true)).
 %% Maximum number of log entries to speculatively retain in the log due to followers
 %% not yet reporting having replicated the log entry locally
 -define(RAFT_MAX_RETAINED_ENTRIES, raft_max_retained_entries).
@@ -502,6 +508,10 @@
     %% [Leader] Whether or not a read has been accepted and is waiting for the
     %%          leader to establish a new quorum to be handled.
     pending_read = false :: boolean(),
+    %% [Leader] Durable local log append currently running on a background
+    %%          process. While set, new commits remain in pending_high/low and
+    %%          are flushed after the durable append completion message.
+    append_in_flight = undefined :: undefined | term(),
     %% [Leader] The queue of accepted commit requests that are waiting to be
     %%          committed and applied for response to the client.
     queued = #{} :: #{wa_raft_log:log_index() => {gen_server:from(), wa_raft_acceptor:priority()}},

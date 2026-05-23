@@ -132,6 +132,10 @@ defmodule FerricstoreServer.PubSubBugHuntTest do
       :ets.delete_all_objects(:ferricstore_pubsub_patterns)
     end
 
+    if :ets.whereis(:ferricstore_pubsub_channel_cache) != :undefined do
+      :ets.delete_all_objects(:ferricstore_pubsub_channel_cache)
+    end
+
     :ok
   end
 

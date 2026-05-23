@@ -6,7 +6,7 @@
 #   - terminal LMDB metadata mirror queries after complete
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB=1 FLOW_LMDB_MODE=mirror mix run --no-start bench/flow_lineage_bench.exs
+#   MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB_MODE=mirror mix run --no-start bench/flow_lineage_bench.exs
 
 backlog = System.get_env("FLOW_LINEAGE_BACKLOG", "100000") |> String.to_integer()
 iterations = System.get_env("FLOW_LINEAGE_ITER", "200") |> String.to_integer()
@@ -18,7 +18,7 @@ seed_concurrency = System.get_env("FLOW_LINEAGE_SEED_CONCURRENCY", "32") |> Stri
 query_count = System.get_env("FLOW_LINEAGE_QUERY_COUNT", "100") |> String.to_integer()
 terminal_count = System.get_env("FLOW_LINEAGE_TERMINAL", "10000") |> String.to_integer()
 
-flow_lmdb_enabled = System.get_env("FLOW_LMDB", "1") in ["1", "true", "TRUE"]
+flow_lmdb_enabled = true
 flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
 
 bench_data_dir =

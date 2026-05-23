@@ -5,6 +5,7 @@ defmodule FerricstoreServer.ConnectionTest do
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Connection.Pipeline
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -183,6 +184,63 @@ defmodule FerricstoreServer.ConnectionTest do
     count = count_occurrences(data, "+PONG\r\n")
     assert count == 3
     :gen_tcp.close(sock)
+  end
+
+  test "pure pipeline segments prepend encoded entries without list concatenation" do
+    source = File.read!("lib/ferricstore_server/connection/pipeline.ex")
+
+    assert source =~ "prepend_pipeline_entries(entries, acc)"
+
+    refute source =~ "Enum.reverse(entries) ++ acc",
+           "pipeline segments should prepend responses with one reducer instead of reverse-plus-concat"
+  end
+
+  test "pipeline fallback path does not spawn per-command tasks" do
+    pipeline_source = File.read!("lib/ferricstore_server/connection/pipeline.ex")
+    connection_source = File.read!("lib/ferricstore_server/connection.ex")
+
+    refute pipeline_source =~ "Task.",
+           "TCP pipeline fallback must stay in the connection process; per-command tasks add scheduler pressure"
+
+    refute connection_source =~ "as `Task`s",
+           "connection documentation must not advertise the old per-command Task pipeline model"
+  end
+
+  test "generic pure fallback coalesces a pipeline into one socket send" do
+    ctx = FerricStore.Instance.get(:default)
+
+    state = %FerricstoreServer.Connection{
+      socket: :fake_socket,
+      transport: :fake_transport,
+      instance_ctx: ctx,
+      stats_counter: ctx.stats_counter,
+      authenticated: true,
+      require_auth: false,
+      acl_cache: :full_access
+    }
+
+    commands = [
+      {:command, "PING", [], :ping, []},
+      {:command, "PING", [], :ping, []},
+      {:command, "PING", [], :ping, []}
+    ]
+
+    parent = self()
+
+    send_response = fn socket, transport, iodata ->
+      send(parent, {:send_response, socket, transport, IO.iodata_to_binary(iodata)})
+      :ok
+    end
+
+    handle_command = fn _cmd, _state ->
+      flunk("pure fallback pipeline should not dispatch through sequential handle_command/2")
+    end
+
+    assert {:continue, _state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command, send_response)
+
+    assert_received {:send_response, :fake_socket, :fake_transport, "+PONG\r\n+PONG\r\n+PONG\r\n"}
+    refute_received {:send_response, _, _, _}
   end
 
   test "single FLOW.CREATE command dispatches through typed AST", %{port: port} do

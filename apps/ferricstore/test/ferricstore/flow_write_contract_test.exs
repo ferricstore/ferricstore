@@ -13,6 +13,118 @@ defmodule Ferricstore.FlowWriteContractTest do
     :ok
   end
 
+  test "flow create has a no-values fast path for named value refs" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "flow_attrs_named_value_refs_empty?(attrs)"
+    assert source =~ "defp flow_empty_named_ref_input?(nil), do: true"
+  end
+
+  test "router flow many batches use fixed shard buckets" do
+    source = File.read!("lib/ferricstore/store/router.ex")
+
+    assert source =~ "flow_fixed_shard_buckets(ctx.shard_count)"
+    assert source =~ "put_elem(buckets, shard_idx"
+  end
+
+  test "router flow pipeline results use ordered tuples instead of index maps" do
+    source = File.read!("lib/ferricstore/store/router.ex")
+
+    assert source =~ "flow_result_tuple(count)"
+    assert source =~ "put_elem(results, index, result)"
+  end
+
+  test "flow create fast apply inserts due lifecycle indexes once" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    refute source =~ "flow_create_put_fast_due(state, plans)",
+           "fast create already includes due/due-any rows in flow_create_put_fast_indexes/2; a separate due pass duplicates lifecycle index work"
+  end
+
+  test "flow claim partition-key aggregation is not quadratic" do
+    source = File.read!("lib/ferricstore/store/router.ex")
+
+    refute source =~ "acc ++ records",
+           "multi-shard claim_due must append records with reverse accumulation, not repeated list concatenation"
+  end
+
+  test "flow pipeline write result assembly is tuple based" do
+    source = File.read!("lib/ferricstore/flow.ex")
+
+    assert source =~ "pipeline_write_ordered_results(ctx, [])"
+
+    refute source =~ "pipeline_write_indexed_results(ctx, %{})",
+           "pipeline writes are ordered; result assembly should not hash every command index through a map"
+  end
+
+  test "flow claim_due adjacent pipeline prepends run results without list concatenation" do
+    source = File.read!("lib/ferricstore/flow.ex")
+
+    [function_source] =
+      Regex.run(~r/defp pipeline_claim_due_adjacent_results\(\[{:ok, claim}.*?^  end/ms, source)
+
+    assert function_source =~ "prepend_claim_due_results"
+
+    refute function_source =~ "++ acc",
+           "claim_due pipeline result assembly should not copy each coalesced run with list concatenation"
+  end
+
+  test "flow query aggregators accumulate chunks without repeated list concatenation" do
+    source = File.read!("lib/ferricstore/flow.ex")
+
+    assert source =~ "flatten_flow_chunks"
+    refute source =~ "records ++ acc"
+    refute source =~ "ids ++ acc"
+    refute source =~ "flow_decode_terminal_index_entries(entries, path, now_ms) ++ acc"
+    refute source =~ "flow_decode_query_index_entries(entries, path, now_ms) ++ acc"
+  end
+
+  test "flow history projection avoids grouping when pending entries stay on the apply shard" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "flow_history_projection_same_shard?"
+
+    assert source =~
+             "publish_pending_flow_history_projection_entries(state, ctx, entries, ra_index)"
+  end
+
+  test "flow history hot path skips after-history pass when records need no trim or terminal mirror" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "flow_after_history_put_records_batch(state, records)"
+    assert source =~ "defp flow_after_history_fast_record?"
+    assert source =~ "flow_many_history_entries_and_records("
+  end
+
+  test "flow retry many history builds entries and next records in one traversal" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "flow_retry_history_entries_and_records(state, plans, [], [])"
+    assert source =~ "defp flow_retry_history_entries_and_records("
+  end
+
+  test "flow fast create history builds entries and records in one traversal" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "flow_create_fast_history_entries_and_records(state, plans, [], [])"
+    assert source =~ "defp flow_create_fast_history_entries_and_records("
+  end
+
+  test "flow put-new indexes record rollback originals as known missing without member lookups" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "track_flow_index_known_missing_originals("
+    assert source =~ "FlowIndex.put_new_members("
+    assert source =~ "FlowIndex.put_new_entries("
+  end
+
+  test "flow fast create state records use known-new pending originals without ETS lookups" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "flow_put_new_state_records_batch(state, key_records)"
+    assert source =~ "track_keydir_binary_delta_from_missing("
+  end
+
   test "singular write commands return success only while claim/get return flow data" do
     now_ms = System.system_time(:millisecond)
     suffix = System.unique_integer([:positive, :monotonic])
@@ -216,7 +328,9 @@ defmodule Ferricstore.FlowWriteContractTest do
     end)
 
     complete_ids = ["many-complete-a-#{suffix}", "many-complete-b-#{suffix}"]
-    complete_claims = create_many_and_claim(partition, complete_ids, type_for.("complete"), now_ms)
+
+    complete_claims =
+      create_many_and_claim(partition, complete_ids, type_for.("complete"), now_ms)
 
     assert :ok =
              FerricStore.flow_complete_many(
@@ -252,6 +366,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert_all_states(fail_ids, partition, "failed")
 
     transition_ids = ["many-transition-a-#{suffix}", "many-transition-b-#{suffix}"]
+
     transition_claims =
       create_many_and_claim(partition, transition_ids, type_for.("transition"), now_ms)
 

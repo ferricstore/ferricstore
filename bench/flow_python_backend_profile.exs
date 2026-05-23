@@ -1,0 +1,409 @@
+Logger.configure(level: :warning)
+:logger.set_primary_config(:level, :warning)
+
+defmodule FlowPythonBackendProfile do
+  @moduledoc false
+
+  @events [
+    [:ferricstore, :flow, :create, :stop],
+    [:ferricstore, :flow, :claim_due, :stop],
+    [:ferricstore, :flow, :complete, :stop],
+    [:ferricstore, :flow, :pipeline_claim_due_batch],
+    [:ferricstore, :batcher, :slot_flush],
+    [:ferricstore, :batcher, :quorum_submit],
+    [:ferricstore, :bitcask, :append],
+    [:ferricstore, :waraft, :batcher, :slot_flush],
+    [:ferricstore, :waraft, :batcher, :hot_flush],
+    [:ferricstore, :waraft, :segment_log, :append],
+    [:ferricstore, :waraft, :storage, :payload_fsync],
+    [:ferricstore, :waraft, :storage_blocked],
+    [:ferricstore, :waraft, :commit_bytes, :rejected]
+  ]
+
+  def run do
+    backends =
+      "BACKENDS"
+      |> env("ra,waraft")
+      |> String.split(",", trim: true)
+      |> Enum.map(&backend!/1)
+
+    Enum.each(backends, &run_backend/1)
+  end
+
+  defp run_backend(backend) do
+    stop_started_apps()
+
+    table = telemetry_table(backend)
+    init_table(table)
+    handler_id = "flow-python-backend-profile-#{backend}-#{System.unique_integer([:positive])}"
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+    attach!(handler_id, table)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-flow-python-profile-#{backend}-#{System.unique_integer([:positive])}"
+      )
+
+    configure_app(backend, data_dir)
+
+    started = System.monotonic_time()
+
+    try do
+      {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+      port = FerricstoreServer.Listener.port()
+
+      {output, status} =
+        System.cmd(python(), benchmark_args(port), cd: sdk_dir(), stderr_to_stdout: true)
+
+      elapsed_ms =
+        System.convert_time_unit(System.monotonic_time() - started, :native, :millisecond)
+
+      IO.puts("\n=== backend=#{backend} status=#{status} elapsed_ms=#{elapsed_ms} ===")
+      IO.write(output)
+      print_profile(table)
+      maybe_print_pending_keydir()
+    after
+      :telemetry.detach(handler_id)
+      stop_started_apps()
+      remove_data_dir(data_dir)
+    end
+  end
+
+  defp configure_app(backend, data_dir) do
+    File.rm_rf!(data_dir)
+    File.mkdir_p!(data_dir)
+
+    Application.put_env(:libcluster, :topologies, [])
+    Application.put_env(:ferricstore, :data_dir, data_dir)
+    Application.put_env(:ferricstore, :port, 0)
+    Application.put_env(:ferricstore, :health_port, 0)
+    Application.put_env(:ferricstore, :shard_count, int_env("SHARDS", 16))
+    Application.put_env(:ferricstore, :raft_backend, backend)
+    Application.put_env(:ferricstore, :protected_mode, false)
+    Application.put_env(:ferricstore, :max_memory_bytes, 100_000_000_000)
+    Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
+    flow_lmdb_enabled? = true
+
+    flow_lmdb_mode =
+      System.get_env("FERRICSTORE_FLOW_LMDB_MODE") ||
+        System.get_env("FLOW_LMDB_MODE") ||
+        "lagged"
+
+    Application.put_env(:ferricstore, :flow_lmdb_enabled, flow_lmdb_enabled?)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
+    IO.puts("flow_lmdb_enabled=#{flow_lmdb_enabled?} flow_lmdb_mode=#{flow_lmdb_mode}")
+
+    Application.delete_env(:ferricstore, :waraft_log_module)
+    put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
+    put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
+    put_optional_bool_env("WARAFT_ASYNC_LOG_APPEND", :waraft_async_log_append)
+
+    put_optional_int_env(
+      "WARAFT_MAX_LOG_ENTRIES_PER_HEARTBEAT",
+      :waraft_max_log_entries_per_heartbeat
+    )
+
+    put_optional_int_env("WARAFT_MAX_HEARTBEAT_SIZE", :waraft_max_heartbeat_size)
+    put_optional_int_env("WARAFT_APPLY_LOG_BATCH_SIZE", :waraft_apply_log_batch_size)
+    put_optional_int_env("WARAFT_APPLY_BATCH_MAX_BYTES", :waraft_apply_batch_max_bytes)
+    put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
+
+    put_optional_int_env(
+      "WARAFT_SEGMENT_PREALLOCATE_BYTES",
+      :waraft_segment_log_preallocate_bytes
+    )
+
+    put_optional_int_env(
+      "WARAFT_SEGMENT_RECORDS_PER_SEGMENT",
+      :waraft_segment_log_records_per_segment
+    )
+
+    put_optional_atom_env("WARAFT_SEGMENT_IO_MODE", :waraft_segment_log_io_mode, [:file, :wal_nif])
+
+    put_optional_atom_env("WARAFT_SEGMENT_SYNC_METHOD", :waraft_segment_log_sync_method, [
+      :datasync,
+      :sync,
+      :auto
+    ])
+
+    put_optional_atom_env("WARAFT_FILE_WRITER_MODE", :waraft_segment_log_file_writer_mode, [
+      :direct,
+      :persistent,
+      :process
+    ])
+
+    put_optional_int_env(
+      "WARAFT_FILE_WRITER_GROUP_DELAY_MS",
+      :waraft_segment_log_file_writer_group_delay_ms
+    )
+  end
+
+  defp benchmark_args(port) do
+    [
+      "examples/dbos_style_benchmark.py",
+      "--url",
+      "redis://127.0.0.1:#{port}/0",
+      "--mode",
+      "queued",
+      "--queued-shape",
+      "live",
+      "--transport",
+      env("TRANSPORT", "many"),
+      "--worker-api",
+      "lowlevel",
+      "--worker-mode",
+      "owner-wakeup",
+      "--partition-mode",
+      "auto",
+      "--flows",
+      env("FLOWS", "1000000"),
+      "--workers",
+      env("WORKERS", "16"),
+      "--producers",
+      env("PRODUCERS", "8"),
+      "--partitions",
+      env("PARTITIONS", "1024"),
+      "--claim-batch-size",
+      env("CLAIM_BATCH_SIZE", "1000"),
+      "--claim-partition-batch-size",
+      env("CLAIM_PARTITION_BATCH_SIZE", "16"),
+      "--create-batch-size",
+      env("CREATE_BATCH_SIZE", "1000"),
+      "--complete-async-depth",
+      env("COMPLETE_ASYNC_DEPTH", "4"),
+      "--server-shards",
+      env("SHARDS", "16"),
+      "--wake-coalesce-ms",
+      "0",
+      "--claim-job-only"
+    ]
+  end
+
+  defp attach!(handler_id, table) do
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        @events,
+        fn event, measurements, metadata, _config ->
+          record_event(table, event, measurements, metadata)
+        end,
+        nil
+      )
+  end
+
+  defp record_event(table, event, measurements, metadata) do
+    key = {event, event_group(event, metadata)}
+    duration_us = duration_us(measurements)
+    batch_size = int_measurement(measurements, :batch_size)
+    count = int_measurement(measurements, :count)
+    bytes = int_measurement(measurements, :batch_bytes) + int_measurement(measurements, :bytes)
+
+    :ets.update_counter(
+      table,
+      key,
+      [
+        {2, 1},
+        {3, duration_us},
+        {4, batch_size},
+        {5, count},
+        {6, bytes}
+      ],
+      {key, 0, 0, 0, 0, 0}
+    )
+
+    update_max(table, {:max_batch, key}, batch_size)
+  rescue
+    _ -> :ok
+  end
+
+  defp event_group([:ferricstore, :batcher, :quorum_submit], metadata),
+    do: Map.get(metadata, :command_shape, :unknown)
+
+  defp event_group([:ferricstore, :batcher, :slot_flush], metadata),
+    do: {Map.get(metadata, :write_path, :unknown), Map.get(metadata, :prefix, :unknown)}
+
+  defp event_group([:ferricstore, :bitcask, :append], metadata),
+    do: Map.get(metadata, :status, :unknown)
+
+  defp event_group([:ferricstore, :waraft, :batcher, :hot_flush], metadata),
+    do: {Map.get(metadata, :kind, :unknown), Map.get(metadata, :result, :unknown)}
+
+  defp event_group([:ferricstore, :waraft, :batcher, :slot_flush], metadata),
+    do: {Map.get(metadata, :prefix, :unknown), Map.get(metadata, :result, :unknown)}
+
+  defp event_group([:ferricstore, :waraft, :segment_log, :append], metadata),
+    do: if(Map.get(metadata, :new_segment), do: :new_segment, else: :same_segment)
+
+  defp event_group(_event, _metadata), do: :all
+
+  defp duration_us(%{duration_us: value}) when is_integer(value), do: value
+  defp duration_us(%{duration_ms: value}) when is_integer(value), do: value * 1000
+
+  defp duration_us(%{duration: value}) when is_integer(value),
+    do: System.convert_time_unit(value, :native, :microsecond)
+
+  defp duration_us(_measurements), do: 0
+
+  defp int_measurement(measurements, key) do
+    case Map.get(measurements, key, 0) do
+      value when is_integer(value) and value >= 0 -> value
+      _ -> 0
+    end
+  end
+
+  defp update_max(table, key, value) when is_integer(value) and value > 0 do
+    current =
+      case :ets.lookup(table, key) do
+        [{^key, existing}] -> existing
+        _ -> 0
+      end
+
+    if value > current, do: :ets.insert(table, {key, value})
+  end
+
+  defp update_max(_table, _key, _value), do: :ok
+
+  defp print_profile(table) do
+    rows =
+      table
+      |> :ets.tab2list()
+      |> Enum.filter(&match?({{event, _group}, _, _, _, _, _} when is_list(event), &1))
+      |> Enum.sort_by(fn {{event, group}, _events, _duration, _batch, _count, _bytes} ->
+        {Enum.join(Enum.map(event, &to_string/1), "."), inspect(group)}
+      end)
+
+    IO.puts("telemetry_profile:")
+
+    Enum.each(rows, fn {key = {event, group}, events, duration_us, batch_size, count, bytes} ->
+      max_batch = lookup(table, {:max_batch, key})
+      avg_duration_us = if events > 0, do: div(duration_us, events), else: 0
+      avg_batch = if events > 0, do: Float.round(batch_size / events, 2), else: 0.0
+
+      IO.puts(
+        "  event=#{Enum.join(Enum.map(event, &to_string/1), ".")} group=#{inspect(group)} " <>
+          "events=#{events} count=#{count} batch_sum=#{batch_size} avg_batch=#{avg_batch} " <>
+          "max_batch=#{max_batch} bytes=#{bytes} total_ms=#{Float.round(duration_us / 1000, 3)} " <>
+          "avg_us=#{avg_duration_us}"
+      )
+    end)
+  end
+
+  defp maybe_print_pending_keydir do
+    if System.get_env("INSPECT_PENDING") in ["1", "true", "TRUE", "yes", "YES"] do
+      print_pending_keydir("pending_keydir")
+      Process.sleep(int_env("INSPECT_PENDING_AFTER_MS", 500))
+      print_pending_keydir("pending_keydir_after_wait")
+    end
+  rescue
+    error -> IO.puts("pending_keydir_inspect_failed=#{inspect(error)}")
+  end
+
+  defp print_pending_keydir(label) do
+    ctx = FerricStore.Instance.get(:default)
+    IO.puts("#{label}:")
+
+    for shard <- 0..(ctx.shard_count - 1) do
+      table = elem(ctx.keydir_refs, shard)
+
+      count =
+        :ets.select_count(table, [
+          {{:_, :_, :_, :_, :pending, :_, :_}, [], [true]}
+        ])
+
+      sample =
+        table
+        |> :ets.match_object({:_, :_, :_, :_, :pending, :_, :_})
+        |> Enum.take(5)
+
+      IO.puts("  shard=#{shard} pending=#{count} sample=#{inspect(sample)}")
+    end
+  end
+
+  defp lookup(table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] -> value
+      _ -> 0
+    end
+  end
+
+  defp init_table(table) do
+    case :ets.whereis(table) do
+      :undefined -> :ets.new(table, [:named_table, :public, :set])
+      _ -> :ets.delete_all_objects(table)
+    end
+  end
+
+  defp telemetry_table(backend), do: :"flow_python_backend_profile_#{backend}"
+
+  defp stop_started_apps do
+    for app <- [:ferricstore_server, :ferricstore_ecto, :ferricstore_session, :ferricstore] do
+      _ = Application.stop(app)
+    end
+  end
+
+  defp remove_data_dir(data_dir) do
+    # WARaft benchmarks preallocate large segment files. BEAM File.rm_rf/1 can spend
+    # minutes cleaning them up on macOS, which makes benchmark process time useless.
+    case System.cmd("rm", ["-rf", data_dir], stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> IO.puts("cleanup_failed status=#{status} output=#{inspect(output)}")
+    end
+  end
+
+  defp backend!("ra"), do: :ra
+  defp backend!("waraft"), do: :waraft
+  defp backend!(other), do: raise("unsupported backend #{inspect(other)}")
+
+  defp python, do: env("PYTHON", Path.join(sdk_dir(), ".venv/bin/python"))
+  defp sdk_dir, do: env("SDK_DIR", "/Users/yoavgea/repos/ferricstore-python")
+
+  defp int_env(name, default) do
+    name
+    |> env(Integer.to_string(default))
+    |> String.to_integer()
+  end
+
+  defp env(name, default), do: System.get_env(name) || default
+
+  defp put_optional_int_env(env_name, app_key) do
+    case System.get_env(env_name) do
+      nil -> :ok
+      value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
+  defp put_optional_bool_env(env_name, app_key) do
+    case System.get_env(env_name) do
+      nil ->
+        :ok
+
+      value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] ->
+        Application.put_env(:ferricstore, app_key, true)
+
+      value when value in ["0", "false", "FALSE", "no", "NO", "off", "OFF"] ->
+        Application.put_env(:ferricstore, app_key, false)
+
+      value ->
+        raise "unsupported #{env_name}=#{inspect(value)}; expected boolean"
+    end
+  end
+
+  defp put_optional_atom_env(env_name, app_key, allowed) do
+    case System.get_env(env_name) do
+      nil ->
+        :ok
+
+      value ->
+        atom = String.to_existing_atom(value)
+
+        if atom in allowed do
+          Application.put_env(:ferricstore, app_key, atom)
+        else
+          raise "unsupported #{env_name}=#{inspect(value)}; expected one of #{inspect(allowed)}"
+        end
+    end
+  end
+end
+
+FlowPythonBackendProfile.run()

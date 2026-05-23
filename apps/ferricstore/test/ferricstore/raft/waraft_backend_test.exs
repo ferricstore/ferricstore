@@ -3,6 +3,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
   import ExUnit.CaptureLog
 
+  alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.BlobRef
@@ -41,6 +42,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
   def handle_blob_prepare_failed_telemetry(event, measurements, metadata, parent) do
     send(parent, {:waraft_blob_prepare_failed, event, measurements, metadata})
+  end
+
+  def handle_commit_timeout_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:waraft_commit_timeout, event, measurements, metadata})
   end
 
   def handle_store_unavailable_telemetry(event, measurements, metadata, parent) do
@@ -260,6 +265,43 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
     assert source =~ "apply_segment_put_batch_entries(entries,"
     refute source =~ "Enum.all?(entries, fn {key, value, expire_at_ms} ->"
+  end
+
+  test "unified segment put_batch hoists keydir state and threshold out of the per-entry loop" do
+    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+
+    assert source =~ "shard_state = shard_ets_state_from_sm(sm_state)"
+    assert source =~ "threshold = ShardETS.hot_cache_threshold(shard_state)"
+
+    assert source =~
+             "apply_segment_put_batch_entries(entries, sm_state, shard_state, threshold, file_id, offset, 0)"
+  end
+
+  test "unified segment put_batch tries a fresh no-ttl ETS batch insert before per-key apply" do
+    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+    ets_source = File.read!("lib/ferricstore/store/shard/ets.ex")
+
+    assert source =~ "ShardETS.ets_insert_fresh_no_expiry_many_with_location("
+    assert ets_source =~ ":ets.insert(state.keydir, records)"
+  end
+
+  test "unified segment batch decoder routes homogeneous put and delete commands directly" do
+    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+
+    assert source =~ "{:put_batch, entries} ->"
+    assert source =~ "{:delete_batch, keys} ->"
+
+    refute source =~ "segment_project_batch_fast_path(commands, position, sm_state)",
+           "the one-pass decoder already handles homogeneous batches; mixed batches should not rescan the list through the old fast-path"
+  end
+
+  test "unified segment generic batch projection decodes and classifies in one pass" do
+    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+
+    assert source =~ "segment_project_decode_batch(commands, :unknown, [], [])"
+
+    refute source =~ "commands = Enum.map(commands, &decoded_replay_command/1)",
+           "projection should not decode once and then scan again for homogeneous batches"
   end
 
   test "keydir location insert skips expiry accounting for no-ttl string puts" do
@@ -586,6 +628,15 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     previous_apply_bytes =
       Application.get_env(:ferricstore_waraft_backend, :raft_apply_batch_max_bytes)
 
+    previous_rotation_interval =
+      Application.get_env(:ferricstore_waraft_backend, :raft_max_log_records_per_file)
+
+    previous_rotation_keep =
+      Application.get_env(:ferricstore_waraft_backend, :raft_max_log_records)
+
+    previous_max_retained =
+      Application.get_env(:ferricstore_waraft_backend, :raft_max_retained_entries)
+
     try do
       assert :ok =
                WARaftBackend.start(ctx,
@@ -593,7 +644,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  max_log_entries_per_heartbeat: 2048,
                  max_heartbeat_size: 32 * 1024 * 1024,
                  apply_log_batch_size: 2048,
-                 apply_batch_max_bytes: 32 * 1024 * 1024
+                 apply_batch_max_bytes: 32 * 1024 * 1024,
+                 log_rotation_interval: 64,
+                 log_rotation_keep: 128,
+                 max_retained_entries: 128
                )
 
       assert 2048 ==
@@ -610,22 +664,38 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert 32 * 1024 * 1024 ==
                Application.get_env(:ferricstore_waraft_backend, :raft_apply_batch_max_bytes)
+
+      assert 64 ==
+               Application.get_env(:ferricstore_waraft_backend, :raft_max_log_records_per_file)
+
+      assert 128 == Application.get_env(:ferricstore_waraft_backend, :raft_max_log_records)
+
+      assert 128 ==
+               Application.get_env(:ferricstore_waraft_backend, :raft_max_retained_entries)
     after
       restore_waraft_app_env(:raft_max_log_entries_per_heartbeat, previous_entries)
       restore_waraft_app_env(:raft_max_heartbeat_size, previous_heartbeat)
       restore_waraft_app_env(:raft_apply_log_batch_size, previous_apply)
       restore_waraft_app_env(:raft_apply_batch_max_bytes, previous_apply_bytes)
+      restore_waraft_app_env(:raft_max_log_records_per_file, previous_rotation_interval)
+      restore_waraft_app_env(:raft_max_log_records, previous_rotation_keep)
+      restore_waraft_app_env(:raft_max_retained_entries, previous_max_retained)
     end
   end
 
   test "FerricStore app env configures WARaft throughput batch knobs", %{ctx: ctx} do
     previous_public = Application.get_env(:ferricstore, :waraft_max_log_entries_per_heartbeat)
+    previous_rotation_public = Application.get_env(:ferricstore, :waraft_log_rotation_keep)
 
     previous_waraft =
       Application.get_env(:ferricstore_waraft_backend, :raft_max_log_entries_per_heartbeat)
 
+    previous_rotation_waraft =
+      Application.get_env(:ferricstore_waraft_backend, :raft_max_log_records)
+
     try do
       Application.put_env(:ferricstore, :waraft_max_log_entries_per_heartbeat, 4096)
+      Application.put_env(:ferricstore, :waraft_log_rotation_keep, 8192)
 
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -634,9 +704,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  :ferricstore_waraft_backend,
                  :raft_max_log_entries_per_heartbeat
                )
+
+      assert 8192 == Application.get_env(:ferricstore_waraft_backend, :raft_max_log_records)
     after
       restore_env(:waraft_max_log_entries_per_heartbeat, previous_public)
+      restore_env(:waraft_log_rotation_keep, previous_rotation_public)
       restore_waraft_app_env(:raft_max_log_entries_per_heartbeat, previous_waraft)
+      restore_waraft_app_env(:raft_max_log_records, previous_rotation_waraft)
     end
   end
 
@@ -698,6 +772,37 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "small WARaft log retention trims in-memory segment log without losing reads", %{ctx: ctx} do
+    assert :ok =
+             WARaftBackend.start(ctx,
+               log_module: :ferricstore_waraft_spike_segment_log,
+               log_rotation_interval: 4,
+               log_rotation_keep: 4,
+               max_retained_entries: 4,
+               apply_log_batch_size: 8
+             )
+
+    for n <- 1..32 do
+      assert :ok = WARaftBackend.write(0, {:put, "trim:key:#{n}", "value:#{n}", 0})
+    end
+
+    log_table = waraft_log_table(0)
+
+    assert_eventually(
+      fn ->
+        case :ets.info(log_table, :size) do
+          size when is_integer(size) and size <= 8 -> :trimmed
+          _ -> :not_trimmed
+        end
+      end,
+      :trimmed,
+      100
+    )
+
+    assert "value:1" == Router.get(ctx, "trim:key:1")
+    assert "value:32" == Router.get(ctx, "trim:key:32")
+  end
+
   test "invalid WARaft election timeout bounds fail closed before partition start", %{ctx: ctx} do
     previous_min = Application.get_env(:ferricstore, :waraft_election_timeout_ms)
     previous_max = Application.get_env(:ferricstore, :waraft_election_timeout_ms_max)
@@ -719,6 +824,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
   test "invalid WARaft queue and commit knobs fail closed before partition start", %{ctx: ctx} do
     previous_pending = Application.get_env(:ferricstore, :waraft_max_pending_reads)
+    previous_async_append = Application.get_env(:ferricstore, :waraft_async_log_append)
 
     try do
       assert_raise ArgumentError, ~r/max_pending_high_priority_commits/, fn ->
@@ -746,8 +852,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       end
 
       refute Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
+
+      Application.delete_env(:ferricstore, :waraft_max_pending_reads)
+      Application.put_env(:ferricstore, :waraft_async_log_append, "true")
+
+      assert_raise ArgumentError, ~r/waraft_async_log_append/, fn ->
+        WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+      end
+
+      refute Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
     after
       restore_env(:waraft_max_pending_reads, previous_pending)
+      restore_env(:waraft_async_log_append, previous_async_append)
     end
   end
 
@@ -874,6 +990,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     previous_pending_reads = Application.get_env(:ferricstore, :waraft_max_pending_reads)
     previous_commit_interval = Application.get_env(:ferricstore, :waraft_commit_batch_interval_ms)
     previous_commit_max = Application.get_env(:ferricstore, :waraft_commit_batch_max)
+    previous_async_append = Application.get_env(:ferricstore, :waraft_async_log_append)
 
     previous_backend_pending_reads =
       Application.get_env(:ferricstore_waraft_backend, :raft_max_pending_reads)
@@ -884,10 +1001,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     previous_backend_commit_max =
       Application.get_env(:ferricstore_waraft_backend, :raft_commit_batch_max)
 
+    previous_backend_async_append =
+      Application.get_env(:ferricstore_waraft_backend, :raft_async_log_append)
+
     try do
       Application.put_env(:ferricstore, :waraft_max_pending_reads, 12_345)
       Application.put_env(:ferricstore, :waraft_commit_batch_interval_ms, 7)
       Application.put_env(:ferricstore, :waraft_commit_batch_max, 2048)
+      Application.put_env(:ferricstore, :waraft_async_log_append, true)
 
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -899,13 +1020,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert 2048 ==
                Application.get_env(:ferricstore_waraft_backend, :raft_commit_batch_max)
+
+      assert true ==
+               Application.get_env(:ferricstore_waraft_backend, :raft_async_log_append)
     after
       restore_env(:waraft_max_pending_reads, previous_pending_reads)
       restore_env(:waraft_commit_batch_interval_ms, previous_commit_interval)
       restore_env(:waraft_commit_batch_max, previous_commit_max)
+      restore_env(:waraft_async_log_append, previous_async_append)
       restore_waraft_app_env(:raft_max_pending_reads, previous_backend_pending_reads)
       restore_waraft_app_env(:raft_commit_batch_interval_ms, previous_backend_commit_interval)
       restore_waraft_app_env(:raft_commit_batch_max, previous_backend_commit_max)
+      restore_waraft_app_env(:raft_async_log_append, previous_backend_async_append)
     end
   end
 
@@ -1239,6 +1365,77 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       restore_backend(previous_backend)
       Ferricstore.NamespaceConfig.reset("waraftns")
+    end
+  end
+
+  test "configured namespace SET windows commit with the compact put batch shape", %{ctx: ctx} do
+    previous_backend = Application.get_env(:ferricstore, :raft_backend)
+    previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+
+    try do
+      Application.put_env(:ferricstore, :raft_backend, :waraft)
+      Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+      assert :ok = Ferricstore.NamespaceConfig.set("waraftput", "window_ms", "25")
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      tasks =
+        for i <- 1..2 do
+          Task.async(fn ->
+            WARaftBackend.write(0, {:put, "waraftput:key#{i}", "v#{i}", 0})
+          end)
+        end
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, ref, worker},
+                     1_000
+
+      send(worker, {ref, :continue})
+      assert [:ok, :ok] = Enum.map(tasks, &Task.await(&1, 5_000))
+      assert "v1" == Router.get(ctx, "waraftput:key1")
+      assert "v2" == Router.get(ctx, "waraftput:key2")
+    after
+      restore_backend(previous_backend)
+      restore_env(:waraft_backend_batcher_call_hook, previous_hook)
+      Ferricstore.NamespaceConfig.reset("waraftput")
+    end
+  end
+
+  test "configured namespace DEL windows commit with the compact delete batch shape", %{ctx: ctx} do
+    previous_backend = Application.get_env(:ferricstore, :raft_backend)
+    previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+
+    try do
+      Application.put_env(:ferricstore, :raft_backend, :waraft)
+      assert :ok = Ferricstore.NamespaceConfig.set("waraftdel", "window_ms", "25")
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 1,
+                 commit_batch_max: 10_000
+               )
+
+      assert :ok == WARaftBackend.write(0, {:put, "waraftdel:key1", "v1", 0})
+      assert :ok == WARaftBackend.write(0, {:put, "waraftdel:key2", "v2", 0})
+      Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+
+      tasks =
+        for i <- 1..2 do
+          Task.async(fn ->
+            WARaftBackend.write(0, {:delete, "waraftdel:key#{i}"})
+          end)
+        end
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_delete_batch_direct__, ref, worker},
+                     1_000
+
+      send(worker, {ref, :continue})
+      assert [:ok, :ok] = Enum.map(tasks, &Task.await(&1, 5_000))
+      assert nil == Router.get(ctx, "waraftdel:key1")
+      assert nil == Router.get(ctx, "waraftdel:key2")
+    after
+      restore_backend(previous_backend)
+      restore_env(:waraft_backend_batcher_call_hook, previous_hook)
+      Ferricstore.NamespaceConfig.reset("waraftdel")
     end
   end
 
@@ -2366,6 +2563,209 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "single-member WARaft persistent segment writer does not ack or apply before fsync",
+       %{ctx: ctx} do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+    previous_writer_mode = Application.get_env(:ferricstore, :waraft_segment_log_file_writer_mode)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_file_writer_mode, :persistent)
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 0,
+                 commit_batch_max: 10
+               )
+
+      Application.put_env(:ferricstore, :waraft_segment_log_file_sync_hook, {:block, self()})
+
+      task =
+        Task.async(fn ->
+          WARaftBackend.write(0, {:put, "persistent-sync-gate:k", "v", 0})
+        end)
+
+      assert_receive {:waraft_segment_log_file_sync_blocked, _path, _method, waiter, ref}, 1_000
+      assert Task.yield(task, 50) == nil
+      assert nil == Router.get(ctx, "persistent-sync-gate:k")
+
+      send(waiter, {ref, :continue})
+
+      assert :ok == Task.await(task, 5_000)
+      assert "v" == Router.get(ctx, "persistent-sync-gate:k")
+    after
+      restore_env(:waraft_segment_log_file_sync_hook, previous_hook)
+      restore_env(:waraft_segment_log_file_writer_mode, previous_writer_mode)
+    end
+  end
+
+  test "single-member WARaft async segment append keeps server responsive during fsync",
+       %{ctx: ctx} do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+    previous_public_async = Application.get_env(:ferricstore, :waraft_async_log_append)
+    previous_async = Application.get_env(:ferricstore_waraft_backend, :raft_async_log_append)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_async_log_append, true)
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 0,
+                 commit_batch_max: 10
+               )
+
+      Application.put_env(:ferricstore, :waraft_segment_log_file_sync_hook, {:block, self()})
+
+      write_task =
+        Task.async(fn ->
+          WARaftBackend.write(0, {:put, "async-append-sync-gate:k", "v", 0})
+        end)
+
+      assert_receive {:waraft_segment_log_file_sync_blocked, _path, _method, waiter, ref}, 1_000
+
+      status_task = Task.async(fn -> WARaftBackend.status(0) end)
+      assert status = Task.await(status_task, 1_000)
+      assert is_list(status)
+
+      assert Task.yield(write_task, 50) == nil
+      assert nil == Router.get(ctx, "async-append-sync-gate:k")
+
+      send(waiter, {ref, :continue})
+
+      assert :ok == Task.await(write_task, 5_000)
+      assert "v" == Router.get(ctx, "async-append-sync-gate:k")
+    after
+      restore_env(:waraft_segment_log_file_sync_hook, previous_hook)
+      restore_env(:waraft_async_log_append, previous_public_async)
+      restore_waraft_app_env(:raft_async_log_append, previous_async)
+    end
+  end
+
+  test "single-member WARaft async segment append batches commands that arrive during fsync",
+       %{ctx: ctx} do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+    previous_public_async = Application.get_env(:ferricstore, :waraft_async_log_append)
+    previous_async = Application.get_env(:ferricstore_waraft_backend, :raft_async_log_append)
+    handler_id = {__MODULE__, :async_segment_append_batches, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log, :append],
+      &__MODULE__.handle_segment_log_telemetry/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_async_log_append, true)
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 0,
+                 commit_batch_max: 10
+               )
+
+      Application.put_env(:ferricstore, :waraft_segment_log_file_sync_hook, {:block, self()})
+
+      first =
+        Task.async(fn -> WARaftBackend.write(0, {:put, "async-append-batch:1", "v1", 0}) end)
+
+      assert_receive {:waraft_segment_log_file_sync_blocked, _path1, _method1, waiter1, ref1},
+                     1_000
+
+      second =
+        Task.async(fn -> WARaftBackend.write(0, {:put, "async-append-batch:2", "v2", 0}) end)
+
+      third =
+        Task.async(fn -> WARaftBackend.write(0, {:put, "async-append-batch:3", "v3", 0}) end)
+
+      assert is_list(WARaftBackend.status(0))
+      assert Task.yield(second, 50) == nil
+      assert Task.yield(third, 50) == nil
+      assert nil == Router.get(ctx, "async-append-batch:2")
+      assert nil == Router.get(ctx, "async-append-batch:3")
+
+      send(waiter1, {ref1, :continue})
+      assert :ok == Task.await(first, 5_000)
+
+      assert_receive {:waraft_segment_log_telemetry,
+                      [:ferricstore, :waraft, :segment_log, :append], %{count: 1},
+                      %{result: :ok}},
+                     1_000
+
+      assert_receive {:waraft_segment_log_file_sync_blocked, _path2, _method2, waiter2, ref2},
+                     1_000
+
+      assert Task.yield(second, 50) == nil
+      assert Task.yield(third, 50) == nil
+
+      send(waiter2, {ref2, :continue})
+
+      assert :ok == Task.await(second, 5_000)
+      assert :ok == Task.await(third, 5_000)
+
+      assert_receive {:waraft_segment_log_telemetry,
+                      [:ferricstore, :waraft, :segment_log, :append], %{count: 2},
+                      %{result: :ok}},
+                     1_000
+
+      assert "v1" == Router.get(ctx, "async-append-batch:1")
+      assert "v2" == Router.get(ctx, "async-append-batch:2")
+      assert "v3" == Router.get(ctx, "async-append-batch:3")
+    after
+      restore_env(:waraft_segment_log_file_sync_hook, previous_hook)
+      restore_env(:waraft_async_log_append, previous_public_async)
+      restore_waraft_app_env(:raft_async_log_append, previous_async)
+    end
+  end
+
+  test "single-member WARaft async segment append fsync failure does not apply before restart",
+       %{root: root, ctx: ctx} do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+    previous_public_async = Application.get_env(:ferricstore, :waraft_async_log_append)
+    previous_async = Application.get_env(:ferricstore_waraft_backend, :raft_async_log_append)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_async_log_append, true)
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 0,
+                 commit_batch_max: 10
+               )
+
+      Application.put_env(:ferricstore, :waraft_segment_log_file_sync_hook, {:fail_once, self()})
+
+      assert Ferricstore.ErrorReasons.write_timeout_unknown() ==
+               WARaftBackend.write(0, {:put, "async-log-file-sync-fail:k", "v1", 0})
+
+      assert_receive {:waraft_segment_log_file_sync, _path}, 1_000
+      assert nil == Router.get(ctx, "async-log-file-sync-fail:k")
+
+      assert :ok = WARaftBackend.stop()
+      FerricStore.Instance.cleanup(ctx.name)
+
+      restarted_ctx = build_ctx(root)
+
+      assert :ok =
+               WARaftBackend.start(restarted_ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 0,
+                 commit_batch_max: 10
+               )
+
+      assert nil == Router.get(restarted_ctx, "async-log-file-sync-fail:k")
+    after
+      restore_env(:waraft_segment_log_file_sync_hook, previous_hook)
+      restore_env(:waraft_async_log_append, previous_public_async)
+      restore_waraft_app_env(:raft_async_log_append, previous_async)
+    end
+  end
+
   test "default WARaft hot put batches coalesce before segment append", %{ctx: ctx} do
     previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
     handler_id = {__MODULE__, :hot_put_flush, make_ref()}
@@ -2410,7 +2810,183 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
-  test "WARaft hot put batcher collects the next slot while previous flush commits", %{ctx: ctx} do
+  test "WARaft hot put batch async API replies to an explicit waiter", %{ctx: ctx} do
+    previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_hot_batch_window_ms, 1)
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 1,
+                 commit_batch_max: 10_000
+               )
+
+      {from, token} = Ferricstore.Raft.ReplyAwaiter.new()
+
+      assert :ok =
+               WARaftBackend.write_put_batch_async(
+                 0,
+                 [
+                   {"hot-put-async-waiter:1", "v1", 0}
+                 ],
+                 from
+               )
+
+      assert {:ok, [:ok]} =
+               Ferricstore.Raft.ReplyAwaiter.await(
+                 token,
+                 5_000,
+                 ErrorReasons.write_timeout_unknown()
+               )
+
+      assert "v1" == Router.get(ctx, "hot-put-async-waiter:1")
+    after
+      restore_env(:waraft_hot_batch_window_ms, previous_window)
+    end
+  end
+
+  test "default WARaft generic batches coalesce before segment append", %{ctx: ctx} do
+    previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
+    previous_generic_window = Application.get_env(:ferricstore, :waraft_generic_batch_window_ms)
+    handler_id = {__MODULE__, :hot_generic_batch_flush, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :batcher, :hot_flush],
+      &__MODULE__.handle_namespace_batcher_telemetry/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_hot_batch_window_ms, 25)
+      Application.put_env(:ferricstore, :waraft_generic_batch_window_ms, 25)
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 1,
+                 commit_batch_max: 10_000
+               )
+
+      tasks =
+        for i <- 1..2 do
+          Task.async(fn ->
+            WARaftBackend.write_batch(0, [
+              {:put, "hot-generic-batch:#{i}:a", "v#{i}a", 0},
+              {:put, "hot-generic-batch:#{i}:b", "v#{i}b", 0}
+            ])
+          end)
+        end
+
+      assert [{:ok, [:ok, :ok]}, {:ok, [:ok, :ok]}] = Enum.map(tasks, &Task.await(&1, 5_000))
+
+      assert_receive {:waraft_namespace_batcher_flush,
+                      [:ferricstore, :waraft, :batcher, :hot_flush],
+                      %{batch_size: 4, group_count: 2}, %{kind: :batch}},
+                     1_000
+
+      assert "v1a" == Router.get(ctx, "hot-generic-batch:1:a")
+      assert "v1b" == Router.get(ctx, "hot-generic-batch:1:b")
+      assert "v2a" == Router.get(ctx, "hot-generic-batch:2:a")
+      assert "v2b" == Router.get(ctx, "hot-generic-batch:2:b")
+    after
+      restore_env(:waraft_hot_batch_window_ms, previous_window)
+      restore_env(:waraft_generic_batch_window_ms, previous_generic_window)
+    end
+  end
+
+  test "default WARaft generic batches coalesce behind an in-flight flush without a static window",
+       %{ctx: ctx} do
+    previous_generic_window = Application.get_env(:ferricstore, :waraft_generic_batch_window_ms)
+    previous_during_flush = Application.get_env(:ferricstore, :waraft_generic_batch_during_flush)
+    previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+    handler_id = {__MODULE__, :generic_batch_during_flush, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :batcher, :hot_flush],
+      &__MODULE__.handle_namespace_batcher_telemetry/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_generic_batch_window_ms, 0)
+      Application.put_env(:ferricstore, :waraft_generic_batch_during_flush, true)
+      Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 1,
+                 commit_batch_max: 10_000
+               )
+
+      first =
+        Task.async(fn ->
+          WARaftBackend.write_batch(0, [
+            {:put, "generic-during-flush:1:a", "v1a", 0},
+            {:put, "generic-during-flush:1:b", "v1b", 0}
+          ])
+        end)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, first_ref,
+                      first_worker},
+                     1_000
+
+      second =
+        Task.async(fn ->
+          WARaftBackend.write_batch(0, [
+            {:put, "generic-during-flush:2:a", "v2a", 0},
+            {:put, "generic-during-flush:2:b", "v2b", 0}
+          ])
+        end)
+
+      third =
+        Task.async(fn ->
+          WARaftBackend.write_batch(0, [
+            {:put, "generic-during-flush:3:a", "v3a", 0},
+            {:put, "generic-during-flush:3:b", "v3b", 0}
+          ])
+        end)
+
+      refute_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, _ref, _worker}, 50
+
+      send(first_worker, {first_ref, :continue})
+      assert {:ok, [:ok, :ok]} = Task.await(first, 5_000)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, second_ref,
+                      second_worker},
+                     1_000
+
+      refute_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, _ref, _worker}, 50
+
+      send(second_worker, {second_ref, :continue})
+
+      assert {:ok, [:ok, :ok]} = Task.await(second, 5_000)
+      assert {:ok, [:ok, :ok]} = Task.await(third, 5_000)
+
+      assert_receive {:waraft_namespace_batcher_flush,
+                      [:ferricstore, :waraft, :batcher, :hot_flush],
+                      %{batch_size: 4, group_count: 2}, %{kind: :batch}},
+                     1_000
+
+      assert "v1a" == Router.get(ctx, "generic-during-flush:1:a")
+      assert "v2a" == Router.get(ctx, "generic-during-flush:2:a")
+      assert "v3a" == Router.get(ctx, "generic-during-flush:3:a")
+    after
+      restore_env(:waraft_generic_batch_window_ms, previous_generic_window)
+      restore_env(:waraft_generic_batch_during_flush, previous_during_flush)
+      restore_env(:waraft_backend_batcher_call_hook, previous_hook)
+    end
+  end
+
+  test "WARaft hot put batcher queues the next slot while previous flush commits", %{ctx: ctx} do
     previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
     previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
 
@@ -2439,18 +3015,100 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
           WARaftBackend.write_put_batch(0, [{"hot-put-async-flush:2", "v2", 0}])
         end)
 
+      refute_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, _ref, _worker},
+                     50
+
+      send(first_worker, {first_ref, :continue})
+      assert {:ok, [:ok]} = Task.await(first, 5_000)
+
       assert_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, second_ref,
                       second_worker},
                      1_000
 
-      send(first_worker, {first_ref, :continue})
       send(second_worker, {second_ref, :continue})
 
-      assert {:ok, [:ok]} = Task.await(first, 5_000)
       assert {:ok, [:ok]} = Task.await(second, 5_000)
 
       assert "v1" == Router.get(ctx, "hot-put-async-flush:1")
       assert "v2" == Router.get(ctx, "hot-put-async-flush:2")
+    after
+      restore_env(:waraft_hot_batch_window_ms, previous_window)
+      restore_env(:waraft_backend_batcher_call_hook, previous_hook)
+    end
+  end
+
+  test "WARaft hot put batcher coalesces writes that arrive during an in-flight flush", %{
+    ctx: ctx
+  } do
+    previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
+    previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+    handler_id = {__MODULE__, :hot_put_during_flush, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :batcher, :hot_flush],
+      &__MODULE__.handle_namespace_batcher_telemetry/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_hot_batch_window_ms, 1)
+      Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 1,
+                 commit_batch_max: 10_000
+               )
+
+      first =
+        Task.async(fn ->
+          WARaftBackend.write_put_batch(0, [{"hot-put-during-flush:1", "v1", 0}])
+        end)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, first_ref,
+                      first_worker},
+                     1_000
+
+      second =
+        Task.async(fn ->
+          WARaftBackend.write_put_batch(0, [{"hot-put-during-flush:2", "v2", 0}])
+        end)
+
+      third =
+        Task.async(fn ->
+          WARaftBackend.write_put_batch(0, [{"hot-put-during-flush:3", "v3", 0}])
+        end)
+
+      refute_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, _ref, _worker},
+                     50
+
+      send(first_worker, {first_ref, :continue})
+      assert {:ok, [:ok]} = Task.await(first, 5_000)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, second_ref,
+                      second_worker},
+                     1_000
+
+      refute_receive {:waraft_backend_batcher_call, :__commit_put_batch_direct__, _ref, _worker},
+                     50
+
+      send(second_worker, {second_ref, :continue})
+
+      assert {:ok, [:ok]} = Task.await(second, 5_000)
+      assert {:ok, [:ok]} = Task.await(third, 5_000)
+
+      assert_receive {:waraft_namespace_batcher_flush,
+                      [:ferricstore, :waraft, :batcher, :hot_flush],
+                      %{batch_size: 2, group_count: 2}, %{kind: :put_batch}},
+                     1_000
+
+      assert "v1" == Router.get(ctx, "hot-put-during-flush:1")
+      assert "v2" == Router.get(ctx, "hot-put-during-flush:2")
+      assert "v3" == Router.get(ctx, "hot-put-during-flush:3")
     after
       restore_env(:waraft_hot_batch_window_ms, previous_window)
       restore_env(:waraft_backend_batcher_call_hook, previous_hook)
@@ -5684,6 +6342,39 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
              WARaftBackend.write_delete_batch(0, ["stopped:delete-batch"])
   end
 
+  @tag timeout: 20_000
+  test "commit timeout emits telemetry with shard and command shape", %{ctx: ctx} do
+    handler_id = {__MODULE__, :commit_timeout, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :commit, :timeout],
+      &__MODULE__.handle_commit_timeout_telemetry/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+    acceptor = :wa_raft_acceptor.registered_name(:ferricstore_waraft_backend, 1)
+    :ok = :sys.suspend(acceptor)
+
+    try do
+      expected = ErrorReasons.write_timeout_unknown()
+      assert ^expected = WARaftBackend.write(0, {:put, "timeout:k", "v", 0})
+    after
+      _ = :sys.resume(acceptor)
+    end
+
+    assert_receive {:waraft_commit_timeout, [:ferricstore, :waraft, :commit, :timeout],
+                    %{count: 1, timeout_ms: 10_000, duration_us: duration_us},
+                    %{shard_index: 0, command_shape: :put, path: :sync, reason: :timeout}},
+                   1_000
+
+    assert duration_us >= 10_000_000
+  end
+
   test "backend admin APIs fail closed when WARaft is stopped" do
     assert :ok = WARaftBackend.stop()
 
@@ -6115,6 +6806,65 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "Flow WARaft apply does not use standalone Bitcask append fallback", %{ctx: ctx} do
+    parent = self()
+    previous_backend = Application.get_env(:ferricstore, :raft_backend)
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+    flow_type = "router-flow-segment-only-#{System.unique_integer([:positive])}"
+    flow_id = "router-flow-segment-only-id-#{System.unique_integer([:positive])}"
+    partition = "tenant-segment-only"
+
+    try do
+      Application.put_env(:ferricstore, :raft_backend, :waraft)
+
+      Application.put_env(:ferricstore, :standalone_durability_hook, fn _file_path, batch ->
+        send(parent, {:unexpected_standalone_bitcask_append, batch})
+        {:error, :standalone_bitcask_append_forbidden}
+      end)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      start_supervised!(
+        {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+      )
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, flow_id,
+                 type: flow_type,
+                 partition_key: partition,
+                 run_at_ms: 1,
+                 now_ms: 1,
+                 payload: "payload"
+               )
+
+      assert {:ok, created} = Ferricstore.Flow.get(ctx, flow_id, partition_key: partition)
+      assert created.id == flow_id
+      refute_receive {:unexpected_standalone_bitcask_append, _batch}, 100
+
+      assert {:ok, [claimed]} =
+               Ferricstore.Flow.claim_due(ctx, flow_type,
+                 partition_key: partition,
+                 worker: "worker-segment-only",
+                 limit: 1,
+                 now_ms: 2,
+                 lease_ms: 10_000
+               )
+
+      assert :ok =
+               Ferricstore.Flow.complete(ctx, flow_id, claimed.lease_token,
+                 partition_key: partition,
+                 fencing_token: claimed.fencing_token,
+                 now_ms: 3,
+                 result: "done"
+               )
+
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+    after
+      restore_env(:standalone_durability_hook, previous_hook)
+      restore_backend(previous_backend)
+    end
+  end
+
   test "Flow create_many and transition_many use WARaft as the selected backend", %{ctx: ctx} do
     previous_backend = Application.get_env(:ferricstore, :raft_backend)
     flow_type = "router-flow-many-#{System.unique_integer([:positive])}"
@@ -6124,6 +6874,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     try do
       Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      start_supervised!(
+        {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+      )
 
       assert :ok =
                Ferricstore.Flow.create_many(
@@ -6158,8 +6912,80 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new(ids)
       assert Enum.all?(claimed, &(&1.state == "running"))
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
     after
       restore_backend(previous_backend)
+    end
+  end
+
+  test "multi-shard Flow terminal batches publish WARaft keydir locations", %{root: root} do
+    previous_backend = Application.get_env(:ferricstore, :raft_backend)
+    shard_count = 16
+    flow_type = "router-flow-pending-publish-#{System.unique_integer([:positive])}"
+    ids = for n <- 1..64, do: "router-flow-pending-publish-#{n}"
+
+    root =
+      Path.join(
+        root,
+        "multi-shard-flow-pending-#{System.unique_integer([:positive])}"
+      )
+
+    File.rm_rf!(root)
+    Ferricstore.DataDir.ensure_layout!(root, shard_count)
+    Ferricstore.Store.ActiveFile.init(shard_count)
+    ctx = build_ctx(root, shard_count: shard_count)
+
+    try do
+      Application.put_env(:ferricstore, :raft_backend, :waraft)
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      items =
+        Enum.map(ids, fn id ->
+          %{id: id, partition_key: "tenant-#{id}", payload: "payload:#{id}"}
+        end)
+
+      assert :ok =
+               Ferricstore.Flow.create_many(ctx, nil, items,
+                 type: flow_type,
+                 state: "queued",
+                 run_at_ms: 1_000,
+                 now_ms: 900
+               )
+
+      assert_pending_keydir_rows(ctx, 0)
+
+      assert {:ok, claimed} =
+               Ferricstore.Flow.claim_due(ctx, flow_type,
+                 partition_keys: Enum.map(items, & &1.partition_key),
+                 worker: "worker-pending-publish",
+                 limit: length(items),
+                 now_ms: 1_000,
+                 lease_ms: 10_000
+               )
+
+      assert length(claimed) > 0
+      assert_pending_keydir_rows(ctx, 0)
+
+      complete_items =
+        Enum.map(claimed, fn record ->
+          %{
+            id: record.id,
+            partition_key: record.partition_key,
+            lease_token: record.lease_token,
+            fencing_token: record.fencing_token,
+            result: "done:#{record.id}"
+          }
+        end)
+
+      assert :ok =
+               Ferricstore.Flow.complete_many(ctx, nil, complete_items, now_ms: 1_100)
+
+      assert_pending_keydir_rows(ctx, 0)
+    after
+      restore_backend(previous_backend)
+      WARaftBackend.stop()
+      FerricStore.Instance.cleanup(ctx.name)
+      File.rm_rf!(root)
     end
   end
 
@@ -6305,6 +7131,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      start_supervised!(
+        {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+      )
 
       assert :ok =
                Ferricstore.Flow.create(ctx, flow_id,
@@ -10916,6 +11746,21 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     )
   end
 
+  defp assert_pending_keydir_rows(ctx, expected) do
+    actual =
+      0..(ctx.shard_count - 1)
+      |> Enum.reduce(0, fn shard_index, acc ->
+        keydir = elem(ctx.keydir_refs, shard_index)
+
+        acc +
+          :ets.select_count(keydir, [
+            {{:_, :_, :_, :_, :pending, :_, :_}, [], [true]}
+          ])
+      end)
+
+    assert actual == expected
+  end
+
   defp instance_opts(root, opts) do
     [
       data_dir: root,
@@ -10953,6 +11798,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     :ferricstore_waraft_backend
     |> :wa_raft_storage.registered_name(shard_index + 1)
     |> :wa_raft_storage.status()
+  end
+
+  defp waraft_log_table(shard_index) do
+    :"raft_log_ferricstore_waraft_backend_#{shard_index + 1}"
   end
 
   defp waraft_storage_metadata(root, shard_index) do

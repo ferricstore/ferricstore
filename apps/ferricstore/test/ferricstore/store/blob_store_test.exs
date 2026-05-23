@@ -755,6 +755,8 @@ defmodule Ferricstore.Store.BlobStoreTest do
   test "sweep_unreferenced deletes an append segment when no live ref points to it", %{
     root: root
   } do
+    with_blob_segment_gc_grace_ms(0)
+
     assert {:ok, refs} =
              BlobStore.put_many(root, 0, [
                :binary.copy("a", 256),
@@ -777,7 +779,26 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute File.exists?(segment_path)
   end
 
+  test "sweep_unreferenced preserves a fresh append segment even before keydir refs appear", %{
+    root: root
+  } do
+    with_blob_segment_gc_grace_ms(60_000)
+
+    assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("pending", 256))
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+    segment_bytes = File.stat!(segment_path).size
+
+    assert {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 1}} =
+             BlobStore.sweep_unreferenced(root, 0, [])
+
+    assert File.exists?(segment_path)
+    assert File.stat!(segment_path).size == segment_bytes
+    assert {:ok, :binary.copy("pending", 256)} == BlobStore.get(root, 0, ref)
+  end
+
   test "sweep_unreferenced ignores malformed live refs", %{root: root} do
+    with_blob_segment_gc_grace_ms(0)
+
     assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("d", 256))
     assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
 
@@ -818,6 +839,7 @@ defmodule Ferricstore.Store.BlobStoreTest do
     root: root
   } do
     with_blob_segment_max_bytes(600)
+    with_blob_segment_gc_grace_ms(0)
 
     first_payload = :binary.copy("a", 400)
     second_payload = :binary.copy("b", 400)
@@ -843,6 +865,7 @@ defmodule Ferricstore.Store.BlobStoreTest do
     root: root
   } do
     with_blob_segment_max_bytes(600)
+    with_blob_segment_gc_grace_ms(0)
 
     assert {:ok, first_ref} = BlobStore.put(root, 0, :binary.copy("a", 400))
     assert {:ok, {first_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
@@ -897,6 +920,11 @@ defmodule Ferricstore.Store.BlobStoreTest do
   defp with_blob_segment_max_bytes(bytes) do
     Process.put(:ferricstore_blob_store_segment_max_bytes, bytes)
     on_exit(fn -> Process.delete(:ferricstore_blob_store_segment_max_bytes) end)
+  end
+
+  defp with_blob_segment_gc_grace_ms(ms) do
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, ms)
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_segment_gc_grace_ms) end)
   end
 
   defp count_regular_files(path) do

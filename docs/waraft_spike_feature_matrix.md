@@ -63,6 +63,19 @@ Covered:
 - The file writer uses `file:datasync/1` by default for data-record durability,
   with `:waraft_segment_log_sync_method` available for forcing `:sync` in
   experiments. Tests assert the sync method at the append boundary.
+- Segment-log append atomicity invariant: a Raft entry is not inserted into the
+  in-memory log table, applied to FerricStore storage, or acknowledged to the
+  client until the segment append has written the bytes and the segment file
+  sync has completed. A blocked-sync test keeps the fsync suspended and proves
+  the write remains invisible and the caller remains waiting until the sync is
+  released.
+- Experimental `:waraft_segment_log_file_writer_mode = :persistent` keeps a
+  lifecycle-safe Erlang file handle open across same-segment appends to remove
+  per-append open/close churn while preserving the same sync-before-ack
+  boundary. It intentionally does not use a raw fd because raw fd ownership is
+  process-local; raw persistent ownership remains in the writer-process or
+  WAL-NIF paths. Local Flow profiling did not show this mode beating `:direct`,
+  so it is not a default.
 - New segment preallocation is wired through the WAL NIF's keep-size fallocate
   helper instead of Erlang `file:allocate/3`, because extending the logical file
   size would leave zero trailer bytes that break deterministic segment recovery.
@@ -797,6 +810,16 @@ Important interpretation:
   multi-member leaders. Before this fork patch, the server applied single-node
   commits before checking `raft_commit_batch_interval_ms`, so concurrent
   one-node durable writes could still produce one segment fsync per write.
+- Single-member WARaft leaders can also opt into
+  `:waraft_async_log_append`. In that mode, local segment append+fsync runs on a
+  background process while the server keeps accepting more commands into the
+  next batch. The server does not advance `log_view`, apply storage, or reply to
+  callers until the durable append completion message returns. Tests block the
+  segment fsync and prove the leader remains responsive, the blocked write is
+  invisible, and commands arriving during that fsync are grouped into the next
+  durable append. This remains single-member only; multi-node leaders still use
+  the synchronous append path until leader-stepdown and follower-replication
+  safety is designed.
 - FerricStore hot GET should keep using local applied state. WARaft strong reads
   use a separate read queue and saturated under the c=200/p=50 mixed load, so
   the migration shape should not put normal GET behind `wa_raft_acceptor:read/3`.

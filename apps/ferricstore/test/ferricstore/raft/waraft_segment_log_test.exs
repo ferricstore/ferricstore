@@ -80,6 +80,258 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     end
   end
 
+  test "file segment appends keep a writer open across same-segment batches" do
+    previous_db = Application.get_env(:wa_raft, :raft_database)
+    previous_io = Application.get_env(:ferricstore, :waraft_segment_log_io_mode)
+    previous_writer_mode = Application.get_env(:ferricstore, :waraft_segment_log_file_writer_mode)
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+    registry = :ferricstore_waraft_segment_writer_registry
+    partition = System.unique_integer([:positive])
+    table = :ferricstore_waraft_segment_log_file_writer_test
+    log_name = :"#{table}_log_#{partition}"
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-file-writer-#{partition}"
+      )
+
+    if :ets.info(registry) != :undefined do
+      :ets.delete(registry)
+    end
+
+    try do
+      Application.put_env(:wa_raft, :raft_database, to_charlist(root))
+      Application.put_env(:ferricstore, :waraft_segment_log_io_mode, :file)
+      Application.put_env(:ferricstore, :waraft_segment_log_file_writer_mode, :process)
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 65_536)
+      File.rm_rf!(root)
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :wa_raft_part_sup.prepare_spec(:ferricstore_waraft_backend, %{
+        table: table,
+        partition: partition
+      })
+
+      log =
+        {:raft_log, log_name, :ferricstore_waraft_backend, table, partition,
+         :ferricstore_waraft_spike_segment_log}
+
+      assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+      assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+      view0 = {:log_view, log, 0, 0, :undefined}
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.append(
+                 view0,
+                 [{1, {:cmd, 1}}],
+                 :strict,
+                 :low
+               )
+
+      segment_path =
+        Path.join([
+          to_string(:wa_raft_part_sup.registered_partition_path(table, partition)),
+          "segment_log",
+          "0.seg"
+        ])
+
+      writer_key = to_charlist(Path.expand(segment_path))
+
+      assert [{^writer_key, _writer_dir, :file_writer, writer_pid, first_position}] =
+               :ets.lookup(registry, writer_key)
+
+      assert is_pid(writer_pid)
+      assert is_integer(first_position)
+      assert first_position > 0
+
+      view1 = {:log_view, log, 0, 1, :undefined}
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.append(
+                 view1,
+                 [{1, {:cmd, 2}}],
+                 :strict,
+                 :low
+               )
+
+      assert [{^writer_key, _writer_dir, :file_writer, ^writer_pid, second_position}] =
+               :ets.lookup(registry, writer_key)
+
+      assert second_position > first_position
+    after
+      if :ets.info(registry) != :undefined do
+        for {_key, _dir, :file_writer, pid, _position} <- :ets.tab2list(registry) do
+          ref = make_ref()
+          send(pid, {:close, self(), ref})
+
+          receive do
+            {^ref, _reply} -> :ok
+          after
+            500 -> :ok
+          end
+        end
+
+        :ets.delete(registry)
+      end
+
+      if previous_db == nil do
+        Application.delete_env(:wa_raft, :raft_database)
+      else
+        Application.put_env(:wa_raft, :raft_database, previous_db)
+      end
+
+      if previous_io == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_io_mode)
+      else
+        Application.put_env(:ferricstore, :waraft_segment_log_io_mode, previous_io)
+      end
+
+      if previous_writer_mode == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_file_writer_mode)
+      else
+        Application.put_env(
+          :ferricstore,
+          :waraft_segment_log_file_writer_mode,
+          previous_writer_mode
+        )
+      end
+
+      if previous_records == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_records_per_segment)
+      else
+        Application.put_env(
+          :ferricstore,
+          :waraft_segment_log_records_per_segment,
+          previous_records
+        )
+      end
+    end
+  end
+
+  test "persistent file segment appends reuse the caller-side fd across same-segment batches" do
+    previous_db = Application.get_env(:wa_raft, :raft_database)
+    previous_io = Application.get_env(:ferricstore, :waraft_segment_log_io_mode)
+    previous_writer_mode = Application.get_env(:ferricstore, :waraft_segment_log_file_writer_mode)
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+    registry = :ferricstore_waraft_segment_writer_registry
+    partition = System.unique_integer([:positive])
+    table = :ferricstore_waraft_segment_log_persistent_writer_test
+    log_name = :"#{table}_log_#{partition}"
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-persistent-writer-#{partition}"
+      )
+
+    if :ets.info(registry) != :undefined do
+      :ets.delete(registry)
+    end
+
+    try do
+      Application.put_env(:wa_raft, :raft_database, to_charlist(root))
+      Application.put_env(:ferricstore, :waraft_segment_log_io_mode, :file)
+      Application.put_env(:ferricstore, :waraft_segment_log_file_writer_mode, :persistent)
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 65_536)
+      File.rm_rf!(root)
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :wa_raft_part_sup.prepare_spec(:ferricstore_waraft_backend, %{
+        table: table,
+        partition: partition
+      })
+
+      log =
+        {:raft_log, log_name, :ferricstore_waraft_backend, table, partition,
+         :ferricstore_waraft_spike_segment_log}
+
+      assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+      assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+      view0 = {:log_view, log, 0, 0, :undefined}
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.append(
+                 view0,
+                 [{1, {:cmd, 1}}],
+                 :strict,
+                 :low
+               )
+
+      segment_path =
+        Path.join([
+          to_string(:wa_raft_part_sup.registered_partition_path(table, partition)),
+          "segment_log",
+          "0.seg"
+        ])
+
+      writer_key = to_charlist(Path.expand(segment_path))
+
+      assert [{^writer_key, _writer_dir, :file_fd, fd, first_position}] =
+               :ets.lookup(registry, writer_key)
+
+      assert is_integer(first_position)
+      assert first_position > 0
+
+      view1 = {:log_view, log, 0, 1, :undefined}
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.append(
+                 view1,
+                 [{1, {:cmd, 2}}],
+                 :strict,
+                 :low
+               )
+
+      assert [{^writer_key, _writer_dir, :file_fd, ^fd, second_position}] =
+               :ets.lookup(registry, writer_key)
+
+      assert second_position > first_position
+    after
+      if :ets.info(registry) != :undefined do
+        for {_key, _dir, :file_fd, fd, _position} <- :ets.tab2list(registry) do
+          _ = :file.close(fd)
+        end
+
+        :ets.delete(registry)
+      end
+
+      if previous_db == nil do
+        Application.delete_env(:wa_raft, :raft_database)
+      else
+        Application.put_env(:wa_raft, :raft_database, previous_db)
+      end
+
+      if previous_io == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_io_mode)
+      else
+        Application.put_env(:ferricstore, :waraft_segment_log_io_mode, previous_io)
+      end
+
+      if previous_writer_mode == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_file_writer_mode)
+      else
+        Application.put_env(
+          :ferricstore,
+          :waraft_segment_log_file_writer_mode,
+          previous_writer_mode
+        )
+      end
+
+      if previous_records == nil do
+        Application.delete_env(:ferricstore, :waraft_segment_log_records_per_segment)
+      else
+        Application.put_env(
+          :ferricstore,
+          :waraft_segment_log_records_per_segment,
+          previous_records
+        )
+      end
+    end
+  end
+
   test "point disk reads only the target segment for cold value lookups" do
     previous = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
 

@@ -501,6 +501,41 @@ defmodule FerricstoreServer.Integration.StreamTcpTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "XREADGROUP BLOCK waits through the TCP connection path", %{port: port} do
+      sock = connect_and_hello(port)
+      key = ustream()
+
+      send_cmd(sock, ["XADD", key, "1-0", "f", "v"])
+      assert recv_response(sock) == "1-0"
+
+      send_cmd(sock, ["XGROUP", "CREATE", key, "workers", "0"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["XREADGROUP", "GROUP", "workers", "c1", "STREAMS", key, ">"])
+      result = recv_response(sock)
+      [^key, entries] = hd(result)
+      assert Enum.map(entries, &hd/1) == ["1-0"]
+
+      started = System.monotonic_time(:millisecond)
+
+      send_cmd(sock, [
+        "XREADGROUP",
+        "GROUP",
+        "workers",
+        "c1",
+        "BLOCK",
+        "50",
+        "STREAMS",
+        key,
+        ">"
+      ])
+
+      assert recv_response(sock) == nil
+      assert System.monotonic_time(:millisecond) - started >= 20
+
+      :gen_tcp.close(sock)
+    end
   end
 
   # ===========================================================================

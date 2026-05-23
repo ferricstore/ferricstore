@@ -32,6 +32,13 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   # Memory & Eviction
   # ---------------------------------------------------------------------------
+  flow_lmdb_mode =
+    case String.downcase(System.get_env("FERRICSTORE_FLOW_LMDB_MODE", "lagged")) do
+      "mirror" -> "mirror"
+      "write_through" -> "mirror"
+      _other -> "lagged"
+    end
+
   config :ferricstore,
     max_memory_bytes: String.to_integer(System.get_env("FERRICSTORE_MAX_MEMORY", "0")),
     keydir_max_ram: String.to_integer(System.get_env("FERRICSTORE_KEYDIR_MAX_RAM", "268435456")),
@@ -51,49 +58,22 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS", "600000")),
     max_active_file_size:
       String.to_integer(System.get_env("FERRICSTORE_MAX_ACTIVE_FILE_SIZE", "8589934592")),
-    flow_lmdb_enabled: System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-    flow_lmdb_mode:
-      System.get_env(
-        "FERRICSTORE_FLOW_LMDB_MODE",
-        if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-          do: "lagged",
-          else: "off"
-        )
-      ),
+    flow_lmdb_enabled: true,
+    flow_lmdb_mode: flow_lmdb_mode,
     flow_lmdb_map_size:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
     flow_lmdb_flush_interval_ms:
       String.to_integer(
         System.get_env(
           "FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "30000",
-            else: "100"
-          )
+          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "1000", else: "100")
         )
       ),
     flow_lmdb_max_batch_ops:
       String.to_integer(
         System.get_env(
           "FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "100000",
-            else: "10000"
-          )
+          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "25000", else: "10000")
         )
       ),
     flow_lmdb_flush_chunk_ops:
@@ -102,34 +82,14 @@ if config_env() == :prod do
       String.to_integer(
         System.get_env(
           "FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "1",
-            else: "0"
-          )
+          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "1", else: "0")
         )
       ),
     flow_lmdb_flush_jitter_ms:
       String.to_integer(
         System.get_env(
           "FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "5000",
-            else: "0"
-          )
+          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "250", else: "0")
         )
       ),
     flow_lmdb_max_concurrent_flushes:
@@ -228,6 +188,12 @@ if config_env() == :prod do
       System.get_env("FERRICSTORE_RAFT_PUT_BATCH_APPLY_FAST_PATH", "true"),
     raft_delete_batch_apply_fast_path:
       System.get_env("FERRICSTORE_RAFT_DELETE_BATCH_APPLY_FAST_PATH", "true"),
+    waraft_log_rotation_interval:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_INTERVAL", "50000")),
+    waraft_log_rotation_keep:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_KEEP", "100000")),
+    waraft_max_retained_entries:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES", "100000")),
     ra_min_snapshot_interval:
       String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "10000000")),
     ra_min_checkpoint_interval:

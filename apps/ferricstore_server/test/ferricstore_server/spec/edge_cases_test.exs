@@ -121,6 +121,10 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
       :ets.delete_all_objects(:ferricstore_pubsub_patterns)
     end
 
+    if :ets.whereis(:ferricstore_pubsub_channel_cache) != :undefined do
+      :ets.delete_all_objects(:ferricstore_pubsub_channel_cache)
+    end
+
     :ok
   end
 
@@ -410,11 +414,15 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
       unsub_responses = recv_n(sock, 2)
 
       # Both channels should be unsubscribed
-      channels_unsubbed = Enum.map(unsub_responses, fn {:push, ["unsubscribe", ch, _count]} -> ch end)
+      channels_unsubbed =
+        Enum.map(unsub_responses, fn {:push, ["unsubscribe", ch, _count]} -> ch end)
+
       assert Enum.sort(channels_unsubbed) == Enum.sort([ch1, ch2])
 
       # Final count should be 0
-      final_counts = Enum.map(unsub_responses, fn {:push, ["unsubscribe", _ch, count]} -> count end)
+      final_counts =
+        Enum.map(unsub_responses, fn {:push, ["unsubscribe", _ch, count]} -> count end)
+
       assert Enum.min(final_counts) == 0
 
       :gen_tcp.close(sock)

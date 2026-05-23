@@ -8,7 +8,27 @@ defmodule Ferricstore.Raft.BlobCommand do
   protocol before followers can apply refs without the original payload.
   """
 
+  alias Ferricstore.Flow
   alias Ferricstore.Store.{BlobRef, BlobStore, BlobValue, CompoundKey}
+
+  @flow_blob_value_ref_tag :ferricstore_flow_blob_value_ref
+  @flow_blob_value_external :ferricstore_flow_blob_value_external
+  @flow_value_fields [:payload, :result, :error]
+  @flow_value_commands [
+    :flow_create,
+    :flow_create_many,
+    :flow_create_pipeline_batch,
+    :flow_complete,
+    :flow_complete_many,
+    :flow_transition,
+    :flow_transition_many,
+    :flow_retry,
+    :flow_retry_many,
+    :flow_fail,
+    :flow_fail_many,
+    :flow_cancel,
+    :flow_cancel_many
+  ]
 
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
@@ -46,6 +66,18 @@ defmodule Ferricstore.Raft.BlobCommand do
         prepare_enabled(ctx, shard_index, threshold, command)
     end
   end
+
+  @doc """
+  Extracts the encoded blob ref from a Flow value marker.
+
+  Flow payload/result/error values are encoded before they enter the blob store,
+  so apply can store a ref to the encoded Flow value without re-encoding bytes.
+  """
+  @spec flow_blob_value_ref(term()) :: {:ok, binary()} | :error
+  def flow_blob_value_ref({@flow_blob_value_ref_tag, encoded_ref}) when is_binary(encoded_ref),
+    do: {:ok, encoded_ref}
+
+  def flow_blob_value_ref(_value), do: :error
 
   @doc """
   Returns true when `command` contains a value that would use the blob
@@ -228,6 +260,45 @@ defmodule Ferricstore.Raft.BlobCommand do
     end
   end
 
+  defp prepare_enabled(
+         %{data_dir: data_dir},
+         shard_index,
+         threshold,
+         {:flow_terminal_pipeline_batch, op, key, attrs} = command
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_atom(op) and is_map(attrs) do
+    case prepare_flow_attrs(data_dir, shard_index, threshold, attrs) do
+      {:ok, prepared_attrs, true} ->
+        {:ok, {:flow_terminal_pipeline_batch, op, key, prepared_attrs}}
+
+      {:ok, _prepared_attrs, false} ->
+        {:ok, command}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_enabled(%{data_dir: data_dir}, shard_index, threshold, {command, key, attrs} = raw)
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_atom(command) and is_map(attrs) do
+    if flow_value_command?(command) do
+      case prepare_flow_attrs(data_dir, shard_index, threshold, attrs) do
+        {:ok, prepared_attrs, true} ->
+          {:ok, {command, key, prepared_attrs}}
+
+        {:ok, _prepared_attrs, false} ->
+          {:ok, raw}
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      {:ok, raw}
+    end
+  end
+
   defp prepare_enabled(_ctx, _shard_index, _threshold, command), do: {:ok, command}
 
   defp command_candidate?({:put, _key, value, _expire_at_ms}, threshold)
@@ -288,6 +359,16 @@ defmodule Ferricstore.Raft.BlobCommand do
 
   defp command_candidate?({:batch, commands}, threshold) when is_list(commands) do
     Enum.any?(commands, &command_candidate?(&1, threshold))
+  end
+
+  defp command_candidate?({:flow_terminal_pipeline_batch, op, _key, attrs}, threshold)
+       when is_atom(op) and is_map(attrs) do
+    flow_attrs_candidate?(attrs, threshold)
+  end
+
+  defp command_candidate?({command, _key, attrs}, threshold)
+       when is_atom(command) and is_map(attrs) do
+    flow_value_command?(command) and flow_attrs_candidate?(attrs, threshold)
   end
 
   defp command_candidate?(_command, _threshold), do: false
@@ -427,6 +508,31 @@ defmodule Ferricstore.Raft.BlobCommand do
           {:error, _reason} = error -> {:halt, error}
         end
 
+      {:flow_terminal_pipeline_batch, op, key, attrs}, {:ok, acc, external_payloads}
+      when is_atom(op) and is_map(attrs) ->
+        case prepare_generic_flow_attrs(attrs, threshold, external_payloads) do
+          {:ok, prepared_attrs, external_payloads} ->
+            command = {:flow_terminal_pipeline_batch, op, key, prepared_attrs}
+            {:cont, {:ok, [command | acc], external_payloads}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+
+      {command, key, attrs}, {:ok, acc, external_payloads}
+      when is_atom(command) and is_map(attrs) ->
+        if flow_value_command?(command) do
+          case prepare_generic_flow_attrs(attrs, threshold, external_payloads) do
+            {:ok, prepared_attrs, external_payloads} ->
+              {:cont, {:ok, [{command, key, prepared_attrs} | acc], external_payloads}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+        else
+          {:cont, {:ok, [{command, key, attrs} | acc], external_payloads}}
+        end
+
       command, {:ok, acc, external_payloads} ->
         {:cont, {:ok, [command | acc], external_payloads}}
     end)
@@ -557,6 +663,18 @@ defmodule Ferricstore.Raft.BlobCommand do
           {inflated_entries, refs} = inflate_compound_batch_blob_refs_with_rest(entries, refs)
           {{:compound_blob_batch_put, redis_key, inflated_entries}, refs}
 
+        {:flow_terminal_pipeline_batch, op, key, attrs}, refs ->
+          {inflated_attrs, refs} = inflate_flow_attrs_with_rest(attrs, refs)
+          {{:flow_terminal_pipeline_batch, op, key, inflated_attrs}, refs}
+
+        {command, key, attrs}, refs when is_atom(command) and is_map(attrs) ->
+          if flow_value_command?(command) do
+            {inflated_attrs, refs} = inflate_flow_attrs_with_rest(attrs, refs)
+            {{command, key, inflated_attrs}, refs}
+          else
+            {{command, key, attrs}, refs}
+          end
+
         command, refs ->
           {command, refs}
       end)
@@ -588,6 +706,129 @@ defmodule Ferricstore.Raft.BlobCommand do
       {:ok, {value, :value}}
     end
   end
+
+  defp prepare_flow_attrs(data_dir, shard_index, threshold, attrs) do
+    with {:ok, prepared_attrs, external_payloads} <- prepare_flow_attrs_placeholders(attrs, threshold) do
+      case external_payloads do
+        [] ->
+          {:ok, prepared_attrs, false}
+
+        [_ | _] ->
+          with {:ok, refs} <-
+                 BlobStore.put_many(data_dir, shard_index, Enum.reverse(external_payloads)) do
+            {inflated_attrs, []} = inflate_flow_attrs_with_rest(prepared_attrs, refs)
+            {:ok, inflated_attrs, true}
+          end
+      end
+    end
+  end
+
+  defp prepare_generic_flow_attrs(attrs, threshold, external_payloads) do
+    with {:ok, prepared_attrs, flow_external_payloads} <-
+           prepare_flow_attrs_placeholders(attrs, threshold) do
+      {:ok, prepared_attrs, flow_external_payloads ++ external_payloads}
+    end
+  end
+
+  defp prepare_flow_attrs_placeholders(%{records: records} = attrs, threshold)
+       when is_list(records) do
+    records
+    |> Enum.reduce_while({:ok, [], []}, fn
+      record_attrs, {:ok, prepared_records, external_payloads} when is_map(record_attrs) ->
+        case prepare_flow_record_attrs_placeholders(record_attrs, threshold) do
+          {:ok, prepared_record, record_external_payloads} ->
+            {:cont,
+             {:ok, [prepared_record | prepared_records],
+              record_external_payloads ++ external_payloads}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+
+      _record_attrs, {:ok, _prepared_records, _external_payloads} ->
+        {:halt, {:error, :invalid_flow_record_attrs}}
+    end)
+    |> case do
+      {:ok, prepared_records, external_payloads} ->
+        {:ok, %{attrs | records: Enum.reverse(prepared_records)}, external_payloads}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_flow_attrs_placeholders(attrs, threshold) when is_map(attrs) do
+    prepare_flow_record_attrs_placeholders(attrs, threshold)
+  end
+
+  defp prepare_flow_record_attrs_placeholders(%{idempotent: true} = attrs, _threshold),
+    do: {:ok, attrs, []}
+
+  defp prepare_flow_record_attrs_placeholders(attrs, threshold) when is_map(attrs) do
+    Enum.reduce_while(@flow_value_fields, {:ok, attrs, []}, fn kind,
+                                                              {:ok, prepared_attrs,
+                                                               external_payloads} ->
+      case Map.fetch(prepared_attrs, kind) do
+        {:ok, value} ->
+          encoded_value = Flow.encode_value(value)
+
+          if externalize?(encoded_value, threshold) do
+            prepared_attrs = Map.put(prepared_attrs, kind, @flow_blob_value_external)
+            {:cont, {:ok, prepared_attrs, [encoded_value | external_payloads]}}
+          else
+            {:cont, {:ok, prepared_attrs, external_payloads}}
+          end
+
+        :error ->
+          {:cont, {:ok, prepared_attrs, external_payloads}}
+      end
+    end)
+  end
+
+  defp inflate_flow_attrs_with_rest(%{records: records} = attrs, refs) when is_list(records) do
+    {records, refs} =
+      Enum.map_reduce(records, refs, fn record_attrs, refs ->
+        inflate_flow_record_attrs_with_rest(record_attrs, refs)
+      end)
+
+    {%{attrs | records: records}, refs}
+  end
+
+  defp inflate_flow_attrs_with_rest(attrs, refs) when is_map(attrs) do
+    inflate_flow_record_attrs_with_rest(attrs, refs)
+  end
+
+  defp inflate_flow_record_attrs_with_rest(attrs, refs) when is_map(attrs) do
+    Enum.reduce(@flow_value_fields, {attrs, refs}, fn kind, {attrs, refs} ->
+      case {Map.get(attrs, kind), refs} do
+        {@flow_blob_value_external, [ref | rest]} ->
+          marker = {@flow_blob_value_ref_tag, BlobRef.encode!(ref)}
+          {Map.put(attrs, kind, marker), rest}
+
+        _other ->
+          {attrs, refs}
+      end
+    end)
+  end
+
+  defp flow_attrs_candidate?(%{records: records}, threshold) when is_list(records) do
+    Enum.any?(records, &flow_attrs_candidate?(&1, threshold))
+  end
+
+  defp flow_attrs_candidate?(%{idempotent: true}, _threshold), do: false
+
+  defp flow_attrs_candidate?(attrs, threshold) when is_map(attrs) do
+    Enum.any?(@flow_value_fields, fn kind ->
+      case Map.fetch(attrs, kind) do
+        {:ok, value} -> externalize?(Flow.encode_value(value), threshold)
+        :error -> false
+      end
+    end)
+  end
+
+  defp flow_attrs_candidate?(_attrs, _threshold), do: false
+
+  defp flow_value_command?(command), do: command in @flow_value_commands
 
   defp externalize?(value, threshold) do
     byte_size(value) >= threshold or BlobRef.ref?(value)

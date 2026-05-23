@@ -16,6 +16,7 @@ defmodule Ferricstore.Store.BlobStore do
   @tmp_stale_after_seconds 300
   @segment_id 0
   @default_segment_max_bytes 256 * 1024 * 1024
+  @default_segment_gc_grace_ms 600_000
   @segment_header_magic <<0, ?F, ?S, ?B, ?L, ?O, ?G, 1>>
   @segment_header_bytes 48
   @segment_next_id_filename "next_segment_id"
@@ -916,9 +917,11 @@ defmodule Ferricstore.Store.BlobStore do
 
   The caller owns producing a complete live set. This function is deliberately
   conservative for append segments: a segment is kept while any live v2 ref
-  points into it, and reclaimed only when the whole segment is dead. The shard
-  must guard Ra replay safety before calling this, because unreleased Ra log
-  entries can still contain older blob refs.
+  points into it, and fresh dead segments are kept for a grace window before
+  they can be reclaimed. The freshness guard covers side-channel refs that have
+  been durably appended to blob storage but have not yet reached the Bitcask
+  keydir through Raft apply. The shard must still guard Ra replay safety before
+  calling this, because unreleased Ra log entries can contain older blob refs.
   """
   @spec sweep_unreferenced(binary(), non_neg_integer(), Enumerable.t()) ::
           {:ok,
@@ -1354,8 +1357,15 @@ defmodule Ferricstore.Store.BlobStore do
 
     case blob_files(shard_path) do
       {:ok, paths} ->
-        with :ok <- ensure_next_segment_id_for_dead_segments(shard_path, paths, live_paths),
-             {:ok, stats} <- sweep_blob_paths(shard_path, paths, live_paths) do
+        with {:ok, protected_paths} <- protected_dead_segment_paths(shard_path, paths, live_paths),
+             :ok <-
+               ensure_next_segment_id_for_dead_segments(
+                 shard_path,
+                 paths,
+                 live_paths,
+                 protected_paths
+               ),
+             {:ok, stats} <- sweep_blob_paths(shard_path, paths, live_paths, protected_paths) do
           if stats.deleted_files > 0 do
             clear_active_segment_cache(data_dir, shard_index)
           end
@@ -1925,13 +1935,71 @@ defmodule Ferricstore.Store.BlobStore do
     end)
   end
 
-  defp ensure_next_segment_id_for_dead_segments(shard_path, paths, live_paths) do
+  defp protected_dead_segment_paths(shard_path, paths, live_paths) do
+    Enum.reduce_while(paths, {:ok, MapSet.new()}, fn path, {:ok, protected} ->
+      relative = Path.relative_to(path, shard_path)
+
+      cond do
+        MapSet.member?(live_paths, relative) ->
+          {:cont, {:ok, protected}}
+
+        fresh_blob_segment?(path) ->
+          {:cont, {:ok, MapSet.put(protected, relative)}}
+
+        true ->
+          {:cont, {:ok, protected}}
+      end
+    end)
+  end
+
+  defp fresh_blob_segment?(path) do
+    case segment_id_from_path(path) do
+      {:ok, _id} ->
+        fresh_segment_file?(path)
+
+      :not_segment ->
+        false
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp fresh_segment_file?(path) do
+    grace_ms = segment_gc_grace_ms()
+
+    grace_ms > 0 and
+      case File.stat(path, time: :posix) do
+        {:ok, %{type: :regular, mtime: mtime}} when is_integer(mtime) ->
+          age_ms = max(System.system_time(:second) - mtime, 0) * 1_000
+          age_ms < grace_ms
+
+        _other ->
+          false
+      end
+  end
+
+  defp segment_gc_grace_ms do
+    case Process.get(
+           :ferricstore_blob_store_segment_gc_grace_ms,
+           Application.get_env(
+             :ferricstore,
+             :blob_segment_gc_grace_ms,
+             @default_segment_gc_grace_ms
+           )
+         ) do
+      value when is_integer(value) and value >= 0 -> value
+      _other -> @default_segment_gc_grace_ms
+    end
+  end
+
+  defp ensure_next_segment_id_for_dead_segments(shard_path, paths, live_paths, protected_paths) do
     Enum.reduce_while(paths, {:ok, nil}, fn path, {:ok, max_dead_id} ->
       relative = Path.relative_to(path, shard_path)
 
       case segment_id_from_path(path) do
         {:ok, id} ->
-          if MapSet.member?(live_paths, relative) do
+          if MapSet.member?(live_paths, relative) or MapSet.member?(protected_paths, relative) do
             {:cont, {:ok, max_dead_id}}
           else
             {:cont, {:ok, max(id, max_dead_id || id)}}
@@ -2060,7 +2128,7 @@ defmodule Ferricstore.Store.BlobStore do
     error -> {:error, {:blob_tmp_list_failed, error}}
   end
 
-  defp sweep_blob_paths(shard_path, paths, live_paths) do
+  defp sweep_blob_paths(shard_path, paths, live_paths, protected_paths) do
     result =
       Enum.reduce_while(
         paths,
@@ -2068,7 +2136,7 @@ defmodule Ferricstore.Store.BlobStore do
         fn path, {:ok, stats, dirs} ->
           relative = Path.relative_to(path, shard_path)
 
-          if MapSet.member?(live_paths, relative) do
+          if MapSet.member?(live_paths, relative) or MapSet.member?(protected_paths, relative) do
             {:cont, {:ok, %{stats | kept_files: stats.kept_files + 1}, dirs}}
           else
             case delete_blob_file(path) do

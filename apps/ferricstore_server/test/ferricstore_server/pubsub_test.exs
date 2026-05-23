@@ -97,16 +97,55 @@ defmodule FerricstoreServer.PubSubTest do
 
   setup do
     # Clean ETS tables between tests to avoid cross-test interference
-    :ets.delete_all_objects(:ferricstore_pubsub)
-    :ets.delete_all_objects(:ferricstore_pubsub_patterns)
+    clear_table(:ferricstore_pubsub)
+    clear_table(:ferricstore_pubsub_patterns)
+    clear_table(:ferricstore_pubsub_channel_cache)
     :ok
+  end
+
+  defp clear_table(table) do
+    case :ets.whereis(table) do
+      :undefined -> :ok
+      _tid -> :ets.delete_all_objects(table)
+    end
   end
 
   # ---------------------------------------------------------------------------
   # Unit tests — PubSub module directly
   # ---------------------------------------------------------------------------
 
+  test "connection Pub/Sub dispatch uses bulk registry APIs" do
+    source = File.read!(Path.expand("../../lib/ferricstore_server/connection/pubsub.ex", __DIR__))
+
+    assert source =~ "PS.subscribe_many(self())"
+    assert source =~ "PS.psubscribe_many(self())"
+    assert source =~ "PS.unsubscribe_many(channels, self())"
+    assert source =~ "PS.punsubscribe_many(patterns, self())"
+    refute source =~ "PS.subscribe(ch, self())"
+    refute source =~ "PS.psubscribe(pat, self())"
+  end
+
+  test "exact publish uses the channel pid cache" do
+    source = File.read!(Path.expand("../../../ferricstore/lib/ferricstore/pubsub.ex", __DIR__))
+    [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
+
+    assert source =~ "@channel_cache_table :ferricstore_pubsub_channel_cache"
+    assert publish_source =~ ":ets.lookup(@channel_cache_table, channel)"
+    refute publish_source =~ ":ets.lookup(@channels_table, channel)"
+  end
+
   describe "subscribe and receive message" do
+    test "bulk exact subscribe and unsubscribe update registry idempotently" do
+      assert :ok = PubSub.subscribe_many(["bulk", "bulk", "other"], self())
+
+      assert PubSub.numsub(["bulk", "other"]) == ["bulk", 1, "other", 1]
+      assert PubSub.publish("bulk", "hello") == 1
+      assert_receive {:pubsub_message, "bulk", "hello"}, 1000
+
+      assert :ok = PubSub.unsubscribe_many(["bulk", "bulk"], self())
+      assert PubSub.numsub(["bulk", "other"]) == ["bulk", 0, "other", 1]
+    end
+
     test "subscriber receives message on exact channel" do
       PubSub.subscribe("news", self())
       PubSub.publish("news", "hello world")
@@ -125,6 +164,16 @@ defmodule FerricstoreServer.PubSubTest do
       refute_receive {:pubsub_message, "news", "hello world"}, 100
     end
 
+    test "bulk duplicate exact subscriptions keep publish count and delivery idempotent" do
+      PubSub.subscribe_many(["news", "news", "news"], self())
+
+      assert PubSub.numsub(["news"]) == ["news", 1]
+      assert PubSub.publish("news", "cached") == 1
+
+      assert_receive {:pubsub_message, "news", "cached"}, 1000
+      refute_receive {:pubsub_message, "news", "cached"}, 100
+    end
+
     test "subscriber does not receive message on different channel" do
       PubSub.subscribe("news", self())
       PubSub.publish("sports", "goal!")
@@ -134,6 +183,18 @@ defmodule FerricstoreServer.PubSubTest do
   end
 
   describe "pattern subscribe and receive message" do
+    test "bulk pattern subscribe and unsubscribe update registry idempotently" do
+      assert :ok = PubSub.psubscribe_many(["bulk.*", "bulk.*", "other.*"], self())
+
+      assert PubSub.numpat() == 2
+      assert PubSub.publish("bulk.1", "hello") == 1
+      assert_receive {:pubsub_pmessage, "bulk.*", "bulk.1", "hello"}, 1000
+
+      assert :ok = PubSub.punsubscribe_many(["bulk.*", "bulk.*"], self())
+      assert PubSub.numpat() == 1
+      assert PubSub.publish("bulk.1", "miss") == 0
+    end
+
     test "pattern subscriber receives message matching pattern" do
       PubSub.psubscribe("news.*", self())
       PubSub.publish("news.tech", "AI breakthrough")

@@ -7,16 +7,16 @@ defmodule FerricstoreServer.Connection do
   1. Performs the `CLIENT HELLO 3` handshake (RESP3-only; rejects RESP2).
   2. Enters a receive loop, accumulating TCP chunks into a binary buffer.
   3. Parses all complete RESP3 frames from the buffer via `FerricstoreServer.Resp.Parser`.
-  4. Dispatches commands using a **sliding window pipeline** (spec section 2C.2):
-     - All "pure" commands (those that don't mutate connection state) in a
-       pipeline batch are dispatched concurrently as `Task`s.
-     - Responses are sent over the socket in-order: response N is sent as
-       soon as responses 0..N are all complete. This means fast commands
-       before a slow command get their responses delivered immediately,
-       without waiting for the slow command to finish.
+  4. Dispatches commands using a segmented pipeline:
+     - Hot pure batches such as GET, SET, mixed GET/SET, Flow, Streams, and
+       selected write groups use batch dispatch paths.
+     - Generic pure fallback stays in the connection process and coalesces
+       encoded replies into one socket send unless a large streaming response
+       is required. Avoiding per-command worker tasks keeps scheduler pressure
+       predictable under deep pipelines.
      - Stateful commands (MULTI, AUTH, SUBSCRIBE, blocking ops, etc.) act
-       as barriers: all prior concurrent tasks are awaited and flushed
-       before the stateful command executes synchronously.
+       as barriers: prior pure commands are flushed before the stateful command
+       executes synchronously.
   5. Handles `QUIT` (send `+OK`, close) and `RESET` (send `+RESET`, reset state).
   6. Closes cleanly on TCP EOF or any transport error.
 
@@ -478,8 +478,8 @@ defmodule FerricstoreServer.Connection do
       blocking_ast?(ast) ->
         dispatch_blocking_ast(ast, args, state)
 
-      cmd == "XREAD" ->
-        ConnBlocking.dispatch_xread_ast(ast, args, state)
+      cmd in ["XREAD", "XREADGROUP"] ->
+        ConnBlocking.dispatch_stream_read_ast(cmd, ast, args, state)
 
       ast_store_command?(ast) ->
         dispatch_normal(cmd, args, ast, state)
@@ -1146,8 +1146,9 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp cleanup_pubsub(state) do
-    if state.pubsub_channels, do: Enum.each(state.pubsub_channels, &PS.unsubscribe(&1, self()))
-    if state.pubsub_patterns, do: Enum.each(state.pubsub_patterns, &PS.punsubscribe(&1, self()))
+    if state.pubsub_channels != nil or state.pubsub_patterns != nil do
+      PS.cleanup(self())
+    end
   end
 
   # ---------------------------------------------------------------------------

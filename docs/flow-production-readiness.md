@@ -118,8 +118,12 @@ workers, but it is not a replacement for explicit tenant/device worker pools.
 
 Use the lineage bench for large terminal/lineage query surfaces:
 
+LMDB projection is mandatory for Flow. Use `FLOW_LMDB_MODE=mirror` only when the
+benchmark intentionally measures synchronous projection; production defaults to
+lagged projection.
+
 ```sh
-MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB=1 FLOW_LMDB_MODE=mirror \
+MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB_MODE=mirror \
 FLOW_LINEAGE_BACKLOG=1000000 FLOW_LINEAGE_TERMINAL=1000000 \
 FLOW_LINEAGE_ITER=200 FLOW_LINEAGE_QUERY_COUNT=100 \
 mix run --no-start bench/flow_lineage_bench.exs

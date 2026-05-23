@@ -5,9 +5,87 @@ defmodule Ferricstore.Store.ShardETSTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
+
+  test "fresh no-ttl location batch inserts records and batches binary accounting" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    ref = :atomics.new(1, signed: true)
+    key1 = "ets:fresh-batch:1"
+    key2 = "ets:fresh-batch:2"
+    value1 = String.duplicate("a", 128)
+    value2 = String.duplicate("b", 96)
+
+    state = %{
+      keydir: keydir,
+      index: 0,
+      instance_ctx: %{hot_cache_max_value_size: 512, keydir_binary_bytes: ref, shard_count: 1}
+    }
+
+    try do
+      assert {:ok, 2} =
+               ShardETS.ets_insert_fresh_no_expiry_many_with_location(
+                 state,
+                 [{key1, value1, 0}, {key2, value2, 0}],
+                 {:waraft_segment, 10},
+                 123,
+                 512
+               )
+
+      assert [{^key1, ^value1, 0, _lfu1, {:waraft_segment, 10}, 123, 128}] =
+               :ets.lookup(keydir, key1)
+
+      assert [{^key2, ^value2, 0, _lfu2, {:waraft_segment, 10}, 123, 96}] =
+               :ets.lookup(keydir, key2)
+
+      assert :atomics.get(ref, 1) == byte_size(value1) + byte_size(value2)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "fresh no-ttl location batch falls back when it would overwrite or clear compound data" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:fresh-batch:fallback"
+    compound_key = "ets:fresh-batch:compound"
+
+    state = %{
+      keydir: keydir,
+      index: 0,
+      instance_ctx: %{
+        hot_cache_max_value_size: 512,
+        keydir_binary_bytes: :atomics.new(1, signed: true),
+        shard_count: 1
+      }
+    }
+
+    try do
+      :ets.insert(keydir, {key, "old", 0, LFU.initial(), 1, 2, 3})
+      :ets.insert(keydir, {CompoundKey.type_key(compound_key), "hash", 0, LFU.initial(), 1, 4, 4})
+
+      assert :fallback =
+               ShardETS.ets_insert_fresh_no_expiry_many_with_location(
+                 state,
+                 [{key, "new", 0}],
+                 {:waraft_segment, 11},
+                 456,
+                 512
+               )
+
+      assert :fallback =
+               ShardETS.ets_insert_fresh_no_expiry_many_with_location(
+                 state,
+                 [{compound_key, "new", 0}],
+                 {:waraft_segment, 11},
+                 456,
+                 512
+               )
+    after
+      :ets.delete(keydir)
+    end
+  end
 
   test "stale async cold-read completion does not warm over a pending large write" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])

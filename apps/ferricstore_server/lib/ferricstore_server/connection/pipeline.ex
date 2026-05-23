@@ -781,98 +781,49 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp extract_flow_writes([], acc), do: {:ok, Enum.reverse(acc)}
 
-  defp extract_flow_writes(
-         [{:command, "FLOW.CREATE", _args, {:flow_create, id, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_list(opts),
-       do: extract_flow_writes(rest, [{:create, id, opts} | acc])
+  defp extract_flow_writes([command | rest], acc) do
+    case flow_write_op(command) do
+      {:ok, op} -> extract_flow_writes(rest, [op | acc])
+      :fallback -> :fallback
+    end
+  end
 
-  defp extract_flow_writes(
-         [
-           {:command, "FLOW.TRANSITION", _args,
-            {:flow_transition, id, from_state, to_state, opts}, _keys}
-           | rest
-         ],
-         acc
+  defp flow_write_op({:command, "FLOW.CREATE", _args, {:flow_create, id, opts} = ast, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, ast}
+
+  defp flow_write_op(
+         {:command, "FLOW.TRANSITION", _args,
+          {:flow_transition, id, from_state, to_state, opts} = ast, _keys}
        )
        when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
-       do: extract_flow_writes(rest, [{:transition, id, from_state, to_state, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
-          | rest],
-         acc
-       )
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: extract_flow_writes(rest, [{:complete, id, lease_token, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: extract_flow_writes(rest, [{:retry, id, lease_token, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: extract_flow_writes(rest, [{:fail, id, lease_token, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_list(opts),
-       do: extract_flow_writes(rest, [{:cancel, id, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_list(opts),
-       do: extract_flow_writes(rest, [{:rewind, id, opts} | acc])
-
-  defp extract_flow_writes(_commands, _acc), do: :fallback
-
-  defp flow_write_op({:command, "FLOW.CREATE", _args, {:flow_create, id, opts}, _keys})
-       when is_binary(id) and is_list(opts),
-       do: {:ok, {:create, id, opts}}
+       do: {:ok, ast}
 
   defp flow_write_op(
-         {:command, "FLOW.TRANSITION", _args, {:flow_transition, id, from_state, to_state, opts},
-          _keys}
-       )
-       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
-       do: {:ok, {:transition, id, from_state, to_state, opts}}
-
-  defp flow_write_op(
-         {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
+         {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts} = ast, _keys}
        )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: {:ok, {:complete, id, lease_token, opts}}
+       do: {:ok, ast}
 
   defp flow_write_op(
-         {:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys}
+         {:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts} = ast, _keys}
        )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: {:ok, {:retry, id, lease_token, opts}}
+       do: {:ok, ast}
 
   defp flow_write_op(
-         {:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys}
+         {:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts} = ast, _keys}
        )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: {:ok, {:fail, id, lease_token, opts}}
+       do: {:ok, ast}
 
-  defp flow_write_op({:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys})
+  defp flow_write_op({:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:cancel, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_write_op({:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys})
+  defp flow_write_op({:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:rewind, id, opts}}
+       do: {:ok, ast}
 
   defp flow_write_op(_command), do: :fallback
 
@@ -884,39 +835,39 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp flow_claim_due_op(_command), do: :fallback
 
-  defp flow_read_op({:command, "FLOW.GET", _args, {:flow_get, id, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.GET", _args, {:flow_get, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:get, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.HISTORY", _args, {:flow_history, id, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.HISTORY", _args, {:flow_history, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:history, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.LIST", _args, {:flow_list, type, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.LIST", _args, {:flow_list, type, opts} = ast, _keys})
        when is_binary(type) and is_list(opts),
-       do: {:ok, {:list, type, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.BY_PARENT", _args, {:flow_by_parent, id, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.BY_PARENT", _args, {:flow_by_parent, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:by_parent, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.BY_ROOT", _args, {:flow_by_root, id, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.BY_ROOT", _args, {:flow_by_root, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:by_root, id, opts}}
+       do: {:ok, ast}
 
   defp flow_read_op(
-         {:command, "FLOW.BY_CORRELATION", _args, {:flow_by_correlation, id, opts}, _keys}
+         {:command, "FLOW.BY_CORRELATION", _args, {:flow_by_correlation, id, opts} = ast, _keys}
        )
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:by_correlation, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.INFO", _args, {:flow_info, type, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.INFO", _args, {:flow_info, type, opts} = ast, _keys})
        when is_binary(type) and is_list(opts),
-       do: {:ok, {:info, type, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.STUCK", _args, {:flow_stuck, type, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.STUCK", _args, {:flow_stuck, type, opts} = ast, _keys})
        when is_binary(type) and is_list(opts),
-       do: {:ok, {:stuck, type, opts}}
+       do: {:ok, ast}
 
   defp flow_read_op(_command), do: :fallback
 
@@ -1031,7 +982,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
       {:ok, op} ->
         {ops, rest} = take_flow_write_segment(rest, [op])
         entries = dispatch_flow_write_segment(Enum.reverse(ops), state)
-        dispatch_pure_segments(rest, state, store, prefetched_reads, Enum.reverse(entries) ++ acc)
+
+        dispatch_pure_segments(
+          rest,
+          state,
+          store,
+          prefetched_reads,
+          prepend_pipeline_entries(entries, acc)
+        )
 
       :fallback ->
         case flow_claim_due_op(cmd) do
@@ -1044,7 +1002,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
               state,
               store,
               prefetched_reads,
-              Enum.reverse(entries) ++ acc
+              prepend_pipeline_entries(entries, acc)
             )
 
           :fallback ->
@@ -1058,7 +1016,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   state,
                   store,
                   prefetched_reads,
-                  Enum.reverse(entries) ++ acc
+                  prepend_pipeline_entries(entries, acc)
                 )
 
               :fallback ->
@@ -1079,7 +1037,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
                       new_state,
                       store,
                       prefetched_reads,
-                      Enum.reverse(entries) ++ acc
+                      prepend_pipeline_entries(entries, acc)
                     )
 
                   :fallback ->
@@ -1095,6 +1053,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
             end
         end
     end
+  end
+
+  defp prepend_pipeline_entries(entries, acc) do
+    Enum.reduce(entries, acc, fn entry, next_acc -> [entry | next_acc] end)
   end
 
   defp take_flow_write_segment([{cmd, idx} | rest], acc) do
@@ -1943,6 +1905,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
     do: {:error, "ERR internal error: #{inspect({kind, reason})}"}
 
   defp extract_command_name({:command, name, _args, _ast, _keys}) when is_binary(name), do: name
+
   defp extract_command_name(_), do: "UNKNOWN"
 
   defp full_acl_fast_path?(:full_access), do: true

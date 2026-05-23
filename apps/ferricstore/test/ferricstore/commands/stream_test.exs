@@ -570,6 +570,21 @@ defmodule Ferricstore.Commands.StreamTest do
       assert length(entries) == 3
       assert Enum.map(entries, &hd/1) == ["3-0", "2-0", "1-0"]
     end
+
+    test "indexed stream reads decode batch results without zip or flat_map" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/stream.ex", __DIR__))
+
+      [decode_source] =
+        Regex.run(
+          ~r/defp decode_indexed_stream_entries\(index_entries, stream_key, store\).*?^  end/ms,
+          source
+        )
+
+      assert decode_source =~ "indexed_stream_keys_and_ids(index_entries, [], [])"
+      assert decode_source =~ "decode_indexed_stream_raw(ids, raw_values, [])"
+      refute decode_source =~ "Enum.zip"
+      refute decode_source =~ "Enum.flat_map"
+    end
   end
 
   # ===========================================================================
@@ -577,6 +592,15 @@ defmodule Ferricstore.Commands.StreamTest do
   # ===========================================================================
 
   describe "XREAD" do
+    test "XREAD builds ordered results in one pass" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/stream.ex", __DIR__))
+      [xread_source] = Regex.run(~r/defp do_xread\(stream_ids, count, store\).*?^  end/ms, source)
+
+      assert xread_source =~ "xread_results(stream_ids, count, store, [])"
+      refute xread_source =~ "Enum.find(results"
+      refute xread_source =~ "Enum.reject(results"
+    end
+
     test "XREAD returns entries after given ID" do
       store = MockStore.make()
       key = ustream()
@@ -680,7 +704,9 @@ defmodule Ferricstore.Commands.StreamTest do
       for i <- 1..5, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], base)
 
       store =
-        Map.put(base, :compound_delete, fn ^key, "X:" <> _rest -> {:error, :disk_full} end)
+        Map.put(base, :compound_batch_delete, fn ^key, ["X:" <> _rest | _] ->
+          {:error, :disk_full}
+        end)
 
       assert {:error, :disk_full} = Stream.handle("XTRIM", [key, "MAXLEN", "3"], store)
       assert 5 == Stream.handle("XLEN", [key], base)
@@ -730,7 +756,9 @@ defmodule Ferricstore.Commands.StreamTest do
       for i <- 1..5, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], base)
 
       store =
-        Map.put(base, :compound_delete, fn ^key, "X:" <> _rest -> {:error, :disk_full} end)
+        Map.put(base, :compound_batch_delete, fn ^key, ["X:" <> _rest | _] ->
+          {:error, :disk_full}
+        end)
 
       assert {:error, :disk_full} = Stream.handle("XTRIM", [key, "MINID", "3-0"], store)
       assert 5 == Stream.handle("XLEN", [key], base)
@@ -765,6 +793,28 @@ defmodule Ferricstore.Commands.StreamTest do
   # ===========================================================================
 
   describe "XDEL" do
+    test "stream deletes use batch get/delete on the hot path" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/stream.ex", __DIR__))
+      [xdel_source] = Regex.run(~r/defp do_xdel\(key, ids, store\).*?^  end/ms, source)
+
+      [delete_ids_source] =
+        Regex.run(~r/defp delete_stream_ids\(key, ids, store\).*?^  end/ms, source)
+
+      assert xdel_source =~ "batch_get_stream_entries"
+      assert xdel_source =~ "existing_ids"
+      assert xdel_source =~ "existing_stream_ids"
+      assert xdel_source =~ "delete_stream_ids"
+      refute xdel_source =~ "stream_entry_exists?"
+      refute xdel_source =~ "Enum.zip"
+
+      assert delete_ids_source =~ "delete_stream_entry_keys"
+      assert delete_ids_source =~ "delete_stream_index_ids"
+      refute delete_ids_source =~ "delete_stream_entry(store"
+      refute delete_ids_source =~ "delete_stream_index_entry"
+
+      assert source =~ "defp existing_stream_ids("
+    end
+
     test "XDEL removes specific entries" do
       store = MockStore.make()
       key = ustream()
@@ -808,7 +858,9 @@ defmodule Ferricstore.Commands.StreamTest do
       Stream.handle("XADD", [key, "1-0", "a", "1"], base)
 
       store =
-        Map.put(base, :compound_delete, fn ^key, "X:" <> _rest -> {:error, :disk_full} end)
+        Map.put(base, :compound_batch_delete, fn ^key, ["X:" <> _rest | _] ->
+          {:error, :disk_full}
+        end)
 
       assert {:error, :disk_full} = Stream.handle("XDEL", [key, "1-0"], store)
       assert 1 == Stream.handle("XLEN", [key], base)
@@ -1008,6 +1060,38 @@ defmodule Ferricstore.Commands.StreamTest do
   # ===========================================================================
 
   describe "XREADGROUP" do
+    test "XREADGROUP builds ordered results in one pass" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/stream.ex", __DIR__))
+
+      [xreadgroup_source] =
+        Regex.run(
+          ~r/defp do_xreadgroup\(group, consumer, stream_ids, count, store\).*?^  end/ms,
+          source
+        )
+
+      assert xreadgroup_source =~
+               "xreadgroup_results(group, consumer, stream_ids, count, store, [])"
+
+      refute xreadgroup_source =~ "Enum.find(results"
+      refute xreadgroup_source =~ "Enum.reject(results"
+    end
+
+    test "XREADGROUP pending replay parses pending ids once before sorting" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/stream.ex", __DIR__))
+
+      assert source =~ "xreadgroup_pending_ids(pending, consumer, pending_start, count)"
+      assert source =~ "defp xreadgroup_pending_ids("
+
+      [pending_source] =
+        Regex.run(
+          ~r/defp xreadgroup_pending_ids\(pending, consumer, pending_start, count\).*?^  end/ms,
+          source
+        )
+
+      refute pending_source =~ "|> Enum.filter",
+             "pending replay should filter and parse in one pass before sorting"
+    end
+
     test "XREADGROUP delivers new messages to consumer" do
       store = MockStore.make()
       key = ustream()
@@ -1120,6 +1204,48 @@ defmodule Ferricstore.Commands.StreamTest do
 
       [[^key, entries]] = result
       assert length(entries) == 2
+    end
+
+    test "XREADGROUP pending replay batches stream entry reads" do
+      base = MockStore.make()
+      key = ustream()
+      parent = self()
+
+      for i <- 1..3, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], base)
+      Stream.handle("XGROUP", ["CREATE", key, "g1", "0"], base)
+
+      Stream.handle(
+        "XREADGROUP",
+        ["GROUP", "g1", "c1", "STREAMS", key, ">"],
+        base
+      )
+
+      store =
+        base
+        |> Map.put(:compound_batch_get, fn redis_key, compound_keys ->
+          send(parent, {:pending_batch_get, redis_key, compound_keys})
+          base.compound_batch_get.(redis_key, compound_keys)
+        end)
+        |> Map.put(:compound_get, fn redis_key, compound_key ->
+          send(parent, {:pending_single_get, redis_key, compound_key})
+          base.compound_get.(redis_key, compound_key)
+        end)
+
+      result =
+        Stream.handle(
+          "XREADGROUP",
+          ["GROUP", "g1", "c1", "COUNT", "2", "STREAMS", key, "0"],
+          store
+        )
+
+      [[^key, entries]] = result
+      assert Enum.map(entries, &hd/1) == ["1-0", "2-0"]
+
+      assert_receive {:pending_batch_get, ^key, compound_keys}
+      assert length(compound_keys) == 2
+      assert Enum.all?(compound_keys, &String.starts_with?(&1, "X:#{key}" <> <<0>>))
+
+      refute_receive {:pending_single_get, ^key, "X:" <> _rest}
     end
 
     test "XREADGROUP returns empty when no new messages" do

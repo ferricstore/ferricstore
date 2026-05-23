@@ -1627,6 +1627,18 @@ leader({call, From}, ?HANDOVER_COMMAND(Peer), #raft_state{handover = {Node, _, _
 leader(Type, ?RAFT_COMMAND(_, _) = Event, #raft_state{} = State) ->
     command(?FUNCTION_NAME, Type, Event, State);
 
+%% [Async Log Append]
+%% A feature-flagged single-member fast path writes the local durable log on a
+%% background process. Completion is the only point where log_view advances and
+%% entries may become visible/applied.
+leader(info, {async_log_append_complete, Ref, Result}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append(Ref, Result, State0),
+    State2 = append_entries_to_followers(State1),
+    State3 = apply_single_node_cluster(State2),
+    State4 = update_quorum_ts(State3),
+    update_status(?FUNCTION_NAME, State4),
+    {keep_state, State4, ?HEARTBEAT_TIMEOUT(State4)};
+
 %% [Fallback] Report unhandled events
 leader(Type, Event, #raft_state{} = State) ->
     ?SERVER_LOG_WARNING(State, "did not know how to handle ~0p event ~0P", [Type, Event, 20]),
@@ -3245,6 +3257,8 @@ add_pending(From, Op, low, #raft_state{pending_low = PendingLow} = Data) ->
     Data#raft_state{pending_low = [{From, Op} | PendingLow]}.
 
 -spec commit_pending(Data :: #raft_state{}, Priority :: wa_raft_acceptor:priority()) -> #raft_state{}.
+commit_pending(#raft_state{append_in_flight = {_Ref, _AppendPriority, _Pending, _NewLabel}} = Data, _Priority) ->
+    Data;
 commit_pending(#raft_state{pending_high = [], pending_low = [], pending_read = false} = Data, _Priority) ->
     Data;
 commit_pending(#raft_state{table = Table, log_view = View, pending_high = PendingHigh, pending_low = PendingLow, queued = Queued} = Data, Priority) ->
@@ -3260,7 +3274,11 @@ commit_pending(#raft_state{table = Table, log_view = View, pending_high = Pendin
         [_ | _] ->
             % If we have processed at least one new log entry
             % with the given priority, we try to append to the log.
-            case wa_raft_log:try_append(View, Entries, Priority) of
+            case should_async_log_append(Data, Priority) of
+                true ->
+                    start_async_log_append(Data, Priority, Pending, Entries, NewLabel);
+                false ->
+                    case wa_raft_log:try_append(View, Entries, Priority) of
                 {ok, NewView} ->
                     % Add the newly appended log entries to the pending queue (which
                     % is kept in reverse order).
@@ -3298,10 +3316,94 @@ commit_pending(#raft_state{table = Table, log_view = View, pending_high = Pendin
                     ?RAFT_COUNTV(Table, {'commit.error', Priority}, length(Entries)),
                     ?SERVER_LOG_ERROR(leader, Data, "sync failed due to ~0P.", [Error, 20]),
                     error(Error)
+                    end
             end;
         _ ->
             Data
     end.
+
+-spec should_async_log_append(Data :: #raft_state{}, Priority :: wa_raft_acceptor:priority()) -> boolean().
+should_async_log_append(
+    #raft_state{application = App, table = Table, self = Self, append_in_flight = undefined} = Data,
+    _Priority
+) ->
+    ?RAFT_ASYNC_LOG_APPEND(App, Table) andalso is_single_member(Self, config(Data));
+should_async_log_append(#raft_state{}, _Priority) ->
+    false.
+
+-spec start_async_log_append(
+    Data :: #raft_state{},
+    Priority :: wa_raft_acceptor:priority(),
+    Pending :: [{gen_server:from(), wa_raft_acceptor:op()}],
+    Entries :: [wa_raft_log:log_entry()],
+    NewLabel :: wa_raft_label:label() | undefined
+) -> #raft_state{}.
+start_async_log_append(#raft_state{log_view = View} = Data0, Priority, Pending, Entries, NewLabel) ->
+    Ref = make_ref(),
+    Parent = self(),
+    spawn(fun() ->
+        Result =
+            try wa_raft_log:try_append(View, Entries, Priority) of
+                AppendResult -> AppendResult
+            catch
+                Class:Reason:Stacktrace -> {error, {Class, Reason, Stacktrace}}
+            end,
+        Parent ! {async_log_append_complete, Ref, Result}
+    end),
+    clear_pending_priority(
+        Priority,
+        Data0#raft_state{
+            pending_read = false,
+            append_in_flight = {Ref, Priority, Pending, NewLabel}
+        }
+    ).
+
+-spec complete_async_log_append(Ref :: reference(), Result :: term(), Data :: #raft_state{}) -> #raft_state{}.
+complete_async_log_append(
+    Ref,
+    {ok, NewView},
+    #raft_state{table = Table, queued = Queued, append_in_flight = {Ref, Priority, Pending, NewLabel}} = Data
+) ->
+    Last = wa_raft_log:last_index(NewView),
+    {_, NewQueued} =
+        lists:foldl(
+            fun ({From, _Op}, {Index, AccQueued}) ->
+                {Index - 1, AccQueued#{Index => {From, Priority}}}
+            end,
+            {Last, Queued},
+            Pending
+        ),
+    ?RAFT_COUNTV(Table, {'commit.async_append.ok', Priority}, length(Pending)),
+    Data#raft_state{
+        log_view = NewView,
+        last_label = NewLabel,
+        queued = NewQueued,
+        append_in_flight = undefined
+    };
+complete_async_log_append(
+    Ref,
+    skipped,
+    #raft_state{table = Table, append_in_flight = {Ref, Priority, Pending, _NewLabel}} = Data
+) ->
+    ?RAFT_COUNTV(Table, {'commit.async_append.skipped', Priority}, length(Pending)),
+    ?SERVER_LOG_WARNING(leader, Data, "skipped async pre-heartbeat sync for ~0p log entr(ies).", [length(Pending)]),
+    cancel_pending({error, commit_stalled}, Data#raft_state{append_in_flight = undefined});
+complete_async_log_append(
+    Ref,
+    {error, Error},
+    #raft_state{table = Table, append_in_flight = {Ref, Priority, Pending, _NewLabel}} = Data
+) ->
+    ?RAFT_COUNTV(Table, {'commit.async_append.error', Priority}, length(Pending)),
+    ?SERVER_LOG_ERROR(leader, Data, "async sync failed due to ~0P.", [Error, 20]),
+    error(Error);
+complete_async_log_append(_Ref, _Result, #raft_state{} = Data) ->
+    Data.
+
+-spec clear_pending_priority(Priority :: wa_raft_acceptor:priority(), Data :: #raft_state{}) -> #raft_state{}.
+clear_pending_priority(high, #raft_state{} = Data) ->
+    Data#raft_state{pending_high = []};
+clear_pending_priority(low, #raft_state{} = Data) ->
+    Data#raft_state{pending_low = []}.
 
 -spec collect_pending(Data :: #raft_state{}, Priority :: wa_raft_acceptor:priority()) -> {[wa_raft_log:log_entry()], wa_raft_label:label() | undefined}.
 collect_pending(#raft_state{pending_high = [], pending_low = [], pending_read = true} = Data, _Priority) ->

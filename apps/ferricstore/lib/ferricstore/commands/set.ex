@@ -495,24 +495,16 @@ defmodule Ferricstore.Commands.Set do
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.set_member(key, &1))
 
-      new_keys =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn
-          {nil, compound_key} -> [compound_key]
-          {_value, _compound_key} -> []
-        end)
+      values = Ops.compound_batch_get(store, key, compound_keys)
+      new_entries = set_member_entries_for_missing(compound_keys, values, [])
 
-      put_new_members(store, key, new_keys, type_status)
+      put_new_member_entries(store, key, new_entries, type_status)
     end
   end
 
-  defp put_new_members(store, key, new_keys, type_status) do
-    entries = Enum.map(new_keys, &{&1, @presence_marker, 0})
-
+  defp put_new_member_entries(store, key, entries, type_status) do
     case Ops.compound_batch_put(store, key, entries) do
-      :ok -> length(new_keys)
+      :ok -> length(entries)
       {:error, _} = err -> rollback_new_set_type_marker(key, store, type_status, err)
     end
   end
@@ -536,17 +528,9 @@ defmodule Ferricstore.Commands.Set do
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.set_member(key, &1))
 
-      removed_keys =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn
-          {nil, _compound_key} -> []
-          {_value, compound_key} -> [compound_key]
-        end)
-
-      removed = length(removed_keys)
-      removed_entries = Enum.map(removed_keys, &{&1, "1", 0})
+      values = Ops.compound_batch_get(store, key, compound_keys)
+      removed_entries = set_member_entries_for_present(compound_keys, values, [])
+      removed = length(removed_entries)
 
       with :ok <- delete_set_members_and_cleanup(key, removed_entries, removed, store) do
         removed
@@ -555,6 +539,30 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp srem_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'srem' command"}
+
+  defp set_member_entries_for_missing([compound_key | compound_keys], [nil | values], acc) do
+    set_member_entries_for_missing(compound_keys, values, [
+      {compound_key, @presence_marker, 0} | acc
+    ])
+  end
+
+  defp set_member_entries_for_missing([_compound_key | compound_keys], [_value | values], acc) do
+    set_member_entries_for_missing(compound_keys, values, acc)
+  end
+
+  defp set_member_entries_for_missing(_compound_keys, _values, acc), do: Enum.reverse(acc)
+
+  defp set_member_entries_for_present([_compound_key | compound_keys], [nil | values], acc) do
+    set_member_entries_for_present(compound_keys, values, acc)
+  end
+
+  defp set_member_entries_for_present([compound_key | compound_keys], [_value | values], acc) do
+    set_member_entries_for_present(compound_keys, values, [
+      {compound_key, @presence_marker, 0} | acc
+    ])
+  end
+
+  defp set_member_entries_for_present(_compound_keys, _values, acc), do: Enum.reverse(acc)
 
   defp smembers_key(key, store) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
@@ -1129,13 +1137,8 @@ defmodule Ferricstore.Commands.Set do
 
       base_key
       |> get_members_list(store)
-      |> Enum.reduce(MapSet.new(), fn member, acc ->
-        if member_in_all_sets?(member, rest, store) do
-          MapSet.put(acc, member)
-        else
-          acc
-        end
-      end)
+      |> filter_members_in_all_sets(rest, store)
+      |> MapSet.new()
     end
   end
 
@@ -1150,26 +1153,50 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp count_intersection_candidates({{base_key, _count}, rest}, limit, store) do
-    base_key
-    |> get_members_list(store)
-    |> Enum.reduce_while(0, fn member, count ->
-      if member_in_all_sets?(member, rest, store) do
-        next_count = count + 1
+    members = get_members_list(base_key, store)
 
-        if limit > 0 and next_count >= limit do
+    if limit > 0 do
+      members
+      |> Enum.chunk_every(128)
+      |> Enum.reduce_while(0, fn chunk, count ->
+        matched_count = chunk |> filter_members_in_all_sets(rest, store) |> length()
+        next_count = count + matched_count
+
+        if next_count >= limit do
           {:halt, limit}
         else
           {:cont, next_count}
         end
-      else
-        {:cont, count}
-      end
-    end)
+      end)
+    else
+      members
+      |> filter_members_in_all_sets(rest, store)
+      |> length()
+    end
   end
 
-  defp member_in_all_sets?(member, counted_keys, store) do
-    Enum.all?(counted_keys, fn {key, _count} ->
-      Ops.compound_get(store, key, CompoundKey.set_member(key, member)) != nil
+  defp filter_members_in_all_sets([], _counted_keys, _store), do: []
+  defp filter_members_in_all_sets(members, [], _store), do: members
+
+  defp filter_members_in_all_sets(members, counted_keys, store) do
+    Enum.reduce_while(counted_keys, members, fn
+      {_key, _count}, [] ->
+        {:halt, []}
+
+      {key, _count}, candidates ->
+        compound_keys = Enum.map(candidates, &CompoundKey.set_member(key, &1))
+        values = Ops.compound_batch_get(store, key, compound_keys)
+
+        next_candidates =
+          candidates
+          |> Enum.zip(values)
+          |> Enum.reduce([], fn
+            {member, value}, acc when not is_nil(value) -> [member | acc]
+            {_member, nil}, acc -> acc
+          end)
+          |> Enum.reverse()
+
+        {:cont, next_candidates}
     end)
   end
 

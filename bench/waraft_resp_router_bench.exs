@@ -55,6 +55,9 @@ defmodule WaraftRespRouterBench do
         )
     end
 
+    profile_before = maybe_profile_snapshot()
+    maybe_start_eprof()
+
     result =
       RespRouterLoad.run(port,
         mode: mode,
@@ -64,6 +67,9 @@ defmodule WaraftRespRouterBench do
         payload: payload,
         key_count: key_count
       )
+
+    maybe_stop_eprof()
+    profile_after = maybe_profile_snapshot()
 
     print_result(result, %{
       backend: backend,
@@ -77,7 +83,11 @@ defmodule WaraftRespRouterBench do
       data_dir: data_dir,
       port: port
     })
+
+    maybe_print_profile(profile_before, profile_after)
+    maybe_print_eprof()
   after
+    _ = maybe_stop_eprof()
     _ = Application.stop(:ferricstore_server)
     _ = Application.stop(:ferricstore)
   end
@@ -102,12 +112,12 @@ defmodule WaraftRespRouterBench do
     Application.put_env(:ferricstore, :health_port, 0)
     Application.put_env(:ferricstore, :shard_count, shards)
     Application.put_env(:ferricstore, :raft_backend, backend)
-    Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
     Application.delete_env(:ferricstore, :waraft_log_module)
     put_optional_int_env("WAL_COMMIT_DELAY_US", :wal_commit_delay_us)
     put_optional_int_env("WAL_MAX_BUFFER_BYTES", :wal_max_buffer_bytes)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
+    put_optional_bool_env("WARAFT_ASYNC_LOG_APPEND", :waraft_async_log_append)
     put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
 
     put_optional_interval_env(
@@ -147,6 +157,22 @@ defmodule WaraftRespRouterBench do
     case System.get_env(env) do
       nil -> :ok
       value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
+  defp put_optional_bool_env(env, app_key) do
+    case System.get_env(env) do
+      nil ->
+        :ok
+
+      value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] ->
+        Application.put_env(:ferricstore, app_key, true)
+
+      value when value in ["0", "false", "FALSE", "no", "NO", "off", "OFF"] ->
+        Application.put_env(:ferricstore, app_key, false)
+
+      value ->
+        raise "unsupported #{env}=#{inspect(value)}; expected boolean"
     end
   end
 
@@ -288,6 +314,116 @@ defmodule WaraftRespRouterBench do
     end
   end
 
+  defp maybe_profile_snapshot do
+    if env_bool("PROFILE_PROCESSES", false) do
+      Process.list()
+      |> Enum.map(fn pid ->
+        info =
+          Process.info(pid, [
+            :registered_name,
+            :current_function,
+            :initial_call,
+            :reductions,
+            :message_queue_len,
+            :memory
+          ]) || []
+
+        {pid, Map.new(info)}
+      end)
+      |> Map.new()
+    else
+      nil
+    end
+  end
+
+  defp maybe_print_profile(nil, _after_snapshot), do: :ok
+  defp maybe_print_profile(_before_snapshot, nil), do: :ok
+
+  defp maybe_print_profile(before_snapshot, after_snapshot) do
+    rows =
+      after_snapshot
+      |> Enum.map(fn {pid, after_info} ->
+        before_info = Map.get(before_snapshot, pid, %{})
+        reductions = Map.get(after_info, :reductions, 0) - Map.get(before_info, :reductions, 0)
+
+        %{
+          pid: pid,
+          reductions: reductions,
+          registered_name: Map.get(after_info, :registered_name, []),
+          current_function: Map.get(after_info, :current_function),
+          initial_call: Map.get(after_info, :initial_call),
+          message_queue_len: Map.get(after_info, :message_queue_len, 0),
+          memory: Map.get(after_info, :memory, 0)
+        }
+      end)
+      |> Enum.filter(&(&1.reductions > 0))
+      |> Enum.sort_by(& &1.reductions, :desc)
+      |> Enum.take(30)
+
+    IO.puts("process_profile_top_reductions")
+
+    Enum.each(rows, fn row ->
+      IO.puts(
+        "reductions=#{row.reductions} mq=#{row.message_queue_len} memory=#{row.memory} " <>
+          "pid=#{inspect(row.pid)} name=#{inspect(row.registered_name)} " <>
+          "current=#{inspect(row.current_function)} initial=#{inspect(row.initial_call)}"
+      )
+    end)
+  end
+
+  defp maybe_start_eprof do
+    case System.get_env("PROFILE_EPROF") do
+      "storage" ->
+        case :code.which(:eprof) do
+          :non_existing ->
+            IO.puts("eprof_unavailable=true")
+
+          _path ->
+            storage_pids =
+              Process.list()
+              |> Enum.filter(fn pid ->
+                case Process.info(pid, :registered_name) do
+                  {:registered_name, name} when is_atom(name) ->
+                    name
+                    |> Atom.to_string()
+                    |> String.starts_with?("raft_storage_ferricstore_waraft_backend_")
+
+                  _other ->
+                    false
+                end
+              end)
+
+            Process.put(:waraft_resp_router_eprof_started?, true)
+            {:ok, _pid} = apply(:eprof, :start, [])
+            :ok = apply(:eprof, :start_profiling, [storage_pids])
+        end
+
+      nil ->
+        :ok
+
+      other ->
+        raise "unsupported PROFILE_EPROF=#{inspect(other)}; expected storage"
+    end
+  end
+
+  defp maybe_stop_eprof do
+    if Process.get(:waraft_resp_router_eprof_started?) do
+      _ = apply(:eprof, :stop_profiling, [])
+      :ok
+    else
+      :ok
+    end
+  end
+
+  defp maybe_print_eprof do
+    if Process.get(:waraft_resp_router_eprof_started?) do
+      IO.puts("eprof_storage_total")
+      apply(:eprof, :analyze, [:total])
+      apply(:eprof, :stop, [])
+      Process.delete(:waraft_resp_router_eprof_started?)
+    end
+  end
+
   defp env_backend(name, default) do
     case System.get_env(name) do
       nil -> default
@@ -320,6 +456,15 @@ defmodule WaraftRespRouterBench do
     case System.get_env(name) do
       nil -> default
       value -> String.to_integer(value)
+    end
+  end
+
+  defp env_bool(name, default) do
+    case System.get_env(name) do
+      nil -> default
+      value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] -> true
+      value when value in ["0", "false", "FALSE", "no", "NO", "off", "OFF"] -> false
+      value -> raise "unsupported #{name}=#{inspect(value)}; expected boolean"
     end
   end
 end

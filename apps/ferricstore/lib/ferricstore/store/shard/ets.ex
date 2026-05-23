@@ -2,7 +2,16 @@ defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BlobRef, BlobValue, ColdRead, ExpiryTracker, LFU, ValueCodec}
+
+  alias Ferricstore.Store.{
+    BlobRef,
+    BlobValue,
+    ColdRead,
+    CompoundKey,
+    ExpiryTracker,
+    LFU,
+    ValueCodec
+  }
 
   @cold_batch_read_timeout_ms 10_000
 
@@ -13,7 +22,8 @@ defmodule Ferricstore.Store.Shard.ETS do
   defguardp valid_waraft_segment_location(file_id, offset, value_size)
             when is_tuple(file_id) and tuple_size(file_id) == 2 and
                    (elem(file_id, 0) == :waraft_segment or
-                      elem(file_id, 0) == :waraft_projection) and
+                      elem(file_id, 0) == :waraft_projection or
+                      elem(file_id, 0) == :waraft_apply_projection) and
                    is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
                    is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
@@ -258,12 +268,76 @@ defmodule Ferricstore.Store.Shard.ETS do
         value_size,
         previous
       ) do
-    threshold = hot_cache_threshold(state)
+    ets_insert_with_location(
+      state,
+      key,
+      value,
+      expire_at_ms,
+      file_id,
+      offset,
+      value_size,
+      previous,
+      hot_cache_threshold(state)
+    )
+  end
+
+  @spec ets_insert_with_location(
+          map(),
+          binary(),
+          term(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          list(),
+          non_neg_integer()
+        ) :: true
+  @doc false
+  def ets_insert_with_location(
+        state,
+        key,
+        value,
+        expire_at_ms,
+        file_id,
+        offset,
+        value_size,
+        previous,
+        threshold
+      ) do
     v = value_for_ets(value, threshold)
     track_binary_insert(state, key, v, previous)
     adjust_expiry_for_insert(state, previous, expire_at_ms)
     :ets.insert(state.keydir, {key, v, expire_at_ms, LFU.initial(), file_id, offset, value_size})
   end
+
+  @spec ets_insert_fresh_no_expiry_many_with_location(
+          map(),
+          [{binary(), binary(), 0}],
+          term(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: {:ok, non_neg_integer()} | :fallback
+  @doc false
+  def ets_insert_fresh_no_expiry_many_with_location(state, entries, file_id, offset, threshold)
+      when is_list(entries) and is_integer(offset) and offset >= 0 and is_integer(threshold) and
+             threshold >= 0 do
+    lfu = LFU.initial()
+
+    case fresh_no_expiry_location_records(entries, state, file_id, offset, threshold, lfu) do
+      {:ok, [], 0, 0} ->
+        {:ok, 0}
+
+      {:ok, records, binary_delta, count} ->
+        true = :ets.insert(state.keydir, records)
+        add_keydir_binary_delta(state, binary_delta)
+        {:ok, count}
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  def ets_insert_fresh_no_expiry_many_with_location(_, _, _, _, _), do: :fallback
 
   # Deletes a key from the keydir table.
   @spec ets_delete_key(map(), binary()) :: true
@@ -606,7 +680,8 @@ defmodule Ferricstore.Store.Shard.ETS do
        {:andalso, {:==, {:tuple_size, :"$4"}, 2},
         {:andalso,
          {:orelse, {:==, {:element, 1, :"$4"}, :waraft_segment},
-          {:==, {:element, 1, :"$4"}, :waraft_projection}},
+          {:orelse, {:==, {:element, 1, :"$4"}, :waraft_projection},
+           {:==, {:element, 1, :"$4"}, :waraft_apply_projection}}},
          {:andalso, {:is_integer, {:element, 2, :"$4"}},
           {:andalso, {:>, {:element, 2, :"$4"}, 0},
            {:andalso, {:is_integer, :"$5"},
@@ -780,7 +855,8 @@ defmodule Ferricstore.Store.Shard.ETS do
        {:andalso, {:==, {:tuple_size, :"$4"}, 2},
         {:andalso,
          {:orelse, {:==, {:element, 1, :"$4"}, :waraft_segment},
-          {:==, {:element, 1, :"$4"}, :waraft_projection}},
+          {:orelse, {:==, {:element, 1, :"$4"}, :waraft_projection},
+           {:==, {:element, 1, :"$4"}, :waraft_apply_projection}}},
          {:andalso, {:is_integer, {:element, 2, :"$4"}},
           {:andalso, {:>, {:element, 2, :"$4"}, 0},
            {:andalso, {:is_integer, :"$5"},
@@ -929,6 +1005,105 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   defp track_binary_insert(_, _, _, _), do: :ok
+
+  defp fresh_no_expiry_location_records(entries, state, file_id, offset, threshold, lfu) do
+    fresh_no_expiry_location_records(
+      entries,
+      state,
+      file_id,
+      offset,
+      threshold,
+      lfu,
+      %{},
+      [],
+      0,
+      0
+    )
+  end
+
+  defp fresh_no_expiry_location_records(
+         [],
+         _state,
+         _file_id,
+         _offset,
+         _threshold,
+         _lfu,
+         _seen,
+         records,
+         binary_delta,
+         count
+       ) do
+    {:ok, records, binary_delta, count}
+  end
+
+  defp fresh_no_expiry_location_records(
+         [{key, value, 0} | rest],
+         %{keydir: keydir} = state,
+         file_id,
+         offset,
+         threshold,
+         lfu,
+         seen,
+         records,
+         binary_delta,
+         count
+       )
+       when is_binary(key) and is_binary(value) do
+    cond do
+      Map.has_key?(seen, key) ->
+        :fallback
+
+      :ets.lookup(keydir, key) != [] ->
+        :fallback
+
+      not fresh_string_put_without_compound_clear?(keydir, key) ->
+        :fallback
+
+      true ->
+        ets_value = value_for_ets(value, threshold)
+
+        fresh_no_expiry_location_records(
+          rest,
+          state,
+          file_id,
+          offset,
+          threshold,
+          lfu,
+          Map.put(seen, key, true),
+          [{key, ets_value, 0, lfu, file_id, offset, byte_size(value)} | records],
+          binary_delta + offheap_size(key) + offheap_size(ets_value),
+          count + 1
+        )
+    end
+  end
+
+  defp fresh_no_expiry_location_records(
+         _entries,
+         _state,
+         _file_id,
+         _offset,
+         _threshold,
+         _lfu,
+         _seen,
+         _records,
+         _binary_delta,
+         _count
+       ),
+       do: :fallback
+
+  defp fresh_string_put_without_compound_clear?(keydir, key) do
+    CompoundKey.internal_key?(key) or :ets.lookup(keydir, CompoundKey.type_key(key)) == []
+  end
+
+  defp add_keydir_binary_delta(
+         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx},
+         delta
+       )
+       when ref != nil and delta != 0 do
+    :atomics.add(ref, idx + 1, delta)
+  end
+
+  defp add_keydir_binary_delta(_, _), do: :ok
 
   defp adjust_expiry_for_insert(_state, [], 0), do: :ok
 

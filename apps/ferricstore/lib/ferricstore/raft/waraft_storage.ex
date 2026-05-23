@@ -23,32 +23,24 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @max_snapshot_metadata_bytes @max_storage_metadata_bytes
   @max_snapshot_install_marker_bytes @max_storage_metadata_bytes
   @version 1
-  @default_metadata_persist_every 128
   @default_metadata_compact_every 1024
-  @default_payload_fsync_every 20_000
   @cold_read_timeout_ms 10_000
   @zero_pos {:raft_log_pos, 0, 0}
   @encoded_peer_tag :ferricstore_waraft_peer
-  @replay_safe_nosync_apply :replay_safe_nosync
-  @bitcask_keydir_apply :bitcask_keydir
-  @segment_keydir_apply :segment_keydir
-  @default_storage_apply @bitcask_keydir_apply
   @segment_projection_registry :ferricstore_waraft_segment_projection_registry
   @storage_root "ferricstore_waraft_backend"
 
   defguardp valid_segment_backed_file_id(file_id)
             when is_tuple(file_id) and tuple_size(file_id) == 2 and
                    (elem(file_id, 0) == :waraft_segment or
-                      elem(file_id, 0) == :waraft_projection) and
+                      elem(file_id, 0) == :waraft_projection or
+                      elem(file_id, 0) == :waraft_apply_projection) and
                    is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0
 
   @type handle :: map()
 
   @spec validate_supported_apply_mode!() :: :ok
-  def validate_supported_apply_mode! do
-    _ = storage_apply_mode()
-    :ok
-  end
+  def validate_supported_apply_mode!, do: :ok
 
   @spec open(map(), charlist() | binary()) :: handle()
   def open(options, root_dir) do
@@ -73,6 +65,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
       ctx
       |> build_sm_state(shard_index)
       |> maybe_recover_segment_projected!(root_dir, metadata)
+      |> rebuild_indexes_from_segment_keydir(ctx, shard_index)
 
     %{
       options: options,
@@ -96,7 +89,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
       with :ok <- maybe_fsync_payload_before_metadata(handle) do
         clean_handle = Map.put(handle, :bitcask_dirty?, false)
 
-        if segment_bitcask_apply?() and not segment_keydir_available?(clean_handle) do
+        if not segment_keydir_available?(clean_handle) do
           :ok
         else
           persist_metadata(clean_handle, :compact)
@@ -134,30 +127,26 @@ defmodule Ferricstore.Raft.WARaftStorage do
       when is_integer(trim_index) and trim_index >= 0 do
     root_dir = to_path(root_dir)
 
-    if segment_bitcask_apply?() do
-      projection_root = segment_projection_root(root_dir)
+    projection_root = segment_projection_root(root_dir)
 
-      with {:ok, context} <- lookup_segment_projection_context(root_dir),
-           :ok <- validate_segment_projection_trim_position(context.position, trim_index),
-           {:ok, relocations} <-
-             collect_segment_projection_relocations(context.ctx, context.shard_index),
-           entries = segment_projection_entries_from_relocations(relocations),
-           :ok <-
-             write_segment_projection(
-               projection_root,
-               context.position,
-               entries
-             ),
-           :ok <-
-             relocate_segment_projection_keydir(
-               context.ctx,
-               context.shard_index,
-               projection_root,
-               relocations
-             ) do
-        :ok
-      end
-    else
+    with {:ok, context} <- lookup_segment_projection_context(root_dir),
+         :ok <- validate_segment_projection_trim_position(context.position, trim_index),
+         {:ok, relocations} <-
+           collect_segment_projection_relocations(context.ctx, context.shard_index),
+         entries = segment_projection_entries_from_relocations(relocations),
+         :ok <-
+           write_segment_projection(
+             projection_root,
+             context.position,
+             entries
+           ),
+         :ok <-
+           relocate_segment_projection_keydir(
+             context.ctx,
+             context.shard_index,
+             projection_root,
+             relocations
+           ) do
       :ok
     end
   end
@@ -353,7 +342,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
     do: persist_position(position, :ok, handle, maybe_update_label(handle, label_update))
 
   defp apply_command(command, position, handle, label_update) do
-    if segment_bitcask_apply?() do
+    if segment_keydir_apply?() do
       case apply_segment_projected_command(command, position, handle, label_update) do
         :unsupported ->
           apply_state_machine_command_and_persist(command, position, handle, label_update)
@@ -567,8 +556,30 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp segment_project_command({:put_batch, entries}, position, sm_state) when is_list(entries) do
     file_id = {:waraft_segment, position_index(position)}
     offset = segment_record_offset(sm_state, position)
+    shard_state = shard_ets_state_from_sm(sm_state)
+    threshold = ShardETS.hot_cache_threshold(shard_state)
 
-    apply_segment_put_batch_entries(entries, sm_state, file_id, offset, 0)
+    case ShardETS.ets_insert_fresh_no_expiry_many_with_location(
+           shard_state,
+           entries,
+           file_id,
+           offset,
+           threshold
+         ) do
+      {:ok, count} ->
+        {:ok, sm_state, {:ok, List.duplicate(:ok, count)}, count}
+
+      :fallback ->
+        apply_segment_put_batch_entries(
+          entries,
+          sm_state,
+          shard_state,
+          threshold,
+          file_id,
+          offset,
+          0
+        )
+    end
   end
 
   defp segment_project_command({:put_blob_batch, entries}, position, sm_state)
@@ -697,8 +708,63 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_project_command({:batch, commands}, position, sm_state) when is_list(commands) do
-    commands = Enum.map(commands, &decoded_replay_command/1)
+    case segment_project_decode_batch(commands, :unknown, [], []) do
+      {:put_batch, entries} ->
+        segment_project_command({:put_batch, entries}, position, sm_state)
 
+      {:delete_batch, keys} ->
+        segment_project_command({:delete_batch, keys}, position, sm_state)
+
+      {:generic, commands} ->
+        segment_project_generic_batch(commands, position, sm_state)
+    end
+  end
+
+  defp segment_project_command(_command, _position, _sm_state), do: :unsupported
+
+  defp segment_project_decode_batch([], :put, _decoded_acc, entries) do
+    {:put_batch, Enum.reverse(entries)}
+  end
+
+  defp segment_project_decode_batch([], :delete, _decoded_acc, keys) do
+    {:delete_batch, Enum.reverse(keys)}
+  end
+
+  defp segment_project_decode_batch([], _kind, decoded_acc, _fast_acc) do
+    {:generic, Enum.reverse(decoded_acc)}
+  end
+
+  defp segment_project_decode_batch([command | rest], kind, decoded_acc, fast_acc) do
+    decoded = decoded_replay_command(command)
+
+    case {kind, decoded} do
+      {:unknown, {:put, key, value, expire_at_ms}}
+      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+        segment_project_decode_batch(rest, :put, [decoded | decoded_acc], [
+          {key, value, expire_at_ms} | fast_acc
+        ])
+
+      {:put, {:put, key, value, expire_at_ms}}
+      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+        segment_project_decode_batch(rest, :put, [decoded | decoded_acc], [
+          {key, value, expire_at_ms} | fast_acc
+        ])
+
+      {:unknown, {:delete, key}} when is_binary(key) ->
+        segment_project_decode_batch(rest, :delete, [decoded | decoded_acc], [key | fast_acc])
+
+      {:delete, {:delete, key}} when is_binary(key) ->
+        segment_project_decode_batch(rest, :delete, [decoded | decoded_acc], [key | fast_acc])
+
+      {:generic, _decoded} ->
+        segment_project_decode_batch(rest, :generic, [decoded | decoded_acc], [])
+
+      {_homogeneous, _decoded} ->
+        segment_project_decode_batch(rest, :generic, [decoded | decoded_acc], [])
+    end
+  end
+
+  defp segment_project_generic_batch(commands, position, sm_state) do
     if Enum.all?(commands, &segment_projectable_batch_command?(sm_state, &1)) do
       Enum.reduce_while(commands, {sm_state, [], 0}, fn command,
                                                         {acc_state, acc_results, acc_count} ->
@@ -722,8 +788,6 @@ defmodule Ferricstore.Raft.WARaftStorage do
       :unsupported
     end
   end
-
-  defp segment_project_command(_command, _position, _sm_state), do: :unsupported
 
   defp segment_projectable_batch_command?(sm_state, {:put, key, value, expire_at_ms}),
     do: segment_projectable_put?(sm_state, key, value, expire_at_ms)
@@ -758,13 +822,23 @@ defmodule Ferricstore.Raft.WARaftStorage do
     is_binary(key) and is_binary(value) and non_neg_integer?(expire_at_ms)
   end
 
-  defp apply_segment_put_batch_entries([], sm_state, _file_id, _offset, count) do
+  defp apply_segment_put_batch_entries(
+         [],
+         sm_state,
+         _shard_state,
+         _threshold,
+         _file_id,
+         _offset,
+         count
+       ) do
     {:ok, sm_state, {:ok, List.duplicate(:ok, count)}, count}
   end
 
   defp apply_segment_put_batch_entries(
          [{key, value, expire_at_ms} | rest],
          sm_state,
+         shard_state,
+         threshold,
          file_id,
          offset,
          count
@@ -772,12 +846,37 @@ defmodule Ferricstore.Raft.WARaftStorage do
        when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
               expire_at_ms >= 0 do
     sm_state =
-      segment_project_put_at_location(sm_state, key, value, expire_at_ms, file_id, offset)
+      segment_project_put_at_location(
+        sm_state,
+        shard_state,
+        threshold,
+        key,
+        value,
+        expire_at_ms,
+        file_id,
+        offset
+      )
 
-    apply_segment_put_batch_entries(rest, sm_state, file_id, offset, count + 1)
+    apply_segment_put_batch_entries(
+      rest,
+      sm_state,
+      shard_state,
+      threshold,
+      file_id,
+      offset,
+      count + 1
+    )
   end
 
-  defp apply_segment_put_batch_entries(_invalid, _sm_state, _file_id, _offset, _count) do
+  defp apply_segment_put_batch_entries(
+         _invalid,
+         _sm_state,
+         _shard_state,
+         _threshold,
+         _file_id,
+         _offset,
+         _count
+       ) do
     :unsupported
   end
 
@@ -931,6 +1030,30 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
   defp segment_project_put_at_location(sm_state, key, value, expire_at_ms, file_id, offset) do
     shard_state = shard_ets_state_from_sm(sm_state)
+    threshold = ShardETS.hot_cache_threshold(shard_state)
+
+    segment_project_put_at_location(
+      sm_state,
+      shard_state,
+      threshold,
+      key,
+      value,
+      expire_at_ms,
+      file_id,
+      offset
+    )
+  end
+
+  defp segment_project_put_at_location(
+         sm_state,
+         shard_state,
+         threshold,
+         key,
+         value,
+         expire_at_ms,
+         file_id,
+         offset
+       ) do
     previous = :ets.lookup(shard_state.keydir, key)
     sm_state = segment_project_clear_compound_for_string_put(sm_state, key, previous)
 
@@ -943,7 +1066,8 @@ defmodule Ferricstore.Raft.WARaftStorage do
         file_id,
         offset,
         byte_size(value),
-        previous
+        previous,
+        threshold
       )
 
     sm_state
@@ -1266,20 +1390,54 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp apply_state_machine_command(command, position, sm_state) do
     meta = meta_from_position(position)
 
-    if replay_safe_nosync_apply?() do
-      StateMachine.apply_waraft_storage_command(command, meta, sm_state)
+    StateMachine.apply_waraft_segment_command(command, meta, sm_state, fn batch ->
+      write_apply_projection_batch(sm_state, position, batch)
+    end)
+  end
+
+  defp write_apply_projection_batch(sm_state, position, batch) do
+    index = position_index(position)
+
+    if index > 0 do
+      entries = apply_projection_entries(batch)
+      file_id = {:waraft_apply_projection, index}
+
+      :ok = cache_apply_projection_entries(sm_state, index, entries)
+      {:ok, file_id, apply_projection_locations(batch, 0)}
     else
-      StateMachine.apply_standalone_command(command, meta, sm_state)
+      {:error, {:bad_waraft_projection_position, position}}
     end
   end
 
-  defp maybe_mark_bitcask_dirty(handle) do
-    if replay_safe_nosync_apply?() do
-      %{handle | bitcask_dirty?: true}
-    else
-      handle
-    end
+  defp cache_apply_projection_entries(_sm_state, _index, []), do: :ok
+
+  defp cache_apply_projection_entries(sm_state, index, entries) do
+    Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+      sm_state.data_dir,
+      sm_state.shard_index,
+      index,
+      entries
+    )
   end
+
+  defp apply_projection_entries(batch) do
+    batch
+    |> Enum.flat_map(fn
+      {:put, key, value, expire_at_ms} -> [{key, value, expire_at_ms}]
+      {:put_cold, key, value, expire_at_ms, _lfu} -> [{key, value, expire_at_ms}]
+      {:delete, _key, _prob_path} -> []
+    end)
+  end
+
+  defp apply_projection_locations(batch, offset) do
+    Enum.map(batch, fn
+      {:put, _key, value, _expire_at_ms} -> {:put, offset, byte_size(value)}
+      {:put_cold, _key, value, _expire_at_ms, _lfu} -> {:put, offset, byte_size(value)}
+      {:delete, key, _prob_path} -> {:delete, offset, byte_size(key)}
+    end)
+  end
+
+  defp maybe_mark_bitcask_dirty(handle), do: handle
 
   defp maybe_update_label(handle, :keep_label), do: handle
   defp maybe_update_label(handle, {:replace_label, label}), do: %{handle | label: label}
@@ -1415,34 +1573,15 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp persist_metadata_for_hot_position(_old_handle, new_handle) do
-    cond do
-      replay_safe_nosync_apply?() ->
-        persist_replay_safe_nosync_position(new_handle)
-
-      storage_metadata_persist_due?(new_handle) ->
-        case persist_metadata(new_handle) do
-          :ok -> {:ok, new_handle}
-          {:error, _reason} = error -> error
-        end
-
-      true ->
-        :skipped
-    end
-  end
-
-  defp persist_replay_safe_nosync_position(%{bitcask_dirty?: true} = new_handle) do
-    if replay_safe_nosync_frontier_due?(new_handle) do
-      with :ok <- maybe_fsync_payload_before_metadata(new_handle),
-           persisted_handle = Map.put(new_handle, :bitcask_dirty?, false),
-           :ok <- persist_metadata(persisted_handle) do
-        {:ok, persisted_handle}
+    if storage_metadata_persist_due?(new_handle) do
+      case persist_metadata(new_handle) do
+        :ok -> {:ok, new_handle}
+        {:error, _reason} = error -> error
       end
     else
       :skipped
     end
   end
-
-  defp persist_replay_safe_nosync_position(_new_handle), do: :skipped
 
   defp mark_metadata_persisted(%{position: position} = handle),
     do: %{handle | persisted_position: position, last_clean_position: position}
@@ -1468,52 +1607,13 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp storage_metadata_persist_every do
-    case Application.fetch_env(:ferricstore, :waraft_storage_metadata_persist_every) do
-      {:ok, interval} ->
-        interval
-
-      :error ->
-        if segment_bitcask_apply?() do
-          :never
-        else
-          @default_metadata_persist_every
-        end
-    end
+    Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every, :never)
   end
 
-  defp replay_safe_nosync_apply? do
-    storage_apply_mode() in [@bitcask_keydir_apply, @replay_safe_nosync_apply]
-  end
-
-  defp segment_bitcask_apply?, do: storage_apply_mode() == @segment_keydir_apply
-
-  defp storage_apply_mode do
-    case Application.get_env(:ferricstore, :waraft_storage_apply_mode, @default_storage_apply) do
-      :segment_bitcask ->
-        raise ArgumentError,
-              "WARaft segment projection storage mode was removed; use :bitcask_keydir"
-
-      :segment_projected ->
-        raise ArgumentError,
-              "WARaft segment projection storage mode was removed; use :bitcask_keydir"
-
-      @segment_keydir_apply ->
-        @segment_keydir_apply
-
-      @bitcask_keydir_apply ->
-        @bitcask_keydir_apply
-
-      @replay_safe_nosync_apply ->
-        @replay_safe_nosync_apply
-
-      mode ->
-        raise ArgumentError,
-              "unsupported WARaft storage apply mode #{inspect(mode)}; expected :bitcask_keydir, :replay_safe_nosync, or :segment_keydir"
-    end
-  end
+  defp segment_keydir_apply?, do: true
 
   defp register_segment_projection_context(%{root_dir: root_dir} = handle) do
-    if segment_bitcask_apply?() do
+    if segment_keydir_apply?() do
       ensure_segment_projection_registry!()
       key = segment_projection_registry_key(root_dir)
 
@@ -1619,26 +1719,6 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_projection_registry_key(root_dir), do: root_dir |> Path.expand() |> to_string()
-
-  defp replay_safe_nosync_frontier_due?(new_handle) do
-    interval =
-      Application.get_env(
-        :ferricstore,
-        :waraft_bitcask_payload_fsync_every,
-        @default_payload_fsync_every
-      )
-
-    case {interval, Map.get(new_handle, :position)} do
-      {:never, _position} ->
-        false
-
-      {interval, {:raft_log_pos, index, _term}} when is_integer(interval) and interval > 0 ->
-        rem(index, interval) == 0
-
-      {_other, _position} ->
-        true
-    end
-  end
 
   defp maybe_fsync_payload_before_metadata(%{bitcask_dirty?: true} = handle) do
     start = System.monotonic_time()
@@ -1762,7 +1842,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp maybe_recover_segment_projected!(sm_state, root_dir, metadata) do
-    if segment_bitcask_apply?() do
+    if segment_keydir_apply?() do
       position = Map.get(metadata, :position, @zero_pos)
 
       with {:ok, projected_sm_state, replay_after_index} <-
@@ -1782,6 +1862,25 @@ defmodule Ferricstore.Raft.WARaftStorage do
     else
       sm_state
     end
+  end
+
+  defp rebuild_indexes_from_segment_keydir(
+         %{ets: keydir, shard_data_path: shard_data_path} = sm_state,
+         ctx,
+         shard_index
+       ) do
+    Ferricstore.Flow.LMDBRebuilder.rebuild_active_indexes_from_keydir(
+      shard_data_path,
+      keydir,
+      shard_index,
+      ctx,
+      sm_state.zset_score_index_name,
+      sm_state.zset_score_lookup_name,
+      sm_state.flow_index_name,
+      sm_state.flow_lookup_name
+    )
+
+    sm_state
   end
 
   defp recover_segment_projection_log(root_dir, sm_state, metadata_position) do
@@ -1946,7 +2045,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
          position: position,
          sm_state: sm_state
        }) do
-    if segment_bitcask_apply?() do
+    if segment_keydir_apply?() do
       with {:ok, entries} <- collect_segment_projected_entries_strict(sm_state) do
         root_dir
         |> segment_projection_root()
@@ -2310,7 +2409,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp segment_projection_root(root_dir), do: Path.join(root_dir, @segment_projection_dir)
 
   defp maybe_write_snapshot_segment_projection(snapshot_path, handle) do
-    if segment_bitcask_apply?() do
+    if segment_keydir_apply?() do
       with {:ok, entries} <- collect_segment_projected_entries_strict(handle.sm_state) do
         case entries do
           [] ->
@@ -2987,7 +3086,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_log_payload_empty?(storage_root) do
-    if segment_bitcask_apply?() do
+    if segment_keydir_apply?() do
       storage_root
       |> Path.join("segment_log")
       |> dir_payload_empty()
@@ -3638,7 +3737,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
     end
   end
 
-  defp copy_dedicated_payload?, do: not segment_bitcask_apply?()
+  defp copy_dedicated_payload?, do: not segment_keydir_apply?()
 
   defp stage_snapshot_dirs(snapshot_path, staging_root, handle, empty_payload_dirs) do
     empty_payload_dirs = MapSet.new(empty_payload_dirs)

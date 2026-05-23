@@ -35,9 +35,14 @@ defmodule FerricstoreServer.Connection.PubSub do
          {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}
        ), state}
     else
+      channels
+      |> MapSet.new()
+      |> MapSet.difference(state.pubsub_channels)
+      |> MapSet.to_list()
+      |> PS.subscribe_many(self())
+
       {responses, new_state} =
         Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
-          unless MapSet.member?(st.pubsub_channels, ch), do: PS.subscribe(ch, self())
           new_channels = MapSet.put(st.pubsub_channels, ch)
           new_st = %{st | pubsub_channels: new_channels}
           count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
@@ -63,10 +68,10 @@ defmodule FerricstoreServer.Connection.PubSub do
 
   def dispatch_unsubscribe(channels, state) do
     state = ensure_pubsub_sets(state)
+    PS.unsubscribe_many(channels, self())
 
     {responses, new_state} =
       Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
-        PS.unsubscribe(ch, self())
         new_channels = MapSet.delete(st.pubsub_channels, ch)
         new_st = %{st | pubsub_channels: new_channels}
         count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
@@ -100,9 +105,14 @@ defmodule FerricstoreServer.Connection.PubSub do
          {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}
        ), state}
     else
+      patterns
+      |> MapSet.new()
+      |> MapSet.difference(state.pubsub_patterns)
+      |> MapSet.to_list()
+      |> PS.psubscribe_many(self())
+
       {responses, new_state} =
         Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
-          unless MapSet.member?(st.pubsub_patterns, pat), do: PS.psubscribe(pat, self())
           new_patterns = MapSet.put(st.pubsub_patterns, pat)
           new_st = %{st | pubsub_patterns: new_patterns}
           count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
@@ -128,10 +138,10 @@ defmodule FerricstoreServer.Connection.PubSub do
 
   def dispatch_punsubscribe(patterns, state) do
     state = ensure_pubsub_sets(state)
+    PS.punsubscribe_many(patterns, self())
 
     {responses, new_state} =
       Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
-        PS.punsubscribe(pat, self())
         new_patterns = MapSet.delete(st.pubsub_patterns, pat)
         new_st = %{st | pubsub_patterns: new_patterns}
         count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)

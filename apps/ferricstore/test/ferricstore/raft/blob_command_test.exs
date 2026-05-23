@@ -292,6 +292,74 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     refute_received {:blob_fsync_file, _}
   end
 
+  test "prepares Flow transition payloads as pre-externalized value refs", %{
+    ctx: ctx,
+    root: root
+  } do
+    payload = :binary.copy("F", 1024)
+
+    command =
+      {:flow_transition_many, nil,
+       %{
+         records: [
+           %{
+             id: "flow-1",
+             from_state: "running",
+             to_state: "next",
+             fencing_token: 3,
+             payload: payload
+           }
+         ]
+       }}
+
+    assert BlobCommand.side_channel_candidate?(ctx, command)
+
+    assert {:ok,
+            {:flow_transition_many, nil,
+             %{
+               records: [
+                 %{
+                   payload: marker
+                 }
+               ]
+             }}} = BlobCommand.prepare(ctx, 0, command, single_member?: true)
+
+    assert_flow_blob_marker(root, marker, payload)
+  end
+
+  test "prepares Flow create, complete, and fail values in one generic batch", %{
+    ctx: ctx,
+    root: root
+  } do
+    payload = :binary.copy("P", 1024)
+    result = :binary.copy("R", 1024)
+    error = :binary.copy("E", 1024)
+
+    command =
+      {:batch,
+       [
+         {:flow_create, nil, %{id: "flow-create", type: "bench", payload: payload}},
+         {:flow_complete, nil,
+          %{id: "flow-complete", lease_token: "lease", fencing_token: 1, result: result}},
+         {:flow_fail, nil,
+          %{id: "flow-fail", lease_token: "lease", fencing_token: 1, error: error}}
+       ]}
+
+    assert BlobCommand.side_channel_candidate?(ctx, command)
+
+    assert {:ok,
+            {:batch,
+             [
+               {:flow_create, nil, %{payload: payload_marker}},
+               {:flow_complete, nil, %{result: result_marker}},
+               {:flow_fail, nil, %{error: error_marker}}
+             ]}} = BlobCommand.prepare(ctx, 0, command, single_member?: true)
+
+    assert_flow_blob_marker(root, payload_marker, payload)
+    assert_flow_blob_marker(root, result_marker, result)
+    assert_flow_blob_marker(root, error_marker, error)
+  end
+
   test "prepares nested put_batch inside generic Ra batches", %{ctx: ctx, root: root} do
     payload = :binary.copy("N", 1024)
 
@@ -397,5 +465,12 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert stored_ref != encoded_ref
     assert {:ok, stored_blob_ref} = BlobRef.decode(stored_ref)
     assert {:ok, ^encoded_ref} = BlobStore.get(root, 0, stored_blob_ref)
+  end
+
+  defp assert_flow_blob_marker(root, marker, expected_value) do
+    assert {:ok, encoded_ref} = BlobCommand.flow_blob_value_ref(marker)
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, encoded_value} = BlobStore.get(root, 0, ref)
+    assert Ferricstore.Flow.decode_value(encoded_value) == expected_value
   end
 end

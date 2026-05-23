@@ -391,6 +391,14 @@ defmodule Ferricstore.Commands.TopKTest do
       assert result == ["b", 50, "a", 10]
     end
 
+    test "LIST WITHCOUNT flattens NIF count results in one pass" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/topk.ex", __DIR__))
+
+      assert source =~ "topk_items_with_counts(items, counts, [])"
+      refute source =~ "Enum.zip(items, counts)"
+      refute source =~ "Enum.flat_map(fn {elem, count} -> [elem, count] end)"
+    end
+
     test "LIST WITHCOUNT option is case-insensitive" do
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "5"], store)

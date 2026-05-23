@@ -58,7 +58,8 @@ defmodule Ferricstore.Store.Router do
   defguardp valid_waraft_segment_location(file_id, offset, value_size)
             when is_tuple(file_id) and tuple_size(file_id) == 2 and
                    (elem(file_id, 0) == :waraft_segment or
-                      elem(file_id, 0) == :waraft_projection) and
+                      elem(file_id, 0) == :waraft_projection or
+                      elem(file_id, 0) == :waraft_apply_projection) and
                    is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
                    is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
@@ -3389,16 +3390,17 @@ defmodule Ferricstore.Store.Router do
   defp waraft_batch_commands(_ctx, []), do: []
 
   defp waraft_batch_commands(ctx, keyed_commands) do
-    {by_shard, count} =
-      Enum.reduce(keyed_commands, {%{}, 0}, fn {key, command}, {shards, i} ->
+    {buckets, count} =
+      Enum.reduce(keyed_commands, {new_waraft_batch_buckets(ctx.shard_count), 0}, fn {key,
+                                                                                      command},
+                                                                                     {buckets, i} ->
         idx = shard_for(ctx, key)
-        {commands, indices} = Map.get(shards, idx, {[], []})
-        {Map.put(shards, idx, {[command | commands], [i | indices]}), i + 1}
+        {put_waraft_batch_bucket(buckets, idx, command, i), i + 1}
       end)
 
     collect_waraft_shard_batches(
       ctx,
-      by_shard,
+      waraft_batch_groups(buckets, ctx.shard_count),
       count,
       &Ferricstore.Raft.Backend.write_batch/2,
       &{:batch, &1}
@@ -3408,69 +3410,182 @@ defmodule Ferricstore.Store.Router do
   defp waraft_batch_put_entries(_ctx, []), do: []
 
   defp waraft_batch_put_entries(ctx, entries) do
-    {by_shard, count} =
-      Enum.reduce(entries, {%{}, 0}, fn entry, {shards, i} ->
+    {buckets, count} =
+      Enum.reduce(entries, {new_waraft_batch_buckets(ctx.shard_count), 0}, fn entry,
+                                                                              {buckets, i} ->
         {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
         idx = shard_for(ctx, key)
-        {entries_acc, indices} = Map.get(shards, idx, {[], []})
-
-        {
-          Map.put(shards, idx, {[{key, value, expire_at_ms} | entries_acc], [i | indices]}),
-          i + 1
-        }
+        {put_waraft_batch_bucket(buckets, idx, {key, value, expire_at_ms}, i), i + 1}
       end)
 
-    collect_waraft_shard_batches(
+    collect_waraft_hot_shard_batches(
       ctx,
-      by_shard,
+      waraft_batch_groups(buckets, ctx.shard_count),
       count,
-      &Ferricstore.Raft.Backend.write_put_batch/2,
-      &{:put_batch, &1}
+      &Ferricstore.Raft.WARaftBackend.write_put_batch_async/3,
+      &Ferricstore.Raft.Backend.write_put_batch/2
     )
   end
 
   defp waraft_batch_delete_keys(_ctx, []), do: []
 
   defp waraft_batch_delete_keys(ctx, keys) do
-    {by_shard, count} =
-      Enum.reduce(keys, {%{}, 0}, fn key, {shards, i} ->
+    {buckets, count} =
+      Enum.reduce(keys, {new_waraft_batch_buckets(ctx.shard_count), 0}, fn key, {buckets, i} ->
         idx = shard_for(ctx, key)
-        {keys_acc, indices} = Map.get(shards, idx, {[], []})
-        {Map.put(shards, idx, {[key | keys_acc], [i | indices]}), i + 1}
+        {put_waraft_batch_bucket(buckets, idx, key, i), i + 1}
       end)
 
-    collect_waraft_shard_batches(
+    collect_waraft_hot_shard_batches(
       ctx,
-      by_shard,
+      waraft_batch_groups(buckets, ctx.shard_count),
       count,
-      &Ferricstore.Raft.Backend.write_delete_batch/2,
-      &{:delete_batch, &1}
+      &Ferricstore.Raft.WARaftBackend.write_delete_batch_async/3,
+      &Ferricstore.Raft.Backend.write_delete_batch/2
     )
   end
 
-  defp collect_waraft_shard_batches(ctx, by_shard, count, submit_fun, _command_fun) do
+  defp new_waraft_batch_buckets(shard_count) when is_integer(shard_count) and shard_count > 0,
+    do: :erlang.make_tuple(shard_count, {[], []})
+
+  defp put_waraft_batch_bucket(buckets, shard_idx, item, index) do
+    {items, indices} = elem(buckets, shard_idx)
+    put_elem(buckets, shard_idx, {[item | items], [index | indices]})
+  end
+
+  defp waraft_batch_groups(buckets, shard_count) do
+    0..(shard_count - 1)
+    |> Enum.reduce([], fn shard_idx, acc ->
+      case elem(buckets, shard_idx) do
+        {[], []} ->
+          acc
+
+        {items, indices} ->
+          [{shard_idx, Enum.reverse(items), Enum.reverse(indices)} | acc]
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp collect_waraft_shard_batches(ctx, groups, count, submit_fun, _command_fun) do
     results =
-      if map_size(by_shard) == 1 do
-        Enum.reduce(by_shard, %{}, fn {shard_idx, {items, indices}}, acc ->
-          items = Enum.reverse(items)
-          indices = Enum.reverse(indices)
+      case groups do
+        [{shard_idx, items, indices}] ->
           result = submit_fun.(shard_idx, items)
-          merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
-        end)
-      else
-        by_shard
-        |> Enum.map(fn {shard_idx, {items, indices}} ->
-          items = Enum.reverse(items)
-          indices = Enum.reverse(indices)
-          {shard_idx, indices, Task.async(fn -> submit_fun.(shard_idx, items) end)}
-        end)
-        |> Enum.reduce(%{}, fn {shard_idx, indices, task}, acc ->
-          result = Task.await(task, 30_000)
-          merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
-        end)
+
+          merge_waraft_batch_results(
+            ctx,
+            shard_idx,
+            indices,
+            result,
+            new_waraft_result_tuple(count)
+          )
+
+        _ ->
+          groups
+          |> Enum.map(fn {shard_idx, items, indices} ->
+            {shard_idx, indices, Task.async(fn -> submit_fun.(shard_idx, items) end)}
+          end)
+          |> Enum.reduce(new_waraft_result_tuple(count), fn {shard_idx, indices, task}, acc ->
+            result = Task.await(task, 30_000)
+            merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
+          end)
       end
 
-    ordered_batch_results(results, count)
+    Tuple.to_list(results)
+  end
+
+  defp collect_waraft_hot_shard_batches(ctx, groups, count, submit_async_fun, submit_sync_fun) do
+    results =
+      case groups do
+        [{shard_idx, items, indices}] ->
+          result = submit_sync_fun.(shard_idx, items)
+
+          merge_waraft_hot_batch_results(
+            ctx,
+            shard_idx,
+            indices,
+            result,
+            new_waraft_result_tuple(count)
+          )
+
+        _ ->
+          {token_meta_pairs, results} =
+            Enum.reduce(groups, {[], new_waraft_result_tuple(count)}, fn {shard_idx, items,
+                                                                          indices},
+                                                                         {tokens, acc} ->
+              {from, token} = ReplyAwaiter.new()
+
+              case submit_async_fun.(shard_idx, items, from) do
+                :ok ->
+                  {[{token, {shard_idx, indices}} | tokens], acc}
+
+                {:direct, result} ->
+                  {tokens, merge_waraft_hot_batch_results(ctx, shard_idx, indices, result, acc)}
+
+                result ->
+                  {tokens, merge_waraft_hot_batch_results(ctx, shard_idx, indices, result, acc)}
+              end
+            end)
+
+          {_status, replies, _unresolved} =
+            token_meta_pairs
+            |> Enum.reverse()
+            |> ReplyAwaiter.collect_tagged(30_000)
+
+          Enum.reduce(replies, results, fn {{shard_idx, indices}, result}, acc ->
+            merge_waraft_hot_batch_results(ctx, shard_idx, indices, result, acc)
+          end)
+      end
+
+    Tuple.to_list(results)
+  end
+
+  defp merge_waraft_hot_batch_results(ctx, shard_idx, indices, {:ok, values}, acc)
+       when is_list(values) do
+    case put_waraft_hot_batch_results(indices, values, acc) do
+      {:ok, results, ok_count} ->
+        if ok_count > 0 do
+          bump_write_version(ctx, shard_idx, ok_count)
+        end
+
+        results
+
+      {:error, expected, actual} ->
+        merge_waraft_batch_results(
+          ctx,
+          shard_idx,
+          indices,
+          {:error, {:batch_result_mismatch, expected, actual}},
+          acc
+        )
+    end
+  end
+
+  defp merge_waraft_hot_batch_results(ctx, shard_idx, indices, result, acc) do
+    merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
+  end
+
+  defp put_waraft_hot_batch_results(indices, values, acc) do
+    put_waraft_hot_batch_results(indices, values, acc, 0, 0)
+  end
+
+  defp put_waraft_hot_batch_results([], [], acc, ok_count, _seen),
+    do: {:ok, acc, ok_count}
+
+  defp put_waraft_hot_batch_results([index | indices], [value | values], acc, ok_count, seen) do
+    ok_count =
+      if value == :ok or not match?({:error, _}, value) do
+        ok_count + 1
+      else
+        ok_count
+      end
+
+    put_waraft_hot_batch_results(indices, values, put_elem(acc, index, value), ok_count, seen + 1)
+  end
+
+  defp put_waraft_hot_batch_results(indices, values, _acc, _ok_count, seen) do
+    {:error, seen + length(indices), seen + length(values)}
   end
 
   defp merge_waraft_batch_results(ctx, shard_idx, indices, result, acc) do
@@ -3489,15 +3604,11 @@ defmodule Ferricstore.Store.Router do
 
     indices
     |> Enum.zip(results)
-    |> Enum.reduce(acc, fn {index, value}, next -> Map.put(next, index, value) end)
+    |> Enum.reduce(acc, fn {index, value}, results -> put_elem(results, index, value) end)
   end
 
-  defp ordered_batch_results(_results, 0), do: []
-
-  defp ordered_batch_results(results, count) do
-    Enum.map(0..(count - 1), fn index ->
-      Map.get(results, index, ErrorReasons.write_timeout_unknown())
-    end)
+  defp new_waraft_result_tuple(count) when is_integer(count) and count >= 0 do
+    :erlang.make_tuple(count, ErrorReasons.write_timeout_unknown())
   end
 
   defp do_batch_quorum_put_entries(ctx, entries, origin_node) do
@@ -4216,24 +4327,23 @@ defmodule Ferricstore.Store.Router do
               :flow_retry_many,
               :flow_transition_many
             ] do
-    indexed =
-      attrs_list
-      |> Enum.with_index()
-      |> Enum.map(fn {%{id: id, partition_key: partition_key} = attrs, idx}
-                     when is_binary(id) and is_binary(partition_key) ->
-        key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-        shard_idx = shard_for(ctx, key)
-        {idx, shard_idx, attrs}
+    {buckets, count} =
+      Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+        %{id: id, partition_key: partition_key} = attrs, {buckets, idx}
+        when is_binary(id) and is_binary(partition_key) ->
+          key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+          shard_idx = shard_for(ctx, key)
+
+          {flow_put_shard_bucket(buckets, shard_idx, {idx, attrs}), idx + 1}
       end)
 
     groups =
-      indexed
-      |> Enum.group_by(fn {_idx, shard_idx, _attrs} -> shard_idx end)
-      |> Enum.map(fn {shard_idx, group} ->
-        attrs = Enum.map(group, fn {_idx, _shard_idx, attrs} -> attrs end)
+      flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+        group = Enum.reverse(entries)
+        attrs = Enum.map(group, fn {_idx, attrs} -> attrs end)
         partition_key = attrs |> hd() |> Map.fetch!(:partition_key)
         key = Ferricstore.Flow.Keys.state_key(batch_id, partition_key)
-        original_indices = Enum.map(group, fn {idx, _shard_idx, _attrs} -> idx end)
+        original_indices = Enum.map(group, fn {idx, _attrs} -> idx end)
         {shard_idx, key, original_indices, {command, key, %{records: attrs}}}
       end)
 
@@ -4242,12 +4352,12 @@ defmodule Ferricstore.Store.Router do
          end) do
       {_shard_idx, _key, indices, _cmd} ->
         error = {:error, "ERR key too large (max #{@max_key_size} bytes)"}
-        {:ok, flow_many_error_results(length(indexed), indices, error)}
+        {:ok, flow_many_error_results(count, indices, error)}
 
       nil ->
         keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
         group_results = batch_quorum_commands(ctx, keyed_commands)
-        expand_flow_many_results(length(indexed), groups, group_results)
+        expand_flow_many_results(count, groups, group_results)
     end
   end
 
@@ -4444,7 +4554,7 @@ defmodule Ferricstore.Store.Router do
     results
     |> Enum.reduce_while({:ok, []}, fn
       {:ok, records}, {:ok, acc} when is_list(records) ->
-        {:cont, {:ok, acc ++ records}}
+        {:cont, {:ok, Enum.reverse(records, acc)}}
 
       {:error, _reason} = error, {:ok, _acc} ->
         {:halt, error}
@@ -4453,7 +4563,7 @@ defmodule Ferricstore.Store.Router do
         {:halt, other}
     end)
     |> case do
-      {:ok, records} -> {:ok, Enum.take(records, limit)}
+      {:ok, records} -> {:ok, records |> Enum.reverse() |> Enum.take(limit)}
       other -> other
     end
   end
@@ -5246,23 +5356,17 @@ defmodule Ferricstore.Store.Router do
   def flow_create_pipeline_batch(_ctx, []), do: []
 
   def flow_create_pipeline_batch(ctx, attrs_list) when is_list(attrs_list) do
-    {by_shard, count} =
-      attrs_list
-      |> Enum.with_index()
-      |> Enum.reduce({%{}, 0}, fn {%{id: id} = attrs, index}, {groups, count} ->
-        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
-        shard_idx = shard_for(ctx, key)
+    {buckets, count} =
+      Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+        %{id: id} = attrs, {buckets, index} ->
+          key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+          shard_idx = shard_for(ctx, key)
 
-        groups =
-          Map.update(groups, shard_idx, [{index, key, attrs}], fn acc ->
-            [{index, key, attrs} | acc]
-          end)
-
-        {groups, max(count, index + 1)}
+          {flow_put_shard_bucket(buckets, shard_idx, {index, key, attrs}), index + 1}
       end)
 
     groups =
-      Enum.map(by_shard, fn {shard_idx, entries} ->
+      flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
         entries = Enum.reverse(entries)
         {indices, keys, attrs} = flow_create_pipeline_entries(entries, [], [], [])
         route_key = List.first(keys)
@@ -5274,10 +5378,12 @@ defmodule Ferricstore.Store.Router do
     keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
     group_results = batch_quorum_commands(ctx, keyed_commands)
 
-    indexed_results =
+    results =
       groups
       |> Enum.zip(group_results)
-      |> Enum.reduce(%{}, fn {{_shard_idx, _route_key, indices, _cmd}, result}, acc ->
+      |> Enum.reduce(flow_result_tuple(count), fn {{_shard_idx, _route_key, indices, _cmd},
+                                                   result},
+                                                  results ->
         group_results =
           case result do
             result when is_list(result) and length(result) == length(indices) -> result
@@ -5286,14 +5392,12 @@ defmodule Ferricstore.Store.Router do
 
         indices
         |> Enum.zip(group_results)
-        |> Enum.reduce(acc, fn {index, result}, result_acc ->
-          Map.put(result_acc, index, result)
+        |> Enum.reduce(results, fn {index, result}, results ->
+          put_elem(results, index, result)
         end)
       end)
 
-    for index <- 0..(count - 1) do
-      Map.get(indexed_results, index, ErrorReasons.write_timeout_unknown())
-    end
+    Tuple.to_list(results)
   end
 
   defp flow_create_pipeline_entries([], indices, keys, attrs) do
@@ -5302,6 +5406,28 @@ defmodule Ferricstore.Store.Router do
 
   defp flow_create_pipeline_entries([{index, key, record_attrs} | rest], indices, keys, attrs) do
     flow_create_pipeline_entries(rest, [index | indices], [key | keys], [record_attrs | attrs])
+  end
+
+  defp flow_fixed_shard_buckets(shard_count) when is_integer(shard_count) and shard_count > 0,
+    do: :erlang.make_tuple(shard_count, [])
+
+  defp flow_put_shard_bucket(buckets, shard_idx, entry) do
+    put_elem(buckets, shard_idx, [entry | elem(buckets, shard_idx)])
+  end
+
+  defp flow_nonempty_shard_buckets(buckets, shard_count, fun) do
+    0..(shard_count - 1)
+    |> Enum.reduce([], fn shard_idx, acc ->
+      case elem(buckets, shard_idx) do
+        [] -> acc
+        entries -> [fun.(shard_idx, entries) | acc]
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp flow_result_tuple(count) when is_integer(count) and count >= 0 do
+    :erlang.make_tuple(count, ErrorReasons.write_timeout_unknown())
   end
 
   @doc false
@@ -6472,7 +6598,9 @@ defmodule Ferricstore.Store.Router do
          key
        )
        when is_tuple(file_id) and tuple_size(file_id) == 2 and
-              (elem(file_id, 0) == :waraft_segment or elem(file_id, 0) == :waraft_projection) and
+              (elem(file_id, 0) == :waraft_segment or
+                 elem(file_id, 0) == :waraft_projection or
+                 elem(file_id, 0) == :waraft_apply_projection) and
               is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0,
        do: read_waraft_segment_materialized(ctx, idx, file_id, key)
 

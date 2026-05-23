@@ -23,7 +23,8 @@
     location_for_index/2,
     read_disk/2,
     read_disk_at/4,
-    write_projection/3
+    write_projection/3,
+    write_projection_batch/3
 ]).
 
 -export([
@@ -259,6 +260,21 @@ write_projection(RootDir, Position, Entries) when is_list(Entries) ->
             {error, {ensure_projection_dir, Reason}}
     end.
 
+write_projection_batch(RootDir, Position, Entries) when is_list(Entries) ->
+    case projection_batch_index(Position) of
+        {ok, Index} ->
+            Dir = fold_disk_segment_dir(RootDir),
+            case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+                ok ->
+                    Record = {Index, {0, {ferricstore_segment_apply_projection_batch, Position, Entries}}},
+                    write_records(Dir, [Record]);
+                {error, Reason} ->
+                    {error, {ensure_projection_batch_dir, Reason}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
 projection_records(Position, Entries) ->
     Header = {0, {0, {ferricstore_segment_projection_header, Position, length(Entries)}}},
     {Records, _NextIndex} =
@@ -271,6 +287,11 @@ projection_records(Position, Entries) ->
             Entries
         ),
     lists:reverse(Records).
+
+projection_batch_index({raft_log_pos, Index, _Term}) when is_integer(Index), Index > 0 ->
+    {ok, Index};
+projection_batch_index(_Position) ->
+    {error, bad_projection_batch_position}.
 
 append(View, Entries, _Mode, _Priority) ->
     Log = wa_raft_log:log(View),
@@ -626,6 +647,41 @@ open_record_group_once(Dir, Path, RecordsRev) ->
     end.
 
 open_record_group_once_file(Dir, Path, RecordsRev) ->
+    case file_writer_mode() of
+        persistent ->
+            open_record_group_once_file_persistent(Dir, Path, RecordsRev);
+        process ->
+            open_record_group_once_file_process(Dir, Path, RecordsRev);
+        direct ->
+            open_record_group_once_file_direct(Dir, Path, RecordsRev);
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+open_record_group_once_file_persistent(Dir, Path, RecordsRev) ->
+    case segment_file_fd_handle(Path) of
+        {ok, Fd, OldSize} ->
+            Records = lists:reverse(RecordsRev),
+            Writes = [encode_record(Record) || Record <- Records],
+            case write_record_group_file_persistent(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
+                ok ->
+                    NewSize = OldSize + iolist_size(Writes),
+                    case update_segment_writer_position(Path, NewSize) of
+                        ok ->
+                            {ok, {Path, OldSize}, offset_entries_for_records(Dir, Path, Records, OldSize, Writes)};
+                        {error, Reason} ->
+                            _ = close_writer_for_path(Path),
+                            {error, {update_writer_position, Reason}}
+                    end;
+                {error, Reason} ->
+                    _ = close_writer_for_path(Path),
+                    {error, Reason}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+open_record_group_once_file_direct(Dir, Path, RecordsRev) ->
     case close_writer_for_path(Path) of
         ok ->
             case file:open(Path, [append, raw, binary]) of
@@ -636,7 +692,7 @@ open_record_group_once_file(Dir, Path, RecordsRev) ->
                                 ok ->
                                     Records = lists:reverse(RecordsRev),
                                     Writes = [encode_record(Record) || Record <- Records],
-                                    case write_record_group_file(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
+                                    case write_record_group_file_direct(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
                                         ok ->
                                             {ok, {Path, OldSize}, offset_entries_for_records(Dir, Path, Records, OldSize, Writes)};
                                         {error, Reason} ->
@@ -652,6 +708,21 @@ open_record_group_once_file(Dir, Path, RecordsRev) ->
                     end;
                 {error, Reason} ->
                     {error, {open, Reason}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+open_record_group_once_file_process(Dir, Path, RecordsRev) ->
+    case segment_file_writer_handle(Path) of
+        {ok, WriterPid} ->
+            Records = lists:reverse(RecordsRev),
+            Writes = [encode_record(Record) || Record <- Records],
+            case write_record_group_file(Dir, Path, WriterPid, Writes) of
+                {ok, OldSize} ->
+                    {ok, {Path, OldSize}, offset_entries_for_records(Dir, Path, Records, OldSize, Writes)};
+                {error, Reason} ->
+                    {error, Reason}
             end;
         {error, _Reason} = Error ->
             Error
@@ -728,7 +799,35 @@ validate_segment_file_for_append(Path) ->
             {error, {read_segment_info, Reason}}
     end.
 
-write_record_group_file(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
+write_record_group_file_persistent(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
+    StartedAt = erlang:monotonic_time(),
+    Count = length(Writes),
+    Bytes = iolist_size(Writes),
+    WriteResult =
+        case file:write(Fd, Writes) of
+            ok ->
+                case maybe_run_append_hook(after_write) of
+                    ok -> sync_segment_file(Path, Fd);
+                    {error, _Reason} = Error -> Error
+                end;
+            {error, WriteError} ->
+                {error, {write, WriteError}}
+        end,
+
+    Result =
+        case WriteResult of
+            ok ->
+                maybe_sync_new_segment_dir(Dir, Path, OldSize, NewSegment);
+            {error, AppendError} ->
+                case rollback_append_fd(Path, Fd, OldSize) of
+                    ok -> {error, AppendError};
+                    {error, RollbackReason} -> {error, {rollback_failed, AppendError, RollbackReason}}
+                end
+        end,
+    emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment),
+    Result.
+
+write_record_group_file_direct(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
     StartedAt = erlang:monotonic_time(),
     Count = length(Writes),
     Bytes = iolist_size(Writes),
@@ -759,6 +858,25 @@ write_record_group_file(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
                 {{error, RollbackReason}, _} -> {error, {rollback_failed, AppendError, RollbackReason}};
                 {_, {error, CloseReason}} -> {error, {rollback_failed, AppendError, {close, CloseReason}}}
             end
+    end,
+    emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment),
+    Result.
+
+write_record_group_file(Dir, Path, WriterPid, Writes) ->
+    StartedAt = erlang:monotonic_time(),
+    Count = length(Writes),
+    Bytes = iolist_size(Writes),
+    {Result, NewSegment} = case file_writer_append(WriterPid, Dir, Path, Writes) of
+        {ok, OldSize, NewPosition, WasNewSegment} ->
+            case update_segment_writer_position(Path, NewPosition) of
+                ok ->
+                    {{ok, OldSize}, WasNewSegment};
+                {error, UpdateReason} ->
+                    {{error, {update_writer_position, UpdateReason}}, WasNewSegment}
+            end;
+        {error, _Reason} = Error ->
+            _ = close_writer_for_path(Path),
+            {Error, false}
     end,
     emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment),
     Result.
@@ -1065,7 +1183,11 @@ prepare_rewrite_stage(Staging, Records, RecordsPerSegment) ->
                     case write_segment_config(Staging, RecordsPerSegment) of
                         ok ->
                             case write_records_with_segment_size(Staging, Records, RecordsPerSegment) of
-                                ok -> sync_dir(Staging);
+                                ok ->
+                                    case close_writers_for_dir(Staging) of
+                                        ok -> sync_dir(Staging);
+                                        {error, _Reason} = Error -> Error
+                                    end;
                                 {error, _Reason} = Error -> Error
                             end;
                         {error, _Reason} = Error -> Error
@@ -1091,7 +1213,11 @@ prepare_rewrite_stage_from_ets(Staging, Name, StartKey, KeepFun, RecordsPerSegme
                                 KeepFun,
                                 RecordsPerSegment
                             ) of
-                                ok -> sync_dir(Staging);
+                                ok ->
+                                    case close_writers_for_dir(Staging) of
+                                        ok -> sync_dir(Staging);
+                                        {error, _Reason} = Error -> Error
+                                    end;
                                 {error, _Reason} = Error -> Error
                             end;
                         {error, _Reason} = Error -> Error
@@ -2180,10 +2306,244 @@ segment_io_mode() ->
         Other -> {error, {bad_segment_io_mode, Other}}
     end.
 
+file_writer_mode() ->
+    %% Experimental group-sync path. Keep direct as the default because local
+    %% Flow profiles showed the process hop did not beat direct append+sync.
+    case application:get_env(ferricstore, waraft_segment_log_file_writer_mode, direct) of
+        direct -> direct;
+        persistent -> persistent;
+        process -> process;
+        Other -> {error, {bad_segment_file_writer_mode, Other}}
+    end.
+
+segment_file_fd_handle(Path) ->
+    Registry = ensure_writer_registry(),
+    Key = writer_key(Path),
+    case ets:lookup(Registry, Key) of
+        [{Key, _Dir, file_fd, Fd, Position}] ->
+            {ok, Fd, Position};
+        [{Key, _Dir, _OtherKind, _Handle, _Position}] ->
+            case close_writer_for_path(Path) of
+                ok -> open_file_fd_writer(Path);
+                {error, _Reason} = Error -> Error
+            end;
+        [{Key, _Dir, _LegacyWalHandle, _LegacyPosition}] ->
+            case close_writer_for_path(Path) of
+                ok -> open_file_fd_writer(Path);
+                {error, _Reason} = Error -> Error
+            end;
+        [] ->
+            open_file_fd_writer(Path)
+    end.
+
+open_file_fd_writer(Path) ->
+    %% This persistent mode is caller-side and must be closeable from the log
+    %% process during shutdown/truncate. A raw fd is tied to its controlling
+    %% process, so raw persistent ownership belongs in the file_writer process
+    %% mode instead.
+    case file:open(Path, [append, binary]) of
+        {ok, Fd} ->
+            case file:position(Fd, eof) of
+                {ok, Position} ->
+                    case maybe_preallocate_new_segment(Path, Position =:= 0) of
+                        ok ->
+                            Registry = ensure_writer_registry(),
+                            true = ets:insert(Registry, {writer_key(Path), writer_dir(Path), file_fd, Fd, Position}),
+                            {ok, Fd, Position};
+                        {error, Reason} ->
+                            _ = file:close(Fd),
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    _ = file:close(Fd),
+                    {error, {position, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {open, Reason}}
+    end.
+
+segment_file_writer_handle(Path) ->
+    Registry = ensure_writer_registry(),
+    Key = writer_key(Path),
+    case ets:lookup(Registry, Key) of
+        [{Key, _Dir, file_writer, Pid, _Position}] when is_pid(Pid) ->
+            case is_process_alive(Pid) of
+                true ->
+                    {ok, Pid};
+                false ->
+                    true = ets:delete(Registry, Key),
+                    open_file_segment_writer(Path)
+            end;
+        [{Key, _Dir, _OtherKind, _Handle, _Position}] ->
+            case close_writer_for_path(Path) of
+                ok -> open_file_segment_writer(Path);
+                {error, _Reason} = Error -> Error
+            end;
+        [{Key, _Dir, _LegacyWalHandle, _LegacyPosition}] ->
+            case close_writer_for_path(Path) of
+                ok -> open_file_segment_writer(Path);
+                {error, _Reason} = Error -> Error
+            end;
+        [] ->
+            open_file_segment_writer(Path)
+    end.
+
+open_file_segment_writer(Path) ->
+    Ref = make_ref(),
+    Parent = self(),
+    Pid = spawn(fun() -> file_writer_init(Parent, Ref, Path) end),
+    receive
+        {Ref, {ok, Position}} ->
+            Registry = ensure_writer_registry(),
+            true = ets:insert(Registry, {writer_key(Path), writer_dir(Path), file_writer, Pid, Position}),
+            {ok, Pid};
+        {Ref, {error, _Reason} = Error} ->
+            Error
+    after file_writer_call_timeout_ms() ->
+        {error, {file_writer_open_timeout, Path, file_writer_call_timeout_ms()}}
+    end.
+
+file_writer_init(Parent, Ref, Path) ->
+    case file:open(Path, [append, raw, binary]) of
+        {ok, Fd} ->
+            case file:position(Fd, eof) of
+                {ok, Position} ->
+                    case maybe_preallocate_new_segment(Path, Position =:= 0) of
+                        ok ->
+                            Parent ! {Ref, {ok, Position}},
+                            file_writer_loop(Path, Fd, Position);
+                        {error, Reason} ->
+                            _ = file:close(Fd),
+                            Parent ! {Ref, {error, Reason}}
+                    end;
+                {error, Reason} ->
+                    _ = file:close(Fd),
+                    Parent ! {Ref, {error, {position, Reason}}}
+            end;
+        {error, Reason} ->
+            Parent ! {Ref, {error, {open, Reason}}}
+    end.
+
+file_writer_append(Pid, Dir, Path, Writes) ->
+    Ref = make_ref(),
+    Pid ! {append, self(), Ref, Dir, Path, Writes},
+    receive
+        {Ref, Reply} -> Reply
+    after file_writer_call_timeout_ms() ->
+        {error, {file_writer_timeout, Path, file_writer_call_timeout_ms()}}
+    end.
+
+file_writer_loop(Path, Fd, Position) ->
+    receive
+        {append, From, Ref, Dir, Path, Writes} ->
+            Requests = collect_file_writer_requests([{From, Ref, Dir, Writes}], Path),
+            case file_writer_flush(Path, Fd, Position, Requests) of
+                {ok, NewPosition} ->
+                    file_writer_loop(Path, Fd, NewPosition);
+                {error, _Reason} ->
+                    _ = file:close(Fd),
+                    ok
+            end;
+        {close, From, Ref} ->
+            From ! {Ref, file:close(Fd)},
+            ok
+    end.
+
+collect_file_writer_requests(Acc, Path) ->
+    receive
+        {append, From, Ref, Dir, Path, Writes} ->
+            collect_file_writer_requests([{From, Ref, Dir, Writes} | Acc], Path)
+    after file_writer_group_delay_ms() ->
+        lists:reverse(Acc)
+    end.
+
+file_writer_flush(Path, Fd, Position, Requests) ->
+    {Writes, _EndPosition, RepliesRev, AnyNewSegment} =
+        lists:foldl(
+            fun({From, Ref, Dir, RequestWrites}, {WriteAcc, Pos, ReplyAcc, NewAcc}) ->
+                Bytes = iolist_size(RequestWrites),
+                Reply = {From, Ref, Pos, Pos + Bytes, Pos =:= 0, Dir},
+                {[RequestWrites | WriteAcc], Pos + Bytes, [Reply | ReplyAcc], NewAcc orelse Pos =:= 0}
+            end,
+            {[], Position, [], false},
+            Requests
+        ),
+    Replies = lists:reverse(RepliesRev),
+    WriteResult =
+        case file:write(Fd, lists:reverse(Writes)) of
+            ok ->
+                case maybe_run_append_hook(after_write) of
+                    ok -> sync_segment_file(Path, Fd);
+                    {error, _HookReason} = HookError -> HookError
+                end;
+            {error, WriteError} ->
+                {error, {write, WriteError}}
+        end,
+    Result =
+        case WriteResult of
+            ok ->
+                maybe_sync_new_segment_dirs(Path, Fd, Position, Replies, AnyNewSegment);
+            {error, AppendError} ->
+                case rollback_append_fd(Path, Fd, Position) of
+                    ok -> {error, AppendError};
+                    {error, RollbackReason} -> {error, {rollback_failed, AppendError, RollbackReason}}
+                end
+        end,
+    reply_file_writer_requests(Replies, Result),
+    case Result of
+        {ok, NewPosition} -> {ok, NewPosition};
+        {error, _FlushReason} = FlushError -> FlushError
+    end.
+
+maybe_sync_new_segment_dirs(_Path, _Fd, _Position, Replies, false) ->
+    {ok, file_writer_new_position(Replies)};
+maybe_sync_new_segment_dirs(Path, Fd, Position, Replies, true) ->
+    Dir = file_writer_first_new_segment_dir(Replies),
+    case maybe_sync_new_segment_dir(Dir, Path, Position, true) of
+        ok ->
+            {ok, file_writer_new_position(Replies)};
+        {error, Reason} ->
+            case rollback_append_fd(Path, Fd, Position) of
+                ok -> {error, Reason};
+                {error, RollbackReason} -> {error, {rollback_failed, Reason, RollbackReason}}
+            end
+    end.
+
+file_writer_first_new_segment_dir([{_From, _Ref, _Old, _New, true, Dir} | _Rest]) ->
+    Dir;
+file_writer_first_new_segment_dir([_Other | Rest]) ->
+    file_writer_first_new_segment_dir(Rest).
+
+file_writer_new_position(Replies) ->
+    {_From, _Ref, _Old, New, _NewSegment, _Dir} = lists:last(Replies),
+    New.
+
+reply_file_writer_requests(Replies, {ok, _FinalPosition}) ->
+    lists:foreach(
+        fun({From, Ref, Old, New, NewSegment, _Dir}) ->
+            From ! {Ref, {ok, Old, New, NewSegment}}
+        end,
+        Replies
+    );
+reply_file_writer_requests(Replies, {error, _Reason} = Error) ->
+    lists:foreach(
+        fun({From, Ref, _Old, _New, _NewSegment, _Dir}) ->
+            From ! {Ref, Error}
+        end,
+        Replies
+    ).
+
 segment_writer_handle(Path, OldSize) ->
     Registry = ensure_writer_registry(),
     Key = writer_key(Path),
     case ets:lookup(Registry, Key) of
+        [{Key, _Dir, wal_nif, Handle, OldSize}] ->
+            {ok, Handle};
+        [{Key, _Dir, _Kind, _Handle, _Position}] ->
+            case close_writer_for_path(Path) of
+                ok -> open_segment_writer(Path, OldSize);
+                {error, _Reason} = Error -> Error
+            end;
         [{Key, _Dir, Handle, OldSize}] ->
             {ok, Handle};
         [{Key, _Dir, _Handle, _Position}] ->
@@ -2204,7 +2564,7 @@ open_segment_writer(Path, OldSize) ->
                     case wal_nif_open_raw_append(BinaryPath, DelayUs, MaxBufferBytes, OldSize) of
                         {ok, Handle} ->
                             Registry = ensure_writer_registry(),
-                            true = ets:insert(Registry, {writer_key(Path), writer_dir(Path), Handle, OldSize}),
+                            true = ets:insert(Registry, {writer_key(Path), writer_dir(Path), wal_nif, Handle, OldSize}),
                             {ok, Handle};
                         {error, _Reason} = Error ->
                             Error
@@ -2280,6 +2640,9 @@ update_segment_writer_position(Path, Position) ->
     Registry = ensure_writer_registry(),
     Key = writer_key(Path),
     case ets:lookup(Registry, Key) of
+        [{Key, Dir, Kind, Handle, _OldPosition}] ->
+            true = ets:insert(Registry, {Key, Dir, Kind, Handle, Position}),
+            ok;
         [{Key, Dir, Handle, _OldPosition}] ->
             true = ets:insert(Registry, {Key, Dir, Handle, Position}),
             ok;
@@ -2292,38 +2655,82 @@ close_inactive_writers_for_dir(Dir, ActivePath) ->
     ActiveKey = writer_key(ActivePath),
     WriterDir = writer_dir_from_dir(Dir),
     maybe_run_writer_registry_hook(before_tab2list, Registry),
-    close_writer_entries(
-        [{Key, Handle} || {Key, WriterDir0, Handle, _Position} <- writer_registry_entries(Registry),
-                          WriterDir0 =:= WriterDir,
-                          Key =/= ActiveKey]
-    ).
+    close_writer_entries(entries_to_close(writer_registry_entries(Registry), WriterDir, ActiveKey)).
 
 close_writers_for_dir(Dir) ->
     Registry = ensure_writer_registry(),
     WriterDir = writer_dir_from_dir(Dir),
     maybe_run_writer_registry_hook(before_tab2list, Registry),
-    close_writer_entries(
-        [{Key, Handle} || {Key, WriterDir0, Handle, _Position} <- writer_registry_entries(Registry),
-                          WriterDir0 =:= WriterDir]
-    ).
+    close_writer_entries(entries_to_close(writer_registry_entries(Registry), WriterDir, undefined)).
 
 close_writer_for_path(Path) ->
     Registry = ensure_writer_registry(),
     Key = writer_key(Path),
     case ets:lookup(Registry, Key) of
-        [{Key, _Dir, Handle, _Position}] -> close_writer_entry(Key, Handle);
+        [{Key, _Dir, Kind, Handle, _Position}] -> close_writer_entry(Key, Kind, Handle);
+        [{Key, _Dir, Handle, _Position}] -> close_writer_entry(Key, wal_nif, Handle);
         [] -> ok
     end.
 
+entries_to_close(Entries, WriterDir, ActiveKey) ->
+    [Spec || Entry <- Entries,
+             {ok, Spec} <- [entry_to_close_spec(Entry, WriterDir, ActiveKey)]].
+
+entry_to_close_spec({Key, WriterDir, Kind, Handle, _Position}, WriterDir, ActiveKey)
+  when Key =/= ActiveKey ->
+    {ok, {Key, Kind, Handle}};
+entry_to_close_spec({Key, WriterDir, Handle, _Position}, WriterDir, ActiveKey)
+  when Key =/= ActiveKey ->
+    {ok, {Key, wal_nif, Handle}};
+entry_to_close_spec(_Entry, _WriterDir, _ActiveKey) ->
+    skip.
+
 close_writer_entries([]) ->
     ok;
-close_writer_entries([{Key, Handle} | Rest]) ->
-    case close_writer_entry(Key, Handle) of
+close_writer_entries([{Key, Kind, Handle} | Rest]) ->
+    case close_writer_entry(Key, Kind, Handle) of
         ok -> close_writer_entries(Rest);
         {error, _Reason} = Error -> Error
     end.
 
-close_writer_entry(Key, Handle) ->
+close_writer_entry(Key, file_writer, Pid) when is_pid(Pid) ->
+    Registry = ensure_writer_registry(),
+    Ref = make_ref(),
+    Pid ! {close, self(), Ref},
+    Result =
+        receive
+            {Ref, ok} ->
+                ok;
+            {Ref, {error, Reason}} ->
+                {error, {file_writer_close, Key, Reason}}
+        after file_writer_call_timeout_ms() ->
+            case is_process_alive(Pid) of
+                false -> ok;
+                true -> {error, {file_writer_close_timeout, Key, file_writer_call_timeout_ms()}}
+            end
+        end,
+    case Result of
+        ok ->
+            ok = delete_writer_entry(Registry, Key),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end;
+close_writer_entry(Key, file_fd, Fd) ->
+    Registry = ensure_writer_registry(),
+    Result =
+        case file:close(Fd) of
+            ok -> ok;
+            {error, Reason} -> {error, {file_fd_close, Key, Reason}}
+        end,
+    case Result of
+        ok ->
+            ok = delete_writer_entry(Registry, Key),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end;
+close_writer_entry(Key, wal_nif, Handle) ->
     Registry = ensure_writer_registry(),
     Result =
         try ferricstore_wal_nif:close(Handle) of
@@ -2335,10 +2742,21 @@ close_writer_entry(Key, Handle) ->
         end,
     case Result of
         ok ->
-            true = ets:delete(Registry, Key),
+            ok = delete_writer_entry(Registry, Key),
             ok;
         {error, _Reason} = Error ->
             Error
+    end.
+
+delete_writer_entry(Registry, Key) ->
+    try ets:delete(Registry, Key) of
+        true -> ok
+    catch
+        %% WARaft shuts down partitions one-for-all, and another partition may
+        %% have owned and lost the named ETS table while this close path was
+        %% already iterating. At shutdown the handle is already closed; missing
+        %% registry cleanup must not crash the log process.
+        error:badarg -> ok
     end.
 
 ensure_writer_registry() ->
@@ -2396,6 +2814,18 @@ wal_nif_sync_timeout_ms() ->
 
 wal_nif_max_buffer_bytes() ->
     non_neg_int_env(wal_max_buffer_bytes, ?DEFAULT_WAL_NIF_MAX_BUFFER_BYTES, bad_wal_max_buffer_bytes).
+
+file_writer_call_timeout_ms() ->
+    case application:get_env(ferricstore, waraft_segment_log_file_writer_timeout_ms, 30000) of
+        Value when is_integer(Value), Value >= 0 -> Value;
+        _Other -> 30000
+    end.
+
+file_writer_group_delay_ms() ->
+    case application:get_env(ferricstore, waraft_segment_log_file_writer_group_delay_ms, 0) of
+        Value when is_integer(Value), Value >= 0 -> Value;
+        _Other -> 0
+    end.
 
 non_neg_int_env(Key, Default, ErrorTag) ->
     case application:get_env(ferricstore, Key, Default) of
@@ -2466,6 +2896,15 @@ maybe_run_preallocate_hook(BinaryPath, Bytes) ->
 
 maybe_run_file_sync_hook(BinaryPath, Method) ->
     case application:get_env(ferricstore, waraft_segment_log_file_sync_hook) of
+        {ok, {block, Notify}} ->
+            Ref = make_ref(),
+            Notify ! {waraft_segment_log_file_sync_blocked, BinaryPath, Method, self(), Ref},
+            receive
+                {Ref, continue} -> ok;
+                {Ref, {error, Reason}} -> {error, {file_sync_hook, BinaryPath, Reason}}
+            after file_sync_hook_timeout_ms() ->
+                {error, {file_sync_hook_timeout, BinaryPath, file_sync_hook_timeout_ms()}}
+            end;
         {ok, {notify, Notify}} ->
             Notify ! {waraft_segment_log_file_sync, BinaryPath},
             ok;
@@ -2483,6 +2922,12 @@ maybe_run_file_sync_hook(BinaryPath, Method) ->
             maybe_fail_file_sync_count(BinaryPath, Target, Notify, Count0 + 1);
         _ ->
             ok
+    end.
+
+file_sync_hook_timeout_ms() ->
+    case application:get_env(ferricstore, waraft_segment_log_file_sync_hook_timeout_ms, 5000) of
+        Value when is_integer(Value), Value >= 0 -> Value;
+        _Other -> 5000
     end.
 
 maybe_run_wal_nif_sync_hook(BinaryPath, DelayUs) ->
@@ -2569,6 +3014,7 @@ emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment) ->
     Metadata =
         case Result of
             ok -> Metadata0;
+            {ok, _Value} -> Metadata0;
             {error, Reason} -> Metadata0#{reason => Reason};
             Other -> Metadata0#{reason => Other}
         end,
@@ -2594,6 +3040,8 @@ emit_telemetry(Event, Measurements, Metadata) ->
     end.
 
 segment_append_result(ok) ->
+    ok;
+segment_append_result({ok, _Value}) ->
     ok;
 segment_append_result({error, _Reason}) ->
     error;

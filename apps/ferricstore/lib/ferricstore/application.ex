@@ -532,16 +532,39 @@ defmodule Ferricstore.Application do
   end
 
   defp shutdown_flush_flow_lmdb_writers(shard_count) do
-    case Ferricstore.Flow.LMDBWriter.flush_all(shard_count) do
-      :ok ->
-        Logger.info("Shutdown: Flow LMDB writers flushed")
+    case Ferricstore.Flow.LMDB.mode() do
+      :lagged ->
+        Logger.info("Shutdown: Flow LMDB lagged projection flush skipped")
+        Ferricstore.Flow.LMDBWriter.suspend_all(shard_count)
+        :ok
 
-      {:error, reason} ->
-        Logger.warning("Shutdown: Flow LMDB writer flush incomplete: #{inspect(reason)}")
+      _mode ->
+        result =
+          case Ferricstore.Flow.LMDBWriter.flush_all(shard_count) do
+            :ok ->
+              Logger.info("Shutdown: Flow LMDB writers flushed")
+              :ok
+
+            {:error, reason} ->
+              Logger.warning("Shutdown: Flow LMDB writer flush incomplete: #{inspect(reason)}")
+              {:error, reason}
+          end
+
+        Ferricstore.Flow.LMDBWriter.suspend_all(shard_count)
+
+        case result do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   catch
     :exit, reason ->
+      _ = Ferricstore.Flow.LMDBWriter.suspend_all(shard_count)
       Logger.warning("Shutdown: Flow LMDB writer flush failed: #{inspect(reason)}")
+      {:error, reason}
   end
 
   defp shutdown_fsync_bitcask(shard_count, data_dir) do

@@ -107,6 +107,12 @@ defmodule FerricstoreServer.Connection.Blocking do
   @spec dispatch_xread_ast(term(), list(), map()) :: conn_result()
   @doc false
   def dispatch_xread_ast(ast, args, state) do
+    dispatch_stream_read_ast("XREAD", ast, args, state)
+  end
+
+  @spec dispatch_stream_read_ast(binary(), term(), list(), map()) :: conn_result()
+  @doc false
+  def dispatch_stream_read_ast(cmd, ast, args, state) when cmd in ["XREAD", "XREADGROUP"] do
     alias Ferricstore.Commands.Dispatcher
     store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
@@ -121,19 +127,19 @@ defmodule FerricstoreServer.Connection.Blocking do
           {:error, "ERR internal error: #{inspect(reason)}"}
       end
 
-    handle_xread_result(result, args, store, state)
+    handle_stream_read_result(cmd, result, args, ast, store, state)
   end
 
-  defp handle_xread_result(result, args, store, state) do
+  defp handle_stream_read_result(cmd, result, args, ast, store, state) do
     case result do
       {:block, timeout_ms, stream_ids, count} ->
-        dispatch_xread_block(timeout_ms, stream_ids, count, store, state)
+        dispatch_stream_read_block(cmd, ast, timeout_ms, stream_ids, count, store, state, args)
 
       other ->
         alias FerricstoreServer.Connection.Tracking, as: ConnTracking
-        ConnTracking.maybe_notify_keyspace("XREAD", args, other)
-        new_state = ConnTracking.maybe_track_read("XREAD", args, other, state)
-        ConnTracking.maybe_notify_tracking("XREAD", args, other, state)
+        ConnTracking.maybe_notify_keyspace(cmd, args, other)
+        new_state = ConnTracking.maybe_track_read(cmd, args, other, state)
+        ConnTracking.maybe_notify_tracking(cmd, args, other, state)
         {:continue, Encoder.encode(other), new_state}
     end
   end
@@ -319,11 +325,12 @@ defmodule FerricstoreServer.Connection.Blocking do
     end
   end
 
-  defp dispatch_xread_block(timeout_ms, stream_ids, count, store, state) do
+  defp dispatch_stream_read_block(cmd, ast, timeout_ms, stream_ids, _count, store, state, args) do
+    alias Ferricstore.Commands.Dispatcher
+
     keys = Enum.map(stream_ids, fn {key, _id} -> key end)
     effective_timeout = if timeout_ms == 0, do: 300_000, else: timeout_ms
     deadline = System.monotonic_time(:millisecond) + effective_timeout
-    tracking_args = build_xread_args(stream_ids, count)
 
     # Register as waiter for all watched stream keys.
     Enum.each(stream_ids, fn {key, id_str} ->
@@ -336,7 +343,7 @@ defmodule FerricstoreServer.Connection.Blocking do
     notify_fn = fn _notified_key ->
       read_result =
         try do
-          StreamCmd.handle("XREAD", build_xread_args(stream_ids, count), store)
+          Dispatcher.dispatch_ast(ast, store)
         catch
           _, _ -> []
         end
@@ -363,11 +370,11 @@ defmodule FerricstoreServer.Connection.Blocking do
         {:quit, Encoder.encode(nil), state}
 
       {:ok, value} ->
-        new_state = ConnTracking.maybe_track_read("XREAD", tracking_args, value, state)
+        new_state = ConnTracking.maybe_track_read(cmd, args, value, state)
         {:continue, Encoder.encode(value), new_state}
 
       nil ->
-        new_state = ConnTracking.maybe_track_read("XREAD", tracking_args, nil, state)
+        new_state = ConnTracking.maybe_track_read(cmd, args, nil, state)
         {:continue, Encoder.encode(nil), new_state}
     end
   end
@@ -464,14 +471,6 @@ defmodule FerricstoreServer.Connection.Blocking do
       {:error, {:error, "ERR internal error: #{inspect({kind, reason})}"}}
   end
 
-  defp build_xread_args(stream_ids, count) do
-    keys = Enum.map(stream_ids, fn {key, _id} -> key end)
-    ids = Enum.map(stream_ids, fn {_key, id} -> id end)
-
-    count_args = if count == :infinity, do: [], else: ["COUNT", Integer.to_string(count)]
-    count_args ++ ["STREAMS"] ++ keys ++ ids
-  end
-
   # Cleanup helper -- delegates to the same logic as the main connection module.
   defp cleanup_connection(state) do
     duration_ms = System.monotonic_time(:millisecond) - state.created_at
@@ -482,12 +481,8 @@ defmodule FerricstoreServer.Connection.Blocking do
       duration_ms: duration_ms
     })
 
-    if state.pubsub_channels do
-      Enum.each(state.pubsub_channels, &Ferricstore.PubSub.unsubscribe(&1, self()))
-    end
-
-    if state.pubsub_patterns do
-      Enum.each(state.pubsub_patterns, &Ferricstore.PubSub.punsubscribe(&1, self()))
+    if state.pubsub_channels != nil or state.pubsub_patterns != nil do
+      Ferricstore.PubSub.cleanup(self())
     end
 
     FerricstoreServer.ClientTracking.cleanup(self())

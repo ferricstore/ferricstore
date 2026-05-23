@@ -192,13 +192,16 @@ defmodule FlowRespPipelineBench do
           %{id: id(prefix, group, j), payload: "payload:" <> id(prefix, group, j)}
         end
 
-      {:ok, _flows} =
-        FerricStore.flow_create_many(partition_key, items,
-          type: flow_type,
-          state: "queued",
-          run_at_ms: 1_000,
-          now_ms: 1_000
-        )
+      case FerricStore.flow_create_many(partition_key, items,
+             type: flow_type,
+             state: "queued",
+             run_at_ms: 1_000,
+             now_ms: 1_000
+           ) do
+        :ok -> :ok
+        {:ok, _flows} -> :ok
+        other -> raise("seed flow_create_many failed: #{inspect(other)}")
+      end
     end
   end
 

@@ -156,6 +156,32 @@ defmodule Ferricstore.Commands.SortedSetTest do
       refute_receive {:compound_batch_put, _, _}
     end
 
+    test "ZADD builds batch write entries without zip flat_map" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/sorted_set.ex", __DIR__))
+
+      assert source =~ "zset_current_by_member(unique_members, current_values, %{})"
+      assert source =~ "zset_write_entries(unique_members, compound_keys, writes_by_member, [])"
+      refute source =~ "then(&Enum.zip(unique_members, &1))"
+      refute source =~ "Enum.flat_map(Enum.zip(unique_members, compound_keys)"
+    end
+
+    test "WITHSCORES responses use shared flat-list helpers" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/sorted_set.ex", __DIR__))
+
+      assert source =~ "zset_score_pairs_to_flat_list(filtered)"
+      assert source =~ "zset_score_pairs_to_flat_list(members)"
+      assert source =~ "zset_score_string_pairs_to_flat_list(selected)"
+
+      refute source =~
+               "Enum.flat_map(filtered, fn {member, score} -> [member, format_score(score)] end)"
+
+      refute source =~
+               "Enum.flat_map(members, fn {member, score} -> [member, format_score(score)] end)"
+
+      refute source =~
+               "Enum.flat_map(selected, fn {member, score} -> [member, format_score_str(score)] end)"
+    end
+
     test "ZADD rolls back new type metadata when member write fails" do
       parent = self()
       type_key = CompoundKey.type_key("zs")

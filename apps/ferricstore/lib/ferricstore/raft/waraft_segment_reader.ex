@@ -4,6 +4,30 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   @table_prefix "raft_log_ferricstore_waraft_backend_"
   @storage_root "ferricstore_waraft_backend"
   @projection_dir "segment_projection_log"
+  @apply_projection_dir "apply_projection_log"
+  @apply_projection_table :ferricstore_waraft_apply_projection_cache
+
+  @spec put_apply_projection(binary(), non_neg_integer(), pos_integer(), [
+          {binary(), binary(), non_neg_integer()}
+        ]) ::
+          :ok
+  def put_apply_projection(data_dir, shard_index, index, entries)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(index) and index > 0 and is_list(entries) do
+    table = ensure_apply_projection_table!()
+    root = storage_root(%{data_dir: data_dir}, shard_index)
+
+    Enum.each(entries, fn
+      {key, value, expire_at_ms}
+      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
+        :ets.insert(table, {{root, index, key}, value, expire_at_ms})
+
+      _invalid ->
+        :ok
+    end)
+
+    :ok
+  end
 
   @spec read_value(FerricStore.Instance.t(), non_neg_integer(), non_neg_integer(), binary()) ::
           {:ok, binary()} | :not_found | {:error, term()}
@@ -31,6 +55,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
 
   def read_value_from_location(ctx, shard_index, {:waraft_projection, index}, key),
     do: read_projection_value_at(ctx, shard_index, index, key)
+
+  def read_value_from_location(ctx, shard_index, {:waraft_apply_projection, index}, key),
+    do: read_apply_projection_value_at(ctx, shard_index, index, key)
 
   def read_value_from_location(_ctx, _shard_index, _file_id, _key),
     do: {:error, :not_waraft_segment_location}
@@ -137,6 +164,101 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
 
   defp read_projection_value_at(_ctx, _shard_index, _index, _key),
     do: {:error, :bad_segment_projection_location}
+
+  defp read_apply_projection_value_at(ctx, shard_index, index, key)
+       when is_integer(index) and index > 0 and is_binary(key) do
+    root = storage_root(ctx, shard_index)
+
+    case read_apply_projection_cache(root, index, key) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :not_found ->
+        read_apply_projection_value_from_disk(root, index, key)
+    end
+  end
+
+  defp read_apply_projection_value_at(_ctx, _shard_index, _index, _key),
+    do: {:error, :bad_segment_apply_projection_location}
+
+  defp read_apply_projection_cache(root, index, key) do
+    case :ets.whereis(@apply_projection_table) do
+      :undefined ->
+        :not_found
+
+      table ->
+        case :ets.lookup(table, {root, index, key}) do
+          [{{^root, ^index, ^key}, value, expire_at_ms}] ->
+            if live_expire_at?(expire_at_ms), do: {:ok, value}, else: :not_found
+
+          [] ->
+            :not_found
+        end
+    end
+  rescue
+    ArgumentError -> :not_found
+  end
+
+  defp read_apply_projection_value_from_disk(root, index, key) do
+    projection_root = Path.join(root, @apply_projection_dir)
+    root_chars = to_charlist(projection_root)
+
+    with {:ok, {_ordinal, offset, encoded_size}} <-
+           :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index),
+         {:ok, entry} <-
+           :ferricstore_waraft_spike_segment_log.read_disk_at(
+             root_chars,
+             index,
+             offset,
+             encoded_size
+           ) do
+      case entry do
+        {0, {:ferricstore_segment_apply_projection_batch, _position, entries}}
+        when is_list(entries) ->
+          value_from_projection_entries(entries, key)
+
+        _other ->
+          {:error, :bad_segment_apply_projection_entry}
+      end
+    else
+      :not_found -> :not_found
+      {:error, :enoent} -> :not_found
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp value_from_projection_entries(entries, key) do
+    Enum.reduce(entries, :not_found, fn
+      {^key, value, _expire_at_ms}, _acc when is_binary(value) -> {:ok, value}
+      _entry, acc -> acc
+    end)
+  end
+
+  defp ensure_apply_projection_table! do
+    case :ets.whereis(@apply_projection_table) do
+      :undefined ->
+        try do
+          :ets.new(@apply_projection_table, [
+            :set,
+            :public,
+            :named_table,
+            {:read_concurrency, true},
+            {:write_concurrency, true}
+          ])
+        rescue
+          ArgumentError -> @apply_projection_table
+        end
+
+      table ->
+        table
+    end
+  end
+
+  defp live_expire_at?(0), do: true
+  defp live_expire_at?(expire_at_ms) when is_integer(expire_at_ms), do: expire_at_ms > now_ms()
+  defp live_expire_at?(_expire_at_ms), do: false
+
+  defp now_ms, do: System.system_time(:millisecond)
 
   defp value_from_entry(entry, key) do
     case command_from_entry(entry) do

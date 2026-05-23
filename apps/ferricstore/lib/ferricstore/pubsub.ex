@@ -8,16 +8,20 @@ defmodule Ferricstore.PubSub do
 
   ## Architecture
 
-  Two ETS tables back the registry:
+  Three ETS tables back the registry:
 
     * `:ferricstore_pubsub` — `{channel, pid}` entries for exact channel
       subscriptions. Uses a `:bag` so multiple pids can subscribe to the same
       channel while duplicate subscriptions from the same pid remain collapsed.
 
+    * `:ferricstore_pubsub_channel_cache` — `{channel, [pid]}` entries derived
+      from `:ferricstore_pubsub`. `PUBLISH` reads this table so the hot path
+      avoids copying and reducing `{channel, pid}` tuples on every exact publish.
+
     * `:ferricstore_pubsub_patterns` — `{pattern, pid, matcher}` entries for
       glob-pattern subscriptions (PSUBSCRIBE). Also a `:bag`.
 
-  Both tables are owned by a `GenServer` (`Ferricstore.PubSub`) so they survive
+  The tables are owned by a `GenServer` (`Ferricstore.PubSub`) so they survive
   the lifetime of the application and are cleaned up on shutdown.
 
   Subscriber pids are monitored once by the owner process. If a connection dies
@@ -39,6 +43,7 @@ defmodule Ferricstore.PubSub do
   use GenServer
 
   @channels_table :ferricstore_pubsub
+  @channel_cache_table :ferricstore_pubsub_channel_cache
   @patterns_table :ferricstore_pubsub_patterns
   @monitors_table :ferricstore_pubsub_monitors
 
@@ -79,7 +84,23 @@ defmodule Ferricstore.PubSub do
   @spec subscribe(channel(), pid()) :: :ok
   def subscribe(channel, pid) when is_binary(channel) and is_pid(pid) do
     :ets.insert(@channels_table, {channel, pid})
-    ensure_monitor(pid)
+    exact_subscription_changed([channel], pid)
+    :ok
+  end
+
+  @doc """
+  Subscribes `pid` to all given channels with one monitor operation.
+
+  Duplicate `{channel, pid}` entries are still collapsed by the ETS `:bag`
+  table, matching `subscribe/2` semantics.
+  """
+  @spec subscribe_many([channel()], pid()) :: :ok
+  def subscribe_many([], pid) when is_pid(pid), do: :ok
+
+  def subscribe_many(channels, pid) when is_list(channels) and is_pid(pid) do
+    entries = subscription_entries(channels, pid, [])
+    :ets.insert(@channels_table, entries)
+    exact_subscription_changed(unique_channels(channels), pid)
     :ok
   end
 
@@ -101,7 +122,22 @@ defmodule Ferricstore.PubSub do
   @spec unsubscribe(channel(), pid()) :: :ok
   def unsubscribe(channel, pid) when is_binary(channel) and is_pid(pid) do
     :ets.match_delete(@channels_table, {channel, pid})
-    maybe_demonitor(pid)
+    exact_unsubscription_changed([channel], pid)
+    :ok
+  end
+
+  @doc """
+  Unsubscribes `pid` from all given channels and checks the monitor once.
+  """
+  @spec unsubscribe_many([channel()], pid()) :: :ok
+  def unsubscribe_many([], pid) when is_pid(pid), do: :ok
+
+  def unsubscribe_many(channels, pid) when is_list(channels) and is_pid(pid) do
+    Enum.each(channels, fn channel ->
+      :ets.match_delete(@channels_table, {channel, pid})
+    end)
+
+    exact_unsubscription_changed(unique_channels(channels), pid)
     :ok
   end
 
@@ -122,11 +158,23 @@ defmodule Ferricstore.PubSub do
   """
   @spec psubscribe(pattern(), pid()) :: :ok
   def psubscribe(pattern, pid) when is_binary(pattern) and is_pid(pid) do
-    if :ets.match(@patterns_table, {pattern, pid, :_}) == [] do
-      :ets.insert(@patterns_table, {pattern, pid, :glob_matcher})
-      ensure_monitor(pid)
-    end
+    # The table is an ETS :bag, so inserting the same {pattern, pid, matcher}
+    # object twice remains idempotent without scanning the pattern bucket first.
+    :ets.insert(@patterns_table, {pattern, pid, pattern_matcher(pattern)})
+    ensure_monitor(pid)
+    :ok
+  end
 
+  @doc """
+  Subscribes `pid` to all given glob patterns with one monitor operation.
+  """
+  @spec psubscribe_many([pattern()], pid()) :: :ok
+  def psubscribe_many([], pid) when is_pid(pid), do: :ok
+
+  def psubscribe_many(patterns, pid) when is_list(patterns) and is_pid(pid) do
+    entries = pattern_subscription_entries(patterns, pid, [])
+    :ets.insert(@patterns_table, entries)
+    ensure_monitor(pid)
     :ok
   end
 
@@ -153,6 +201,21 @@ defmodule Ferricstore.PubSub do
   end
 
   @doc """
+  Unsubscribes `pid` from all given glob patterns and checks the monitor once.
+  """
+  @spec punsubscribe_many([pattern()], pid()) :: :ok
+  def punsubscribe_many([], pid) when is_pid(pid), do: :ok
+
+  def punsubscribe_many(patterns, pid) when is_list(patterns) and is_pid(pid) do
+    Enum.each(patterns, fn pattern ->
+      :ets.match_delete(@patterns_table, {pattern, pid, :_})
+    end)
+
+    maybe_demonitor(pid)
+    :ok
+  end
+
+  @doc """
   Publishes `message` to all subscribers of `channel`.
 
   Looks up exact channel subscribers and pattern subscribers whose glob pattern
@@ -169,27 +232,30 @@ defmodule Ferricstore.PubSub do
   """
   @spec publish(channel(), binary()) :: non_neg_integer()
   def publish(channel, message) when is_binary(channel) and is_binary(message) do
-    # Exact channel subscribers
     channel_count =
-      @channels_table
-      |> :ets.lookup(channel)
-      |> Enum.reduce(0, fn {_ch, pid}, count ->
-        send(pid, {:pubsub_message, channel, message})
-        count + 1
-      end)
+      case :ets.lookup(@channel_cache_table, channel) do
+        [{^channel, pids}] -> publish_exact_pids(pids, channel, message, 0)
+        [] -> 0
+      end
 
     # Pattern subscribers
     pattern_count =
-      @patterns_table
-      |> :ets.tab2list()
-      |> Enum.reduce(0, fn {pattern, pid, _matcher}, count ->
-        if Ferricstore.GlobMatcher.match?(channel, pattern) do
-          send(pid, {:pubsub_pmessage, pattern, channel, message})
-          count + 1
-        else
-          count
-        end
-      end)
+      if :ets.info(@patterns_table, :size) == 0 do
+        0
+      else
+        :ets.foldl(
+          fn {pattern, pid, matcher}, count ->
+            if pattern_matches?(channel, matcher) do
+              send(pid, {:pubsub_pmessage, pattern, channel, message})
+              count + 1
+            else
+              count
+            end
+          end,
+          0,
+          @patterns_table
+        )
+      end
 
     channel_count + pattern_count
   end
@@ -210,18 +276,22 @@ defmodule Ferricstore.PubSub do
   """
   @spec channels(pattern() | nil) :: [channel()]
   def channels(pattern \\ nil) do
-    all_channels =
-      @channels_table
-      |> :ets.tab2list()
-      |> Enum.map(fn {ch, _pid} -> ch end)
-      |> Enum.uniq()
+    collect_channels(:ets.first(@channels_table), pattern, [])
+  end
 
-    case pattern do
-      nil ->
-        all_channels
+  defp collect_channels(:"$end_of_table", _pattern, acc), do: Enum.reverse(acc)
 
-      pat when is_binary(pat) ->
-        Enum.filter(all_channels, &Ferricstore.GlobMatcher.match?(&1, pat))
+  defp collect_channels(channel, nil, acc) do
+    collect_channels(:ets.next(@channels_table, channel), nil, [channel | acc])
+  end
+
+  defp collect_channels(channel, pattern, acc) when is_binary(pattern) do
+    next = :ets.next(@channels_table, channel)
+
+    if Ferricstore.GlobMatcher.match?(channel, pattern) do
+      collect_channels(next, pattern, [channel | acc])
+    else
+      collect_channels(next, pattern, acc)
     end
   end
 
@@ -241,10 +311,14 @@ defmodule Ferricstore.PubSub do
   """
   @spec numsub([channel()]) :: [channel() | non_neg_integer()]
   def numsub(channel_list) when is_list(channel_list) do
-    Enum.flat_map(channel_list, fn channel ->
-      count = length(:ets.lookup(@channels_table, channel))
-      [channel, count]
-    end)
+    numsub_reply(channel_list, [])
+  end
+
+  defp numsub_reply([], acc), do: Enum.reverse(acc)
+
+  defp numsub_reply([channel | rest], acc) do
+    count = length(:ets.lookup(@channels_table, channel))
+    numsub_reply(rest, [count, channel | acc])
   end
 
   @doc """
@@ -275,9 +349,7 @@ defmodule Ferricstore.PubSub do
   """
   @spec cleanup(pid()) :: :ok
   def cleanup(pid) when is_pid(pid) do
-    cleanup_pid(pid)
-    maybe_demonitor(pid)
-    :ok
+    GenServer.call(__MODULE__, {:cleanup, pid})
   end
 
   # ---------------------------------------------------------------------------
@@ -287,6 +359,15 @@ defmodule Ferricstore.PubSub do
   @impl true
   def init(_opts) do
     :ets.new(@channels_table, [:named_table, :bag, :public, read_concurrency: true])
+
+    :ets.new(@channel_cache_table, [
+      :named_table,
+      :set,
+      :public,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
     :ets.new(@patterns_table, [:named_table, :bag, :public, read_concurrency: true])
     :ets.new(@monitors_table, [:named_table, :set, :protected, read_concurrency: true])
     {:ok, %{}}
@@ -294,15 +375,8 @@ defmodule Ferricstore.PubSub do
 
   @impl true
   def handle_call({:ensure_monitor, pid}, _from, state) do
-    case :ets.lookup(@monitors_table, pid) do
-      [] ->
-        ref = Process.monitor(pid)
-        :ets.insert(@monitors_table, {pid, ref})
-        {:reply, :ok, state}
-
-      [_] ->
-        {:reply, :ok, state}
-    end
+    ensure_monitor_local(pid)
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -312,11 +386,36 @@ defmodule Ferricstore.PubSub do
   end
 
   @impl true
+  def handle_call({:exact_subscription_changed, channels, pid}, _from, state) do
+    ensure_monitor_local(pid)
+    rebuild_exact_channels(channels)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:exact_unsubscription_changed, channels, pid}, _from, state) do
+    rebuild_exact_channels(channels)
+    demonitor_if_unused(pid)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:cleanup, pid}, _from, state) do
+    channels = exact_channels_for_pid(pid)
+    cleanup_pid(pid)
+    rebuild_exact_channels(channels)
+    demonitor_if_unused(pid)
+    {:reply, :ok, state}
+  end
+
+  @impl true
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
     case :ets.lookup(@monitors_table, pid) do
       [{^pid, ^ref}] ->
+        channels = exact_channels_for_pid(pid)
         :ets.delete(@monitors_table, pid)
         cleanup_pid(pid)
+        rebuild_exact_channels(channels)
 
       _ ->
         :ok
@@ -329,8 +428,39 @@ defmodule Ferricstore.PubSub do
     GenServer.call(__MODULE__, {:ensure_monitor, pid})
   end
 
+  defp exact_subscription_changed(channels, pid) do
+    GenServer.call(__MODULE__, {:exact_subscription_changed, channels, pid})
+  end
+
+  defp exact_unsubscription_changed(channels, pid) do
+    GenServer.call(__MODULE__, {:exact_unsubscription_changed, channels, pid})
+  end
+
+  defp subscription_entries([], _pid, acc), do: Enum.reverse(acc)
+
+  defp subscription_entries([channel | rest], pid, acc) when is_binary(channel) do
+    subscription_entries(rest, pid, [{channel, pid} | acc])
+  end
+
+  defp pattern_subscription_entries([], _pid, acc), do: Enum.reverse(acc)
+
+  defp pattern_subscription_entries([pattern | rest], pid, acc) when is_binary(pattern) do
+    pattern_subscription_entries(rest, pid, [{pattern, pid, pattern_matcher(pattern)} | acc])
+  end
+
   defp maybe_demonitor(pid) do
     GenServer.call(__MODULE__, {:maybe_demonitor, pid})
+  end
+
+  defp ensure_monitor_local(pid) do
+    case :ets.lookup(@monitors_table, pid) do
+      [] ->
+        ref = Process.monitor(pid)
+        :ets.insert(@monitors_table, {pid, ref})
+
+      [_] ->
+        :ok
+    end
   end
 
   defp demonitor_if_unused(pid) do
@@ -357,4 +487,108 @@ defmodule Ferricstore.PubSub do
     :ets.match_delete(@channels_table, {:_, pid})
     :ets.match_delete(@patterns_table, {:_, pid, :_})
   end
+
+  defp rebuild_exact_channels([]), do: :ok
+
+  defp rebuild_exact_channels([channel | rest]) do
+    rebuild_exact_channel(channel)
+    rebuild_exact_channels(rest)
+  end
+
+  defp rebuild_exact_channel(channel) do
+    case exact_pids_for_channel(:ets.lookup(@channels_table, channel), []) do
+      [] -> :ets.delete(@channel_cache_table, channel)
+      pids -> :ets.insert(@channel_cache_table, {channel, pids})
+    end
+  end
+
+  defp exact_pids_for_channel([{_channel, pid} | rest], acc) do
+    exact_pids_for_channel(rest, [pid | acc])
+  end
+
+  defp exact_pids_for_channel([], acc), do: acc
+
+  defp exact_channels_for_pid(pid) do
+    @channels_table
+    |> :ets.match({:"$1", pid})
+    |> exact_channels_from_match([])
+  end
+
+  defp exact_channels_from_match([[channel] | rest], acc),
+    do: exact_channels_from_match(rest, [channel | acc])
+
+  defp exact_channels_from_match([], acc), do: unique_channels(acc)
+
+  defp unique_channels(channels), do: unique_channels(channels, MapSet.new(), [])
+
+  defp unique_channels([channel | rest], seen, acc) do
+    if MapSet.member?(seen, channel) do
+      unique_channels(rest, seen, acc)
+    else
+      unique_channels(rest, MapSet.put(seen, channel), [channel | acc])
+    end
+  end
+
+  defp unique_channels([], _seen, acc), do: acc
+
+  defp publish_exact_pids([pid | rest], channel, message, count) do
+    send(pid, {:pubsub_message, channel, message})
+    publish_exact_pids(rest, channel, message, count + 1)
+  end
+
+  defp publish_exact_pids([], _channel, _message, count), do: count
+
+  defp pattern_matcher(pattern) do
+    if byte_size(pattern) > 1024 do
+      :never
+    else
+      simple_pattern_matcher(pattern, 0, byte_size(pattern), 0, -1)
+    end
+  end
+
+  defp simple_pattern_matcher(pattern, pos, size, star_count, star_pos) when pos < size do
+    case :binary.at(pattern, pos) do
+      ?* ->
+        simple_pattern_matcher(pattern, pos + 1, size, star_count + 1, pos)
+
+      special when special in [??, ?[, ?\\] ->
+        {:glob, pattern}
+
+      _literal ->
+        simple_pattern_matcher(pattern, pos + 1, size, star_count, star_pos)
+    end
+  end
+
+  defp simple_pattern_matcher(pattern, _pos, _size, 0, _star_pos), do: {:exact, pattern}
+  defp simple_pattern_matcher(_pattern, _pos, 1, 1, 0), do: :all
+
+  defp simple_pattern_matcher(pattern, _pos, size, 1, star_pos) when star_pos == size - 1 do
+    {:prefix, binary_part(pattern, 0, size - 1)}
+  end
+
+  defp simple_pattern_matcher(pattern, _pos, size, 1, 0) do
+    {:suffix, binary_part(pattern, 1, size - 1)}
+  end
+
+  defp simple_pattern_matcher(pattern, _pos, _size, _star_count, _star_pos), do: {:glob, pattern}
+
+  defp pattern_matches?(_channel, :all), do: true
+  defp pattern_matches?(_channel, :never), do: false
+  defp pattern_matches?(channel, {:exact, exact}), do: channel == exact
+
+  defp pattern_matches?(channel, {:prefix, prefix}) do
+    prefix_size = byte_size(prefix)
+    byte_size(channel) >= prefix_size and binary_part(channel, 0, prefix_size) == prefix
+  end
+
+  defp pattern_matches?(channel, {:suffix, suffix}) do
+    channel_size = byte_size(channel)
+    suffix_size = byte_size(suffix)
+
+    channel_size >= suffix_size and
+      binary_part(channel, channel_size - suffix_size, suffix_size) == suffix
+  end
+
+  defp pattern_matches?(channel, {:glob, pattern}),
+    do: Ferricstore.GlobMatcher.match?(channel, pattern)
 end

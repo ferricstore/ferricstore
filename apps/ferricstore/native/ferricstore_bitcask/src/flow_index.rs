@@ -224,7 +224,10 @@ pub fn flow_index_score_of<'a>(
 ) -> NifResult<Term<'a>> {
     let index = resource.inner.lock().expect("flow index mutex poisoned");
 
-    match index.lookup.get(&(key.as_slice().to_vec(), member.as_slice().to_vec())) {
+    match index
+        .lookup
+        .get(&(key.as_slice().to_vec(), member.as_slice().to_vec()))
+    {
         Some(score) => Ok((crate::atoms::ok(), *score).encode(env)),
         None => Ok(crate::atoms::miss().encode(env)),
     }
@@ -280,10 +283,7 @@ pub fn flow_index_claim_due_candidates<'a>(
     max_scan: usize,
 ) -> NifResult<Term<'a>> {
     let index = resource.inner.lock().expect("flow index mutex poisoned");
-    let key_refs = keys
-        .iter()
-        .map(|key| key.as_slice())
-        .collect::<Vec<_>>();
+    let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
     let rows = index.claim_due_candidates(&key_refs, max_score, limit, max_scan);
 
     encode_owned_key_member_scores(env, rows)
@@ -295,7 +295,12 @@ pub fn flow_index_count_all<'a>(
     key: Binary<'a>,
 ) -> i64 {
     let index = resource.inner.lock().expect("flow index mutex poisoned");
-    index.counts.get(key.as_slice()).copied().unwrap_or(0).max(0)
+    index
+        .counts
+        .get(key.as_slice())
+        .copied()
+        .unwrap_or(0)
+        .max(0)
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -306,7 +311,14 @@ pub fn flow_index_count_many<'a>(
     let index = resource.inner.lock().expect("flow index mutex poisoned");
 
     keys.into_iter()
-        .map(|key| index.counts.get(key.as_slice()).copied().unwrap_or(0).max(0))
+        .map(|key| {
+            index
+                .counts
+                .get(key.as_slice())
+                .copied()
+                .unwrap_or(0)
+                .max(0)
+        })
         .collect()
 }
 
@@ -319,7 +331,13 @@ pub fn flow_index_count_keys<'a>(
     let keys = index
         .counts
         .iter()
-        .filter_map(|(key, count)| if *count > 0 { Some(key.as_slice()) } else { None })
+        .filter_map(|(key, count)| {
+            if *count > 0 {
+                Some(key.as_slice())
+            } else {
+                None
+            }
+        })
         .collect::<Vec<_>>();
 
     encode_binaries(env, keys)
@@ -602,15 +620,17 @@ pub fn flow_record_plan_claims<'a>(
             worker_key.clone(),
             deadline_score,
         )
-            .encode(env);
+        .encode(env);
 
-        plan_terms.push((
-            next_value_term,
-            entry_term,
-            state_key_term,
-            previous_history_ms,
-        )
-            .encode(env));
+        plan_terms.push(
+            (
+                next_value_term,
+                entry_term,
+                state_key_term,
+                previous_history_ms,
+            )
+                .encode(env),
+        );
         accepted += 1;
     }
 
@@ -939,7 +959,12 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
         b"parent_flow_id",
         parent_flow_id.unwrap_or(&[]),
     )?;
-    push_history_binary_field(env, &mut fields, b"root_flow_id", root_flow_id.unwrap_or(&[]))?;
+    push_history_binary_field(
+        env,
+        &mut fields,
+        b"root_flow_id",
+        root_flow_id.unwrap_or(&[]),
+    )?;
     push_history_binary_field(
         env,
         &mut fields,
@@ -1044,7 +1069,10 @@ impl FlowOrderedIndex {
 
     fn move_member(&mut self, from_key: &[u8], to_key: &[u8], member: &[u8], score: f64) {
         if from_key == to_key {
-            if let Some(old_score) = self.lookup.get(&(from_key.to_vec(), member.to_vec())).copied()
+            if let Some(old_score) = self
+                .lookup
+                .get(&(from_key.to_vec(), member.to_vec()))
+                .copied()
             {
                 self.ordered.remove(&OrderedEntry {
                     key: from_key.to_vec(),
@@ -1065,7 +1093,8 @@ impl FlowOrderedIndex {
             score: Score(score),
             member: member.to_vec(),
         });
-        self.lookup.insert((to_key.to_vec(), member.to_vec()), score);
+        self.lookup
+            .insert((to_key.to_vec(), member.to_vec()), score);
 
         self.increment_count(to_key, 1);
     }
@@ -1106,7 +1135,11 @@ impl FlowOrderedIndex {
         let mut rows = Vec::new();
         let mut skipped = 0usize;
         let unlimited = count < 0;
-        let limit = if unlimited { usize::MAX } else { count as usize };
+        let limit = if unlimited {
+            usize::MAX
+        } else {
+            count as usize
+        };
 
         if reverse {
             for entry in self.ordered.iter().rev() {

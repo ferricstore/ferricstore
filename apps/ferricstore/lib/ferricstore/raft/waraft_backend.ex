@@ -239,11 +239,17 @@ defmodule Ferricstore.Raft.WARaftBackend do
   def write_batch(_shard_index, []), do: {:ok, []}
 
   def write_batch(shard_index, commands) when is_list(commands) do
-    commit_or_redirect(shard_index, {:batch, commands}, 2)
+    NamespaceBatcher.write_batch(shard_index, commands)
   end
 
   def write_batch(_shard_index, commands),
     do: {:error, {:invalid_command_batch, commands}}
+
+  @doc false
+  @spec __commit_batch_direct__(non_neg_integer(), [tuple()]) :: term()
+  def __commit_batch_direct__(shard_index, commands) when is_list(commands) do
+    commit_or_redirect(shard_index, {:batch, commands}, 2)
+  end
 
   @spec write_put_batch(non_neg_integer(), [{binary(), binary(), non_neg_integer()}]) :: term()
   def write_put_batch(shard_index, _entries) when invalid_shard_index_shape(shard_index),
@@ -258,6 +264,31 @@ defmodule Ferricstore.Raft.WARaftBackend do
   def write_put_batch(_shard_index, entries),
     do: {:error, {:invalid_put_batch, entries}}
 
+  @spec write_put_batch_async(
+          non_neg_integer(),
+          [{binary(), binary(), non_neg_integer()}],
+          GenServer.from()
+        ) :: :ok | {:direct, term()}
+  def write_put_batch_async(shard_index, _entries, from)
+      when invalid_shard_index_shape(shard_index) do
+    GenServer.reply(from, invalid_shard_index_error(shard_index))
+    :ok
+  end
+
+  def write_put_batch_async(_shard_index, [], from) do
+    GenServer.reply(from, {:ok, []})
+    :ok
+  end
+
+  def write_put_batch_async(shard_index, entries, from) when is_list(entries) do
+    NamespaceBatcher.write_put_batch_async(shard_index, entries, from)
+  end
+
+  def write_put_batch_async(_shard_index, entries, from) do
+    GenServer.reply(from, {:error, {:invalid_put_batch, entries}})
+    :ok
+  end
+
   @spec write_delete_batch(non_neg_integer(), [binary()]) :: term()
   def write_delete_batch(shard_index, _keys) when invalid_shard_index_shape(shard_index),
     do: invalid_shard_index_error(shard_index)
@@ -270,6 +301,28 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   def write_delete_batch(_shard_index, keys),
     do: {:error, {:invalid_delete_batch, keys}}
+
+  @spec write_delete_batch_async(non_neg_integer(), [binary()], GenServer.from()) ::
+          :ok | {:direct, term()}
+  def write_delete_batch_async(shard_index, _keys, from)
+      when invalid_shard_index_shape(shard_index) do
+    GenServer.reply(from, invalid_shard_index_error(shard_index))
+    :ok
+  end
+
+  def write_delete_batch_async(_shard_index, [], from) do
+    GenServer.reply(from, {:ok, []})
+    :ok
+  end
+
+  def write_delete_batch_async(shard_index, keys, from) when is_list(keys) do
+    NamespaceBatcher.write_delete_batch_async(shard_index, keys, from)
+  end
+
+  def write_delete_batch_async(_shard_index, keys, from) do
+    GenServer.reply(from, {:error, {:invalid_delete_batch, keys}})
+    :ok
+  end
 
   @doc false
   @spec __commit_put_batch_direct__(
@@ -735,10 +788,23 @@ defmodule Ferricstore.Raft.WARaftBackend do
           acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
           acceptor_pid = Process.whereis(acceptor)
           stamped = CommandStamp.to_ttb(prepared_command)
+          started_mono = System.monotonic_time()
 
-          acceptor
-          |> commit_safely(acceptor_pid, {make_ref(), stamped})
-          |> normalize_commit_transport_result(acceptor_pid)
+          result =
+            acceptor
+            |> commit_safely(acceptor_pid, {make_ref(), stamped})
+            |> normalize_commit_transport_result(acceptor_pid)
+
+          emit_commit_timeout_if_needed(
+            shard_index,
+            command,
+            result,
+            acquired_bytes,
+            started_mono,
+            :sync
+          )
+
+          result
         end
       after
         release_commit_bytes(shard_index, acquired_bytes)
@@ -842,6 +908,8 @@ defmodule Ferricstore.Raft.WARaftBackend do
             reply_alias = :erlang.alias([:reply])
             command_ref = make_ref()
             stamped = CommandStamp.to_ttb(prepared_command)
+            command_shape = command_shape(command)
+            started_mono = System.monotonic_time()
 
             case commit_async_safely(
                    acceptor,
@@ -849,7 +917,8 @@ defmodule Ferricstore.Raft.WARaftBackend do
                    {command_ref, stamped}
                  ) do
               :ok ->
-                {:submitted, shard_index, reply_alias, reply_ref, pid, acquired_bytes}
+                {:submitted, shard_index, reply_alias, reply_ref, pid, acquired_bytes,
+                 command_shape, started_mono}
 
               {:error, _reason} = error ->
                 flush_reply_alias(reply_alias, reply_ref)
@@ -885,13 +954,16 @@ defmodule Ferricstore.Raft.WARaftBackend do
   defp await_commit_async({:immediate, result}), do: result
 
   defp await_commit_async(
-         {:submitted, shard_index, reply_alias, reply_ref, acceptor_pid, acquired_bytes}
+         {:submitted, shard_index, reply_alias, reply_ref, acceptor_pid, acquired_bytes,
+          command_shape, started_mono}
        ) do
     try do
       receive do
         {^reply_ref, result} -> normalize_commit_transport_result(result, acceptor_pid)
       after
-        @timeout -> {:error, :timeout}
+        @timeout ->
+          emit_commit_timeout(shard_index, command_shape, acquired_bytes, started_mono, :async)
+          {:error, :timeout}
       end
     after
       flush_reply_alias(reply_alias, reply_ref)
@@ -2090,6 +2162,13 @@ defmodule Ferricstore.Raft.WARaftBackend do
     :ok =
       Application.put_env(
         @app,
+        :raft_async_log_append,
+        config.async_log_append
+      )
+
+    :ok =
+      Application.put_env(
+        @app,
         :raft_election_timeout_ms,
         config.timeout_ms
       )
@@ -2127,6 +2206,27 @@ defmodule Ferricstore.Raft.WARaftBackend do
         @app,
         :raft_apply_batch_max_bytes,
         config.apply_batch_max_bytes
+      )
+
+    :ok =
+      Application.put_env(
+        @app,
+        :raft_max_log_records_per_file,
+        config.log_rotation_interval
+      )
+
+    :ok =
+      Application.put_env(
+        @app,
+        :raft_max_log_records,
+        config.log_rotation_keep
+      )
+
+    :ok =
+      Application.put_env(
+        @app,
+        :raft_max_retained_entries,
+        config.max_retained_entries
       )
   end
 
@@ -2234,6 +2334,27 @@ defmodule Ferricstore.Raft.WARaftBackend do
           :apply_batch_max_bytes,
           :waraft_apply_batch_max_bytes,
           16 * 1024 * 1024
+        ),
+      log_rotation_interval:
+        throughput_option(
+          opts,
+          :log_rotation_interval,
+          :waraft_log_rotation_interval,
+          50_000
+        ),
+      log_rotation_keep:
+        throughput_option(
+          opts,
+          :log_rotation_keep,
+          :waraft_log_rotation_keep,
+          100_000
+        ),
+      max_retained_entries:
+        throughput_option(
+          opts,
+          :max_retained_entries,
+          :waraft_max_retained_entries,
+          100_000
         )
     }
   end
@@ -2285,7 +2406,15 @@ defmodule Ferricstore.Raft.WARaftBackend do
     %{
       commit_batch_interval_ms:
         non_negative_integer_option!(batch_interval_source, batch_interval_value),
-      commit_batch_max: throughput_option(opts, :commit_batch_max, :waraft_commit_batch_max, 1024)
+      commit_batch_max:
+        throughput_option(opts, :commit_batch_max, :waraft_commit_batch_max, 1024),
+      async_log_append:
+        boolean_option(
+          opts,
+          :async_log_append,
+          :waraft_async_log_append,
+          false
+        )
     }
   end
 
@@ -2331,6 +2460,17 @@ defmodule Ferricstore.Raft.WARaftBackend do
   defp non_negative_integer_option!(source, value) do
     raise ArgumentError,
           "#{inspect(source)} must be a non-negative integer, got: #{inspect(value)}"
+  end
+
+  defp boolean_option(opts, opt_key, app_key, default) do
+    {source, value} = config_option(opts, opt_key, app_key, default)
+    boolean_option!(source, value)
+  end
+
+  defp boolean_option!(_source, value) when is_boolean(value), do: value
+
+  defp boolean_option!(source, value) do
+    raise ArgumentError, "#{inspect(source)} must be a boolean, got: #{inspect(value)}"
   end
 
   defp registered_partition_count do
@@ -2497,6 +2637,53 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp blob_prepare_failure_cause({:blob_prepare_failed, cause}), do: cause
   defp blob_prepare_failure_cause(reason), do: reason
+
+  defp emit_commit_timeout_if_needed(
+         shard_index,
+         command,
+         {:error, :timeout},
+         acquired_bytes,
+         started_mono,
+         path
+       ) do
+    emit_commit_timeout(shard_index, command_shape(command), acquired_bytes, started_mono, path)
+  end
+
+  defp emit_commit_timeout_if_needed(
+         _shard_index,
+         _command,
+         _result,
+         _acquired_bytes,
+         _started_mono,
+         _path
+       ),
+       do: :ok
+
+  defp emit_commit_timeout(shard_index, command_shape, acquired_bytes, started_mono, path) do
+    duration_us =
+      System.monotonic_time()
+      |> Kernel.-(started_mono)
+      |> System.convert_time_unit(:native, :microsecond)
+
+    :telemetry.execute(
+      [:ferricstore, :waraft, :commit, :timeout],
+      %{
+        count: 1,
+        duration_us: max(duration_us, 0),
+        timeout_ms: @timeout,
+        acquired_bytes: acquired_bytes,
+        inflight_bytes: inflight_commit_bytes(shard_index)
+      },
+      %{
+        shard_index: shard_index,
+        command_shape: command_shape,
+        path: path,
+        reason: :timeout
+      }
+    )
+  rescue
+    _ -> :ok
+  end
 
   defp command_shape({:put_batch, _entries}), do: :put_batch
   defp command_shape({:delete_batch, _keys}), do: :delete_batch

@@ -109,6 +109,39 @@ defmodule Ferricstore.Commands.HashTest do
       refute_received {:compound_batch_put, _}
     end
 
+    test "HSET builds write entries and added count in one pass" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/hash.ex", __DIR__))
+
+      [hset_source] = Regex.run(~r/defp hset_pairs\(.*?^  end/ms, source)
+
+      assert hset_source =~ "hash_put_entries(fields, compound_keys, existing_values,"
+      refute hset_source =~ "Enum.count(&is_nil/1)"
+      refute hset_source =~ "|> Enum.zip(compound_keys)"
+    end
+
+    test "multi-field hash metadata maps are built in one pass" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/hash.ex", __DIR__))
+
+      [batch_meta_source] = Regex.run(~r/defp batch_hash_field_metas\(.*?^  end/ms, source)
+
+      assert batch_meta_source =~ "hash_field_metas_by_field(unique_fields, metas, %{})"
+      refute batch_meta_source =~ "then(&Enum.zip(unique_fields, &1))"
+      refute batch_meta_source =~ "|> Map.new()"
+    end
+
+    test "multi-field hash metadata writes are built in one pass" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/hash.ex", __DIR__))
+
+      assert source =~
+               "persistent_hash_field_entries(unique_fields, compound_keys, metas_by_field, [])"
+
+      [existing_source] = Regex.run(~r/defp existing_hash_field_entries\(.*?^  end/ms, source)
+
+      assert existing_source =~ "existing_hash_field_entries(unique_fields, compound_keys,"
+      refute existing_source =~ "Enum.zip(compound_keys)"
+      refute existing_source =~ "Enum.flat_map"
+    end
+
     test "HSET rolls back new type metadata when field write fails" do
       parent = self()
       type_key = CompoundKey.type_key("hash")
@@ -263,6 +296,16 @@ defmodule Ferricstore.Commands.HashTest do
       refute_received {:compound_batch_delete, _}
     end
 
+    test "HDEL builds deleted entries directly from batch metadata" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/hash.ex", __DIR__))
+
+      [hdel_source] = Regex.run(~r/defp hdel_args\(\[key \| fields\].*?^  end/ms, source)
+
+      assert hdel_source =~ "hash_deleted_entries(compound_keys, metas, [])"
+      refute hdel_source =~ "metas_by_key"
+      refute hdel_source =~ "Enum.flat_map"
+    end
+
     test "HDEL with no fields returns error" do
       assert {:error, _} = Hash.handle("HDEL", ["hash"], MockStore.make())
     end
@@ -302,6 +345,16 @@ defmodule Ferricstore.Commands.HashTest do
   # ---------------------------------------------------------------------------
 
   describe "HGETDEL" do
+    test "HGETDEL builds results and deleted entries in one reducer" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/hash.ex", __DIR__))
+
+      [hgetdel_source] = Regex.run(~r/defp hgetdel_fields\(.*?^  end/ms, source)
+
+      assert hgetdel_source =~ "hgetdel_results(fields, key, metas_by_key, [], %{}, [])"
+      refute hgetdel_source =~ "deleted_entries_by_key"
+      refute hgetdel_source =~ "Enum.map(deleted_entries"
+    end
+
     test "HGETDEL preserves the last field when type cleanup fails" do
       base = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1"], base)
@@ -393,6 +446,17 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HGETALL with wrong arity returns error" do
       assert {:error, _} = Hash.handle("HGETALL", [], MockStore.make())
+    end
+
+    test "hash field-value responses use shared flat-list helper" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/hash.ex", __DIR__))
+
+      assert source =~ "hash_pairs_to_flat_list(pairs)"
+      assert source =~ "hash_pairs_to_flat_list(batch)"
+      assert source =~ "hash_pairs_to_flat_list(selected)"
+      refute source =~ "Enum.flat_map(pairs, fn {field, value} -> [field, value] end)"
+      refute source =~ "Enum.flat_map(batch, fn {field, value} -> [field, value] end)"
+      refute source =~ "Enum.flat_map(selected, fn {field, value} -> [field, value] end)"
     end
   end
 

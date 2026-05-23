@@ -2110,23 +2110,27 @@ fn v2_append_ops_batch_nosync<'a>(
 fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
     let stores = LMDB_STORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
 
-    {
-        let guard = stores
-            .lock()
-            .map_err(|_| "lmdb cache poisoned".to_string())?;
-        if let Some(store) = guard.get(path) {
-            return Ok(Arc::clone(store));
-        }
-    }
+    let mut guard = stores
+        .lock()
+        .map_err(|_| "lmdb cache poisoned".to_string())?;
 
     std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let cache_key = std::fs::canonicalize(path)
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .into_owned();
+
+    if let Some(store) = guard.get(&cache_key) {
+        return Ok(Arc::clone(store));
+    }
+
     let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
 
     let env = unsafe {
         heed::EnvOpenOptions::new()
             .map_size(map_size)
             .max_dbs(4)
-            .open(path)
+            .open(&cache_key)
             .map_err(|e| e.to_string())?
     };
 
@@ -2137,12 +2141,8 @@ fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
     wtxn.commit().map_err(|e| e.to_string())?;
 
     let store = Arc::new(LmdbStore { env, db });
-    let mut guard = stores
-        .lock()
-        .map_err(|_| "lmdb cache poisoned".to_string())?;
-    Ok(Arc::clone(
-        guard.entry(path.to_string()).or_insert_with(|| store),
-    ))
+    guard.insert(cache_key, Arc::clone(&store));
+    Ok(store)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -3716,6 +3716,29 @@ mod nif_scheduler_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lmdb_cache_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lmdb_store_reuses_canonical_path_for_aliases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("db");
+        let alias_root = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias_root).unwrap();
+        let alias = alias_root.join("db");
+
+        let first = lmdb_store(real.to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        let second = lmdb_store(alias.to_str().unwrap(), 128 * 1024 * 1024).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "aliased LMDB paths must reuse the already-open environment"
+        );
     }
 }
 
