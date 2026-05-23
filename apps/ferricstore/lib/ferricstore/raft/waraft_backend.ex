@@ -358,6 +358,25 @@ defmodule Ferricstore.Raft.WARaftBackend do
     end
   end
 
+  @spec segment_log_memory_status(non_neg_integer()) :: map()
+  def segment_log_memory_status(shard_index) when invalid_shard_index_shape(shard_index),
+    do: empty_segment_log_memory_status()
+
+  def segment_log_memory_status(shard_index) do
+    partition = partition(shard_index)
+    log_name = :wa_raft_log.registered_name(@table, partition)
+    log = {:raft_log, log_name, @app, @table, partition, @default_log_module}
+
+    case @default_log_module.memory_status(log) do
+      status when is_map(status) -> status
+      _other -> empty_segment_log_memory_status()
+    end
+  rescue
+    _ -> empty_segment_log_memory_status()
+  catch
+    _, _ -> empty_segment_log_memory_status()
+  end
+
   @spec storage_position(non_neg_integer()) :: {:ok, tuple()} | {:error, term()}
   def storage_position(shard_index) when invalid_shard_index_shape(shard_index),
     do: invalid_shard_index_error(shard_index)
@@ -2525,6 +2544,18 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp partition(shard_index) when is_integer(shard_index) and shard_index >= 0 do
     shard_index + 1
+  end
+
+  defp empty_segment_log_memory_status do
+    %{
+      ets_entries: 0,
+      ets_bytes: 0,
+      disk_first_index: nil,
+      disk_last_index: nil,
+      max_ets_bytes: 0,
+      max_ets_entries: 0,
+      min_ets_entries: 0
+    }
   end
 
   defp server_name(partition) do

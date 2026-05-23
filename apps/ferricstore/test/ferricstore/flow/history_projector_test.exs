@@ -188,6 +188,143 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     send(test_pid, {:history_projector_recover_error, event, measurements, metadata})
   end
 
+  test "async enqueue rejects above configured pending cap so apply can fall back to sync projection" do
+    unique = System.unique_integer([:positive])
+
+    old_max_pending =
+      Application.get_env(:ferricstore, :flow_history_projector_max_pending_entries)
+
+    old_flush_interval =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    instance_name = :"history_projector_pending_cap_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_pending_cap_#{unique}")
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_pending_cap_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    :ets.new(flow_index, [:ordered_set, :public, :named_table])
+    :ets.new(flow_lookup, [:set, :public, :named_table])
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    try do
+      Application.put_env(:ferricstore, :flow_history_projector_max_pending_entries, 1)
+      Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+      {:ok, pid} =
+        HistoryProjector.start_link(
+          shard_index: 0,
+          shard_data_path: dir,
+          instance_ctx: ctx,
+          recover_on_init: false
+        )
+
+      entry = fn version ->
+        event_ms = 1_000 + version
+        event_id = "#{event_ms}-#{version}"
+
+        %{
+          key: Ferricstore.Flow.Keys.stream_entry_key("flow-cap", event_id, nil),
+          expire_at_ms: 0,
+          history_key: Ferricstore.Flow.Keys.history_key("flow-cap"),
+          event_id: event_id,
+          event_ms: event_ms,
+          version: version,
+          value: "history-#{version}",
+          ra_index: version
+        }
+      end
+
+      assert :ok = HistoryProjector.enqueue(ctx, 0, [entry.(1)], 1)
+      assert {:error, :queue_full} = HistoryProjector.enqueue(ctx, 0, [entry.(2)], 2)
+
+      assert Process.alive?(pid)
+    after
+      if Process.whereis(HistoryProjector.name(ctx, 0)),
+        do: GenServer.stop(HistoryProjector.name(ctx, 0))
+
+      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
+      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
+      File.rm_rf(dir)
+      restore_env(:flow_history_projector_max_pending_entries, old_max_pending)
+      restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+    end
+  end
+
+  test "fire-and-forget enqueue does not wait behind projector work" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_async_enqueue_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_async_enqueue_#{unique}")
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_async_enqueue_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    :ets.new(flow_index, [:ordered_set, :public, :named_table])
+    :ets.new(flow_lookup, [:set, :public, :named_table])
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    try do
+      {:ok, pid} =
+        HistoryProjector.start_link(
+          shard_index: 0,
+          shard_data_path: dir,
+          instance_ctx: ctx,
+          recover_on_init: false
+        )
+
+      :ok = :sys.suspend(pid)
+
+      entry = %{
+        key: Ferricstore.Flow.Keys.stream_entry_key("flow-async-enqueue", "1001-1", nil),
+        expire_at_ms: 0,
+        history_key: Ferricstore.Flow.Keys.history_key("flow-async-enqueue"),
+        event_id: "1001-1",
+        event_ms: 1001,
+        version: 1,
+        value: "history-1",
+        ra_index: 1
+      }
+
+      started = System.monotonic_time()
+      assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry], 1)
+
+      elapsed_ms =
+        System.convert_time_unit(System.monotonic_time() - started, :native, :millisecond)
+
+      assert elapsed_ms < 50
+
+      :ok = :sys.resume(pid)
+      assert :ok = HistoryProjector.flush(ctx, 0)
+    after
+      if Process.whereis(HistoryProjector.name(ctx, 0)),
+        do: GenServer.stop(HistoryProjector.name(ctx, 0))
+
+      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
+      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
+      File.rm_rf(dir)
+    end
+  end
+
   test "start_link can skip recovery when shard startup already imported history" do
     unique = System.unique_integer([:positive])
     instance_name = :"history_projector_skip_recover_#{unique}"
@@ -250,4 +387,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     assert OrderedIndex.count_all(flow_lookup, history_key) == 0
     assert HistoryProjector.durable?(ctx, 0, dir, 7)
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

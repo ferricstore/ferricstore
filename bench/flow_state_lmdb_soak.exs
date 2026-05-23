@@ -123,6 +123,7 @@ defmodule FlowStateLMDBSoak do
         max_keydir_binary_mb: 0.0,
         max_flow_index_entries: 0,
         max_flow_lookup_entries: 0,
+        sample_count: 0,
         outputs: %{}
       }
 
@@ -283,6 +284,7 @@ defmodule FlowStateLMDBSoak do
     flow_index = flow_index_status()
     waraft_log = waraft_log_status()
     telemetry = telemetry_snapshot(state.table)
+    sample_count = Map.get(state, :sample_count, 0) + 1
 
     IO.puts(
       "sample elapsed_s=#{Float.round(elapsed_s, 1)} " <>
@@ -320,6 +322,9 @@ defmodule FlowStateLMDBSoak do
         "flow_lookup_entries=#{flow_index.lookup_entries}"
     )
 
+    maybe_print_top_binary_holders(sample_count)
+    maybe_print_top_ets_binary_tables(sample_count)
+
     %{
       state
       | last_disk_mb: disk_mb,
@@ -337,7 +342,8 @@ defmodule FlowStateLMDBSoak do
         max_binary_mem_mb: max(state.max_binary_mem_mb, memory.binary_mb),
         max_keydir_binary_mb: max(state.max_keydir_binary_mb, keydir.binary_mb),
         max_flow_index_entries: max(state.max_flow_index_entries, flow_index.index_entries),
-        max_flow_lookup_entries: max(state.max_flow_lookup_entries, flow_index.lookup_entries)
+        max_flow_lookup_entries: max(state.max_flow_lookup_entries, flow_index.lookup_entries),
+        sample_count: sample_count
     }
   end
 
@@ -813,6 +819,166 @@ defmodule FlowStateLMDBSoak do
     }
   end
 
+  defp maybe_print_top_binary_holders(sample_count) do
+    if diagnostic_due?("TOP_BINARY_HOLDERS", "TOP_BINARY_HOLDERS_EVERY_N", sample_count) do
+      limit = int_env("TOP_BINARY_HOLDERS_LIMIT", 8)
+
+      Process.list()
+      |> Enum.map(&process_binary_holder/1)
+      |> Enum.filter(fn %{bytes: bytes} -> bytes > 0 end)
+      |> Enum.sort_by(& &1.bytes, :desc)
+      |> Enum.take(limit)
+      |> Enum.each(fn holder ->
+        IO.puts(
+          "top_binary_holder pid=#{inspect(holder.pid)} name=#{inspect(holder.name)} " <>
+            "initial_call=#{inspect(holder.initial_call)} binary_mb=#{Float.round(bytes_to_mb(holder.bytes), 1)} " <>
+            "binary_count=#{holder.count}"
+        )
+      end)
+    end
+  end
+
+  defp maybe_print_top_ets_binary_tables(sample_count) do
+    if diagnostic_due?("TOP_ETS_BINARY_TABLES", "TOP_ETS_BINARY_TABLES_EVERY_N", sample_count) do
+      limit = int_env("TOP_ETS_BINARY_TABLES_LIMIT", 8)
+      max_rows = int_env("TOP_ETS_BINARY_TABLES_MAX_ROWS", 1_000)
+
+      :ets.all()
+      |> Enum.map(&ets_binary_table_sample(&1, max_rows))
+      |> Enum.filter(fn %{bytes: bytes} -> bytes > 0 end)
+      |> Enum.sort_by(& &1.bytes, :desc)
+      |> Enum.take(limit)
+      |> Enum.each(fn table ->
+        IO.puts(
+          "top_ets_binary_table table=#{inspect(table.table)} sampled_binary_mb=#{Float.round(bytes_to_mb(table.bytes), 1)} " <>
+            "sampled_rows=#{table.rows} table_size=#{inspect(table.size)}"
+        )
+      end)
+    end
+  end
+
+  defp diagnostic_due?(enabled_env, every_env, sample_count) do
+    case env(enabled_env, "0") do
+      value when value in ["1", "true", "TRUE"] ->
+        every = max(int_env(every_env, 4), 1)
+        rem(sample_count, every) == 0
+
+      _ ->
+        false
+    end
+  end
+
+  defp process_binary_holder(pid) do
+    binaries =
+      case Process.info(pid, :binary) do
+        {:binary, binaries} when is_list(binaries) -> binaries
+        _ -> []
+      end
+
+    {bytes, count} =
+      Enum.reduce(binaries, {0, 0}, fn
+        {_binary, size, _refs}, {sum, total} when is_integer(size) ->
+          {sum + size, total + 1}
+
+        _other, acc ->
+          acc
+      end)
+
+    %{
+      pid: pid,
+      name: process_info_value(pid, :registered_name),
+      initial_call: process_info_value(pid, :initial_call),
+      bytes: bytes,
+      count: count
+    }
+  end
+
+  defp process_info_value(pid, key) do
+    case Process.info(pid, key) do
+      {^key, value} -> value
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp ets_binary_table_sample(table, max_rows) do
+    size = ets_info(table, :size)
+
+    {bytes, rows} =
+      if is_integer(size) and size > 0 do
+        sample_ets_table_binaries(table, max_rows)
+      else
+        {0, 0}
+      end
+
+    %{table: table, bytes: bytes, rows: rows, size: size}
+  end
+
+  defp sample_ets_table_binaries(table, max_rows) do
+    try do
+      :ets.safe_fixtable(table, true)
+
+      try do
+        sample_ets_table_binaries(table, :ets.first(table), max_rows, 0, 0)
+      rescue
+        ArgumentError -> {0, 0}
+      after
+        try do
+          :ets.safe_fixtable(table, false)
+        rescue
+          ArgumentError -> :ok
+        end
+      end
+    rescue
+      ArgumentError -> {0, 0}
+    end
+  end
+
+  defp sample_ets_table_binaries(_table, :"$end_of_table", _max_rows, bytes, rows),
+    do: {bytes, rows}
+
+  defp sample_ets_table_binaries(_table, _key, max_rows, bytes, rows) when rows >= max_rows,
+    do: {bytes, rows}
+
+  defp sample_ets_table_binaries(table, key, max_rows, bytes, rows) do
+    next = :ets.next(table, key)
+
+    row_bytes =
+      case :ets.lookup(table, key) do
+        [row] -> term_binary_ref_bytes(row)
+        rows when is_list(rows) -> Enum.reduce(rows, 0, &(&2 + term_binary_ref_bytes(&1)))
+      end
+
+    sample_ets_table_binaries(table, next, max_rows, bytes + row_bytes, rows + 1)
+  rescue
+    ArgumentError -> {bytes, rows}
+  end
+
+  defp term_binary_ref_bytes(term) when is_binary(term) and byte_size(term) > 64,
+    do: byte_size(term)
+
+  defp term_binary_ref_bytes(term) when is_tuple(term) do
+    term
+    |> Tuple.to_list()
+    |> Enum.reduce(0, &(&2 + term_binary_ref_bytes(&1)))
+  end
+
+  defp term_binary_ref_bytes(term) when is_list(term),
+    do: Enum.reduce(term, 0, &(&2 + term_binary_ref_bytes(&1)))
+
+  defp term_binary_ref_bytes(term) when is_map(term) do
+    :maps.fold(
+      fn key, value, acc ->
+        acc + term_binary_ref_bytes(key) + term_binary_ref_bytes(value)
+      end,
+      0,
+      term
+    )
+  end
+
+  defp term_binary_ref_bytes(_term), do: 0
+
   defp os_process_status do
     pid = :os.getpid() |> List.to_string()
 
@@ -907,6 +1073,27 @@ defmodule FlowStateLMDBSoak do
       int_env("FLOW_LMDB_MAX_CONCURRENT_FLUSHES", 1)
     )
 
+    put_optional_limit_env(
+      [
+        "FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES",
+        "FERRICSTORE_FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES"
+      ],
+      :flow_history_projector_max_pending_entries
+    )
+
+    put_optional_limit_env(
+      [
+        "FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES",
+        "FERRICSTORE_FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES"
+      ],
+      :flow_lmdb_writer_max_mailbox_messages
+    )
+
+    put_optional_limit_env(
+      ["FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS", "FERRICSTORE_FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS"],
+      :flow_lmdb_writer_max_enqueue_ops
+    )
+
     Application.delete_env(:ferricstore, :waraft_log_module)
     put_optional_bool_env("WARAFT_ASYNC_LOG_APPEND", :waraft_async_log_append)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
@@ -917,6 +1104,21 @@ defmodule FlowStateLMDBSoak do
     put_optional_int_env("WARAFT_LOG_ROTATION_KEEP", :waraft_log_rotation_keep)
     put_optional_int_env("WARAFT_MAX_RETAINED_ENTRIES", :waraft_max_retained_entries)
     put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES"],
+      :waraft_segment_log_max_ets_bytes
+    )
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES"],
+      :waraft_segment_log_max_ets_entries
+    )
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES"],
+      :waraft_segment_log_min_ets_entries
+    )
 
     put_optional_int_env(
       "WARAFT_SEGMENT_PREALLOCATE_BYTES",
@@ -1130,6 +1332,28 @@ defmodule FlowStateLMDBSoak do
     case System.get_env(env_name) do
       nil -> :ok
       value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
+  defp put_optional_limit_env(env_names, app_key) when is_list(env_names) do
+    case Enum.find_value(env_names, fn env_name ->
+           case System.get_env(env_name) do
+             nil -> nil
+             value -> value
+           end
+         end) do
+      nil -> :ok
+      value -> Application.put_env(:ferricstore, app_key, parse_limit_env(value))
+    end
+  end
+
+  defp parse_limit_env(value) do
+    case String.downcase(String.trim(value)) do
+      value when value in ["", "false", "off", "infinity", "inf", "unlimited"] ->
+        :infinity
+
+      value ->
+        String.to_integer(value)
     end
   end
 

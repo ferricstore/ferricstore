@@ -60,10 +60,53 @@ struct ClaimEntry<'a>(
     f64,
 );
 
-const FLOW_RECORD_MAGIC: &[u8; 4] = b"FSF4";
-const FLOW_HISTORY_MAGIC: &[u8; 4] = b"FSH1";
+const FLOW_RECORD_MAGIC: &[u8; 4] = b"FSF5";
+const FLOW_HISTORY_MAGIC: &[u8; 4] = b"FSH2";
 const RUNNING_STATE: &[u8] = b"running";
 const DEFAULT_RUNNING_RUN_STATE: &[u8] = b"queued";
+const EMPTY_CHILD_GROUPS_ENCODED: &[u8; 4] = b"\x04J{}";
+
+// FSF5/FSH2 are durable Flow metadata formats. Keep flag numbers and wire order
+// in lockstep with Ferricstore.Flow; changing field order/type after release
+// requires a new magic and migration decoder.
+const RECORD_FLAG_ATTEMPTS: u64 = 1 << 0;
+const RECORD_FLAG_FENCING_TOKEN: u64 = 1 << 1;
+const RECORD_FLAG_NEXT_RUN_AT_MS: u64 = 1 << 2;
+const RECORD_FLAG_PRIORITY: u64 = 1 << 3;
+const RECORD_FLAG_TTL_MS: u64 = 1 << 4;
+const RECORD_FLAG_HISTORY_HOT_MAX_EVENTS: u64 = 1 << 5;
+const RECORD_FLAG_HISTORY_MAX_EVENTS: u64 = 1 << 6;
+const RECORD_FLAG_RETENTION_TTL_MS: u64 = 1 << 7;
+const RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS: u64 = 1 << 8;
+const RECORD_FLAG_PARTITION_KEY: u64 = 1 << 9;
+const RECORD_FLAG_PAYLOAD_REF: u64 = 1 << 10;
+const RECORD_FLAG_PARENT_FLOW_ID: u64 = 1 << 11;
+const RECORD_FLAG_PARENT_PARTITION_KEY: u64 = 1 << 12;
+const RECORD_FLAG_ROOT_FLOW_ID: u64 = 1 << 13;
+const RECORD_FLAG_ROOT_FLOW_ID_SELF: u64 = 1 << 14;
+const RECORD_FLAG_CORRELATION_ID: u64 = 1 << 15;
+const RECORD_FLAG_RESULT_REF: u64 = 1 << 16;
+const RECORD_FLAG_ERROR_REF: u64 = 1 << 17;
+const RECORD_FLAG_LEASE_OWNER: u64 = 1 << 18;
+const RECORD_FLAG_LEASE_TOKEN: u64 = 1 << 19;
+const RECORD_FLAG_LEASE_DEADLINE_MS: u64 = 1 << 20;
+const RECORD_FLAG_RUN_STATE: u64 = 1 << 21;
+const RECORD_FLAG_REWOUND_TO_EVENT_ID: u64 = 1 << 22;
+const RECORD_FLAG_SIDECAR: u64 = 1 << 23;
+
+const HISTORY_FLAG_PRIORITY: u64 = 1 << 0;
+const HISTORY_FLAG_ATTEMPTS: u64 = 1 << 1;
+const HISTORY_FLAG_FENCING_TOKEN: u64 = 1 << 2;
+const HISTORY_FLAG_CREATED_AT_MS: u64 = 1 << 3;
+const HISTORY_FLAG_UPDATED_AT_MS: u64 = 1 << 4;
+const HISTORY_FLAG_NEXT_RUN_AT_MS: u64 = 1 << 5;
+const HISTORY_FLAG_LEASE_DEADLINE_MS: u64 = 1 << 6;
+const HISTORY_FLAG_LEASE_OWNER: u64 = 1 << 7;
+const HISTORY_FLAG_PAYLOAD_REF: u64 = 1 << 8;
+const HISTORY_FLAG_RESULT_REF: u64 = 1 << 9;
+const HISTORY_FLAG_ERROR_REF: u64 = 1 << 10;
+const HISTORY_FLAG_REWOUND_TO_EVENT_ID: u64 = 1 << 11;
+const HISTORY_FLAG_META: u64 = 1 << 12;
 
 struct FlowRecordParts<'a> {
     id: &'a [u8],
@@ -553,7 +596,6 @@ pub fn flow_record_plan_claims<'a>(
         }
 
         if record.state != expected_state {
-            stale_terms.push(id_bin.encode(env));
             continue;
         }
 
@@ -670,59 +712,195 @@ pub fn flow_record_encode<'a>(
     rewound_to_event_id: Option<Binary<'a>>,
     child_groups_encoded: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut out = Vec::with_capacity(
-        FLOW_RECORD_MAGIC.len()
-            + optional_bin_len(id.as_ref())
-            + optional_bin_len(flow_type.as_ref())
-            + optional_bin_len(state.as_ref())
-            + optional_bin_len(partition_key.as_ref())
-            + optional_bin_len(payload_ref.as_ref())
-            + optional_bin_len(parent_flow_id.as_ref())
-            + optional_bin_len(parent_partition_key.as_ref())
-            + optional_bin_len(root_flow_id.as_ref())
-            + optional_bin_len(correlation_id.as_ref())
-            + optional_bin_len(result_ref.as_ref())
-            + optional_bin_len(error_ref.as_ref())
-            + optional_bin_len(lease_owner.as_ref())
-            + optional_bin_len(lease_token.as_ref())
-            + optional_bin_len(run_state.as_ref())
-            + optional_bin_len(rewound_to_event_id.as_ref())
-            + child_groups_encoded.as_slice().len()
-            + 96,
+    let out = encode_flow_record_compact(
+        optional_bin_slice(id.as_ref()),
+        optional_bin_slice(flow_type.as_ref()),
+        optional_bin_slice(state.as_ref()),
+        version,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        priority,
+        ttl_ms,
+        history_hot_max_events,
+        history_max_events,
+        retention_ttl_ms,
+        terminal_retention_until_ms,
+        optional_bin_slice(partition_key.as_ref()),
+        optional_bin_slice(payload_ref.as_ref()),
+        optional_bin_slice(parent_flow_id.as_ref()),
+        optional_bin_slice(parent_partition_key.as_ref()),
+        optional_bin_slice(root_flow_id.as_ref()),
+        optional_bin_slice(correlation_id.as_ref()),
+        optional_bin_slice(result_ref.as_ref()),
+        optional_bin_slice(error_ref.as_ref()),
+        optional_bin_slice(lease_owner.as_ref()),
+        optional_bin_slice(lease_token.as_ref()),
+        lease_deadline_ms,
+        optional_bin_slice(run_state.as_ref()),
+        optional_bin_slice(rewound_to_event_id.as_ref()),
+        child_groups_encoded.as_slice(),
     );
 
+    binary_term(env, &out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_flow_record_compact(
+    id: Option<&[u8]>,
+    flow_type: Option<&[u8]>,
+    state: Option<&[u8]>,
+    version: Option<u64>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    priority: Option<u64>,
+    ttl_ms: Option<u64>,
+    history_hot_max_events: Option<u64>,
+    history_max_events: Option<u64>,
+    retention_ttl_ms: Option<u64>,
+    terminal_retention_until_ms: Option<u64>,
+    partition_key: Option<&[u8]>,
+    payload_ref: Option<&[u8]>,
+    parent_flow_id: Option<&[u8]>,
+    parent_partition_key: Option<&[u8]>,
+    root_flow_id: Option<&[u8]>,
+    correlation_id: Option<&[u8]>,
+    result_ref: Option<&[u8]>,
+    error_ref: Option<&[u8]>,
+    lease_owner: Option<&[u8]>,
+    lease_token: Option<&[u8]>,
+    lease_deadline_ms: Option<u64>,
+    run_state: Option<&[u8]>,
+    rewound_to_event_id: Option<&[u8]>,
+    child_groups_encoded: &[u8],
+) -> Vec<u8> {
+    // Required fields stay inline. Nil/default optional fields are skipped by
+    // flags so common state records avoid repeated policy/lease metadata.
+    let flags = encode_record_flags(
+        id,
+        attempts,
+        fencing_token,
+        next_run_at_ms,
+        priority,
+        ttl_ms,
+        history_hot_max_events,
+        history_max_events,
+        retention_ttl_ms,
+        terminal_retention_until_ms,
+        partition_key,
+        payload_ref,
+        parent_flow_id,
+        parent_partition_key,
+        root_flow_id,
+        correlation_id,
+        result_ref,
+        error_ref,
+        lease_owner,
+        lease_token,
+        lease_deadline_ms,
+        run_state,
+        rewound_to_event_id,
+        child_groups_encoded,
+    );
+
+    let mut out = Vec::with_capacity(
+        FLOW_RECORD_MAGIC.len()
+            + optional_slice_len(id)
+            + optional_slice_len(flow_type)
+            + optional_slice_len(state)
+            + optional_slice_len(partition_key)
+            + optional_slice_len(payload_ref)
+            + optional_slice_len(parent_flow_id)
+            + optional_slice_len(parent_partition_key)
+            + optional_slice_len(root_flow_id)
+            + optional_slice_len(correlation_id)
+            + optional_slice_len(result_ref)
+            + optional_slice_len(error_ref)
+            + optional_slice_len(lease_owner)
+            + optional_slice_len(lease_token)
+            + optional_slice_len(run_state)
+            + optional_slice_len(rewound_to_event_id)
+            + child_groups_encoded.len()
+            + 48,
+    );
+
+    // Wire order is schema-owned; update Elixir codec/tests with every change.
     out.extend_from_slice(FLOW_RECORD_MAGIC);
-    encode_bin(&mut out, optional_bin_slice(id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(flow_type.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(state.as_ref()));
+    encode_int(&mut out, Some(flags));
+    encode_bin(&mut out, id);
+    encode_bin(&mut out, flow_type);
+    encode_bin(&mut out, state);
     encode_int(&mut out, version);
-    encode_int(&mut out, attempts);
-    encode_int(&mut out, fencing_token);
     encode_int(&mut out, created_at_ms);
     encode_int(&mut out, updated_at_ms);
-    encode_int(&mut out, next_run_at_ms);
-    encode_int(&mut out, priority);
-    encode_int(&mut out, ttl_ms);
-    encode_int(&mut out, history_hot_max_events);
-    encode_int(&mut out, history_max_events);
-    encode_int(&mut out, retention_ttl_ms);
-    encode_int(&mut out, terminal_retention_until_ms);
-    encode_bin(&mut out, optional_bin_slice(partition_key.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(payload_ref.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(parent_flow_id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(parent_partition_key.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(root_flow_id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(correlation_id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(result_ref.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(error_ref.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(lease_owner.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(lease_token.as_ref()));
-    encode_int(&mut out, lease_deadline_ms);
-    encode_bin(&mut out, optional_bin_slice(run_state.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(rewound_to_event_id.as_ref()));
-    out.extend_from_slice(child_groups_encoded.as_slice());
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_ATTEMPTS, attempts);
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_FENCING_TOKEN, fencing_token);
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_NEXT_RUN_AT_MS, next_run_at_ms);
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_PRIORITY, priority);
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_TTL_MS, ttl_ms);
+    encode_flagged_int(
+        &mut out,
+        flags,
+        RECORD_FLAG_HISTORY_HOT_MAX_EVENTS,
+        history_hot_max_events,
+    );
+    encode_flagged_int(
+        &mut out,
+        flags,
+        RECORD_FLAG_HISTORY_MAX_EVENTS,
+        history_max_events,
+    );
+    encode_flagged_int(
+        &mut out,
+        flags,
+        RECORD_FLAG_RETENTION_TTL_MS,
+        retention_ttl_ms,
+    );
+    encode_flagged_int(
+        &mut out,
+        flags,
+        RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS,
+        terminal_retention_until_ms,
+    );
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_PARTITION_KEY, partition_key);
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_PAYLOAD_REF, payload_ref);
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_PARENT_FLOW_ID, parent_flow_id);
+    encode_flagged_bin(
+        &mut out,
+        flags,
+        RECORD_FLAG_PARENT_PARTITION_KEY,
+        parent_partition_key,
+    );
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_ROOT_FLOW_ID, root_flow_id);
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_CORRELATION_ID, correlation_id);
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_RESULT_REF, result_ref);
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_ERROR_REF, error_ref);
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_LEASE_OWNER, lease_owner);
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_LEASE_TOKEN, lease_token);
+    encode_flagged_int(
+        &mut out,
+        flags,
+        RECORD_FLAG_LEASE_DEADLINE_MS,
+        lease_deadline_ms,
+    );
+    encode_flagged_bin(&mut out, flags, RECORD_FLAG_RUN_STATE, run_state);
+    encode_flagged_bin(
+        &mut out,
+        flags,
+        RECORD_FLAG_REWOUND_TO_EVENT_ID,
+        rewound_to_event_id,
+    );
 
-    binary_term(env, &out)
+    if flags & RECORD_FLAG_SIDECAR != 0 {
+        out.extend_from_slice(child_groups_encoded);
+    }
+
+    out
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -787,8 +965,8 @@ pub fn flow_history_encode<'a>(
     event: Binary<'a>,
     version: Option<u64>,
     now_ms: Option<u64>,
-    id: Option<Binary<'a>>,
-    flow_type: Option<Binary<'a>>,
+    _id: Option<Binary<'a>>,
+    _flow_type: Option<Binary<'a>>,
     state: Option<Binary<'a>>,
     priority: Option<u64>,
     attempts: Option<u64>,
@@ -799,55 +977,99 @@ pub fn flow_history_encode<'a>(
     lease_deadline_ms: Option<u64>,
     lease_owner: Option<Binary<'a>>,
     payload_ref: Option<Binary<'a>>,
-    parent_flow_id: Option<Binary<'a>>,
-    root_flow_id: Option<Binary<'a>>,
-    correlation_id: Option<Binary<'a>>,
+    _parent_flow_id: Option<Binary<'a>>,
+    _root_flow_id: Option<Binary<'a>>,
+    _correlation_id: Option<Binary<'a>>,
     result_ref: Option<Binary<'a>>,
     error_ref: Option<Binary<'a>>,
     rewound_to_event_id: Option<Binary<'a>>,
     meta_encoded: Binary<'a>,
 ) -> NifResult<Term<'a>> {
+    // History is compact by design: workflow identity fields passed above are
+    // omitted and reconstructed from record context on user-facing decode.
+    let flags = encode_history_flags(
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        now_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        optional_bin_slice(lease_owner.as_ref()),
+        optional_bin_slice(payload_ref.as_ref()),
+        optional_bin_slice(result_ref.as_ref()),
+        optional_bin_slice(error_ref.as_ref()),
+        optional_bin_slice(rewound_to_event_id.as_ref()),
+        meta_encoded.as_slice(),
+    );
+
     let mut out = Vec::with_capacity(
         FLOW_HISTORY_MAGIC.len()
             + event.as_slice().len()
-            + optional_bin_len(id.as_ref())
-            + optional_bin_len(flow_type.as_ref())
             + optional_bin_len(state.as_ref())
             + optional_bin_len(lease_owner.as_ref())
             + optional_bin_len(payload_ref.as_ref())
-            + optional_bin_len(parent_flow_id.as_ref())
-            + optional_bin_len(root_flow_id.as_ref())
-            + optional_bin_len(correlation_id.as_ref())
             + optional_bin_len(result_ref.as_ref())
             + optional_bin_len(error_ref.as_ref())
             + optional_bin_len(rewound_to_event_id.as_ref())
             + meta_encoded.as_slice().len()
-            + 72,
+            + 40,
     );
 
+    // Keep this field order identical to Flow.encode_history_parts_elixir/23.
     out.extend_from_slice(FLOW_HISTORY_MAGIC);
+    encode_int(&mut out, Some(flags));
     encode_bin(&mut out, Some(event.as_slice()));
     encode_int(&mut out, version);
     encode_int(&mut out, now_ms);
-    encode_bin(&mut out, optional_bin_slice(id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(flow_type.as_ref()));
     encode_bin(&mut out, optional_bin_slice(state.as_ref()));
-    encode_int(&mut out, priority);
-    encode_int(&mut out, attempts);
-    encode_int(&mut out, fencing_token);
-    encode_int(&mut out, created_at_ms);
-    encode_int(&mut out, updated_at_ms);
-    encode_int(&mut out, next_run_at_ms);
-    encode_int(&mut out, lease_deadline_ms);
-    encode_bin(&mut out, optional_bin_slice(lease_owner.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(payload_ref.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(parent_flow_id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(root_flow_id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(correlation_id.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(result_ref.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(error_ref.as_ref()));
-    encode_bin(&mut out, optional_bin_slice(rewound_to_event_id.as_ref()));
-    out.extend_from_slice(meta_encoded.as_slice());
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_PRIORITY, priority);
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_ATTEMPTS, attempts);
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_FENCING_TOKEN, fencing_token);
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_CREATED_AT_MS, created_at_ms);
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_UPDATED_AT_MS, updated_at_ms);
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_NEXT_RUN_AT_MS, next_run_at_ms);
+    encode_flagged_int(
+        &mut out,
+        flags,
+        HISTORY_FLAG_LEASE_DEADLINE_MS,
+        lease_deadline_ms,
+    );
+    encode_flagged_bin(
+        &mut out,
+        flags,
+        HISTORY_FLAG_LEASE_OWNER,
+        optional_bin_slice(lease_owner.as_ref()),
+    );
+    encode_flagged_bin(
+        &mut out,
+        flags,
+        HISTORY_FLAG_PAYLOAD_REF,
+        optional_bin_slice(payload_ref.as_ref()),
+    );
+    encode_flagged_bin(
+        &mut out,
+        flags,
+        HISTORY_FLAG_RESULT_REF,
+        optional_bin_slice(result_ref.as_ref()),
+    );
+    encode_flagged_bin(
+        &mut out,
+        flags,
+        HISTORY_FLAG_ERROR_REF,
+        optional_bin_slice(error_ref.as_ref()),
+    );
+    encode_flagged_bin(
+        &mut out,
+        flags,
+        HISTORY_FLAG_REWOUND_TO_EVENT_ID,
+        optional_bin_slice(rewound_to_event_id.as_ref()),
+    );
+
+    if flags & HISTORY_FLAG_META != 0 {
+        out.extend_from_slice(meta_encoded.as_slice());
+    }
 
     binary_term(env, &out)
 }
@@ -860,6 +1082,12 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
     }
 
     let rest = &input[FLOW_HISTORY_MAGIC.len()..];
+    let Some((flags, rest)) = decode_int(rest) else {
+        return Ok(crate::atoms::error().encode(env));
+    };
+    let Some(flags) = flags else {
+        return Ok(crate::atoms::error().encode(env));
+    };
     let Some((event, rest)) = decode_required_bin(rest) else {
         return Ok(crate::atoms::error().encode(env));
     };
@@ -869,65 +1097,74 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
     let Some((at, rest)) = decode_int(rest) else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((id, rest)) = decode_bin(rest) else {
-        return Ok(crate::atoms::error().encode(env));
-    };
-    let Some((flow_type, rest)) = decode_bin(rest) else {
-        return Ok(crate::atoms::error().encode(env));
-    };
     let Some((state, rest)) = decode_bin(rest) else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((priority, rest)) = decode_int(rest) else {
+    let Some((priority, rest)) = decode_flagged_int(rest, flags, HISTORY_FLAG_PRIORITY, Some(0))
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((attempts, rest)) = decode_int(rest) else {
+    let Some((attempts, rest)) = decode_flagged_int(rest, flags, HISTORY_FLAG_ATTEMPTS, Some(0))
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((fencing_token, rest)) = decode_int(rest) else {
+    let Some((fencing_token, rest)) =
+        decode_flagged_int(rest, flags, HISTORY_FLAG_FENCING_TOKEN, Some(0))
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((created_at_ms, rest)) = decode_int(rest) else {
+    let Some((created_at_ms, rest)) =
+        decode_flagged_int(rest, flags, HISTORY_FLAG_CREATED_AT_MS, at)
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((updated_at_ms, rest)) = decode_int(rest) else {
+    let Some((updated_at_ms, rest)) =
+        decode_flagged_int(rest, flags, HISTORY_FLAG_UPDATED_AT_MS, at)
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((next_run_at_ms, rest)) = decode_int(rest) else {
+    let Some((next_run_at_ms, rest)) =
+        decode_flagged_int(rest, flags, HISTORY_FLAG_NEXT_RUN_AT_MS, None)
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((lease_deadline_ms, rest)) = decode_int(rest) else {
+    let Some((lease_deadline_ms, rest)) =
+        decode_flagged_int(rest, flags, HISTORY_FLAG_LEASE_DEADLINE_MS, None)
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((lease_owner, rest)) = decode_bin(rest) else {
+    let Some((lease_owner, rest)) = decode_flagged_bin(rest, flags, HISTORY_FLAG_LEASE_OWNER)
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((payload_ref, rest)) = decode_bin(rest) else {
+    let Some((payload_ref, rest)) = decode_flagged_bin(rest, flags, HISTORY_FLAG_PAYLOAD_REF)
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((parent_flow_id, rest)) = decode_bin(rest) else {
+    let parent_flow_id: Option<&[u8]> = None;
+    let root_flow_id: Option<&[u8]> = None;
+    let correlation_id: Option<&[u8]> = None;
+    let Some((result_ref, rest)) = decode_flagged_bin(rest, flags, HISTORY_FLAG_RESULT_REF) else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((root_flow_id, rest)) = decode_bin(rest) else {
+    let Some((error_ref, rest)) = decode_flagged_bin(rest, flags, HISTORY_FLAG_ERROR_REF) else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((correlation_id, rest)) = decode_bin(rest) else {
+    let Some((rewound_to_event_id, rest)) =
+        decode_flagged_bin(rest, flags, HISTORY_FLAG_REWOUND_TO_EVENT_ID)
+    else {
         return Ok(crate::atoms::error().encode(env));
     };
-    let Some((result_ref, rest)) = decode_bin(rest) else {
-        return Ok(crate::atoms::error().encode(env));
-    };
-    let Some((error_ref, rest)) = decode_bin(rest) else {
-        return Ok(crate::atoms::error().encode(env));
-    };
-    let Some((rewound_to_event_id, rest)) = decode_bin(rest) else {
-        return Ok(crate::atoms::error().encode(env));
-    };
-    let Some((meta_count, mut rest)) = decode_int(rest) else {
-        return Ok(crate::atoms::error().encode(env));
-    };
-    let Some(meta_count) = meta_count else {
-        return Ok(crate::atoms::error().encode(env));
+    let (meta_count, mut rest) = if flags & HISTORY_FLAG_META != 0 {
+        let Some((meta_count, rest)) = decode_int(rest) else {
+            return Ok(crate::atoms::error().encode(env));
+        };
+        let Some(meta_count) = meta_count else {
+            return Ok(crate::atoms::error().encode(env));
+        };
+        (meta_count, rest)
+    } else {
+        (0, rest)
     };
 
     let mut fields =
@@ -935,8 +1172,8 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
     push_history_binary_field(env, &mut fields, b"event", event)?;
     push_history_int_field(env, &mut fields, b"version", version, false)?;
     push_history_int_field(env, &mut fields, b"at", at, false)?;
-    push_history_binary_field(env, &mut fields, b"id", id.unwrap_or(&[]))?;
-    push_history_binary_field(env, &mut fields, b"type", flow_type.unwrap_or(&[]))?;
+    push_history_binary_field(env, &mut fields, b"id", b"")?;
+    push_history_binary_field(env, &mut fields, b"type", b"")?;
     push_history_binary_field(env, &mut fields, b"state", state.unwrap_or(&[]))?;
     push_history_int_field(env, &mut fields, b"priority", priority, false)?;
     push_history_int_field(env, &mut fields, b"attempts", attempts, false)?;
@@ -1342,6 +1579,9 @@ fn add_count_delta(count_deltas: &mut HashMap<Vec<u8>, i64>, key: &[u8], delta: 
 fn decode_flow_record(value: &[u8]) -> Option<FlowRecordParts<'_>> {
     let mut input = value.strip_prefix(FLOW_RECORD_MAGIC)?;
 
+    let (flags, rest) = decode_int(input)?;
+    let flags = flags?;
+    input = rest;
     let (id, rest) = decode_required_bin(input)?;
     input = rest;
     let (flow_type, rest) = decode_required_bin(input)?;
@@ -1350,55 +1590,64 @@ fn decode_flow_record(value: &[u8]) -> Option<FlowRecordParts<'_>> {
     input = rest;
     let (version, rest) = decode_int(input)?;
     input = rest;
-    let (attempts, rest) = decode_int(input)?;
-    input = rest;
-    let (fencing_token, rest) = decode_int(input)?;
-    input = rest;
     let (created_at_ms, rest) = decode_int(input)?;
     input = rest;
     let (updated_at_ms, rest) = decode_int(input)?;
     input = rest;
-    let (next_run_at_ms, rest) = decode_int(input)?;
+    let (attempts, rest) = decode_flagged_int(input, flags, RECORD_FLAG_ATTEMPTS, Some(0))?;
     input = rest;
-    let (priority, rest) = decode_int(input)?;
+    let (fencing_token, rest) =
+        decode_flagged_int(input, flags, RECORD_FLAG_FENCING_TOKEN, Some(0))?;
     input = rest;
-    let (ttl_ms, rest) = decode_int(input)?;
+    let (next_run_at_ms, rest) =
+        decode_flagged_int(input, flags, RECORD_FLAG_NEXT_RUN_AT_MS, None)?;
     input = rest;
-    let (history_hot_max_events, rest) = decode_int(input)?;
+    let (priority, rest) = decode_flagged_int(input, flags, RECORD_FLAG_PRIORITY, Some(0))?;
     input = rest;
-    let (history_max_events, rest) = decode_int(input)?;
+    let (ttl_ms, rest) = decode_flagged_int(input, flags, RECORD_FLAG_TTL_MS, None)?;
     input = rest;
-    let (retention_ttl_ms, rest) = decode_int(input)?;
+    let (history_hot_max_events, rest) =
+        decode_flagged_int(input, flags, RECORD_FLAG_HISTORY_HOT_MAX_EVENTS, None)?;
     input = rest;
-    let (terminal_retention_until_ms, rest) = decode_int(input)?;
+    let (history_max_events, rest) =
+        decode_flagged_int(input, flags, RECORD_FLAG_HISTORY_MAX_EVENTS, None)?;
     input = rest;
-    let (partition_key, rest) = decode_bin(input)?;
+    let (retention_ttl_ms, rest) =
+        decode_flagged_int(input, flags, RECORD_FLAG_RETENTION_TTL_MS, None)?;
     input = rest;
-    let (payload_ref, rest) = decode_bin(input)?;
+    let (terminal_retention_until_ms, rest) =
+        decode_flagged_int(input, flags, RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS, None)?;
     input = rest;
-    let (parent_flow_id, rest) = decode_bin(input)?;
+    let (partition_key, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_PARTITION_KEY)?;
     input = rest;
-    let (parent_partition_key, rest) = decode_bin(input)?;
+    let (payload_ref, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_PAYLOAD_REF)?;
     input = rest;
-    let (root_flow_id, rest) = decode_bin(input)?;
+    let (parent_flow_id, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_PARENT_FLOW_ID)?;
     input = rest;
-    let (correlation_id, rest) = decode_bin(input)?;
+    let (parent_partition_key, rest) =
+        decode_flagged_bin(input, flags, RECORD_FLAG_PARENT_PARTITION_KEY)?;
     input = rest;
-    let (result_ref, rest) = decode_bin(input)?;
+    let (root_flow_id, rest) = decode_record_root(input, flags, id)?;
     input = rest;
-    let (error_ref, rest) = decode_bin(input)?;
+    let (correlation_id, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_CORRELATION_ID)?;
     input = rest;
-    let (lease_owner, rest) = decode_bin(input)?;
+    let (result_ref, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_RESULT_REF)?;
     input = rest;
-    let (lease_token, rest) = decode_bin(input)?;
+    let (error_ref, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_ERROR_REF)?;
     input = rest;
-    let (lease_deadline_ms, rest) = decode_int(input)?;
+    let (lease_owner, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_LEASE_OWNER)?;
     input = rest;
-    let (run_state, rest) = decode_bin(input)?;
+    let (lease_token, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_LEASE_TOKEN)?;
     input = rest;
-    let (rewound_to_event_id, rest) = decode_bin(input)?;
+    let (lease_deadline_ms, rest) =
+        decode_flagged_int(input, flags, RECORD_FLAG_LEASE_DEADLINE_MS, Some(0))?;
     input = rest;
-    let (child_groups_encoded, rest) = decode_encoded_bin_field(input)?;
+    let (run_state, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_RUN_STATE)?;
+    input = rest;
+    let (rewound_to_event_id, rest) =
+        decode_flagged_bin(input, flags, RECORD_FLAG_REWOUND_TO_EVENT_ID)?;
+    input = rest;
+    let (child_groups_encoded, rest) = decode_record_sidecar(input, flags)?;
 
     if !rest.is_empty() {
         return None;
@@ -1487,6 +1736,53 @@ fn decode_bin(input: &[u8]) -> Option<(Option<&[u8]>, &[u8])> {
     Some((Some(value), remaining))
 }
 
+fn decode_flagged_int<'a>(
+    input: &'a [u8],
+    flags: u64,
+    flag: u64,
+    default: Option<u64>,
+) -> Option<(Option<u64>, &'a [u8])> {
+    if flags & flag != 0 {
+        decode_int(input)
+    } else {
+        Some((default, input))
+    }
+}
+
+fn decode_flagged_bin<'a>(
+    input: &'a [u8],
+    flags: u64,
+    flag: u64,
+) -> Option<(Option<&'a [u8]>, &'a [u8])> {
+    if flags & flag != 0 {
+        decode_bin(input)
+    } else {
+        Some((None, input))
+    }
+}
+
+fn decode_record_root<'a>(
+    input: &'a [u8],
+    flags: u64,
+    id: &'a [u8],
+) -> Option<(Option<&'a [u8]>, &'a [u8])> {
+    if flags & RECORD_FLAG_ROOT_FLOW_ID_SELF != 0 {
+        Some((Some(id), input))
+    } else if flags & RECORD_FLAG_ROOT_FLOW_ID != 0 {
+        decode_bin(input)
+    } else {
+        Some((None, input))
+    }
+}
+
+fn decode_record_sidecar(input: &[u8], flags: u64) -> Option<(&[u8], &[u8])> {
+    if flags & RECORD_FLAG_SIDECAR != 0 {
+        decode_encoded_bin_field(input)
+    } else {
+        Some((EMPTY_CHILD_GROUPS_ENCODED, input))
+    }
+}
+
 fn decode_encoded_bin_field(input: &[u8]) -> Option<(&[u8], &[u8])> {
     let before_len = input.len();
     let (encoded_len, rest) = decode_varint(input)?;
@@ -1523,38 +1819,37 @@ fn encode_claimed_record(
     next_version: u64,
     next_fencing_token: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(estimate_claimed_record_size(record, worker, lease_token));
-    out.extend_from_slice(FLOW_RECORD_MAGIC);
-    encode_bin(&mut out, Some(record.id));
-    encode_bin(&mut out, Some(record.flow_type));
-    encode_bin(&mut out, Some(RUNNING_STATE));
-    encode_int(&mut out, Some(next_version));
-    encode_int(&mut out, record.attempts);
-    encode_int(&mut out, Some(next_fencing_token));
-    encode_int(&mut out, record.created_at_ms);
-    encode_int(&mut out, Some(now_ms));
-    encode_int(&mut out, Some(deadline_ms));
-    encode_int(&mut out, record.priority);
-    encode_int(&mut out, None);
-    encode_int(&mut out, record.history_hot_max_events);
-    encode_int(&mut out, record.history_max_events);
-    encode_int(&mut out, record.retention_ttl_ms);
-    encode_int(&mut out, None);
-    encode_bin(&mut out, record.partition_key);
-    encode_bin(&mut out, record.payload_ref);
-    encode_bin(&mut out, record.parent_flow_id);
-    encode_bin(&mut out, record.parent_partition_key);
-    encode_bin(&mut out, record.root_flow_id);
-    encode_bin(&mut out, record.correlation_id);
-    encode_bin(&mut out, record.result_ref);
-    encode_bin(&mut out, record.error_ref);
-    encode_bin(&mut out, Some(worker));
-    encode_bin(&mut out, Some(lease_token));
-    encode_int(&mut out, Some(deadline_ms));
-    encode_bin(&mut out, Some(flow_claim_run_state(record)));
-    encode_bin(&mut out, record.rewound_to_event_id);
-    out.extend_from_slice(record.child_groups_encoded);
-    out
+    encode_flow_record_compact(
+        Some(record.id),
+        Some(record.flow_type),
+        Some(RUNNING_STATE),
+        Some(next_version),
+        record.attempts,
+        Some(next_fencing_token),
+        record.created_at_ms,
+        Some(now_ms),
+        Some(deadline_ms),
+        record.priority,
+        None,
+        record.history_hot_max_events,
+        record.history_max_events,
+        record.retention_ttl_ms,
+        None,
+        record.partition_key,
+        record.payload_ref,
+        record.parent_flow_id,
+        record.parent_partition_key,
+        record.root_flow_id,
+        record.correlation_id,
+        record.result_ref,
+        record.error_ref,
+        Some(worker),
+        Some(lease_token),
+        Some(deadline_ms),
+        Some(flow_claim_run_state(record)),
+        record.rewound_to_event_id,
+        record.child_groups_encoded,
+    )
 }
 
 fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -1583,6 +1878,189 @@ fn encode_bin(out: &mut Vec<u8>, value: Option<&[u8]>) {
     }
 }
 
+fn encode_flagged_int(out: &mut Vec<u8>, flags: u64, flag: u64, value: Option<u64>) {
+    if flags & flag != 0 {
+        encode_int(out, value);
+    }
+}
+
+fn encode_flagged_bin(out: &mut Vec<u8>, flags: u64, flag: u64, value: Option<&[u8]>) {
+    if flags & flag != 0 {
+        encode_bin(out, value);
+    }
+}
+
+fn optional_slice_len(value: Option<&[u8]>) -> usize {
+    value.map_or(0, <[u8]>::len)
+}
+
+fn flag_int(flags: &mut u64, flag: u64, value: Option<u64>, omitted_default: u64) {
+    if matches!(value, Some(v) if v != omitted_default) {
+        *flags |= flag;
+    }
+}
+
+fn flag_int_present(flags: &mut u64, flag: u64, value: Option<u64>) {
+    if value.is_some() {
+        *flags |= flag;
+    }
+}
+
+fn flag_bin(flags: &mut u64, flag: u64, value: Option<&[u8]>) {
+    if value.is_some() {
+        *flags |= flag;
+    }
+}
+
+fn flag_nonempty_bin(flags: &mut u64, flag: u64, value: Option<&[u8]>) {
+    if matches!(value, Some(v) if !v.is_empty()) {
+        *flags |= flag;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_record_flags(
+    id: Option<&[u8]>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    priority: Option<u64>,
+    ttl_ms: Option<u64>,
+    history_hot_max_events: Option<u64>,
+    history_max_events: Option<u64>,
+    retention_ttl_ms: Option<u64>,
+    terminal_retention_until_ms: Option<u64>,
+    partition_key: Option<&[u8]>,
+    payload_ref: Option<&[u8]>,
+    parent_flow_id: Option<&[u8]>,
+    parent_partition_key: Option<&[u8]>,
+    root_flow_id: Option<&[u8]>,
+    correlation_id: Option<&[u8]>,
+    result_ref: Option<&[u8]>,
+    error_ref: Option<&[u8]>,
+    lease_owner: Option<&[u8]>,
+    lease_token: Option<&[u8]>,
+    lease_deadline_ms: Option<u64>,
+    run_state: Option<&[u8]>,
+    rewound_to_event_id: Option<&[u8]>,
+    child_groups_encoded: &[u8],
+) -> u64 {
+    let mut flags = 0u64;
+    flag_int(&mut flags, RECORD_FLAG_ATTEMPTS, attempts, 0);
+    flag_int(&mut flags, RECORD_FLAG_FENCING_TOKEN, fencing_token, 0);
+    flag_int_present(&mut flags, RECORD_FLAG_NEXT_RUN_AT_MS, next_run_at_ms);
+    flag_int(&mut flags, RECORD_FLAG_PRIORITY, priority, 0);
+    flag_int_present(&mut flags, RECORD_FLAG_TTL_MS, ttl_ms);
+    flag_int_present(
+        &mut flags,
+        RECORD_FLAG_HISTORY_HOT_MAX_EVENTS,
+        history_hot_max_events,
+    );
+    flag_int_present(
+        &mut flags,
+        RECORD_FLAG_HISTORY_MAX_EVENTS,
+        history_max_events,
+    );
+    flag_int_present(&mut flags, RECORD_FLAG_RETENTION_TTL_MS, retention_ttl_ms);
+    flag_int_present(
+        &mut flags,
+        RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS,
+        terminal_retention_until_ms,
+    );
+    flag_bin(&mut flags, RECORD_FLAG_PARTITION_KEY, partition_key);
+    flag_bin(&mut flags, RECORD_FLAG_PAYLOAD_REF, payload_ref);
+    flag_bin(&mut flags, RECORD_FLAG_PARENT_FLOW_ID, parent_flow_id);
+    flag_bin(
+        &mut flags,
+        RECORD_FLAG_PARENT_PARTITION_KEY,
+        parent_partition_key,
+    );
+
+    match (id, root_flow_id) {
+        (Some(id), Some(root)) if id == root => flags |= RECORD_FLAG_ROOT_FLOW_ID_SELF,
+        (_, Some(_)) => flags |= RECORD_FLAG_ROOT_FLOW_ID,
+        _ => {}
+    }
+
+    flag_bin(&mut flags, RECORD_FLAG_CORRELATION_ID, correlation_id);
+    flag_bin(&mut flags, RECORD_FLAG_RESULT_REF, result_ref);
+    flag_bin(&mut flags, RECORD_FLAG_ERROR_REF, error_ref);
+    flag_bin(&mut flags, RECORD_FLAG_LEASE_OWNER, lease_owner);
+    flag_bin(&mut flags, RECORD_FLAG_LEASE_TOKEN, lease_token);
+    flag_int(
+        &mut flags,
+        RECORD_FLAG_LEASE_DEADLINE_MS,
+        lease_deadline_ms,
+        0,
+    );
+    flag_bin(&mut flags, RECORD_FLAG_RUN_STATE, run_state);
+    flag_bin(
+        &mut flags,
+        RECORD_FLAG_REWOUND_TO_EVENT_ID,
+        rewound_to_event_id,
+    );
+
+    if !encoded_child_groups_empty(child_groups_encoded) {
+        flags |= RECORD_FLAG_SIDECAR;
+    }
+
+    flags
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_history_flags(
+    priority: Option<u64>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    now_ms: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    lease_deadline_ms: Option<u64>,
+    lease_owner: Option<&[u8]>,
+    payload_ref: Option<&[u8]>,
+    result_ref: Option<&[u8]>,
+    error_ref: Option<&[u8]>,
+    rewound_to_event_id: Option<&[u8]>,
+    meta_encoded: &[u8],
+) -> u64 {
+    let mut flags = 0u64;
+    flag_int(&mut flags, HISTORY_FLAG_PRIORITY, priority, 0);
+    flag_int(&mut flags, HISTORY_FLAG_ATTEMPTS, attempts, 0);
+    flag_int(&mut flags, HISTORY_FLAG_FENCING_TOKEN, fencing_token, 0);
+
+    if matches!((created_at_ms, now_ms), (Some(created), Some(now)) if created != now) {
+        flags |= HISTORY_FLAG_CREATED_AT_MS;
+    }
+
+    if matches!((updated_at_ms, now_ms), (Some(updated), Some(now)) if updated != now) {
+        flags |= HISTORY_FLAG_UPDATED_AT_MS;
+    }
+
+    flag_int_present(&mut flags, HISTORY_FLAG_NEXT_RUN_AT_MS, next_run_at_ms);
+    flag_int(
+        &mut flags,
+        HISTORY_FLAG_LEASE_DEADLINE_MS,
+        lease_deadline_ms,
+        0,
+    );
+    flag_nonempty_bin(&mut flags, HISTORY_FLAG_LEASE_OWNER, lease_owner);
+    flag_nonempty_bin(&mut flags, HISTORY_FLAG_PAYLOAD_REF, payload_ref);
+    flag_nonempty_bin(&mut flags, HISTORY_FLAG_RESULT_REF, result_ref);
+    flag_nonempty_bin(&mut flags, HISTORY_FLAG_ERROR_REF, error_ref);
+    flag_nonempty_bin(
+        &mut flags,
+        HISTORY_FLAG_REWOUND_TO_EVENT_ID,
+        rewound_to_event_id,
+    );
+
+    if !meta_encoded.is_empty() && meta_encoded != [1] {
+        flags |= HISTORY_FLAG_META;
+    }
+
+    flags
+}
+
 fn optional_bin_slice<'a>(value: Option<&Binary<'a>>) -> Option<&'a [u8]> {
     value.map(Binary::as_slice)
 }
@@ -1603,31 +2081,6 @@ fn option_u64_term<'a>(env: Env<'a>, value: Option<u64>) -> Term<'a> {
         Some(value) => value.encode(env),
         None => crate::atoms::nil().encode(env),
     }
-}
-
-fn estimate_claimed_record_size(
-    record: &FlowRecordParts<'_>,
-    worker: &[u8],
-    lease_token: &[u8],
-) -> usize {
-    FLOW_RECORD_MAGIC.len()
-        + record.id.len()
-        + record.flow_type.len()
-        + RUNNING_STATE.len()
-        + record.partition_key.map_or(0, <[u8]>::len)
-        + record.payload_ref.map_or(0, <[u8]>::len)
-        + record.parent_flow_id.map_or(0, <[u8]>::len)
-        + record.parent_partition_key.map_or(0, <[u8]>::len)
-        + record.root_flow_id.map_or(0, <[u8]>::len)
-        + record.correlation_id.map_or(0, <[u8]>::len)
-        + record.result_ref.map_or(0, <[u8]>::len)
-        + record.error_ref.map_or(0, <[u8]>::len)
-        + worker.len()
-        + lease_token.len()
-        + flow_claim_run_state(record).len()
-        + record.rewound_to_event_id.map_or(0, <[u8]>::len)
-        + record.child_groups_encoded.len()
-        + 96
 }
 
 fn claim_lease_token(worker: &[u8], now_ms: u64, fencing_token: u64) -> Vec<u8> {

@@ -12,6 +12,25 @@ if config_env() == :prod do
       _other -> :info
     end
 
+  limit_env = fn name ->
+    case System.get_env(name) do
+      nil ->
+        nil
+
+      value ->
+        case String.downcase(String.trim(value)) do
+          value when value in ["", "false", "off", "infinity", "inf", "unlimited"] ->
+            :infinity
+
+          value ->
+            case Integer.parse(value) do
+              {parsed, ""} when parsed >= 0 -> parsed
+              _other -> nil
+            end
+        end
+    end
+  end
+
   config :logger, level: log_level
 
   # ---------------------------------------------------------------------------
@@ -96,6 +115,27 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
+
+  memory_budget_overrides =
+    [
+      flow_history_projector_max_pending_entries:
+        limit_env.("FERRICSTORE_FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES"),
+      flow_lmdb_writer_max_mailbox_messages:
+        limit_env.("FERRICSTORE_FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES"),
+      flow_lmdb_writer_max_enqueue_ops:
+        limit_env.("FERRICSTORE_FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS"),
+      waraft_segment_log_max_ets_bytes:
+        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES"),
+      waraft_segment_log_max_ets_entries:
+        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES"),
+      waraft_segment_log_min_ets_entries:
+        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES")
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+  if memory_budget_overrides != [] do
+    config :ferricstore, memory_budget_overrides
+  end
 
   # ---------------------------------------------------------------------------
   # LFU Scoring

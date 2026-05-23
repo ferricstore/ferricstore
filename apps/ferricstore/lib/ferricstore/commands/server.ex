@@ -1224,14 +1224,37 @@ defmodule Ferricstore.Commands.Server do
 
   defp waraft_info_fields(shard_index) do
     if RaftBackend.waraft?() do
+      segment_log = WARaftBackend.segment_log_memory_status(shard_index)
+
       [
         {"shard_#{shard_index}_waraft_inflight_commit_bytes",
-         Integer.to_string(WARaftBackend.inflight_commit_bytes(shard_index))}
+         Integer.to_string(WARaftBackend.inflight_commit_bytes(shard_index))},
+        {"shard_#{shard_index}_waraft_segment_log_ets_entries",
+         waraft_info_value(segment_log[:ets_entries])},
+        {"shard_#{shard_index}_waraft_segment_log_ets_bytes",
+         waraft_info_value(segment_log[:ets_bytes])},
+        {"shard_#{shard_index}_waraft_segment_log_disk_first_index",
+         waraft_info_value(segment_log[:disk_first_index])},
+        {"shard_#{shard_index}_waraft_segment_log_disk_last_index",
+         waraft_info_value(segment_log[:disk_last_index])},
+        {"shard_#{shard_index}_waraft_segment_log_max_ets_entries",
+         waraft_info_value(segment_log[:max_ets_entries])},
+        {"shard_#{shard_index}_waraft_segment_log_max_ets_bytes",
+         waraft_info_value(segment_log[:max_ets_bytes])},
+        {"shard_#{shard_index}_waraft_segment_log_min_ets_entries",
+         waraft_info_value(segment_log[:min_ets_entries])}
       ]
     else
       []
     end
   end
+
+  defp waraft_info_value(:infinity), do: "infinity"
+  defp waraft_info_value(:undefined), do: "0"
+  defp waraft_info_value(nil), do: "0"
+  defp waraft_info_value(value) when is_integer(value), do: Integer.to_string(value)
+  defp waraft_info_value(value) when is_binary(value), do: value
+  defp waraft_info_value(value), do: inspect(value)
 
   defp local_raft_member_id(shard_index) do
     if RaftBackend.waraft?() do

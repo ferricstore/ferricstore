@@ -14,6 +14,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   @default_batch_size 16_384
   @default_flush_interval_ms 250
+  @default_max_pending_entries 100_000
   @retry_interval_ms 50
 
   @type entry :: %{
@@ -28,6 +29,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
           optional(:event) => binary(),
           optional(:now_ms) => non_neg_integer(),
           optional(:meta) => map(),
+          optional(:terminal?) => boolean(),
           optional(:history_max_events) => pos_integer(),
           optional(:ra_index) => non_neg_integer() | nil
         }
@@ -89,6 +91,27 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
       _pid ->
         GenServer.call(projector, {:enqueue, stamp_ra_index(entries, ra_index)}, 5_000)
+    end
+  catch
+    :exit, _reason -> {:error, :not_started}
+  end
+
+  @spec enqueue_async(map() | nil, non_neg_integer(), [entry()], non_neg_integer() | nil) ::
+          :ok | {:error, :not_started}
+  def enqueue_async(_instance_ctx, _shard_index, [], _ra_index), do: :ok
+
+  def enqueue_async(instance_ctx, shard_index, entries, ra_index) when is_list(entries) do
+    projector = name(instance_ctx, shard_index)
+
+    case Process.whereis(projector) do
+      nil ->
+        {:error, :not_started}
+
+      pid when is_pid(pid) ->
+        # This is used from Raft apply. It must never wait behind cold history
+        # projection or LMDB work; release-cursor gating handles durability.
+        GenServer.cast(pid, {:enqueue, stamp_ra_index(entries, ra_index)})
+        :ok
     end
   catch
     :exit, _reason -> {:error, :not_started}
@@ -185,6 +208,11 @@ defmodule Ferricstore.Flow.HistoryProjector do
        flush_timer: nil,
        requested_index: nil,
        batch_size: app_env(:flow_history_projector_batch_size, @default_batch_size),
+       max_pending_entries:
+         Ferricstore.MemoryBudget.limit(
+           :flow_history_projector_max_pending_entries,
+           @default_max_pending_entries
+         ),
        flush_interval_ms:
          app_env(:flow_history_projector_flush_interval_ms, @default_flush_interval_ms)
      }}
@@ -208,7 +236,14 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   def handle_call({:enqueue, entries}, _from, state) do
-    {:reply, :ok, enqueue_entries(state, entries)}
+    case pending_capacity(state, length(entries)) do
+      :ok ->
+        {:reply, :ok, enqueue_entries(state, entries)}
+
+      {:error, :queue_full} = error ->
+        emit_queue_full(state, length(entries))
+        {:reply, error, state}
+    end
   end
 
   @impl true
@@ -228,6 +263,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
     else
       schedule_flush(state)
     end
+  end
+
+  defp pending_capacity(%{max_pending_entries: :infinity}, _new_count), do: :ok
+
+  defp pending_capacity(%{pending_count: count, max_pending_entries: max_pending}, new_count)
+       when is_integer(max_pending) do
+    if count + new_count <= max_pending, do: :ok, else: {:error, :queue_full}
   end
 
   defp flush_pending(%{pending_count: 0, requested_index: nil} = state), do: cancel_flush(state)
@@ -307,6 +349,16 @@ defmodule Ferricstore.Flow.HistoryProjector do
       with :ok <- publish_history_index(instance_ctx, shard_index, encoded_entries),
            :ok <-
              publish_lmdb_history_locations(shard_data_path, file_id, encoded_entries, locations),
+           :ok <-
+             compact_projected_flow_values(
+               instance_ctx,
+               shard_index,
+               shard_data_path,
+               keydir,
+               file_path,
+               file_id,
+               encoded_entries
+             ),
            :ok <-
              trim_history_caps(
                instance_ctx,
@@ -459,6 +511,11 @@ defmodule Ferricstore.Flow.HistoryProjector do
     entries
     |> Enum.zip(locations)
     |> Enum.each(fn {entry, {offset, value_size}} ->
+      case :ets.lookup(keydir, entry.key) do
+        [row] -> delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
+        _missing -> :ok
+      end
+
       track_keydir_binary_delta(instance_ctx, keydir, shard_index, entry.key, nil)
 
       :ets.insert(
@@ -567,6 +624,344 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end)
   end
 
+  defp compact_projected_flow_values(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         file_path,
+         file_id,
+         entries
+       ) do
+    refs = projected_flow_value_refs(entries)
+
+    case collect_projected_flow_values(instance_ctx, shard_index, shard_data_path, keydir, refs) do
+      [] ->
+        :ok
+
+      value_entries ->
+        batch =
+          Enum.map(value_entries, fn %{key: key, value: value, expire_at_ms: expire_at_ms} ->
+            {key, value, expire_at_ms}
+          end)
+
+        with {:ok, locations} <- append_batch(file_path, batch),
+             :ok <- validate_projected_value_locations(value_entries, locations),
+             :ok <-
+               publish_lmdb_value_locations(
+                 shard_data_path,
+                 file_id,
+                 value_entries,
+                 locations
+               ) do
+          delete_projected_flow_value_keydir_rows(
+            instance_ctx,
+            shard_index,
+            keydir,
+            value_entries
+          )
+        end
+    end
+  end
+
+  defp collect_projected_flow_values(instance_ctx, shard_index, shard_data_path, keydir, refs) do
+    refs
+    |> Enum.reduce([], fn ref, acc ->
+      case projected_flow_value_entry(instance_ctx, shard_index, shard_data_path, keydir, ref) do
+        {:ok, entry} -> [entry | acc]
+        :skip -> acc
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp projected_flow_value_entry(instance_ctx, shard_index, shard_data_path, keydir, key) do
+    case :ets.lookup(keydir, key) do
+      [{^key, value, expire_at_ms, lfu, file_id, offset, value_size} = row] ->
+        if readable_value_locator?(file_id, offset, value_size) do
+          case projected_flow_value_bytes(
+                 instance_ctx,
+                 shard_index,
+                 shard_data_path,
+                 key,
+                 value,
+                 file_id,
+                 offset
+               ) do
+            {:ok, bytes} ->
+              {:ok,
+               %{
+                 key: key,
+                 value: bytes,
+                 expire_at_ms: expire_at_ms,
+                 lfu: lfu,
+                 source_file_id: file_id,
+                 source_offset: offset,
+                 source_value_size: value_size,
+                 source_row: row
+               }}
+
+            _error ->
+              :skip
+          end
+        else
+          :skip
+        end
+
+      _other ->
+        :skip
+    end
+  end
+
+  defp projected_flow_value_bytes(
+         _instance_ctx,
+         _shard_index,
+         _shard_data_path,
+         _key,
+         value,
+         _file_id,
+         _offset
+       )
+       when is_binary(value),
+       do: {:ok, value}
+
+  defp projected_flow_value_bytes(
+         _instance_ctx,
+         _shard_index,
+         shard_data_path,
+         key,
+         nil,
+         file_id,
+         offset
+       )
+       when is_integer(file_id) and file_id >= 0 do
+    shard_data_path
+    |> ShardETS.file_path(file_id)
+    |> Ferricstore.Store.ColdRead.pread_at(offset, key, 10_000)
+  end
+
+  defp projected_flow_value_bytes(
+         _instance_ctx,
+         _shard_index,
+         shard_data_path,
+         _key,
+         nil,
+         {:flow_history, _file_id} = file_id,
+         offset
+       ) do
+    read_value(shard_data_path, file_id, offset)
+  end
+
+  defp projected_flow_value_bytes(
+         instance_ctx,
+         shard_index,
+         _shard_data_path,
+         key,
+         nil,
+         file_id,
+         _offset
+       )
+       when is_tuple(file_id) do
+    Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+      instance_ctx,
+      shard_index,
+      file_id,
+      key
+    )
+  end
+
+  defp projected_flow_value_bytes(
+         _instance_ctx,
+         _shard_index,
+         _shard_data_path,
+         _key,
+         _value,
+         _file_id,
+         _offset
+       ),
+       do: :error
+
+  defp validate_projected_value_locations(entries, locations)
+       when length(entries) == length(locations) do
+    if Enum.all?(locations, &valid_projected_value_location?/1) do
+      :ok
+    else
+      {:error, {:flow_value_projection_location_mismatch, length(entries), locations}}
+    end
+  end
+
+  defp validate_projected_value_locations(entries, locations),
+    do: {:error, {:flow_value_projection_location_mismatch, length(entries), locations}}
+
+  defp valid_projected_value_location?({offset, value_size})
+       when is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp valid_projected_value_location?(_location), do: false
+
+  defp publish_lmdb_value_locations(shard_data_path, file_id, entries, locations) do
+    ops =
+      entries
+      |> Enum.zip(locations)
+      |> Enum.map(fn {%{key: key, expire_at_ms: expire_at_ms}, {offset, value_size}} ->
+        {:put, key,
+         Ferricstore.Flow.LMDB.encode_value_locator(
+           expire_at_ms,
+           {:flow_history, file_id},
+           offset,
+           value_size
+         )}
+      end)
+
+    shard_data_path
+    |> Ferricstore.Flow.LMDB.path()
+    |> Ferricstore.Flow.LMDB.write_batch(ops)
+  end
+
+  defp delete_projected_flow_value_keydir_rows(instance_ctx, shard_index, keydir, entries) do
+    {count, bytes} =
+      Enum.reduce(entries, {0, 0}, fn %{key: key, value: value, source_row: row},
+                                      {count_acc, bytes_acc} ->
+        case :ets.lookup(keydir, key) do
+          [^row] ->
+            bytes = binary_bytes(value)
+            track_keydir_binary_remove(instance_ctx, keydir, shard_index, key)
+            delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
+            :ets.delete(keydir, key)
+            {count_acc + 1, bytes_acc + bytes}
+
+          _changed ->
+            {count_acc, bytes_acc}
+        end
+      end)
+
+    emit_value_dematerialize(instance_ctx, shard_index, count, bytes)
+    :ok
+  end
+
+  defp projected_flow_value_refs(entries) do
+    entries
+    |> Enum.reduce(MapSet.new(), fn entry, acc ->
+      entry
+      |> entry_flow_value_refs()
+      |> Enum.reduce(acc, fn ref, refs ->
+        if generated_flow_value_ref?(ref), do: MapSet.put(refs, ref), else: refs
+      end)
+    end)
+  end
+
+  defp entry_flow_value_refs(%{record: record}) when is_map(record),
+    do: record_flow_value_refs(record)
+
+  defp entry_flow_value_refs(%{snapshot: snapshot}) do
+    :encode_history_snapshot
+    |> flow_call([snapshot])
+    |> history_value_refs_from_encoded()
+  rescue
+    _ -> []
+  end
+
+  defp entry_flow_value_refs(%{value: value}) when is_binary(value),
+    do: history_value_refs_from_encoded(value)
+
+  defp entry_flow_value_refs(_entry), do: []
+
+  defp record_flow_value_refs(record) when is_map(record) do
+    [
+      Map.get(record, :payload_ref),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref)
+      | named_flow_value_refs(Map.get(record, :value_refs))
+    ]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+  end
+
+  defp history_value_refs_from_encoded(value) when is_binary(value) do
+    :decode_history_fields
+    |> flow_call([value])
+    |> history_fields_to_map()
+    |> history_fields_value_refs()
+  rescue
+    _ -> []
+  end
+
+  defp history_fields_to_map(fields) when is_list(fields) do
+    fields
+    |> Enum.chunk_every(2)
+    |> Enum.reduce(%{}, fn
+      [key, value], acc when is_binary(key) -> Map.put(acc, key, value)
+      _field, acc -> acc
+    end)
+  end
+
+  defp history_fields_to_map(_fields), do: %{}
+
+  defp history_fields_value_refs(fields) when is_map(fields) do
+    [
+      Map.get(fields, "payload_ref"),
+      Map.get(fields, "result_ref"),
+      Map.get(fields, "error_ref")
+      | named_flow_value_refs(Map.get(fields, "value_refs"))
+    ]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+  end
+
+  defp named_flow_value_refs(%{} = refs) do
+    Enum.flat_map(refs, fn
+      {_name, %{ref: ref}} when is_binary(ref) -> [ref]
+      {_name, %{"ref" => ref}} when is_binary(ref) -> [ref]
+      {_name, ref} when is_binary(ref) -> [ref]
+      _entry -> []
+    end)
+  end
+
+  defp named_flow_value_refs(value) when is_binary(value) do
+    case Jason.decode(value) do
+      {:ok, refs} -> named_flow_value_refs(refs)
+      _error -> []
+    end
+  end
+
+  defp named_flow_value_refs(_refs), do: []
+
+  defp generated_flow_value_ref?("f:" <> _rest = ref) do
+    case :binary.split(ref, ":v:") do
+      ["f:" <> tag, <<kind, ?:, rest::binary>>]
+      when byte_size(tag) > 0 and kind in [?p, ?r, ?e] and byte_size(rest) > 0 ->
+        true
+
+      _other ->
+        false
+    end
+  end
+
+  defp generated_flow_value_ref?(_ref), do: false
+
+  defp readable_value_locator?(file_id, offset, value_size)
+       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp readable_value_locator?({tag, index}, offset, value_size)
+       when tag in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+              is_integer(index) and index > 0 and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp readable_value_locator?(_file_id, _offset, _value_size), do: false
+
+  defp emit_value_dematerialize(_instance_ctx, _shard_index, 0, _bytes), do: :ok
+
+  defp emit_value_dematerialize(instance_ctx, shard_index, count, bytes) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :value_dematerialize],
+      %{count: count, bytes: bytes},
+      %{instance: instance_name(instance_ctx), shard_index: shard_index}
+    )
+  rescue
+    _ -> :ok
+  end
+
   defp trim_history_caps(instance_ctx, shard_index, shard_data_path, keydir, file_path, entries) do
     caps = history_caps(entries, keydir, shard_data_path)
 
@@ -615,8 +1010,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
             end)
 
             Enum.each(tombstone_keys, fn key ->
-              track_keydir_binary_remove(instance_ctx, keydir, shard_index, key)
-              :ets.delete(keydir, key)
+              delete_keydir_row(instance_ctx, keydir, shard_index, key)
             end)
 
             :ok
@@ -742,13 +1136,20 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp history_hot_caps(entries) do
     Enum.reduce(entries, %{}, fn
+      %{history_key: history_key, terminal?: true}, acc when is_binary(history_key) ->
+        put_history_hot_cap(acc, history_key, 0)
+
       %{history_key: history_key, history_hot_max_events: max_events}, acc
       when is_binary(history_key) and is_integer(max_events) and max_events > 0 ->
-        Map.put(acc, history_key, max_events)
+        put_history_hot_cap(acc, history_key, max_events)
 
       _entry, acc ->
         acc
     end)
+  end
+
+  defp put_history_hot_cap(caps, history_key, max_events) do
+    Map.update(caps, history_key, max_events, &min(&1, max_events))
   end
 
   defp evict_hot_history_items(
@@ -780,8 +1181,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end)
 
     Enum.each(items, fn {_history_key, _event_id, key} ->
-      track_keydir_binary_remove(instance_ctx, keydir, shard_index, key)
-      :ets.delete(keydir, key)
+      delete_keydir_row(instance_ctx, keydir, shard_index, key)
     end)
 
     :ok
@@ -1013,6 +1413,24 @@ defmodule Ferricstore.Flow.HistoryProjector do
     _ -> :ok
   end
 
+  defp emit_queue_full(state, incoming_entries) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :history_projector, :queue_full],
+      %{
+        count: 1,
+        pending_entries: state.pending_count,
+        incoming_entries: incoming_entries,
+        max_pending_entries: state.max_pending_entries
+      },
+      %{
+        instance: instance_name(state.instance_ctx),
+        shard_index: state.shard_index
+      }
+    )
+  rescue
+    _ -> :ok
+  end
+
   defp parse_history_entry_key("X:" <> rest) do
     case :binary.split(rest, <<0>>) do
       [history_key, event_id] ->
@@ -1156,6 +1574,35 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp track_keydir_binary_remove(_instance_ctx, _keydir, _shard_index, _key), do: :ok
+
+  defp delete_keydir_row(instance_ctx, keydir, shard_index, key) do
+    case :ets.lookup(keydir, key) do
+      [row] ->
+        track_keydir_binary_remove(instance_ctx, keydir, shard_index, key)
+        delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
+        :ets.delete(keydir, key)
+
+      _missing ->
+        :ok
+    end
+  end
+
+  defp delete_apply_projection_cache_for_row(
+         %{data_dir: data_dir},
+         shard_index,
+         {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+          _value_size}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_integer(index) and index > 0 do
+    Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(data_dir, shard_index, [
+      {index, key}
+    ])
+
+    :ok
+  end
+
+  defp delete_apply_projection_cache_for_row(_instance_ctx, _shard_index, _row), do: :ok
 
   defp binary_bytes(value) when is_binary(value) and byte_size(value) > 64, do: byte_size(value)
   defp binary_bytes(_value), do: 0

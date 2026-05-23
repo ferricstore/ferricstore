@@ -2,6 +2,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @moduledoc false
 
   alias Ferricstore.HLC
+  alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Raft.StateMachine
   alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.BlobStore
@@ -76,6 +77,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
       position: Map.get(metadata, :position, @zero_pos),
       persisted_position: Map.get(metadata, :position, @zero_pos),
       last_clean_position: Map.get(metadata, :position, @zero_pos),
+      replay_dependencies: %{history: %{}},
       label: Map.get(metadata, :label),
       config: Map.get(metadata, :config),
       bitcask_dirty?: false
@@ -87,12 +89,23 @@ defmodule Ferricstore.Raft.WARaftStorage do
   def close(handle) do
     try do
       with :ok <- maybe_fsync_payload_before_metadata(handle) do
-        clean_handle = Map.put(handle, :bitcask_dirty?, false)
+        clean_handle =
+          handle
+          |> Map.put(:bitcask_dirty?, false)
+          |> maybe_mark_clean_position()
 
-        if not segment_keydir_available?(clean_handle) do
-          :ok
-        else
-          persist_metadata(clean_handle, :compact)
+        cond do
+          not segment_keydir_available?(clean_handle) ->
+            :ok
+
+          replay_dependencies_ready?(clean_handle) ->
+            clean_handle
+            |> clear_replay_dependencies()
+            |> persist_metadata(:compact)
+
+          true ->
+            request_replay_dependencies(clean_handle)
+            :ok
         end
       end
     after
@@ -147,6 +160,13 @@ defmodule Ferricstore.Raft.WARaftStorage do
              projection_root,
              relocations
            ) do
+      prune_apply_projection_cache_after_segment_projection(
+        context.ctx,
+        context.shard_index,
+        trim_index,
+        relocations
+      )
+
       :ok
     end
   end
@@ -361,7 +381,10 @@ defmodule Ferricstore.Raft.WARaftStorage do
          %{sm_state: sm_state} = handle,
          label_update
        ) do
-    case apply_state_machine_command(command, position, sm_state) do
+    apply_result = apply_state_machine_command(command, position, sm_state)
+    replay_dependencies = StateMachine.consume_waraft_replay_dependencies()
+
+    case apply_result do
       {new_sm_state, result} ->
         finish_apply_result(
           command,
@@ -372,6 +395,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
             handle
             | sm_state: new_sm_state
           }
+          |> merge_replay_dependencies(replay_dependencies)
           |> maybe_mark_bitcask_dirty()
           |> maybe_update_label(label_update)
         )
@@ -386,6 +410,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
             handle
             | sm_state: new_sm_state
           }
+          |> merge_replay_dependencies(replay_dependencies)
           |> maybe_mark_bitcask_dirty()
           |> maybe_update_label(label_update)
         )
@@ -1402,19 +1427,28 @@ defmodule Ferricstore.Raft.WARaftStorage do
       entries = apply_projection_entries(batch)
       file_id = {:waraft_apply_projection, index}
 
-      :ok = cache_apply_projection_entries(sm_state, index, entries)
+      :ok = write_apply_projection_batch_log(sm_state, position, entries)
       {:ok, file_id, apply_projection_locations(batch, 0)}
     else
       {:error, {:bad_waraft_projection_position, position}}
     end
   end
 
-  defp cache_apply_projection_entries(_sm_state, _index, []), do: :ok
+  defp write_apply_projection_batch_log(_sm_state, _position, []), do: :ok
 
-  defp cache_apply_projection_entries(sm_state, index, entries) do
+  defp write_apply_projection_batch_log(
+         %{data_dir: data_dir, shard_index: shard_index},
+         position,
+         entries
+       ) do
+    index = position_index(position)
+
+    # This is an in-process read cache, not an extra durable log. The Raft WAL is
+    # the durable source before trim; prepare_segment_projection_for_trim/2 writes
+    # a durable segment projection before the WAL can be trimmed.
     Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
-      sm_state.data_dir,
-      sm_state.shard_index,
+      data_dir,
+      shard_index,
       index,
       entries
     )
@@ -1446,6 +1480,19 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp maybe_put_status(status, key, value), do: [{key, value} | status]
 
   defp durable_position(%{bitcask_dirty?: true} = handle) do
+    last_clean_position(handle)
+  end
+
+  defp durable_position(handle) do
+    if replay_dependencies_ready?(handle) do
+      Map.get(handle, :position)
+    else
+      request_replay_dependencies(handle)
+      last_clean_position(handle)
+    end
+  end
+
+  defp last_clean_position(handle) do
     Map.get(
       handle,
       :last_clean_position,
@@ -1453,7 +1500,97 @@ defmodule Ferricstore.Raft.WARaftStorage do
     )
   end
 
-  defp durable_position(handle), do: Map.get(handle, :position)
+  defp merge_replay_dependencies(handle, dependencies) when is_map(dependencies) do
+    history =
+      dependencies
+      |> Map.get(:history, %{})
+      |> normalize_replay_dependency_map()
+
+    if map_size(history) == 0 do
+      handle
+    else
+      Map.update(handle, :replay_dependencies, %{history: history}, fn existing ->
+        Map.update(existing || %{}, :history, history, fn existing_history ->
+          merge_replay_dependency_maps(existing_history, history)
+        end)
+      end)
+    end
+  end
+
+  defp merge_replay_dependencies(handle, _dependencies), do: handle
+
+  defp clear_replay_dependencies(handle),
+    do: Map.put(handle, :replay_dependencies, %{history: %{}})
+
+  defp replay_dependencies_ready?(handle) do
+    handle
+    |> Map.get(:replay_dependencies, %{})
+    |> Map.get(:history, %{})
+    |> normalize_replay_dependency_map()
+    |> Enum.all?(fn {shard_index, index} ->
+      HistoryProjector.durable?(
+        Map.get(handle, :ctx),
+        shard_index,
+        replay_dependency_shard_data_path(handle, shard_index),
+        index
+      )
+    end)
+  end
+
+  defp request_replay_dependencies(handle) do
+    handle
+    |> Map.get(:replay_dependencies, %{})
+    |> Map.get(:history, %{})
+    |> normalize_replay_dependency_map()
+    |> Enum.each(fn {shard_index, index} ->
+      HistoryProjector.request(
+        Map.get(handle, :ctx),
+        shard_index,
+        replay_dependency_shard_data_path(handle, shard_index),
+        index
+      )
+    end)
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp replay_dependency_shard_data_path(%{ctx: %{data_dir: data_dir}}, shard_index)
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+  end
+
+  defp replay_dependency_shard_data_path(%{sm_state: %{shard_data_path: path}}, _shard_index)
+       when is_binary(path),
+       do: path
+
+  defp replay_dependency_shard_data_path(_handle, shard_index),
+    do: Path.join(["data", "shard_#{shard_index}"])
+
+  defp merge_replay_dependency_maps(left, right) do
+    right
+    |> normalize_replay_dependency_map()
+    |> Enum.reduce(normalize_replay_dependency_map(left), fn {shard_index, index}, acc ->
+      Map.update(acc, shard_index, index, &max(&1, index))
+    end)
+  end
+
+  defp normalize_replay_dependency_map(dependencies) when is_map(dependencies) do
+    dependencies
+    |> Enum.reduce(%{}, fn
+      {shard_index, index}, acc
+      when is_integer(shard_index) and shard_index >= 0 and is_integer(index) and index > 0 ->
+        Map.update(acc, shard_index, index, &max(&1, index))
+
+      _other, acc ->
+        acc
+    end)
+  end
+
+  defp normalize_replay_dependency_map(_dependencies), do: %{}
 
   defp meta_from_position({:raft_log_pos, index, term})
        when is_integer(index) and is_integer(term) do
@@ -1560,34 +1697,116 @@ defmodule Ferricstore.Raft.WARaftStorage do
       |> Map.put(:position, position)
       |> register_segment_projection_context()
 
-    case persist_metadata_for_hot_position(old_handle, new_handle) do
-      {:ok, persisted_handle} ->
-        {result, mark_metadata_persisted(persisted_handle)}
+    case maybe_compact_apply_projection_cache(new_handle) do
+      {:ok, compacted_handle} ->
+        case persist_metadata_for_hot_position(old_handle, compacted_handle) do
+          {:ok, persisted_handle} ->
+            {result, mark_metadata_persisted(persisted_handle)}
 
-      :skipped ->
-        {result, maybe_mark_clean_position(new_handle)}
+          :skipped ->
+            {result, maybe_mark_clean_position(compacted_handle)}
+
+          {:error, reason} ->
+            {{:error, reason}, block_storage(old_handle, reason, position, :metadata_failure)}
+        end
 
       {:error, reason} ->
-        {{:error, reason}, block_storage(old_handle, reason, position, :metadata_failure)}
+        {{:error, reason},
+         block_storage(old_handle, reason, position, :apply_projection_cache_compaction)}
     end
+  end
+
+  defp maybe_compact_apply_projection_cache(handle) do
+    limit = apply_projection_cache_max_entries()
+
+    cond do
+      limit == :infinity ->
+        {:ok, handle}
+
+      not (is_integer(limit) and limit >= 0) ->
+        {:ok, handle}
+
+      true ->
+        count =
+          Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
+            handle.ctx.data_dir,
+            handle.shard_index
+          )
+
+        if count > limit do
+          compact_apply_projection_cache(handle, count, limit)
+        else
+          {:ok, handle}
+        end
+    end
+  end
+
+  defp compact_apply_projection_cache(
+         %{position: position} = handle,
+         count,
+         limit
+       ) do
+    started_at = System.monotonic_time()
+    index = position_index(position)
+
+    result =
+      if index > 0 do
+        Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(
+          handle.ctx.data_dir,
+          handle.shard_index
+        )
+      else
+        :ok
+      end
+
+    emit_apply_projection_cache_compaction(handle, started_at, count, limit, result)
+
+    case result do
+      :ok -> {:ok, handle}
+      {:ok, _removed} -> {:ok, handle}
+      {:error, reason} -> {:error, {:apply_projection_cache_compact_failed, reason}}
+      other -> {:error, {:apply_projection_cache_compact_failed, other}}
+    end
+  end
+
+  defp apply_projection_cache_max_entries do
+    Ferricstore.MemoryBudget.limit(:waraft_apply_projection_cache_max_entries, 16_384)
   end
 
   defp persist_metadata_for_hot_position(_old_handle, new_handle) do
-    if storage_metadata_persist_due?(new_handle) do
-      case persist_metadata(new_handle) do
-        :ok -> {:ok, new_handle}
-        {:error, _reason} = error -> error
-      end
-    else
-      :skipped
+    cond do
+      not replay_dependencies_ready?(new_handle) ->
+        :skipped
+
+      storage_metadata_persist_due?(new_handle) ->
+        new_handle = clear_replay_dependencies(new_handle)
+
+        case persist_metadata(new_handle) do
+          :ok -> {:ok, new_handle}
+          {:error, _reason} = error -> error
+        end
+
+      true ->
+        :skipped
     end
   end
 
-  defp mark_metadata_persisted(%{position: position} = handle),
-    do: %{handle | persisted_position: position, last_clean_position: position}
+  defp mark_metadata_persisted(%{position: position} = handle) do
+    handle
+    |> Map.put(:persisted_position, position)
+    |> Map.put(:last_clean_position, position)
+    |> clear_replay_dependencies()
+  end
 
-  defp maybe_mark_clean_position(%{bitcask_dirty?: false, position: position} = handle),
-    do: %{handle | last_clean_position: position}
+  defp maybe_mark_clean_position(%{bitcask_dirty?: false, position: position} = handle) do
+    if replay_dependencies_ready?(handle) do
+      handle
+      |> Map.put(:last_clean_position, position)
+      |> clear_replay_dependencies()
+    else
+      handle
+    end
+  end
 
   defp maybe_mark_clean_position(handle), do: handle
 
@@ -1774,6 +1993,35 @@ defmodule Ferricstore.Raft.WARaftStorage do
       }
     )
   end
+
+  defp emit_apply_projection_cache_compaction(handle, started_at, count, limit, result) do
+    duration_us =
+      System.convert_time_unit(System.monotonic_time() - started_at, :native, :microsecond)
+
+    :telemetry.execute(
+      [:ferricstore, :waraft, :apply_projection_cache, :compact],
+      %{count: count, limit: limit, duration_us: duration_us},
+      %{
+        result: apply_projection_cache_compaction_result(result),
+        reason: apply_projection_cache_compaction_reason(result),
+        shard_index: Map.get(handle, :shard_index),
+        position: Map.get(handle, :position),
+        root_dir: Map.get(handle, :root_dir)
+      }
+    )
+  rescue
+    _ -> :ok
+  end
+
+  defp apply_projection_cache_compaction_result(:ok), do: :ok
+  defp apply_projection_cache_compaction_result({:ok, _removed}), do: :ok
+  defp apply_projection_cache_compaction_result({:error, _reason}), do: :error
+  defp apply_projection_cache_compaction_result(_other), do: :error
+
+  defp apply_projection_cache_compaction_reason(:ok), do: nil
+  defp apply_projection_cache_compaction_reason({:ok, _removed}), do: nil
+  defp apply_projection_cache_compaction_reason({:error, reason}), do: reason
+  defp apply_projection_cache_compaction_reason(other), do: other
 
   defp build_sm_state(ctx, shard_index) do
     data_dir = ctx.data_dir
@@ -2564,6 +2812,69 @@ defmodule Ferricstore.Raft.WARaftStorage do
   rescue
     error -> {:error, {:relocate_segment_projection_keydir_failed, error}}
   end
+
+  defp prune_apply_projection_cache_after_segment_projection(
+         ctx,
+         shard_index,
+         trim_index,
+         relocations
+       ) do
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    relocated_refs = apply_projection_refs_from_relocations(relocations)
+
+    before_trim_refs =
+      Ferricstore.Raft.WARaftSegmentReader.apply_projection_refs_before(
+        ctx.data_dir,
+        shard_index,
+        trim_index
+      )
+
+    refs =
+      relocated_refs
+      |> Enum.concat(before_trim_refs)
+      |> Enum.uniq()
+      |> Enum.reject(&apply_projection_ref_still_referenced?(keydir, &1))
+
+    Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(
+      ctx.data_dir,
+      shard_index,
+      refs
+    )
+
+    :ok
+  end
+
+  defp apply_projection_refs_from_relocations(relocations) do
+    Enum.flat_map(relocations, fn
+      {{key, _value, _expire_at_ms},
+       {row_key, _ets_value, _ets_expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+        _value_size}}
+      when key == row_key and is_integer(index) and index > 0 ->
+        [{index, key}]
+
+      _relocation ->
+        []
+    end)
+  end
+
+  defp apply_projection_ref_still_referenced?(keydir, {index, key})
+       when is_integer(index) and index > 0 and is_binary(key) do
+    case :ets.lookup(keydir, key) do
+      [
+        {^key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, ^index}, _offset,
+         _value_size}
+      ] ->
+        true
+
+      _not_current ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp apply_projection_ref_still_referenced?(_keydir, _ref), do: false
 
   defp maybe_run_segment_projection_before_relocate_hook(
          shard_index,

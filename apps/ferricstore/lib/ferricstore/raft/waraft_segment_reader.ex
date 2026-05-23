@@ -6,6 +6,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   @projection_dir "segment_projection_log"
   @apply_projection_dir "apply_projection_log"
   @apply_projection_table :ferricstore_waraft_apply_projection_cache
+  @apply_projection_count_tag :apply_projection_count
 
   @spec put_apply_projection(binary(), non_neg_integer(), pos_integer(), [
           {binary(), binary(), non_neg_integer()}
@@ -17,17 +18,133 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     table = ensure_apply_projection_table!()
     root = storage_root(%{data_dir: data_dir}, shard_index)
 
-    Enum.each(entries, fn
-      {key, value, expire_at_ms}
-      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
-        :ets.insert(table, {{root, index, key}, value, expire_at_ms})
+    inserted =
+      Enum.reduce(entries, 0, fn
+        {key, value, expire_at_ms}, acc
+        when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
+          cache_key = {root, index, key}
+          entry = {cache_key, value, expire_at_ms}
 
-      _invalid ->
-        :ok
-    end)
+          if :ets.insert_new(table, entry) do
+            acc + 1
+          else
+            :ets.insert(table, entry)
+            acc
+          end
+
+        _invalid, acc ->
+          acc
+      end)
+
+    increment_apply_projection_count(table, root, inserted)
 
     :ok
   end
+
+  @spec apply_projection_cache_count(binary(), non_neg_integer()) :: non_neg_integer()
+  def apply_projection_cache_count(data_dir, shard_index)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    case :ets.whereis(@apply_projection_table) do
+      :undefined ->
+        0
+
+      table ->
+        root = storage_root(%{data_dir: data_dir}, shard_index)
+
+        case :ets.lookup(table, apply_projection_count_key(root)) do
+          [{_key, count}] when is_integer(count) and count >= 0 ->
+            count
+
+          _missing_or_stale ->
+            count_apply_projection_rows(table, root)
+        end
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  def apply_projection_cache_count(_data_dir, _shard_index), do: 0
+
+  @spec spill_apply_projection_cache(binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def spill_apply_projection_cache(data_dir, shard_index)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    case :ets.whereis(@apply_projection_table) do
+      :undefined ->
+        {:ok, 0}
+
+      table ->
+        root = storage_root(%{data_dir: data_dir}, shard_index)
+        projection_root = Path.join(root, @apply_projection_dir)
+
+        table
+        |> apply_projection_cache_entries(root)
+        |> Enum.group_by(fn {index, _key, _value, _expire_at_ms} -> index end)
+        |> Enum.sort_by(fn {index, _entries} -> index end)
+        |> spill_apply_projection_groups(data_dir, shard_index, projection_root)
+    end
+  rescue
+    error -> {:error, {:spill_apply_projection_cache_failed, error}}
+  end
+
+  def spill_apply_projection_cache(_data_dir, _shard_index), do: {:ok, 0}
+
+  @spec apply_projection_refs_before(binary(), non_neg_integer(), pos_integer()) :: [
+          {pos_integer(), binary()}
+        ]
+  def apply_projection_refs_before(data_dir, shard_index, before_index)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(before_index) and before_index > 0 do
+    case :ets.whereis(@apply_projection_table) do
+      :undefined ->
+        []
+
+      table ->
+        root = storage_root(%{data_dir: data_dir}, shard_index)
+
+        :ets.select(table, [
+          {{{root, :"$1", :"$2"}, :_, :_}, [{:<, :"$1", before_index}], [{{:"$1", :"$2"}}]}
+        ])
+    end
+  rescue
+    ArgumentError -> []
+  end
+
+  def apply_projection_refs_before(_data_dir, _shard_index, _before_index), do: []
+
+  @spec delete_apply_projection_entries(binary(), non_neg_integer(), [
+          {pos_integer(), binary()}
+        ]) :: non_neg_integer()
+  def delete_apply_projection_entries(data_dir, shard_index, refs)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(refs) do
+    case :ets.whereis(@apply_projection_table) do
+      :undefined ->
+        0
+
+      table ->
+        root = storage_root(%{data_dir: data_dir}, shard_index)
+
+        removed =
+          Enum.reduce(refs, 0, fn
+            {index, key}, acc when is_integer(index) and index > 0 and is_binary(key) ->
+              case :ets.take(table, {root, index, key}) do
+                [] -> acc
+                [_entry] -> acc + 1
+              end
+
+            _invalid, acc ->
+              acc
+          end)
+
+        decrement_apply_projection_count(table, root, removed)
+        removed
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  def delete_apply_projection_entries(_data_dir, _shard_index, _refs), do: 0
 
   @spec read_value(FerricStore.Instance.t(), non_neg_integer(), non_neg_integer(), binary()) ::
           {:ok, binary()} | :not_found | {:error, term()}
@@ -251,6 +368,79 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
 
       table ->
         table
+    end
+  end
+
+  defp apply_projection_count_key(root), do: {@apply_projection_count_tag, root}
+
+  defp increment_apply_projection_count(_table, _root, 0), do: :ok
+
+  defp increment_apply_projection_count(table, root, count) when count > 0 do
+    :ets.update_counter(
+      table,
+      apply_projection_count_key(root),
+      {2, count},
+      {apply_projection_count_key(root), 0}
+    )
+
+    :ok
+  end
+
+  defp decrement_apply_projection_count(_table, _root, 0), do: :ok
+
+  defp decrement_apply_projection_count(table, root, count) when count > 0 do
+    key = apply_projection_count_key(root)
+
+    current =
+      case :ets.lookup(table, key) do
+        [{^key, value}] when is_integer(value) and value > 0 -> value
+        _missing_or_stale -> count_apply_projection_rows(table, root) + count
+      end
+
+    :ets.insert(table, {key, max(current - count, 0)})
+    :ok
+  end
+
+  defp count_apply_projection_rows(table, root) do
+    :ets.select_count(table, [
+      {{{root, :_, :_}, :_, :_}, [], [true]}
+    ])
+  end
+
+  defp apply_projection_cache_entries(table, root) do
+    :ets.select(table, [
+      {{{root, :"$1", :"$2"}, :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
+    ])
+  end
+
+  defp spill_apply_projection_groups(groups, data_dir, shard_index, projection_root) do
+    Enum.reduce_while(groups, {:ok, 0}, fn {index, entries}, {:ok, acc} ->
+      batch =
+        Enum.map(entries, fn {_index, key, value, expire_at_ms} -> {key, value, expire_at_ms} end)
+
+      case write_apply_projection_spill(projection_root, index, batch) do
+        :ok ->
+          refs = Enum.map(entries, fn {_index, key, _value, _expire_at_ms} -> {index, key} end)
+          removed = delete_apply_projection_entries(data_dir, shard_index, refs)
+          {:cont, {:ok, acc + removed}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp write_apply_projection_spill(_projection_root, _index, []), do: :ok
+
+  defp write_apply_projection_spill(projection_root, index, entries) do
+    case :ferricstore_waraft_spike_segment_log.write_projection_batch(
+           to_charlist(projection_root),
+           {:raft_log_pos, index, 0},
+           entries
+         ) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:write_apply_projection_spill_failed, index, reason}}
+      other -> {:error, {:write_apply_projection_spill_failed, index, other}}
     end
   end
 

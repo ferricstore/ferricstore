@@ -23,6 +23,7 @@
     location_for_index/2,
     read_disk/2,
     read_disk_at/4,
+    memory_status/1,
     write_projection/3,
     write_projection_batch/3
 ]).
@@ -57,19 +58,23 @@
 -define(DEFAULT_PREALLOCATE_BYTES, 0).
 -define(WRITER_REGISTRY, ferricstore_waraft_segment_writer_registry).
 -define(OFFSET_REGISTRY, ferricstore_waraft_segment_offset_registry).
+-define(MEMORY_REGISTRY, ferricstore_waraft_segment_log_memory_registry).
 -define(DEFAULT_WAL_NIF_SYNC_TIMEOUT_MS, 30000).
 -define(DEFAULT_WAL_NIF_MAX_BUFFER_BYTES, 67108864).
+-define(DEFAULT_MAX_ETS_BYTES, 536870912).
+-define(DEFAULT_MAX_ETS_ENTRIES, 65536).
+-define(DEFAULT_MIN_ETS_ENTRIES, 4096).
 
-first_index(#raft_log{name = Name}) ->
-    case ets:first(Name) of
-        '$end_of_table' -> undefined;
-        Key -> Key
+first_index(#raft_log{name = Name} = Log) ->
+    case memory_boundaries(Name, log_dir(Log)) of
+        {undefined, _Last} -> undefined;
+        {First, _Last} -> First
     end.
 
-last_index(#raft_log{name = Name}) ->
-    case ets:last(Name) of
-        '$end_of_table' -> undefined;
-        Key -> Key
+last_index(#raft_log{name = Name} = Log) ->
+    case memory_boundaries(Name, log_dir(Log)) of
+        {_First, undefined} -> undefined;
+        {_First, Last} -> Last
     end.
 
 fold(Log, Start, End, SizeLimit, Func, Acc) ->
@@ -81,10 +86,10 @@ fold_binary(Log, Start, End, SizeLimit, Func, Acc) ->
 fold_terms(Log, Start, End, Func, Acc) ->
     fold_terms_impl(Log, Start, End, Func, Acc).
 
-get(#raft_log{name = Name}, Index) ->
+get(#raft_log{name = Name} = Log, Index) ->
     case ets:lookup(Name, Index) of
         [{Index, Entry}] -> {ok, Entry};
-        [] -> not_found
+        [] -> read_log_disk_record(Log, Index)
     end.
 
 term(Log, Index) ->
@@ -93,20 +98,31 @@ term(Log, Index) ->
         not_found -> not_found
     end.
 
-config(#raft_log{name = Name}) ->
-    config_from_index(Name, ets:last(Name)).
+config(Log) ->
+    case last_index(Log) of
+        undefined -> not_found;
+        Last ->
+            First =
+                case first_index(Log) of
+                    undefined -> 0;
+                    Value -> Value
+                end,
+            config_from_index(Log, Last, First)
+    end.
 
-config_from_index(_Name, '$end_of_table') ->
+config_from_index(_Log, Index, First) when Index < First ->
     not_found;
-config_from_index(Name, Index) ->
-    case ets:lookup(Name, Index) of
-        [{Index, Entry}] ->
+config_from_index(Log, Index, First) ->
+    case get(Log, Index) of
+        {ok, Entry} ->
             case config_from_entry(Entry) of
                 {ok, Config} -> {ok, Index, Config};
-                not_found -> config_from_index(Name, ets:prev(Name, Index))
+                not_found -> config_from_index(Log, Index - 1, First)
             end;
-        [] ->
-            config_from_index(Name, ets:prev(Name, Index))
+        not_found ->
+            config_from_index(Log, Index - 1, First);
+        {error, _Reason} = Error ->
+            Error
     end.
 
 config_from_entry({_Term, {_Key, {config, Config}}}) ->
@@ -267,7 +283,7 @@ write_projection_batch(RootDir, Position, Entries) when is_list(Entries) ->
             case filelib:ensure_dir(filename:join(Dir, "dummy")) of
                 ok ->
                     Record = {Index, {0, {ferricstore_segment_apply_projection_batch, Position, Entries}}},
-                    write_records(Dir, [Record]);
+                    write_records_nosync(Dir, [Record]);
                 {error, Reason} ->
                     {error, {ensure_projection_batch_dir, Reason}}
             end;
@@ -303,6 +319,8 @@ append(View, Entries, _Mode, _Priority) ->
             case write_records(Dir, Records) of
                 ok ->
                     true = ets:insert(Name, Records),
+                    refresh_memory_stats(Name, Dir),
+                    enforce_ets_memory_limit(Name, Dir),
                     ok;
                 {error, _Reason} = Error ->
                     Error
@@ -337,11 +355,16 @@ open(#raft_log{name = Name} = Log) ->
                                                         ok ->
                                                             true = ets:delete_all_objects(Name),
                                                             _ = ensure_offset_registry(),
+                                                            _ = ensure_memory_registry(),
                                                             _ = clear_offset_registry_for_dir(Dir),
                                                             case load_segments(Dir, Name) of
-                                                                ok -> {ok, #{dir => Dir}};
+                                                                ok ->
+                                                                    refresh_memory_stats(Name, Dir),
+                                                                    enforce_ets_memory_limit(Name, Dir),
+                                                                    {ok, #{dir => Dir}};
                                                                 {error, _Reason} = Error ->
                                                                     true = ets:delete_all_objects(Name),
+                                                                    clear_memory_stats(Name),
                                                                     Error
                                                             end;
                                                         {error, _Reason} = Error ->
@@ -382,6 +405,7 @@ reset(#raft_log{name = Name} = Log, #raft_log_pos{index = Index, term = Term}, S
                     case rewrite_records(Dir, [Record]) of
                         ok ->
                             true = ets:insert(Name, Record),
+                            set_memory_stats(Name, Dir, 1, record_memory_bytes(Record), Index, Index),
                             {ok, State};
                         {error, _Reason} = Error ->
                             Error
@@ -397,6 +421,7 @@ truncate(_Log, '$end_of_table', State) ->
     {ok, State};
 truncate(#raft_log{name = Name} = Log, Index, State) ->
     Dir = log_dir(Log),
+    {FirstBefore, _LastBefore} = memory_boundaries(Name, Dir),
     case check_append_failure_marker(Dir) of
         ok ->
             case close_writers_for_dir(Dir) of
@@ -404,6 +429,7 @@ truncate(#raft_log{name = Name} = Log, Index, State) ->
                     case rewrite_ets_records_before(Dir, Name, Index) of
                         ok ->
                             delete_from(Name, Index),
+                            set_memory_boundaries_and_refresh(Name, Dir, FirstBefore, Index - 1),
                             {ok, State};
                         {error, _Reason} = Error ->
                             Error
@@ -423,6 +449,7 @@ trim(#raft_log{name = Name} = Log, Index, State) ->
     %% location. Before trimming those records, the storage layer must persist
     %% a projection checkpoint so cold keydir rows can still be rebuilt/read.
     Dir = log_dir(Log),
+    {_FirstBefore, LastBefore} = memory_boundaries(Name, Dir),
     case prepare_segment_projection_for_trim(Dir, Index) of
         ok ->
             case check_append_failure_marker(Dir) of
@@ -432,6 +459,7 @@ trim(#raft_log{name = Name} = Log, Index, State) ->
                             case rewrite_ets_records_at_or_after(Dir, Name, Index) of
                                 ok ->
                                     delete_before(Name, Index),
+                                    set_memory_boundaries_and_refresh(Name, Dir, Index, LastBefore),
                                     {ok, State};
                                 {error, _Reason} = Error ->
                                     Error
@@ -460,19 +488,26 @@ prepare_segment_projection_for_trim(Dir, Index) ->
 flush(_Log) ->
     ok.
 
+memory_status(#raft_log{name = Name} = Log) ->
+    Dir = log_dir(Log),
+    refresh_memory_stats(Name, Dir),
+    memory_status_for(Name, Dir).
+
 fold_impl(_Log, '$end_of_table', _End, _Size, _SizeLimit, _Func, Acc) ->
     {ok, Acc};
 fold_impl(_Log, Start, End, _Size, _SizeLimit, _Func, Acc) when End < Start ->
     {ok, Acc};
 fold_impl(_Log, _Start, _End, Size, SizeLimit, _Func, Acc) when Size >= SizeLimit ->
     {ok, Acc};
-fold_impl(#raft_log{name = Name} = Log, Start, End, Size, SizeLimit, Func, Acc) ->
-    case ets:lookup(Name, Start) of
-        [{Start, Entry}] ->
+fold_impl(Log, Start, End, Size, SizeLimit, Func, Acc) ->
+    case get(Log, Start) of
+        {ok, Entry} ->
             EntrySize = erlang:external_size(Entry),
-            fold_impl(Log, ets:next(Name, Start), End, Size + EntrySize, SizeLimit, Func, Func(Start, EntrySize, Entry, Acc));
-        [] ->
-            fold_impl(Log, ets:next(Name, Start), End, Size, SizeLimit, Func, Acc)
+            fold_impl(Log, Start + 1, End, Size + EntrySize, SizeLimit, Func, Func(Start, EntrySize, Entry, Acc));
+        not_found ->
+            fold_impl(Log, Start + 1, End, Size, SizeLimit, Func, Acc);
+        {error, _Reason} = Error ->
+            Error
     end.
 
 fold_binary_impl(_Log, '$end_of_table', _End, _Size, _SizeLimit, _Func, Acc) ->
@@ -481,26 +516,30 @@ fold_binary_impl(_Log, Start, End, _Size, _SizeLimit, _Func, Acc) when End < Sta
     {ok, Acc};
 fold_binary_impl(_Log, _Start, _End, Size, SizeLimit, _Func, Acc) when Size >= SizeLimit ->
     {ok, Acc};
-fold_binary_impl(#raft_log{name = Name} = Log, Start, End, Size, SizeLimit, Func, Acc) ->
-    case ets:lookup(Name, Start) of
-        [{Start, Entry}] ->
+fold_binary_impl(Log, Start, End, Size, SizeLimit, Func, Acc) ->
+    case get(Log, Start) of
+        {ok, Entry} ->
             Binary = term_to_binary(Entry),
             EntrySize = byte_size(Binary),
-            fold_binary_impl(Log, ets:next(Name, Start), End, Size + EntrySize, SizeLimit, Func, Func(Start, Binary, Acc));
-        [] ->
-            fold_binary_impl(Log, ets:next(Name, Start), End, Size, SizeLimit, Func, Acc)
+            fold_binary_impl(Log, Start + 1, End, Size + EntrySize, SizeLimit, Func, Func(Start, Binary, Acc));
+        not_found ->
+            fold_binary_impl(Log, Start + 1, End, Size, SizeLimit, Func, Acc);
+        {error, _Reason} = Error ->
+            Error
     end.
 
 fold_terms_impl(_Log, '$end_of_table', _End, _Func, Acc) ->
     {ok, Acc};
 fold_terms_impl(_Log, Start, End, _Func, Acc) when End < Start ->
     {ok, Acc};
-fold_terms_impl(#raft_log{name = Name} = Log, Start, End, Func, Acc) ->
-    case ets:lookup(Name, Start) of
-        [{Start, {Term, _Op}}] ->
-            fold_terms_impl(Log, ets:next(Name, Start), End, Func, Func(Start, Term, Acc));
-        [] ->
-            fold_terms_impl(Log, ets:next(Name, Start), End, Func, Acc)
+fold_terms_impl(Log, Start, End, Func, Acc) ->
+    case get(Log, Start) of
+        {ok, {Term, _Op}} ->
+            fold_terms_impl(Log, Start + 1, End, Func, Func(Start, Term, Acc));
+        not_found ->
+            fold_terms_impl(Log, Start + 1, End, Func, Acc);
+        {error, _Reason} = Error ->
+            Error
     end.
 
 append_decode(Index, Entries) ->
@@ -580,6 +619,44 @@ write_records_with_segment_size(Dir, Records, RecordsPerSegment) ->
         {error, _Reason} = Error -> Error
     end.
 
+write_records_nosync(_Dir, []) ->
+    ok;
+write_records_nosync(Dir, Records) ->
+    case validate_segment_log_dir(Dir) of
+        ok ->
+            case check_append_failure_marker(Dir) of
+                ok ->
+                    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+                        ok ->
+                            case validate_segment_log_dir(Dir) of
+                                ok ->
+                                    case records_per_segment(Dir) of
+                                        {ok, RecordsPerSegment} ->
+                                            write_records_nosync_with_segment_size(Dir, Records, RecordsPerSegment);
+                                        {error, _Reason} = Error ->
+                                            Error
+                                    end;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, Reason} ->
+                            {error, {ensure_dir, Reason}}
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+write_records_nosync_with_segment_size(_Dir, [], _RecordsPerSegment) ->
+    ok;
+write_records_nosync_with_segment_size(Dir, Records, RecordsPerSegment) ->
+    case group_records(Records, RecordsPerSegment) of
+        {ok, Groups} -> write_record_group_nosync_list(Dir, Groups, []);
+        {error, _Reason} = Error -> Error
+    end.
+
 group_records(Records, RecordsPerSegment) ->
     group_records_start(Records, RecordsPerSegment).
 
@@ -625,6 +702,31 @@ write_record_group_list(Dir, [{{_Ordinal, Segment}, RecordsRev} | Rest], Rollbac
                 ok -> maybe_poison_after_append_rollback_failure(Dir, Reason);
                 {error, RollbackReason} -> poison_segment_log(Dir, {rollback_failed, Reason, RollbackReason})
             end
+    end.
+
+write_record_group_nosync_list(Dir, Groups, Rollbacks) ->
+    write_record_group_nosync_list(Dir, Groups, Rollbacks, []).
+
+write_record_group_nosync_list(_Dir, [], _Rollbacks, OffsetAcc) ->
+    register_offset_entries(lists:append(lists:reverse(OffsetAcc)));
+write_record_group_nosync_list(Dir, [{{_Ordinal, Segment}, RecordsRev} | Rest], Rollbacks, OffsetAcc) ->
+    case write_record_group_once_nosync(Dir, Segment, RecordsRev) of
+        {ok, Rollback, Offsets} ->
+            write_record_group_nosync_list(Dir, Rest, [Rollback | Rollbacks], [Offsets | OffsetAcc]);
+        {error, Reason} ->
+            case rollback_written_groups(Rollbacks) of
+                ok -> maybe_poison_after_append_rollback_failure(Dir, Reason);
+                {error, RollbackReason} -> poison_segment_log(Dir, {rollback_failed, Reason, RollbackReason})
+            end
+    end.
+
+write_record_group_once_nosync(Dir, Segment, RecordsRev) ->
+    Path = filename:join(Dir, Segment),
+    case validate_segment_file_for_append(Path) of
+        ok ->
+            open_record_group_once_file_direct_nosync(Dir, Path, RecordsRev);
+        {error, _Reason} = Error ->
+            Error
     end.
 
 write_record_group_once(Dir, Segment, RecordsRev) ->
@@ -693,6 +795,38 @@ open_record_group_once_file_direct(Dir, Path, RecordsRev) ->
                                     Records = lists:reverse(RecordsRev),
                                     Writes = [encode_record(Record) || Record <- Records],
                                     case write_record_group_file_direct(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
+                                        ok ->
+                                            {ok, {Path, OldSize}, offset_entries_for_records(Dir, Path, Records, OldSize, Writes)};
+                                        {error, Reason} ->
+                                            {error, Reason}
+                                    end;
+                                {error, Reason} ->
+                                    _ = file:close(Fd),
+                                    {error, Reason}
+                            end;
+                        {error, Reason} ->
+                            _ = file:close(Fd),
+                            {error, {position, Reason}}
+                    end;
+                {error, Reason} ->
+                    {error, {open, Reason}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+open_record_group_once_file_direct_nosync(Dir, Path, RecordsRev) ->
+    case close_writer_for_path(Path) of
+        ok ->
+            case file:open(Path, [append, raw, binary]) of
+                {ok, Fd} ->
+                    case file:position(Fd, eof) of
+                        {ok, OldSize} ->
+                            case maybe_preallocate_new_segment(Path, OldSize =:= 0) of
+                                ok ->
+                                    Records = lists:reverse(RecordsRev),
+                                    Writes = [encode_record(Record) || Record <- Records],
+                                    case write_record_group_file_direct_nosync(Dir, Path, Fd, OldSize, Writes, OldSize =:= 0) of
                                         ok ->
                                             {ok, {Path, OldSize}, offset_entries_for_records(Dir, Path, Records, OldSize, Writes)};
                                         {error, Reason} ->
@@ -849,6 +983,37 @@ write_record_group_file_direct(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
                     maybe_sync_new_segment_dir(Dir, Path, OldSize, NewSegment);
                 {error, CloseReason} ->
                     rollback_append_path(Path, OldSize, {close, CloseReason})
+            end;
+        {error, AppendError} ->
+            RollbackResult = rollback_append_fd(Path, Fd, OldSize),
+            CloseResult = file:close(Fd),
+            case {RollbackResult, CloseResult} of
+                {ok, _} -> {error, AppendError};
+                {{error, RollbackReason}, _} -> {error, {rollback_failed, AppendError, RollbackReason}};
+                {_, {error, CloseReason}} -> {error, {rollback_failed, AppendError, {close, CloseReason}}}
+            end
+    end,
+    emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment),
+    Result.
+
+write_record_group_file_direct_nosync(_Dir, Path, Fd, OldSize, Writes, NewSegment) ->
+    %% Apply-projection records are rebuilt from the durable Raft WAL after
+    %% crash. Keep their hot append path out of fdatasync; the later segment
+    %% projection/snapshot path is the durable cold-query boundary.
+    StartedAt = erlang:monotonic_time(),
+    Count = length(Writes),
+    Bytes = iolist_size(Writes),
+    WriteResult =
+        case file:write(Fd, Writes) of
+            ok -> maybe_run_append_hook(after_write);
+            {error, WriteError} -> {error, {write, WriteError}}
+        end,
+
+    Result = case WriteResult of
+        ok ->
+            case file:close(Fd) of
+                ok -> ok;
+                {error, CloseReason} -> rollback_append_path(Path, OldSize, {close, CloseReason})
             end;
         {error, AppendError} ->
             RollbackResult = rollback_append_fd(Path, Fd, OldSize),
@@ -1083,18 +1248,13 @@ rewrite_records(Dir, Records) ->
         {error, _Reason} = Error -> Error
     end.
 
-rewrite_ets_records_before(Dir, Name, Index) ->
-    rewrite_ets_records(Dir, Name, ets:first(Name), fun(Key) -> Key < Index end).
+rewrite_ets_records_before(Dir, _Name, Index) ->
+    rewrite_disk_records(Dir, fun(Key) -> Key < Index end).
 
-rewrite_ets_records_at_or_after(Dir, Name, Index) ->
-    StartKey =
-        case ets:lookup(Name, Index) of
-            [{Index, _Entry}] -> Index;
-            [] -> ets:next(Name, Index)
-        end,
-    rewrite_ets_records(Dir, Name, StartKey, fun(_Key) -> true end).
+rewrite_ets_records_at_or_after(Dir, _Name, Index) ->
+    rewrite_disk_records(Dir, fun(Key) -> Key >= Index end).
 
-rewrite_ets_records(Dir, Name, StartKey, KeepFun) ->
+rewrite_disk_records(Dir, KeepFun) ->
     case validate_segment_log_dir(Dir) of
         ok ->
             case recover_rewrite(Dir) of
@@ -1103,7 +1263,7 @@ rewrite_ets_records(Dir, Name, StartKey, KeepFun) ->
                         ok ->
                             case records_per_segment(Dir) of
                                 {ok, RecordsPerSegment} ->
-                                    rewrite_ets_records_atomic(Dir, Name, StartKey, KeepFun, RecordsPerSegment);
+                                    rewrite_disk_records_atomic(Dir, KeepFun, RecordsPerSegment);
                                 {error, _Reason} = Error ->
                                     Error
                             end;
@@ -1145,11 +1305,11 @@ rewrite_records_atomic(Dir, Records, RecordsPerSegment) ->
             Error
     end.
 
-rewrite_ets_records_atomic(Dir, Name, StartKey, KeepFun, RecordsPerSegment) ->
+rewrite_disk_records_atomic(Dir, KeepFun, RecordsPerSegment) ->
     Paths = rewrite_paths(Dir),
     Staging = maps:get(staging, Paths),
     Backup = maps:get(backup, Paths),
-    case prepare_rewrite_stage_from_ets(Staging, Name, StartKey, KeepFun, RecordsPerSegment) of
+    case prepare_rewrite_stage_from_disk(Staging, Dir, KeepFun, RecordsPerSegment) of
         ok ->
             case write_rewrite_marker(Dir, Paths) of
                 ok ->
@@ -1199,17 +1359,16 @@ prepare_rewrite_stage(Staging, Records, RecordsPerSegment) ->
             Error
     end.
 
-prepare_rewrite_stage_from_ets(Staging, Name, StartKey, KeepFun, RecordsPerSegment) ->
+prepare_rewrite_stage_from_disk(Staging, SourceDir, KeepFun, RecordsPerSegment) ->
     case remove_tree(Staging) of
         ok ->
             case filelib:ensure_dir(filename:join(Staging, "dummy")) of
                 ok ->
                     case write_segment_config(Staging, RecordsPerSegment) of
                         ok ->
-                            case write_ets_records_with_segment_size(
+                            case write_disk_records_with_segment_size(
+                                SourceDir,
                                 Staging,
-                                Name,
-                                StartKey,
                                 KeepFun,
                                 RecordsPerSegment
                             ) of
@@ -1229,75 +1388,186 @@ prepare_rewrite_stage_from_ets(Staging, Name, StartKey, KeepFun, RecordsPerSegme
             Error
     end.
 
-write_ets_records_with_segment_size(Dir, Name, StartKey, KeepFun, RecordsPerSegment) ->
-    case write_ets_records_loop(Dir, Name, StartKey, KeepFun, RecordsPerSegment, undefined, [], []) of
-        {ok, _Rollbacks} -> ok;
-        {error, _Reason} = Error -> Error
+write_disk_records_with_segment_size(SourceDir, DestDir, KeepFun, RecordsPerSegment) ->
+    case segment_paths(SourceDir) of
+        {ok, Paths} ->
+            case stream_disk_segment_paths(
+                Paths,
+                DestDir,
+                KeepFun,
+                RecordsPerSegment,
+                undefined,
+                [],
+                []
+            ) of
+                {ok, Ordinal, RecordsRev, Rollbacks} ->
+                    case finish_streamed_record_group(DestDir, Ordinal, RecordsRev, Rollbacks) of
+                        {ok, _FinalRollbacks} -> ok;
+                        {error, _Reason} = Error -> Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, enoent} ->
+            ok;
+        {error, _Reason} = Error ->
+            Error
     end.
 
-write_ets_records_loop(Dir, _Name, '$end_of_table', _KeepFun, _RecordsPerSegment, Ordinal, RecordsRev, Rollbacks) ->
-    finish_streamed_record_group(Dir, Ordinal, RecordsRev, Rollbacks);
-write_ets_records_loop(Dir, Name, Key, KeepFun, RecordsPerSegment, Ordinal, RecordsRev, Rollbacks) ->
-    case KeepFun(Key) of
-        true ->
-            NextKey = ets:next(Name, Key),
-            case ets:lookup(Name, Key) of
-                [{Key, Entry}] ->
-                    RecordOrdinal = segment_ordinal(Key, RecordsPerSegment),
-                    case Ordinal of
-                        undefined ->
-                            write_ets_records_loop(
-                                Dir,
-                                Name,
-                                NextKey,
-                                KeepFun,
-                                RecordsPerSegment,
-                                RecordOrdinal,
-                                [{Key, Entry}],
-                                Rollbacks
-                            );
-                        RecordOrdinal ->
-                            write_ets_records_loop(
-                                Dir,
-                                Name,
-                                NextKey,
-                                KeepFun,
-                                RecordsPerSegment,
-                                Ordinal,
-                                [{Key, Entry} | RecordsRev],
-                                Rollbacks
-                            );
-                        _OtherOrdinal ->
-                            case finish_streamed_record_group(Dir, Ordinal, RecordsRev, Rollbacks) of
-                                {ok, NextRollbacks} ->
-                                    write_ets_records_loop(
-                                        Dir,
-                                        Name,
-                                        NextKey,
+stream_disk_segment_paths([], _DestDir, _KeepFun, _RecordsPerSegment, Ordinal, RecordsRev, Rollbacks) ->
+    {ok, Ordinal, RecordsRev, Rollbacks};
+stream_disk_segment_paths([{SourceOrdinal, Path} | Rest], DestDir, KeepFun, RecordsPerSegment, Ordinal, RecordsRev, Rollbacks) ->
+    case stream_disk_segment_path(Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdinal, Ordinal, RecordsRev, Rollbacks) of
+        {ok, NextOrdinal, NextRecordsRev, NextRollbacks} ->
+            stream_disk_segment_paths(Rest, DestDir, KeepFun, RecordsPerSegment, NextOrdinal, NextRecordsRev, NextRollbacks);
+        {error, Reason} = Error ->
+            emit_corrupt_segment(Path, Reason),
+            Error
+    end.
+
+stream_disk_segment_path(Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdinal, Ordinal, RecordsRev, Rollbacks) ->
+    case file:read_link_info(Path) of
+        {ok, #file_info{type = regular, size = FileBytes}} ->
+            case file:open(Path, [read, raw, binary]) of
+                {ok, Fd} ->
+                    try stream_disk_segment_fd(
+                        Fd,
+                        Path,
+                        DestDir,
+                        KeepFun,
+                        RecordsPerSegment,
+                        SourceOrdinal,
+                        0,
+                        FileBytes,
+                        Ordinal,
+                        RecordsRev,
+                        Rollbacks
+                    ) of
+                        Result -> Result
+                    after
+                        _ = file:close(Fd)
+                    end;
+                {error, Reason} ->
+                    {error, {open_segment, Reason}}
+            end;
+        {ok, #file_info{type = Type}} ->
+            {error, {unsafe_segment_path, Path, Type}};
+        {error, Reason} ->
+            {error, {read_segment_info, Reason}}
+    end.
+
+stream_disk_segment_fd(Fd, Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdinal, Offset, FileBytes, Ordinal, RecordsRev, Rollbacks) ->
+    case file:read(Fd, ?RECORD_HEADER_SIZE) of
+        eof ->
+            {ok, Ordinal, RecordsRev, Rollbacks};
+        {ok, Header} when byte_size(Header) < ?RECORD_HEADER_SIZE ->
+            {ok, Ordinal, RecordsRev, Rollbacks};
+        {ok, <<Len:32/unsigned-big, Crc:32/unsigned-big>>} ->
+            case Len > ?MAX_RECORD_BYTES of
+                true ->
+                    {error, {record_too_large, Offset, Len}};
+                false ->
+                    case Offset + ?RECORD_HEADER_SIZE + Len > FileBytes of
+                        true ->
+                            {ok, Ordinal, RecordsRev, Rollbacks};
+                        false ->
+                            case file:read(Fd, Len) of
+                                {ok, Payload} when byte_size(Payload) =:= Len ->
+                                    stream_disk_segment_payload(
+                                        Fd,
+                                        Path,
+                                        DestDir,
                                         KeepFun,
                                         RecordsPerSegment,
-                                        RecordOrdinal,
-                                        [{Key, Entry}],
+                                        SourceOrdinal,
+                                        Offset,
+                                        FileBytes,
+                                        Ordinal,
+                                        RecordsRev,
+                                        Rollbacks,
+                                        Len,
+                                        Crc,
+                                        Payload
+                                    );
+                                {ok, Payload} ->
+                                    {error, {short_record_read, Offset, Len, byte_size(Payload)}};
+                                eof ->
+                                    {ok, Ordinal, RecordsRev, Rollbacks};
+                                {error, Reason} ->
+                                    {error, {read_record_payload, Offset, Reason}}
+                            end
+                    end
+            end;
+        {error, Reason} ->
+            {error, {read_record_header, Offset, Reason}}
+    end.
+
+stream_disk_segment_payload(Fd, Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdinal, Offset, FileBytes, Ordinal, RecordsRev, Rollbacks, Len, Crc, Payload) ->
+    case erlang:crc32(Payload) of
+        Crc ->
+            try binary_to_term(Payload, [safe]) of
+                {Index, {_Term, _Op} = Entry} when is_integer(Index), Index >= 0 ->
+                    case validate_record_segment_ordinal(Path, Index, SourceOrdinal, RecordsPerSegment) of
+                        ok ->
+                            case maybe_stream_rewrite_record(
+                                DestDir,
+                                KeepFun,
+                                RecordsPerSegment,
+                                {Index, Entry},
+                                Ordinal,
+                                RecordsRev,
+                                Rollbacks
+                            ) of
+                                {ok, NextOrdinal, NextRecordsRev, NextRollbacks} ->
+                                    stream_disk_segment_fd(
+                                        Fd,
+                                        Path,
+                                        DestDir,
+                                        KeepFun,
+                                        RecordsPerSegment,
+                                        SourceOrdinal,
+                                        Offset + ?RECORD_HEADER_SIZE + Len,
+                                        FileBytes,
+                                        NextOrdinal,
+                                        NextRecordsRev,
                                         NextRollbacks
                                     );
                                 {error, _Reason} = Error ->
                                     Error
-                            end
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
                     end;
-                [] ->
-                    write_ets_records_loop(
-                        Dir,
-                        Name,
-                        NextKey,
-                        KeepFun,
-                        RecordsPerSegment,
-                        Ordinal,
-                        RecordsRev,
-                        Rollbacks
-                    )
+                Other ->
+                    {error, {bad_record, Other}}
+            catch
+                _:Reason ->
+                    {error, {bad_term, Reason}}
             end;
-        false ->
-            finish_streamed_record_group(Dir, Ordinal, RecordsRev, Rollbacks)
+        _Mismatch ->
+            {error, {crc_mismatch, Offset}}
+    end.
+
+maybe_stream_rewrite_record(DestDir, KeepFun, RecordsPerSegment, {Index, _Entry} = Record, Ordinal, RecordsRev, Rollbacks) ->
+    case KeepFun(Index) of
+        true -> stream_rewrite_record(DestDir, RecordsPerSegment, Record, Ordinal, RecordsRev, Rollbacks);
+        false -> {ok, Ordinal, RecordsRev, Rollbacks}
+    end.
+
+stream_rewrite_record(_DestDir, RecordsPerSegment, {Index, _Entry} = Record, undefined, [], Rollbacks) ->
+    {ok, segment_ordinal(Index, RecordsPerSegment), [Record], Rollbacks};
+stream_rewrite_record(DestDir, RecordsPerSegment, {Index, _Entry} = Record, Ordinal, RecordsRev, Rollbacks) ->
+    RecordOrdinal = segment_ordinal(Index, RecordsPerSegment),
+    case RecordOrdinal of
+        Ordinal ->
+            {ok, Ordinal, [Record | RecordsRev], Rollbacks};
+        _OtherOrdinal ->
+            case finish_streamed_record_group(DestDir, Ordinal, RecordsRev, Rollbacks) of
+                {ok, NextRollbacks} ->
+                    {ok, RecordOrdinal, [Record], NextRollbacks};
+                {error, _Reason} = Error ->
+                    Error
+            end
     end.
 
 finish_streamed_record_group(_Dir, undefined, [], Rollbacks) ->
@@ -2012,6 +2282,297 @@ clear_offset_registry_for_dir(Dir) ->
 
 offset_dir_key(Dir) ->
     unicode:characters_to_binary(filename:absname(Dir)).
+
+read_log_disk_record(Log, Index) when is_integer(Index), Index >= 0 ->
+    Dir = log_dir(Log),
+    case existing_records_per_segment(Dir) of
+        {ok, RecordsPerSegment} -> read_disk_record(Dir, Index, RecordsPerSegment);
+        not_found -> not_found;
+        {error, _Reason} = Error -> Error
+    end;
+read_log_disk_record(_Log, _Index) ->
+    not_found.
+
+memory_boundaries(Name, Dir) ->
+    case memory_registry_lookup(Name) of
+        {ok, #{first := First, last := Last}} ->
+            {First, Last};
+        not_found ->
+            refresh_memory_stats(Name, Dir),
+            case memory_registry_lookup(Name) of
+                {ok, #{first := First, last := Last}} -> {First, Last};
+                not_found -> {ets_first(Name), ets_last(Name)}
+            end
+    end.
+
+refresh_memory_stats(Name, Dir) ->
+    {Count, Bytes, EtsFirst, EtsLast} = ets_memory_usage(Name),
+    {First, Last} =
+        case memory_registry_lookup(Name) of
+            {ok, #{first := OldFirst, last := OldLast}} ->
+                {
+                    choose_first(OldFirst, EtsFirst),
+                    choose_last(OldLast, EtsLast)
+                };
+            not_found ->
+                {EtsFirst, EtsLast}
+        end,
+    set_memory_stats(Name, Dir, Count, Bytes, First, Last).
+
+set_memory_boundaries_and_refresh(Name, Dir, First, Last) ->
+    {SafeFirst, SafeLast} =
+        case {First, Last} of
+            {F, L} when is_integer(F), is_integer(L), L >= F -> {F, L};
+            _Other -> {undefined, undefined}
+        end,
+    {Count, Bytes, _EtsFirst, _EtsLast} = ets_memory_usage(Name),
+    set_memory_stats(Name, Dir, Count, Bytes, SafeFirst, SafeLast).
+
+set_memory_stats(Name, Dir, Count, Bytes, First, Last) ->
+    case ensure_memory_registry() of
+        ok ->
+            true = ets:insert(?MEMORY_REGISTRY, {Name, offset_dir_key(Dir), Count, Bytes, First, Last}),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+clear_memory_stats(Name) ->
+    case ensure_memory_registry() of
+        ok ->
+            true = ets:delete(?MEMORY_REGISTRY, Name),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+memory_status_for(Name, Dir) ->
+    Limits = ets_memory_limits(),
+    case memory_registry_lookup(Name) of
+        {ok, #{count := Count, bytes := Bytes, first := First, last := Last}} ->
+            #{
+                ets_entries => Count,
+                ets_bytes => Bytes,
+                disk_first_index => First,
+                disk_last_index => Last,
+                max_ets_bytes => maps:get(max_bytes, Limits),
+                max_ets_entries => maps:get(max_entries, Limits),
+                min_ets_entries => maps:get(min_entries, Limits),
+                dir => unicode:characters_to_binary(filename:absname(Dir))
+            };
+        not_found ->
+            #{
+                ets_entries => 0,
+                ets_bytes => 0,
+                disk_first_index => undefined,
+                disk_last_index => undefined,
+                max_ets_bytes => maps:get(max_bytes, Limits),
+                max_ets_entries => maps:get(max_entries, Limits),
+                min_ets_entries => maps:get(min_entries, Limits),
+                dir => unicode:characters_to_binary(filename:absname(Dir))
+            }
+    end.
+
+enforce_ets_memory_limit(Name, Dir) ->
+    Limits = ets_memory_limits(),
+    case memory_registry_lookup(Name) of
+        {ok, #{count := Count, bytes := Bytes, first := First, last := Last}} ->
+            case over_ets_memory_limit(Count, Bytes, Limits) of
+                true ->
+                    demote_ets_tail(Name, Dir, Count, Bytes, First, Last, Limits);
+                false ->
+                    ok
+            end;
+        not_found ->
+            ok
+    end.
+
+demote_ets_tail(Name, Dir, Count, Bytes, First, Last, Limits) ->
+    MinEntries = maps:get(min_entries, Limits),
+    MaxEntries = maps:get(max_entries, Limits),
+    MaxBytes = maps:get(max_bytes, Limits),
+    {NewCount, NewBytes, Deleted, Freed} =
+        demote_ets_tail_loop(Name, Count, Bytes, First, Last, MaxEntries, MaxBytes, MinEntries, 0, 0),
+    set_memory_stats(Name, Dir, NewCount, NewBytes, First, Last),
+    emit_ets_demote(Name, Dir, Deleted, Freed, NewCount, NewBytes),
+    ok.
+
+demote_ets_tail_loop(Name, Count, Bytes, First, Last, MaxEntries, MaxBytes, MinEntries, Deleted, Freed) ->
+    case Count > MinEntries andalso over_ets_memory_limit(Count, Bytes, #{max_entries => MaxEntries, max_bytes => MaxBytes}) of
+        true ->
+            case ets:first(Name) of
+                '$end_of_table' ->
+                    {Count, Bytes, Deleted, Freed};
+                Key ->
+                    case ets:lookup(Name, Key) of
+                        [{Key, Entry}] ->
+                            EntryBytes = erlang:external_size(Entry),
+                            true = ets:delete(Name, Key),
+                            demote_ets_tail_loop(
+                                Name,
+                                Count - 1,
+                                max(Bytes - EntryBytes, 0),
+                                First,
+                                Last,
+                                MaxEntries,
+                                MaxBytes,
+                                MinEntries,
+                                Deleted + 1,
+                                Freed + EntryBytes
+                            );
+                        [] ->
+                            true = ets:delete(Name, Key),
+                            demote_ets_tail_loop(Name, Count, Bytes, First, Last, MaxEntries, MaxBytes, MinEntries, Deleted, Freed)
+                    end
+            end;
+        false ->
+            {Count, Bytes, Deleted, Freed}
+    end.
+
+over_ets_memory_limit(Count, Bytes, #{max_entries := MaxEntries, max_bytes := MaxBytes}) ->
+    over_limit(Count, MaxEntries) orelse over_limit(Bytes, MaxBytes).
+
+over_limit(_Value, infinity) ->
+    false;
+over_limit(Value, Limit) when is_integer(Value), is_integer(Limit) ->
+    Value > Limit.
+
+ets_memory_usage(Name) ->
+    try ets_memory_usage(Name, ets:first(Name), 0, 0, undefined, undefined) of
+        Usage -> Usage
+    catch
+        error:badarg -> {0, 0, undefined, undefined}
+    end.
+
+ets_memory_usage(_Name, '$end_of_table', Count, Bytes, First, Last) ->
+    {Count, Bytes, First, Last};
+ets_memory_usage(Name, Key, Count, Bytes, First, _Last) ->
+    Next = ets:next(Name, Key),
+    case ets:lookup(Name, Key) of
+        [{Key, Entry}] ->
+            ets_memory_usage(
+                Name,
+                Next,
+                Count + 1,
+                Bytes + erlang:external_size(Entry),
+                choose_first(First, Key),
+                Key
+            );
+        [] ->
+            ets_memory_usage(Name, Next, Count, Bytes, First, Key)
+    end.
+
+record_memory_bytes({_Index, Entry}) ->
+    erlang:external_size(Entry).
+
+ets_first(Name) ->
+    try ets:first(Name) of
+        '$end_of_table' -> undefined;
+        Key -> Key
+    catch
+        error:badarg -> undefined
+    end.
+
+ets_last(Name) ->
+    try ets:last(Name) of
+        '$end_of_table' -> undefined;
+        Key -> Key
+    catch
+        error:badarg -> undefined
+    end.
+
+choose_first(undefined, Value) -> Value;
+choose_first(Value, undefined) -> Value;
+choose_first(A, B) when A =< B -> A;
+choose_first(_A, B) -> B.
+
+choose_last(undefined, Value) -> Value;
+choose_last(Value, undefined) -> Value;
+choose_last(A, B) when A >= B -> A;
+choose_last(_A, B) -> B.
+
+ets_memory_limits() ->
+    MaxEntries = memory_limit_env(waraft_segment_log_max_ets_entries, ?DEFAULT_MAX_ETS_ENTRIES),
+    MaxBytes = memory_limit_env(waraft_segment_log_max_ets_bytes, ?DEFAULT_MAX_ETS_BYTES),
+    MinRaw = non_neg_int_env_value(waraft_segment_log_min_ets_entries, ?DEFAULT_MIN_ETS_ENTRIES),
+    MinEntries =
+        case MaxEntries of
+            infinity -> MinRaw;
+            _ -> min(MinRaw, MaxEntries)
+        end,
+    #{max_entries => MaxEntries, max_bytes => MaxBytes, min_entries => MinEntries}.
+
+memory_limit_env(Key, Default) ->
+    normalize_memory_limit(memory_budget_limit(Key, Default), Default).
+
+non_neg_int_env_value(Key, Default) ->
+    case normalize_memory_limit(memory_budget_limit(Key, Default), Default) of
+        infinity -> Default;
+        Value -> Value
+    end.
+
+memory_budget_limit(Key, Default) ->
+    try 'Elixir.Ferricstore.MemoryBudget':limit(Key, Default) of
+        Value -> Value
+    catch
+        _:_ ->
+            application:get_env(ferricstore, Key, Default)
+    end.
+
+normalize_memory_limit(infinity, _Default) -> infinity;
+normalize_memory_limit(false, _Default) -> infinity;
+normalize_memory_limit(undefined, _Default) -> infinity;
+normalize_memory_limit(Value, _Default) when is_integer(Value), Value >= 0 -> Value;
+normalize_memory_limit(_Other, Default) -> Default.
+
+memory_registry_lookup(Name) ->
+    case ensure_memory_registry() of
+        ok ->
+            case ets:lookup(?MEMORY_REGISTRY, Name) of
+                [{Name, Dir, Count, Bytes, First, Last}] ->
+                    {ok, #{dir => Dir, count => Count, bytes => Bytes, first => First, last => Last}};
+                [] ->
+                    not_found
+            end;
+        {error, _Reason} ->
+            not_found
+    end.
+
+ensure_memory_registry() ->
+    case ets:info(?MEMORY_REGISTRY) of
+        undefined ->
+            try
+                ets:new(?MEMORY_REGISTRY, [
+                    named_table,
+                    public,
+                    set,
+                    {read_concurrency, true},
+                    {write_concurrency, true}
+                ]),
+                ok
+            catch
+                error:badarg ->
+                    case ets:info(?MEMORY_REGISTRY) of
+                        undefined -> {error, memory_registry_unavailable};
+                        _Info -> ok
+                    end
+            end;
+        _Info ->
+            ok
+    end.
+
+emit_ets_demote(_Name, _Dir, 0, _Freed, _Count, _Bytes) ->
+    ok;
+emit_ets_demote(Name, Dir, Deleted, Freed, Count, Bytes) ->
+    try telemetry:execute(
+        [ferricstore, waraft, segment_log, ets_demote],
+        #{count => Deleted, bytes => Freed, ets_entries => Count, ets_bytes => Bytes},
+        #{log_name => Name, dir => unicode:characters_to_binary(filename:absname(Dir))}
+    ) of
+        _ -> ok
+    catch
+        _:_ -> ok
+    end.
 
 ensure_offset_registry() ->
     case ets:info(?OFFSET_REGISTRY) of
@@ -3008,6 +3569,7 @@ emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment) ->
     Duration = erlang:monotonic_time() - StartedAt,
     Metadata0 = #{
         path => unicode:characters_to_binary(Path),
+        kind => segment_append_kind(Path),
         result => segment_append_result(Result),
         new_segment => NewSegment
     },
@@ -3024,6 +3586,14 @@ emit_segment_append(Path, Count, Bytes, StartedAt, Result, NewSegment) ->
         duration => Duration
     },
     emit_telemetry([ferricstore, waraft, segment_log, append], Measurements, Metadata).
+
+segment_append_kind(Path) ->
+    Parts = filename:split(Path),
+    case {lists:member("apply_projection_log", Parts), lists:member("segment_projection_log", Parts)} of
+        {true, _} -> apply_projection;
+        {_, true} -> segment_projection;
+        _ -> raft_log
+    end.
 
 emit_telemetry(Event, Measurements, Metadata) ->
     %% telemetry:execute/3 logs a warning when the telemetry application has not

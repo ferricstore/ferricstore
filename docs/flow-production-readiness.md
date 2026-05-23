@@ -33,8 +33,12 @@ replay-safe lag that grows instead of draining.
 ## Retention And Cleanup
 
 Terminal flows stay in hot indexes for `:flow_terminal_hot_ttl_ms` after LMDB
-flush, then the writer prunes hot terminal/lineage index entries. The Flow state
-record remains durable until normal Flow TTL expiry.
+flush, then the writer prunes hot terminal/lineage index entries. The default is
+`0`, so terminal rows leave hot indexes as soon as the LMDB projection is flushed.
+Terminal history is also cold-only after LMDB projection: it remains queryable
+from LMDB/history storage, but no terminal history rows are kept in the hot Flow
+index by default. The Flow state record remains durable until normal Flow TTL
+expiry.
 
 LMDB terminal and history projections have explicit expire indexes:
 
@@ -89,12 +93,14 @@ when retry exhaustion moves a Flow into `completed`, `failed`, or `cancelled`.
 
 History has two separate caps:
 
-- `history_hot_max_events`: default `1024`, hard max `10000`
+- `history_hot_max_events`: default `1`, hard max `10000`
 - `history_max_events`: default `100000`, hard max `1000000`
 
 The hot cap bounds the recent history kept in memory/indexed for quick reads.
 The total cap bounds durable history growth for one Flow. `history_max_events`
 must be greater than or equal to `history_hot_max_events`.
+Terminal flows override the hot cap to zero after LMDB projection, because
+terminal history is not on the worker hot path.
 
 ## Fairness
 
@@ -161,16 +167,32 @@ existing LMDB lineage indexes. They support `FROM_MS`, `TO_MS`, `REV`, `STATE`,
 and `TERMINAL_ONLY` as read-side filters; no new LMDB rows are written for
 these query shapes.
 
-## Flow Schema Migration
+## Flow Schema And Compact Codec
 
 Before public release, Flow uses one compact current schema:
 
-- Flow record magic: `FSF4`
-- Flow history magic: `FSH1`
-- Flow value magic: `FSV1`
+- Flow record magic: `FSF5`
+- Flow history magic: `FSH2`
+- Flow value magic: `FSV2`
 
 User payload/result/error bytes are raw refs and are not decoded by FerricStore.
 Only Flow metadata is schema-owned by FerricStore.
+
+`FSF5` stores required mutable state fields inline and uses a flag word for
+optional/default fields. Nil values, default counters, default priority,
+missing leases, empty sidecars, and the common `root_flow_id == id` case are not
+written repeatedly. The Elixir codec and Rust NIF codec must stay byte-compatible.
+
+`FSH2` stores per-event history fields only. It intentionally omits immutable
+workflow metadata such as id, type, parent/root, partition, and correlation id.
+User-facing history decode must pass the current/snapshot Flow record as context
+through `Ferricstore.Flow.decode_history_fields/2`; no-context decode is only
+for low-level projection/ref extraction.
+
+Generated payload/result/error refs can be dematerialized from the hot keydir
+after LMDB/history projection confirms the history event. Public Flow value
+reads must go through Flow value helpers so they can resolve hot keydir rows,
+LMDB locators, history-projector files, and WARaft segment locations.
 
 Before public release, old Flow record magic may be rejected cleanly because no
 external user data depends on it yet. After public release, incompatible

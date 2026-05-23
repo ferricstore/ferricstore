@@ -234,6 +234,20 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
   end
 
+  describe "Flow retention cleanup" do
+    test "does not crash if keydir is already gone during shutdown", %{state: state, ets: ets} do
+      :ets.delete(ets)
+
+      assert {_state, {:applied_at, 1, {:ok, %{flows: 0, history: 0, values: 0}}}, _effects} =
+               StateMachine.apply(
+                 %{index: 1, system_time: 1_000},
+                 {:flow_retention_cleanup, "__flow_retention_cleanup__:#{state.shard_index}",
+                  %{now_ms: 1_000, limit: 10}},
+                 state
+               )
+    end
+  end
+
   defp safe_delete_ets(table) do
     :ets.delete(table)
   rescue
@@ -277,22 +291,111 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
   end
 
+  defp flow_history_fields!(state, id, partition_key, event_id) do
+    history_key = Ferricstore.Flow.Keys.stream_entry_key(id, event_id, partition_key)
+
+    case :ets.lookup(state.ets, history_key) do
+      [
+        {^history_key, nil, _expire_at_ms, _lfu, {:flow_history, file_id}, offset, _value_size}
+      ] ->
+        assert {:ok, value} =
+                 Ferricstore.Flow.HistoryProjector.read_value(
+                   state.shard_data_path,
+                   {:flow_history, file_id},
+                   offset
+                 )
+
+        record = flow_record!(state, Ferricstore.Flow.Keys.state_key(id, partition_key))
+        Ferricstore.Flow.decode_history_fields(value, record)
+
+      other ->
+        flunk(
+          "expected projected Flow history for #{inspect(history_key)}, got: #{inspect(other)}"
+        )
+    end
+  end
+
+  defp assert_flow_history_event!(state, id, partition_key, event_id, event) do
+    fields = flow_history_fields!(state, id, partition_key, event_id)
+    assert flow_history_field(fields, "event") == event
+    assert flow_history_field(fields, "id") == id
+  end
+
+  defp flow_history_field([key, value | _rest], key), do: value
+  defp flow_history_field([_key, _value | rest], key), do: flow_history_field(rest, key)
+  defp flow_history_field([], _key), do: nil
+
   defp flow_value!(state, value_key) do
     case :ets.lookup(state.ets, value_key) do
       [{^value_key, nil, _expire_at_ms, _lfu, file_id, offset, _value_size}] ->
-        path =
-          Path.join(
-            state.shard_data_path,
-            "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
-          )
+        flow_value_from_location!(state, value_key, file_id, offset)
 
-        case NIF.v2_pread_at(path, offset) do
-          {:ok, value} when is_binary(value) -> value
-          other -> flunk("expected cold Flow value at #{path}:#{offset}, got: #{inspect(other)}")
+      other ->
+        flow_value_from_lmdb!(state, value_key, other)
+    end
+  end
+
+  defp flow_value_from_location!(state, _value_key, {:flow_history, _file_id} = file_id, offset) do
+    case Ferricstore.Flow.HistoryProjector.read_value(state.shard_data_path, file_id, offset) do
+      {:ok, value} when is_binary(value) ->
+        value
+
+      other ->
+        flunk(
+          "expected projected Flow value at #{inspect(file_id)}:#{offset}, got: #{inspect(other)}"
+        )
+    end
+  end
+
+  defp flow_value_from_location!(state, _value_key, file_id, offset)
+       when is_integer(file_id) and file_id >= 0 do
+    path =
+      Path.join(
+        state.shard_data_path,
+        "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
+      )
+
+    case NIF.v2_pread_at(path, offset) do
+      {:ok, value} when is_binary(value) ->
+        value
+
+      other ->
+        flunk("expected cold Flow value at #{path}:#{offset}, got: #{inspect(other)}")
+    end
+  end
+
+  defp flow_value_from_lmdb!(state, value_key, original_lookup) do
+    path = Ferricstore.Flow.LMDB.path(state.shard_data_path)
+
+    case Ferricstore.Flow.LMDB.get(path, value_key) do
+      {:ok, blob} when is_binary(blob) ->
+        now_ms = System.system_time(:millisecond)
+
+        case Ferricstore.Flow.LMDB.decode_value_locator(blob, now_ms) do
+          {:ok, {file_id, offset, _value_size}} ->
+            flow_value_from_location!(state, value_key, file_id, offset)
+
+          :not_locator ->
+            case Ferricstore.Flow.LMDB.decode_value(blob, now_ms) do
+              {:ok, value} when is_binary(value) ->
+                value
+
+              other ->
+                flunk(
+                  "expected LMDB Flow value for #{inspect(value_key)}, got decoded #{inspect(other)}"
+                )
+            end
+
+          other ->
+            flunk(
+              "expected LMDB Flow value locator for #{inspect(value_key)}, got #{inspect(other)}"
+            )
         end
 
       other ->
-        flunk("expected cold Flow value for #{inspect(value_key)}, got: #{inspect(other)}")
+        flunk(
+          "expected cold or projected Flow value for #{inspect(value_key)}, got ETS #{inspect(original_lookup)} and LMDB #{inspect(other)}"
+        )
     end
   end
 
@@ -459,7 +562,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
              ) == {:ok, 2_000.0}
     end
 
-    test "create_many stages all Flow Bitcask writes into one append batch", %{
+    test "create_many stages Flow state writes into one append batch and projects history", %{
       state: state,
       shard_index: shard_index
     } do
@@ -515,9 +618,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
                         %{shard_index: ^shard_index, status: :ok}},
                        500
 
-        assert measurements.batch_size == 6
+        assert measurements.batch_size == 3
         assert measurements.delete_count == 0
         assert measurements.batch_bytes > 0
+
+        Enum.each(records, fn %{id: id, partition_key: partition_key} ->
+          assert_flow_history_event!(state, id, partition_key, "1000-1", "created")
+        end)
 
         refute_receive {:flow_bitcask_append, _measurements, _metadata}, 100
       after
@@ -525,7 +632,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
-    test "Ra-batched Flow commands share append batch but keep per-command semantic results", %{
+    test "Ra-batched Flow commands share state append batch but keep semantic results", %{
       state: state,
       shard_index: shard_index
     } do
@@ -602,9 +709,12 @@ defmodule Ferricstore.Raft.StateMachineTest do
                         %{shard_index: ^shard_index, status: :ok}},
                        500
 
-        assert measurements.batch_size == 4
+        assert measurements.batch_size == 2
         assert measurements.delete_count == 0
         assert measurements.batch_bytes > 0
+
+        assert_flow_history_event!(state, "flow-ra-batch-a", partition_key, "1000-1", "created")
+        assert_flow_history_event!(state, "flow-ra-batch-b", partition_key, "1000-1", "created")
 
         refute_receive {:flow_bitcask_append, _measurements, _metadata}, 100
       after
@@ -6078,6 +6188,52 @@ defmodule Ferricstore.Raft.StateMachineTest do
              ])
 
     assert reason != %CaseClauseError{}
+  end
+
+  test "standalone rollback tolerates keydir table disappearing during shutdown", %{
+    state: state,
+    ets: ets
+  } do
+    old_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, _batch ->
+      :ets.delete(ets)
+      {:error, :shutdown_keydir_removed}
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, old_hook) end)
+
+    {_new_state, result} =
+      StateMachine.apply_standalone_command({:put, "late_shutdown_key", "value", 0}, state)
+
+    assert {:error, {:bitcask_append_failed, :shutdown_keydir_removed}} = result
+    assert :undefined == :ets.whereis(ets)
+  end
+
+  test "Flow read during apply tolerates keydir table disappearing during shutdown", %{
+    state: state,
+    ets: ets
+  } do
+    setup_flow_indexes(state)
+    :ets.delete(ets)
+
+    state_key = Ferricstore.Flow.Keys.state_key("late-flow", "tenant-shutdown")
+
+    {_state, result} =
+      StateMachine.apply(
+        %{system_time: 2_000},
+        {:flow_transition, state_key,
+         %{
+           id: "late-flow",
+           from_state: "running",
+           to_state: "waiting",
+           partition_key: "tenant-shutdown"
+         }},
+        state
+      )
+
+    assert {:error, "ERR flow not found"} = result
+    assert :undefined == :ets.whereis(ets)
   end
 
   def relay_compound_put_append_telemetry(_event, measurements, metadata, test_pid) do

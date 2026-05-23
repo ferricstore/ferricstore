@@ -62,7 +62,9 @@ defmodule FlowPythonBackendProfile do
       IO.puts("\n=== backend=#{backend} status=#{status} elapsed_ms=#{elapsed_ms} ===")
       IO.write(output)
       print_profile(table)
+      maybe_flush_flow_projection()
       maybe_print_pending_keydir()
+      maybe_print_storage_breakdown()
     after
       :telemetry.detach(handler_id)
       stop_started_apps()
@@ -94,6 +96,27 @@ defmodule FlowPythonBackendProfile do
     Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
     IO.puts("flow_lmdb_enabled=#{flow_lmdb_enabled?} flow_lmdb_mode=#{flow_lmdb_mode}")
 
+    put_optional_limit_env(
+      [
+        "FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES",
+        "FERRICSTORE_FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES"
+      ],
+      :flow_history_projector_max_pending_entries
+    )
+
+    put_optional_limit_env(
+      [
+        "FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES",
+        "FERRICSTORE_FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES"
+      ],
+      :flow_lmdb_writer_max_mailbox_messages
+    )
+
+    put_optional_limit_env(
+      ["FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS", "FERRICSTORE_FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS"],
+      :flow_lmdb_writer_max_enqueue_ops
+    )
+
     Application.delete_env(:ferricstore, :waraft_log_module)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
@@ -108,6 +131,21 @@ defmodule FlowPythonBackendProfile do
     put_optional_int_env("WARAFT_APPLY_LOG_BATCH_SIZE", :waraft_apply_log_batch_size)
     put_optional_int_env("WARAFT_APPLY_BATCH_MAX_BYTES", :waraft_apply_batch_max_bytes)
     put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES"],
+      :waraft_segment_log_max_ets_bytes
+    )
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES"],
+      :waraft_segment_log_max_ets_entries
+    )
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES"],
+      :waraft_segment_log_min_ets_entries
+    )
 
     put_optional_int_env(
       "WARAFT_SEGMENT_PREALLOCATE_BYTES",
@@ -233,7 +271,9 @@ defmodule FlowPythonBackendProfile do
     do: {Map.get(metadata, :prefix, :unknown), Map.get(metadata, :result, :unknown)}
 
   defp event_group([:ferricstore, :waraft, :segment_log, :append], metadata),
-    do: if(Map.get(metadata, :new_segment), do: :new_segment, else: :same_segment)
+    do:
+      {Map.get(metadata, :kind, :unknown),
+       if(Map.get(metadata, :new_segment), do: :new_segment, else: :same_segment)}
 
   defp event_group(_event, _metadata), do: :all
 
@@ -320,6 +360,143 @@ defmodule FlowPythonBackendProfile do
     end
   end
 
+  defp maybe_print_storage_breakdown do
+    if System.get_env("INSPECT_STORAGE") in ["1", "true", "TRUE", "yes", "YES"] do
+      print_apply_projection_cache()
+      print_keydir_breakdown()
+      print_flow_index_breakdown()
+    end
+  rescue
+    error -> IO.puts("storage_breakdown_failed=#{inspect(error)}")
+  end
+
+  defp print_apply_projection_cache do
+    table = :ferricstore_waraft_apply_projection_cache
+
+    case :ets.whereis(table) do
+      :undefined ->
+        IO.puts("apply_projection_cache: missing")
+
+      tid ->
+        words = :ets.info(tid, :memory) || 0
+        size = :ets.info(tid, :size) || 0
+        bytes = words * :erlang.system_info(:wordsize)
+
+        IO.puts("apply_projection_cache: rows=#{size} ets_bytes=#{bytes}")
+    end
+  end
+
+  defp maybe_flush_flow_projection do
+    if System.get_env("INSPECT_FLUSH") in ["1", "true", "TRUE", "yes", "YES"] do
+      ctx = FerricStore.Instance.get(:default)
+      timeout = int_env("INSPECT_FLUSH_TIMEOUT_MS", 30_000)
+
+      IO.puts(
+        "inspect_flush_lmdb=#{inspect(Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, timeout))}"
+      )
+
+      history_result =
+        for shard <- 0..(ctx.shard_count - 1), reduce: :ok do
+          acc ->
+            case Ferricstore.Flow.HistoryProjector.flush(ctx, shard, timeout) do
+              :ok -> acc
+              {:error, _reason} = error -> error
+            end
+        end
+
+      IO.puts("inspect_flush_history=#{inspect(history_result)}")
+    end
+  rescue
+    error -> IO.puts("inspect_flush_failed=#{inspect(error)}")
+  end
+
+  defp print_keydir_breakdown do
+    ctx = FerricStore.Instance.get(:default)
+    IO.puts("keydir_breakdown:")
+
+    totals =
+      for shard <- 0..(ctx.shard_count - 1),
+          reduce: %{rows: 0, hot: 0, hot_bytes: 0, nils: 0, kinds: %{}} do
+        acc ->
+          table = elem(ctx.keydir_refs, shard)
+
+          {rows, hot, hot_bytes, nils, kinds} =
+            :ets.foldl(
+              fn
+                {key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size},
+                {rows, hot, bytes, nils, kinds}
+                when is_binary(value) ->
+                  {rows + 1, hot + 1, bytes + byte_size(value), nils, count_key_kind(kinds, key)}
+
+                {key, nil, _expire_at_ms, _lfu, _file_id, _offset, _value_size},
+                {rows, hot, bytes, nils, kinds} ->
+                  {rows + 1, hot, bytes, nils + 1, count_key_kind(kinds, key)}
+
+                _row, {rows, hot, bytes, nils, kinds} ->
+                  {rows + 1, hot, bytes, nils, kinds}
+              end,
+              {0, 0, 0, 0, %{}},
+              table
+            )
+
+          IO.puts(
+            "  shard=#{shard} rows=#{rows} hot=#{hot} hot_bytes=#{hot_bytes} nil=#{nils} kinds=#{inspect(kinds)}"
+          )
+
+          %{
+            rows: acc.rows + rows,
+            hot: acc.hot + hot,
+            hot_bytes: acc.hot_bytes + hot_bytes,
+            nils: acc.nils + nils,
+            kinds: merge_counts(acc.kinds, kinds)
+          }
+      end
+
+    IO.puts(
+      "  total rows=#{totals.rows} hot=#{totals.hot} hot_bytes=#{totals.hot_bytes} nil=#{totals.nils} kinds=#{inspect(totals.kinds)}"
+    )
+  end
+
+  defp count_key_kind(kinds, key), do: Map.update(kinds, key_kind(key), 1, &(&1 + 1))
+
+  defp key_kind("X:f:" <> _rest), do: :flow_history
+
+  defp key_kind("f:" <> rest) when is_binary(rest) do
+    cond do
+      String.contains?(rest, "}:s:") -> :flow_state
+      String.contains?(rest, "}:v:") -> :flow_value
+      String.contains?(rest, "}:policy:") -> :flow_policy
+      true -> :flow_other
+    end
+  end
+
+  defp key_kind(_key), do: :other
+
+  defp merge_counts(left, right) do
+    Enum.reduce(right, left, fn {key, value}, acc ->
+      Map.update(acc, key, value, &(&1 + value))
+    end)
+  end
+
+  defp print_flow_index_breakdown do
+    ctx = FerricStore.Instance.get(:default)
+    IO.puts("flow_index_breakdown:")
+
+    for shard <- 0..(ctx.shard_count - 1) do
+      {index, lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard)
+      index_size = ets_size(index)
+      lookup_size = ets_size(lookup)
+      IO.puts("  shard=#{shard} index=#{index_size} lookup=#{lookup_size}")
+    end
+  end
+
+  defp ets_size(table) do
+    case :ets.whereis(table) do
+      :undefined -> 0
+      tid -> :ets.info(tid, :size) || 0
+    end
+  end
+
   defp lookup(table, key) do
     case :ets.lookup(table, key) do
       [{^key, value}] -> value
@@ -370,6 +547,28 @@ defmodule FlowPythonBackendProfile do
     case System.get_env(env_name) do
       nil -> :ok
       value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
+  defp put_optional_limit_env(env_names, app_key) when is_list(env_names) do
+    case Enum.find_value(env_names, fn env_name ->
+           case System.get_env(env_name) do
+             nil -> nil
+             value -> value
+           end
+         end) do
+      nil -> :ok
+      value -> Application.put_env(:ferricstore, app_key, parse_limit_env(value))
+    end
+  end
+
+  defp parse_limit_env(value) do
+    case String.downcase(String.trim(value)) do
+      value when value in ["", "false", "off", "infinity", "inf", "unlimited"] ->
+        :infinity
+
+      value ->
+        String.to_integer(value)
     end
   end
 

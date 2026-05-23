@@ -422,7 +422,7 @@ defmodule Ferricstore.FlowTest do
     normal_record = Map.delete(record, :rewound_to_event_id)
     term_record = :erlang.term_to_binary(record)
 
-    assert "FSF4" <> _ = compact
+    assert "FSF5" <> _ = compact
     assert Ferricstore.Flow.decode_record(compact) == record
 
     assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(normal_record)) ==
@@ -571,9 +571,9 @@ defmodule Ferricstore.FlowTest do
              })
              |> Ferricstore.Flow.encode_history_snapshot()
 
-    assert "FSH1" <> _ = compact
+    assert "FSH2" <> _ = compact
 
-    assert Ferricstore.Flow.decode_history_fields(compact) ==
+    assert Ferricstore.Flow.decode_history_fields(compact, record) ==
              fields ++
                [
                  "retry_decision",
@@ -6699,11 +6699,11 @@ defmodule Ferricstore.FlowTest do
     shard = shard_for(history_key)
     {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 1
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
 
     assert Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 2, false)
            |> length() ==
-             1
+             0
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
   end
@@ -7021,22 +7021,17 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, hot_events} = FerricStore.flow_history(id, count: 10, include_cold: false)
     hot_event_ids = Enum.map(hot_events, fn {event_id, _fields} -> event_id end)
 
-    assert Enum.map(hot_events, fn {_id, fields} -> fields["event"] end) == [
-             "claimed",
-             "completed"
-           ]
-
+    assert hot_events == []
     refute created_event_id in hot_event_ids
 
     history_key = Ferricstore.Flow.Keys.history_key(id)
     shard = shard_for(history_key)
     {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 2
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
 
     assert Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 10, false)
-           |> Enum.map(&elem(&1, 0)) ==
-             hot_event_ids
+           |> Enum.map(&elem(&1, 0)) == []
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
 
@@ -7102,7 +7097,7 @@ defmodule Ferricstore.FlowTest do
     shard = shard_for(history_key)
     {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 5
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
     assert {:ok, nil} = FerricStore.get(history_entry_key)
   end
 
@@ -7201,8 +7196,7 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_200
              )
 
-    assert {:ok, events} = FerricStore.flow_history(id, count: 10, include_cold: false)
-    assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
+    assert {:ok, []} = FerricStore.flow_history(id, count: 10, include_cold: false)
   end
 
   test "flow history default hot max keeps only the latest event hot" do

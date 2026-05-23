@@ -88,8 +88,8 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert state_key == FlowKeys.state_key("flow-1", partition_key)
 
     assert entry ==
-             {"flow-1", from_due_key, 20.0, to_due_key, 75.0, from_state_key, 11.0,
-              to_state_key, 25.0, inflight_key, worker_key, 75.0}
+             {"flow-1", from_due_key, 20.0, to_due_key, 75.0, from_state_key, 11.0, to_state_key,
+              25.0, inflight_key, worker_key, 75.0}
   end
 
   test "native claim planner reports stale missing records and skips state mismatches" do
@@ -230,6 +230,18 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
 
     assert [{"flow-2", 4.0}] =
              OrderedIndex.range_slice(index, "worker:a", :neg_inf, :inf, false, 0, 10)
+  end
+
+  test "delete_members removes zero-count keys from lookup table", %{
+    index: index,
+    lookup: lookup
+  } do
+    assert :ok = OrderedIndex.put_members(index, lookup, "worker:empty", [{"flow-1", 3}])
+    assert :ok = OrderedIndex.delete_members(index, lookup, "worker:empty", ["flow-1"])
+
+    assert 0 = OrderedIndex.count_all(lookup, "worker:empty")
+    assert [] = :ets.lookup(lookup, {:count, "worker:empty"})
+    assert [] = OrderedIndex.count_keys(lookup)
   end
 
   test "due_count_keys returns only positive due keys", %{
@@ -430,8 +442,8 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     native = NativeOrderedIndex.new()
 
     claim_entry =
-      {"flow-2", "due:queued", 20.0, "due:running", 60.0, "state:queued", 21.0,
-       "state:running", 61.0, "inflight", "worker:b", 70.0}
+      {"flow-2", "due:queued", 20.0, "due:running", 60.0, "state:queued", 21.0, "state:running",
+       61.0, "inflight", "worker:b", 70.0}
 
     assert :ok =
              NativeOrderedIndex.apply_batch(native, [

@@ -55,6 +55,37 @@ defmodule Ferricstore.Flow.LMDB do
     if Ferricstore.FS.dir?(path), do: NIF.lmdb_get(path, key, map_size()), else: :not_found
   end
 
+  def encode_value_locator(expire_at_ms, file_id, offset, value_size) do
+    :erlang.term_to_binary({:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size})
+  end
+
+  def decode_value_locator(blob, now_ms) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      {:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size}
+      when is_integer(expire_at_ms) and expire_at_ms > 0 ->
+        if expire_at_ms <= now_ms do
+          :expired
+        else
+          decode_live_value_locator(file_id, offset, value_size)
+        end
+
+      {:flow_value_locator, 1, _expire_at_ms, file_id, offset, value_size} ->
+        decode_live_value_locator(file_id, offset, value_size)
+
+      _other ->
+        :not_locator
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp decode_live_value_locator(file_id, offset, value_size)
+       when is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 do
+    {:ok, {file_id, offset, value_size}}
+  end
+
+  defp decode_live_value_locator(_file_id, _offset, _value_size), do: :error
+
   def get_many(_path, []), do: {:ok, []}
 
   def get_many(path, keys) when is_binary(path) and is_list(keys) do
@@ -581,18 +612,10 @@ defmodule Ferricstore.Flow.LMDB do
 
   def history_compound_entries(path, history_key, limit)
       when is_binary(path) and is_binary(history_key) and is_integer(limit) and limit > 0 do
-    with {:ok, entries} <- prefix_entries(path, history_index_prefix(history_key), limit) do
+    with {:ok, decoded} <- history_compound_location_entries(path, history_key, limit) do
       decoded =
-        entries
-        |> Enum.flat_map(fn {_history_index_key, value} ->
-          case decode_history_index_value(value) do
-            {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
-              [{compound_key, event_id}]
-
-            :error ->
-              []
-          end
-        end)
+        decoded
+        |> Enum.map(fn {compound_key, event_id, _value} -> {compound_key, event_id} end)
         |> Enum.uniq()
 
       {:ok, decoded}
@@ -600,6 +623,28 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def history_compound_entries(_path, _history_key, _limit), do: {:ok, []}
+
+  def history_compound_location_entries(path, history_key, limit)
+      when is_binary(path) and is_binary(history_key) and is_integer(limit) and limit > 0 do
+    with {:ok, entries} <- prefix_entries(path, history_index_prefix(history_key), limit) do
+      decoded =
+        entries
+        |> Enum.flat_map(fn {_history_index_key, value} ->
+          case decode_history_index_value(value) do
+            {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
+              [{compound_key, event_id, value}]
+
+            :error ->
+              []
+          end
+        end)
+        |> Enum.uniq_by(fn {compound_key, event_id, _value} -> {compound_key, event_id} end)
+
+      {:ok, decoded}
+    end
+  end
+
+  def history_compound_location_entries(_path, _history_key, _limit), do: {:ok, []}
 
   def decode_terminal_index_value(blob) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do

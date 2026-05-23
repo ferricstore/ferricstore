@@ -340,7 +340,12 @@ defmodule Ferricstore.Flow.OrderedIndex do
   defp increment_count(_lookup_table, _key, 0), do: :ok
 
   defp increment_count(lookup_table, key, delta) do
-    :ets.update_counter(lookup_table, {:count, key}, {2, delta}, {{:count, key}, 0})
+    count = :ets.update_counter(lookup_table, {:count, key}, {2, delta}, {{:count, key}, 0})
+
+    if count <= 0 do
+      :ets.delete(lookup_table, {:count, key})
+    end
+
     :ok
   end
 

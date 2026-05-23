@@ -20,6 +20,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
   @default_lagged_flush_chunk_pause_ms 1
   @default_source_pending_retries 100
   @default_source_pending_sleep_ms 1
+  @default_max_mailbox_messages 50_000
+  @default_max_enqueue_ops 100_000
   @terminal_states ["completed", "failed", "cancelled"]
 
   def start_link(opts) do
@@ -50,12 +52,20 @@ defmodule Ferricstore.Flow.LMDBWriter do
         :ok
 
       is_pid(pid = Process.whereis(name(instance_name, shard_index))) ->
-        try do
-          GenServer.cast(pid, {:enqueue, ops, after_flush})
-          :ok
-        catch
-          :exit, reason ->
-            writer_unavailable(:enqueue, instance_name, shard_index, reason, length(ops))
+        op_count = length(ops)
+
+        case enqueue_guard(pid, op_count) do
+          :ok ->
+            try do
+              GenServer.cast(pid, {:enqueue, ops, after_flush})
+              :ok
+            catch
+              :exit, reason ->
+                writer_unavailable(:enqueue, instance_name, shard_index, reason, op_count)
+            end
+
+          {:error, reason} ->
+            writer_unavailable(:enqueue, instance_name, shard_index, reason, op_count)
         end
 
       true ->
@@ -337,6 +347,40 @@ defmodule Ferricstore.Flow.LMDBWriter do
     case Ferricstore.Flow.LMDB.mode() do
       :lagged -> @default_lagged_flush_chunk_pause_ms
       _ -> 0
+    end
+  end
+
+  defp enqueue_guard(pid, op_count) do
+    with :ok <- enqueue_ops_capacity(op_count) do
+      enqueue_mailbox_capacity(pid)
+    end
+  end
+
+  defp enqueue_ops_capacity(op_count) do
+    case Ferricstore.MemoryBudget.limit(
+           :flow_lmdb_writer_max_enqueue_ops,
+           @default_max_enqueue_ops
+         ) do
+      :infinity -> :ok
+      max_ops when is_integer(max_ops) and op_count <= max_ops -> :ok
+      _max_ops -> {:error, :queue_full}
+    end
+  end
+
+  defp enqueue_mailbox_capacity(pid) do
+    case Ferricstore.MemoryBudget.limit(
+           :flow_lmdb_writer_max_mailbox_messages,
+           @default_max_mailbox_messages
+         ) do
+      :infinity ->
+        :ok
+
+      max_messages when is_integer(max_messages) ->
+        case Process.info(pid, :message_queue_len) do
+          {:message_queue_len, len} when len < max_messages -> :ok
+          {:message_queue_len, _len} -> {:error, :queue_full}
+          nil -> {:error, :writer_not_started}
+        end
     end
   end
 
@@ -1443,6 +1487,34 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
+  defp apply_after_flush(
+         {:prune_terminal_flow_v3, data_dir, shard_index, ets, zset_index, zset_lookup,
+          flow_index, flow_lookup, state_key, type, terminal_state, partition_key, parent_flow_id,
+          root_flow_id, correlation_id, id, version}
+       ) do
+    state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
+
+    metadata_index_keys =
+      terminal_project_metadata_index_keys(
+        id,
+        partition_key,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id
+      )
+
+    prune_terminal_state_key(data_dir, shard_index, ets, state_key, version)
+
+    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
+
+    Enum.each(metadata_index_keys, fn index_key ->
+      safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
+    end)
+
+    :ok
+  end
+
   defp apply_after_flush({:defer_after_flush, delay_ms, action}) do
     delay_ms = normalize_delay_ms(delay_ms)
 
@@ -1544,6 +1616,41 @@ defmodule Ferricstore.Flow.LMDBWriter do
   rescue
     ArgumentError -> :ok
   end
+
+  defp prune_terminal_state_key(data_dir, shard_index, ets, state_key, version) do
+    case :ets.lookup(ets, state_key) do
+      [
+        {^state_key, nil, _expire_at_ms, {:flow_state_version, ^version, _lfu}, _fid, _off,
+         _vsize} = row
+      ] ->
+        delete_apply_projection_cache_for_row(data_dir, shard_index, row)
+        :ets.delete(ets, state_key)
+
+      _ ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp delete_apply_projection_cache_for_row(
+         data_dir,
+         shard_index,
+         {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+          _value_size}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_integer(index) and index > 0 do
+    Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(data_dir, shard_index, [
+      {index, key}
+    ])
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp delete_apply_projection_cache_for_row(_data_dir, _shard_index, _row), do: :ok
 
   defp poke_release_cursor(state, index) do
     # This poke is only for legacy Ra log release. WARaft persists/replays from

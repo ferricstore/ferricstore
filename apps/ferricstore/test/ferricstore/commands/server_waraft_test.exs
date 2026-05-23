@@ -67,6 +67,10 @@ defmodule Ferricstore.Commands.ServerWARaftTest do
     info = Server.handle("INFO", ["raft"], nil)
 
     assert String.contains?(info, "shard_0_waraft_inflight_commit_bytes:0")
+    assert String.contains?(info, "shard_0_waraft_segment_log_ets_entries:")
+    assert String.contains?(info, "shard_0_waraft_segment_log_max_ets_entries:")
+    assert String.contains?(info, "shard_0_waraft_segment_log_ets_bytes:")
+    assert String.contains?(info, "shard_0_waraft_segment_log_max_ets_bytes:")
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

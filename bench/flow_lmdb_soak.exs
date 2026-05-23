@@ -384,6 +384,27 @@ defmodule FlowLMDBSoak do
       int_env("FLOW_LMDB_MAX_CONCURRENT_FLUSHES", 1)
     )
 
+    put_optional_limit_env(
+      [
+        "FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES",
+        "FERRICSTORE_FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES"
+      ],
+      :flow_history_projector_max_pending_entries
+    )
+
+    put_optional_limit_env(
+      [
+        "FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES",
+        "FERRICSTORE_FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES"
+      ],
+      :flow_lmdb_writer_max_mailbox_messages
+    )
+
+    put_optional_limit_env(
+      ["FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS", "FERRICSTORE_FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS"],
+      :flow_lmdb_writer_max_enqueue_ops
+    )
+
     Application.delete_env(:ferricstore, :waraft_log_module)
     put_optional_bool_env("WARAFT_ASYNC_LOG_APPEND", :waraft_async_log_append)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
@@ -391,6 +412,21 @@ defmodule FlowLMDBSoak do
     put_optional_int_env("WARAFT_APPLY_LOG_BATCH_SIZE", :waraft_apply_log_batch_size)
     put_optional_int_env("WARAFT_APPLY_BATCH_MAX_BYTES", :waraft_apply_batch_max_bytes)
     put_optional_int_env("WARAFT_SEGMENT_SYNC_DELAY_US", :waraft_segment_log_sync_delay_us)
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES"],
+      :waraft_segment_log_max_ets_bytes
+    )
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES"],
+      :waraft_segment_log_max_ets_entries
+    )
+
+    put_optional_limit_env(
+      ["WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES", "FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES"],
+      :waraft_segment_log_min_ets_entries
+    )
 
     put_optional_int_env(
       "WARAFT_SEGMENT_PREALLOCATE_BYTES",
@@ -502,6 +538,28 @@ defmodule FlowLMDBSoak do
     case System.get_env(env_name) do
       nil -> :ok
       value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
+  defp put_optional_limit_env(env_names, app_key) when is_list(env_names) do
+    case Enum.find_value(env_names, fn env_name ->
+           case System.get_env(env_name) do
+             nil -> nil
+             value -> value
+           end
+         end) do
+      nil -> :ok
+      value -> Application.put_env(:ferricstore, app_key, parse_limit_env(value))
+    end
+  end
+
+  defp parse_limit_env(value) do
+    case String.downcase(String.trim(value)) do
+      value when value in ["", "false", "off", "infinity", "inf", "unlimited"] ->
+        :infinity
+
+      value ->
+        String.to_integer(value)
     end
   end
 
