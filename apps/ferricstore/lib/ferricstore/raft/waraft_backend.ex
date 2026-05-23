@@ -2432,7 +2432,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
           opts,
           :async_log_append,
           :waraft_async_log_append,
-          false
+          true
         )
     }
   end

@@ -56,7 +56,7 @@ defmodule FlowStateLMDBSoak do
       "flow_state_lmdb_soak_prepare backend=#{backend} duration_s=#{duration_s} " <>
         "target_ops_s=#{target_ops_s} payload_bytes=#{payload_bytes} normal_flows=#{normal_flows} " <>
         "normal_steps=#{normal_steps} long_flows=#{long_flows} long_steps=#{long_steps} " <>
-        "flow_async_history=#{env("FLOW_ASYNC_HISTORY", "true")} " <>
+        "flow_async_history=true " <>
         "estimated_raw_payload_gb=#{Float.round(estimate_bytes / 1_073_741_824, 2)} " <>
         "free_mb=#{free_mb_before} min_free_mb=#{min_free_mb}"
     )
@@ -1015,9 +1015,7 @@ defmodule FlowStateLMDBSoak do
     Application.put_env(:ferricstore, :protected_mode, false)
     Application.put_env(:ferricstore, :max_memory_bytes, int_env("FERRICSTORE_MAX_MEMORY", 0))
     Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
-    Application.put_env(:ferricstore, :flow_lmdb_enabled, true)
-    Application.put_env(:ferricstore, :flow_lmdb_mode, env("FLOW_LMDB_MODE", "lagged"))
-    Application.put_env(:ferricstore, :flow_async_history, bool_env("FLOW_ASYNC_HISTORY", true))
+    Application.put_env(:ferricstore, :flow_async_history, true)
 
     Application.put_env(
       :ferricstore,

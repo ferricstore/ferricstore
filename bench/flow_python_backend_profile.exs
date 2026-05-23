@@ -85,16 +85,7 @@ defmodule FlowPythonBackendProfile do
     Application.put_env(:ferricstore, :protected_mode, false)
     Application.put_env(:ferricstore, :max_memory_bytes, 100_000_000_000)
     Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
-    flow_lmdb_enabled? = true
-
-    flow_lmdb_mode =
-      System.get_env("FERRICSTORE_FLOW_LMDB_MODE") ||
-        System.get_env("FLOW_LMDB_MODE") ||
-        "lagged"
-
-    Application.put_env(:ferricstore, :flow_lmdb_enabled, flow_lmdb_enabled?)
-    Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
-    IO.puts("flow_lmdb_enabled=#{flow_lmdb_enabled?} flow_lmdb_mode=#{flow_lmdb_mode}")
+    IO.puts("flow_lmdb_projection=lagged")
 
     put_optional_limit_env(
       [

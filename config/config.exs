@@ -21,6 +21,13 @@ config :ferricstore, :data_dir, "data"
 # Number of shards (0 = auto-detect from CPU cores)
 config :ferricstore, :shard_count, 0
 
+# Production durability path. WARaft is the default engine for normal runs; the
+# old Ra backend stays selectable only for explicit comparison tests/benchmarks.
+config :ferricstore,
+  raft_backend: :waraft,
+  waraft_async_log_append: true,
+  flow_async_history: true
+
 # LFU decay: minutes per decay step (0 = no decay). Matches Redis lfu-decay-time.
 config :ferricstore, :lfu_decay_time, 1
 # LFU log factor: controls probabilistic increment curve. Matches Redis lfu-log-factor.

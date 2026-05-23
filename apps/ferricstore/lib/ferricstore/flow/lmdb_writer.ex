@@ -11,10 +11,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   require Logger
 
-  @default_flush_interval_ms 100
   @default_lagged_flush_interval_ms 1_000
   @default_lagged_flush_jitter_ms 250
-  @default_max_ops 10_000
   @default_lagged_max_ops 25_000
   @default_flush_chunk_ops 10_000
   @default_lagged_flush_chunk_pause_ms 1
@@ -323,31 +321,19 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp default_flush_interval_ms do
-    case Ferricstore.Flow.LMDB.mode() do
-      :lagged -> @default_lagged_flush_interval_ms
-      _ -> @default_flush_interval_ms
-    end
+    @default_lagged_flush_interval_ms
   end
 
   defp default_max_ops do
-    case Ferricstore.Flow.LMDB.mode() do
-      :lagged -> @default_lagged_max_ops
-      _ -> @default_max_ops
-    end
+    @default_lagged_max_ops
   end
 
   defp default_flush_jitter_ms do
-    case Ferricstore.Flow.LMDB.mode() do
-      :lagged -> @default_lagged_flush_jitter_ms
-      _ -> 0
-    end
+    @default_lagged_flush_jitter_ms
   end
 
   defp default_flush_chunk_pause_ms do
-    case Ferricstore.Flow.LMDB.mode() do
-      :lagged -> @default_lagged_flush_chunk_pause_ms
-      _ -> 0
-    end
+    @default_lagged_flush_chunk_pause_ms
   end
 
   defp enqueue_guard(pid, op_count) do

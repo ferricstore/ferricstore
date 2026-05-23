@@ -28,9 +28,6 @@ transition_many_batch =
 terminal_many_batch =
   System.get_env("FLOW_100K_TERMINAL_MANY_BATCH", "100") |> String.to_integer()
 
-flow_lmdb_enabled = true
-flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
-
 claim_limits =
   System.get_env("FLOW_100K_CLAIM_LIMITS", "10,100")
   |> String.split(",", trim: true)
@@ -46,7 +43,6 @@ Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
-Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 
@@ -60,8 +56,6 @@ defmodule Flow100kStateBench do
         create_many_batch,
         transition_many_batch,
         terminal_many_batch,
-        flow_lmdb_enabled,
-        flow_lmdb_mode,
         claim_limits,
         bench_data_dir
       ) do
@@ -77,7 +71,7 @@ defmodule Flow100kStateBench do
     )
 
     IO.puts(
-      "seed_concurrency=#{seed_concurrency} create_many_batch=#{create_many_batch} transition_many_batch=#{transition_many_batch} terminal_many_batch=#{terminal_many_batch} flow_lmdb=#{flow_lmdb_enabled} flow_lmdb_mode=#{flow_lmdb_mode}"
+      "seed_concurrency=#{seed_concurrency} create_many_batch=#{create_many_batch} transition_many_batch=#{transition_many_batch} terminal_many_batch=#{terminal_many_batch} flow_lmdb_projection=lagged"
     )
 
     memory_before = :erlang.memory(:total)
@@ -174,8 +168,6 @@ defmodule Flow100kStateBench do
       create_many_batch: create_many_batch,
       transition_many_batch: transition_many_batch,
       terminal_many_batch: terminal_many_batch,
-      flow_lmdb_enabled: flow_lmdb_enabled,
-      flow_lmdb_mode: flow_lmdb_mode,
       claim_limits: claim_limits,
       memory_before: memory_before,
       memory_after_seed: memory_after_seed,
@@ -818,8 +810,7 @@ defmodule Flow100kStateBench do
       "- create_many_batch: #{config.create_many_batch}",
       "- transition_many_batch: #{config.transition_many_batch}",
       "- terminal_many_batch: #{config.terminal_many_batch}",
-      "- flow_lmdb_enabled: #{config.flow_lmdb_enabled}",
-      "- flow_lmdb_mode: #{config.flow_lmdb_mode}",
+      "- flow_lmdb_projection: lagged",
       "- claim_limits: #{Enum.join(config.claim_limits, ",")}",
       "- beam_memory_before: #{config.memory_before}",
       "- beam_memory_after_seed: #{config.memory_after_seed}",
@@ -872,8 +863,6 @@ try do
     create_many_batch,
     transition_many_batch,
     terminal_many_batch,
-    flow_lmdb_enabled,
-    flow_lmdb_mode,
     claim_limits,
     bench_data_dir
   )

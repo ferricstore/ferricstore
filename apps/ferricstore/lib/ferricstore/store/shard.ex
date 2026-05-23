@@ -244,20 +244,16 @@ defmodule Ferricstore.Store.Shard do
       end)
 
       profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
-        if Ferricstore.Flow.LMDB.mirror?() do
-          Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
-            path,
-            keydir,
-            index,
-            ctx,
-            zset_score_index,
-            zset_score_lookup,
-            flow_index,
-            flow_lookup
-          )
-        else
-          :ok
-        end
+        Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+          path,
+          keydir,
+          index,
+          ctx,
+          zset_score_index,
+          zset_score_lookup,
+          flow_index,
+          flow_lookup
+        )
       end)
 
       profile_startup_phase(index, :flow_native_index_rebuild, fn ->
@@ -1644,10 +1640,10 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp flow_async_history_enabled? do
-    case Application.get_env(:ferricstore, :flow_async_history) do
+    case Application.get_env(:ferricstore, :flow_async_history, true) do
       value when value in [true, "1", "true"] -> true
       value when value in [false, "0", "false"] -> false
-      _ -> System.get_env("FLOW_ASYNC_HISTORY", "true") in ["1", "true"]
+      _ -> true
     end
   end
 

@@ -8,17 +8,11 @@ defmodule Ferricstore.Flow.LMDB do
 
   def enabled?, do: true
 
-  def mirror? do
-    mode() in [:mirror, :lagged]
-  end
+  # Historical name kept to avoid renaming every projection metric/field in one
+  # pass. Functionally LMDB is always an enabled, lagged cold projection now.
+  def mirror?, do: true
 
-  def mode do
-    :ferricstore
-    |> Application.get_env(:flow_lmdb_mode, default_mode())
-    |> normalize_mode()
-  end
-
-  defp default_mode, do: :lagged
+  def mode, do: :lagged
 
   def map_size do
     Application.get_env(:ferricstore, :flow_lmdb_map_size, @default_map_size)
@@ -774,24 +768,6 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   defp refresh_terminal_count_cache_after_delete(_path, :missing), do: :ok
-
-  defp normalize_mode(:off), do: :lagged
-  defp normalize_mode(:lagged), do: :lagged
-  defp normalize_mode(:async), do: :lagged
-  defp normalize_mode(:write_through), do: :mirror
-  defp normalize_mode(:mirror), do: :mirror
-
-  defp normalize_mode(value) when value in [false, "false", "FALSE", "0", "off", nil],
-    do: :lagged
-
-  defp normalize_mode(value) when value in ["lagged", "async", "batched"],
-    do: :lagged
-
-  defp normalize_mode(value) when value in [true, "true", "TRUE", "1", "mirror", "on"],
-    do: :mirror
-
-  defp normalize_mode(value) when value in ["write_through", "write-through"], do: :mirror
-  defp normalize_mode(_value), do: default_mode()
 
   defp expired_terminal_sweep_ops(path, entries, now_ms) do
     Enum.reduce_while(entries, {[], %{}, 0}, fn {expire_key, expire_value},

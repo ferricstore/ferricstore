@@ -1,7 +1,7 @@
 # Targeted Flow tail-latency probe for Flow hot commands.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB_MODE=mirror \
+#   MIX_ENV=bench FERRICSTORE_BUILD=1 \
 #     FLOW_TAIL_BACKLOG=100000 FLOW_TAIL_ITER=400 mix run --no-start bench/flow_tail_probe.exs
 
 backlog = System.get_env("FLOW_TAIL_BACKLOG", "100000") |> String.to_integer()
@@ -11,7 +11,6 @@ partition_count = System.get_env("FLOW_TAIL_PARTITIONS", "4") |> String.to_integ
 seed_concurrency = System.get_env("FLOW_TAIL_SEED_CONCURRENCY", "64") |> String.to_integer()
 batch_size = System.get_env("FLOW_TAIL_BATCH", "100") |> String.to_integer()
 top_count = System.get_env("FLOW_TAIL_TOP", "8") |> String.to_integer()
-flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
 warm_info? = System.get_env("FLOW_TAIL_WARM_INFO", "true") != "false"
 
 release_cursor_interval = System.get_env("FLOW_TAIL_RELEASE_CURSOR_INTERVAL")
@@ -26,7 +25,6 @@ Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
-Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
 
 if release_cursor_interval not in [nil, ""] do
   Application.put_env(

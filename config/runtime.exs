@@ -51,11 +51,11 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   # Memory & Eviction
   # ---------------------------------------------------------------------------
-  flow_lmdb_mode =
-    case String.downcase(System.get_env("FERRICSTORE_FLOW_LMDB_MODE", "lagged")) do
-      "mirror" -> "mirror"
-      "write_through" -> "mirror"
-      _other -> "lagged"
+  raft_backend =
+    case String.downcase(System.get_env("FERRICSTORE_RAFT_BACKEND", "waraft")) do
+      "ra" -> :ra
+      "waraft" -> :waraft
+      other -> raise "invalid FERRICSTORE_RAFT_BACKEND=#{inspect(other)}; expected ra or waraft"
     end
 
   config :ferricstore,
@@ -77,42 +77,21 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS", "600000")),
     max_active_file_size:
       String.to_integer(System.get_env("FERRICSTORE_MAX_ACTIVE_FILE_SIZE", "8589934592")),
-    flow_lmdb_enabled: true,
-    flow_lmdb_mode: flow_lmdb_mode,
     flow_lmdb_map_size:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
     flow_lmdb_flush_interval_ms:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS",
-          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "1000", else: "100")
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS", "1000")),
     flow_lmdb_max_batch_ops:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS",
-          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "25000", else: "10000")
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS", "25000")),
     flow_lmdb_flush_chunk_ops:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_OPS", "10000")),
     flow_lmdb_flush_chunk_pause_ms:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS",
-          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "1", else: "0")
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS", "1")),
     flow_lmdb_flush_jitter_ms:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS",
-          if(flow_lmdb_mode in ["lagged", "async", "batched"], do: "250", else: "0")
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS", "250")),
     flow_lmdb_max_concurrent_flushes:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
+    flow_async_history: true,
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
 
@@ -205,6 +184,7 @@ if config_env() == :prod do
   # Raft / Internals
   # ---------------------------------------------------------------------------
   config :ferricstore,
+    raft_backend: raft_backend,
     release_cursor_interval:
       String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")),
     ra_segment_max_entries:
@@ -234,6 +214,8 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_KEEP", "100000")),
     waraft_max_retained_entries:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES", "100000")),
+    waraft_async_log_append:
+      System.get_env("FERRICSTORE_WARAFT_ASYNC_LOG_APPEND", "true") in ["1", "true", "TRUE"],
     ra_min_snapshot_interval:
       String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "10000000")),
     ra_min_checkpoint_interval:

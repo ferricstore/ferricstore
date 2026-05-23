@@ -178,7 +178,7 @@ defmodule Ferricstore.Flow do
           []
       end)
 
-    if missing == [] or not Ferricstore.Flow.LMDB.mirror?() do
+    if missing == [] do
       values
     else
       lmdb_values =
@@ -1477,34 +1477,30 @@ defmodule Ferricstore.Flow do
     do: {:ok, []}
 
   defp flow_history_lmdb_refs(ctx, history_key, count, consistent?, reverse?) do
-    if Ferricstore.Flow.LMDB.mirror?() do
-      shard_index = Router.shard_for(ctx, history_key)
+    shard_index = Router.shard_for(ctx, history_key)
 
-      with :ok <- flow_maybe_flush_lmdb_shard(ctx, shard_index, consistent?),
-           :ok <- flow_require_lmdb_mirror_healthy_shard(ctx, history_key, shard_index) do
-        path =
-          ctx.data_dir
-          |> Ferricstore.DataDir.shard_data_path(shard_index)
-          |> Ferricstore.Flow.LMDB.path()
+    with :ok <- flow_maybe_flush_lmdb_shard(ctx, shard_index, consistent?),
+         :ok <- flow_require_lmdb_mirror_healthy_shard(ctx, history_key, shard_index) do
+      path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.LMDB.path()
 
-        prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
-        now_ms = now_ms()
-        sweep_limit = flow_history_lmdb_sweep_limit()
+      prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+      now_ms = now_ms()
+      sweep_limit = flow_history_lmdb_sweep_limit()
 
-        with {:ok, _swept} <-
-               Ferricstore.Flow.LMDB.sweep_expired_history(path, now_ms, sweep_limit),
-             {:ok, entries} <-
-               Ferricstore.Flow.LMDB.prefix_entries(
-                 path,
-                 prefix,
-                 flow_history_lmdb_query_scan_count(count, reverse?),
-                 reverse?
-               ) do
-          {:ok, flow_decode_history_index_entries(entries, path, now_ms)}
-        end
+      with {:ok, _swept} <-
+             Ferricstore.Flow.LMDB.sweep_expired_history(path, now_ms, sweep_limit),
+           {:ok, entries} <-
+             Ferricstore.Flow.LMDB.prefix_entries(
+               path,
+               prefix,
+               flow_history_lmdb_query_scan_count(count, reverse?),
+               reverse?
+             ) do
+        {:ok, flow_decode_history_index_entries(entries, path, now_ms)}
       end
-    else
-      {:ok, []}
     end
   end
 
@@ -1525,7 +1521,7 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_require_lmdb_mirror_healthy_shard(ctx, index_key, shard_index) do
-    if Ferricstore.Flow.LMDB.mirror?() and flow_lmdb_mirror_degraded_shard?(ctx, shard_index) do
+    if flow_lmdb_mirror_degraded_shard?(ctx, shard_index) do
       {:error, "ERR flow LMDB projection unavailable for #{index_key}"}
     else
       :ok
@@ -1575,7 +1571,7 @@ defmodule Ferricstore.Flow do
   defp flow_history_cold_values_by_event(ctx, history_key, event_ids, hot_values) do
     missing_ids = Enum.reject(event_ids, &Map.has_key?(hot_values, &1))
 
-    if missing_ids == [] or not Ferricstore.Flow.LMDB.mirror?() do
+    if missing_ids == [] do
       %{}
     else
       shard_index = Router.shard_for(ctx, history_key)
@@ -3797,7 +3793,7 @@ defmodule Ferricstore.Flow do
          include_cold?,
          consistent?
        ) do
-    if include_cold? and Ferricstore.Flow.LMDB.mirror?() do
+    if include_cold? do
       with {:ok, entries} <-
              flow_lmdb_index_entries(ctx, index_key, partition_key, count, consistent?) do
         ids =
@@ -3845,7 +3841,7 @@ defmodule Ferricstore.Flow do
          include_cold?,
          consistent?
        ) do
-    if include_cold? and Ferricstore.Flow.LMDB.mirror?() do
+    if include_cold? do
       flow_lmdb_index_entries(ctx, index_key, partition_key, count, consistent?)
     else
       {:ok, []}
@@ -3982,8 +3978,7 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
-    if Ferricstore.Flow.LMDB.mirror?() and
-         flow_lmdb_mirror_degraded?(ctx, index_key, partition_key) do
+    if flow_lmdb_mirror_degraded?(ctx, index_key, partition_key) do
       {:error, "ERR flow LMDB mirror degraded"}
     else
       :ok

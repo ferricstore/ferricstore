@@ -657,7 +657,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, _} = Ferricstore.Flow.LMDB.get(path, reused_key)
   end
 
-  test "flow LMDB mode defaults to lagged and off is coerced on" do
+  test "flow LMDB mode is always lagged" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_enabled = Application.get_env(:ferricstore, :flow_lmdb_enabled)
 
@@ -676,22 +676,30 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert Ferricstore.Flow.LMDB.enabled?()
     assert Ferricstore.Flow.LMDB.mode() == :lagged
 
-    for off <- [:off, false, "false", "FALSE", "0", "off", nil] do
-      Application.put_env(:ferricstore, :flow_lmdb_mode, off)
-      assert Ferricstore.Flow.LMDB.mode() == :lagged
-      assert Ferricstore.Flow.LMDB.mirror?()
-    end
-
-    for lagged <- [:lagged, :async, "lagged", "async", "batched"] do
-      Application.put_env(:ferricstore, :flow_lmdb_mode, lagged)
+    for ignored <- [
+          :off,
+          :lagged,
+          :async,
+          :mirror,
+          :write_through,
+          false,
+          true,
+          "false",
+          "TRUE",
+          "0",
+          "1",
+          "off",
+          "lagged",
+          "async",
+          "batched",
+          "mirror",
+          "write_through",
+          "on",
+          nil
+        ] do
+      Application.put_env(:ferricstore, :flow_lmdb_mode, ignored)
       assert Ferricstore.Flow.LMDB.enabled?()
       assert Ferricstore.Flow.LMDB.mode() == :lagged
-      assert Ferricstore.Flow.LMDB.mirror?()
-    end
-
-    for mirror <- [:mirror, true, "true", "TRUE", "1", "mirror", "on"] do
-      Application.put_env(:ferricstore, :flow_lmdb_mode, mirror)
-      assert Ferricstore.Flow.LMDB.mode() == :mirror
       assert Ferricstore.Flow.LMDB.mirror?()
     end
   end
@@ -2260,7 +2268,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert is_integer(vsize)
   end
 
-  test "mirror mode persists terminal Flow state for cold reads and info" do
+  test "lagged projection persists terminal Flow state for cold reads and info" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
 
@@ -2279,7 +2287,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     flow_type = "default-mirror"
     id = "flow-default-mirror"
 
-    assert Ferricstore.Flow.LMDB.mode() == :mirror
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
 
     assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
@@ -2506,7 +2514,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
   end
 
-  test "legacy write-through Flow LMDB mode aliases to mirror" do
+  test "legacy Flow LMDB mode values are ignored" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :write_through)
@@ -2515,10 +2523,13 @@ defmodule Ferricstore.Flow.LMDBTest do
       restore_env(:flow_lmdb_mode, old_mode)
     end)
 
-    assert Ferricstore.Flow.LMDB.mode() == :mirror
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
   end
 
-  test "mirror flow get emits telemetry for corrupt LMDB wrapper" do
+  test "lagged projection flow get emits telemetry for corrupt LMDB wrapper" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -2557,7 +2568,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
 
     assert_receive {:flow_lmdb_read_error, [:ferricstore, :flow, :lmdb, :read_error], %{count: 1},
-                    %{mode: :mirror, reason: :decode_error}}
+                    %{mode: :lagged, reason: :decode_error}}
   end
 
   test "lineage queries skip malformed LMDB mirror records" do
@@ -3219,10 +3230,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                include_cold: false
              )
 
-    assert Enum.map(hot_events, fn {_event_id, fields} -> fields["event"] end) == [
-             "claimed",
-             "completed"
-           ]
+    assert hot_events == []
   end
 
   test "async history keeps only hot cap in keydir while default history reads cold LMDB locations" do
@@ -3649,7 +3657,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
     {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 1
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
 
     lmdb_path =
       ctx.data_dir
@@ -4012,7 +4020,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.get(ctx, completed.id, partition_key: partition_key)
   end
 
-  test "startup rebuilds native flow history index from durable history entries" do
+  test "startup keeps terminal history cold while durable history remains queryable" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -4061,18 +4069,16 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3
              )
 
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
     assert {:ok, before_restart} =
              Ferricstore.Flow.history(ctx, id,
                partition_key: partition_key,
                include_cold: false
              )
 
-    assert Enum.map(before_restart, fn {_event_id, fields} -> fields["event"] end) == [
-             "lease_extended",
-             "completed"
-           ]
+    assert before_restart == []
 
-    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
     restart_isolated_shard!(ctx, 0)
 
     assert {:ok, after_restart} =

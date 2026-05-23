@@ -45,7 +45,7 @@ defmodule FlowLMDBSoak do
       IO.puts(
         "flow_lmdb_soak backend=#{backend} port=#{port} data_dir=#{data_dir} " <>
           "duration_s=#{duration_s} flows_per_run=#{flows_per_run} target_fps=#{target_fps} " <>
-          "shards=#{shards} lmdb_mode=#{Application.get_env(:ferricstore, :flow_lmdb_mode)} " <>
+          "shards=#{shards} lmdb_projection=lagged " <>
           "flush_interval_ms=#{Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)} " <>
           "max_batch_ops=#{Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)}"
       )
@@ -345,8 +345,6 @@ defmodule FlowLMDBSoak do
     Application.put_env(:ferricstore, :protected_mode, false)
     Application.put_env(:ferricstore, :max_memory_bytes, int_env("FERRICSTORE_MAX_MEMORY", 0))
     Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
-    Application.put_env(:ferricstore, :flow_lmdb_enabled, true)
-    Application.put_env(:ferricstore, :flow_lmdb_mode, env("FLOW_LMDB_MODE", "lagged"))
 
     Application.put_env(
       :ferricstore,

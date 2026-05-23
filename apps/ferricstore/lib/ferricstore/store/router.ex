@@ -4010,41 +4010,28 @@ defmodule Ferricstore.Store.Router do
   def flow_get(ctx, id, partition_key) when is_binary(id) do
     key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
-    cond do
-      Ferricstore.Flow.LMDB.mirror?() ->
-        case get(ctx, key) do
-          nil -> flow_get_lmdb(ctx, key, :mirror)
-          value -> value
-        end
-
-      true ->
-        get(ctx, key)
+    case get(ctx, key) do
+      nil -> flow_get_lmdb(ctx, key, :lagged)
+      value -> value
     end
   end
 
   @doc false
   def flow_batch_get(ctx, ids, partition_key) when is_list(ids) do
     keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
+    values = batch_get(ctx, keys)
+    missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
+    missing_values = flow_batch_get_lmdb(ctx, missing_keys, :lagged)
 
-    cond do
-      Ferricstore.Flow.LMDB.mirror?() ->
-        values = batch_get(ctx, keys)
-        missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
-        missing_values = flow_batch_get_lmdb(ctx, missing_keys, :mirror)
+    {merged, []} =
+      Enum.map_reduce(values, missing_values, fn
+        value, remaining when is_binary(value) -> {value, remaining}
+        nil, [value | remaining] -> {value, remaining}
+        nil, [] -> {nil, []}
+        _other, remaining -> {nil, remaining}
+      end)
 
-        {merged, []} =
-          Enum.map_reduce(values, missing_values, fn
-            value, remaining when is_binary(value) -> {value, remaining}
-            nil, [value | remaining] -> {value, remaining}
-            nil, [] -> {nil, []}
-            _other, remaining -> {nil, remaining}
-          end)
-
-        merged
-
-      true ->
-        batch_get(ctx, keys)
-    end
+    merged
   end
 
   @doc false
@@ -4134,11 +4121,7 @@ defmodule Ferricstore.Store.Router do
 
   defp flow_lmdb_read_error_result(mode, reason) do
     flow_observe_lmdb_read_error(mode, reason)
-
-    case mode do
-      :mirror -> nil
-      _other -> nil
-    end
+    nil
   end
 
   defp flow_observe_lmdb_read_error(mode, reason) do
@@ -5234,23 +5217,18 @@ defmodule Ferricstore.Store.Router do
 
   defp flow_terminal_many_values(ctx, keys) do
     values = batch_get(ctx, keys)
+    missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
+    missing_values = flow_batch_get_lmdb(ctx, missing_keys, :lagged)
 
-    if Ferricstore.Flow.LMDB.mirror?() do
-      missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
-      missing_values = flow_batch_get_lmdb(ctx, missing_keys, :mirror)
+    {merged, []} =
+      Enum.map_reduce(values, missing_values, fn
+        value, remaining when is_binary(value) -> {value, remaining}
+        nil, [value | remaining] -> {value, remaining}
+        nil, [] -> {nil, []}
+        _other, remaining -> {nil, remaining}
+      end)
 
-      {merged, []} =
-        Enum.map_reduce(values, missing_values, fn
-          value, remaining when is_binary(value) -> {value, remaining}
-          nil, [value | remaining] -> {value, remaining}
-          nil, [] -> {nil, []}
-          _other, remaining -> {nil, remaining}
-        end)
-
-      merged
-    else
-      values
-    end
+    merged
   end
 
   defp flow_terminal_key_entry_cross_shard?(ctx, {:ok, keys}),

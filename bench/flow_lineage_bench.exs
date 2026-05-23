@@ -3,10 +3,10 @@
 # Lineage-heavy Flow benchmark:
 #   - root + child workflows with parent/root/correlation metadata
 #   - partitioned queries by parent/root/correlation
-#   - terminal LMDB metadata mirror queries after complete
+#   - terminal LMDB projection queries after complete
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB_MODE=mirror mix run --no-start bench/flow_lineage_bench.exs
+#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/flow_lineage_bench.exs
 
 backlog = System.get_env("FLOW_LINEAGE_BACKLOG", "100000") |> String.to_integer()
 iterations = System.get_env("FLOW_LINEAGE_ITER", "200") |> String.to_integer()
@@ -18,9 +18,6 @@ seed_concurrency = System.get_env("FLOW_LINEAGE_SEED_CONCURRENCY", "32") |> Stri
 query_count = System.get_env("FLOW_LINEAGE_QUERY_COUNT", "100") |> String.to_integer()
 terminal_count = System.get_env("FLOW_LINEAGE_TERMINAL", "10000") |> String.to_integer()
 
-flow_lmdb_enabled = true
-flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
-
 bench_data_dir =
   Path.join(System.tmp_dir!(), "ferricstore_flow_lineage_#{System.unique_integer([:positive])}")
 
@@ -31,8 +28,6 @@ Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
-Application.put_env(:ferricstore, :flow_lmdb_enabled, flow_lmdb_enabled)
-Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 
@@ -50,9 +45,7 @@ defmodule FlowLineageBench do
       "backlog=#{config.backlog} terminal=#{config.terminal_count} iterations=#{config.iterations} roots=#{config.root_count} terminal_roots=#{config.terminal_root_count} shards=#{config.shard_count} partitions=#{config.partition_count} query_count=#{config.query_count}"
     )
 
-    IO.puts(
-      "seed_concurrency=#{config.seed_concurrency} flow_lmdb=#{config.flow_lmdb_enabled} flow_lmdb_mode=#{config.flow_lmdb_mode}"
-    )
+    IO.puts("seed_concurrency=#{config.seed_concurrency} flow_lmdb_projection=lagged")
 
     memory_before = :erlang.memory(:total)
 
@@ -402,8 +395,7 @@ defmodule FlowLineageBench do
       "- partitions: #{config.partition_count}",
       "- query_count: #{config.query_count}",
       "- seed_concurrency: #{config.seed_concurrency}",
-      "- flow_lmdb_enabled: #{config.flow_lmdb_enabled}",
-      "- flow_lmdb_mode: #{config.flow_lmdb_mode}",
+      "- flow_lmdb_projection: lagged",
       "- beam_memory_before: #{config.memory_before}",
       "- beam_memory_after_seed: #{config.memory_after_seed}",
       "- beam_memory_delta: #{config.memory_delta}",
@@ -450,8 +442,6 @@ try do
     root_count: root_count,
     seed_concurrency: seed_concurrency,
     query_count: query_count,
-    flow_lmdb_enabled: flow_lmdb_enabled,
-    flow_lmdb_mode: flow_lmdb_mode,
     data_dir: bench_data_dir
   })
 after

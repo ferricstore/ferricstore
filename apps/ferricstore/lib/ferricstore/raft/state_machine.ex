@@ -4598,7 +4598,6 @@ defmodule Ferricstore.Raft.StateMachine do
   defp apply_put_batch_entries_fast(_state, entries) do
     pending = Process.get(:sm_pending_writes, [])
     pending_values = Process.get(:sm_pending_values, %{})
-    mirror_flow_policy? = flow_lmdb_mirror?(nil)
     fast_publish? = fast_put_publish_possible?(pending, pending_values)
 
     {results, pending} =
@@ -4606,7 +4605,7 @@ defmodule Ferricstore.Raft.StateMachine do
         {key, value, expire_at_ms}, {results, pending_acc} ->
           disk_val = to_disk_binary(value)
 
-          if mirror_flow_policy? and FlowKeys.policy_key?(key) do
+          if FlowKeys.policy_key?(key) do
             queue_pending_lmdb_mirror_put(key, disk_val, expire_at_ms)
           end
 
@@ -17015,7 +17014,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_async_history_config(config) do
     Map.get_lazy(config, :flow_async_history, fn ->
-      case Application.get_env(:ferricstore, :flow_async_history) do
+      case Application.get_env(:ferricstore, :flow_async_history, true) do
         value when value in [true, "1", "true"] ->
           true
 
@@ -17023,7 +17022,7 @@ defmodule Ferricstore.Raft.StateMachine do
           false
 
         _ ->
-          System.get_env("FLOW_ASYNC_HISTORY", "true") in ["1", "true"]
+          true
       end
     end)
   end
@@ -17539,7 +17538,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp maybe_queue_lmdb_policy_put(key, value, expire_at_ms) do
-    if flow_lmdb_mirror?(nil) and FlowKeys.policy_key?(key) do
+    if FlowKeys.policy_key?(key) do
       queue_pending_lmdb_mirror_put(key, value, expire_at_ms)
     end
 

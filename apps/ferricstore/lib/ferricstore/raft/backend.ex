@@ -2,9 +2,8 @@ defmodule Ferricstore.Raft.Backend do
   @moduledoc """
   Runtime write-backend selector.
 
-  The default remains the current `:ra` implementation. `:waraft` is a gated
-  replacement candidate used by tests and benchmarks until it satisfies the
-  full migration checklist.
+  WARaft is the production default. The legacy `:ra` backend remains selectable
+  only for explicit comparison tests and benchmarks.
   """
 
   alias Ferricstore.Raft.WARaftBackend
@@ -13,7 +12,7 @@ defmodule Ferricstore.Raft.Backend do
 
   @spec selected() :: :ra | :waraft
   def selected do
-    Application.get_env(:ferricstore, :raft_backend, :ra)
+    Application.get_env(:ferricstore, :raft_backend, :waraft)
     |> normalize_selected()
   end
 
