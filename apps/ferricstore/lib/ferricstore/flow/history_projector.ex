@@ -8,7 +8,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.HistoryProjectedIndex
-  alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Store.{DiskPressure, LFU, WriteVersion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
@@ -155,6 +154,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   def durable?(instance_ctx, shard_index, shard_data_path, index) do
     projected_index(instance_ctx, shard_index, shard_data_path) >= index
+  end
+
+  @doc false
+  def __trim_cap_requirements_for_test__(entries, load_cap_fun)
+      when is_list(entries) and is_function(load_cap_fun, 1) do
+    history_cap_requirements(entries, load_cap_fun)
   end
 
   @spec write_entries_sync(
@@ -527,7 +532,9 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp publish_history_index(instance_ctx, shard_index, entries) do
-    {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+    {flow_index, flow_lookup} =
+      NativeFlowIndex.table_names(instance_name(instance_ctx), shard_index)
+
     native = NativeFlowIndex.get(flow_index, flow_lookup)
 
     {new_entries, update_entries} =
@@ -545,8 +552,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
         {key, event_id, event_ms}
       end)
 
-    if new_entries != [], do: FlowIndex.put_new_entries(flow_index, flow_lookup, new_entries)
-    if update_entries != [], do: FlowIndex.put_entries(flow_index, flow_lookup, update_entries)
     if native && new_entries != [], do: NativeFlowIndex.put_new_entries(native, new_entries)
     if native && update_entries != [], do: NativeFlowIndex.put_entries(native, update_entries)
 
@@ -963,26 +968,31 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp trim_history_caps(instance_ctx, shard_index, shard_data_path, keydir, file_path, entries) do
-    caps = history_caps(entries, keydir, shard_data_path)
+    cap_requirements =
+      history_cap_requirements(entries, fn history_key ->
+        load_history_max_cap(history_key, keydir, shard_data_path)
+      end)
 
-    if map_size(caps) == 0 do
+    if map_size(cap_requirements) == 0 do
       :ok
     else
-      {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+      {flow_index, flow_lookup} =
+        NativeFlowIndex.table_names(instance_name(instance_ctx), shard_index)
+
       native = NativeFlowIndex.get(flow_index, flow_lookup)
 
       trim_items =
-        caps
-        |> Enum.flat_map(fn {history_key, max_events} ->
-          if history_cap_check_required?(entries, history_key, max_events) do
+        cap_requirements
+        |> Enum.flat_map(fn
+          {history_key, {max_events, true}} ->
             history_key
             |> lmdb_history_over_cap_items(shard_data_path, max_events)
             |> Enum.map(fn {event_id, key, history_index_key} ->
               {history_key, event_id, key, history_index_key}
             end)
-          else
+
+          {_history_key, {_max_events, false}} ->
             []
-          end
         end)
 
       case trim_items do
@@ -1005,7 +1015,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
                   event_id
                 end)
 
-              FlowIndex.delete_members(flow_index, flow_lookup, history_key, event_ids)
               if native, do: NativeFlowIndex.delete_members(native, history_key, event_ids)
             end)
 
@@ -1019,34 +1028,84 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-  defp history_caps(entries, keydir, shard_data_path) do
-    {caps, history_keys} =
-      Enum.reduce(entries, {%{}, MapSet.new()}, fn
-        %{history_key: history_key, history_max_events: max_events}, {caps, keys}
-        when is_binary(history_key) and is_integer(max_events) and max_events > 0 ->
-          {Map.put(caps, history_key, max_events), MapSet.put(keys, history_key)}
+  defp history_cap_requirements(entries, load_cap_fun) do
+    entries
+    |> Enum.reduce(%{}, &put_history_cap_requirement/2)
+    |> Enum.reduce(%{}, fn {history_key, state}, acc ->
+      cap = state.cap || load_cap_fun.(history_key)
 
-        %{history_key: history_key}, {caps, keys} when is_binary(history_key) ->
-          {caps, MapSet.put(keys, history_key)}
+      case cap do
+        max_events when is_integer(max_events) and max_events > 0 ->
+          Map.put(acc, history_key, {max_events, history_cap_required?(state, max_events)})
 
-        _entry, acc ->
+        _ ->
           acc
-      end)
-
-    Enum.reduce(history_keys, caps, fn history_key, acc ->
-      if Map.has_key?(acc, history_key) do
-        acc
-      else
-        case load_history_max_cap(history_key, keydir, shard_data_path) do
-          max_events when is_integer(max_events) and max_events > 0 ->
-            Map.put(acc, history_key, max_events)
-
-          _ ->
-            acc
-        end
       end
     end)
   end
+
+  defp put_history_cap_requirement(%{history_key: history_key} = entry, acc)
+       when is_binary(history_key) do
+    state =
+      Map.get(acc, history_key, %{
+        cap: nil,
+        max_version: nil,
+        unknown_version?: false
+      })
+
+    state =
+      entry
+      |> history_cap_entry_state()
+      |> merge_history_cap_entry_state(state)
+
+    Map.put(acc, history_key, state)
+  end
+
+  defp put_history_cap_requirement(_entry, acc), do: acc
+
+  defp history_cap_entry_state(entry) do
+    %{
+      cap: history_cap_from_entry(entry),
+      version: Map.get(entry, :version, :missing)
+    }
+  end
+
+  defp history_cap_from_entry(%{history_max_events: max_events})
+       when is_integer(max_events) and max_events > 0,
+       do: max_events
+
+  defp history_cap_from_entry(_entry), do: nil
+
+  defp merge_history_cap_entry_state(%{cap: cap, version: version}, state) do
+    state
+    |> maybe_put_history_cap(cap)
+    |> put_history_cap_version(version)
+  end
+
+  defp maybe_put_history_cap(state, cap) when is_integer(cap) and cap > 0,
+    do: %{state | cap: cap}
+
+  defp maybe_put_history_cap(state, _cap), do: state
+
+  defp put_history_cap_version(state, version) when is_integer(version) and version >= 0 do
+    max_version =
+      case state.max_version do
+        existing when is_integer(existing) -> max(existing, version)
+        _ -> version
+      end
+
+    %{state | max_version: max_version}
+  end
+
+  defp put_history_cap_version(state, _version), do: %{state | unknown_version?: true}
+
+  defp history_cap_required?(%{unknown_version?: true}, _max_events), do: true
+
+  defp history_cap_required?(%{max_version: version}, max_events)
+       when is_integer(version) and version > max_events,
+       do: true
+
+  defp history_cap_required?(_state, _max_events), do: false
 
   defp load_history_max_cap(history_key, keydir, shard_data_path) do
     with {:ok, state_key} <- history_state_key(history_key),
@@ -1057,23 +1116,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
     else
       _ -> nil
     end
-  end
-
-  defp history_cap_check_required?(entries, history_key, max_events) do
-    Enum.any?(entries, fn
-      %{history_key: ^history_key, version: version}
-      when is_integer(version) and version > max_events ->
-        true
-
-      %{history_key: ^history_key, version: version} when not is_integer(version) ->
-        true
-
-      %{history_key: ^history_key} = entry ->
-        not Map.has_key?(entry, :version)
-
-      _entry ->
-        false
-    end)
   end
 
   defp lmdb_history_over_cap_items(history_key, shard_data_path, max_events) do
@@ -1106,19 +1148,25 @@ defmodule Ferricstore.Flow.HistoryProjector do
     if map_size(caps) == 0 do
       :ok
     else
-      {flow_index, flow_lookup} = FlowIndex.table_names(instance_name(instance_ctx), shard_index)
+      {flow_index, flow_lookup} =
+        NativeFlowIndex.table_names(instance_name(instance_ctx), shard_index)
+
       native = NativeFlowIndex.get(flow_index, flow_lookup)
 
       caps
       |> Enum.flat_map(fn {history_key, max_events} ->
-        count = FlowIndex.count_all(flow_lookup, history_key)
+        if native do
+          count = NativeFlowIndex.count_all(native, history_key)
 
-        if count > max_events do
-          flow_index
-          |> FlowIndex.rank_range(history_key, 0, count - max_events - 1, false)
-          |> Enum.map(fn {event_id, _score} ->
-            {history_key, event_id, history_entry_key(history_key, event_id)}
-          end)
+          if count > max_events do
+            native
+            |> NativeFlowIndex.rank_range(history_key, 0, count - max_events - 1, false)
+            |> Enum.map(fn {event_id, _score} ->
+              {history_key, event_id, history_entry_key(history_key, event_id)}
+            end)
+          else
+            []
+          end
         else
           []
         end
@@ -1127,8 +1175,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
         instance_ctx,
         shard_index,
         keydir,
-        flow_index,
-        flow_lookup,
         native
       )
     end
@@ -1157,8 +1203,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
          _instance_ctx,
          _shard_index,
          _keydir,
-         _flow_index,
-         _flow_lookup,
          _native
        ),
        do: :ok
@@ -1168,15 +1212,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
          instance_ctx,
          shard_index,
          keydir,
-         flow_index,
-         flow_lookup,
          native
        ) do
     items
     |> Enum.group_by(fn {history_key, _event_id, _key} -> history_key end)
     |> Enum.each(fn {history_key, group} ->
       event_ids = Enum.map(group, fn {_history_key, event_id, _key} -> event_id end)
-      FlowIndex.delete_members(flow_index, flow_lookup, history_key, event_ids)
       if native, do: NativeFlowIndex.delete_members(native, history_key, event_ids)
     end)
 

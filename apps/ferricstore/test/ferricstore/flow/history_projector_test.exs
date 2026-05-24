@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.HistoryProjector
+  alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.OrderedIndex
 
   test "sync projection writes dedicated history log, updates index, and advances watermark" do
@@ -16,12 +17,9 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
     keydir = :ets.new(:"history_projector_keydir_#{unique}", [:set, :public])
     {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
-    :ets.new(flow_index, [:ordered_set, :public, :named_table])
-    :ets.new(flow_lookup, [:set, :public, :named_table])
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
 
     on_exit(fn ->
-      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
-      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
       File.rm_rf(dir)
     end)
 
@@ -90,12 +88,9 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
     keydir = :ets.new(:"history_projector_hot_cap_keydir_#{unique}", [:set, :public])
     {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
-    :ets.new(flow_index, [:ordered_set, :public, :named_table])
-    :ets.new(flow_lookup, [:set, :public, :named_table])
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
 
     on_exit(fn ->
-      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
-      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
       File.rm_rf(dir)
     end)
 
@@ -157,6 +152,59 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     assert HistoryProjector.durable?(ctx, 0, dir, 103)
   end
 
+  test "history cap planning is one pass for unique under-cap entries" do
+    entries =
+      for idx <- 1..1_000 do
+        %{
+          history_key: "history:#{idx}",
+          event_id: "1000-2",
+          event_ms: 1_000,
+          version: 2,
+          history_max_events: 100_000,
+          key: "history:#{idx}:1000-2",
+          value: "history"
+        }
+      end
+
+    requirements =
+      HistoryProjector.__trim_cap_requirements_for_test__(entries, fn history_key ->
+        flunk("unexpected cap load for #{inspect(history_key)}")
+      end)
+
+    assert map_size(requirements) == 1_000
+    assert Enum.all?(requirements, fn {_history_key, {100_000, false}} -> true end)
+  end
+
+  test "history cap planning loads missing caps once and marks over-cap keys" do
+    parent = self()
+
+    entries = [
+      %{history_key: "history:one", event_id: "1000-3", event_ms: 1_000, version: 3},
+      %{history_key: "history:one", event_id: "1001-5", event_ms: 1_001, version: 5},
+      %{history_key: "history:two", event_id: "1002-1", event_ms: 1_002, version: 1}
+    ]
+
+    requirements =
+      HistoryProjector.__trim_cap_requirements_for_test__(entries, fn
+        "history:one" ->
+          send(parent, {:loaded_cap, "history:one"})
+          4
+
+        "history:two" ->
+          send(parent, {:loaded_cap, "history:two"})
+          10
+      end)
+
+    assert requirements == %{
+             "history:one" => {4, true},
+             "history:two" => {10, false}
+           }
+
+    assert_receive {:loaded_cap, "history:one"}
+    assert_receive {:loaded_cap, "history:two"}
+    refute_receive {:loaded_cap, _}
+  end
+
   test "recover returns an error and emits telemetry when history path is invalid" do
     unique = System.unique_integer([:positive])
     dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_error_#{unique}")
@@ -203,8 +251,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
     keydir = :ets.new(:"history_projector_pending_cap_keydir_#{unique}", [:set, :public])
     {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
-    :ets.new(flow_index, [:ordered_set, :public, :named_table])
-    :ets.new(flow_lookup, [:set, :public, :named_table])
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
 
     ctx = %{
       name: instance_name,
@@ -253,8 +300,6 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
       if Process.whereis(HistoryProjector.name(ctx, 0)),
         do: GenServer.stop(HistoryProjector.name(ctx, 0))
 
-      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
-      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
       File.rm_rf(dir)
       restore_env(:flow_history_projector_max_pending_entries, old_max_pending)
       restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
@@ -269,8 +314,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
     keydir = :ets.new(:"history_projector_async_enqueue_keydir_#{unique}", [:set, :public])
     {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
-    :ets.new(flow_index, [:ordered_set, :public, :named_table])
-    :ets.new(flow_lookup, [:set, :public, :named_table])
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
 
     ctx = %{
       name: instance_name,
@@ -319,8 +363,6 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
       if Process.whereis(HistoryProjector.name(ctx, 0)),
         do: GenServer.stop(HistoryProjector.name(ctx, 0))
 
-      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
-      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
       File.rm_rf(dir)
     end
   end
@@ -333,8 +375,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
     keydir = :ets.new(:"history_projector_skip_keydir_#{unique}", [:set, :public])
     {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
-    :ets.new(flow_index, [:ordered_set, :public, :named_table])
-    :ets.new(flow_lookup, [:set, :public, :named_table])
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
 
     ctx = %{
       name: instance_name,
@@ -365,8 +406,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
     assert :ok = HistoryProjector.write_entries_sync(ctx, 0, dir, [entry], 7)
     :ets.delete_all_objects(keydir)
-    :ets.delete_all_objects(flow_index)
-    :ets.delete_all_objects(flow_lookup)
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
 
     {:ok, pid} =
       HistoryProjector.start_link(
@@ -378,8 +418,6 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid)
-      if :ets.whereis(flow_index) != :undefined, do: :ets.delete(flow_index)
-      if :ets.whereis(flow_lookup) != :undefined, do: :ets.delete(flow_lookup)
       File.rm_rf(dir)
     end)
 
