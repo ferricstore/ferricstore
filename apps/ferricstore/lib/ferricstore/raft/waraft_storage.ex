@@ -564,7 +564,23 @@ defmodule Ferricstore.Raft.WARaftStorage do
          %{sm_state: sm_state} = handle,
          label_update
        ) do
-    case segment_project_command(decoded_replay_command(command), position, sm_state) do
+    decoded_command = decoded_replay_command(command)
+
+    if segment_projection_locks_present?(sm_state) do
+      :unsupported
+    else
+      do_apply_segment_projected_command(decoded_command, command, position, handle, label_update)
+    end
+  end
+
+  defp do_apply_segment_projected_command(
+         decoded_command,
+         command,
+         position,
+         handle,
+         label_update
+       ) do
+    case segment_project_command(decoded_command, position, handle.sm_state) do
       {:ok, new_sm_state, result, applied_increment} ->
         finish_apply_result(
           command,
@@ -580,6 +596,13 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
       :unsupported ->
         :unsupported
+    end
+  end
+
+  defp segment_projection_locks_present?(sm_state) do
+    case Map.get(sm_state, :cross_shard_locks, %{}) do
+      locks when is_map(locks) -> map_size(locks) > 0
+      _other -> false
     end
   end
 

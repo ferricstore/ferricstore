@@ -28,6 +28,58 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
     end)
   end
 
+  test "prod runtime protected mode accepts common strict boolean values" do
+    for value <- ["true", "TRUE", "1", "yes", "on"] do
+      with_env("FERRICSTORE_PROTECTED_MODE", value, fn ->
+        assert runtime_ferricstore_config(:protected_mode) == true
+      end)
+    end
+
+    for value <- ["false", "FALSE", "0", "no", "off"] do
+      with_env("FERRICSTORE_PROTECTED_MODE", value, fn ->
+        assert runtime_ferricstore_config(:protected_mode) == false
+      end)
+    end
+
+    with_env("FERRICSTORE_PROTECTED_MODE", "maybe", fn ->
+      assert_raise RuntimeError, ~r/FERRICSTORE_PROTECTED_MODE/, fn ->
+        runtime_config()
+      end
+    end)
+  end
+
+  test "prod runtime WARaft ETS byte cap treats empty as unset and validates overrides" do
+    with_env("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", nil, fn ->
+      refute Keyword.has_key?(
+               runtime_ferricstore_memory_overrides(),
+               :waraft_segment_log_max_ets_bytes
+             )
+    end)
+
+    with_env("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "", fn ->
+      refute Keyword.has_key?(
+               runtime_ferricstore_memory_overrides(),
+               :waraft_segment_log_max_ets_bytes
+             )
+    end)
+
+    with_env("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "off", fn ->
+      assert runtime_ferricstore_memory_overrides()[:waraft_segment_log_max_ets_bytes] ==
+               :infinity
+    end)
+
+    with_env("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "1048576", fn ->
+      assert runtime_ferricstore_memory_overrides()[:waraft_segment_log_max_ets_bytes] ==
+               1_048_576
+    end)
+
+    with_env("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", "256MB", fn ->
+      assert_raise RuntimeError, ~r/FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES/, fn ->
+        runtime_config()
+      end
+    end)
+  end
+
   test "runtime library telemetry handlers use named callbacks" do
     offenders =
       @lib_root
@@ -81,10 +133,40 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
   defp local_telemetry_handler?(_other), do: false
 
   defp runtime_logger_level do
+    runtime_config()
+    |> get_in([:logger, :level])
+  end
+
+  defp runtime_ferricstore_config(key) do
+    runtime_config()
+    |> merged_runtime_ferricstore_config()
+    |> Keyword.fetch!(key)
+  end
+
+  defp runtime_ferricstore_memory_overrides do
+    runtime_config()
+    |> merged_runtime_ferricstore_config()
+    |> Keyword.take([
+      :flow_history_projector_max_pending_entries,
+      :flow_lmdb_writer_max_mailbox_messages,
+      :flow_lmdb_writer_max_enqueue_ops,
+      :waraft_segment_log_max_ets_bytes,
+      :waraft_segment_log_max_ets_entries,
+      :waraft_segment_log_min_ets_entries,
+      :waraft_apply_projection_cache_max_entries
+    ])
+  end
+
+  defp merged_runtime_ferricstore_config(config) do
+    config
+    |> Keyword.get_values(:ferricstore)
+    |> Enum.reduce([], &Keyword.merge(&2, &1))
+  end
+
+  defp runtime_config do
     @repo_root
     |> Path.join("config/runtime.exs")
     |> Config.Reader.read!(env: :prod)
-    |> get_in([:logger, :level])
   end
 
   defp with_env(key, value, fun) do

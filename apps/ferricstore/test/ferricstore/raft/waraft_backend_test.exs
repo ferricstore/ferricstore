@@ -269,6 +269,100 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "unified segment fast paths route through lock-aware apply when keys are locked", %{
+    ctx: ctx
+  } do
+    previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      owner = make_ref()
+      expires_at = Ferricstore.HLC.now_ms() + 60_000
+
+      put_key = "segment-lock:put"
+      delete_key = "segment-lock:delete"
+      batch_put_locked = "segment-lock:batch-put-locked"
+      batch_put_free = "segment-lock:batch-put-free"
+      batch_delete_locked = "segment-lock:batch-delete-locked"
+      batch_delete_free = "segment-lock:batch-delete-free"
+
+      for key <- [put_key, delete_key, batch_put_locked, batch_delete_locked, batch_delete_free] do
+        assert :ok = WARaftBackend.write(0, {:put, key, "old", 0})
+      end
+
+      assert :ok =
+               WARaftBackend.write(0, {
+                 :lock_keys,
+                 [put_key, delete_key, batch_put_locked, batch_delete_locked],
+                 owner,
+                 expires_at
+               })
+
+      assert {:error, :key_locked} = WARaftBackend.write(0, {:put, put_key, "new", 0})
+      assert {:error, :key_locked} = WARaftBackend.write(0, {:delete, delete_key})
+
+      assert {:ok, [{:error, :key_locked}, :ok]} =
+               WARaftBackend.__commit_put_batch_direct__(0, [
+                 {batch_put_locked, "new", 0},
+                 {batch_put_free, "new", 0}
+               ])
+
+      assert {:ok, [{:error, :key_locked}, :ok]} =
+               WARaftBackend.__commit_delete_batch_direct__(0, [
+                 batch_delete_locked,
+                 batch_delete_free
+               ])
+
+      assert "old" == Router.get(ctx, put_key)
+      assert "old" == Router.get(ctx, delete_key)
+      assert "old" == Router.get(ctx, batch_put_locked)
+      assert "new" == Router.get(ctx, batch_put_free)
+      assert "old" == Router.get(ctx, batch_delete_locked)
+      assert nil == Router.get(ctx, batch_delete_free)
+    after
+      restore_env(:waraft_storage_apply_mode, previous_mode)
+    end
+  end
+
+  test "unified segment lock expiry uses stamped command time on replay", %{ctx: ctx} do
+    previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      key = "segment-lock:stamped-expiry"
+      owner = make_ref()
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 20_000
+      expires_after_stamp_before_local_now = stamped_now + 10_000
+
+      assert :ok = WARaftBackend.write(0, {:put, key, "old", 0})
+
+      assert :ok =
+               WARaftBackend.write(0, {
+                 :lock_keys,
+                 [key],
+                 owner,
+                 expires_after_stamp_before_local_now
+               })
+
+      assert {:error, :key_locked} =
+               WARaftBackend.write(0, {
+                 {:put, key, "new", 0},
+                 %{hlc_ts: {stamped_now, 0}}
+               })
+
+      assert "old" == Router.get(ctx, key)
+    after
+      restore_env(:waraft_storage_apply_mode, previous_mode)
+    end
+  end
+
   test "unified segment storage keeps Flow value and history payloads cold", %{ctx: ctx} do
     previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
 
@@ -1398,6 +1492,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
     assert {:error, :leader_unavailable} ==
              WARaftBackend.__redirect_transfer_failure_for_test__(:exit, {:erpc, :noconnection})
+  end
+
+  test "WARaft post-submit not-leader outcome is not redirectable as a fresh write" do
+    refute WARaftBackend.__redirectable_write_error_for_test__({:error, :not_leader_after_submit})
+    assert WARaftBackend.__redirectable_write_error_for_test__({:error, :not_leader})
   end
 
   test "WARaft redirect peer normalization rejects boolean pseudo-nodes" do

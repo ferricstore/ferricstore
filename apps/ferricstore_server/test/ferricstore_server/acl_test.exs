@@ -90,10 +90,10 @@ defmodule FerricstoreServer.AclTest do
       assert user.password == nil
     end
 
-    test "new user defaults to all commands" do
+    test "new user defaults to no commands" do
       assert :ok = Acl.set_user("charlie", [])
       user = Acl.get_user("charlie")
-      assert user.commands == :all
+      assert user.commands == MapSet.new()
     end
 
     test "new user defaults to empty denied_commands" do
@@ -102,10 +102,10 @@ defmodule FerricstoreServer.AclTest do
       assert user.denied_commands == MapSet.new()
     end
 
-    test "new user defaults to all keys" do
+    test "new user defaults to no keys" do
       assert :ok = Acl.set_user("charlie", [])
       user = Acl.get_user("charlie")
-      assert user.keys == :all
+      assert user.keys == []
     end
   end
 
@@ -265,7 +265,7 @@ defmodule FerricstoreServer.AclTest do
     end
 
     test "-command from :all adds to denied_commands" do
-      assert :ok = Acl.set_user("alice", ["on", "-get"])
+      assert :ok = Acl.set_user("alice", ["on", "+@all", "-get"])
       user = Acl.get_user("alice")
       # Still :all, but GET is in denied_commands
       assert user.commands == :all
@@ -277,7 +277,7 @@ defmodule FerricstoreServer.AclTest do
     end
 
     test "+command when already :all is a no-op" do
-      assert :ok = Acl.set_user("alice", ["on", "+get"])
+      assert :ok = Acl.set_user("alice", ["on", "+@all", "+get"])
       user = Acl.get_user("alice")
       assert user.commands == :all
     end

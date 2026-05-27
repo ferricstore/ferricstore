@@ -217,6 +217,19 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp blob_gc_entry_ref(ctx, idx, _state, {key, _value, _exp, _lfu, fid, off, value_size})
+       when is_binary(key) and valid_waraft_segment_location(fid, off, value_size) do
+    if blob_ref_candidate?(ctx, value_size) do
+      case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, fid, key) do
+        {:ok, value} -> blob_gc_decode_ref(value)
+        :not_found -> {:error, {:blob_gc_live_ref_scan_failed, key, :not_found}}
+        {:error, reason} -> {:error, {:blob_gc_live_ref_scan_failed, key, reason}}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
   defp blob_gc_entry_ref(_ctx, _idx, _state, _entry), do: {:ok, nil}
 
   defp blob_gc_after_live_refs_hook(ctx, idx, live_refs) do

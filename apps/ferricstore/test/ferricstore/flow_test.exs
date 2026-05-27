@@ -4846,6 +4846,41 @@ defmodule Ferricstore.FlowTest do
     assert completed.version == 3
   end
 
+  test "terminal flows reject normal transition and cancel" do
+    id = uid("flow-terminal-guard")
+
+    assert {:ok, _} =
+             flow_create_and_get(id, type: "image", state: "queued", run_at_ms: 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("image",
+               state: "queued",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, completed} =
+             flow_complete_and_get(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               result: "result:" <> id
+             )
+
+    assert completed.state == "completed"
+
+    assert {:error, "ERR flow is terminal; use FLOW.REWIND"} =
+             flow_transition_and_get(id, "completed", "queued",
+               fencing_token: completed.fencing_token
+             )
+
+    assert {:error, "ERR flow is terminal; use FLOW.REWIND"} =
+             flow_cancel_and_get(id, fencing_token: completed.fencing_token)
+
+    assert {:ok, still_completed} = FerricStore.flow_get(id)
+    assert still_completed.state == "completed"
+  end
+
   test "flow_retry clears lease and reschedules flow" do
     id = uid("flow-retry")
 

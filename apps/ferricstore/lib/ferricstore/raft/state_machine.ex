@@ -9397,6 +9397,7 @@ defmodule Ferricstore.Raft.StateMachine do
        ) do
     with id when is_binary(id) <- Map.get(record, :id),
          :ok <- flow_require_expected_state(record, from_state),
+         :ok <- flow_reject_terminal_current(record),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
          :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)),
          :ok <- flow_reject_running_transition(to_state),
@@ -9446,6 +9447,14 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_reject_terminal_transition(to_state) do
     if Ferricstore.Flow.LMDB.terminal_state?(to_state) do
       {:error, "ERR terminal flow state requires FLOW.COMPLETE, FLOW.FAIL, or FLOW.CANCEL"}
+    else
+      :ok
+    end
+  end
+
+  defp flow_reject_terminal_current(record) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      {:error, "ERR flow is terminal; use FLOW.REWIND"}
     else
       :ok
     end
@@ -10051,6 +10060,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_prepare_cancel_existing_record(record, attrs, now_ms) do
     with :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
+         :ok <- flow_reject_terminal_current(record),
          :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
       version = Map.fetch!(record, :version) + 1
       partition_key = Map.get(record, :partition_key)
@@ -11072,27 +11082,29 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_retention_cleanup_record(state, state_key, record) do
     history_key = FlowKeys.history_key(Map.fetch!(record, :id), Map.get(record, :partition_key))
-    history_entries = flow_retention_history_entries(state, history_key)
-    history_keys = Enum.map(history_entries, &flow_retention_history_entry_key/1)
-    history_values = flow_retention_history_values(state, history_entries)
 
-    value_refs =
-      record
-      |> flow_retention_record_value_refs()
-      |> Kernel.++(flow_retention_history_value_refs(history_values))
-      |> Enum.uniq()
+    with {:ok, history_entries} <- flow_retention_history_entries(state, history_key) do
+      history_keys = Enum.map(history_entries, &flow_retention_history_entry_key/1)
+      history_values = flow_retention_history_values(state, history_entries)
 
-    shared_value_links = flow_retention_shared_value_links(state, record)
-    shared_link_keys = Enum.map(shared_value_links, fn {key, _ref} -> key end)
-    shared_value_refs = Enum.map(shared_value_links, fn {_key, ref} -> ref end)
+      value_refs =
+        record
+        |> flow_retention_record_value_refs()
+        |> Kernel.++(flow_retention_history_value_refs(history_values))
+        |> Enum.uniq()
 
-    with :ok <- flow_retention_delete_history_index(state, history_key, history_entries),
-         {:ok, history_count} <- flow_retention_delete_keys(state, history_keys),
-         {:ok, values_count} <- flow_retention_delete_keys(state, value_refs),
-         {:ok, shared_values_count} <- flow_retention_delete_keys(state, shared_value_refs),
-         {:ok, _shared_link_count} <- flow_retention_delete_keys(state, shared_link_keys),
-         :ok <- do_delete(state, state_key) do
-      {:ok, %{flows: 1, history: history_count, values: values_count + shared_values_count}}
+      shared_value_links = flow_retention_shared_value_links(state, record)
+      shared_link_keys = Enum.map(shared_value_links, fn {key, _ref} -> key end)
+      shared_value_refs = Enum.map(shared_value_links, fn {_key, ref} -> ref end)
+
+      with :ok <- flow_retention_delete_history_index(state, history_key, history_entries),
+           {:ok, history_count} <- flow_retention_delete_keys(state, history_keys),
+           {:ok, values_count} <- flow_retention_delete_keys(state, value_refs),
+           {:ok, shared_values_count} <- flow_retention_delete_keys(state, shared_value_refs),
+           {:ok, _shared_link_count} <- flow_retention_delete_keys(state, shared_link_keys),
+           :ok <- do_delete(state, state_key) do
+        {:ok, %{flows: 1, history: history_count, values: values_count + shared_values_count}}
+      end
     end
   end
 
@@ -11143,22 +11155,56 @@ defmodule Ferricstore.Raft.StateMachine do
       |> :ets.select(match_spec)
       |> Enum.map(fn key -> {key, binary_part(key, prefix_len, byte_size(key) - prefix_len)} end)
 
-    lmdb_entries =
-      if flow_lmdb_mirror?(state) do
-        case Ferricstore.Flow.LMDB.history_compound_entries(
-               flow_lmdb_record_path(state),
-               history_key,
-               flow_retention_history_lmdb_scan_limit()
-             ) do
-          {:ok, entries} -> entries
-          {:error, _reason} -> []
-        end
-      else
-        []
-      end
+    with {:ok, lmdb_entries} <- flow_retention_lmdb_history_entries(state, history_key) do
+      entries =
+        (ets_entries ++ lmdb_entries)
+        |> Enum.uniq_by(&flow_retention_history_entry_key/1)
 
-    (ets_entries ++ lmdb_entries)
-    |> Enum.uniq_by(&flow_retention_history_entry_key/1)
+      {:ok, entries}
+    end
+  end
+
+  defp flow_retention_lmdb_history_entries(state, history_key) do
+    if flow_lmdb_mirror?(state) do
+      path = flow_lmdb_record_path(state)
+      prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+      limit = flow_retention_history_lmdb_scan_limit()
+      flow_retention_lmdb_history_entries_after(path, prefix, <<>>, limit, [])
+    else
+      {:ok, []}
+    end
+  end
+
+  defp flow_retention_lmdb_history_entries_after(path, prefix, after_key, limit, acc) do
+    case Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, after_key, limit) do
+      {:ok, []} ->
+        {:ok, Enum.reverse(acc)}
+
+      {:ok, entries} ->
+        decoded = flow_retention_decode_lmdb_history_entries(entries, acc)
+        {last_key, _last_value} = List.last(entries)
+
+        if length(entries) < limit do
+          {:ok, Enum.reverse(decoded)}
+        else
+          flow_retention_lmdb_history_entries_after(path, prefix, last_key, limit, decoded)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp flow_retention_decode_lmdb_history_entries(entries, acc) do
+    Enum.reduce(entries, acc, fn {_history_index_key, value}, acc ->
+      case Ferricstore.Flow.LMDB.decode_history_index_value(value) do
+        {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
+          [{compound_key, event_id, value} | acc]
+
+        :error ->
+          acc
+      end
+    end)
   end
 
   defp flow_retention_delete_history_index(_state, _history_key, []), do: :ok

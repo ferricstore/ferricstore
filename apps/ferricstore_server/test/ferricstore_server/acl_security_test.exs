@@ -222,6 +222,27 @@ defmodule FerricstoreServer.AclSecurityTest do
       assert user.denied_commands == MapSet.new()
     end
 
+    test "new user with password starts with no command or key permissions" do
+      assert :ok = Acl.set_user("alice", ["on", ">s3cret"])
+
+      assert {:ok, "alice"} = Acl.authenticate("alice", "s3cret")
+      assert {:error, _} = Acl.check_command("alice", "GET")
+      assert {:error, _} = Acl.check_key_access("alice", "any:key", :read)
+
+      user = Acl.get_user("alice")
+      assert user.commands == MapSet.new()
+      assert user.keys == []
+    end
+
+    test "new user requires explicit command and key grants" do
+      assert :ok = Acl.set_user("alice", ["on", ">s3cret", "+GET", "~cache:*"])
+
+      assert :ok = Acl.check_command("alice", "GET")
+      assert {:error, _} = Acl.check_command("alice", "SET")
+      assert :ok = Acl.check_key_access("alice", "cache:item", :read)
+      assert {:error, _} = Acl.check_key_access("alice", "other:item", :read)
+    end
+
     test "multiple denied commands accumulate" do
       assert :ok = Acl.set_user("alice", ["on", "+@all", "-FLUSHDB", "-FLUSHALL", "-DEBUG"])
 

@@ -1,6 +1,25 @@
 import Config
 
 if config_env() == :prod do
+  boolean_env = fn name, default ->
+    case System.get_env(name) do
+      nil ->
+        default
+
+      value ->
+        case String.downcase(String.trim(value)) do
+          value when value in ["1", "true", "yes", "y", "on"] ->
+            true
+
+          value when value in ["0", "false", "no", "n", "off"] ->
+            false
+
+          _other ->
+            raise "#{name} must be a boolean: true/false, 1/0, yes/no, or on/off"
+        end
+    end
+  end
+
   log_level =
     case String.downcase(System.get_env("FERRICSTORE_LOG_LEVEL", "info")) do
       "debug" -> :debug
@@ -19,13 +38,16 @@ if config_env() == :prod do
 
       value ->
         case String.downcase(String.trim(value)) do
-          value when value in ["", "false", "off", "infinity", "inf", "unlimited"] ->
+          "" ->
+            nil
+
+          value when value in ["false", "off", "infinity", "inf", "unlimited"] ->
             :infinity
 
           value ->
             case Integer.parse(value) do
               {parsed, ""} when parsed >= 0 -> parsed
-              _other -> nil
+              _other -> raise "#{name} must be a non-negative integer or infinity/off/false"
             end
         end
     end
@@ -62,8 +84,7 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES", "262144")),
     blob_segment_max_bytes:
       String.to_integer(System.get_env("FERRICSTORE_BLOB_SEGMENT_MAX_BYTES", "268435456")),
-    blob_gc_sweeper_enabled:
-      System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_ENABLED", "true") in ["1", "true", "TRUE"],
+    blob_gc_sweeper_enabled: boolean_env.("FERRICSTORE_BLOB_GC_SWEEPER_ENABLED", true),
     blob_gc_sweeper_initial_delay_ms:
       String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INITIAL_DELAY_MS", "60000")),
     blob_gc_sweeper_interval_ms:
@@ -146,10 +167,10 @@ if config_env() == :prod do
   # Security
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    protected_mode: System.get_env("FERRICSTORE_PROTECTED_MODE", "true") == "true",
+    protected_mode: boolean_env.("FERRICSTORE_PROTECTED_MODE", true),
     maxclients: String.to_integer(System.get_env("FERRICSTORE_MAXCLIENTS", "10000")),
-    audit_log_enabled: System.get_env("FERRICSTORE_AUDIT_LOG", "false") == "true",
-    acl_auto_save: System.get_env("FERRICSTORE_ACL_AUTO_SAVE", "false") == "true"
+    audit_log_enabled: boolean_env.("FERRICSTORE_AUDIT_LOG", false),
+    acl_auto_save: boolean_env.("FERRICSTORE_ACL_AUTO_SAVE", false)
 
   # ---------------------------------------------------------------------------
   # TLS (optional)
@@ -162,7 +183,7 @@ if config_env() == :prod do
       tls_cert_file: tls_cert,
       tls_key_file: System.get_env("FERRICSTORE_TLS_KEY_FILE"),
       tls_ca_cert_file: System.get_env("FERRICSTORE_TLS_CA_CERT_FILE"),
-      require_tls: System.get_env("FERRICSTORE_REQUIRE_TLS", "false") == "true"
+      require_tls: boolean_env.("FERRICSTORE_REQUIRE_TLS", false)
   end
 
   # ---------------------------------------------------------------------------
@@ -177,7 +198,7 @@ if config_env() == :prod do
          "once" -> :once
          n -> String.to_integer(n)
        end),
-    tcp_nodelay: System.get_env("FERRICSTORE_TCP_NODELAY", "true") == "true",
+    tcp_nodelay: boolean_env.("FERRICSTORE_TCP_NODELAY", true),
     tcp_recbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_RECBUF", "131072")),
     tcp_sndbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_SNDBUF", "131072"))
 
@@ -234,7 +255,7 @@ if config_env() == :prod do
       node_name: String.to_atom(node_name),
       cookie: String.to_atom(cookie),
       cluster_role: String.to_atom(System.get_env("FERRICSTORE_CLUSTER_ROLE", "voter")),
-      cluster_auto_join: System.get_env("FERRICSTORE_CLUSTER_AUTO_JOIN", "false") == "true",
+      cluster_auto_join: boolean_env.("FERRICSTORE_CLUSTER_AUTO_JOIN", false),
       cluster_remove_delay_ms:
         String.to_integer(System.get_env("FERRICSTORE_CLUSTER_REMOVE_DELAY_MS", "60000"))
 

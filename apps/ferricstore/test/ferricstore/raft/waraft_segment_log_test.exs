@@ -899,6 +899,53 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     end
   end
 
+  test "apply projection batch read fails closed when cache hit is partial and disk read fails" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-apply-projection-partial-disk-fail-#{System.unique_integer([:positive])}"
+      )
+
+    ctx = %{data_dir: data_dir}
+    projection_index = 77
+    key_a = "partial-disk-fail:a"
+    key_b = "partial-disk-fail:b"
+
+    File.rm_rf!(data_dir)
+
+    try do
+      assert :ok =
+               Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                 data_dir,
+                 0,
+                 projection_index,
+                 [{key_a, "value-a", 0}]
+               )
+
+      segment_log_path =
+        Path.join([
+          data_dir,
+          "waraft",
+          "ferricstore_waraft_backend.1",
+          "apply_projection_log",
+          "segment_log"
+        ])
+
+      File.mkdir_p!(Path.dirname(segment_log_path))
+      File.write!(segment_log_path, "not a segment log directory")
+
+      assert {:error, _reason} =
+               Ferricstore.Raft.WARaftSegmentReader.read_values_from_location(
+                 ctx,
+                 0,
+                 {:waraft_apply_projection, projection_index},
+                 [key_a, key_b]
+               )
+    after
+      File.rm_rf!(data_dir)
+    end
+  end
+
   defp clear_segment_offset_registry do
     if :ets.info(:ferricstore_waraft_segment_offset_registry) != :undefined do
       :ets.delete_all_objects(:ferricstore_waraft_segment_offset_registry)

@@ -127,7 +127,7 @@ defmodule FerricstoreServer.AclPersistenceTest do
     end
 
     test "denied commands are serialized as -command", %{tmp_dir: dir} do
-      assert :ok = Acl.set_user("alice", ["on", "-flushdb", "-debug"])
+      assert :ok = Acl.set_user("alice", ["on", "+@all", "-flushdb", "-debug"])
       assert :ok = Acl.save(dir)
 
       contents = File.read!(Acl.acl_file_path(dir))
@@ -278,7 +278,7 @@ defmodule FerricstoreServer.AclPersistenceTest do
     end
 
     test "preserves denied commands (denied_commands MapSet)", %{tmp_dir: dir} do
-      assert :ok = Acl.set_user("alice", ["on", "-flushdb", "-debug"])
+      assert :ok = Acl.set_user("alice", ["on", "+@all", "-flushdb", "-debug"])
       assert :ok = Acl.save(dir)
 
       Acl.reset!()
@@ -656,7 +656,7 @@ defmodule FerricstoreServer.AclPersistenceTest do
     end
 
     test "loaded denied commands are enforced", %{tmp_dir: dir} do
-      assert :ok = Acl.set_user("alice", ["on", ">pass", "-flushdb"])
+      assert :ok = Acl.set_user("alice", ["on", ">pass", "+@all", "-flushdb"])
       assert :ok = Acl.save(dir)
 
       Acl.reset!()

@@ -226,7 +226,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
             {:ok, found}
 
           {:error, reason} ->
-            if map_size(found) > 0, do: {:ok, found}, else: {:error, reason}
+            {:error, reason}
         end
     end
   end
@@ -252,7 +252,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         {:ok, found}
 
       {:error, reason} ->
-        if map_size(found) > 0, do: {:ok, found}, else: {:error, reason}
+        {:error, reason}
     end
   end
 

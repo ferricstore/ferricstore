@@ -204,6 +204,11 @@ defmodule Ferricstore.Raft.WARaftBackend do
   end
 
   @doc false
+  def __redirectable_write_error_for_test__(error) do
+    redirectable_write_error?(error)
+  end
+
+  @doc false
   def __redirect_membership_failure_for_test__(kind, reason) do
     redirect_membership_failure(kind, reason)
   end
@@ -1120,18 +1125,20 @@ defmodule Ferricstore.Raft.WARaftBackend do
        when redirects_left <= 0,
        do: error
 
-  defp maybe_redirect_commit({:error, :not_leader} = error, shard_index, command, redirects_left) do
-    case local_leader_node(shard_index) do
-      node_name when is_atom(node_name) and not is_nil(node_name) and node_name != node() ->
-        redirect_commit(node_name, shard_index, command, redirects_left)
-
-      _other ->
-        error
+  defp maybe_redirect_commit(error, shard_index, command, redirects_left) do
+    if redirectable_write_error?(error) do
+      maybe_redirect_write_to_leader(error, shard_index, command, redirects_left)
+    else
+      error
     end
   end
 
-  defp maybe_redirect_commit(
-         {:error, :not_leader_after_submit} = error,
+  defp redirectable_write_error?({:error, :not_leader}), do: true
+  defp redirectable_write_error?({:error, {:notify_redirect, _peer}}), do: true
+  defp redirectable_write_error?(_error), do: false
+
+  defp maybe_redirect_write_to_leader(
+         {:error, :not_leader} = error,
          shard_index,
          command,
          redirects_left
@@ -1145,7 +1152,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
     end
   end
 
-  defp maybe_redirect_commit(
+  defp maybe_redirect_write_to_leader(
          {:error, {:notify_redirect, peer}} = error,
          shard_index,
          command,
@@ -1159,8 +1166,6 @@ defmodule Ferricstore.Raft.WARaftBackend do
         error
     end
   end
-
-  defp maybe_redirect_commit(error, _shard_index, _command, _redirects_left), do: error
 
   defp redirect_commit(node_name, shard_index, command, redirects_left) do
     try do

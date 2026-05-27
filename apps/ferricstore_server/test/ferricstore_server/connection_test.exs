@@ -186,6 +186,52 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "BLPOP timeout preserves PING sent while the connection is blocked", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "blocked-ping:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, ["BLPOP", key, "0.1"])
+    Process.sleep(20)
+    send_command(sock, ["PING"])
+
+    assert [nil, {:simple, "PONG"}] = recv_values(sock, 2)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "CLIENT KILL ID interrupts a blocked BLPOP connection", %{port: port} do
+    blocked = connect(port)
+    send_raw(blocked, hello3())
+    _greeting = recv(blocked)
+
+    send_command(blocked, ["CLIENT", "ID"])
+    assert [blocked_id] = recv_values(blocked, 1)
+
+    key = "blocked-kill:" <> Integer.to_string(System.unique_integer([:positive]))
+    send_command(blocked, ["BLPOP", key, "5"])
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> Ferricstore.Waiters.total_count() > 0 end,
+      "BLPOP waiter registered",
+      100,
+      5
+    )
+
+    killer = connect(port)
+    send_raw(killer, hello3())
+    _greeting = recv(killer)
+
+    send_command(killer, ["CLIENT", "KILL", "ID", Integer.to_string(blocked_id)])
+    assert [{:simple, "OK"}] = recv_values(killer, 1)
+
+    assert closed_or_eof?(blocked)
+
+    :gen_tcp.close(killer)
+  end
+
   test "pure pipeline segments prepend encoded entries without list concatenation" do
     source = File.read!("lib/ferricstore_server/connection/pipeline.ex")
 

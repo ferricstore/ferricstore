@@ -9,7 +9,7 @@ defmodule FerricstoreServer.Connection.Blocking do
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
-  @type conn_result :: {:continue, iodata(), map()} | {:block, map()} | {:close, iodata(), map()}
+  @type conn_result :: {:continue, iodata(), map()} | {:quit, iodata(), map()}
 
   @spec dispatch_blpop_ast([binary()], non_neg_integer(), map()) :: conn_result()
   @doc false
@@ -204,15 +204,13 @@ defmodule FerricstoreServer.Connection.Blocking do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
-    result = block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+    {result, state} = block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
 
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
     case result do
       :client_closed ->
-        cleanup_connection(state)
-        state.transport.close(state.socket)
-        {:quit, Encoder.encode(nil), state}
+        {:quit, "", state}
 
       {:ok, value} ->
         notify_blocking_pop_success(pop_cmd, value, state)
@@ -227,46 +225,56 @@ defmodule FerricstoreServer.Connection.Blocking do
   end
 
   defp block_wait_loop(state, deadline, timeout_ms, pop_cmd, store) do
+    block_wait_loop(state, deadline, timeout_ms, pop_cmd, store, [])
+  end
+
+  defp block_wait_loop(state, deadline, timeout_ms, pop_cmd, store, buffered_chunks) do
     remaining = max(0, deadline - System.monotonic_time(:millisecond))
 
     receive do
       {:waiter_notify, notified_key} ->
-        case safe_list_handle(pop_cmd, [notified_key], store) do
-          {:ok, nil} -> nil
-          {:ok, {:error, _}} -> nil
-          {:ok, value} -> {:ok, [notified_key, value]}
-          {:error, err} -> {:error, err}
-        end
+        result =
+          case safe_list_handle(pop_cmd, [notified_key], store) do
+            {:ok, nil} -> nil
+            {:ok, {:error, _}} -> nil
+            {:ok, value} -> {:ok, [notified_key, value]}
+            {:error, err} -> {:error, err}
+          end
+
+        {result, append_buffered_data(state, buffered_chunks)}
 
       # TCP data arriving during block -- buffer it and keep waiting.
-      {:tcp, _socket, _data} ->
-        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+      {:tcp, _socket, data} ->
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store, [data | buffered_chunks])
 
-      {:ssl, _socket, _data} ->
-        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+      {:ssl, _socket, data} ->
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store, [data | buffered_chunks])
 
       {:tcp_passive, _socket} ->
         state.transport.setopts(state.socket, active: state.active_mode)
-        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store, buffered_chunks)
 
       {:ssl_passive, _socket} ->
         state.transport.setopts(state.socket, active: state.active_mode)
-        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store, buffered_chunks)
 
       {:tcp_closed, _socket} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
 
       {:tcp_error, _socket, _reason} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
 
       {:ssl_closed, _socket} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
 
       {:ssl_error, _socket, _reason} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
+
+      :client_kill ->
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
     after
       remaining ->
-        nil
+        {nil, append_buffered_data(state, buffered_chunks)}
     end
   end
 
@@ -287,15 +295,13 @@ defmodule FerricstoreServer.Connection.Blocking do
       end
     end
 
-    result = generic_wait_loop(state, deadline, timeout_ms, notify_fn)
+    {result, state} = generic_wait_loop(state, deadline, timeout_ms, notify_fn)
 
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
     case result do
       :client_closed ->
-        cleanup_connection(state)
-        state.transport.close(state.socket)
-        {:quit, Encoder.encode(nil), state}
+        {:quit, "", state}
 
       {:ok, value} ->
         notify_blmove_success(source, destination, value, state)
@@ -330,15 +336,13 @@ defmodule FerricstoreServer.Connection.Blocking do
       end
     end
 
-    result = generic_wait_loop(state, deadline, timeout_ms, notify_fn)
+    {result, state} = generic_wait_loop(state, deadline, timeout_ms, notify_fn)
 
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
     case result do
       :client_closed ->
-        cleanup_connection(state)
-        state.transport.close(state.socket)
-        {:quit, Encoder.encode(nil), state}
+        {:quit, "", state}
 
       {:ok, value} ->
         notify_blocking_pop_success(pop_cmd, value, state)
@@ -382,7 +386,7 @@ defmodule FerricstoreServer.Connection.Blocking do
       end
     end
 
-    result =
+    {result, state} =
       generic_wait_loop(state, deadline, effective_timeout, notify_fn,
         waiter_msg: :stream_waiter_notify
       )
@@ -392,9 +396,7 @@ defmodule FerricstoreServer.Connection.Blocking do
 
     case result do
       :client_closed ->
-        cleanup_connection(state)
-        state.transport.close(state.socket)
-        {:quit, Encoder.encode(nil), state}
+        {:quit, "", state}
 
       {:ok, value} ->
         new_state = ConnTracking.maybe_track_read(cmd, args, value, state)
@@ -421,10 +423,10 @@ defmodule FerricstoreServer.Connection.Blocking do
           end
         end
 
-        result =
+        {result, state} =
           case safe_dispatch({:flow_claim_due, type, claim_opts}, store) do
             result when is_list(result) and result != [] ->
-              {:ok, result}
+              {{:ok, result}, state}
 
             [] ->
               generic_wait_loop(state, deadline, timeout_ms, notify_fn,
@@ -432,19 +434,17 @@ defmodule FerricstoreServer.Connection.Blocking do
               )
 
             {:error, _reason} = error ->
-              {:error, error}
+              {{:error, error}, state}
 
             _other ->
-              nil
+              {nil, state}
           end
 
         ClaimWaiters.unregister(keys, self())
 
         case result do
           :client_closed ->
-            cleanup_connection(state)
-            state.transport.close(state.socket)
-            {:quit, Encoder.encode(nil), state}
+            {:quit, "", state}
 
           {:ok, value} ->
             {:continue, Encoder.encode(value), state}
@@ -468,41 +468,60 @@ defmodule FerricstoreServer.Connection.Blocking do
   # handles TCP events inline, and calls notify_fn when the waiter is notified.
   # This avoids the active: :once deadlock bug.
   defp generic_wait_loop(state, deadline, _timeout_ms, notify_fn, opts \\ []) do
+    generic_wait_loop_buffered(state, deadline, notify_fn, opts, [])
+  end
+
+  defp generic_wait_loop_buffered(state, deadline, notify_fn, opts, buffered_chunks) do
     remaining = max(0, deadline - System.monotonic_time(:millisecond))
     waiter_msg = Keyword.get(opts, :waiter_msg, :waiter_notify)
 
     receive do
       {^waiter_msg, notified_key} ->
-        notify_fn.(notified_key)
+        {notify_fn.(notified_key), append_buffered_data(state, buffered_chunks)}
 
-      {:tcp, _socket, _data} ->
-        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+      {:tcp, _socket, data} ->
+        generic_wait_loop_buffered(state, deadline, notify_fn, opts, [data | buffered_chunks])
 
-      {:ssl, _socket, _data} ->
-        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+      {:ssl, _socket, data} ->
+        generic_wait_loop_buffered(state, deadline, notify_fn, opts, [data | buffered_chunks])
 
       {:tcp_passive, _socket} ->
         state.transport.setopts(state.socket, active: state.active_mode)
-        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+        generic_wait_loop_buffered(state, deadline, notify_fn, opts, buffered_chunks)
 
       {:ssl_passive, _socket} ->
         state.transport.setopts(state.socket, active: state.active_mode)
-        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+        generic_wait_loop_buffered(state, deadline, notify_fn, opts, buffered_chunks)
 
       {:tcp_closed, _socket} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
 
       {:tcp_error, _socket, _reason} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
 
       {:ssl_closed, _socket} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
 
       {:ssl_error, _socket, _reason} ->
-        :client_closed
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
+
+      :client_kill ->
+        {:client_closed, append_buffered_data(state, buffered_chunks)}
     after
       remaining ->
-        nil
+        {nil, append_buffered_data(state, buffered_chunks)}
+    end
+  end
+
+  defp append_buffered_data(state, []), do: state
+
+  defp append_buffered_data(state, buffered_chunks) do
+    buffered = IO.iodata_to_binary(Enum.reverse(buffered_chunks))
+
+    if state.buffer == "" do
+      %{state | buffer: buffered}
+    else
+      %{state | buffer: state.buffer <> buffered}
     end
   end
 
@@ -556,26 +575,6 @@ defmodule FerricstoreServer.Connection.Blocking do
       {:error, {:error, "ERR internal error: #{inspect({kind, reason})}"}}
   end
 
-  # Cleanup helper -- delegates to the same logic as the main connection module.
-  defp cleanup_connection(state) do
-    duration_ms = System.monotonic_time(:millisecond) - state.created_at
-
-    Ferricstore.AuditLog.log(:connection_close, %{
-      client_id: state.client_id,
-      client_ip: format_peer(state.peer),
-      duration_ms: duration_ms
-    })
-
-    if state.pubsub_channels != nil or state.pubsub_patterns != nil do
-      Ferricstore.PubSub.cleanup(self())
-    end
-
-    FerricstoreServer.ClientTracking.cleanup(self())
-    Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
-    Ferricstore.Flow.ClaimWaiters.cleanup(self())
-    Ferricstore.Stats.decr_connections()
-  end
-
   defp safe_dispatch(ast, store) do
     Ferricstore.Commands.Dispatcher.dispatch_ast(ast, store)
   catch
@@ -588,7 +587,4 @@ defmodule FerricstoreServer.Connection.Blocking do
     kind, reason ->
       {:error, "ERR internal error: #{inspect({kind, reason})}"}
   end
-
-  defp format_peer(nil), do: "unknown"
-  defp format_peer({ip, port}), do: "#{:inet.ntoa(ip)}:#{port}"
 end

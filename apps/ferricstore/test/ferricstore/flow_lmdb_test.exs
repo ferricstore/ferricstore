@@ -636,11 +636,11 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, 1} =
              Ferricstore.Flow.LMDB.prefix_count(
                fixture.lmdb_path,
-             Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
-           )
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
   end
 
-  test "terminal Flow state projection leaves stale active LMDB rows to query post-filtering" do
+  test "terminal Flow state projection removes stale active LMDB rows" do
     fixture = start_active_lmdb_projection_fixture!("terminal-fast-state")
 
     active =
@@ -677,7 +677,11 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, ^encoded_completed} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
 
     completed_state_key =
-      Ferricstore.Flow.Keys.state_index_key(completed.type, completed.state, completed.partition_key)
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
 
     assert {:ok, 1} =
              Ferricstore.Flow.LMDB.prefix_count(
@@ -685,7 +689,16 @@ defmodule Ferricstore.Flow.LMDBTest do
                Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
              )
 
-    assert {:ok, ^active_reverse} =
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(active.type, active.state, active.partition_key)
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+
+    assert :not_found =
              Ferricstore.Flow.LMDB.get(
                fixture.lmdb_path,
                Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
@@ -4561,6 +4574,189 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     events = Map.new(history, fn {_event_id, fields} -> {fields["event"], fields} end)
     assert events["created"]["payload"] == initial_payload
+  end
+
+  test "retention cleanup removes value refs that only survive in cold LMDB history" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_flush_interval =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+    end)
+
+    id = "retention-cold-history-ref"
+    partition_key = "tenant-retention-cold-history-ref"
+    flow_type = "retention-cold-history-ref"
+    initial_payload = String.duplicate("i", 1024)
+    next_payload = String.duplicate("n", 1024)
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: initial_payload,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, created} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, [first_claim]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-cold-history-ref-1",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.transition(ctx, id, "running", "waiting",
+               partition_key: partition_key,
+               lease_token: first_claim.lease_token,
+               fencing_token: first_claim.fencing_token,
+               payload: next_payload,
+               run_at_ms: now + 2,
+               now_ms: now + 2
+             )
+
+    assert {:ok, transitioned} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+    assert transitioned.payload_ref != created.payload_ref
+
+    assert {:ok, [second_claim]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-cold-history-ref-2",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 3
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, second_claim.lease_token,
+               partition_key: partition_key,
+               fencing_token: second_claim.fencing_token,
+               now_ms: now + 4
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    refute_keydir_row!(ctx, created.payload_ref)
+
+    assert {:ok, [^initial_payload, ^next_payload]} =
+             Ferricstore.Flow.value_mget(ctx, [created.payload_ref, transitioned.payload_ref])
+
+    Process.sleep(5)
+
+    assert {:ok, cleaned} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert cleaned.flows == 1
+    assert cleaned.history >= 1
+    assert cleaned.values >= 2
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, [nil, nil]} =
+             Ferricstore.Flow.value_mget(ctx, [created.payload_ref, transitioned.payload_ref])
+  end
+
+  test "retention cleanup pages cold LMDB history without orphaning rows" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+    old_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit, 1)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_lmdb_history_cleanup_scan_limit, old_scan_limit)
+    end)
+
+    id = "retention-cold-history-paged"
+    partition_key = "tenant-retention-cold-history-paged"
+    flow_type = "retention-cold-history-paged"
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-cold-history-paged",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 2
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    lmdb_path = Ferricstore.Flow.LMDB.path(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0))
+
+    assert {:ok, history_count} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert history_count > 1
+
+    Process.sleep(5)
+
+    assert {:ok, cleaned} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert cleaned.flows == 1
+    assert cleaned.history == history_count
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
   end
 
   test "async history hard cap removes trimmed events from LMDB projection" do

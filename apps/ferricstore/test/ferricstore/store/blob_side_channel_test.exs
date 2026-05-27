@@ -1537,6 +1537,45 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert :binary.copy("P", 1024) == GenServer.call(shard, {:compound_get, redis_key, field})
   end
 
+  test "blob garbage sweep preserves live refs stored behind WARaft segment locations" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 0,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "blob:gc:waraft-segment-live"
+    payload = :binary.copy("W", 1536)
+
+    try do
+      Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+      assert :ok =
+               Ferricstore.Raft.WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log
+               )
+
+      assert :ok = Ferricstore.Raft.WARaftBackend.write(0, {:put, key, payload, 0})
+
+      assert [
+               {^key, nil, 0, _lfu, {:waraft_segment, index}, offset, value_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+      assert is_integer(index) and index > 0
+      assert is_integer(offset) and offset >= 0
+      assert value_size == BlobRef.encoded_size()
+      assert payload == Router.get(ctx, key)
+
+      assert {:ok, _stats} = Router.sweep_blob_garbage(ctx)
+      assert payload == Router.get(ctx, key)
+    after
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+      Ferricstore.Raft.WARaftBackend.stop()
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "blob garbage sweep skips deletion while Ra replay cursor still covers possible blob refs",
        %{ctx: ctx, shard: shard} do
     payload = "dead-but-possibly-still-in-raft-log"

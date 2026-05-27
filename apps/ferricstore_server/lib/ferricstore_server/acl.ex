@@ -843,9 +843,9 @@ defmodule FerricstoreServer.Acl do
           %{
             enabled: false,
             password: nil,
-            commands: :all,
+            commands: MapSet.new(),
             denied_commands: MapSet.new(),
-            keys: :all
+            keys: []
           }
         end
 

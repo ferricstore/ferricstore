@@ -358,7 +358,8 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
           "+auth",
           "+hello",
           "+ping",
-          "+command"
+          "+command",
+          "~*"
         ])
 
       {sock, resp} = connect_and_auth(port, "limited", "limitpass")
@@ -537,7 +538,16 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
 
     test "switching user via AUTH changes command permissions", %{port: port} do
       :ok =
-        Acl.set_user("reader", ["on", ">readpass", "-@all", "+get", "+auth", "+hello", "+command"])
+        Acl.set_user("reader", [
+          "on",
+          ">readpass",
+          "-@all",
+          "+get",
+          "+auth",
+          "+hello",
+          "+command",
+          "~*"
+        ])
 
       :ok =
         Acl.set_user("writer", [
@@ -547,7 +557,8 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
           "+set",
           "+auth",
           "+hello",
-          "+command"
+          "+command",
+          "~*"
         ])
 
       {sock, _} = connect_and_auth(port, "reader", "readpass")
@@ -592,7 +603,8 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
           "+auth",
           "+hello",
           "+del",
-          "+command"
+          "+command",
+          "~*"
         ])
 
       {sock, _} = connect_and_auth(port, "stressuser", "stresspass")

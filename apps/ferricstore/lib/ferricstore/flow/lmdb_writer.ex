@@ -908,18 +908,17 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp expand_flow_state_projection(path, state_key, expire_at_ms, record, acc) do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      # Active Flow truth is maintained by the native ordered index and durable
-      # state records. Terminal cold projection must not pay a per-flow LMDB
-      # lookup to clean old active LMDB rows that normal reads do not consult.
-      expand_path_op(
-        path,
-        {:terminal_project, Map.fetch!(record, :id), Map.fetch!(record, :type),
-         Map.fetch!(record, :state), Map.get(record, :partition_key),
-         Map.get(record, :updated_at_ms, 0), state_key, expire_at_ms,
-         Map.get(record, :parent_flow_id), Map.get(record, :root_flow_id),
-         Map.get(record, :correlation_id)},
-        acc
-      )
+      with {:ok, acc} <- maybe_expand_stale_active_delete(path, state_key, acc) do
+        expand_path_op(
+          path,
+          {:terminal_project, Map.fetch!(record, :id), Map.fetch!(record, :type),
+           Map.fetch!(record, :state), Map.get(record, :partition_key),
+           Map.get(record, :updated_at_ms, 0), state_key, expire_at_ms,
+           Map.get(record, :parent_flow_id), Map.get(record, :root_flow_id),
+           Map.get(record, :correlation_id)},
+          acc
+        )
+      end
     else
       with {:ok, acc} <- maybe_expand_stale_terminal_delete(path, state_key, acc),
            {:ok, acc} <- maybe_expand_stale_active_delete(path, state_key, acc) do

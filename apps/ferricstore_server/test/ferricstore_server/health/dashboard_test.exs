@@ -515,6 +515,22 @@ defmodule FerricstoreServer.Health.DashboardTest do
       assert body =~ ~s(name="next" value="/dashboard/flow")
     end
 
+    test "dashboard login rejects control bytes in next before writing Location" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+      :ok = FerricstoreServer.Acl.set_user("dash", ["on", ">secret"])
+
+      response =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "dash",
+          "password" => "secret",
+          "next" => "/dashboard\r\nX-Injected: yes"
+        })
+
+      assert extract_status_code(response) == 302
+      assert extract_header(response, "location") == "/dashboard"
+      refute extract_header(response, "x-injected")
+    end
+
     test "ACL login creates a dashboard session for permitted commands" do
       Application.put_env(:ferricstore, :protected_mode, true)
 

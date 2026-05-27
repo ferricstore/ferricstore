@@ -1404,6 +1404,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   defp sanitize_dashboard_next(path) when is_binary(path) do
     cond do
       path == "" -> "/dashboard"
+      has_control_byte?(path) -> "/dashboard"
       String.starts_with?(path, "//") -> "/dashboard"
       String.starts_with?(path, "/dashboard/login") -> "/dashboard"
       String.starts_with?(path, "/dashboard") -> path
@@ -1412,6 +1413,12 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp sanitize_dashboard_next(_path), do: "/dashboard"
+
+  defp has_control_byte?(path) do
+    :binary.match(path, [<<"\r">>, <<"\n">>]) != :nomatch or
+      :binary.match(path, for(byte <- 0..31, byte not in [?\r, ?\n], do: <<byte>>)) != :nomatch or
+      :binary.match(path, <<127>>) != :nomatch
+  end
 
   defp render_login_page(next, error) do
     safe_next = sanitize_dashboard_next(next)

@@ -376,10 +376,16 @@ defmodule FerricstoreServer.Connection do
 
           # If SUBSCRIBE was dispatched, switch to the pubsub loop.
           # in_pubsub_mode? is a nil check (O(1)) for non-pubsub connections.
-          if in_pubsub_mode?(new_state) do
-            pubsub_loop(new_state)
-          else
-            loop(new_state)
+          cond do
+            in_pubsub_mode?(new_state) ->
+              pubsub_loop(new_state)
+
+            new_state.buffer != "" ->
+              buffered = new_state.buffer
+              handle_data(%{new_state | buffer: ""}, buffered)
+
+            true ->
+              loop(new_state)
           end
       end
     end
