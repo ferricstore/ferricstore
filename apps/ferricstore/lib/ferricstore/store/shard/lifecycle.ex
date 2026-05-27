@@ -19,6 +19,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @default_sweep_interval_ms 5_000
   @default_max_keys_per_sweep 100
   @default_frag_check_interval_ms 60_000
+  @default_recovery_scan_page_size 8_192
   @log_header_size 26
 
   # Number of consecutive ceiling-hit sweeps before emitting the
@@ -132,19 +133,15 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     log_path = Path.join(shard_path, log_name)
     fid = log_name |> String.trim_trailing(".log") |> String.to_integer()
 
-    # v2_scan_file returns {:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}
-    case NIF.v2_scan_file(log_path) do
-      {:ok, records} ->
-        Enum.each(records, fn record ->
-          recover_record(keydir, shard_index, fid, record, instance_ctx)
-        end)
-
-      {:error, reason} ->
-        fail_recovery_scan!(:recover_from_log, log_path, shard_index, reason)
-
-      other ->
-        fail_recovery_scan!(:recover_from_log, log_path, shard_index, {:unexpected, other})
-    end
+    recover_from_log_pages(
+      log_path,
+      0,
+      keydir,
+      shard_index,
+      fid,
+      instance_ctx,
+      :recover_from_log
+    )
   end
 
   defp recover_from_log_from_offset(
@@ -158,22 +155,92 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     log_path = Path.join(shard_path, log_name)
     fid = log_file_id(log_name)
 
-    case NIF.v2_scan_file_from_offset(log_path, offset) do
-      {:ok, records} ->
+    recover_from_log_pages(
+      log_path,
+      offset,
+      keydir,
+      shard_index,
+      fid,
+      instance_ctx,
+      :recover_from_log_from_offset
+    )
+  end
+
+  defp recover_from_log_pages(
+         log_path,
+         offset,
+         keydir,
+         shard_index,
+         fid,
+         instance_ctx,
+         operation
+       ) do
+    page_size = recovery_scan_page_size()
+
+    recover_from_log_pages(
+      log_path,
+      offset,
+      page_size,
+      keydir,
+      shard_index,
+      fid,
+      instance_ctx,
+      operation
+    )
+  end
+
+  defp recover_from_log_pages(
+         log_path,
+         offset,
+         page_size,
+         keydir,
+         shard_index,
+         fid,
+         instance_ctx,
+         operation
+       ) do
+    case NIF.v2_scan_file_page(log_path, offset, page_size) do
+      {:ok, records, next_offset, done?} ->
         Enum.each(records, fn record ->
           recover_record(keydir, shard_index, fid, record, instance_ctx)
         end)
 
+        cond do
+          done? ->
+            :ok
+
+          is_integer(next_offset) and next_offset > offset ->
+            recover_from_log_pages(
+              log_path,
+              next_offset,
+              page_size,
+              keydir,
+              shard_index,
+              fid,
+              instance_ctx,
+              operation
+            )
+
+          true ->
+            fail_recovery_scan!(operation, log_path, shard_index, {:non_advancing_scan, offset})
+        end
+
       {:error, reason} ->
-        fail_recovery_scan!(:recover_from_log_from_offset, log_path, shard_index, reason)
+        fail_recovery_scan!(operation, log_path, shard_index, reason)
 
       other ->
-        fail_recovery_scan!(
-          :recover_from_log_from_offset,
-          log_path,
-          shard_index,
-          {:unexpected, other}
-        )
+        fail_recovery_scan!(operation, log_path, shard_index, {:unexpected, other})
+    end
+  end
+
+  defp recovery_scan_page_size do
+    case Application.get_env(
+           :ferricstore,
+           :recovery_scan_page_size,
+           @default_recovery_scan_page_size
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @default_recovery_scan_page_size
     end
   end
 
@@ -455,10 +522,9 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Raft startup
   # -------------------------------------------------------------------
 
-  # Returns true if this shard has a pre-existing Batcher process (started by
-  # Application.start for shards 0..N-1). If so, also starts the ra server
-  # for this shard. Isolated test shards with ad-hoc indices won't have a
-  # Batcher and fall back to the direct write path.
+  # WARaft owns default-instance replication outside the Shard GenServer. This
+  # helper remains for old lifecycle call sites and reports whether the
+  # production WARaft batcher for this shard exists.
   @spec start_raft_if_available(
           non_neg_integer(),
           binary(),
@@ -478,34 +544,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         instance_name \\ :default,
         opts \\ []
       ) do
-    batcher_name = Ferricstore.Raft.Batcher.batcher_name(index)
-
-    if Process.whereis(batcher_name) != nil do
-      try do
-        case Ferricstore.Raft.Cluster.start_shard_server(
-               index,
-               shard_data_path,
-               active_file_id,
-               active_file_path,
-               ets,
-               Keyword.put_new(opts, :instance_name, instance_name)
-             ) do
-          :ok ->
-            true
-
-          {:error, reason} ->
-            exit({:raft_start_failed, reason})
-        end
-      catch
-        :exit, {:raft_start_failed, _reason} = start_failure ->
-          exit(start_failure)
-
-        kind, reason ->
-          exit({:raft_start_failed, {kind, reason}})
-      end
-    else
-      false
-    end
+    _ = {shard_data_path, active_file_id, active_file_path, ets, instance_name, opts}
+    Process.whereis(Ferricstore.Raft.Batcher.batcher_name(index)) != nil
   end
 
   # -------------------------------------------------------------------
@@ -785,23 +825,67 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp recover_tombstones_from_full_scan(log_path, keydir, shard_index, fid, instance_ctx) do
-    case NIF.v2_scan_file(log_path) do
-      {:ok, records} ->
+    recover_tombstones_from_full_scan_pages(
+      log_path,
+      0,
+      recovery_scan_page_size(),
+      keydir,
+      shard_index,
+      fid,
+      instance_ctx
+    )
+  end
+
+  defp recover_tombstones_from_full_scan_pages(
+         log_path,
+         offset,
+         page_size,
+         keydir,
+         shard_index,
+         fid,
+         instance_ctx
+       ) do
+    case NIF.v2_scan_file_page(log_path, offset, page_size) do
+      {:ok, records, next_offset, done?} ->
         Enum.each(records, fn
-          {key, offset, value_size, expire_at_ms, true} ->
+          {key, record_offset, value_size, expire_at_ms, true} ->
             record_size = @log_header_size + byte_size(key) + value_size
 
             recover_hint_tombstone(
               keydir,
               shard_index,
               fid,
-              {key, offset, record_size, expire_at_ms},
+              {key, record_offset, record_size, expire_at_ms},
               instance_ctx
             )
 
           _record ->
             :ok
         end)
+
+        cond do
+          done? ->
+            :ok
+
+          is_integer(next_offset) and next_offset > offset ->
+            recover_tombstones_from_full_scan_pages(
+              log_path,
+              next_offset,
+              page_size,
+              keydir,
+              shard_index,
+              fid,
+              instance_ctx
+            )
+
+          true ->
+            fail_recovery_scan!(
+              :recover_tombstones_from_full_scan,
+              log_path,
+              shard_index,
+              {:non_advancing_scan, offset}
+            )
+        end
 
       {:error, reason} ->
         fail_recovery_scan!(:recover_tombstones_from_full_scan, log_path, shard_index, reason)

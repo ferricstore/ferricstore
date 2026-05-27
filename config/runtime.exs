@@ -88,6 +88,12 @@ if config_env() == :prod do
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
 
+  # These override adaptive memory-budget caps. The apply-projection cache is
+  # the important Flow/LMDB-adjacent one: it buffers WARaft-applied Flow
+  # state/value rows until lagged LMDB/history projection can consume them.
+  # Too low a value forces synchronous spill/compaction during terminal-flow
+  # bursts; tune it with the DBOS-style 1M Flow benchmark, not by lowering it
+  # to reduce steady-state LMDB lag.
   memory_budget_overrides =
     [
       flow_history_projector_max_pending_entries:
@@ -101,7 +107,9 @@ if config_env() == :prod do
       waraft_segment_log_max_ets_entries:
         limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES"),
       waraft_segment_log_min_ets_entries:
-        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES")
+        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES"),
+      waraft_apply_projection_cache_max_entries:
+        limit_env.("FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES")
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
 
@@ -174,19 +182,11 @@ if config_env() == :prod do
     tcp_sndbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_SNDBUF", "131072"))
 
   # ---------------------------------------------------------------------------
-  # Raft / Internals
+  # Replication / Internals
   # ---------------------------------------------------------------------------
   config :ferricstore,
     release_cursor_interval:
       String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")),
-    ra_segment_max_entries:
-      String.to_integer(System.get_env("FERRICSTORE_RA_SEGMENT_MAX_ENTRIES", "1048576")),
-    ra_segment_max_size_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RA_SEGMENT_MAX_SIZE_BYTES", "256000000")),
-    ra_wal_max_size_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RA_WAL_MAX_SIZE_BYTES", "8589934592")),
-    ra_wal_compute_checksums:
-      System.get_env("FERRICSTORE_RA_WAL_COMPUTE_CHECKSUMS", "true") in ["1", "true", "TRUE"],
     raft_batcher_max_pending:
       String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_PENDING", "256")),
     raft_batcher_max_pending_bytes:
@@ -206,10 +206,8 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_KEEP", "100000")),
     waraft_max_retained_entries:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES", "100000")),
-    ra_min_snapshot_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "10000000")),
-    ra_min_checkpoint_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_CHECKPOINT_INTERVAL", "1000000")),
+    waraft_commit_batch_max:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_COMMIT_BATCH_MAX", "10000")),
     promotion_threshold:
       String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100")),
     wal_commit_delay_us:
@@ -222,8 +220,7 @@ if config_env() == :prod do
     supervisor_max_restarts: {
       String.to_integer(System.get_env("FERRICSTORE_MAX_RESTARTS", "20")),
       String.to_integer(System.get_env("FERRICSTORE_MAX_RESTARTS_SECONDS", "10"))
-    },
-    observability_token: System.get_env("FERRICSTORE_OBSERVABILITY_TOKEN")
+    }
 
   # ---------------------------------------------------------------------------
   # Clustering

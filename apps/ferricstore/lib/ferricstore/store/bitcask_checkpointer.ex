@@ -5,13 +5,13 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   Replaces the per-apply `v2_fsync` in `StateMachine.flush_pending_writes` and
   the old shard-level `fsync_needed` deferred fsync timer. One shared
   mechanism, one shared flag (atomics on the Instance), covering all write
-  paths (Raft state machine + async BitcaskWriter).
+  paths (WARaft state machine + direct test-instance Bitcask writes).
 
   ## Correctness
 
-  Ra WAL is the source of truth for client-visible durability. Writes hit
+  The WARaft segment log is the source of truth for client-visible durability. Writes hit
   Bitcask data files via `v2_append_batch_nosync` (page cache only). On a
-  crash, the Ra log replays any post-checkpoint entries and rebuilds the
+  crash, the WARaft log replays any post-checkpoint entries and rebuilds the
   Bitcask state exactly — no acknowledged data is lost.
 
   The checkpointer's job is to move data from page cache to disk on a
@@ -31,8 +31,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   a false-clean window where Raft could release log entries while Bitcask
   bytes are still only in page cache. A writer that arrives during fsync
   re-sets the dirty flag, so the next tick picks it up. The current fsync
-  may miss bytes from that concurrent write, which is fine because Ra WAL
-  is authoritative.
+  may miss bytes from that concurrent write, which is fine because the WARaft
+  segment log is authoritative.
 
   On fsync error (disk full, I/O error), we re-set the flag so the next
   tick retries, and raise DiskPressure to shed writes.
@@ -40,9 +40,9 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   ## Configuration
 
     * `:checkpoint_interval_ms` (default 10_000 = 10s) — how often to
-      check the flag. Ra WAL is fdatasync'd per batch and is the source
+      check the flag. The WARaft segment log is fdatasync'd per batch and is the source
       of truth for acknowledged writes, so a large interval is safe:
-      on kernel panic we replay up to one interval's worth of Ra log
+      on kernel panic we replay up to one interval's worth of WARaft log
       entries and rebuild Bitcask exactly. Short intervals mean more
       fsync syscalls per shard for no durability gain.
     * `:checkpoint_idle_ms` (default 250ms) — if writes are still moving
@@ -173,8 +173,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
     :ok
   rescue
-    # ActiveFile entry may be missing if the shard is gone. Not fatal —
-    # Ra WAL replay covers us. Emit telemetry so observers see the skip.
+    # ActiveFile entry may be missing if the shard is gone. Not fatal: WARaft
+    # log replay covers us. Emit telemetry so observers see the skip.
     exception ->
       :telemetry.execute(
         [:ferricstore, :bitcask, :checkpoint_shutdown],

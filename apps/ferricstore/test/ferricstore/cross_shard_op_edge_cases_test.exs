@@ -46,7 +46,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       expire_at = System.os_time(:millisecond) + 200
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Wait for expiry
       Process.sleep(300)
@@ -56,12 +56,12 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       new_expire = System.os_time(:millisecond) + 5000
 
       {:ok, {:applied_at, _, result}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], other_ref, new_expire})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], other_ref, new_expire})
 
       assert result == :ok
 
       # Cleanup
-      :ra.process_command(shard_id, {:unlock_keys, [k1], other_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [k1], other_ref})
     end
 
     test "expired lock allows regular writes" do
@@ -74,7 +74,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       expire_at = System.os_time(:millisecond) + 200
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Wait for expiry
       Process.sleep(300)
@@ -135,7 +135,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       shard_id = Cluster.shard_server_id(0)
       owner_ref = make_ref()
 
-      :ra.process_command(
+      Ferricstore.Raft.CommandClock.process_command(
         shard_id,
         {:cross_shard_intent, owner_ref,
          %{
@@ -148,18 +148,18 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
 
       Ferricstore.CrossShardOp.IntentResolver.resolve_shard_intents(0)
 
-      {:ok, {:applied_at, _, intents}, _} = :ra.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
       assert Map.has_key?(intents, owner_ref)
 
       # Cleanup
-      :ra.process_command(shard_id, {:delete_intent, owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:delete_intent, owner_ref})
     end
 
     test "stale intent IS cleaned up" do
       shard_id = Cluster.shard_server_id(0)
       owner_ref = make_ref()
 
-      :ra.process_command(
+      Ferricstore.Raft.CommandClock.process_command(
         shard_id,
         {:cross_shard_intent, owner_ref,
          %{
@@ -172,7 +172,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
 
       Ferricstore.CrossShardOp.IntentResolver.resolve_shard_intents(0)
 
-      {:ok, {:applied_at, _, intents}, _} = :ra.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
       refute Map.has_key?(intents, owner_ref)
     end
   end
@@ -195,14 +195,14 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       expire_at = System.os_time(:millisecond) + 5000
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Read should still work
       assert "readable" == Router.get(FerricStore.Instance.get(:default), k1)
       assert Router.exists?(FerricStore.Instance.get(:default), k1)
 
       # Cleanup
-      :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
     end
 
     test "writes on locked keys are rejected" do
@@ -215,7 +215,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       expire_at = System.os_time(:millisecond) + 5000
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Write should be rejected
       result = Router.put(FerricStore.Instance.get(:default), k1, "blocked", 0)
@@ -224,7 +224,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
              "Expected write to locked key to be rejected, got: #{inspect(result)}"
 
       # Cleanup
-      :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
     end
   end
 end

@@ -1,0 +1,17 @@
+<% data = assigns.data %>
+<%= page_head("Storage - FerricStore", 10) %>
+<body data-dashboard-live-page="storage" data-dashboard-live-url="/dashboard/api/storage" data-dashboard-live-interval-ms="10000">
+<div class="layout">
+<%= render_sidebar_static("storage") %>
+<main class="main-content">
+<%= render_subpage_header("Storage") %>
+<div class="content">
+<%= render_page_intro("Storage", "Inspect per-shard disk footprint, Bitcask/WARaft files, hint files, and storage skew.") %>
+<%= render_kv_subnav("storage") %>
+<%= render_live_component("storage_summary", render_storage_summary(data)) %>
+<%= render_live_component("storage_table", render_storage_table(data.shards)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

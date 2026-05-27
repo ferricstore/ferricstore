@@ -11,7 +11,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   use GenServer
 
   @call_timeout 30_000
-  @default_max_batch_size 1024
+  @default_max_batch_size 10_000
   @default_hot_batch_window_ms 1
 
   defstruct [
@@ -58,6 +58,16 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     end
   catch
     :exit, _reason -> :ok
+  end
+
+  @spec flush(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def flush(shard_index, timeout \\ @call_timeout) do
+    case Process.whereis(name(shard_index)) do
+      nil -> :ok
+      _pid -> GenServer.call(name(shard_index), :flush, timeout)
+    end
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   @spec write(non_neg_integer(), binary(), tuple(), pos_integer()) :: term()
@@ -226,6 +236,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   def handle_call(:stop, _from, state) do
     state = flush_all_slots(state, :sync)
     {:stop, :normal, :ok, state}
+  end
+
+  def handle_call(:flush, _from, state) do
+    state = flush_all_slots(state, :sync)
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -437,14 +452,16 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
           froms = Enum.reverse(slot.froms)
 
           flush_fun = fn ->
+            flush_started = System.monotonic_time()
             {function, args} = compact_slot_commit(state.shard_index, commands)
             result = safe_backend_call(function, args)
+            flush_finished = System.monotonic_time()
             replies = replies_for_batch(result, length(commands))
 
             Enum.zip(froms, replies)
             |> Enum.each(fn {from, reply} -> GenServer.reply(from, reply) end)
 
-            emit_flush_telemetry(state, prefix, slot, result)
+            emit_flush_telemetry(state, prefix, slot, result, flush_started, flush_finished)
           end
 
           state
@@ -523,9 +540,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       commands = hot_batch_items(groups)
 
       flush_fun = fn ->
+        flush_started = System.monotonic_time()
         result = safe_backend_call(:__commit_batch_direct__, [state.shard_index, commands])
+        flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
-        emit_hot_flush_telemetry(state, :batch, slot, result)
+        emit_hot_flush_telemetry(state, :batch, slot, result, flush_started, flush_finished)
       end
 
       %{state | batch_slot: nil}
@@ -545,9 +564,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       entries = hot_batch_items(groups)
 
       flush_fun = fn ->
+        flush_started = System.monotonic_time()
         result = safe_backend_call(:__commit_put_batch_direct__, [state.shard_index, entries])
+        flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
-        emit_hot_flush_telemetry(state, :put_batch, slot, result)
+        emit_hot_flush_telemetry(state, :put_batch, slot, result, flush_started, flush_finished)
       end
 
       %{state | put_slot: nil}
@@ -567,9 +588,19 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       keys = hot_batch_items(groups)
 
       flush_fun = fn ->
+        flush_started = System.monotonic_time()
         result = safe_backend_call(:__commit_delete_batch_direct__, [state.shard_index, keys])
+        flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
-        emit_hot_flush_telemetry(state, :delete_batch, slot, result)
+
+        emit_hot_flush_telemetry(
+          state,
+          :delete_batch,
+          slot,
+          result,
+          flush_started,
+          flush_finished
+        )
       end
 
       %{state | delete_slot: nil}
@@ -727,18 +758,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     end
   end
 
-  defp emit_flush_telemetry(state, prefix, slot, result) do
+  defp emit_flush_telemetry(state, prefix, slot, result, flush_started, flush_finished) do
+    measurements = flush_measurements(slot, flush_started, flush_finished, slot.count)
+
     :telemetry.execute(
       [:ferricstore, :waraft, :batcher, :slot_flush],
-      %{
-        batch_size: slot.count,
-        queue_wait_us:
-          System.convert_time_unit(
-            System.monotonic_time() - slot.created_mono,
-            :native,
-            :microsecond
-          )
-      },
+      measurements,
       %{
         shard_index: state.shard_index,
         prefix: prefix,
@@ -752,19 +777,15 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   defp result_shape({:error, reason}), do: {:error, reason}
   defp result_shape(_other), do: :other
 
-  defp emit_hot_flush_telemetry(state, kind, slot, result) do
+  defp emit_hot_flush_telemetry(state, kind, slot, result, flush_started, flush_finished) do
+    measurements =
+      slot
+      |> flush_measurements(flush_started, flush_finished, slot.count)
+      |> Map.put(:group_count, length(slot.groups))
+
     :telemetry.execute(
       [:ferricstore, :waraft, :batcher, :hot_flush],
-      %{
-        batch_size: slot.count,
-        group_count: length(slot.groups),
-        queue_wait_us:
-          System.convert_time_unit(
-            System.monotonic_time() - slot.created_mono,
-            :native,
-            :microsecond
-          )
-      },
+      measurements,
       %{
         shard_index: state.shard_index,
         kind: kind,
@@ -773,6 +794,23 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       }
     )
   end
+
+  defp flush_measurements(slot, flush_started, flush_finished, batch_size) do
+    queue_age_us = native_to_us(flush_started - slot.created_mono)
+    flush_duration_us = native_to_us(flush_finished - flush_started)
+    total_duration_us = native_to_us(flush_finished - slot.created_mono)
+
+    %{
+      batch_size: batch_size,
+      duration_us: total_duration_us,
+      queue_wait_us: queue_age_us,
+      queue_age_us: queue_age_us,
+      flush_duration_us: flush_duration_us,
+      total_duration_us: total_duration_us
+    }
+  end
+
+  defp native_to_us(value), do: System.convert_time_unit(value, :native, :microsecond)
 
   defp hot_batch_window_ms do
     Application.get_env(:ferricstore, :waraft_hot_batch_window_ms, @default_hot_batch_window_ms)
@@ -783,6 +821,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   end
 
   defp generic_batch_during_flush? do
-    Application.get_env(:ferricstore, :waraft_generic_batch_during_flush, false) == true
+    # Keep zero-window generic batches on the batcher so callers arriving behind
+    # an in-flight flush coalesce without adding a fixed latency window.
+    Application.get_env(:ferricstore, :waraft_generic_batch_during_flush, true) == true
   end
 end

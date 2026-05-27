@@ -54,8 +54,7 @@ defmodule Ferricstore.Cluster.TopologyTest do
 
     Enum.each(nodes, fn node ->
       for shard <- 0..(shard_count - 1) do
-        server_id = {:"ferricstore_shard_#{shard}", node.name}
-        result = :rpc.call(node.name, :ra, :members, [server_id])
+        result = :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard, 2_000])
 
         assert match?({:ok, _, _}, result),
                "shard #{shard} on #{node.name} should have a leader, got #{inspect(result)}"
@@ -475,13 +474,9 @@ defmodule Ferricstore.Cluster.PartitionTest do
   test "partitioned node loses Raft membership", %{nodes: nodes} do
     [n1, _n2, n3] = nodes
     shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
-    # Stop ra on n3 — simulates network partition from Raft's perspective
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
-    end
+    # Stop consensus on n3 to simulate local consensus unavailability.
+    :ok = ClusterHelper.stop_consensus(n3.name)
 
     Process.sleep(500)
 
@@ -495,11 +490,8 @@ defmodule Ferricstore.Cluster.PartitionTest do
 
     assert result == :ok, "majority side should still accept writes"
 
-    # Restart ra on n3 — simulates partition heal
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
-    end
+    # Restart consensus on n3 to simulate heal.
+    :ok = ClusterHelper.start_consensus(n3.name)
 
     ClusterHelper.wait_for_leaders(nodes, shards, timeout: 10_000)
 
@@ -514,27 +506,20 @@ defmodule Ferricstore.Cluster.PartitionTest do
   test "heal partition: node catches up on writes made during its absence", %{nodes: nodes} do
     [n1, _n2, n3] = nodes
     shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
     # Write before partition
     remote_router(n1.name, :put, ["topo:heal:pre", "before", 0])
 
-    # Stop ra on n3
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
-    end
+    # Stop consensus on n3
+    :ok = ClusterHelper.stop_consensus(n3.name)
 
     Process.sleep(500)
 
     # Write on n1 during n3's absence
     remote_router(n1.name, :put, ["topo:heal:during", "during", 0])
 
-    # Restart ra on n3
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
-    end
+    # Restart consensus on n3
+    :ok = ClusterHelper.start_consensus(n3.name)
 
     ClusterHelper.wait_for_leaders(nodes, shards, timeout: 10_000)
 
@@ -561,13 +546,9 @@ defmodule Ferricstore.Cluster.PartitionTest do
   } do
     [n1, n2, n3] = nodes
     shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
-    # Stop ra on n3 — simulates partition
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
-    end
+    # Stop consensus on n3 — simulates partition
+    :ok = ClusterHelper.stop_consensus(n3.name)
 
     Process.sleep(500)
 
@@ -581,11 +562,8 @@ defmodule Ferricstore.Cluster.PartitionTest do
         ])
     end
 
-    # Restart ra on n3 — heals the partition
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
-    end
+    # Restart consensus on n3 — heals the partition
+    :ok = ClusterHelper.start_consensus(n3.name)
 
     ClusterHelper.wait_for_leaders(nodes, shards, timeout: 15_000)
 

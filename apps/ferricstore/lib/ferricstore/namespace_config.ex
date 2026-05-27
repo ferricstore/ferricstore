@@ -250,9 +250,8 @@ defmodule Ferricstore.NamespaceConfig do
     {:error, "ERR unknown namespace config field '#{field}'"}
   end
 
-  # Sends :ns_config_changed to all live legacy Ra batcher processes so they
-  # clear their in-process namespace window caches. WARaft rejects window
-  # changes above until it has native per-prefix commit windows.
+  # Sends :ns_config_changed to live namespace batchers so they clear their
+  # in-process window caches.
   @spec broadcast_ns_config_changed() :: :ok
   defp broadcast_ns_config_changed do
     notify_batchers()

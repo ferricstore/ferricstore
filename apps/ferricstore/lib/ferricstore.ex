@@ -890,13 +890,13 @@ defmodule FerricStore do
   @doc """
   Returns Flow history events for `id`.
 
-  Default reads use the hot history index, bounded by `:history_hot_max_events`.
-  Pass `include_cold: true` to include older history projected into LMDB.
+  Default reads include history projected into LMDB. Hot history is only a
+  short-lived keydir cache while projection catches up.
   When async history is enabled, reads flush the async projection by default.
   Pass `consistent_projection: false` to allow briefly stale history reads.
 
   History caps are set when the Flow is created. Defaults are
-  `history_hot_max_events: 1024` and `history_max_events: 100000`; hard caps are
+  `history_hot_max_events: 0` and `history_max_events: 100000`; hard caps are
   `10000` hot events and `1000000` total durable events.
   """
   @spec flow_history(binary(), keyword()) :: {:ok, [{binary(), map()}]} | {:error, binary()}
@@ -2453,7 +2453,7 @@ defmodule FerricStore do
         {:ok, "list"}
 
       true ->
-        case Router.get(ctx, key) do
+        case Ferricstore.Stats.with_cache_tracking_disabled(fn -> Router.get(ctx, key) end) do
           nil ->
             {:ok, "none"}
 

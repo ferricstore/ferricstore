@@ -6,7 +6,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   2. WriteVersion atomic counters
   3. Router value size limits
   4. RESP parser value size limits
-  5. Application patched WAL loading
+  5. WARaft backend loading
   6. exists_fast? (ETS-direct existence check on write path)
 
   See also:
@@ -322,8 +322,8 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       assert Ferricstore.Raft.Backend.running_or_selected() == :waraft
     end
 
-    test "legacy Ra batchers are not application-supervised" do
-      refute Process.whereis(Ferricstore.Raft.Batcher.batcher_name(0))
+    test "WARaft commit batcher is application-supervised" do
+      assert is_pid(Process.whereis(Ferricstore.Raft.Batcher.batcher_name(0)))
 
       acceptor = :wa_raft_acceptor.registered_name(:ferricstore_waraft_backend, 1)
       assert is_pid(Process.whereis(acceptor))

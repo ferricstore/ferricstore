@@ -3,15 +3,9 @@ defmodule Ferricstore.Commands.ServerWARaftTest do
 
   alias Ferricstore.Commands.Server
 
-  test "SAVE skips legacy Ra batcher flushes when WARaft is selected" do
-    old_backend = Application.get_env(:ferricstore, :raft_backend)
-    Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-    on_exit(fn -> restore_env(:raft_backend, old_backend) end)
-
-    # Use a shard count above the default test app's legacy batchers. Before
-    # the WARaft guard this tried to flush Ferricstore.Raft.Batcher.4 and failed
-    # even though WARaft does not use those processes.
+  test "SAVE flushes through the WARaft write facade" do
+    # Use a shard count above the default test app's supervised shard count.
+    # SAVE must tolerate absent runtime processes for inactive shards.
     dir =
       Path.join(
         System.tmp_dir!(),
@@ -37,12 +31,7 @@ defmodule Ferricstore.Commands.ServerWARaftTest do
     assert :ok = Server.handle("SAVE", [], ctx)
   end
 
-  test "DEBUG BATCHER-STATS reports WARaft processes instead of legacy Ra processes" do
-    old_backend = Application.get_env(:ferricstore, :raft_backend)
-    Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-    on_exit(fn -> restore_env(:raft_backend, old_backend) end)
-
+  test "DEBUG BATCHER-STATS reports WARaft processes" do
     assert {:simple, stats_line} = Server.handle("DEBUG", ["BATCHER-STATS"], nil)
 
     assert String.contains?(stats_line, "WA0:")
@@ -59,11 +48,6 @@ defmodule Ferricstore.Commands.ServerWARaftTest do
   end
 
   test "INFO raft reports WARaft in-flight commit bytes" do
-    old_backend = Application.get_env(:ferricstore, :raft_backend)
-    Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-    on_exit(fn -> restore_env(:raft_backend, old_backend) end)
-
     info = Server.handle("INFO", ["raft"], nil)
 
     assert String.contains?(info, "shard_0_waraft_inflight_commit_bytes:0")
@@ -72,7 +56,4 @@ defmodule Ferricstore.Commands.ServerWARaftTest do
     assert String.contains?(info, "shard_0_waraft_segment_log_ets_bytes:")
     assert String.contains?(info, "shard_0_waraft_segment_log_max_ets_bytes:")
   end
-
-  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
-  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

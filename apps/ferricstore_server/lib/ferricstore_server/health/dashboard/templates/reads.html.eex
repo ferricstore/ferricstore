@@ -1,0 +1,17 @@
+<% data = assigns.data %>
+<%= page_head("Read Path - FerricStore", 5) %>
+<body data-dashboard-live-page="reads" data-dashboard-live-url="/dashboard/api/reads" data-dashboard-live-interval-ms="5000">
+<div class="layout">
+<%= render_sidebar_static("reads") %>
+<main class="main-content">
+<%= render_subpage_header("Read Path") %>
+<div class="content">
+<%= render_page_intro("Read Path", "Track hot-cache efficiency, cold-read pressure, miss rate, and which prefixes are forcing disk access.") %>
+<%= render_kv_subnav("reads") %>
+<%= render_live_component("reads_summary", render_reads_summary(data)) %>
+<%= render_live_component("reads_prefixes", render_read_prefix_table(data)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

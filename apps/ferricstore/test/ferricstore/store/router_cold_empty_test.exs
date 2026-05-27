@@ -299,10 +299,8 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end)
 
     try do
-      with_waraft_backend(fn ->
-        with_unregistered_shard(ctx, shard, fn ->
-          assert [^value] = Router.compound_batch_get(ctx, redis_key, [compound_key])
-        end)
+      with_unregistered_shard(ctx, shard, fn ->
+        assert [^value] = Router.compound_batch_get(ctx, redis_key, [compound_key])
       end)
     after
       Process.delete(:ferricstore_router_cold_location_miss_hook)
@@ -378,11 +376,9 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end)
 
     try do
-      with_waraft_backend(fn ->
-        with_unregistered_shard(ctx, shard, fn ->
-          assert [{^value, ^expire_at_ms}] =
-                   Router.compound_batch_get_meta(ctx, redis_key, [compound_key])
-        end)
+      with_unregistered_shard(ctx, shard, fn ->
+        assert [{^value, ^expire_at_ms}] =
+                 Router.compound_batch_get_meta(ctx, redis_key, [compound_key])
       end)
     after
       Process.delete(:ferricstore_router_cold_location_miss_hook)
@@ -1346,17 +1342,4 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
-  defp with_waraft_backend(fun) when is_function(fun, 0) do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-    Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-    try do
-      fun.()
-    after
-      restore_env(:raft_backend, previous_backend)
-    end
-  end
-
-  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
-  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

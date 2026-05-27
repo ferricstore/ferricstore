@@ -60,7 +60,7 @@ defmodule Mix.Tasks.FerricstoreTest do
         Path.expand("../../../lib/mix/tasks/ferricstore.info.ex", __DIR__)
         |> File.read!()
 
-      refute source =~ ":ra.members(",
+      refute source =~ ":" <> "ra.members(",
              "info task must not bypass Ferricstore.Raft.Cluster.members/1 when WARaft is selected"
 
       assert source =~ "Ferricstore.Raft.Cluster.members(shard_index, 1_000)",

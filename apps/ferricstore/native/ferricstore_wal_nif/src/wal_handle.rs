@@ -86,7 +86,7 @@ impl WalHandle {
         })
     }
 
-    /// Open a generic append file without the Ra WAL header offset.
+    /// Open a generic append file from byte 0.
     ///
     /// Used by WARaft segment logs where byte 0 is the first segment record.
     pub fn open_raw_append(

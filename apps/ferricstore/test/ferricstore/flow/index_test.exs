@@ -2,10 +2,13 @@ defmodule Ferricstore.Flow.IndexTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Flow.Index
+  alias Ferricstore.Flow.NativeOrderedIndex
 
   setup do
-    index = :ets.new(:flow_index_test_index, [:ordered_set])
-    lookup = :ets.new(:flow_index_test_lookup, [:set])
+    instance_name = :"flow_index_test_#{System.unique_integer([:positive, :monotonic])}"
+    {index, lookup} = Index.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(index, lookup)
+
     {:ok, index: index, lookup: lookup}
   end
 
@@ -95,5 +98,39 @@ defmodule Ferricstore.Flow.IndexTest do
 
     assert [{"flow-2", 4.0}] =
              Index.range_slice(index, "worker:a", :neg_inf, :inf, false, 0, 10)
+  end
+
+  test "due_keys_present returns every key with at least one due member", %{
+    index: index,
+    lookup: lookup
+  } do
+    hot_key = "due:hot"
+    sparse_key = "due:sparse"
+    future_key = "due:future"
+    empty_key = "due:empty"
+
+    hot_members = for i <- 1..100, do: {"hot-#{i}", i}
+
+    assert :ok =
+             Index.put_entries(
+               index,
+               lookup,
+               Enum.map(hot_members, fn {member, score} -> {hot_key, member, score} end) ++
+                 [{sparse_key, "sparse-1", 5}, {future_key, "future-1", 5_000}]
+             )
+
+    assert [^hot_key, ^sparse_key] =
+             NativeOrderedIndex.due_keys_present(
+               NativeOrderedIndex.get(index, lookup),
+               [hot_key, sparse_key, future_key, empty_key],
+               100
+             )
+
+    assert [] =
+             NativeOrderedIndex.due_keys_present(
+               NativeOrderedIndex.get(index, lookup),
+               [future_key, empty_key],
+               100
+             )
   end
 end

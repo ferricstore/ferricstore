@@ -60,11 +60,26 @@ struct ClaimEntry<'a>(
     f64,
 );
 
+#[derive(rustler::NifTuple)]
+struct ClaimHistoryEntry<'a>(
+    Term<'a>,
+    Term<'a>,
+    u64,
+    u64,
+    Term<'a>,
+    Term<'a>,
+    Term<'a>,
+    Term<'a>,
+    bool,
+);
+
 const FLOW_RECORD_MAGIC: &[u8; 4] = b"FSF5";
 const FLOW_HISTORY_MAGIC: &[u8; 4] = b"FSH2";
 const RUNNING_STATE: &[u8] = b"running";
 const DEFAULT_RUNNING_RUN_STATE: &[u8] = b"queued";
 const EMPTY_CHILD_GROUPS_ENCODED: &[u8; 4] = b"\x04J{}";
+const CLAIMED_EVENT: &[u8] = b"claimed";
+const EMPTY_HISTORY_META_ENCODED: &[u8; 1] = b"\x01";
 
 // FSF5/FSH2 are durable Flow metadata formats. Keep flag numbers and wire order
 // in lockstep with Ferricstore.Flow; changing field order/type after release
@@ -219,6 +234,21 @@ pub fn flow_index_delete_members<'a>(
 }
 
 #[rustler::nif(schedule = "Normal")]
+pub fn flow_index_delete_entries<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FlowOrderedIndexResource>,
+    entries: Vec<(Binary<'a>, Binary<'a>)>,
+) -> NifResult<Term<'a>> {
+    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+
+    for (key, member) in entries {
+        index.delete(key.as_slice(), member.as_slice());
+    }
+
+    Ok(crate::atoms::ok().encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
 pub fn flow_index_apply_batch<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
@@ -330,6 +360,20 @@ pub fn flow_index_claim_due_candidates<'a>(
     let rows = index.claim_due_candidates(&key_refs, max_score, limit, max_scan);
 
     encode_owned_key_member_scores(env, rows)
+}
+
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_index_due_keys_present<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FlowOrderedIndexResource>,
+    keys: Vec<Binary<'a>>,
+    max_score: f64,
+) -> NifResult<Term<'a>> {
+    let index = resource.inner.lock().expect("flow index mutex poisoned");
+    let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+    let rows = index.due_keys_present(&key_refs, max_score);
+
+    encode_owned_binaries(env, rows)
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -680,6 +724,203 @@ pub fn flow_record_plan_claims<'a>(
 }
 
 #[rustler::nif(schedule = "Normal")]
+pub fn flow_record_plan_claims_with_history<'a>(
+    env: Env<'a>,
+    candidates: Vec<(Binary<'a>, f64)>,
+    values: Vec<Option<Binary<'a>>>,
+    flow_type: Binary<'a>,
+    expected_state: Binary<'a>,
+    worker: Binary<'a>,
+    lease_ms: u64,
+    now_ms: u64,
+    remaining: usize,
+    from_due_key: Binary<'a>,
+    to_due_key: Binary<'a>,
+    from_state_key: Binary<'a>,
+    to_state_key: Binary<'a>,
+    inflight_key: Binary<'a>,
+    worker_key: Binary<'a>,
+    state_key_prefix: Binary<'a>,
+    history_key_prefix: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    if values.len() != candidates.len() || expected_state.as_slice() == RUNNING_STATE {
+        return Ok(crate::atoms::fallback().encode(env));
+    }
+
+    if remaining == 0 {
+        let empty: Vec<Term<'a>> = Vec::new();
+        return Ok((crate::atoms::ok(), empty.clone(), empty, 0usize).encode(env));
+    }
+
+    let flow_type = flow_type.as_slice();
+    let expected_state = expected_state.as_slice();
+    let worker = worker.as_slice();
+    let deadline_ms = now_ms.saturating_add(lease_ms);
+    let plan_capacity = remaining.min(candidates.len());
+    let mut plan_terms = Vec::with_capacity(plan_capacity);
+    let mut stale_terms = Vec::new();
+    let mut accepted = 0usize;
+
+    for ((id_bin, due_score), value) in candidates.iter().zip(values.iter()) {
+        if accepted >= remaining {
+            break;
+        }
+
+        let id = id_bin.as_slice();
+        let Some(value) = value else {
+            stale_terms.push(id_bin.encode(env));
+            continue;
+        };
+
+        let Some(record) = decode_flow_record(value.as_slice()) else {
+            stale_terms.push(id_bin.encode(env));
+            continue;
+        };
+
+        if record.id != id {
+            return Ok(crate::atoms::fallback().encode(env));
+        }
+
+        if record.flow_type != flow_type {
+            continue;
+        }
+
+        if record.state != expected_state {
+            continue;
+        }
+
+        if !flow_record_fast_claim_shape(&record) {
+            return Ok(crate::atoms::fallback().encode(env));
+        }
+
+        let Some(next_run_at_ms) = record.next_run_at_ms else {
+            continue;
+        };
+
+        if next_run_at_ms > now_ms {
+            continue;
+        }
+
+        let Some(version) = record.version else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
+        let Some(fencing_token) = record.fencing_token else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
+        let Some(updated_at_ms) = record.updated_at_ms else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
+        if record.priority.is_none() {
+            return Ok(crate::atoms::fallback().encode(env));
+        }
+
+        let next_version = version.saturating_add(1);
+        let next_fencing_token = fencing_token.saturating_add(1);
+        let lease_token = claim_lease_token(worker, now_ms, next_fencing_token);
+        let next_value = encode_claimed_record(
+            &record,
+            worker,
+            &lease_token,
+            deadline_ms,
+            now_ms,
+            next_version,
+            next_fencing_token,
+        );
+
+        let mut state_key = Vec::with_capacity(state_key_prefix.as_slice().len() + id.len());
+        state_key.extend_from_slice(state_key_prefix.as_slice());
+        state_key.extend_from_slice(id);
+
+        let previous_history_ms = record.updated_at_ms.or(record.created_at_ms);
+        let history_event_ms = previous_history_ms.map_or(now_ms, |previous| previous.max(now_ms));
+        let event_id = flow_history_event_id(history_event_ms, next_version);
+
+        let mut history_key = Vec::with_capacity(history_key_prefix.as_slice().len() + id.len());
+        history_key.extend_from_slice(history_key_prefix.as_slice());
+        history_key.extend_from_slice(id);
+
+        let mut history_entry_key = Vec::with_capacity(2 + history_key.len() + 1 + event_id.len());
+        history_entry_key.extend_from_slice(b"X:");
+        history_entry_key.extend_from_slice(&history_key);
+        history_entry_key.push(0);
+        history_entry_key.extend_from_slice(&event_id);
+
+        let history_value = encode_flow_history_compact(
+            CLAIMED_EVENT,
+            Some(next_version),
+            Some(now_ms),
+            Some(RUNNING_STATE),
+            record.priority,
+            record.attempts,
+            Some(next_fencing_token),
+            record.created_at_ms,
+            Some(now_ms),
+            Some(deadline_ms),
+            Some(deadline_ms),
+            Some(worker),
+            record.payload_ref,
+            record.result_ref,
+            record.error_ref,
+            record.rewound_to_event_id,
+            EMPTY_HISTORY_META_ENCODED,
+        );
+
+        let next_value_term = binary_term(env, &next_value)?;
+        let state_key_term = binary_term(env, &state_key)?;
+        let history_key_term = binary_term(env, &history_key)?;
+        let event_id_term = binary_term(env, &event_id)?;
+        let history_entry_key_term = binary_term(env, &history_entry_key)?;
+        let history_value_term = binary_term(env, &history_value)?;
+        let deadline_score = deadline_ms as f64;
+        let now_score = now_ms as f64;
+        let updated_score = updated_at_ms as f64;
+
+        let entry_term = ClaimEntry(
+            id_bin.clone(),
+            from_due_key.clone(),
+            *due_score,
+            to_due_key.clone(),
+            deadline_score,
+            from_state_key.clone(),
+            updated_score,
+            to_state_key.clone(),
+            now_score,
+            inflight_key.clone(),
+            worker_key.clone(),
+            deadline_score,
+        )
+        .encode(env);
+
+        let history_entry_term = ClaimHistoryEntry(
+            history_key_term,
+            event_id_term,
+            history_event_ms,
+            next_version,
+            history_entry_key_term,
+            history_value_term,
+            option_u64_term(env, record.history_hot_max_events),
+            option_u64_term(env, record.history_max_events),
+            false,
+        )
+        .encode(env);
+
+        plan_terms.push(
+            (
+                next_value_term,
+                entry_term,
+                state_key_term,
+                previous_history_ms,
+                history_entry_term,
+            )
+                .encode(env),
+        );
+        accepted += 1;
+    }
+
+    Ok((crate::atoms::ok(), plan_terms, stale_terms, accepted).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
 pub fn flow_record_encode<'a>(
     env: Env<'a>,
     id: Option<Binary<'a>>,
@@ -987,13 +1228,16 @@ pub fn flow_history_encode<'a>(
 ) -> NifResult<Term<'a>> {
     // History is compact by design: workflow identity fields passed above are
     // omitted and reconstructed from record context on user-facing decode.
-    let flags = encode_history_flags(
+    let out = encode_flow_history_compact(
+        event.as_slice(),
+        version,
+        now_ms,
+        optional_bin_slice(state.as_ref()),
         priority,
         attempts,
         fencing_token,
         created_at_ms,
         updated_at_ms,
-        now_ms,
         next_run_at_ms,
         lease_deadline_ms,
         optional_bin_slice(lease_owner.as_ref()),
@@ -1004,26 +1248,66 @@ pub fn flow_history_encode<'a>(
         meta_encoded.as_slice(),
     );
 
+    binary_term(env, &out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_flow_history_compact(
+    event: &[u8],
+    version: Option<u64>,
+    now_ms: Option<u64>,
+    state: Option<&[u8]>,
+    priority: Option<u64>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    lease_deadline_ms: Option<u64>,
+    lease_owner: Option<&[u8]>,
+    payload_ref: Option<&[u8]>,
+    result_ref: Option<&[u8]>,
+    error_ref: Option<&[u8]>,
+    rewound_to_event_id: Option<&[u8]>,
+    meta_encoded: &[u8],
+) -> Vec<u8> {
+    let flags = encode_history_flags(
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        now_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        result_ref,
+        error_ref,
+        rewound_to_event_id,
+        meta_encoded,
+    );
+
     let mut out = Vec::with_capacity(
         FLOW_HISTORY_MAGIC.len()
-            + event.as_slice().len()
-            + optional_bin_len(state.as_ref())
-            + optional_bin_len(lease_owner.as_ref())
-            + optional_bin_len(payload_ref.as_ref())
-            + optional_bin_len(result_ref.as_ref())
-            + optional_bin_len(error_ref.as_ref())
-            + optional_bin_len(rewound_to_event_id.as_ref())
-            + meta_encoded.as_slice().len()
+            + event.len()
+            + optional_slice_len(state)
+            + optional_slice_len(lease_owner)
+            + optional_slice_len(payload_ref)
+            + optional_slice_len(result_ref)
+            + optional_slice_len(error_ref)
+            + optional_slice_len(rewound_to_event_id)
+            + meta_encoded.len()
             + 40,
     );
 
     // Keep this field order identical to Flow.encode_history_parts_elixir/23.
     out.extend_from_slice(FLOW_HISTORY_MAGIC);
     encode_int(&mut out, Some(flags));
-    encode_bin(&mut out, Some(event.as_slice()));
+    encode_bin(&mut out, Some(event));
     encode_int(&mut out, version);
     encode_int(&mut out, now_ms);
-    encode_bin(&mut out, optional_bin_slice(state.as_ref()));
+    encode_bin(&mut out, state);
     encode_flagged_int(&mut out, flags, HISTORY_FLAG_PRIORITY, priority);
     encode_flagged_int(&mut out, flags, HISTORY_FLAG_ATTEMPTS, attempts);
     encode_flagged_int(&mut out, flags, HISTORY_FLAG_FENCING_TOKEN, fencing_token);
@@ -1036,42 +1320,22 @@ pub fn flow_history_encode<'a>(
         HISTORY_FLAG_LEASE_DEADLINE_MS,
         lease_deadline_ms,
     );
-    encode_flagged_bin(
-        &mut out,
-        flags,
-        HISTORY_FLAG_LEASE_OWNER,
-        optional_bin_slice(lease_owner.as_ref()),
-    );
-    encode_flagged_bin(
-        &mut out,
-        flags,
-        HISTORY_FLAG_PAYLOAD_REF,
-        optional_bin_slice(payload_ref.as_ref()),
-    );
-    encode_flagged_bin(
-        &mut out,
-        flags,
-        HISTORY_FLAG_RESULT_REF,
-        optional_bin_slice(result_ref.as_ref()),
-    );
-    encode_flagged_bin(
-        &mut out,
-        flags,
-        HISTORY_FLAG_ERROR_REF,
-        optional_bin_slice(error_ref.as_ref()),
-    );
+    encode_flagged_bin(&mut out, flags, HISTORY_FLAG_LEASE_OWNER, lease_owner);
+    encode_flagged_bin(&mut out, flags, HISTORY_FLAG_PAYLOAD_REF, payload_ref);
+    encode_flagged_bin(&mut out, flags, HISTORY_FLAG_RESULT_REF, result_ref);
+    encode_flagged_bin(&mut out, flags, HISTORY_FLAG_ERROR_REF, error_ref);
     encode_flagged_bin(
         &mut out,
         flags,
         HISTORY_FLAG_REWOUND_TO_EVENT_ID,
-        optional_bin_slice(rewound_to_event_id.as_ref()),
+        rewound_to_event_id,
     );
 
     if flags & HISTORY_FLAG_META != 0 {
-        out.extend_from_slice(meta_encoded.as_slice());
+        out.extend_from_slice(meta_encoded);
     }
 
-    binary_term(env, &out)
+    out
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -1495,6 +1759,30 @@ impl FlowOrderedIndex {
 
                 if rows.len() >= limit || scanned >= max_scan {
                     return rows;
+                }
+            }
+        }
+
+        rows
+    }
+
+    fn due_keys_present(&self, keys: &[&[u8]], max_score: f64) -> Vec<Vec<u8>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        let mut rows = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            let lower = OrderedEntry {
+                key: key.to_vec(),
+                score: Score(f64::NEG_INFINITY),
+                member: Vec::new(),
+            };
+
+            if let Some(entry) = self.ordered.range(lower..).next() {
+                if entry.key.as_slice() == *key && entry.score.0 <= max_score {
+                    rows.push((*key).to_vec());
                 }
             }
         }
@@ -2065,8 +2353,8 @@ fn optional_bin_slice<'a>(value: Option<&Binary<'a>>) -> Option<&'a [u8]> {
     value.map(Binary::as_slice)
 }
 
-fn optional_bin_len(value: Option<&Binary<'_>>) -> usize {
-    value.map_or(0, |bin| bin.as_slice().len())
+fn flow_history_event_id(event_ms: u64, version: u64) -> Vec<u8> {
+    format!("{event_ms}-{version}").into_bytes()
 }
 
 fn option_binary_term<'a>(env: Env<'a>, value: Option<&[u8]>) -> NifResult<Term<'a>> {
@@ -2152,6 +2440,16 @@ fn encode_binaries<'a>(env: Env<'a>, values: Vec<&[u8]>) -> NifResult<Term<'a>> 
 
     for value in values {
         terms.push(binary_term(env, value)?);
+    }
+
+    Ok(terms.encode(env))
+}
+
+fn encode_owned_binaries<'a>(env: Env<'a>, values: Vec<Vec<u8>>) -> NifResult<Term<'a>> {
+    let mut terms = Vec::with_capacity(values.len());
+
+    for value in values {
+        terms.push(binary_term(env, &value)?);
     }
 
     Ok(terms.encode(env))

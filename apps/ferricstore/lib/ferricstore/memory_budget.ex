@@ -27,6 +27,13 @@ defmodule Ferricstore.MemoryBudget do
   @segment_entry_budget_bytes 1024
   @segment_max_entries_cap 262_144
 
+  # This is the Flow/WARaft handoff cache used while cold LMDB/history
+  # projection catches up. It is not an LMDB queue, but it shows up as "LMDB
+  # lag" operationally: if this cap is too low, terminal Flow bursts spill and
+  # compact synchronously before the lagged projection can consume the rows.
+  # The 1M DBOS-style benchmark regressed from ~58K/s to ~35K/s when this was
+  # capped at 65K entries/shard, so keep the cap memory-derived and avoid
+  # lowering `:waraft_apply_projection_cache_max_entries` without a burst test.
   @apply_projection_cache_memory_percent 2
   @apply_projection_cache_entry_bytes 512
   @apply_projection_cache_min_entries 1_024
@@ -37,6 +44,10 @@ defmodule Ferricstore.MemoryBudget do
   @history_pending_entry_bytes 2_048
   @history_pending_max_entries 200_000
 
+  # LMDB writer limits protect the async cold-projection mailbox/enqueue path.
+  # They should bound memory and projection lag, not throttle hot Flow command
+  # throughput. If throughput drops while LMDB lag is visible, check the
+  # apply-projection cache above before making these drains more aggressive.
   @lmdb_mailbox_memory_percent 1
   @lmdb_mailbox_entry_bytes 4_096
   @lmdb_mailbox_max_messages 100_000

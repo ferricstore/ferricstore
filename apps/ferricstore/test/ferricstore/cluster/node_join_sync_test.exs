@@ -149,11 +149,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
             IO.puts("  poll ##{pc}: #{length(missing)}/#{length(all_keys)} keys missing")
 
             for s <- 0..(@shards - 1) do
-              jid = {:"ferricstore_shard_#{s}", joiner_n}
-
               m =
                 try do
-                  :erpc.call(joiner_n, :ra, :key_metrics, [jid])
+                  :erpc.call(joiner_n, Ferricstore.Raft.WARaftBackend, :storage_position, [s])
                 catch
                   _, _ -> :error
                 end
@@ -286,11 +284,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
             IO.puts("  poll ##{pc}: #{length(missing)}/#{length(all_keys)} keys missing")
 
             for s <- 0..(@shards - 1) do
-              jid = {:"ferricstore_shard_#{s}", joiner_n}
-
               m =
                 try do
-                  :erpc.call(joiner_n, :ra, :key_metrics, [jid])
+                  :erpc.call(joiner_n, Ferricstore.Raft.WARaftBackend, :storage_position, [s])
                 catch
                   _, _ -> :error
                 end
@@ -1169,22 +1165,26 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     IO.puts("\n=== RAFT DIAGNOSTICS [#{label}] ===")
 
     for shard <- 0..(shard_count - 1) do
-      leader_id = {:"ferricstore_shard_#{shard}", leader_n}
-      joiner_id = {:"ferricstore_shard_#{shard}", joiner_n}
-
       leader_info =
         try do
-          {:ok, members, leader} = :erpc.call(leader_n, :ra, :members, [leader_id, 5_000])
-          metrics = :erpc.call(leader_n, :ra, :key_metrics, [leader_id])
-          %{members: length(members), leader: leader, metrics: metrics}
+          {:ok, members, leader} =
+            :erpc.call(leader_n, Ferricstore.Raft.Cluster, :members, [shard, 5_000])
+
+          position =
+            :erpc.call(leader_n, Ferricstore.Raft.WARaftBackend, :storage_position, [shard])
+
+          %{members: length(members), leader: leader, storage_position: position}
         catch
           _, e -> %{error: inspect(e)}
         end
 
       joiner_info =
         try do
-          metrics = :erpc.call(joiner_n, :ra, :key_metrics, [joiner_id])
-          %{metrics: metrics}
+          position =
+            :erpc.call(joiner_n, Ferricstore.Raft.WARaftBackend, :storage_position, [shard])
+
+          status = :erpc.call(joiner_n, Ferricstore.Raft.WARaftBackend, :status, [shard])
+          %{storage_position: position, status: status}
         catch
           _, e -> %{error: inspect(e)}
         end

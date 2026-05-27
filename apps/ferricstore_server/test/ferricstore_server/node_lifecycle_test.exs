@@ -333,7 +333,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   describe "graceful shard shutdown preserves data" do
     @tag :capture_log
     test "isolated shard: write, stop gracefully, verify data on disk" do
-      # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+      # Isolated shard tests bypass WARaft consensus for ad-hoc indices.
       tmp_dir =
         Path.join(
           System.tmp_dir!(),

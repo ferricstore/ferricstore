@@ -1,6 +1,6 @@
 defmodule Ferricstore.Test.SnapshotKvMachine do
   @moduledoc """
-  A simple Map-based ra state machine that emits `release_cursor` effects
+  A simple Map-based state machine that emits `release_cursor` effects
   at a configurable interval. Used by snapshot/compaction recovery tests.
 
   State is `%{data: %{key => value}, applied: non_neg_integer()}`.
@@ -8,15 +8,11 @@ defmodule Ferricstore.Test.SnapshotKvMachine do
   Init config accepts `:release_cursor_interval` (default 100).
   """
 
-  @behaviour :ra_machine
-
-  @impl true
   def init(config) do
     interval = Map.get(config, :release_cursor_interval, 100)
     %{data: %{}, applied: 0, release_cursor_interval: interval}
   end
 
-  @impl true
   def apply(meta, {:put, key, value}, state) do
     new_data = Map.put(state.data, key, value)
     new_applied = state.applied + 1
@@ -38,10 +34,9 @@ defmodule Ferricstore.Test.SnapshotKvMachine do
 
   def apply(_meta, _cmd, state), do: {state, :ok}
 
-  @impl true
   def state_enter(_role, _state), do: []
 
-  # Query helpers (used with ra:local_query)
+  # Query helpers.
   def count(%{data: data}), do: map_size(data)
   def get_value(%{data: data}, key), do: Map.get(data, key)
 

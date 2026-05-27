@@ -238,7 +238,7 @@ defmodule FerricstoreServer.Connection do
               client_ip: format_peer(peer)
             })
 
-            ConnRegistry.register(state.client_id, self())
+            ConnRegistry.register(state.client_id, self(), connection_dashboard_summary(state))
             loop(state)
           end
       end
@@ -372,6 +372,8 @@ defmodule FerricstoreServer.Connection do
           transport.close(socket)
 
         {:continue, new_state} ->
+          new_state = maybe_sync_connection_registry(state, new_state)
+
           # If SUBSCRIBE was dispatched, switch to the pubsub loop.
           # in_pubsub_mode? is a nil check (O(1)) for non-pubsub connections.
           if in_pubsub_mode?(new_state) do
@@ -940,6 +942,10 @@ defmodule FerricstoreServer.Connection do
   defp blocking_ast?({tag, _, _}) when tag in ~w(blpop brpop)a, do: true
   defp blocking_ast?({:blmove, _, _, _, _, _}), do: true
   defp blocking_ast?({:blmpop, _, _, _, _}), do: true
+
+  defp blocking_ast?({:flow_claim_due, _type, opts}) when is_list(opts),
+    do: Keyword.get(opts, :block_ms, 0) > 0
+
   defp blocking_ast?(_ast), do: false
 
   defp dispatch_blocking_ast({:blpop, error}, _args, state) when elem(error, 0) == :error,
@@ -978,6 +984,9 @@ defmodule FerricstoreServer.Connection do
   defp dispatch_blocking_ast({:blmpop, keys, direction, count, timeout_ms}, _args, state),
     do: ConnBlocking.dispatch_blmpop_ast(keys, direction, count, timeout_ms, state)
 
+  defp dispatch_blocking_ast({:flow_claim_due, type, opts}, _args, state),
+    do: ConnBlocking.dispatch_flow_claim_due_ast(type, opts, state)
+
   defp dispatch_blocking_ast(_ast, _args, state),
     do: {:continue, Encoder.encode({:error, "ERR unsupported blocking command AST"}), state}
 
@@ -986,7 +995,7 @@ defmodule FerricstoreServer.Connection do
        do: true
 
   defp ast_store_command?({tag, _, _})
-       when tag in ~w(set incrby decrby incrbyfloat append getset getex setnx expire pexpire expireat pexpireat lpop rpop lindex lpos rpoplpush hget hexists hstrlen hrandfield hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex sismember srandmember spop sscan sintercard zscore zrank zrevrank zadd zcount zpopmin zpopmax zscan zrangebyscore zrevrangebyscore getbit bitcount bitpos rename renamenx scan object wait xadd xrange xrevrange xtrim xdel xgroup json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrlen json_toggle json_clear json_mget geosearch bf_reserve cf_reserve cms_initbydim cms_initbyprob cms_incrby cms_merge topk_reserve topk_incrby topk_list tdigest_create tdigest_add tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_merge cas lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error ferricstore_key_info ratelimit_add flow_create flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
+       when tag in ~w(set incrby decrby incrbyfloat append getset getex setnx expire pexpire expireat pexpireat lpop rpop lindex lpos rpoplpush hget hexists hstrlen hrandfield hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex sismember srandmember spop sscan sintercard zscore zrank zrevrank zadd zcount zpopmin zpopmax zscan zrangebyscore zrevrangebyscore getbit bitcount bitpos rename renamenx scan object wait xadd xrange xrevrange xtrim xdel xgroup json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrlen json_toggle json_clear json_mget geosearch bf_reserve cf_reserve cms_initbydim cms_initbyprob cms_incrby cms_merge topk_reserve topk_incrby topk_list tdigest_create tdigest_add tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_merge cas lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error ferricstore_key_info ratelimit_add flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
        do: true
 
   defp ast_store_command?({tag, _, _, _})
@@ -1141,6 +1150,7 @@ defmodule FerricstoreServer.Connection do
     cleanup_pubsub(state)
     ClientTracking.cleanup(self())
     Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
+    Ferricstore.Flow.ClaimWaiters.cleanup(self())
     ConnRegistry.unregister(state.client_id, self())
     Stats.decr_connections()
   end
@@ -1150,6 +1160,44 @@ defmodule FerricstoreServer.Connection do
       PS.cleanup(self())
     end
   end
+
+  defp maybe_sync_connection_registry(old_state, new_state) do
+    if connection_dashboard_summary(old_state) != connection_dashboard_summary(new_state) do
+      ConnRegistry.update(new_state.client_id, self(), connection_dashboard_summary(new_state))
+    end
+
+    new_state
+  end
+
+  defp connection_dashboard_summary(state) do
+    %{
+      client_id: state.client_id,
+      client_name: state.client_name,
+      username: state.username,
+      peer: format_peer(state.peer),
+      created_at_ms: state.created_at,
+      flags: connection_dashboard_flags(state)
+    }
+  end
+
+  defp connection_dashboard_flags(state) do
+    []
+    |> maybe_connection_dashboard_flag(state.multi_state == :queuing, "M")
+    |> maybe_connection_dashboard_flag(in_pubsub_mode?(state), "S")
+    |> maybe_connection_dashboard_flag(connection_tracking_enabled?(state), "T")
+    |> Enum.reverse()
+    |> Enum.join()
+  end
+
+  defp maybe_connection_dashboard_flag(flags, true, flag), do: [flag | flags]
+  defp maybe_connection_dashboard_flag(flags, false, _flag), do: flags
+
+  defp connection_tracking_enabled?(%{tracking: nil}), do: false
+
+  defp connection_tracking_enabled?(%{tracking: tracking}) when is_map(tracking),
+    do: Map.get(tracking, :enabled, false)
+
+  defp connection_tracking_enabled?(_state), do: false
 
   # ---------------------------------------------------------------------------
   # Instance context helpers

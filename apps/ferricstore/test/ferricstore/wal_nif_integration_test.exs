@@ -1,7 +1,8 @@
 defmodule Ferricstore.WalNifIntegrationTest do
   @moduledoc """
-  Integration tests for the Rust NIF WAL module wired into ra_log_wal.
-  Tests the full pipeline: Batcher → {ttb} → ra_log → ra_log_wal → NIF → disk.
+  Integration tests for the Rust NIF WAL module used by WARaft segments.
+  Tests that normal Router writes flow through the replicated storage path and
+  remain readable.
   """
 
   use ExUnit.Case, async: false
@@ -23,10 +24,10 @@ defmodule Ferricstore.WalNifIntegrationTest do
   defp ctx, do: FerricStore.Instance.get(:default)
 
   # ---------------------------------------------------------------------------
-  # {ttb} pre-serialization pipeline
+  # Replicated write pipeline
   # ---------------------------------------------------------------------------
 
-  describe "{ttb} pre-serialization" do
+  describe "WARaft segment writes" do
     test "write and read back through Raft" do
       key = ukey("ttb_rw")
       :ok = Router.put(ctx(), key, "hello_ttb", 0)

@@ -1,0 +1,17 @@
+<% data = assigns.data %>
+<%= page_head("Flow Query Explorer - FerricStore", nil) %>
+<body>
+<div class="layout">
+<%= render_sidebar_static("flow") %>
+<main class="main-content">
+<%= render_subpage_header("Flow Query Explorer") %>
+<div class="content">
+<%= render_page_intro("Flow Query Explorer", "Run bounded Flow queries with filters and time ranges without turning the dashboard into an unbounded scanner.") %>
+<%= render_flow_subnav("query") %>
+<%= render_flow_query_controls(data) %>
+<%= render_flow_query_result(data) %>
+</div>
+</main>
+</div>
+</body>
+</html>

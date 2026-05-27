@@ -30,7 +30,7 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
       expire_at = System.os_time(:millisecond) + 30_000
 
       # Lock the key
-      {:ok, {:applied_at, _, :ok}, _} = :ra.process_command(shard_id, {:lock_keys, [key], owner_ref, expire_at})
+      {:ok, {:applied_at, _, :ok}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [key], owner_ref, expire_at})
 
       # Kill and restart shard
       ShardHelpers.flush_all_shards()
@@ -40,13 +40,13 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
       # because the original lock should have survived
       other_ref = make_ref()
       other_expire = System.os_time(:millisecond) + 5000
-      {:ok, {:applied_at, _, result}, _} = :ra.process_command(shard_id, {:lock_keys, [key], other_ref, other_expire})
+      {:ok, {:applied_at, _, result}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [key], other_ref, other_expire})
 
       assert result == {:error, :keys_locked},
              "Lock should survive shard restart — got #{inspect(result)} instead of {:error, :keys_locked}"
 
       # Cleanup
-      :ra.process_command(shard_id, {:unlock_keys, [key], owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [key], owner_ref})
     end
   end
 
@@ -56,7 +56,7 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
       owner_ref = make_ref()
 
       # Write intent
-      :ra.process_command(shard_id, {:cross_shard_intent, owner_ref, %{
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:cross_shard_intent, owner_ref, %{
         command: :smove,
         keys: %{source: "a", dest: "b"},
         status: :executing,
@@ -68,13 +68,13 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
       ShardHelpers.kill_shard_safely(0)
 
       # After restart, intent should still be there
-      {:ok, {:applied_at, _, intents}, _} = :ra.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
 
       assert Map.has_key?(intents, owner_ref),
              "Intent should survive shard restart"
 
       # Cleanup
-      :ra.process_command(shard_id, {:delete_intent, owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:delete_intent, owner_ref})
     end
   end
 end

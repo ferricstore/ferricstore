@@ -566,37 +566,45 @@ fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
             let records = reader
                 .iter_metadata_from_start_tolerant()
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-
-            let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
-
-            for record in &records {
-                // M-REMAIN-1 fix: handle OOM gracefully instead of panicking.
-                let key_bin = match OwnedBinary::new(record.key.len()) {
-                    Some(mut ob) => {
-                        ob.as_mut_slice().copy_from_slice(&record.key);
-                        ob.release(env)
-                    }
-                    None => {
-                        return Ok(
-                            (atoms::error(), "out of memory allocating key binary").encode(env)
-                        );
-                    }
-                };
-
-                let tuple = (
-                    key_bin,
-                    record.offset,
-                    record.value_size,
-                    record.expire_at_ms,
-                    record.is_tombstone,
-                )
-                    .encode(env);
-
-                results.push(tuple);
+            match encode_scan_records(env, &records) {
+                Ok(results) => Ok((atoms::ok(), results).encode(env)),
+                Err(e) => Ok((atoms::error(), e).encode(env)),
             }
-
-            Ok((atoms::ok(), results).encode(env))
         }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Scan a bounded page of records in a data file from an exact byte offset.
+/// `{:ok, records, next_offset, done?}`.
+///
+/// `done?` has the same tolerant crash-recovery meaning as `v2_scan_file/1`:
+/// true means EOF or a truncated/corrupt tail was reached. This is the startup
+/// recovery hot path because it avoids returning millions of metadata tuples in
+/// a single BEAM NIF result.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_scan_file_page<'a>(
+    env: Env<'a>,
+    path: String,
+    start_offset: u64,
+    limit: usize,
+) -> NifResult<Term<'a>> {
+    if limit == 0 {
+        return Ok((atoms::error(), "limit must be positive").encode(env));
+    }
+
+    let p = std::path::Path::new(&path);
+
+    match log::LogReader::open(p) {
+        Ok(mut reader) => match reader.iter_metadata_page_from_offset_tolerant(start_offset, limit)
+        {
+            Ok((records, next_offset, done)) => match encode_scan_records(env, &records) {
+                Ok(results) => Ok((atoms::ok(), results, next_offset, done).encode(env)),
+                Err(e) => Ok((atoms::error(), e).encode(env)),
+            },
+            Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+        },
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
 }
@@ -621,37 +629,45 @@ fn v2_scan_file_from_offset<'a>(
                 .iter_metadata_from_offset_tolerant(start_offset)
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
-            let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
-
-            for record in &records {
-                let key_bin = match OwnedBinary::new(record.key.len()) {
-                    Some(mut ob) => {
-                        ob.as_mut_slice().copy_from_slice(&record.key);
-                        ob.release(env)
-                    }
-                    None => {
-                        return Ok(
-                            (atoms::error(), "out of memory allocating key binary").encode(env)
-                        );
-                    }
-                };
-
-                let tuple = (
-                    key_bin,
-                    record.offset,
-                    record.value_size,
-                    record.expire_at_ms,
-                    record.is_tombstone,
-                )
-                    .encode(env);
-
-                results.push(tuple);
+            match encode_scan_records(env, &records) {
+                Ok(results) => Ok((atoms::ok(), results).encode(env)),
+                Err(e) => Ok((atoms::error(), e).encode(env)),
             }
-
-            Ok((atoms::ok(), results).encode(env))
         }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
+}
+
+fn encode_scan_records<'a>(
+    env: Env<'a>,
+    records: &[log::RecordMetadata],
+) -> Result<Vec<Term<'a>>, &'static str> {
+    let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
+
+    for record in records {
+        let key_bin = match OwnedBinary::new(record.key.len()) {
+            Some(mut ob) => {
+                ob.as_mut_slice().copy_from_slice(&record.key);
+                ob.release(env)
+            }
+            None => {
+                return Err("out of memory allocating key binary");
+            }
+        };
+
+        results.push(
+            (
+                key_bin,
+                record.offset,
+                record.value_size,
+                record.expire_at_ms,
+                record.is_tombstone,
+            )
+                .encode(env),
+        );
+    }
+
+    Ok(results)
 }
 
 /// Scan only tombstone metadata from a data file.
@@ -2126,13 +2142,13 @@ fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
 
     let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
 
-    let env = unsafe {
-        heed::EnvOpenOptions::new()
-            .map_size(map_size)
-            .max_dbs(4)
-            .open(&cache_key)
-            .map_err(|e| e.to_string())?
-    };
+    let mut env_options = heed::EnvOpenOptions::new();
+    env_options.map_size(map_size).max_dbs(4);
+    unsafe {
+        env_options.flags(heed::EnvFlags::NO_READ_AHEAD);
+    }
+
+    let env = unsafe { env_options.open(&cache_key).map_err(|e| e.to_string())? };
 
     let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
     let db = env
@@ -2297,6 +2313,78 @@ fn lmdb_prefix_entries<'a>(
                         entries.push((key_term, value_term).encode(env));
                     }
                     Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                }
+            }
+
+            Ok((atoms::ok(), entries).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_prefix_entries_after<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    after_key: Binary<'a>,
+    limit: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let max = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut entries = Vec::new();
+
+            if after_key.as_slice().is_empty() {
+                let iter = match store.db.prefix_iter(&rtxn, prefix.as_slice()) {
+                    Ok(iter) => iter,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                for item in iter.take(max) {
+                    match item {
+                        Ok((key, value)) => {
+                            let key_term = binary_term(env, key)?;
+                            let value_term = binary_term(env, value)?;
+                            entries.push((key_term, value_term).encode(env));
+                        }
+                        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                    }
+                }
+            } else {
+                let range = (
+                    std::ops::Bound::Excluded(after_key.as_slice()),
+                    std::ops::Bound::Unbounded,
+                );
+                let iter = match store.db.range(&rtxn, &range) {
+                    Ok(iter) => iter,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                for item in iter {
+                    if entries.len() >= max {
+                        break;
+                    }
+
+                    match item {
+                        Ok((key, value)) => {
+                            if !key.starts_with(prefix.as_slice()) {
+                                break;
+                            }
+
+                            let key_term = binary_term(env, key)?;
+                            let value_term = binary_term(env, value)?;
+                            entries.push((key_term, value_term).encode(env));
+                        }
+                        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                    }
                 }
             }
 
@@ -3738,6 +3826,22 @@ mod lmdb_cache_tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "aliased LMDB paths must reuse the already-open environment"
+        );
+    }
+
+    #[test]
+    fn lmdb_store_opens_without_readahead() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = lmdb_store(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        let flags = store
+            .env
+            .flags()
+            .unwrap()
+            .expect("LMDB env flags should be representable by heed");
+
+        assert!(
+            flags.contains(heed::EnvFlags::NO_READ_AHEAD),
+            "startup prefix scans should not force the OS to fault huge LMDB files into RSS"
         );
     }
 }

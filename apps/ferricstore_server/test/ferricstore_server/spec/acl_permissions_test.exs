@@ -70,6 +70,56 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     {cmd, keys}
   end
 
+  defp parser_supported_commands do
+    parser_path =
+      Path.expand(
+        "../../../../ferricstore/native/resp_parser_nif/src/lib.rs",
+        __DIR__
+      )
+
+    parser_source = File.read!(parser_path)
+
+    parser_ast_commands =
+      parser_source
+      |> parser_match_block!(
+        ~r/fn classify_command_ast\(cmd: &\[u8\], arity: usize\).*?match cmd \{(.*?)\n\s*_ => CommandAstKind::Unknown,/s
+      )
+      |> parser_command_literals()
+
+    parser_tag_commands =
+      parser_source
+      |> parser_match_block!(
+        ~r/fn command_tag_name\(cmd: &\[u8\]\).*?match cmd \{(.*?)\n\s*}\n}/s
+      )
+      |> parser_command_literals()
+
+    MapSet.union(parser_ast_commands, parser_tag_commands)
+  end
+
+  defp parser_match_block!(source, pattern) do
+    [_all, command_tag_block] =
+      Regex.run(
+        pattern,
+        source
+      )
+
+    command_tag_block
+  end
+
+  defp parser_command_literals(block) do
+    ~r/b"([A-Z0-9_.]+)"\s*=>\s*Some/
+    |> Regex.scan(block, capture: :all_but_first)
+    |> then(fn tag_commands ->
+      ast_commands =
+        ~r/b"([A-Z0-9_.]+)"(?:\s+if\s+.*?)?\s*=>\s*CommandAstKind::/
+        |> Regex.scan(block, capture: :all_but_first)
+
+      tag_commands ++ ast_commands
+    end)
+    |> List.flatten()
+    |> MapSet.new()
+  end
+
   # Sets requirepass for tests that need AUTH. Registers on_exit cleanup.
   defp enable_requirepass do
     Ferricstore.Config.set("requirepass", "testpass")
@@ -589,29 +639,21 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
 
   describe "category membership" do
     test "ACL categories cover every RESP command known by the parser" do
-      parser_path =
-        Path.expand(
-          "../../../../ferricstore/native/resp_parser_nif/src/lib.rs",
-          __DIR__
-        )
-
-      parser_source = File.read!(parser_path)
-
-      [_all, command_tag_block] =
-        Regex.run(
-          ~r/fn command_tag_name\(cmd: &\[u8\]\).*?match cmd \{(.*?)\n\s*}\n}/s,
-          parser_source
-        )
-
-      parser_commands =
-        ~r/b"([A-Z0-9_.]+)"\s*=>\s*Some/
-        |> Regex.scan(command_tag_block, capture: :all_but_first)
-        |> List.flatten()
-        |> MapSet.new()
-
+      parser_commands = parser_supported_commands()
       acl_commands = FerricstoreServer.Acl.CommandCategories.acl_supported_commands()
 
       assert MapSet.difference(parser_commands, acl_commands) == MapSet.new()
+    end
+
+    test "@flow category covers every FLOW command known by the parser" do
+      parser_flow_commands =
+        parser_supported_commands()
+        |> Enum.filter(&String.starts_with?(&1, "FLOW."))
+        |> MapSet.new()
+
+      {:ok, acl_flow_commands} = FerricstoreServer.Acl.CommandCategories.category_commands("FLOW")
+
+      assert MapSet.difference(parser_flow_commands, acl_flow_commands) == MapSet.new()
     end
 
     test "-@write denies every mutating command family, including newer modules" do
@@ -643,13 +685,14 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
       read_cmds =
         ~w(
           BF.EXISTS CF.EXISTS CMS.QUERY TOPK.QUERY TDIGEST.INFO FLOW.GET FLOW.HISTORY
-          ZRANGEBYSCORE ZREVRANGE ZREVRANGEBYSCORE HTTL HPTTL HEXPIRETIME
+          FLOW.TERMINALS FLOW.FAILURES ZRANGEBYSCORE ZREVRANGE ZREVRANGEBYSCORE
+          HTTL HPTTL HEXPIRETIME
         )
 
       write_cmds =
         ~w(
           BF.ADD CF.DEL CMS.MERGE TOPK.INCRBY TDIGEST.MERGE FLOW.COMPLETE
-          FLOW.TRANSITION_MANY HEXPIRE HSETEX XREADGROUP
+          FLOW.TRANSITION_MANY FLOW.RETENTION_CLEANUP HEXPIRE HSETEX XREADGROUP
         )
 
       read_write_cmds = ~w(GETEX GETDEL GETSET HGETEX HGETDEL CAS)

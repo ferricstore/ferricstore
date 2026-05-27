@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.Ops do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
   alias Ferricstore.Store.Shard.ZSetIndex
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
 
   @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
   @max_int64 9_223_372_036_854_775_807
@@ -1143,6 +1144,7 @@ defmodule Ferricstore.Store.Ops do
   def flush(%FerricStore.Instance{} = ctx) do
     with :ok <- flush_keys(ctx, Router.keys(ctx)) do
       clear_stream_tables()
+      NativeFlowIndex.reset_all(ctx.name, ctx.shard_count)
       :ok
     end
   end
@@ -1150,6 +1152,7 @@ defmodule Ferricstore.Store.Ops do
   def flush(%LocalTxStore{} = tx) do
     with :ok <- flush_keys(tx.instance_ctx, Router.keys(tx.instance_ctx)) do
       clear_stream_tables()
+      NativeFlowIndex.reset_all(tx.instance_ctx.name, tx.instance_ctx.shard_count)
       :ok
     end
   end

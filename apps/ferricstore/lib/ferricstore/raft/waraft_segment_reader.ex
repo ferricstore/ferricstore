@@ -69,6 +69,15 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
           {:ok, non_neg_integer()} | {:error, term()}
   def spill_apply_projection_cache(data_dir, shard_index)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    spill_apply_projection_cache(data_dir, shard_index, :all)
+  end
+
+  def spill_apply_projection_cache(_data_dir, _shard_index), do: {:ok, 0}
+
+  @spec spill_apply_projection_cache(binary(), non_neg_integer(), :all | non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def spill_apply_projection_cache(data_dir, shard_index, max_entries)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
     case :ets.whereis(@apply_projection_table) do
       :undefined ->
         {:ok, 0}
@@ -78,7 +87,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         projection_root = Path.join(root, @apply_projection_dir)
 
         table
-        |> apply_projection_cache_entries(root)
+        |> apply_projection_cache_entries(root, max_entries)
         |> Enum.group_by(fn {index, _key, _value, _expire_at_ms} -> index end)
         |> Enum.sort_by(fn {index, _entries} -> index end)
         |> spill_apply_projection_groups(data_dir, shard_index, projection_root)
@@ -87,7 +96,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     error -> {:error, {:spill_apply_projection_cache_failed, error}}
   end
 
-  def spill_apply_projection_cache(_data_dir, _shard_index), do: {:ok, 0}
+  def spill_apply_projection_cache(_data_dir, _shard_index, _max_entries), do: {:ok, 0}
 
   @spec apply_projection_refs_before(binary(), non_neg_integer(), pos_integer()) :: [
           {pos_integer(), binary()}
@@ -178,6 +187,80 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
 
   def read_value_from_location(_ctx, _shard_index, _file_id, _key),
     do: {:error, :not_waraft_segment_location}
+
+  @spec read_values_from_location(FerricStore.Instance.t(), non_neg_integer(), term(), [
+          binary()
+        ]) ::
+          {:ok, %{binary() => binary()}} | {:error, term()}
+  def read_values_from_location(ctx, shard_index, {:waraft_apply_projection, index}, keys)
+      when is_integer(index) and index > 0 and is_list(keys) do
+    root = storage_root(ctx, shard_index)
+
+    {found, missing} =
+      keys
+      |> Enum.uniq()
+      |> Enum.reduce({%{}, []}, fn key, {found, missing} ->
+        case read_apply_projection_cache(root, index, key) do
+          {:ok, value} -> {Map.put(found, key, value), missing}
+          :not_found -> {found, [key | missing]}
+        end
+      end)
+
+    case missing do
+      [] ->
+        {:ok, found}
+
+      [_ | _] ->
+        case read_apply_projection_latest_entries_from_disk(root, index) do
+          {:ok, entries} ->
+            found = collect_projection_entry_values(entries, missing, found)
+            still_missing = reject_found_keys(missing, found)
+
+            if still_missing == [] do
+              {:ok, found}
+            else
+              read_apply_projection_missing_from_merged_disk(root, index, still_missing, found)
+            end
+
+          :not_found ->
+            {:ok, found}
+
+          {:error, reason} ->
+            if map_size(found) > 0, do: {:ok, found}, else: {:error, reason}
+        end
+    end
+  end
+
+  def read_values_from_location(ctx, shard_index, file_id, keys) when is_list(keys) do
+    values =
+      Enum.reduce(keys, %{}, fn key, acc ->
+        case read_value_from_location(ctx, shard_index, file_id, key) do
+          {:ok, value} -> Map.put(acc, key, value)
+          _missing_or_error -> acc
+        end
+      end)
+
+    {:ok, values}
+  end
+
+  defp read_apply_projection_missing_from_merged_disk(root, index, missing, found) do
+    case read_apply_projection_entries_from_disk(root, index) do
+      {:ok, entries} ->
+        {:ok, collect_projection_entry_values(entries, missing, found)}
+
+      :not_found ->
+        {:ok, found}
+
+      {:error, reason} ->
+        if map_size(found) > 0, do: {:ok, found}, else: {:error, reason}
+    end
+  end
+
+  defp reject_found_keys(keys, found) when is_map(found) do
+    Enum.reject(keys, &Map.has_key?(found, &1))
+  end
+
+  defp reject_found_keys(keys, _found), do: keys
 
   defp read_main_log_value(ctx, shard_index, index, key) do
     with {:ok, entry} <- read_main_log_entry(ctx, shard_index, index) do
@@ -317,6 +400,30 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   end
 
   defp read_apply_projection_value_from_disk(root, index, key) do
+    case read_apply_projection_latest_entries_from_disk(root, index) do
+      {:ok, entries} ->
+        case value_from_projection_entries(entries, key) do
+          {:ok, _value} = ok -> ok
+          :not_found -> read_apply_projection_value_from_merged_disk(root, index, key)
+        end
+
+      :not_found ->
+        :not_found
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp read_apply_projection_value_from_merged_disk(root, index, key) do
+    case read_apply_projection_entries_from_disk(root, index) do
+      {:ok, entries} -> value_from_projection_entries(entries, key)
+      :not_found -> :not_found
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_apply_projection_latest_entries_from_disk(root, index) do
     projection_root = Path.join(root, @apply_projection_dir)
     root_chars = to_charlist(projection_root)
 
@@ -332,7 +439,28 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       case entry do
         {0, {:ferricstore_segment_apply_projection_batch, _position, entries}}
         when is_list(entries) ->
-          value_from_projection_entries(entries, key)
+          {:ok, entries}
+
+        _other ->
+          {:error, :bad_segment_apply_projection_entry}
+      end
+    else
+      :not_found -> :not_found
+      {:error, :enoent} -> :not_found
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_apply_projection_entries_from_disk(root, index) do
+    projection_root = Path.join(root, @apply_projection_dir)
+    root_chars = to_charlist(projection_root)
+
+    with {:ok, entry} <-
+           :ferricstore_waraft_spike_segment_log.read_disk(root_chars, index) do
+      case entry do
+        {0, {:ferricstore_segment_apply_projection_batch, _position, entries}}
+        when is_list(entries) ->
+          {:ok, entries}
 
         _other ->
           {:error, :bad_segment_apply_projection_entry}
@@ -348,6 +476,19 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     Enum.reduce(entries, :not_found, fn
       {^key, value, _expire_at_ms}, _acc when is_binary(value) -> {:ok, value}
       _entry, acc -> acc
+    end)
+  end
+
+  defp collect_projection_entry_values(entries, keys, acc) do
+    keyset = MapSet.new(keys)
+
+    Enum.reduce(entries, acc, fn
+      {key, value, _expire_at_ms}, values
+      when is_binary(key) and is_binary(value) ->
+        if MapSet.member?(keyset, key), do: Map.put(values, key, value), else: values
+
+      _entry, values ->
+        values
     end)
   end
 
@@ -407,40 +548,71 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     ])
   end
 
-  defp apply_projection_cache_entries(table, root) do
+  defp apply_projection_cache_entries(table, root, :all) do
     :ets.select(table, [
       {{{root, :"$1", :"$2"}, :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
     ])
   end
 
-  defp spill_apply_projection_groups(groups, data_dir, shard_index, projection_root) do
-    Enum.reduce_while(groups, {:ok, 0}, fn {index, entries}, {:ok, acc} ->
-      batch =
-        Enum.map(entries, fn {_index, key, value, expire_at_ms} -> {key, value, expire_at_ms} end)
+  defp apply_projection_cache_entries(_table, _root, max_entries)
+       when is_integer(max_entries) and max_entries <= 0,
+       do: []
 
-      case write_apply_projection_spill(projection_root, index, batch) do
-        :ok ->
-          refs = Enum.map(entries, fn {_index, key, _value, _expire_at_ms} -> {index, key} end)
-          removed = delete_apply_projection_entries(data_dir, shard_index, refs)
-          {:cont, {:ok, acc + removed}}
-
-        {:error, _reason} = error ->
-          {:halt, error}
+  defp apply_projection_cache_entries(table, root, max_entries) when is_integer(max_entries) do
+    selected =
+      case :ets.select(
+             table,
+             [
+               {{{root, :"$1", :"$2"}, :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
+             ],
+             max_entries
+           ) do
+        {entries, _continuation} -> entries
+        :"$end_of_table" -> []
       end
+
+    selected
+    |> Enum.map(fn {index, _key, _value, _expire_at_ms} -> index end)
+    |> MapSet.new()
+    |> Enum.flat_map(fn index ->
+      :ets.select(table, [
+        {{{root, index, :"$1"}, :"$2", :"$3"}, [], [{{index, :"$1", :"$2", :"$3"}}]}
+      ])
     end)
   end
 
-  defp write_apply_projection_spill(_projection_root, _index, []), do: :ok
+  defp spill_apply_projection_groups(groups, data_dir, shard_index, projection_root) do
+    {batches, refs} =
+      Enum.map_reduce(groups, [], fn {index, entries}, ref_acc ->
+        batch =
+          Enum.map(entries, fn {_index, key, value, expire_at_ms} ->
+            {key, value, expire_at_ms}
+          end)
 
-  defp write_apply_projection_spill(projection_root, index, entries) do
-    case :ferricstore_waraft_spike_segment_log.write_projection_batch(
+        refs =
+          Enum.reduce(entries, ref_acc, fn {_index, key, _value, _expire_at_ms}, acc ->
+            [{index, key} | acc]
+          end)
+
+        {{{:raft_log_pos, index, 0}, batch}, refs}
+      end)
+
+    case write_apply_projection_spill(projection_root, batches) do
+      :ok -> {:ok, delete_apply_projection_entries(data_dir, shard_index, refs)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp write_apply_projection_spill(_projection_root, []), do: :ok
+
+  defp write_apply_projection_spill(projection_root, batches) do
+    case :ferricstore_waraft_spike_segment_log.write_projection_batches(
            to_charlist(projection_root),
-           {:raft_log_pos, index, 0},
-           entries
+           batches
          ) do
       :ok -> :ok
-      {:error, reason} -> {:error, {:write_apply_projection_spill_failed, index, reason}}
-      other -> {:error, {:write_apply_projection_spill_failed, index, other}}
+      {:error, reason} -> {:error, {:write_apply_projection_spill_failed, reason}}
+      other -> {:error, {:write_apply_projection_spill_failed, other}}
     end
   end
 

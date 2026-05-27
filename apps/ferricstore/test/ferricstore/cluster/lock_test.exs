@@ -6,7 +6,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
   - LOCK acquired on one node is visible on that node (Raft-durable)
   - Concurrent LOCK attempts on the same node: exactly 1 winner
-  - LOCK survives node restart (Raft WAL persistence)
+  - LOCK survives node restart (WARaft segment persistence)
   - UNLOCK from wrong owner fails
 
   ## Current Architecture Note

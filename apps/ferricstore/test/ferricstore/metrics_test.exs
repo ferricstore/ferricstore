@@ -459,18 +459,6 @@ defmodule Ferricstore.MetricsTest do
              )
     end
 
-    test "prefix metrics cache ignores stale ra_event messages without error logging" do
-      pid = Process.whereis(PrefixMetricsCache)
-      assert is_pid(pid)
-
-      log =
-        capture_log(fn ->
-          send(pid, {:ra_event, {:stale_shard, :nonode@nohost}, {:applied, []}})
-          Process.sleep(20)
-        end)
-
-      refute log =~ "received unexpected message"
-    end
   end
 
   # ---------------------------------------------------------------------------

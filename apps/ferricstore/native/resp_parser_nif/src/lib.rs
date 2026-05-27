@@ -6379,6 +6379,7 @@ enum FlowOptType<'a> {
     Boolean,
     Ref(&'a [u8]),
     NonNegative,
+    NonNegativeNamed(&'a [u8]),
     Positive(&'a [u8]),
     Partition,
 }
@@ -6435,7 +6436,7 @@ fn flow_create_option<'a>(
             (
                 b"HISTORY_HOT_MAX_EVENTS",
                 "history_hot_max_events",
-                FlowOptType::Positive(b"history_hot_max_events"),
+                FlowOptType::NonNegativeNamed(b"history_hot_max_events"),
             ),
             (
                 b"HISTORY_MAX_EVENTS",
@@ -6628,7 +6629,7 @@ fn flow_spawn_children_option<'a>(
             (
                 b"HISTORY_HOT_MAX_EVENTS",
                 "history_hot_max_events",
-                FlowOptType::Positive(b"history_hot_max_events"),
+                FlowOptType::NonNegativeNamed(b"history_hot_max_events"),
             ),
             (
                 b"HISTORY_MAX_EVENTS",
@@ -6771,15 +6772,10 @@ fn flow_policy_option<'a>(
             )),
         }
     } else if ascii_eq_ignore_case(arg_bytes[idx], b"HISTORY_HOT_MAX_EVENTS") {
-        match parse_int_bytes(arg_bytes[idx + 1]) {
-            Some(value) if value > 0 => Ok(FlowPolicyOpt::Retention(
-                (atom(env, "history_hot_max_events"), value).encode(env),
-            )),
-            _ => Err(generic_ast_error(
-                env,
-                b"ERR value is not an integer or out of range",
-            )),
-        }
+        Err(generic_ast_error(
+            env,
+            b"ERR flow retention history_hot_max_events is internal",
+        ))
     } else if ascii_eq_ignore_case(arg_bytes[idx], b"HISTORY_MAX_EVENTS") {
         match parse_int_bytes(arg_bytes[idx + 1]) {
             Some(value) if value > 0 => Ok(FlowPolicyOpt::Retention(
@@ -6907,6 +6903,7 @@ fn flow_claim_due_option<'a>(
             (b"LIMIT", "limit", FlowOptType::Positive(b"limit")),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"BLOCK", "block_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
             (b"RETURN", "return", FlowOptType::Binary),
             (b"RECLAIM_EXPIRED", "reclaim_expired", FlowOptType::Boolean),
@@ -7449,6 +7446,15 @@ fn flow_option_value<'a>(
                 env,
                 b"ERR value is not an integer or out of range",
             )),
+        },
+        FlowOptType::NonNegativeNamed(label) => match parse_int_bytes(value_bytes) {
+            Some(value) if value >= 0 => Ok(Some((key_atom, value).encode(env))),
+            _ => {
+                let mut msg = b"ERR flow ".to_vec();
+                msg.extend_from_slice(label);
+                msg.extend_from_slice(b" must be a non-negative integer");
+                Err(generic_ast_error(env, &msg))
+            }
         },
         FlowOptType::Positive(label) => match parse_int_bytes(value_bytes) {
             Some(value) if value > 0 => Ok(Some((key_atom, value).encode(env))),

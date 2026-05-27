@@ -23,7 +23,6 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.HLC
   alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.ErrorReasons
-  alias Ferricstore.Flow.Index, as: FlowIndex
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Raft.PerfToggles
   alias Ferricstore.Raft.ReplyAwaiter
@@ -47,6 +46,8 @@ defmodule Ferricstore.Store.Router do
   @default_async_key_latch_timeout_ms 30_000
   @flow_claim_cursor_table :ferricstore_flow_claim_due_any_cursor
   @flow_claim_due_any_window_multiplier 8
+  @flow_claim_due_precheck_slack_ms 5
+  @flow_shard_marker :__flow_shard_index__
 
   defguardp valid_cold_file_ref(file_id, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(value_size) and
@@ -987,7 +988,7 @@ defmodule Ferricstore.Store.Router do
         end
 
       :expired ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
 
       :miss ->
@@ -1055,7 +1056,7 @@ defmodule Ferricstore.Store.Router do
                 {:hot, value}
 
               :miss ->
-                record_keyspace_miss(ctx)
+                record_keyspace_miss(ctx, key)
                 :miss
             end
         end
@@ -1069,7 +1070,7 @@ defmodule Ferricstore.Store.Router do
             {:cold_value, value}
 
           _ ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             :miss
         end
 
@@ -1079,7 +1080,7 @@ defmodule Ferricstore.Store.Router do
         shard_file_ref_or_value(ctx, idx, key)
 
       :expired ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         :miss
 
       :miss ->
@@ -1087,7 +1088,7 @@ defmodule Ferricstore.Store.Router do
           {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
         else
           # Key not in ETS = doesn't exist. No GenServer needed.
-          record_keyspace_miss(ctx)
+          record_keyspace_miss(ctx, key)
           :miss
         end
 
@@ -1115,7 +1116,7 @@ defmodule Ferricstore.Store.Router do
           Stats.record_cold_read(ctx, key)
           {:cold_value, result}
         else
-          record_keyspace_miss(ctx)
+          record_keyspace_miss(ctx, key)
           :miss
         end
     end
@@ -1437,7 +1438,7 @@ defmodule Ferricstore.Store.Router do
                 value
 
               :miss ->
-                record_keyspace_miss(ctx)
+                record_keyspace_miss(ctx, key)
                 nil
             end
         end
@@ -1451,7 +1452,7 @@ defmodule Ferricstore.Store.Router do
             value
 
           _ ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             nil
         end
 
@@ -1466,18 +1467,18 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          record_keyspace_miss(ctx)
+          record_keyspace_miss(ctx, key)
         end
 
         result
 
       :expired ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
 
       :miss ->
         # Key not in ETS at all — doesn't exist. No GenServer needed.
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
 
       :no_table ->
@@ -1491,7 +1492,7 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          record_keyspace_miss(ctx)
+          record_keyspace_miss(ctx, key)
         end
 
         result
@@ -1537,7 +1538,7 @@ defmodule Ferricstore.Store.Router do
                   value
 
                 _ ->
-                  record_keyspace_miss(ctx)
+                  record_keyspace_miss(ctx, key)
                   nil
               end
 
@@ -1553,17 +1554,17 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              record_keyspace_miss(ctx)
+              record_keyspace_miss(ctx, key)
             end
 
             {{:value, result}, {cold_entries, cold_count, hot_hits}}
 
           :expired ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :miss ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :no_table ->
@@ -1576,7 +1577,7 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              record_keyspace_miss(ctx)
+              record_keyspace_miss(ctx, key)
             end
 
             {{:value, result}, {cold_entries, cold_count, hot_hits}}
@@ -1662,7 +1663,7 @@ defmodule Ferricstore.Store.Router do
                   value
 
                 _ ->
-                  record_keyspace_miss(ctx)
+                  record_keyspace_miss(ctx, key)
                   nil
               end
 
@@ -1678,17 +1679,17 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              record_keyspace_miss(ctx)
+              record_keyspace_miss(ctx, key)
             end
 
             {{:value, result}, {cold_entries, cold_count, hot_hits}}
 
           :expired ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :miss ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             {{:value, nil}, {cold_entries, cold_count, hot_hits}}
 
           :no_table ->
@@ -1701,7 +1702,7 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              record_keyspace_miss(ctx)
+              record_keyspace_miss(ctx, key)
             end
 
             {{:value, result}, {cold_entries, cold_count, hot_hits}}
@@ -1826,7 +1827,7 @@ defmodule Ferricstore.Store.Router do
               {{:value, value}, {cold_entries, cold_count, hot_hits}}
 
             :miss ->
-              record_keyspace_miss(ctx)
+              record_keyspace_miss(ctx, key)
               {{:value, nil}, {cold_entries, cold_count, hot_hits}}
           end
       end
@@ -1952,7 +1953,7 @@ defmodule Ferricstore.Store.Router do
             value
 
           :miss ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             nil
         end
     end)
@@ -2188,7 +2189,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       :miss ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
     end
   end
@@ -2451,7 +2452,7 @@ defmodule Ferricstore.Store.Router do
                 {value, retry_expire_at_ms}
 
               :miss ->
-                record_keyspace_miss(ctx)
+                record_keyspace_miss(ctx, key)
                 nil
             end
         end
@@ -2465,7 +2466,7 @@ defmodule Ferricstore.Store.Router do
             {value, expire_at_ms}
 
           _ ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             nil
         end
 
@@ -2480,17 +2481,17 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          record_keyspace_miss(ctx)
+          record_keyspace_miss(ctx, key)
         end
 
         result
 
       :expired ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
 
       :miss ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
 
       :no_table ->
@@ -2503,7 +2504,7 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          record_keyspace_miss(ctx)
+          record_keyspace_miss(ctx, key)
         end
 
         result
@@ -2716,7 +2717,7 @@ defmodule Ferricstore.Store.Router do
             range_from_value(value, start_idx, end_idx)
 
           _ ->
-            record_keyspace_miss(ctx)
+            record_keyspace_miss(ctx, key)
             nil
         end
 
@@ -2724,11 +2725,11 @@ defmodule Ferricstore.Store.Router do
         fallback_getrange(ctx, idx, key, start_idx, end_idx)
 
       :expired ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
 
       :miss ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
 
       :no_table ->
@@ -2889,7 +2890,7 @@ defmodule Ferricstore.Store.Router do
                 value
 
               :error ->
-                record_keyspace_miss(ctx)
+                record_keyspace_miss(ctx, key)
                 nil
             end
         end
@@ -2898,7 +2899,7 @@ defmodule Ferricstore.Store.Router do
         range_from_value(value, start_idx, end_idx)
 
       :miss ->
-        record_keyspace_miss(ctx)
+        record_keyspace_miss(ctx, key)
         nil
     end
   end
@@ -2934,7 +2935,7 @@ defmodule Ferricstore.Store.Router do
       Stats.record_cold_read(ctx, key)
       range_from_value(result, start_idx, end_idx)
     else
-      record_keyspace_miss(ctx)
+      record_keyspace_miss(ctx, key)
       nil
     end
   end
@@ -3002,7 +3003,7 @@ defmodule Ferricstore.Store.Router do
   # LFU counter already available from the initial ets_get_full lookup.
   # Eliminates the second ETS lookup that sampled_read_bookkeeping does.
   defp sampled_read_bookkeeping_fast(ctx, keydir, key, lfu) do
-    sampled = Stats.sample_keyspace_hits(ctx)
+    sampled = Stats.sample_keyspace_hits_for_key(ctx, key)
 
     if sampled > 0 do
       LFU.touch(ctx, keydir, key, lfu)
@@ -3014,15 +3015,23 @@ defmodule Ferricstore.Store.Router do
 
   defp sampled_read_bookkeeping_batch(ctx, hot_hits, max_hits)
        when is_list(hot_hits) and is_integer(max_hits) and max_hits >= 0 do
-    sample_state = Stats.start_keyspace_hit_batch(ctx, max_hits)
-    touched = sampled_hit_entries(sample_state, hot_hits)
+    if Stats.cache_tracking_enabled?() do
+      hot_hits =
+        Enum.filter(hot_hits, fn {_keydir, key, _lfu} -> Stats.cache_tracking_key?(key) end)
 
-    :ok = Stats.finish_keyspace_hit_batch(ctx, finish_hit_batch_state(sample_state, max_hits))
+      max_hits = length(hot_hits)
+      sample_state = Stats.start_keyspace_hit_batch(ctx, max_hits)
+      touched = sampled_hit_entries(sample_state, hot_hits)
 
-    Enum.each(touched, fn {keydir, key, lfu} ->
-      LFU.touch(ctx, keydir, key, lfu)
-      Stats.record_hot_read(ctx, key)
-    end)
+      :ok = Stats.finish_keyspace_hit_batch(ctx, finish_hit_batch_state(sample_state, max_hits))
+
+      Enum.each(touched, fn {keydir, key, lfu} ->
+        LFU.touch(ctx, keydir, key, lfu)
+        Stats.record_hot_read(ctx, key)
+      end)
+    else
+      :ok
+    end
   end
 
   defp sampled_hit_entries({:exact, _count}, hot_hits), do: hot_hits
@@ -3053,8 +3062,8 @@ defmodule Ferricstore.Store.Router do
   defp finish_hit_batch_state({:sampled_touch, rate, previous, _count, offset}, count),
     do: {:sampled_touch, rate, previous, count, offset}
 
-  defp record_keyspace_miss(ctx) do
-    Stats.sample_keyspace_misses(ctx)
+  defp record_keyspace_miss(ctx, key) do
+    Stats.sample_keyspace_misses_for_key(ctx, key)
   end
 
   # After a cold read, promote the value back to ETS (hot) if it fits
@@ -4010,7 +4019,7 @@ defmodule Ferricstore.Store.Router do
   def flow_get(ctx, id, partition_key) when is_binary(id) do
     key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
-    case get(ctx, key) do
+    case Stats.with_cache_tracking_disabled(fn -> get(ctx, key) end) do
       nil -> flow_get_lmdb(ctx, key, :lagged)
       value -> value
     end
@@ -4019,7 +4028,12 @@ defmodule Ferricstore.Store.Router do
   @doc false
   def flow_batch_get(ctx, ids, partition_key) when is_list(ids) do
     keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
-    values = batch_get(ctx, keys)
+
+    values =
+      Stats.with_cache_tracking_disabled(fn ->
+        batch_get(ctx, keys)
+      end)
+
     missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
     missing_values = flow_batch_get_lmdb(ctx, missing_keys, :lagged)
 
@@ -4198,8 +4212,7 @@ defmodule Ferricstore.Store.Router do
 
       valid = Enum.reverse(valid)
 
-      valid_results =
-        batch_quorum_commands(ctx, Enum.map(valid, fn {_idx, key, cmd} -> {key, cmd} end))
+      valid_results = flow_transition_batch_valid_results(ctx, valid)
 
       indexed_results =
         valid
@@ -4327,7 +4340,9 @@ defmodule Ferricstore.Store.Router do
         partition_key = attrs |> hd() |> Map.fetch!(:partition_key)
         key = Ferricstore.Flow.Keys.state_key(batch_id, partition_key)
         original_indices = Enum.map(group, fn {idx, _attrs} -> idx end)
-        {shard_idx, key, original_indices, {command, key, %{records: attrs}}}
+        command_attrs = flow_many_command_attrs(command, attrs)
+        command_attrs = flow_stamp_shard(command_attrs, shard_idx)
+        {shard_idx, key, original_indices, {command, key, command_attrs}}
       end)
 
     case Enum.find(groups, fn {_shard_idx, key, _indices, _cmd} ->
@@ -4341,6 +4356,61 @@ defmodule Ferricstore.Store.Router do
         keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
         group_results = batch_quorum_commands(ctx, keyed_commands)
         expand_flow_many_results(count, groups, group_results)
+    end
+  end
+
+  defp flow_many_command_attrs(:flow_transition_many, attrs_list),
+    do: flow_transition_many_command_attrs(attrs_list)
+
+  defp flow_many_command_attrs(_command, attrs_list), do: %{records: attrs_list}
+
+  defp flow_stamp_shard(attrs, shard_idx) when is_map(attrs) and is_integer(shard_idx),
+    do: Map.put(attrs, @flow_shard_marker, shard_idx)
+
+  @flow_transition_many_shared_keys [
+    :from_state,
+    :to_state,
+    :now_ms,
+    :run_at_ms,
+    :priority,
+    :payload,
+    :payload_ref,
+    :values,
+    :value_refs,
+    :drop_values,
+    :override_values
+  ]
+
+  defp flow_transition_many_command_attrs([_ | _] = attrs_list) do
+    case flow_extract_shared_attrs(attrs_list, @flow_transition_many_shared_keys) do
+      {%{} = shared, records} when map_size(shared) > 0 ->
+        %{records: records, shared: shared}
+
+      {_shared, records} ->
+        %{records: records}
+    end
+  end
+
+  defp flow_transition_many_command_attrs(attrs_list), do: %{records: attrs_list}
+
+  defp flow_extract_shared_attrs(attrs_list, shared_keys) do
+    Enum.reduce(shared_keys, {%{}, attrs_list}, fn key, {shared, records} ->
+      case flow_shared_attr_value(records, key) do
+        {:ok, value} ->
+          {Map.put(shared, key, value), Enum.map(records, &Map.delete(&1, key))}
+
+        :error ->
+          {shared, records}
+      end
+    end)
+  end
+
+  defp flow_shared_attr_value([first | rest], key) do
+    with {:ok, value} <- Map.fetch(first, key),
+         true <- Enum.all?(rest, &(Map.has_key?(&1, key) and Map.fetch!(&1, key) == value)) do
+      {:ok, value}
+    else
+      _ -> :error
     end
   end
 
@@ -4417,16 +4487,33 @@ defmodule Ferricstore.Store.Router do
 
   def flow_claim_due(ctx, %{type: type, priority: priority} = attrs)
       when is_binary(type) and (is_integer(priority) or is_nil(priority)) do
-    state = flow_claim_route_state(Map.get(attrs, :state))
+    requested_state = Map.get(attrs, :state)
+    state = flow_claim_route_state(requested_state)
+    partition_key = Map.get(attrs, :partition_key)
 
     key =
-      Ferricstore.Flow.Keys.due_key(type, state, priority || 0, Map.get(attrs, :partition_key))
+      Ferricstore.Flow.Keys.due_key(type, state, priority || 0, partition_key)
 
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
       idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_claim_due, key, attrs})
+
+      case flow_claim_due_empty_precheck(
+             ctx,
+             idx,
+             type,
+             requested_state,
+             priority,
+             partition_key,
+             attrs
+           ) do
+        :empty ->
+          {:ok, []}
+
+        _unknown_or_non_empty ->
+          raft_write(ctx, idx, key, {:flow_claim_due, key, attrs})
+      end
     end
   end
 
@@ -4485,7 +4572,7 @@ defmodule Ferricstore.Store.Router do
         rem(idx - start_idx + ctx.shard_count, ctx.shard_count)
       end)
 
-    case flow_claim_due_partition_key_commands(groups, attrs, limit) do
+    case flow_claim_due_partition_key_commands(ctx, groups, attrs, limit) do
       [] ->
         {:ok, []}
 
@@ -4502,36 +4589,135 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp flow_claim_due_partition_key_commands([], _attrs, _limit), do: []
+  defp flow_claim_due_partition_key_commands(_ctx, [], _attrs, _limit), do: []
 
-  defp flow_claim_due_partition_key_commands(groups, attrs, limit) do
-    group_count = length(groups)
-    base = div(limit, group_count)
-    extra = rem(limit, group_count)
+  defp flow_claim_due_partition_key_commands(ctx, groups, attrs, limit) do
     type = Map.fetch!(attrs, :type)
-    state = flow_claim_route_state(Map.get(attrs, :state))
-    priority = Map.get(attrs, :priority) || 0
+    requested_state = Map.get(attrs, :state)
+    state = flow_claim_route_state(requested_state)
+    priority = Map.get(attrs, :priority)
+    route_priority = priority || 0
 
-    groups
-    |> Enum.with_index()
-    |> Enum.flat_map(fn {{_idx, partition_keys}, group_idx} ->
-      quota = base + if(group_idx < extra, do: 1, else: 0)
+    groups =
+      groups
+      |> Enum.flat_map(fn {idx, partition_keys} ->
+        filtered =
+          Enum.reject(partition_keys, fn partition_key ->
+            flow_claim_due_empty_precheck(
+              ctx,
+              idx,
+              type,
+              requested_state,
+              priority,
+              partition_key,
+              attrs
+            ) ==
+              :empty
+          end)
 
-      if quota <= 0 do
-        []
-      else
-        key = Ferricstore.Flow.Keys.due_key(type, state, priority, hd(partition_keys))
+        if filtered == [], do: [], else: [{idx, filtered}]
+      end)
 
-        shard_attrs =
-          attrs
-          |> Map.put(:limit, quota)
-          |> Map.put(:partition_key, hd(partition_keys))
-          |> Map.put(:partition_keys, partition_keys)
+    group_count = length(groups)
 
-        [{key, {:flow_claim_due, key, shard_attrs}}]
-      end
-    end)
+    if group_count == 0 do
+      []
+    else
+      base = div(limit, group_count)
+      extra = rem(limit, group_count)
+
+      groups
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {{_idx, partition_keys}, group_idx} ->
+        quota = base + if(group_idx < extra, do: 1, else: 0)
+
+        if quota <= 0 do
+          []
+        else
+          key = Ferricstore.Flow.Keys.due_key(type, state, route_priority, hd(partition_keys))
+
+          shard_attrs =
+            attrs
+            |> Map.put(:limit, quota)
+            |> Map.put(:partition_key, hd(partition_keys))
+            |> Map.put(:partition_keys, partition_keys)
+
+          [{key, {:flow_claim_due, key, shard_attrs}}]
+        end
+      end)
+    end
   end
+
+  defp flow_claim_due_empty_precheck(ctx, idx, type, state, priority, partition_key, attrs) do
+    with true <- flow_claim_due_empty_precheck_allowed?(ctx, idx),
+         {:ok, due_keys} <- flow_claim_due_precheck_keys(type, state, priority, partition_key),
+         true <- due_keys != [],
+         {:ok, native} <- direct_flow_index_read(ctx, idx, & &1) do
+      now_ms = flow_claim_due_precheck_now_ms(attrs)
+
+      case NativeFlowIndex.due_keys_present(native, due_keys, now_ms) do
+        [] -> :empty
+        [_ | _] -> :non_empty
+      end
+    else
+      _other -> :unknown
+    end
+  rescue
+    _error -> :unknown
+  catch
+    _kind, _reason -> :unknown
+  end
+
+  defp flow_claim_due_precheck_now_ms(%{now_ms: now_ms}) when is_integer(now_ms), do: now_ms
+
+  defp flow_claim_due_precheck_now_ms(_attrs),
+    do: CommandTime.now_ms() + @flow_claim_due_precheck_slack_ms
+
+  defp flow_claim_due_empty_precheck_allowed?(ctx, idx) do
+    selected_waraft_ctx?(ctx) and flow_claim_due_single_local_member?(idx)
+  end
+
+  defp flow_claim_due_single_local_member?(idx) do
+    case Ferricstore.Raft.WARaftBackend.cached_members(idx) do
+      {:ok, [{_server, node_name}], nil} ->
+        node_name == node()
+
+      {:ok, [{_server, node_name}], {_leader_server, leader_node}} ->
+        node_name == node() and leader_node == node()
+
+      _other ->
+        false
+    end
+  catch
+    _kind, _reason -> false
+  end
+
+  defp flow_claim_due_precheck_keys(type, state, priority, partition_key)
+       when is_binary(type) and partition_key not in [:any, :auto] do
+    with {:ok, states} <- flow_claim_due_precheck_states(state),
+         priorities <- flow_claim_any_priorities(priority),
+         true <- Enum.all?(priorities, &is_integer/1) do
+      keys =
+        for state <- states,
+            priority <- priorities do
+          Ferricstore.Flow.Keys.due_key(type, state, priority, partition_key)
+        end
+
+      {:ok, keys}
+    else
+      _other -> :unknown
+    end
+  end
+
+  defp flow_claim_due_precheck_keys(_type, _state, _priority, _partition_key), do: :unknown
+
+  defp flow_claim_due_precheck_states(state) when is_binary(state), do: {:ok, [state]}
+
+  defp flow_claim_due_precheck_states(states) when is_list(states) do
+    if Enum.all?(states, &is_binary/1), do: {:ok, states}, else: :unknown
+  end
+
+  defp flow_claim_due_precheck_states(_state), do: :unknown
 
   defp flow_claim_due_partition_key_results(results, limit) do
     results
@@ -4924,8 +5110,7 @@ defmodule Ferricstore.Store.Router do
 
       valid = Enum.reverse(valid)
 
-      valid_results =
-        batch_quorum_commands(ctx, Enum.map(valid, fn {_idx, key, cmd} -> {key, cmd} end))
+      valid_results = flow_transition_batch_valid_results(ctx, valid)
 
       indexed_results =
         valid
@@ -4937,6 +5122,64 @@ defmodule Ferricstore.Store.Router do
     else
       Enum.map(attrs_list, &flow_transition(ctx, &1))
     end
+  end
+
+  defp flow_transition_batch_valid_results(_ctx, []), do: []
+
+  defp flow_transition_batch_valid_results(ctx, valid) do
+    {buckets, count} =
+      valid
+      |> Enum.with_index()
+      |> Enum.reduce({flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+        {{_idx, key, {:flow_transition, _key, attrs}}, local_idx}, {buckets, count} ->
+          shard_idx = shard_for(ctx, key)
+          {flow_put_shard_bucket(buckets, shard_idx, {local_idx, key, attrs}), count + 1}
+      end)
+
+    groups =
+      flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+        group = Enum.reverse(entries)
+        key = group |> hd() |> elem(1)
+        local_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
+        attrs_list = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
+
+        command_attrs =
+          attrs_list
+          |> flow_transition_many_command_attrs()
+          |> Map.put(:independent, true)
+          |> flow_stamp_shard(shard_idx)
+
+        {key, local_indices, {:flow_transition_many, key, command_attrs}}
+      end)
+
+    keyed_commands = Enum.map(groups, fn {key, _indices, cmd} -> {key, cmd} end)
+    group_results = batch_quorum_commands(ctx, keyed_commands)
+    expand_flow_transition_batch_results(count, groups, group_results)
+  end
+
+  defp expand_flow_transition_batch_results(count, groups, group_results) do
+    results =
+      group_results
+      |> Enum.zip(groups)
+      |> Enum.reduce(new_waraft_result_tuple(count), fn
+        {results, {_key, indices, _cmd}}, acc when is_list(results) ->
+          put_flow_transition_batch_results(indices, results, acc)
+
+        {{:error, _reason} = error, {_key, indices, _cmd}}, acc ->
+          Enum.reduce(indices, acc, fn idx, next -> put_elem(next, idx, error) end)
+
+        {other, {_key, indices, _cmd}}, acc ->
+          Enum.reduce(indices, acc, fn idx, next -> put_elem(next, idx, other) end)
+      end)
+
+    Tuple.to_list(results)
+  end
+
+  defp put_flow_transition_batch_results([], _results, acc), do: acc
+  defp put_flow_transition_batch_results(_indices, [], acc), do: acc
+
+  defp put_flow_transition_batch_results([index | indices], [result | results], acc) do
+    put_flow_transition_batch_results(indices, results, put_elem(acc, index, result))
   end
 
   @doc false
@@ -4953,7 +5196,7 @@ defmodule Ferricstore.Store.Router do
         ctx,
         idx,
         key,
-        {:flow_transition_many, key, %{records: attrs_list}}
+        {:flow_transition_many, key, flow_transition_many_command_attrs(attrs_list)}
       )
     end
   end
@@ -5216,6 +5459,10 @@ defmodule Ferricstore.Store.Router do
   defp flow_terminal_many_values(_ctx, []), do: []
 
   defp flow_terminal_many_values(ctx, keys) do
+    if hook = Process.get(:ferricstore_flow_terminal_many_values_hook) do
+      hook.(keys)
+    end
+
     values = batch_get(ctx, keys)
     missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
     missing_values = flow_batch_get_lmdb(ctx, missing_keys, :lagged)
@@ -5350,7 +5597,7 @@ defmodule Ferricstore.Store.Router do
         route_key = List.first(keys)
 
         {shard_idx, route_key, indices,
-         {:flow_create_pipeline_batch, route_key, %{records: attrs}}}
+         {:flow_create_pipeline_batch, route_key, flow_stamp_shard(%{records: attrs}, shard_idx)}}
       end)
 
     keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
@@ -5423,10 +5670,34 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  def flow_terminal_command_batch_independent(_ctx, []), do: []
+
+  def flow_terminal_command_batch_independent(ctx, commands) when is_list(commands) do
+    case flow_terminal_pipeline_independent_batch(ctx, commands) do
+      {:ok, results} ->
+        results
+
+      :fallback ->
+        commands
+        |> flow_terminal_command_batch_independent(ctx, [], [])
+        |> Enum.reverse()
+    end
+  end
+
   defp flow_terminal_pipeline_batch(ctx, commands) do
     with {:ok, op, attrs_list} <- flow_terminal_homogeneous_attrs(commands),
          :ok <- flow_terminal_pipeline_keys_valid?(attrs_list),
          :same_or_none <- flow_cross_terminal_many_keys(ctx, attrs_list) do
+      {:ok, flow_terminal_pipeline_same_shard(ctx, op, attrs_list)}
+    else
+      _other -> :fallback
+    end
+  end
+
+  defp flow_terminal_pipeline_independent_batch(ctx, commands) do
+    with {:ok, op, attrs_list} <- flow_terminal_homogeneous_attrs(commands),
+         :ok <- flow_terminal_pipeline_keys_valid?(attrs_list) do
       {:ok, flow_terminal_pipeline_same_shard(ctx, op, attrs_list)}
     else
       _other -> :fallback
@@ -5461,51 +5732,55 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp flow_terminal_pipeline_same_shard(ctx, op, attrs_list) do
-    {by_shard, count} =
+    {buckets, count} =
       attrs_list
       |> Enum.with_index()
-      |> Enum.reduce({%{}, 0}, fn {%{id: id} = attrs, index}, {groups, count} ->
+      |> Enum.reduce({flow_fixed_shard_buckets(ctx.shard_count), 0}, fn {%{id: id} = attrs, index},
+                                                                        {buckets, count} ->
         key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
         shard_idx = shard_for(ctx, key)
 
-        groups =
-          Map.update(groups, shard_idx, [{index, key, attrs}], fn acc ->
-            [{index, key, attrs} | acc]
-          end)
-
-        {groups, max(count, index + 1)}
+        {flow_put_shard_bucket(buckets, shard_idx, {index, key, attrs}), max(count, index + 1)}
       end)
 
-    indexed_results =
-      Enum.reduce(by_shard, %{}, fn {shard_idx, entries}, acc ->
+    groups =
+      buckets
+      |> flow_nonempty_shard_buckets(ctx.shard_count, fn shard_idx, entries ->
+        {shard_idx, entries}
+      end)
+      |> Enum.map(fn {shard_idx, entries} ->
         entries = Enum.reverse(entries)
         {indices, keys, attrs} = flow_terminal_pipeline_entries(entries, [], [], [])
         route_key = List.first(keys)
 
-        results =
-          case raft_write(
-                 ctx,
-                 shard_idx,
-                 route_key,
-                 {:flow_terminal_pipeline_batch, op, route_key, %{records: attrs}}
-               ) do
-            result when is_list(result) and length(result) == length(indices) ->
-              result
+        {shard_idx, route_key, indices,
+         {:flow_terminal_pipeline_batch, op, route_key,
+          flow_stamp_shard(%{records: attrs}, shard_idx)}}
+      end)
 
-            result ->
-              List.duplicate(result, length(indices))
+    keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
+    group_results = batch_quorum_commands(ctx, keyed_commands)
+
+    results =
+      groups
+      |> Enum.zip(group_results)
+      |> Enum.reduce(flow_result_tuple(count), fn {{_shard_idx, _route_key, indices, _cmd},
+                                                   result},
+                                                  acc ->
+        group_results =
+          case result do
+            result when is_list(result) and length(result) == length(indices) -> result
+            result -> List.duplicate(result, length(indices))
           end
 
         indices
-        |> Enum.zip(results)
-        |> Enum.reduce(acc, fn {index, result}, result_acc ->
-          Map.put(result_acc, index, result)
+        |> Enum.zip(group_results)
+        |> Enum.reduce(acc, fn {index, result}, results_acc ->
+          put_elem(results_acc, index, result)
         end)
       end)
 
-    for index <- 0..(count - 1) do
-      Map.get(indexed_results, index, ErrorReasons.write_timeout_unknown())
-    end
+    Tuple.to_list(results)
   end
 
   defp flow_terminal_pipeline_entries([], indices, keys, attrs) do
@@ -5556,6 +5831,54 @@ defmodule Ferricstore.Store.Router do
     results = batch_quorum_commands(ctx, Enum.reverse(batch_acc), nil)
 
     Enum.reverse(results) ++ result_acc
+  end
+
+  defp flow_terminal_command_batch_independent([], ctx, batch_acc, result_acc) do
+    flow_terminal_flush_batch(ctx, batch_acc, result_acc)
+  end
+
+  defp flow_terminal_command_batch_independent(
+         [{op, %{id: id} = attrs} | rest],
+         ctx,
+         batch_acc,
+         result_acc
+       )
+       when op in [:complete, :retry, :fail, :cancel] and is_binary(id) do
+    case flow_terminal_batch_command_independent(op, attrs) do
+      {:batch, key, command} ->
+        flow_terminal_command_batch_independent(
+          rest,
+          ctx,
+          [{key, command} | batch_acc],
+          result_acc
+        )
+
+      {:result, result} ->
+        result_acc = flow_terminal_flush_batch(ctx, batch_acc, result_acc)
+        flow_terminal_command_batch_independent(rest, ctx, [], [result | result_acc])
+    end
+  end
+
+  defp flow_terminal_command_batch_independent([_invalid | rest], ctx, batch_acc, result_acc) do
+    result_acc = flow_terminal_flush_batch(ctx, batch_acc, result_acc)
+
+    flow_terminal_command_batch_independent(
+      rest,
+      ctx,
+      [],
+      [{:error, "ERR flow id must be a non-empty string"} | result_acc]
+    )
+  end
+
+  defp flow_terminal_batch_command_independent(op, %{id: id} = attrs)
+       when op in [:complete, :retry, :fail, :cancel] do
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+    if byte_size(key) > @max_key_size do
+      {:result, {:error, "ERR key too large (max #{@max_key_size} bytes)"}}
+    else
+      {:batch, key, flow_terminal_raft_command(op, key, attrs)}
+    end
   end
 
   defp flow_terminal_batch_command(ctx, op, %{id: id} = attrs) do
@@ -7294,17 +7617,9 @@ defmodule Ferricstore.Store.Router do
          offset,
          count
        ) do
-    direct_flow_index_read(
-      ctx,
-      idx,
-      key,
-      fn flow_index, _flow_lookup ->
-        FlowIndex.range_slice(flow_index, key, min_bound, max_bound, reverse?, offset, count)
-      end,
-      fn native ->
-        NativeFlowIndex.range_slice(native, key, min_bound, max_bound, reverse?, offset, count)
-      end
-    )
+    direct_flow_index_read(ctx, idx, fn native ->
+      NativeFlowIndex.range_slice(native, key, min_bound, max_bound, reverse?, offset, count)
+    end)
   end
 
   defp direct_flow_index_rank_range(_ctx, _idx, _key, start_idx, stop_idx, _reverse?)
@@ -7312,17 +7627,9 @@ defmodule Ferricstore.Store.Router do
        do: {:ok, []}
 
   defp direct_flow_index_rank_range(ctx, idx, key, start_idx, stop_idx, reverse?) do
-    direct_flow_index_read(
-      ctx,
-      idx,
-      key,
-      fn flow_index, _flow_lookup ->
-        FlowIndex.rank_range(flow_index, key, start_idx, stop_idx, reverse?)
-      end,
-      fn native ->
-        NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)
-      end
-    )
+    direct_flow_index_read(ctx, idx, fn native ->
+      NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)
+    end)
   end
 
   defp direct_flow_index_rank_range_many(ctx, requests) do
@@ -7341,17 +7648,9 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp direct_flow_index_count_all(ctx, idx, key) do
-    direct_flow_index_read(
-      ctx,
-      idx,
-      key,
-      fn _flow_index, flow_lookup ->
-        FlowIndex.count_all(flow_lookup, key)
-      end,
-      fn native ->
-        NativeFlowIndex.count_all(native, key)
-      end
-    )
+    direct_flow_index_read(ctx, idx, fn native ->
+      NativeFlowIndex.count_all(native, key)
+    end)
   end
 
   defp direct_flow_index_count_all_many(ctx, keys) do
@@ -7369,29 +7668,16 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp direct_flow_index_read(ctx, idx, key, ets_fun, native_fun) do
-    {flow_index, flow_lookup} = FlowIndex.table_names(ctx.name, idx)
+  defp direct_flow_index_read(ctx, idx, fun) do
+    {flow_index, flow_lookup} = NativeFlowIndex.table_names(ctx.name, idx)
 
-    if native_flow_lifecycle_index_key?(key) do
-      case NativeFlowIndex.get(flow_index, flow_lookup) do
-        nil -> :unavailable
-        native -> {:ok, native_fun.(native)}
-      end
-    else
-      {:ok, ets_fun.(flow_index, flow_lookup)}
+    case NativeFlowIndex.get(flow_index, flow_lookup) do
+      nil -> :unavailable
+      native -> {:ok, fun.(native)}
     end
   rescue
     ArgumentError -> :unavailable
   end
-
-  defp native_flow_lifecycle_index_key?(key) when is_binary(key) do
-    :binary.match(key, "}:d:") != :nomatch or
-      :binary.match(key, "}:i:s:") != :nomatch or
-      :binary.match(key, "}:i:r:") != :nomatch or
-      :binary.match(key, "}:i:w:") != :nomatch
-  end
-
-  defp native_flow_lifecycle_index_key?(_key), do: false
 
   defp direct_zset_score_range(ctx, idx, redis_key, min_bound, max_bound, reverse?) do
     ctx

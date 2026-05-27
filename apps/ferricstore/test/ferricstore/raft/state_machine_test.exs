@@ -3,7 +3,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   Unit tests for `Ferricstore.Raft.StateMachine`.
 
   These tests exercise the state machine callbacks directly without running
-  a full ra server. The state machine is deterministic and its callbacks can
+  a full WARaft partition. The state machine is deterministic and its callbacks can
   be tested in isolation by constructing state manually.
   """
 
@@ -80,6 +80,85 @@ defmodule Ferricstore.Raft.StateMachineTest do
       shard_index: shard_index,
       writer_pid: writer_pid
     }
+  end
+
+  test "coalesces consecutive Flow native index ops without crossing ordering barriers" do
+    native_a = make_ref()
+    native_b = make_ref()
+
+    ops = [
+      {native_a, {:put_entries, [{"idx", "a", 1.0}]}},
+      {native_a, {:put_entries, [{"idx", "b", 2.0}]}},
+      {native_a, {:delete_members, "idx", ["a"]}},
+      {native_a, {:put_entries, [{"idx", "a", 3.0}]}},
+      {native_b, {:put_entries, [{"idx", "c", 4.0}]}},
+      {native_b, {:put_entries, [{"idx", "d", 5.0}]}},
+      {native_b, {:apply_claim_entries, [{:claim, "flow-1"}]}},
+      {native_b, {:apply_claim_entries, [{:claim, "flow-2"}]}}
+    ]
+
+    assert [
+             {^native_a,
+              [
+                {:put_entries, [{"idx", "a", 1.0}]},
+                {:put_entries, [{"idx", "b", 2.0}]}
+              ]},
+             {^native_a, [{:delete_members, "idx", ["a"]}]},
+             {^native_a, [{:put_entries, [{"idx", "a", 3.0}]}]},
+             {^native_b,
+              [
+                {:put_entries, [{"idx", "c", 4.0}]},
+                {:put_entries, [{"idx", "d", 5.0}]}
+              ]},
+             {^native_b,
+              [
+                {:apply_claim_entries, [{:claim, "flow-1"}]},
+                {:apply_claim_entries, [{:claim, "flow-2"}]}
+              ]}
+           ] = StateMachine.__coalesce_flow_native_ops_for_test__(ops)
+  end
+
+  test "flow history projection shard routing uses stamped shard before hashing key" do
+    ctx = %{slot_map: List.to_tuple(List.duplicate(0, 1024))}
+    state = %{shard_index: 7}
+
+    assert [3, 0] =
+             StateMachine.__flow_history_projection_shards_for_test__(ctx, state, [
+               %{key: "flow-history-a", shard_index: 3},
+               %{key: "flow-history-b"}
+             ])
+  end
+
+  test "flow history projection same-shard check trusts apply-stamped batches" do
+    ctx = %{slot_map: List.to_tuple(List.duplicate(0, 1024))}
+    state = %{shard_index: 7}
+
+    assert StateMachine.__flow_history_projection_same_shard_for_test__(ctx, state, [
+             %{key: "flow-history-a", shard_index: 7},
+             %{key: "flow-history-b", shard_index: 7}
+           ])
+
+    refute StateMachine.__flow_history_projection_same_shard_for_test__(ctx, state, [
+             %{key: "flow-history-a"},
+             %{key: "flow-history-b"}
+           ])
+  end
+
+  test "flow history projection entries carry direct value refs for projector dematerialization" do
+    assert [
+             "f:{flow-fast-ref}:v:p:flow-fast-ref:2",
+             "f:{flow-fast-ref}:v:r:flow-fast-ref:2",
+             "external-ref"
+           ] =
+             StateMachine.__flow_history_projection_value_refs_for_test__(%{
+               payload_ref: "f:{flow-fast-ref}:v:p:flow-fast-ref:2",
+               result_ref: "f:{flow-fast-ref}:v:r:flow-fast-ref:2",
+               error_ref: nil,
+               value_refs: %{
+                 "shared" => %{ref: "external-ref"},
+                 "empty" => ""
+               }
+             })
   end
 
   # ---------------------------------------------------------------------------
@@ -450,6 +529,214 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert is_binary(record.payload_ref)
       assert_flow_blob_value!(state, record.payload_ref, payload)
+    end
+
+    test "prepared Flow transition_many shared payload stores one shared blob ref", %{
+      state: state
+    } do
+      setup_flow_indexes(state)
+
+      partition_key = "tenant-blob-flow-shared-transition"
+      type = "blob-flow"
+      id_a = "flow-blob-transition-a"
+      id_b = "flow-blob-transition-b"
+      batch_key = Ferricstore.Flow.Keys.state_key("__transition_batch__", partition_key)
+      payload = :binary.copy("flow-shared-payload", 1024)
+
+      create_command =
+        {:flow_create_many, batch_key,
+         %{
+           records: [
+             %{id: id_a, type: type, state: "queued", partition_key: partition_key},
+             %{id: id_b, type: type, state: "queued", partition_key: partition_key}
+           ]
+         }}
+
+      {state, {:applied_at, 1, :ok}, _effects} =
+        StateMachine.apply(%{index: 1, system_time: 1_000}, create_command, state)
+
+      command =
+        {:flow_transition_many, batch_key,
+         %{
+           shared: %{
+             from_state: "queued",
+             to_state: "ready",
+             payload: payload,
+             now_ms: 1_100,
+             run_at_ms: 1_200
+           },
+           records: [
+             %{id: id_a, partition_key: partition_key, fencing_token: 0},
+             %{id: id_b, partition_key: partition_key, fencing_token: 0}
+           ]
+         }}
+
+      assert {:ok, prepared} =
+               BlobCommand.prepare(
+                 %{data_dir: state.data_dir, blob_side_channel_threshold_bytes: 128},
+                 state.shard_index,
+                 command,
+                 single_member?: true
+               )
+
+      assert {:flow_transition_many, ^batch_key, prepared_attrs} = prepared
+      assert {:ferricstore_flow_blob_value_ref, encoded_ref} = prepared_attrs.shared.payload
+      refute Enum.any?(prepared_attrs.records, &Map.has_key?(&1, :payload))
+
+      {state, {:applied_at, 2, :ok}, _effects} =
+        StateMachine.apply(%{index: 2, system_time: 1_100}, prepared, state)
+
+      record_a = flow_record!(state, Ferricstore.Flow.Keys.state_key(id_a, partition_key))
+      record_b = flow_record!(state, Ferricstore.Flow.Keys.state_key(id_b, partition_key))
+
+      assert record_a.payload_ref != record_b.payload_ref
+      assert flow_value!(state, record_a.payload_ref) == encoded_ref
+      assert flow_value!(state, record_b.payload_ref) == encoded_ref
+      assert_flow_blob_value!(state, record_a.payload_ref, payload)
+      assert_flow_blob_value!(state, record_b.payload_ref, payload)
+    end
+
+    test "prepared Flow create payload does not enqueue direct LMDB value projection", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+      old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+      old_max_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+      Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+      Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+      Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
+      state = %{state | flow_lmdb_mirror?: true}
+
+      setup_flow_indexes(state)
+
+      {:ok, writer_pid} =
+        Ferricstore.Flow.LMDBWriter.start_link(
+          instance_name: state.instance_name,
+          shard_index: shard_index,
+          data_dir: state.data_dir
+        )
+
+      handler_id = {:flow_blob_value_lmdb_enqueue, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :flow, :lmdb_writer, :backlog],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
+          end,
+          self()
+        )
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+
+        try do
+          if Process.alive?(writer_pid), do: GenServer.stop(writer_pid, :normal, 5_000)
+        catch
+          :exit, _ -> :ok
+        end
+
+        restore_env(:flow_lmdb_mode, old_mode)
+        restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+        restore_env(:flow_lmdb_max_batch_ops, old_max_ops)
+      end)
+
+      id = "flow-blob-create-no-lmdb"
+      type = "blob-flow"
+      partition_key = "tenant-blob-flow"
+      payload = :binary.copy("flow-payload", 1024)
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      command =
+        {:flow_create, state_key,
+         %{id: id, type: type, state: "queued", partition_key: partition_key, payload: payload}}
+
+      assert {:ok, prepared} =
+               BlobCommand.prepare(
+                 %{data_dir: state.data_dir, blob_side_channel_threshold_bytes: 128},
+                 state.shard_index,
+                 command,
+                 single_member?: true
+               )
+
+      {_state, {:applied_at, 1, :ok}, _effects} =
+        StateMachine.apply(%{index: 1, system_time: 1_000}, prepared, state)
+
+      refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
+    end
+
+    test "prepared Flow create payload does not reopen the blob during apply", %{state: state} do
+      setup_flow_indexes(state)
+
+      id = "flow-blob-create-no-read"
+      type = "blob-flow"
+      partition_key = "tenant-blob-flow"
+      payload = :binary.copy("flow-payload", 1024)
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      command =
+        {:flow_create, state_key,
+         %{id: id, type: type, state: "queued", partition_key: partition_key, payload: payload}}
+
+      assert {:ok, prepared} =
+               BlobCommand.prepare(
+                 %{data_dir: state.data_dir, blob_side_channel_threshold_bytes: 128},
+                 state.shard_index,
+                 command,
+                 single_member?: true
+               )
+
+      test_pid = self()
+
+      Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+        send(test_pid, {:blob_opened_during_apply, path})
+        File.open(path, modes)
+      end)
+
+      on_exit(fn -> Process.delete(:ferricstore_blob_store_open_read_hook) end)
+
+      {state, {:applied_at, 1, :ok}, _effects} =
+        StateMachine.apply(%{index: 1, system_time: 1_000}, prepared, state)
+
+      record = flow_record!(state, state_key)
+
+      assert is_binary(record.payload_ref)
+      refute_received {:blob_opened_during_apply, _path}
+    end
+
+    test "prepared Flow create payload tolerates keydir table disappearing during shutdown", %{
+      state: state,
+      ets: ets
+    } do
+      setup_flow_indexes(state)
+
+      id = "flow-blob-create-shutdown"
+      type = "blob-flow"
+      partition_key = "tenant-blob-flow"
+      payload = :binary.copy("flow-payload", 1024)
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      command =
+        {:flow_create, state_key,
+         %{id: id, type: type, state: "queued", partition_key: partition_key, payload: payload}}
+
+      assert {:ok, prepared} =
+               BlobCommand.prepare(
+                 %{data_dir: state.data_dir, blob_side_channel_threshold_bytes: 128},
+                 state.shard_index,
+                 command,
+                 single_member?: true
+               )
+
+      :ets.delete(ets)
+
+      assert {_state, {:applied_at, 2, :ok}, _effects} =
+               StateMachine.apply(%{index: 2, system_time: 1_000}, prepared, state)
+
+      assert :undefined == :ets.whereis(ets)
     end
   end
 
@@ -4768,6 +5055,177 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert [{^key, "new", 456, _lfu, 7, 42, 3}] = :ets.lookup(ets, key)
     end
+
+    test "attaches WARaft tuple file ids to matching hot and cold pending rows", %{
+      state: state,
+      ets: ets
+    } do
+      hot_key = "matching-waraft-hot-location-key"
+      cold_key = "matching-waraft-cold-location-key"
+      file_id = {:waraft_apply_projection, 17}
+      cold_lfu = {:flow_state_version, 2, 123_456}
+
+      :ets.insert(
+        ets,
+        {hot_key, "hot", 456, Ferricstore.Store.LFU.initial(), :pending, 0, byte_size("hot")}
+      )
+
+      :ets.insert(
+        ets,
+        {cold_key, nil, 789, cold_lfu, :pending, 0, byte_size("cold")}
+      )
+
+      try do
+        Process.put(:sm_pending_fast_staged_put_batch, true)
+
+        StateMachine.__apply_pending_locations_for_test__(
+          state,
+          file_id,
+          [
+            {:put, hot_key, "hot", 456},
+            {:put_cold, cold_key, "cold", 789, cold_lfu}
+          ],
+          [
+            {:put, 11, byte_size("hot")},
+            {:put, 22, byte_size("cold")}
+          ]
+        )
+      after
+        Process.delete(:sm_pending_fast_staged_put_batch)
+      end
+
+      assert [{^hot_key, "hot", 456, _lfu, ^file_id, 11, 3}] = :ets.lookup(ets, hot_key)
+      assert [{^cold_key, nil, 789, ^cold_lfu, ^file_id, 22, 4}] = :ets.lookup(ets, cold_key)
+    end
+
+    test "batch deletes stale apply-projection cache for matching staged rows", %{
+      state: state,
+      ets: ets
+    } do
+      hot_key = "staged-hot-apply-projection-cache"
+      cold_key = "staged-cold-apply-projection-cache"
+      cold_lfu = {:flow_state_version, 2, 123_456}
+      old_index = 41
+      new_file_id = {:waraft_apply_projection, 42}
+
+      :ok =
+        Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+          state.data_dir,
+          state.shard_index,
+          old_index,
+          [
+            {hot_key, "old-hot", 0},
+            {cold_key, "old-cold", 0}
+          ]
+        )
+
+      assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
+               state.data_dir,
+               state.shard_index
+             ) == 2
+
+      :ets.insert(
+        ets,
+        {hot_key, "hot", 456, Ferricstore.Store.LFU.initial(), :pending, 0, byte_size("hot")}
+      )
+
+      :ets.insert(
+        ets,
+        {cold_key, nil, 789, cold_lfu, :pending, 0, byte_size("cold")}
+      )
+
+      try do
+        Process.put(:sm_pending_fast_staged_put_batch, true)
+
+        Process.put(:sm_pending_originals, %{
+          hot_key =>
+            {:entry,
+             {hot_key, nil, 0, Ferricstore.Store.LFU.initial(),
+              {:waraft_apply_projection, old_index}, 0, 7}},
+          cold_key =>
+            {:entry, {cold_key, nil, 0, cold_lfu, {:waraft_apply_projection, old_index}, 0, 8}}
+        })
+
+        StateMachine.__apply_pending_locations_for_test__(
+          state,
+          new_file_id,
+          [
+            {:put, hot_key, "hot", 456},
+            {:put_cold, cold_key, "cold", 789, cold_lfu}
+          ],
+          [
+            {:put, 11, byte_size("hot")},
+            {:put, 22, byte_size("cold")}
+          ]
+        )
+      after
+        Process.delete(:sm_pending_fast_staged_put_batch)
+        Process.delete(:sm_pending_originals)
+      end
+
+      assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
+               state.data_dir,
+               state.shard_index
+             ) == 0
+    end
+
+    test "duplicate-key staged batch deletes stale apply-projection cache for final row", %{
+      state: state,
+      ets: ets
+    } do
+      key = "duplicate-staged-apply-projection-cache"
+      old_index = 141
+      new_file_id = {:waraft_apply_projection, 142}
+
+      :ok =
+        Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+          state.data_dir,
+          state.shard_index,
+          old_index,
+          [{key, "old-value", 0}]
+        )
+
+      :ets.insert(
+        ets,
+        {key, "final-value", 0, Ferricstore.Store.LFU.initial(), :pending, 0,
+         byte_size("final-value")}
+      )
+
+      try do
+        Process.put(:sm_pending_fast_staged_put_batch, true)
+
+        Process.put(:sm_pending_originals, %{
+          key =>
+            {:entry,
+             {key, nil, 0, Ferricstore.Store.LFU.initial(),
+              {:waraft_apply_projection, old_index}, 0, byte_size("old-value")}}
+        })
+
+        StateMachine.__apply_pending_locations_for_test__(
+          state,
+          new_file_id,
+          [
+            {:put, key, "intermediate-value", 0},
+            {:put, key, "final-value", 0}
+          ],
+          [
+            {:put, 11, byte_size("intermediate-value")},
+            {:put, 22, byte_size("final-value")}
+          ]
+        )
+      after
+        Process.delete(:sm_pending_fast_staged_put_batch)
+        Process.delete(:sm_pending_originals)
+      end
+
+      assert [{^key, "final-value", 0, _lfu, ^new_file_id, 22, _value_size}] =
+               :ets.lookup(ets, key)
+
+      assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
+               state.data_dir,
+               state.shard_index
+             ) == 0
+    end
   end
 
   describe "apply/3 probabilistic native failures" do
@@ -5607,152 +6065,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
     end
 
-    test "release cursor poke releases a pending durable marker without user write", %{
-      state: state,
-      shard_index: shard_index
-    } do
-      marker_index = 88
-      poke_index = 89
-      atomics_size = shard_index + 1
-      checkpoint_flags = :atomics.new(atomics_size, signed: false)
-      checkpoint_in_flight = :atomics.new(atomics_size, signed: false)
-      last_applied_index = :atomics.new(atomics_size, signed: false)
-      last_released_cursor_index = :atomics.new(atomics_size, signed: false)
-      replay_safe_index = :atomics.new(atomics_size, signed: false)
-      flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
-      flow_history_projected_index = :atomics.new(atomics_size, signed: false)
-
-      :atomics.put(replay_safe_index, shard_index + 1, marker_index)
-      :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, marker_index)
-      :atomics.put(flow_history_projected_index, shard_index + 1, marker_index)
-
-      state = %{
-        state
-        | applied_count: 10,
-          release_cursor_interval: 1,
-          pending_release_cursor_index: marker_index,
-          pending_replay_safe_marker_index: marker_index,
-          pending_release_cursor_checkpoint_indices: MapSet.new(),
-          instance_ctx: %{
-            checkpoint_flags: checkpoint_flags,
-            checkpoint_in_flight: checkpoint_in_flight,
-            last_applied_index: last_applied_index,
-            last_released_cursor_index: last_released_cursor_index,
-            replay_safe_index: replay_safe_index,
-            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
-            flow_history_projected_index: flow_history_projected_index
-          }
-      }
-
-      {new_state, {:applied_at, ^poke_index, :ok}, effects} =
-        StateMachine.apply(
-          %{index: poke_index, term: 1, system_time: System.os_time(:millisecond)},
-          {:async, node(), {:release_cursor_poke, marker_index}},
-          state
-        )
-
-      assert Enum.any?(effects, &match?({:release_cursor, ^marker_index}, &1))
-      assert new_state.applied_count == 10
-      assert :atomics.get(last_applied_index, shard_index + 1) == poke_index
-      assert :atomics.get(last_released_cursor_index, shard_index + 1) == marker_index
-    end
-
-    test "release cursor waits for LMDB replay-safe marker when Flow LMDB is enabled", %{
-      state: state,
-      shard_index: shard_index
-    } do
-      marker_index = 91
-      atomics_size = shard_index + 1
-      checkpoint_flags = :atomics.new(atomics_size, signed: false)
-      checkpoint_in_flight = :atomics.new(atomics_size, signed: false)
-      last_applied_index = :atomics.new(atomics_size, signed: false)
-      last_released_cursor_index = :atomics.new(atomics_size, signed: false)
-      replay_safe_index = :atomics.new(atomics_size, signed: false)
-      flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
-      flow_history_projected_index = :atomics.new(atomics_size, signed: false)
-
-      :atomics.put(replay_safe_index, shard_index + 1, marker_index)
-      :atomics.put(flow_history_projected_index, shard_index + 1, marker_index)
-
-      state = %{
-        state
-        | applied_count: 10,
-          release_cursor_interval: 1,
-          pending_release_cursor_index: marker_index,
-          pending_replay_safe_marker_index: marker_index,
-          pending_release_cursor_checkpoint_indices: MapSet.new(),
-          instance_ctx: %{
-            checkpoint_flags: checkpoint_flags,
-            checkpoint_in_flight: checkpoint_in_flight,
-            last_applied_index: last_applied_index,
-            last_released_cursor_index: last_released_cursor_index,
-            replay_safe_index: replay_safe_index,
-            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
-            flow_history_projected_index: flow_history_projected_index
-          }
-      }
-
-      {_new_state, {:applied_at, 92, :ok}, effects} =
-        StateMachine.apply(
-          %{index: 92, term: 1, system_time: System.os_time(:millisecond)},
-          {:async, node(), {:release_cursor_poke, marker_index}},
-          state
-        )
-
-      refute Enum.any?(effects, &match?({:release_cursor, ^marker_index}, &1))
-      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
-    end
-
-    test "batched release cursor poke does not advance release interval", %{
-      state: state,
-      shard_index: shard_index
-    } do
-      marker_index = 88
-      poke_index = 89
-      atomics_size = shard_index + 1
-      checkpoint_flags = :atomics.new(atomics_size, signed: false)
-      checkpoint_in_flight = :atomics.new(atomics_size, signed: false)
-      last_applied_index = :atomics.new(atomics_size, signed: false)
-      last_released_cursor_index = :atomics.new(atomics_size, signed: false)
-      replay_safe_index = :atomics.new(atomics_size, signed: false)
-      flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
-      flow_history_projected_index = :atomics.new(atomics_size, signed: false)
-
-      :atomics.put(replay_safe_index, shard_index + 1, marker_index)
-      :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, marker_index)
-      :atomics.put(flow_history_projected_index, shard_index + 1, marker_index)
-
-      state = %{
-        state
-        | applied_count: 10,
-          release_cursor_interval: 1,
-          pending_release_cursor_index: marker_index,
-          pending_replay_safe_marker_index: marker_index,
-          pending_release_cursor_checkpoint_indices: MapSet.new(),
-          instance_ctx: %{
-            checkpoint_flags: checkpoint_flags,
-            checkpoint_in_flight: checkpoint_in_flight,
-            last_applied_index: last_applied_index,
-            last_released_cursor_index: last_released_cursor_index,
-            replay_safe_index: replay_safe_index,
-            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
-            flow_history_projected_index: flow_history_projected_index
-          }
-      }
-
-      {new_state, {:applied_at, ^poke_index, {:ok, [:ok]}}, effects} =
-        StateMachine.apply(
-          %{index: poke_index, term: 1, system_time: System.os_time(:millisecond)},
-          {:batch, [{:async, node(), {:release_cursor_poke, marker_index}}]},
-          state
-        )
-
-      assert Enum.any?(effects, &match?({:release_cursor, ^marker_index}, &1))
-      assert new_state.applied_count == 10
-      assert :atomics.get(last_applied_index, shard_index + 1) == poke_index
-      assert :atomics.get(last_released_cursor_index, shard_index + 1) == marker_index
-    end
-
     test "release cursor metrics resolve instance context by name like production Raft config", %{
       state: state,
       shard_index: shard_index
@@ -6234,6 +6546,86 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
     assert {:error, "ERR flow not found"} = result
     assert :undefined == :ets.whereis(ets)
+  end
+
+  test "Flow claim_due native hydration tolerates keydir table disappearing during shutdown", %{
+    state: state,
+    ets: ets
+  } do
+    setup_flow_indexes(state)
+
+    id = "late-claim-flow"
+    type = "late-claim"
+    partition_key = "tenant-shutdown"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    {state, :ok} =
+      StateMachine.apply(
+        %{system_time: 1_000},
+        {:flow_create, state_key,
+         %{
+           id: id,
+           type: type,
+           state: "queued",
+           partition_key: partition_key,
+           now_ms: 1_000,
+           run_at_ms: 1_000
+         }},
+        state
+      )
+
+    :ets.delete(ets)
+
+    due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+
+    {_state, result} =
+      StateMachine.apply(
+        %{system_time: 2_000},
+        {:flow_claim_due, due_key,
+         %{
+           type: type,
+           state: "queued",
+           worker: "worker-shutdown",
+           lease_ms: 30_000,
+           limit: 1,
+           priority: nil,
+           partition_key: partition_key
+         }},
+        state
+      )
+
+    assert {:ok, []} = result
+    assert :undefined == :ets.whereis(ets)
+  end
+
+  test "Flow claim_due native hot probe does not warm cold state values one by one", %{
+    state: state,
+    ets: ets
+  } do
+    id = "cold-native-probe"
+    partition_key = "tenant-cold-native-probe"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    test_pid = self()
+
+    :ets.insert(ets, {state_key, nil, 0, 1, {:waraft_projection, 999_999}, 0, 64})
+
+    Process.put(:ferricstore_state_machine_cold_location_miss_hook, fn ->
+      send(test_pid, :unexpected_cold_retry)
+    end)
+
+    try do
+      assert [nil] =
+               StateMachine.__flow_read_claim_hot_values_for_test__(
+                 state,
+                 [{id, 1.0}],
+                 nil,
+                 partition_key
+               )
+
+      refute_receive :unexpected_cold_retry, 20
+    after
+      Process.delete(:ferricstore_state_machine_cold_location_miss_hook)
+    end
   end
 
   def relay_compound_put_append_telemetry(_event, measurements, metadata, test_pid) do

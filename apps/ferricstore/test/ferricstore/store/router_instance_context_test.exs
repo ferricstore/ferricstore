@@ -80,12 +80,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert nil == Router.compound_get(ctx, key, field_key)
   end
 
-  test "custom writes stay local when WARaft is selected for the default instance", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-    Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-    on_exit(fn -> restore_backend(previous_backend) end)
-
+  test "custom writes stay local when WARaft owns the default instance", %{ctx: ctx} do
     key = "router:instance:waraft-local:#{System.unique_integer([:positive])}"
     field_key = CompoundKey.hash_field(key, "field")
 
@@ -199,6 +194,4 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     end
   end
 
-  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
-  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
 end

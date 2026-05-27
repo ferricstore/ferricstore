@@ -150,29 +150,16 @@ defmodule Ferricstore.Cluster.DataSyncTest do
              )
   end
 
-  test "WARaft never uses legacy Ra WAL bridge checks for resync decisions" do
+  test "WARaft resync decisions use one production path" do
     source = File.read!("lib/ferricstore/cluster/data_sync.ex")
 
-    assert source =~ "RaftBackend.waraft?()"
+    refute source =~ "RaftBackend.waraft?()"
+    refute source =~ "unsupported_waraft_data_sync"
     assert source =~ "do_needs_resync?"
   end
 
-  test "WARaft data sync fails closed instead of using legacy batcher pause path" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-    Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-    ctx = %FerricStore.Instance{data_dir: System.tmp_dir!(), shard_count: 1}
-
-    on_exit(fn ->
-      restore_backend(previous_backend)
-    end)
-
-    assert {:error, :unsupported_waraft_data_sync} = DataSync.sync_shard(0, node(), ctx)
-    assert {:error, :unsupported_waraft_data_sync} = DataSync.retry_sync_shard(0, node(), ctx)
-    assert {:error, :unsupported_waraft_data_sync} = DataSync.sync_all_shards(node(), ctx)
-
-    assert {:error, :unsupported_waraft_data_sync} =
-             DataSync.__pause_batcher_for_test__(node(), 0)
+  test "WARaft data sync pauses the production write facade" do
+    assert :ok = DataSync.__pause_batcher_for_test__(node(), 0)
   end
 
   test "remote batcher pause failures return error tuples instead of exiting" do
@@ -224,7 +211,4 @@ defmodule Ferricstore.Cluster.DataSyncTest do
       0 -> Enum.reverse(acc)
     end
   end
-
-  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
-  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
 end

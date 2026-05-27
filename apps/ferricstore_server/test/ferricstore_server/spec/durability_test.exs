@@ -567,7 +567,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       {:ok, ttl_after} = FerricStore.pttl(k)
       # TTL should be close to before (within 15s tolerance for restart time
-      # including Raft WAL replay which can take 7+ seconds on CI)
+      # including WARaft segment replay which can take 7+ seconds on CI)
       assert abs(ttl_before - ttl_after) < 15_000, "TTL drifted too much after crash"
     end
 

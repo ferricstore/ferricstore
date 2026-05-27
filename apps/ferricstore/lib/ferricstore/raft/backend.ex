@@ -2,9 +2,8 @@ defmodule Ferricstore.Raft.Backend do
   @moduledoc """
   Runtime write backend.
 
-  WARaft is the only supported production path. The old Ra implementation may
-  still exist in reference/test modules, but normal runtime selection is fixed
-  here so deploys and benchmarks do not drift via config flags.
+  WARaft is the only supported production path. Runtime selection is fixed here
+  so deploys and benchmarks cannot drift through config flags.
   """
 
   alias Ferricstore.Raft.WARaftBackend
@@ -31,8 +30,7 @@ defmodule Ferricstore.Raft.Backend do
   @doc """
   Returns the backend used by the currently running default application.
 
-  This is intentionally separate from `selected/0`: `selected/0` reads mutable
-  application env and is useful before startup, while default-instance runtime
+  This is intentionally separate from `selected/0`: default-instance runtime
   routing must stay pinned to the backend that actually booted.
   """
   @spec running() :: :waraft | :undefined
@@ -77,10 +75,9 @@ defmodule Ferricstore.Raft.Backend do
   def write_batch(shard_index, commands),
     do: WARaftBackend.write_batch(shard_index, Enum.map(commands, &normalize_command/1))
 
-  # Router/Shard-forwarded compound commands include the parent redis_key so the
-  # old Ra path can enter through the Shard GenServer. WARaft applies straight
-  # through the state machine, whose compact command shape derives redis_key
-  # from the internal compound key.
+  # Router/Shard-forwarded compound commands may include the parent redis_key.
+  # WARaft applies straight through the state machine, whose compact command
+  # shape derives redis_key from the internal compound key.
   defp normalize_command({:compound_put, _redis_key, compound_key, value, expire_at_ms}),
     do: {:compound_put, compound_key, value, expire_at_ms}
 

@@ -260,7 +260,7 @@ defmodule FerricstoreServer.ApplicationTest do
         assert is_pid(pid) and Process.alive?(pid), "Shard #{i} should still be alive"
       end
 
-      # Shard 3 should be restarted. Allow generous time for Raft WAL
+      # Shard 3 should be restarted. Allow generous time for WARaft
       # replay on slow CI runners.
       deadline = System.monotonic_time(:millisecond) + 30_000
 
@@ -288,7 +288,7 @@ defmodule FerricstoreServer.ApplicationTest do
       ref = Process.monitor(shard2)
       Process.exit(shard2, :kill)
       assert_receive {:DOWN, ^ref, :process, ^shard2, :killed}, 1_000
-      # Wait for shard 2 to fully restart (including init/Raft WAL replay)
+      # Wait for shard 2 to fully restart (including init/WARaft replay)
       ShardHelpers.wait_shards_alive(30_000)
 
       port = Listener.port()

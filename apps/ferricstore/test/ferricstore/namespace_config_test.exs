@@ -42,13 +42,6 @@ defmodule Ferricstore.NamespaceConfigTest do
     end
 
     test "sets window_ms under WARaft native namespace windows" do
-      previous_backend = Application.get_env(:ferricstore, :raft_backend)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-      on_exit(fn ->
-        restore_backend(previous_backend)
-      end)
-
       assert :ok = NamespaceConfig.set("rate", "window_ms", "10")
       {:ok, entry} = NamespaceConfig.get("rate")
       assert entry.window_ms == 10
@@ -662,7 +655,4 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert "admin" in cmd.flags
     end
   end
-
-  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
-  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
 end

@@ -708,7 +708,8 @@ defmodule Ferricstore.Raft.BlobCommand do
   end
 
   defp prepare_flow_attrs(data_dir, shard_index, threshold, attrs) do
-    with {:ok, prepared_attrs, external_payloads} <- prepare_flow_attrs_placeholders(attrs, threshold) do
+    with {:ok, prepared_attrs, external_payloads} <-
+           prepare_flow_attrs_placeholders(attrs, threshold) do
       case external_payloads do
         [] ->
           {:ok, prepared_attrs, false}
@@ -732,6 +733,33 @@ defmodule Ferricstore.Raft.BlobCommand do
 
   defp prepare_flow_attrs_placeholders(%{records: records} = attrs, threshold)
        when is_list(records) do
+    with {:ok, prepared_shared, shared_external_payloads} <-
+           prepare_flow_shared_attrs_placeholders(Map.get(attrs, :shared), threshold),
+         {:ok, prepared_records, record_external_payloads} <-
+           prepare_flow_records_attrs_placeholders(records, threshold) do
+      prepared_attrs =
+        attrs
+        |> Map.put(:records, prepared_records)
+        |> put_prepared_flow_shared_attrs(prepared_shared)
+
+      {:ok, prepared_attrs, record_external_payloads ++ shared_external_payloads}
+    end
+  end
+
+  defp prepare_flow_attrs_placeholders(attrs, threshold) when is_map(attrs) do
+    prepare_flow_record_attrs_placeholders(attrs, threshold)
+  end
+
+  defp prepare_flow_shared_attrs_placeholders(nil, _threshold), do: {:ok, nil, []}
+
+  defp prepare_flow_shared_attrs_placeholders(shared, threshold) when is_map(shared) do
+    prepare_flow_record_attrs_placeholders(shared, threshold)
+  end
+
+  defp prepare_flow_shared_attrs_placeholders(_shared, _threshold),
+    do: {:error, :invalid_flow_shared_attrs}
+
+  defp prepare_flow_records_attrs_placeholders(records, threshold) do
     records
     |> Enum.reduce_while({:ok, [], []}, fn
       record_attrs, {:ok, prepared_records, external_payloads} when is_map(record_attrs) ->
@@ -750,24 +778,23 @@ defmodule Ferricstore.Raft.BlobCommand do
     end)
     |> case do
       {:ok, prepared_records, external_payloads} ->
-        {:ok, %{attrs | records: Enum.reverse(prepared_records)}, external_payloads}
+        {:ok, Enum.reverse(prepared_records), external_payloads}
 
       {:error, _reason} = error ->
         error
     end
   end
 
-  defp prepare_flow_attrs_placeholders(attrs, threshold) when is_map(attrs) do
-    prepare_flow_record_attrs_placeholders(attrs, threshold)
-  end
+  defp put_prepared_flow_shared_attrs(attrs, nil), do: attrs
+  defp put_prepared_flow_shared_attrs(attrs, shared), do: Map.put(attrs, :shared, shared)
 
   defp prepare_flow_record_attrs_placeholders(%{idempotent: true} = attrs, _threshold),
     do: {:ok, attrs, []}
 
   defp prepare_flow_record_attrs_placeholders(attrs, threshold) when is_map(attrs) do
     Enum.reduce_while(@flow_value_fields, {:ok, attrs, []}, fn kind,
-                                                              {:ok, prepared_attrs,
-                                                               external_payloads} ->
+                                                               {:ok, prepared_attrs,
+                                                                external_payloads} ->
       case Map.fetch(prepared_attrs, kind) do
         {:ok, value} ->
           encoded_value = Flow.encode_value(value)
@@ -786,6 +813,8 @@ defmodule Ferricstore.Raft.BlobCommand do
   end
 
   defp inflate_flow_attrs_with_rest(%{records: records} = attrs, refs) when is_list(records) do
+    {attrs, refs} = inflate_flow_shared_attrs_with_rest(attrs, refs)
+
     {records, refs} =
       Enum.map_reduce(records, refs, fn record_attrs, refs ->
         inflate_flow_record_attrs_with_rest(record_attrs, refs)
@@ -797,6 +826,13 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp inflate_flow_attrs_with_rest(attrs, refs) when is_map(attrs) do
     inflate_flow_record_attrs_with_rest(attrs, refs)
   end
+
+  defp inflate_flow_shared_attrs_with_rest(%{shared: shared} = attrs, refs) when is_map(shared) do
+    {shared, refs} = inflate_flow_record_attrs_with_rest(shared, refs)
+    {%{attrs | shared: shared}, refs}
+  end
+
+  defp inflate_flow_shared_attrs_with_rest(attrs, refs), do: {attrs, refs}
 
   defp inflate_flow_record_attrs_with_rest(attrs, refs) when is_map(attrs) do
     Enum.reduce(@flow_value_fields, {attrs, refs}, fn kind, {attrs, refs} ->
@@ -811,8 +847,9 @@ defmodule Ferricstore.Raft.BlobCommand do
     end)
   end
 
-  defp flow_attrs_candidate?(%{records: records}, threshold) when is_list(records) do
-    Enum.any?(records, &flow_attrs_candidate?(&1, threshold))
+  defp flow_attrs_candidate?(%{records: records} = attrs, threshold) when is_list(records) do
+    flow_attrs_candidate?(Map.get(attrs, :shared), threshold) or
+      Enum.any?(records, &flow_attrs_candidate?(&1, threshold))
   end
 
   defp flow_attrs_candidate?(%{idempotent: true}, _threshold), do: false

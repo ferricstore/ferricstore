@@ -1,0 +1,16 @@
+<% data = assigns.data %>
+<%= page_head("Client List - FerricStore", 5) %>
+<body data-dashboard-live-page="clients" data-dashboard-live-url="/dashboard/api/clients" data-dashboard-live-interval-ms="5000">
+<div class="layout">
+<%= render_sidebar_static("clients") %>
+<main class="main-content">
+<%= render_subpage_header("Client List") %>
+<div class="content">
+<%= render_page_intro("Clients", "See active Redis protocol connections, authenticated user metadata, connection flags, and blocked client pressure.") %>
+<%= render_live_component("clients_summary", render_clients_summary(data.connections, data.clients)) %>
+<%= render_live_component("clients_table", render_clients_table(data.clients)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

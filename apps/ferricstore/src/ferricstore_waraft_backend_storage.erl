@@ -19,6 +19,7 @@
     storage_apply/3,
     storage_apply/4,
     storage_apply_config/3,
+    storage_info/2,
     storage_read/3,
     storage_create_snapshot/2,
     storage_create_witness_snapshot/2,
@@ -64,6 +65,9 @@ storage_apply(Command, Position, Label, Handle) ->
 
 storage_apply_config(Config, Position, Handle) ->
     'Elixir.Ferricstore.Raft.WARaftStorage':apply_config(Config, Position, Handle).
+
+storage_info(Info, Handle) ->
+    'Elixir.Ferricstore.Raft.WARaftStorage':info(Info, Handle).
 
 storage_read(Command, Position, Handle) ->
     'Elixir.Ferricstore.Raft.WARaftStorage':read(Command, Position, Handle).

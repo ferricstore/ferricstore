@@ -1,4 +1,4 @@
-// ferricstore_wal_nif — Rust NIF WAL I/O layer for ra_log_wal
+// ferricstore_wal_nif -- Rust NIF append-log I/O layer for WARaft segments
 //
 // Hot write/sync NIF functions run on normal BEAM schedulers (<1μs each).
 // Blocking I/O (write + fdatasync) runs on a dedicated background thread.
@@ -60,7 +60,7 @@ fn open(
     }
 }
 
-/// Open a generic append log file without the 5-byte Ra WAL header offset.
+/// Open a generic append log file from byte 0.
 #[rustler::nif(schedule = "Normal")]
 fn open_raw_append(
     path: String,

@@ -3,7 +3,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
   Jepsen-style full cluster restart durability test from test plan Section 19.8.
 
   Verifies that all quorum-committed writes survive a complete cluster restart.
-  Every node is stopped and restarted from disk. The Raft WAL and Bitcask
+  Every node is stopped and restarted from disk. The WARaft segment log and Bitcask
   hint files must contain enough information to recover all committed state.
 
   ## Test flow
@@ -16,7 +16,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
   ## Architecture note
 
   In single-node Raft mode, each node is independent. A full restart means
-  each node individually restarts and recovers its own Raft WAL + Bitcask
+  each node individually restarts and recovers its own WARaft segment log + Bitcask
   data. When multi-node Raft is implemented, this test will verify that
   the cluster reforms and all quorum-committed writes are present on all
   nodes after restart.
@@ -42,7 +42,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
   # This is the most fundamental durability test: if data was ACKed with
   # quorum durability and ALL nodes are restarted, every ACKed write must
   # still be present. This tests the combined durability of:
-  #   - Raft WAL persistence (ra log segments)
+  #   - WARaft segment persistence
   #   - Bitcask data file persistence
   #   - Bitcask hint file recovery
   #   - ETS cache reconstruction from Bitcask on startup

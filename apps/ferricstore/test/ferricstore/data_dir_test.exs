@@ -20,6 +20,29 @@ defmodule Ferricstore.DataDirTest do
     end
   end
 
+  test "shard path helpers preserve Path.join canonicalization for trailing slash roots" do
+    assert DataDir.shard_data_path("/tmp/ferric-root/", 2) == "/tmp/ferric-root/data/shard_2"
+    assert DataDir.blob_shard_path("/tmp/ferric-root/", 3) == "/tmp/ferric-root/blob/shard_3"
+    assert DataDir.shard_data_path("/", 0) == "/data/shard_0"
+    assert DataDir.shard_data_path("", 0) == "data/shard_0"
+  end
+
+  test "hot shard path helpers avoid generic Path.join" do
+    source = File.read!("lib/ferricstore/data_dir.ex")
+
+    [shard_source] =
+      Regex.run(~r/def shard_data_path\(data_dir, shard_index\).*?^  end/ms, source)
+
+    [blob_source] =
+      Regex.run(~r/def blob_shard_path\(data_dir, shard_index\).*?^  end/ms, source)
+
+    refute shard_source =~ "Path.join",
+           "shard_data_path/2 is called from Flow/Router hot paths; build the canonical path directly"
+
+    refute blob_source =~ "Path.join",
+           "blob_shard_path/2 is used by blob hot paths; build the canonical path directly"
+  end
+
   test "root_from_shard_path accepts only canonical data shard paths" do
     root = Path.join(System.tmp_dir!(), "data_dir_root_#{System.unique_integer([:positive])}")
 

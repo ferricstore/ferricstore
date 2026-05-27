@@ -168,14 +168,13 @@ defmodule Ferricstore.ApplicationTest do
   end
 
   describe "graceful shutdown" do
-    test "stopping the application stops the Ra system" do
+    test "stopping the application clears WARaft backend state" do
       server_started? = application_started?(:ferricstore_server)
-      system = Ferricstore.Raft.Cluster.system_name()
 
       try do
         stop_app_if_started(:ferricstore_server)
         assert :ok = Application.stop(:ferricstore)
-        assert :ra_system.fetch(system) == :undefined
+        assert Ferricstore.Raft.Backend.running() == :undefined
 
         assert_raise ArgumentError, fn ->
           FerricStore.Instance.get(:default)
@@ -190,52 +189,8 @@ defmodule Ferricstore.ApplicationTest do
       end
     end
 
-    test "shutdown uses the Raft backend selected at startup, not mutated env" do
+    test "failed startup clears WARaft backend and default instance context" do
       server_started? = application_started?(:ferricstore_server)
-      system = Ferricstore.Raft.Cluster.system_name()
-      previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
-      try do
-        stop_app_if_started(:ferricstore_server)
-        assert Application.get_env(:ferricstore, :raft_backend, :ra) == :ra
-        assert :ra_system.fetch(system) != :undefined
-
-        Application.put_env(:ferricstore, :raft_backend, :waraft)
-        assert :ok = Application.stop(:ferricstore)
-
-        assert :ra_system.fetch(system) == :undefined
-      after
-        restore_env(:raft_backend, previous_backend)
-        stop_app_if_started(:ferricstore)
-        {:ok, _} = Application.ensure_all_started(:ferricstore)
-        ShardHelpers.wait_shards_alive()
-
-        if server_started? do
-          {:ok, _} = Application.ensure_all_started(:ferricstore_server)
-        end
-      end
-    end
-
-    test "default writes use the Raft backend selected at startup, not mutated env" do
-      previous_backend = Application.get_env(:ferricstore, :raft_backend)
-      key = "startup-backend-env-mutation"
-
-      try do
-        assert Application.get_env(:ferricstore, :raft_backend, :ra) == :ra
-
-        ctx = FerricStore.Instance.get(:default)
-        Application.put_env(:ferricstore, :raft_backend, :waraft)
-
-        assert :ok = Ferricstore.Store.Router.put(ctx, key, "value", 0)
-        assert "value" == Ferricstore.Store.Router.get(ctx, key)
-      after
-        restore_env(:raft_backend, previous_backend)
-      end
-    end
-
-    test "failed startup clears partial Ra system and default instance context" do
-      server_started? = application_started?(:ferricstore_server)
-      system = Ferricstore.Raft.Cluster.system_name()
 
       try do
         stop_app_if_started(:ferricstore_server)
@@ -251,7 +206,7 @@ defmodule Ferricstore.ApplicationTest do
         Process.register(blocker, Ferricstore.Stats)
 
         assert {:error, {:ferricstore, _reason}} = Application.ensure_all_started(:ferricstore)
-        assert :ra_system.fetch(system) == :undefined
+        assert Ferricstore.Raft.Backend.running() == :undefined
 
         assert_raise ArgumentError, fn ->
           FerricStore.Instance.get(:default)
@@ -414,8 +369,7 @@ defmodule Ferricstore.ApplicationTest do
         capture_log(fn ->
           Ferricstore.Application.prep_stop(%{
             shard_count: ctx.shard_count,
-            data_dir: ctx.data_dir,
-            raft_backend: :waraft
+            data_dir: ctx.data_dir
           })
         end)
 

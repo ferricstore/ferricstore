@@ -757,7 +757,9 @@ init(
     % Open storage and the log. Both providers can reject startup on
     % recoverable corruption or unsafe disk state, so keep those as normal
     % start failures instead of crashing through a bad pattern match.
-    case open_storage_and_log(Storage, Log) of
+    case profile_startup_phase(Application, Partition, server_open_storage_and_log, fun() ->
+             open_storage_and_log(Application, Partition, Storage, Log)
+         end) of
         {ok, Last, View} ->
             Now = erlang:monotonic_time(millisecond),
             State0 = #raft_state{
@@ -785,7 +787,9 @@ init(
             % TODO T246543655 When we have proper error handling for data corruption
             %                 vs. stalled server then handle {error, Reason} type
             %                 returns from load_state.
-            State2 = case wa_raft_durable_state:load(State1) of
+            State2 = case profile_startup_phase(Application, Partition, server_durable_state_load, fun() ->
+                              wa_raft_durable_state:load(State1)
+                          end) of
                 {ok, NewState} -> NewState;
                 _              -> State1
             end,
@@ -813,12 +817,21 @@ init(
             {stop, Reason}
     end.
 
--spec open_storage_and_log(Storage :: gen_server:server_ref(), Log :: gen_server:server_ref()) ->
+-spec open_storage_and_log(
+    Application :: atom(),
+    Partition :: wa_raft:partition(),
+    Storage :: gen_server:server_ref(),
+    Log :: gen_server:server_ref()
+) ->
     {ok, wa_raft_log:log_pos(), wa_raft_log:view()} | {error, term()}.
-open_storage_and_log(Storage, Log) ->
-    case wa_raft_storage:open(Storage) of
+open_storage_and_log(Application, Partition, Storage, Log) ->
+    case profile_startup_phase(Application, Partition, server_storage_open, fun() ->
+             wa_raft_storage:open(Storage)
+         end) of
         {ok, Last} ->
-            case wa_raft_log:open(Log, Last) of
+            case profile_startup_phase(Application, Partition, server_log_open, fun() ->
+                     wa_raft_log:open(Log, Last)
+                 end) of
                 {ok, View} -> {ok, Last, View};
                 {error, Reason} -> {error, Reason}
             end;
@@ -4447,6 +4460,43 @@ request_snapshot_for_follower(
 ) ->
     Witness = lists:member({Name, FollowerId}, config_witnesses(config(State))),
     wa_raft_snapshot_catchup:catchup(App, Name, FollowerId, Table, Partition, Witness).
+
+-spec profile_startup_phase(
+    Application :: atom(),
+    Partition :: wa_raft:partition(),
+    Phase :: atom(),
+    Fun :: fun(() -> Result)
+) -> Result.
+profile_startup_phase(Application, Partition, Phase, Fun) ->
+    StartedAt = erlang:monotonic_time(),
+    Result = Fun(),
+    DurationUs = erlang:convert_time_unit(erlang:monotonic_time() - StartedAt, native, microsecond),
+    emit_startup_phase(Application, Partition, Phase, DurationUs),
+    Result.
+
+-spec emit_startup_phase(
+    Application :: atom(),
+    Partition :: wa_raft:partition(),
+    Phase :: atom(),
+    DurationUs :: non_neg_integer()
+) -> ok.
+emit_startup_phase(ferricstore_waraft_backend, Partition, Phase, DurationUs) ->
+    case persistent_term:get(telemetry, undefined) of
+        undefined ->
+            ok;
+        _ ->
+            try telemetry:execute(
+                    [ferricstore, waraft, vendor, startup_phase],
+                    #{duration_us => DurationUs},
+                    #{partition => Partition, shard_index => Partition - 1, phase => Phase, module => ?MODULE}
+                ) of
+                _ -> ok
+            catch
+                _:_ -> ok
+            end
+    end;
+emit_startup_phase(_Application, _Partition, _Phase, _DurationUs) ->
+    ok.
 
 -spec identity_to_server(Identity :: #raft_identity{} | undefined) -> {Name :: atom(), Node :: node()} | undefined.
 identity_to_server(undefined) ->

@@ -6,7 +6,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
   - Rate limit counter works correctly per-node (Raft-durable)
   - Concurrent requests on a single node: at most `limit` succeed
-  - Rate limit state survives (persisted through Raft WAL)
+  - Rate limit state survives (persisted through WARaft segments)
 
   ## Return Value Format
 

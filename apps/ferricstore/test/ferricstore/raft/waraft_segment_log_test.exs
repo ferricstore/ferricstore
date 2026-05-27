@@ -9,6 +9,18 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     send(parent, {:segment_log_append, event, measurements, metadata})
   end
 
+  def handle_projection_overlap_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:projection_overlap, event, measurements, metadata})
+  end
+
+  def handle_load_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:segment_log_load, event, measurements, metadata})
+  end
+
+  def handle_fold_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:segment_log_fold, event, measurements, metadata})
+  end
+
   test "segment log caps ETS tail while disk-backed reads still see older entries" do
     with_segment_log_memory_env(
       max_bytes: 1_000,
@@ -64,6 +76,214 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
                    segment_dir |> to_string() |> Path.dirname() |> to_charlist(),
                    2
                  )
+      end
+    )
+  end
+
+  test "segment log keeps latest config cached after ETS tail demotion" do
+    with_segment_log_memory_env(
+      max_bytes: 1_000,
+      max_entries: 1,
+      min_entries: 1,
+      records_per_segment: 64,
+      fun: fn _root, log, log_name ->
+        assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+        assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+        view0 = {:log_view, log, 0, 0, :undefined}
+        config = %{version: 1, membership: [node()], participants: [node()], witness: []}
+        payload = :binary.copy("x", 2_048)
+
+        assert :ok =
+                 :ferricstore_waraft_spike_segment_log.append(
+                   view0,
+                   [
+                     {1, {make_ref(), {:config, config}}},
+                     {1, {:cmd, payload <> "2"}},
+                     {1, {:cmd, payload <> "3"}}
+                   ],
+                   :strict,
+                   :low
+                 )
+
+        assert :ets.info(log_name, :size) == 1
+        assert :ets.lookup(log_name, 1) == []
+        assert {:ok, 1, ^config} = :ferricstore_waraft_spike_segment_log.config(log)
+
+        :ets.delete_all_objects(log_name)
+        assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+        assert {:ok, 1, ^config} = :ferricstore_waraft_spike_segment_log.config(log)
+      end
+    )
+  end
+
+  test "segment log reopen loads only bounded tail into ETS" do
+    parent = self()
+    handler_id = {:segment_log_bounded_reopen, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log, :load],
+      &__MODULE__.handle_load_telemetry/4,
+      parent
+    )
+
+    try do
+      clear_segment_offset_registry()
+
+      with_segment_log_memory_env(
+        max_bytes: 4_096,
+        max_entries: 2,
+        min_entries: 1,
+        records_per_segment: 64,
+        fun: fn _root, log, log_name ->
+          assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+          assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+          view0 = {:log_view, log, 0, 0, :undefined}
+          payload = :binary.copy("z", 2_048)
+
+          assert :ok =
+                   :ferricstore_waraft_spike_segment_log.append(
+                     view0,
+                     for(i <- 1..6, do: {1, {:cmd, payload <> Integer.to_string(i)}}),
+                     :strict,
+                     :low
+                   )
+
+          assert :ets.info(log_name, :size) == 1
+          :ets.delete_all_objects(log_name)
+          assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+          assert_receive {:segment_log_load, [:ferricstore, :waraft, :segment_log, :load],
+                          %{
+                            disk_records: 6,
+                            decoded_records: decoded_records,
+                            ets_entries: ets_entries,
+                            scan_payload_bytes: scan_payload_bytes
+                          }, %{dir: _dir}},
+                         500
+
+          assert ets_entries <= 2
+          assert decoded_records <= ets_entries + 1
+          assert scan_payload_bytes <= 4_096
+          assert :ets.info(log_name, :size) <= 2
+
+          assert :ets.info(:ferricstore_waraft_segment_offset_registry, :size) <= 3
+
+          assert {:ok, {1, {:cmd, ^payload <> "1"}}} =
+                   :ferricstore_waraft_spike_segment_log.get(log, 1)
+
+          assert {:ok, {1, {:cmd, ^payload <> "6"}}} =
+                   :ferricstore_waraft_spike_segment_log.get(log, 6)
+
+          assert %{dir: segment_dir} = :ferricstore_waraft_spike_segment_log.memory_status(log)
+          root_dir = segment_dir |> to_string() |> Path.dirname()
+
+          assert {:ok, {_ordinal, offset, encoded_size}} =
+                   :ferricstore_waraft_spike_segment_log.location_for_index(
+                     to_charlist(root_dir),
+                     1
+                   )
+
+          assert {:ok, {1, {:cmd, ^payload <> "1"}}} =
+                   :ferricstore_waraft_spike_segment_log.read_disk_at(
+                     to_charlist(root_dir),
+                     1,
+                     offset,
+                     encoded_size
+                   )
+        end
+      )
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  test "fold_disk streams records instead of loading them into a temp ETS table" do
+    parent = self()
+    handler_id = {:segment_log_streaming_fold, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log, :fold_disk],
+      &__MODULE__.handle_fold_telemetry/4,
+      parent
+    )
+
+    try do
+      with_segment_log_memory_env(
+        max_bytes: 4_096,
+        max_entries: 2,
+        min_entries: 1,
+        records_per_segment: 64,
+        fun: fn _root, log, _log_name ->
+          assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+          assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+          view0 = {:log_view, log, 0, 0, :undefined}
+          payload = :binary.copy("f", 2_048)
+
+          assert :ok =
+                   :ferricstore_waraft_spike_segment_log.append(
+                     view0,
+                     for(i <- 1..6, do: {1, {:cmd, payload <> Integer.to_string(i)}}),
+                     :strict,
+                     :low
+                   )
+
+          assert %{dir: segment_dir} = :ferricstore_waraft_spike_segment_log.memory_status(log)
+          log_root = segment_dir |> to_string() |> Path.dirname()
+
+          assert {:ok, [1, 2, 3, 4, 5, 6]} =
+                   :ferricstore_waraft_spike_segment_log.fold_disk(
+                     to_charlist(log_root),
+                     fn index, _entry, acc -> [index | acc] end,
+                     []
+                   )
+                   |> map_fold_seen()
+
+          assert_receive {:segment_log_fold, [:ferricstore, :waraft, :segment_log, :fold_disk],
+                          %{disk_records: 6}, %{dir: _dir}},
+                         500
+        end
+      )
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  test "fold_disk decodes trusted Raft log entries with correlation references" do
+    with_segment_log_memory_env(
+      max_bytes: 4_096,
+      max_entries: 2,
+      min_entries: 1,
+      records_per_segment: 64,
+      fun: fn _root, log, _log_name ->
+        assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+        assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+        view0 = {:log_view, log, 0, 0, :undefined}
+        corr = make_ref()
+
+        assert :ok =
+                 :ferricstore_waraft_spike_segment_log.append(
+                   view0,
+                   [{1, {:default, {corr, {:put, "ref-fold:k", "v1", 0}}}}],
+                   :strict,
+                   :low
+                 )
+
+        assert %{dir: segment_dir} = :ferricstore_waraft_spike_segment_log.memory_status(log)
+        log_root = segment_dir |> to_string() |> Path.dirname()
+
+        assert {:ok, [{1, {1, {:default, {^corr, {:put, "ref-fold:k", "v1", 0}}}}}]} =
+                 :ferricstore_waraft_spike_segment_log.fold_disk(
+                   to_charlist(log_root),
+                   fn index, entry, acc -> [{index, entry} | acc] end,
+                   []
+                 )
+                 |> map_fold_seen()
       end
     )
   end
@@ -188,6 +408,41 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
            ]
   end
 
+  test "projection offset registry survives shutdown-time ETS deletion" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-registry-race-#{System.unique_integer([:positive])}"
+      )
+
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_offset_registry_hook)
+
+    File.rm_rf!(root)
+
+    try do
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_offset_registry_hook,
+        {:delete_once, :before_last_lookup, self()}
+      )
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection(
+                 to_charlist(root),
+                 {:raft_log_pos, 42, 7},
+                 [{"a", "1", 0}, {"b", "2", 0}]
+               )
+
+      assert_receive {:waraft_segment_log_offset_registry_hook, :before_last_lookup}, 1_000
+
+      assert {:ok, {_ordinal, _offset, _encoded_size}} =
+               :ferricstore_waraft_spike_segment_log.location_for_index(to_charlist(root), 2)
+    after
+      restore_env(:ferricstore, :waraft_segment_log_offset_registry_hook, previous_hook)
+      File.rm_rf!(root)
+    end
+  end
+
   test "segment append telemetry classifies log kind for byte accounting" do
     parent = self()
     handler_id = {__MODULE__, :segment_append_kind, make_ref()}
@@ -270,6 +525,386 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     end
   end
 
+  test "sync apply projection batch append fdatasyncs before returning" do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+    root = Path.join(System.tmp_dir!(), "ferricstore-waraft-apply-projection-sync")
+    File.rm_rf!(root)
+
+    try do
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_file_sync_hook,
+        {:notify_with_method, self()}
+      )
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches_sync(
+                 to_charlist(root),
+                 [
+                   {{:raft_log_pos, 42, 7}, [{"a", "1", 0}]},
+                   {{:raft_log_pos, 43, 7}, [{"b", "2", 0}]}
+                 ]
+               )
+
+      assert_receive {:waraft_segment_log_file_sync, synced_path, :datasync}, 1_000
+      assert synced_path |> to_string() |> String.contains?("apply-projection-sync")
+
+      assert {:ok, {_ordinal, offset, encoded_size}} =
+               :ferricstore_waraft_spike_segment_log.location_for_index(to_charlist(root), 42)
+
+      assert {:ok, {0, {:ferricstore_segment_apply_projection_batch, _, [{"a", "1", 0}]}}} =
+               :ferricstore_waraft_spike_segment_log.read_disk_at(
+                 to_charlist(root),
+                 42,
+                 offset,
+                 encoded_size
+               )
+    after
+      restore_env(:ferricstore, :waraft_segment_log_file_sync_hook, previous_hook)
+      File.rm_rf!(root)
+    end
+  end
+
+  test "apply projection batch recovery accepts sparse raft indexes" do
+    root = Path.join(System.tmp_dir!(), "ferricstore-waraft-apply-projection-sparse")
+    projection_root = Path.join(root, "apply_projection_log")
+    File.rm_rf!(root)
+
+    try do
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [
+                   {{:raft_log_pos, 30, 7}, [{"a", "1", 0}]},
+                   {{:raft_log_pos, 32, 7}, [{"b", "2", 0}]}
+                 ]
+               )
+
+      assert {:ok, records} =
+               :ferricstore_waraft_spike_segment_log.fold_disk(
+                 to_charlist(projection_root),
+                 fn index, entry, acc -> [{index, entry} | acc] end,
+                 []
+               )
+
+      assert Enum.reverse(records) == [
+               {30,
+                {0,
+                 {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 30, 7},
+                  [{"a", "1", 0}]}}},
+               {32,
+                {0,
+                 {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 32, 7},
+                  [{"b", "2", 0}]}}}
+             ]
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  test "apply projection batch write merges repeated raft index" do
+    root = Path.join(System.tmp_dir!(), "ferricstore-waraft-apply-projection-merge")
+    projection_root = Path.join(root, "apply_projection_log")
+    File.rm_rf!(root)
+
+    try do
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "old", 0}, {"b", "2", 0}]}]
+               )
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "new", 0}, {"c", "3", 0}]}]
+               )
+
+      assert {:ok,
+              {0,
+               {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 42, 7},
+                [{"a", "new", 0}, {"b", "2", 0}, {"c", "3", 0}]}}} =
+               :ferricstore_waraft_spike_segment_log.read_disk(to_charlist(projection_root), 42)
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  test "apply projection batch duplicate replay appends and reads merged view" do
+    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_rewrite_hook)
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-apply-projection-idempotent-#{System.unique_integer([:positive])}"
+      )
+
+    projection_root = Path.join(root, "apply_projection_log")
+    File.rm_rf!(root)
+
+    try do
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "1", 0}, {"b", "2", 0}]}]
+               )
+
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_rewrite_hook,
+        {:fail_once_after_live_backup, self()}
+      )
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches_sync(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "1", 0}]}]
+               )
+
+      refute_receive {:waraft_segment_log_rewrite_hook, :after_live_backup}, 100
+
+      assert {:ok, records} =
+               :ferricstore_waraft_spike_segment_log.fold_disk(
+                 to_charlist(projection_root),
+                 fn index, entry, acc -> [{index, entry} | acc] end,
+                 []
+               )
+
+      assert Enum.reverse(records) == [
+               {42,
+                {0,
+                 {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 42, 7},
+                  [{"a", "1", 0}, {"b", "2", 0}]}}},
+               {42,
+                {0,
+                 {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 42, 7},
+                  [{"a", "1", 0}]}}}
+             ]
+
+      assert {:ok,
+              {0,
+               {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 42, 7},
+                [{"a", "1", 0}, {"b", "2", 0}]}}} =
+               :ferricstore_waraft_spike_segment_log.read_disk(to_charlist(projection_root), 42)
+    after
+      restore_env(:ferricstore, :waraft_segment_log_rewrite_hook, previous_hook)
+      File.rm_rf!(root)
+    end
+  end
+
+  test "apply projection append skips overlap checks for new indexes" do
+    parent = self()
+    handler_id = {__MODULE__, :projection_overlap_miss, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log, :projection_overlap],
+      &__MODULE__.handle_projection_overlap_telemetry/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    root = Path.join(System.tmp_dir!(), "ferricstore-waraft-apply-projection-overlap-miss")
+    projection_root = Path.join(root, "apply_projection_log")
+    File.rm_rf!(root)
+
+    try do
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "1", 0}]}]
+               )
+
+      refute_receive {:projection_overlap,
+                      [:ferricstore, :waraft, :segment_log, :projection_overlap], _measurements,
+                      _metadata},
+                     100
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 43, 7}, [{"b", "2", 0}]}]
+               )
+
+      refute_receive {:projection_overlap,
+                      [:ferricstore, :waraft, :segment_log, :projection_overlap], _measurements,
+                      _metadata},
+                     100
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  test "apply projection writes track tail index for append-only overlap fast path" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-apply-projection-tail-#{System.unique_integer([:positive])}"
+      )
+
+    projection_root = Path.join(root, "apply_projection_log")
+    segment_dir = Path.join(projection_root, "segment_log")
+    dir_key = :unicode.characters_to_binary(Path.expand(segment_dir))
+    registry = :ferricstore_waraft_segment_offset_registry
+    File.rm_rf!(root)
+
+    try do
+      if :ets.info(registry) != :undefined do
+        :ets.delete_all_objects(registry)
+      end
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "1", 0}]}]
+               )
+
+      assert [{{^dir_key, :last_index}, :last_index, 42, 0}] =
+               :ets.lookup(registry, {dir_key, :last_index})
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 43, 7}, [{"b", "2", 0}]}]
+               )
+
+      assert [{{^dir_key, :last_index}, :last_index, 43, 0}] =
+               :ets.lookup(registry, {dir_key, :last_index})
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  test "apply projection append survives registry loss without overlap scan" do
+    parent = self()
+    handler_id = {__MODULE__, :projection_overlap_rebuild, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log, :projection_overlap],
+      &__MODULE__.handle_projection_overlap_telemetry/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    root = Path.join(System.tmp_dir!(), "ferricstore-waraft-apply-projection-overlap-rebuild")
+    projection_root = Path.join(root, "apply_projection_log")
+    File.rm_rf!(root)
+
+    try do
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "old", 0}]}]
+               )
+
+      refute_receive {:projection_overlap, _, _measurements, _metadata}, 100
+
+      if :ets.info(:ferricstore_waraft_segment_offset_registry) != :undefined do
+        :ets.delete_all_objects(:ferricstore_waraft_segment_offset_registry)
+      end
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "new", 0}, {"b", "2", 0}]}]
+               )
+
+      refute_receive {:projection_overlap,
+                      [:ferricstore, :waraft, :segment_log, :projection_overlap], _measurements,
+                      _metadata},
+                     100
+
+      if :ets.info(:ferricstore_waraft_segment_offset_registry) != :undefined do
+        :ets.delete_all_objects(:ferricstore_waraft_segment_offset_registry)
+      end
+
+      assert {:ok,
+              {0,
+               {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 42, 7},
+                [{"a", "new", 0}, {"b", "2", 0}]}}} =
+               :ferricstore_waraft_spike_segment_log.read_disk(to_charlist(projection_root), 42)
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  test "apply projection value read uses latest duplicate batch without folding disk" do
+    assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
+
+    parent = self()
+    handler_id = {__MODULE__, :apply_projection_latest_read_no_fold, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log, :fold_disk],
+      &__MODULE__.handle_fold_telemetry/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-apply-projection-latest-read-#{System.unique_integer([:positive])}"
+      )
+
+    projection_root =
+      Path.join([
+        data_dir,
+        "waraft",
+        "ferricstore_waraft_backend.1",
+        "apply_projection_log"
+      ])
+
+    File.rm_rf!(data_dir)
+
+    try do
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "old", 0}, {"b", "2", 0}]}]
+               )
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(projection_root),
+                 [{{:raft_log_pos, 42, 7}, [{"a", "new", 0}, {"c", "3", 0}]}]
+               )
+
+      assert {:ok, "new"} =
+               Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                 %{data_dir: data_dir},
+                 0,
+                 {:waraft_apply_projection, 42},
+                 "a"
+               )
+
+      assert {:ok, "3"} =
+               Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                 %{data_dir: data_dir},
+                 0,
+                 {:waraft_apply_projection, 42},
+                 "c"
+               )
+
+      refute_receive {:segment_log_fold, [:ferricstore, :waraft, :segment_log, :fold_disk],
+                      _measurements, _metadata},
+                     100
+    after
+      File.rm_rf!(data_dir)
+    end
+  end
+
+  defp clear_segment_offset_registry do
+    if :ets.info(:ferricstore_waraft_segment_offset_registry) != :undefined do
+      :ets.delete_all_objects(:ferricstore_waraft_segment_offset_registry)
+    end
+  end
+
   defp with_segment_log_memory_env(opts) do
     previous_db = Application.get_env(:wa_raft, :raft_database)
     previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
@@ -328,6 +963,21 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
 
   defp restore_env(app, key, nil), do: Application.delete_env(app, key)
   defp restore_env(app, key, value), do: Application.put_env(app, key, value)
+
+  defp writer_entries_for_owner(registry, owner) do
+    registry
+    |> :ets.tab2list()
+    |> Enum.filter(fn
+      {{^owner, _path}, _dir, :file_fd, _fd, _position} -> true
+      {{^owner, _path}, _dir, _kind, _handle, _position} -> true
+      {{^owner, _path}, _dir, _handle, _position} -> true
+      _entry -> false
+    end)
+  end
+
+  defp writer_entry_path({{_owner, path}, _dir, :file_fd, _fd, _position}), do: path
+  defp writer_entry_path({{_owner, path}, _dir, _kind, _handle, _position}), do: path
+  defp writer_entry_path({{_owner, path}, _dir, _handle, _position}), do: path
 
   defp map_fold_seen({:ok, entries}) do
     {:ok, Enum.reverse(entries)}
@@ -388,6 +1038,8 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     if :ets.info(registry) != :undefined do
       :ets.delete(registry)
     end
+
+    :ets.new(registry, [:named_table, :public, :set])
 
     try do
       Application.put_env(:wa_raft, :raft_database, to_charlist(root))
@@ -459,6 +1111,217 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
           previous_records
         )
       end
+    end
+  end
+
+  test "segment appends close stale writer handles on rollover" do
+    previous_db = Application.get_env(:wa_raft, :raft_database)
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+    registry = :ferricstore_waraft_segment_writer_registry
+    partition = System.unique_integer([:positive])
+    table = :ferricstore_waraft_segment_log_rollover_writer_test
+    log_name = :"#{table}_log_#{partition}"
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-rollover-writer-#{partition}"
+      )
+
+    if :ets.info(registry) != :undefined do
+      :ets.delete(registry)
+    end
+
+    :ets.new(registry, [:named_table, :public, :set])
+
+    try do
+      Application.put_env(:wa_raft, :raft_database, to_charlist(root))
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
+      File.rm_rf!(root)
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :wa_raft_part_sup.prepare_spec(:ferricstore_waraft_backend, %{
+        table: table,
+        partition: partition
+      })
+
+      log =
+        {:raft_log, log_name, :ferricstore_waraft_backend, table, partition,
+         :ferricstore_waraft_spike_segment_log}
+
+      assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+      assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+      view0 = {:log_view, log, 0, 0, :undefined}
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.append(
+                 view0,
+                 [{1, {:cmd, 1}}],
+                 :strict,
+                 :low
+               )
+
+      assert [first_entry] = writer_entries_for_owner(registry, self())
+      assert writer_entry_path(first_entry) |> to_string() |> String.ends_with?("0.seg")
+
+      view1 = {:log_view, log, 0, 1, :undefined}
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.append(
+                 view1,
+                 [{1, {:cmd, 2}}],
+                 :strict,
+                 :low
+               )
+
+      assert [second_entry] = writer_entries_for_owner(registry, self())
+      assert writer_entry_path(second_entry) |> to_string() |> String.ends_with?("1.seg")
+    after
+      _ =
+        :ferricstore_waraft_spike_segment_log.close(
+          {:raft_log, log_name, :ferricstore_waraft_backend, table, partition,
+           :ferricstore_waraft_spike_segment_log},
+          %{}
+        )
+
+      if :ets.info(registry) != :undefined do
+        :ets.delete(registry)
+      end
+
+      restore_env(:wa_raft, :raft_database, previous_db)
+      restore_env(:ferricstore, :waraft_segment_log_records_per_segment, previous_records)
+    end
+  end
+
+  test "projection batch appends reuse the direct nosync segment writer" do
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+    registry = :ferricstore_waraft_segment_writer_registry
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-projection-nosync-writer-#{System.unique_integer([:positive])}"
+      )
+
+    if :ets.info(registry) != :undefined do
+      :ets.delete(registry)
+    end
+
+    :ets.new(registry, [:named_table, :public, :set])
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 65_536)
+      File.rm_rf!(root)
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.write_projection_batches(
+                 to_charlist(root),
+                 [
+                   {{:raft_log_pos, 1, 0}, [{"a", "1", 0}]},
+                   {{:raft_log_pos, 2, 0}, [{"b", "2", 0}]}
+                 ]
+               )
+
+      assert [entry] = writer_entries_for_owner(registry, self())
+      assert writer_entry_path(entry) |> to_string() |> String.ends_with?("0.seg")
+    after
+      if :ets.info(registry) != :undefined do
+        :ets.delete(registry)
+      end
+
+      restore_env(:ferricstore, :waraft_segment_log_records_per_segment, previous_records)
+    end
+  end
+
+  test "segment appends prune stale writer entries from dead owners" do
+    previous_db = Application.get_env(:wa_raft, :raft_database)
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
+    registry = :ferricstore_waraft_segment_writer_registry
+    partition = System.unique_integer([:positive])
+    table = :ferricstore_waraft_segment_log_dead_writer_test
+    log_name = :"#{table}_log_#{partition}"
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-log-dead-writer-#{partition}"
+      )
+
+    if :ets.info(registry) != :undefined do
+      :ets.delete(registry)
+    end
+
+    :ets.new(registry, [:named_table, :public, :set])
+
+    try do
+      Application.put_env(:wa_raft, :raft_database, to_charlist(root))
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
+      File.rm_rf!(root)
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :wa_raft_part_sup.prepare_spec(:ferricstore_waraft_backend, %{
+        table: table,
+        partition: partition
+      })
+
+      log =
+        {:raft_log, log_name, :ferricstore_waraft_backend, table, partition,
+         :ferricstore_waraft_spike_segment_log}
+
+      assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+      assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          view0 = {:log_view, log, 0, 0, :undefined}
+
+          result =
+            :ferricstore_waraft_spike_segment_log.append(
+              view0,
+              [{1, {:cmd, 1}}],
+              :strict,
+              :low
+            )
+
+          send(parent, {:dead_writer_append, self(), result})
+        end)
+
+      ref = Process.monitor(owner)
+      assert_receive {:dead_writer_append, ^owner, :ok}, 1_000
+      assert_receive {:DOWN, ^ref, :process, ^owner, _reason}, 1_000
+      assert [_stale] = writer_entries_for_owner(registry, owner)
+
+      view1 = {:log_view, log, 0, 1, :undefined}
+
+      assert :ok =
+               :ferricstore_waraft_spike_segment_log.append(
+                 view1,
+                 [{1, {:cmd, 2}}],
+                 :strict,
+                 :low
+               )
+
+      assert [] = writer_entries_for_owner(registry, owner)
+      assert [current] = writer_entries_for_owner(registry, self())
+      assert writer_entry_path(current) |> to_string() |> String.ends_with?("1.seg")
+    after
+      _ =
+        :ferricstore_waraft_spike_segment_log.close(
+          {:raft_log, log_name, :ferricstore_waraft_backend, table, partition,
+           :ferricstore_waraft_spike_segment_log},
+          %{}
+        )
+
+      if :ets.info(registry) != :undefined do
+        :ets.delete(registry)
+      end
+
+      restore_env(:wa_raft, :raft_database, previous_db)
+      restore_env(:ferricstore, :waraft_segment_log_records_per_segment, previous_records)
     end
   end
 

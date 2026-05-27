@@ -57,6 +57,7 @@
     init/1,
     handle_call/3,
     handle_cast/2,
+    handle_info/2,
     terminate/2
 ]).
 
@@ -199,6 +200,13 @@
 %% desired consistency guarantee then implementations can raise an error to be
 %% aborted safely.
 -callback storage_apply_config(Config :: wa_raft_server:config(), Position :: wa_raft_log:log_pos(), Handle :: storage_handle()) -> {Result :: ok | {error, Reason :: term()}, NewHandle :: storage_handle()}.
+
+%% Handle provider-specific asynchronous messages delivered to the storage
+%% server. This lets storage implementations finish background checkpoint work
+%% without blocking the apply path.
+-callback storage_info(Info :: term(), Handle :: storage_handle()) ->
+    {ok, NewHandle :: storage_handle()} | ignore | {stop, Reason :: term(), NewHandle :: storage_handle()}.
+-optional_callbacks([storage_info/2]).
 
 %%-----------------------------------------------------------------------------
 %% RAFT Storage Provider - Read Commands
@@ -654,6 +662,27 @@ handle_cast(?DELETE_SNAPSHOT_REQUEST(SnapshotName), #state{name = Name, path = P
 handle_cast(Request, #state{name = Name} = State) ->
     ?RAFT_LOG_WARNING("Storage[~0p] received unexpected cast ~0P.", [Name, Request, 20]),
     {noreply, State}.
+
+-spec handle_info(Info :: term(), State :: #state{}) ->
+    {noreply, NewState :: #state{}} | {stop, Reason :: term(), NewState :: #state{}}.
+handle_info(Info, #state{name = Name, module = Module, handle = Handle} = State) ->
+    case erlang:function_exported(Module, storage_info, 2) of
+        true ->
+            case Module:storage_info(Info, Handle) of
+                {ok, NewHandle} ->
+                    {noreply, State#state{handle = NewHandle}};
+                ignore ->
+                    {noreply, State};
+                {stop, Reason, NewHandle} ->
+                    {stop, Reason, State#state{handle = NewHandle}};
+                Other ->
+                    ?RAFT_LOG_WARNING("Storage[~0p] received bad storage_info result ~0P for ~0P.", [Name, Other, 20, Info, 20]),
+                    {noreply, State}
+            end;
+        false ->
+            ?RAFT_LOG_WARNING("Storage[~0p] received unexpected info ~0P.", [Name, Info, 20]),
+            {noreply, State}
+    end.
 
 -spec terminate(Reason :: term(), State :: #state{}) -> term().
 terminate(Reason, #state{name = Name, module = Module, handle = Handle, position = Position}) ->

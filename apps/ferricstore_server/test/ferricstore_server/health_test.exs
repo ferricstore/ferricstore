@@ -18,31 +18,38 @@ defmodule FerricstoreServer.HealthTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
+    protected_mode = Application.get_env(:ferricstore, :protected_mode)
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
       Ferricstore.Health.set_ready(true)
-      Application.delete_env(:ferricstore, :observability_token)
+      restore_env(:protected_mode, protected_mode)
     end)
 
     :ok
   end
 
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
   describe "observability endpoint authorization" do
-    test "allows loopback peers without a token" do
-      refute Application.get_env(:ferricstore, :observability_token)
+    test "allows peers without a token when protected mode is off" do
+      Application.put_env(:ferricstore, :protected_mode, false)
       assert Endpoint.observability_authorized?({127, 0, 0, 1}, %{})
       assert Endpoint.observability_authorized?({0, 0, 0, 0, 0, 0, 0, 1}, %{})
+      assert Endpoint.observability_authorized?({10, 0, 0, 5}, %{})
     end
 
-    test "rejects non-loopback peers without a token" do
+    test "rejects peers without an ACL session when protected mode is on" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+      refute Endpoint.observability_authorized?({127, 0, 0, 1}, %{})
       refute Endpoint.observability_authorized?({10, 0, 0, 5}, %{})
     end
 
-    test "allows non-loopback peers with the configured bearer token" do
-      Application.put_env(:ferricstore, :observability_token, "secret-token")
+    test "does not allow bearer token bypass when protected mode is on" do
+      Application.put_env(:ferricstore, :protected_mode, true)
 
-      assert Endpoint.observability_authorized?({10, 0, 0, 5}, %{
+      refute Endpoint.observability_authorized?({10, 0, 0, 5}, %{
                "authorization" => "Bearer secret-token"
              })
 

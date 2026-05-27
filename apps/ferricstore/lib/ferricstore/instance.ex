@@ -2,7 +2,7 @@ defmodule FerricStore.Instance do
   @moduledoc """
   Instance context for a FerricStore instance.
 
-  Each instance owns its own shards, ETS tables, Raft system, atomics,
+  Each instance owns its own shards, ETS tables, replication system, atomics,
   and config — fully isolated from other instances. The context struct
   holds all references needed to route operations without any global
   state (no persistent_term lookups).
@@ -26,7 +26,7 @@ defmodule FerricStore.Instance do
           slot_map: tuple(),
           shard_names: tuple(),
           keydir_refs: tuple(),
-          ra_system: atom(),
+          replication_system: atom(),
           pressure_flags: reference(),
           disk_pressure: reference(),
           checkpoint_flags: reference(),
@@ -81,7 +81,7 @@ defmodule FerricStore.Instance do
     :slot_map,
     :shard_names,
     :keydir_refs,
-    :ra_system,
+    :replication_system,
     :pressure_flags,
     :disk_pressure,
     :checkpoint_flags,
@@ -446,7 +446,7 @@ defmodule FerricStore.Instance do
       shard_names: shard_names,
       keydir_refs: keydir_refs,
       latch_refs: latch_refs,
-      ra_system: :"#{name}_raft",
+      replication_system: :"#{name}_replication",
       pressure_flags: pressure_flags,
       disk_pressure: disk_pressure,
       checkpoint_flags: checkpoint_flags,

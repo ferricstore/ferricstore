@@ -17,7 +17,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # The application already started the ra system, ra servers, and
+    # The application already started WARaft partitions and
     # batchers for shards 0-3. Reuse them.
     :ok
   end

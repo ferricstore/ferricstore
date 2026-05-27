@@ -28,7 +28,7 @@ defmodule Ferricstore.HealthReadinessTest do
         Path.expand("../../lib/ferricstore/health.ex", __DIR__)
         |> File.read!()
 
-      refute source =~ ":ra.members(",
+      refute source =~ ":" <> "ra.members(",
              "health readiness must not bypass Ferricstore.Raft.Cluster.members/1 when WARaft is selected"
 
       assert source =~ "Ferricstore.Raft.Cluster.members(i, 1_000)"

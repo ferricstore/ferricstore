@@ -1,0 +1,21 @@
+<% data = assigns.data %>
+<%= page_head("Flow Failures - FerricStore", nil) %>
+<body>
+<div class="layout">
+<%= render_sidebar_static("flow") %>
+<main class="main-content">
+<%= render_subpage_header("Flow Failures") %>
+<div class="content">
+<%= render_page_intro("Flow Failures", "Review failed or stuck workflows and run guarded recovery actions when operators intentionally reclaim work.") %>
+<%= render_flow_subnav("failures") %>
+<%= render_flow_failures_flash(data) %>
+<%= render_flow_failures_controls(data) %>
+<%= render_flow_exact_scan_status(data) %>
+<%= render_flow_recovery_actions(data) %>
+<%= render_flow_failures_summary(data) %>
+<%= render_flow_failures_table(data) %>
+</div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,24 @@
+<% data = assigns.data %>
+<% summary = Map.get(data, :summary, %{}) %>
+<div class="flow-card-grid">
+  <div class="flow-card">
+    <div class="flow-card-label">Failure Candidates</div>
+    <div class="flow-card-value"><%= format_number(Map.get(summary, :total, 0)) %></div>
+    <div class="flow-card-detail">filtered from sampled and projected records</div>
+  </div>
+  <div class="flow-card">
+    <div class="flow-card-label">Failed</div>
+    <div class="flow-card-value c-red"><%= format_number(Map.get(summary, :failed, 0)) %></div>
+    <div class="flow-card-detail">terminal failed records</div>
+  </div>
+  <div class="flow-card">
+    <div class="flow-card-label">Expired Leases</div>
+    <div class="flow-card-value c-yellow"><%= format_number(Map.get(summary, :expired_leases, 0)) %></div>
+    <div class="flow-card-detail">safe to reclaim with fencing</div>
+  </div>
+  <div class="flow-card">
+    <div class="flow-card-label">Maxed Retries</div>
+    <div class="flow-card-value"><%= format_number(Map.get(summary, :maxed, 0)) %></div>
+    <div class="flow-card-detail">attempts reached max attempts</div>
+  </div>
+</div>

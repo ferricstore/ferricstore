@@ -13,6 +13,15 @@ defmodule Ferricstore.Store.Shard.Reads do
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
 
+  defguardp valid_waraft_segment_location(file_id, offset, value_size)
+            when is_tuple(file_id) and tuple_size(file_id) == 2 and
+                   (elem(file_id, 0) == :waraft_segment or
+                      elem(file_id, 0) == :waraft_projection or
+                      elem(file_id, 0) == :waraft_apply_projection) and
+                   is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
+                   is_integer(offset) and offset >= 0 and
+                   is_integer(value_size) and value_size >= 0
+
   # -------------------------------------------------------------------
   # Read-path handlers (return {:reply, result, state})
   # -------------------------------------------------------------------
@@ -29,10 +38,7 @@ defmodule Ferricstore.Store.Shard.Reads do
         {:reply, nil, state}
 
       {:cold, fid, off, vsize, exp} ->
-        # Cold key — value evicted from ETS but disk location known.
-        p = ShardETS.file_path(state.shard_data_path, fid)
-
-        case read_cold_async(p, off, key) do
+        case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             reply_cold_value(state, key, value, exp, fid, off, vsize)
 
@@ -60,6 +66,15 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       :expired ->
         {:reply, nil, state}
+
+      {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
+        case read_cold_raw(state, fid, off, key) do
+          {:ok, value} when is_binary(value) ->
+            reply_cold_value(state, key, value, exp, fid, off, vsize)
+
+          _ ->
+            {:reply, nil, state}
+        end
 
       {:cold, fid, off, vsize, exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
@@ -92,6 +107,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
+      {:cold, fid, off, vsize, _exp} when valid_waraft_segment_location(fid, off, vsize) ->
+        {:reply, nil, state}
+
       {:cold, fid, off, vsize, _exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
         {:reply, validated_file_ref(p, off, key, vsize), state}
@@ -117,9 +135,7 @@ defmodule Ferricstore.Store.Shard.Reads do
         {:reply, nil, state}
 
       {:cold, fid, off, vsize, exp} ->
-        p = ShardETS.file_path(state.shard_data_path, fid)
-
-        case read_cold_async(p, off, key) do
+        case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             reply_cold_meta_value(state, key, value, exp, fid, off, vsize)
 
@@ -147,6 +163,15 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       :expired ->
         {:reply, nil, state}
+
+      {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
+        case read_cold_raw(state, fid, off, key) do
+          {:ok, value} when is_binary(value) ->
+            reply_cold_meta_value(state, key, value, exp, fid, off, vsize)
+
+          _ ->
+            {:reply, nil, state}
+        end
 
       {:cold, fid, off, vsize, exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
@@ -205,10 +230,7 @@ defmodule Ferricstore.Store.Shard.Reads do
         value
 
       {:cold, fid, off, vsize, exp} ->
-        # Zero-copy cold read via v2 pread (ResourceBinary).
-        p = ShardETS.file_path(state.shard_data_path, fid)
-
-        case read_cold_async(p, off, key) do
+        case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize)
 
@@ -226,6 +248,9 @@ defmodule Ferricstore.Store.Shard.Reads do
 
   defp file_ref_from_lookup(state, key) do
     case ShardETS.ets_lookup(state, key) do
+      {:cold, fid, off, vsize, _exp} when valid_waraft_segment_location(fid, off, vsize) ->
+        nil
+
       {:cold, fid, off, vsize, _exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
         validated_file_ref(p, off, key, vsize)
@@ -250,9 +275,7 @@ defmodule Ferricstore.Store.Shard.Reads do
         {value, expire_at_ms}
 
       {:cold, fid, off, vsize, exp} ->
-        p = ShardETS.file_path(state.shard_data_path, fid)
-
-        case read_cold_async(p, off, key) do
+        case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
               nil -> nil
@@ -295,6 +318,13 @@ defmodule Ferricstore.Store.Shard.Reads do
           {:ok, materialized}
         end
 
+      [{^key, nil, _exp, _lfu, fid, off, vsize}]
+      when valid_waraft_segment_location(fid, off, vsize) ->
+        with {:ok, value} <- read_cold_raw(state, fid, off, key),
+             {:ok, materialized} <- materialize_blob_value(state, value) do
+          {:ok, materialized}
+        end
+
       [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
         ShardETS.ets_delete_key(state, key)
         {:ok, nil}
@@ -329,6 +359,32 @@ defmodule Ferricstore.Store.Shard.Reads do
   defp read_cold_async(path, offset, expected_key) do
     Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_read_timeout_ms)
   end
+
+  defp read_cold_raw(state, file_id, _offset, expected_key)
+       when valid_waraft_segment_location(file_id, 0, 0) do
+    case shard_index(state) do
+      idx when is_integer(idx) and idx >= 0 ->
+        Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+          Map.get(state, :instance_ctx),
+          idx,
+          file_id,
+          expected_key
+        )
+
+      _ ->
+        {:error, :missing_shard_index}
+    end
+  end
+
+  defp read_cold_raw(state, file_id, offset, expected_key) do
+    state.shard_data_path
+    |> ShardETS.file_path(file_id)
+    |> read_cold_async(offset, expected_key)
+  end
+
+  defp shard_index(%{index: index}), do: index
+  defp shard_index(%{shard_index: shard_index}), do: shard_index
+  defp shard_index(_state), do: nil
 
   defp reply_cold_value(state, key, value, exp, fid, off, vsize) do
     case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
@@ -377,12 +433,20 @@ defmodule Ferricstore.Store.Shard.Reads do
           when valid_cold_location(fid, off, vsize) ->
             {[key | live], expired}
 
+          {key, nil, 0, _lfu, fid, off, vsize}, {live, expired}
+          when valid_waraft_segment_location(fid, off, vsize) ->
+            {[key | live], expired}
+
           {key, value, exp, _lfu, _fid, _off, _vsize}, {live, expired}
           when exp > now and value != nil ->
             {[key | live], expired}
 
           {key, nil, exp, _lfu, fid, off, vsize}, {live, expired}
           when exp > now and valid_cold_location(fid, off, vsize) ->
+            {[key | live], expired}
+
+          {key, nil, exp, _lfu, fid, off, vsize}, {live, expired}
+          when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
             {[key | live], expired}
 
           {key, _value, _exp, _lfu, _fid, _off, _vsize}, {live, expired} ->

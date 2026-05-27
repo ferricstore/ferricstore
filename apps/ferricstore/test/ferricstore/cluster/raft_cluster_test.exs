@@ -54,7 +54,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
   #
   # In single-node mode, quorum is 1 (self). We verify that after a PUT
   # returns :ok, the entry is present in the Raft log on the local node.
-  # We check this by confirming the ra server has a non-zero last_applied
+  # We check this by confirming the WARaft partition has a non-zero last_applied
   # index and the written value is immediately readable.
   # ---------------------------------------------------------------------------
 
@@ -69,10 +69,8 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
         assert result == :ok, "PUT should succeed, got: #{inspect(result)} on #{node.name}"
 
         shard_idx = remote_router(node.name, :shard_for, [key])
-        server_id = {:"ferricstore_shard_#{shard_idx}", node.name}
-
         {:ok, members, {_leader_name, leader_node}} =
-          :rpc.call(node.name, :ra, :members, [server_id])
+          :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard_idx, 2_000])
 
         assert is_atom(leader_node), "should have a leader"
         assert length(members) == 3, "ra group should have 3 members"
@@ -371,8 +369,9 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
 
       for shard <- 0..3 do
         node = hd(remaining)
-        server_id = {:"ferricstore_shard_#{shard}", node.name}
-        {:ok, _members, {_name, leader}} = :rpc.call(node.name, :ra, :members, [server_id])
+        {:ok, _members, {_name, leader}} =
+          :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard, 2_000])
+
         assert leader in remaining_names,
                "LE-001: leader for shard #{shard} should be a surviving node, got #{inspect(leader)}"
       end
@@ -403,12 +402,12 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
       for shard <- 0..3 do
         leaders =
           Enum.map(alive_nodes, fn node ->
-            server_id = {:"ferricstore_shard_#{shard}", node.name}
-            case :rpc.call(node.name, :ra, :members, [server_id]) do
+            case :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard, 2_000]) do
               {:ok, _members, {_leader_name, leader_node}} ->
                 leader_node
+
               _ ->
-                flunk("LE-002: ra:members failed for shard #{shard} on #{node.name}")
+                flunk("LE-002: members failed for shard #{shard} on #{node.name}")
             end
           end)
           |> Enum.uniq()
@@ -435,8 +434,7 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
       for shard <- 0..3 do
         claims =
           for node <- alive_nodes do
-            server_id = {:"ferricstore_shard_#{shard}", node.name}
-            case :rpc.call(node.name, :ra, :members, [server_id]) do
+            case :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard, 2_000]) do
               {:ok, _members, {_name, leader}} -> leader
               _ -> nil
             end

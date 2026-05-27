@@ -473,12 +473,7 @@ defmodule Ferricstore.Commands.Cluster do
 
   # Returns "leader" or "follower" for the given shard on this node.
   defp shard_role(index) do
-    shard_id =
-      if Ferricstore.Raft.Backend.waraft?() do
-        {:"raft_server_ferricstore_waraft_backend_#{index + 1}", node()}
-      else
-        Ferricstore.Raft.Cluster.shard_server_id(index)
-      end
+    shard_id = {:"raft_server_ferricstore_waraft_backend_#{index + 1}", node()}
 
     case Ferricstore.Raft.Cluster.members(index, 1_000) do
       {:ok, _members, ^shard_id} -> "leader"

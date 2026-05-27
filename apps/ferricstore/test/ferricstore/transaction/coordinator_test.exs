@@ -59,12 +59,11 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
     test "single-shard write transaction applies through Raft", %{same1: s1} do
       idx = Router.shard_for(FerricStore.Instance.get(:default), s1)
-      shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
-      before_count = raft_applied_count(shard_id)
+      before_count = raft_applied_count(idx)
 
       assert [:ok] == Coordinator.execute([{"SET", [s1, "via_raft"]}], %{}, nil)
 
-      assert raft_applied_count(shard_id) == before_count + 1
+      assert raft_applied_count(idx) == before_count + 1
     end
 
     test "returns results in original command order", %{same1: s1, same2: s2} do
@@ -424,8 +423,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     end
   end
 
-  defp raft_applied_count(shard_id) do
-    {:ok, %{machine: %{applied_count: count}}, _leader} = :ra.member_overview(shard_id)
-    count
+  defp raft_applied_count(shard_index) do
+    {:ok, {:raft_log_pos, index, _term}} = Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+    index
   end
 end

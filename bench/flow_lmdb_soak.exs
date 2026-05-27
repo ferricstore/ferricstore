@@ -208,7 +208,7 @@ defmodule FlowLMDBSoak do
       "--worker-api",
       "lowlevel",
       "--worker-mode",
-      "owner-wakeup",
+      env("WORKER_MODE", "blocking"),
       "--partition-mode",
       "auto",
       "--flows",

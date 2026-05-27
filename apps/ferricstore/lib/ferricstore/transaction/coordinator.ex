@@ -16,7 +16,7 @@ defmodule Ferricstore.Transaction.Coordinator do
   materialized just to enter or check WATCH.
   """
 
-  alias Ferricstore.Raft.CommandClock
+  alias Ferricstore.Raft.Backend
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Ast, as: TxAst
 
@@ -71,24 +71,9 @@ defmodule Ferricstore.Transaction.Coordinator do
       end)
 
     command = {:cross_shard_tx, shard_batches}
-    shard_id = Ferricstore.Raft.Cluster.shard_server_id(anchor_idx)
-    corr = make_ref()
 
     try do
-      case CommandClock.pipeline_command(shard_id, command, corr, :low) do
-        :ok ->
-          case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
-            {:ok, shard_results} ->
-              Enum.each(Map.keys(shard_groups), fn idx ->
-                Ferricstore.Store.WriteVersion.increment(idx)
-              end)
-
-              reassemble_results(shard_results, index_map, total)
-
-            {:error, _} = err ->
-              err
-          end
-
+      case Backend.write(anchor_idx, command) do
         {:error, :noproc} ->
           maybe_execute_cross_shard_sequential(
             shard_groups,
@@ -106,6 +91,13 @@ defmodule Ferricstore.Transaction.Coordinator do
             sandbox_namespace,
             :pipeline_rejected
           )
+
+        shard_results ->
+          Enum.each(Map.keys(shard_groups), fn idx ->
+            Ferricstore.Store.WriteVersion.increment(idx)
+          end)
+
+          reassemble_results(shard_results, index_map, total)
       end
     catch
       :exit, {:noproc, _} ->
@@ -131,47 +123,6 @@ defmodule Ferricstore.Transaction.Coordinator do
     _ = {shard_groups, index_map, total, sandbox_namespace}
     {:error, "ERR transaction raft unavailable: #{inspect(reason)}"}
   end
-
-  # Waits for ra_event with our correlation ref. Mirrors Router.wait_for_ra_applied.
-  defp wait_for_ra_result(corr, shard_id, idx, command) do
-    receive do
-      {:ra_event, _leader, {:applied, applied_list}} ->
-        case List.keyfind(applied_list, corr, 0) do
-          {^corr, result} ->
-            {:ok, unwrap_applied(result)}
-
-          nil ->
-            wait_for_ra_result(corr, shard_id, idx, command)
-        end
-
-      {:ra_event, _from, {:rejected, {:not_leader, maybe_leader, ^corr}}} ->
-        leader =
-          if maybe_leader in [nil, :undefined],
-            do: shard_id,
-            else: maybe_leader
-
-        retry_corr = make_ref()
-
-        case CommandClock.pipeline_command(leader, command, retry_corr, :low) do
-          :ok ->
-            wait_for_ra_result(retry_corr, leader, idx, command)
-
-          _err ->
-            {:error, "ERR cross-shard transaction failed: leader redirect"}
-        end
-
-      {:ra_event, _from, {:rejected, {_reason, _hint, ^corr}}} ->
-        {:error, "ERR cross-shard transaction rejected"}
-    after
-      10_000 ->
-        {:error, "ERR cross-shard transaction timeout"}
-    end
-  end
-
-  # State machine wraps every reply as {:applied_at, ra_index, real_result}
-  # for read-your-write consistency. Unwrap before passing to reassemble_results.
-  defp unwrap_applied({:applied_at, _idx, real}), do: real
-  defp unwrap_applied(other), do: other
 
   # Reassembles per-shard results back into the original command order.
   defp reassemble_results(shard_results, index_map, total) do

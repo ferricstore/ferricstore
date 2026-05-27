@@ -1,0 +1,22 @@
+<% data = assigns.data %>
+<%= page_head("FerricFlow - FerricStore", 2, chartjs: true) %>
+<body data-dashboard-live-page="flow" data-dashboard-live-url="<%= flow_overview_live_url(flow_page_filters(data)) %>" data-dashboard-live-interval-ms="2000">
+<div class="layout">
+<%= render_sidebar_static("flow") %>
+<main class="main-content">
+<%= render_subpage_header("FerricFlow") %>
+<div class="content">
+<%= render_page_intro("FerricFlow", "Monitor workflow lifecycle state, projection health, due work, failures, and debug links for individual flows.") %>
+<%= render_flow_subnav("overview") %>
+<%= render_flow_overview_filter(data) %>
+<%= render_live_component("flow_overview", render_flow_overview(data.summary, Map.get(data, :filtered_sampled, data.total_sampled), data.sample_limit)) %>
+<%= render_live_component("flow_issue_cards", render_flow_issue_cards(data.summary)) %>
+<%= render_live_component("flow_projection_health", render_flow_projection_health(Map.get(data, :projection, default_flow_projection_health()))) %>
+<%= render_live_component("flow_state_breakdown", render_flow_state_breakdown(data.types)) %>
+<%= render_live_component("flow_workers", render_flow_workers(data.workers)) %>
+<%= render_live_component("flow_recent_records", render_flow_recent_records(data.records)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

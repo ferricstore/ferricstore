@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Connection.Blocking do
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.List
   alias Ferricstore.Commands.Stream, as: StreamCmd
+  alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Waiters
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
@@ -128,6 +129,32 @@ defmodule FerricstoreServer.Connection.Blocking do
       end
 
     handle_stream_read_result(cmd, result, args, ast, store, state)
+  end
+
+  @spec dispatch_flow_claim_due_ast(binary(), keyword(), map()) :: conn_result()
+  @doc false
+  def dispatch_flow_claim_due_ast(type, opts, state) when is_binary(type) and is_list(opts) do
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+    timeout_ms = Keyword.get(opts, :block_ms, 0)
+    claim_opts = Keyword.delete(opts, :block_ms)
+
+    if is_integer(timeout_ms) and timeout_ms > 0 do
+      do_flow_claim_due_wait(type, claim_opts, timeout_ms, store, state)
+    else
+      case safe_dispatch({:flow_claim_due, type, claim_opts}, store) do
+        result when is_list(result) and result != [] ->
+          {:continue, Encoder.encode(result), state}
+
+        [] ->
+          {:continue, Encoder.encode([]), state}
+
+        {:error, _reason} = error ->
+          {:continue, Encoder.encode(error), state}
+
+        other ->
+          {:continue, Encoder.encode(other), state}
+      end
+    end
   end
 
   defp handle_stream_read_result(cmd, result, args, ast, store, state) do
@@ -379,6 +406,64 @@ defmodule FerricstoreServer.Connection.Blocking do
     end
   end
 
+  defp do_flow_claim_due_wait(type, claim_opts, timeout_ms, store, state) do
+    try do
+      with {:ok, keys, limit} <- Ferricstore.Flow.claim_due_wait_registration(type, claim_opts) do
+        deadline = System.monotonic_time(:millisecond) + timeout_ms
+        ClaimWaiters.register(keys, self(), deadline, limit: limit)
+
+        notify_fn = fn _notified_key ->
+          case safe_dispatch({:flow_claim_due, type, claim_opts}, store) do
+            result when is_list(result) and result != [] -> {:ok, result}
+            [] -> nil
+            {:error, _reason} = error -> {:error, error}
+            _other -> nil
+          end
+        end
+
+        result =
+          case safe_dispatch({:flow_claim_due, type, claim_opts}, store) do
+            result when is_list(result) and result != [] ->
+              {:ok, result}
+
+            [] ->
+              generic_wait_loop(state, deadline, timeout_ms, notify_fn,
+                waiter_msg: ClaimWaiters.message()
+              )
+
+            {:error, _reason} = error ->
+              {:error, error}
+
+            _other ->
+              nil
+          end
+
+        ClaimWaiters.unregister(keys, self())
+
+        case result do
+          :client_closed ->
+            cleanup_connection(state)
+            state.transport.close(state.socket)
+            {:quit, Encoder.encode(nil), state}
+
+          {:ok, value} ->
+            {:continue, Encoder.encode(value), state}
+
+          {:error, err} ->
+            {:continue, Encoder.encode(err), state}
+
+          nil ->
+            {:continue, Encoder.encode([]), state}
+        end
+      else
+        {:error, _reason} = error ->
+          {:continue, Encoder.encode(error), state}
+      end
+    after
+      ClaimWaiters.cleanup(self())
+    end
+  end
+
   # Generalized wait loop — keeps the socket in its configured active_mode,
   # handles TCP events inline, and calls notify_fn when the waiter is notified.
   # This avoids the active: :once deadlock bug.
@@ -487,7 +572,21 @@ defmodule FerricstoreServer.Connection.Blocking do
 
     FerricstoreServer.ClientTracking.cleanup(self())
     Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
+    Ferricstore.Flow.ClaimWaiters.cleanup(self())
     Ferricstore.Stats.decr_connections()
+  end
+
+  defp safe_dispatch(ast, store) do
+    Ferricstore.Commands.Dispatcher.dispatch_ast(ast, store)
+  catch
+    :exit, {:noproc, _} ->
+      {:error, "ERR server not ready, shard process unavailable"}
+
+    :exit, {reason, _} ->
+      {:error, "ERR internal error: #{inspect(reason)}"}
+
+    kind, reason ->
+      {:error, "ERR internal error: #{inspect({kind, reason})}"}
   end
 
   defp format_peer(nil), do: "unknown"

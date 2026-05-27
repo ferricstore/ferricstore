@@ -2,8 +2,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
   @moduledoc """
   Production WARaft backend boundary.
 
-  WARaft is the only default-instance runtime backend. Keep old Ra-facing code
-  as reference/test-only code, not as a deploy-time mode switch.
+  WARaft is the only default-instance runtime backend.
   """
 
   alias Ferricstore.ErrorReasons
@@ -22,6 +21,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
   @shard_count_key {__MODULE__, :shard_count}
   @voter_nodes_key {__MODULE__, :voter_nodes}
   @default_log_module :ferricstore_waraft_spike_segment_log
+  @default_commit_batch_max 10_000
   @config_apply_poll_ms 10
   @config_redirects 2
   @log_module_callbacks [
@@ -106,19 +106,40 @@ defmodule Ferricstore.Raft.WARaftBackend do
     end
   end
 
+  @doc false
+  @spec default_commit_batch_max() :: pos_integer()
+  def default_commit_batch_max do
+    value = Application.get_env(:ferricstore, :waraft_commit_batch_max, @default_commit_batch_max)
+    positive_integer_option!(:waraft_commit_batch_max, value)
+  end
+
   @spec start(FerricStore.Instance.t(), keyword()) :: :ok | {:error, term()}
   def start(%FerricStore.Instance{} = ctx, opts \\ []) do
     Ferricstore.Raft.WARaftStorage.validate_supported_apply_mode!()
 
     config = backend_config!(opts)
 
-    :ok = ensure_started()
-    _ = stop()
+    profile_startup_phase(:ensure_waraft_app_started, %{shard_count: ctx.shard_count}, fn ->
+      :ok = ensure_started()
+    end)
 
-    Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
-    Ferricstore.Store.ActiveFile.init(ctx.shard_count)
+    profile_startup_phase(:stop_existing_backend, %{shard_count: ctx.shard_count}, fn ->
+      _ = stop()
+      :ok
+    end)
 
-    configure(ctx, config)
+    profile_startup_phase(:ensure_data_layout, %{shard_count: ctx.shard_count}, fn ->
+      Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
+    end)
+
+    profile_startup_phase(:active_file_init, %{shard_count: ctx.shard_count}, fn ->
+      Ferricstore.Store.ActiveFile.init(ctx.shard_count)
+    end)
+
+    profile_startup_phase(:configure, %{shard_count: ctx.shard_count}, fn ->
+      configure(ctx, config)
+    end)
+
     :persistent_term.put({@context_key, @table}, ctx)
 
     specs =
@@ -128,15 +149,29 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
     spec =
       @app
-      |> :wa_raft_sup.child_spec(specs, %{config_search_apps: [@app, :ferricstore]})
+      |> :wa_raft_sup.child_spec([], %{config_search_apps: [@app, :ferricstore]})
       |> Map.put(:id, @sup_id)
 
-    case Supervisor.start_child(:kernel_sup, spec) do
-      {:ok, _pid} -> finish_started(ctx.shard_count, opts)
-      {:ok, _pid, _info} -> finish_started(ctx.shard_count, opts)
-      {:error, {:already_started, _pid}} -> finish_started(ctx.shard_count, opts)
-      {:error, :already_present} -> restart_present_child(ctx, opts)
-      {:error, reason} -> cleanup_failed_start({:error, reason})
+    start_result =
+      profile_startup_phase(:start_backend_supervisor, %{shard_count: ctx.shard_count}, fn ->
+        Supervisor.start_child(:kernel_sup, spec)
+      end)
+
+    case start_result do
+      {:ok, _pid} ->
+        start_partitions_then_finish(specs, ctx.shard_count, opts)
+
+      {:ok, _pid, _info} ->
+        start_partitions_then_finish(specs, ctx.shard_count, opts)
+
+      {:error, {:already_started, _pid}} ->
+        start_partitions_then_finish(specs, ctx.shard_count, opts)
+
+      {:error, :already_present} ->
+        restart_present_child(ctx, opts)
+
+      {:error, reason} ->
+        cleanup_failed_start({:error, reason})
     end
   end
 
@@ -1322,7 +1357,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
   end
 
   defp finish_started(shard_count, opts) do
-    case finish_start(shard_count, opts) do
+    case profile_startup_phase(:finish_start, %{shard_count: shard_count}, fn ->
+           finish_start(shard_count, opts)
+         end) do
       :ok -> :ok
       {:error, _reason} = error -> cleanup_failed_start(error)
     end
@@ -1346,39 +1383,121 @@ defmodule Ferricstore.Raft.WARaftBackend do
     error
   end
 
-  defp finish_start(shard_count, opts) do
-    with :ok <-
-           0..(shard_count - 1)
-           |> Enum.reduce_while(:ok, fn shard_index, :ok ->
-             case finish_start_partition(shard_index, opts) do
-               :ok -> {:cont, :ok}
-               {:error, _reason} = error -> {:halt, error}
-             end
-           end) do
-      start_namespace_batchers(shard_count, opts)
+  defp start_partitions_then_finish(specs, shard_count, opts) do
+    case profile_startup_phase(:start_partitions, %{shard_count: shard_count}, fn ->
+           start_partitions(specs)
+         end) do
+      :ok -> finish_started(shard_count, opts)
+      {:error, _reason} = error -> cleanup_failed_start(error)
     end
   end
+
+  defp start_partitions(specs) when is_list(specs) do
+    supervisor = :wa_raft_sup.default_name(@app)
+    max_concurrency = startup_partition_concurrency(length(specs))
+
+    specs
+    |> Task.async_stream(
+      fn spec ->
+        shard_index = Map.get(spec, :partition, 1) - 1
+
+        try do
+          profile_startup_phase(:start_partition, %{shard_index: shard_index}, fn ->
+            case :wa_raft_sup.start_partition(supervisor, spec) do
+              {:error, {:already_started, _pid}} -> :ok
+              {:error, :already_present} -> :ok
+              {:error, reason} -> {:error, reason}
+              _other -> :ok
+            end
+          end)
+        catch
+          kind, reason -> {:error, {kind, reason}}
+        end
+      end,
+      max_concurrency: max_concurrency,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while(:ok, fn
+      {:ok, :ok}, :ok -> {:cont, :ok}
+      {:ok, {:error, reason}}, :ok -> {:halt, {:error, reason}}
+      {:exit, reason}, :ok -> {:halt, {:error, {:partition_start_exit, reason}}}
+    end)
+  end
+
+  defp startup_partition_concurrency(count) when is_integer(count) and count > 0 do
+    default = min(count, max(4, System.schedulers_online() * 2))
+
+    :ferricstore
+    |> Application.get_env(:waraft_start_partition_max_concurrency, default)
+    |> then(&positive_integer_option!(:waraft_start_partition_max_concurrency, &1))
+    |> min(count)
+  end
+
+  defp startup_partition_concurrency(_count), do: 1
+
+  defp startup_wait_attempts do
+    :ferricstore
+    |> Application.get_env(:waraft_start_wait_timeout_ms, 300_000)
+    |> then(&positive_integer_option!(:waraft_start_wait_timeout_ms, &1))
+    |> Kernel.+(9)
+    |> div(10)
+    |> max(1)
+  end
+
+  defp finish_start(shard_count, opts) do
+    with :ok <-
+           finish_start_partitions(shard_count, opts) do
+      profile_startup_phase(:start_namespace_batchers, %{shard_count: shard_count}, fn ->
+        start_namespace_batchers(shard_count, opts)
+      end)
+    end
+  end
+
+  defp finish_start_partitions(shard_count, opts) when shard_count > 0 do
+    max_concurrency = startup_partition_concurrency(shard_count)
+
+    0..(shard_count - 1)
+    |> Task.async_stream(
+      fn shard_index ->
+        profile_startup_phase(:finish_start_partition, %{shard_index: shard_index}, fn ->
+          finish_start_partition(shard_index, opts)
+        end)
+      end,
+      max_concurrency: max_concurrency,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while(:ok, fn
+      {:ok, :ok}, :ok -> {:cont, :ok}
+      {:ok, {:error, _reason} = error}, :ok -> {:halt, error}
+      {:exit, reason}, :ok -> {:halt, {:error, {:finish_start_exit, reason}}}
+    end)
+  end
+
+  defp finish_start_partitions(_shard_count, _opts), do: :ok
 
   defp finish_start_partition(shard_index, opts) do
     server = :wa_raft_server.registered_name(@table, partition(shard_index))
     bootstrap? = Keyword.get(opts, :bootstrap, true)
     replay_target = segment_log_last_index(shard_index)
+    wait_attempts = startup_wait_attempts()
 
-    with {:ok, status} <- wait_status(server, 100),
-         :ok <- finish_start_status(server, status, bootstrap?),
-         :ok <- wait_log_replayed(server, replay_target, 100),
-         :ok <- wait_storage_replayed(shard_index, replay_target, 100) do
+    with {:ok, status} <- wait_status(server, wait_attempts),
+         :ok <- finish_start_status(server, status, bootstrap?, wait_attempts),
+         :ok <- wait_log_replayed(server, replay_target, wait_attempts),
+         :ok <- wait_storage_replayed(shard_index, replay_target, wait_attempts) do
       maybe_cache_current_config(shard_index)
     end
   end
 
-  defp finish_start_status(_server, _status, false), do: :ok
+  defp finish_start_status(_server, _status, false, _wait_attempts), do: :ok
 
-  defp finish_start_status(server, status, true) do
+  defp finish_start_status(server, status, true, wait_attempts) do
     case Keyword.get(status, :state) do
       :stalled ->
         with :ok <- bootstrap(server) do
-          wait_leader(server, 100)
+          wait_leader(server, wait_attempts)
         end
 
       :leader ->
@@ -1386,7 +1505,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
       _other ->
         case backend_call(fn -> :wa_raft_server.promote(server, :next, true) end) do
-          :ok -> wait_leader(server, 100)
+          :ok -> wait_leader(server, wait_attempts)
           {:error, _reason} = error -> error
           other -> {:error, other}
         end
@@ -1934,8 +2053,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
             wait_leader(server, attempts - 1, status)
         end
 
-      {:error, _reason} = error ->
-        error
+      {:error, reason} ->
+        Process.sleep(10)
+        wait_leader(server, attempts - 1, {:status_error, reason})
     end
   end
 
@@ -1955,8 +2075,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
           wait_log_replayed(server, target_index, attempts - 1, status)
         end
 
-      {:error, _reason} = error ->
-        error
+      {:error, reason} ->
+        Process.sleep(10)
+        wait_log_replayed(server, target_index, attempts - 1, {:status_error, reason})
     end
   end
 
@@ -2424,7 +2545,12 @@ defmodule Ferricstore.Raft.WARaftBackend do
       commit_batch_interval_ms:
         non_negative_integer_option!(batch_interval_source, batch_interval_value),
       commit_batch_max:
-        throughput_option(opts, :commit_batch_max, :waraft_commit_batch_max, 1024),
+        throughput_option(
+          opts,
+          :commit_batch_max,
+          :waraft_commit_batch_max,
+          default_commit_batch_max()
+        ),
       async_log_append: true
     }
   end
@@ -2435,7 +2561,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
       |> Application.get_env(:wal_commit_delay_us, 6_000)
       |> then(&non_negative_integer_option!(:wal_commit_delay_us, &1))
 
-    if delay_us == 0, do: 0, else: 1
+    if delay_us == 0, do: 0, else: div(delay_us + 999, 1_000)
   end
 
   defp max_inflight_commit_bytes_option!(opts) do
@@ -2711,5 +2837,17 @@ defmodule Ferricstore.Raft.WARaftBackend do
     )
   rescue
     _ -> :ok
+  end
+
+  defp profile_startup_phase(phase, metadata, fun) when is_function(fun, 0) do
+    {duration_us, result} = :timer.tc(fun)
+
+    :telemetry.execute(
+      [:ferricstore, :waraft, :backend, :startup_phase],
+      %{duration_us: duration_us},
+      Map.put(metadata, :phase, phase)
+    )
+
+    result
   end
 end

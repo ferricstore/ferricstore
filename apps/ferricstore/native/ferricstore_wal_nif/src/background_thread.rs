@@ -191,7 +191,7 @@ fn run_sync_cycle<W>(
     // =====================================================================
     // Phase 4: one Erlang-owned sync cycle
     // =====================================================================
-    // ra_log_wal owns sync_in_flight and the pending/syncing frontier. Do not
+    // Erlang owns sync_in_flight and the pending/syncing frontier. Do not
     // self-drive extra syncs here: Flush messages that arrive during fdatasync
     // must stay queued until Erlang observes this completion and explicitly
     // schedules the next sync cycle.
@@ -388,16 +388,14 @@ fn notify_callers_error(callers: &mut Vec<FlushCaller>, error: &io::Error) {
     }
 }
 
-/// ra WAL header: "RAWA" (4 bytes) + version (1 byte) = 5 bytes.
-/// Written by ra_log_wal:make_tmp/1 before the NIF opens the file.
-pub const WAL_HEADER_SIZE: u64 = 5;
+/// WARaft segment logs start at byte 0.
+pub const WAL_HEADER_SIZE: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // File opening
 // ---------------------------------------------------------------------------
 
-/// Open a WAL file with platform-appropriate flags.
-/// Seeks past the WAL header so writes start at offset 5.
+/// Open an append log file with platform-appropriate flags.
 pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
     #[cfg(target_os = "linux")]
     let (mut file, o_direct) = open_wal_file_linux(path, pre_allocate_bytes)?;
@@ -410,8 +408,7 @@ pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, b
 
 /// Open a generic append log file and seek to the supplied logical end.
 ///
-/// WARaft segment files are self-framed from byte 0 and must not contain the
-/// 5-byte Ra WAL header gap. Segment preallocation is handled separately with
+/// WARaft segment files are self-framed from byte 0. Segment preallocation is handled separately with
 /// KEEP_SIZE so recovery never scans zero-filled preallocated trailers.
 pub fn open_raw_append_file(path: &str, start_offset: u64) -> io::Result<(File, bool)> {
     let mut file = std::fs::OpenOptions::new()
@@ -469,8 +466,6 @@ pub fn preallocate_keep_size_path(path: &str, bytes: u64) -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
-    // Ra WAL files have a 5-byte header, so the first data write starts at
-    // offset 5. That offset cannot satisfy O_DIRECT alignment requirements.
     // Keep buffered writes and rely on explicit fdatasync for durability.
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -798,12 +793,12 @@ mod tests {
     fn test_open_wal_file_linux_preallocate_failure_preserves_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
-        std::fs::write(&path, b"RAWA\x01existing bytes").unwrap();
+        std::fs::write(&path, b"existing bytes").unwrap();
 
         let result = open_wal_file_linux(path.to_str().unwrap(), u64::MAX);
 
         assert!(result.is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"RAWA\x01existing bytes");
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing bytes");
     }
 
     #[test]
@@ -944,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_to_kernel_appends_logical_bytes_without_padding_gap() {
+    fn drain_to_kernel_appends_logical_bytes_from_byte_zero() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
@@ -955,7 +950,6 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        file.write_all(b"RAWA\x01").unwrap();
         file.seek(SeekFrom::Start(WAL_HEADER_SIZE)).unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));

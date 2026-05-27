@@ -100,8 +100,7 @@ defmodule FerricstoreServer.GracefulShutdownTest do
         alive = is_pid(pid) and Process.alive?(pid)
 
         alive and try do
-          server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-          match?({:ok, _, _}, :ra.members(server_id, 200))
+          match?({:ok, {:raft_log_pos, _, _}}, Ferricstore.Raft.WARaftBackend.storage_position(i))
         catch
           :exit, _ -> false
         end

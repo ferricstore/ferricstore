@@ -927,13 +927,21 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp split_at_stateful([cmd | rest], state, acc) do
     name = extract_command_name(cmd)
 
-    if MapSet.member?(@stateful_cmds, name) or
+    if stateful_pipeline_command?(cmd) or MapSet.member?(@stateful_cmds, name) or
          (is_binary(name) and String.starts_with?(name, "CLIENT")) do
       {:split, Enum.reverse(acc), cmd, rest}
     else
       split_at_stateful(rest, state, [cmd | acc])
     end
   end
+
+  defp stateful_pipeline_command?(
+         {:command, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, _type, opts}, _keys}
+       )
+       when is_list(opts),
+       do: Keyword.get(opts, :block_ms, 0) > 0
+
+  defp stateful_pipeline_command?(_command), do: false
 
   defp do_batch_pure([], state, _send_response_fn), do: {:continue, state}
 

@@ -1,0 +1,27 @@
+<% data = assigns.data %>
+<% filters = data.filters %>
+<div class="flow-policy-panel">
+  <div class="section-title">Safe Query Explorer <%= info_icon("Runs bounded Flow read APIs only. Payload/value hydration stays off.") %></div>
+  <%= render_flow_query_kind_help(filters.kind) %>
+  <form class="flow-filter-form" action="/dashboard/flow/query" method="get" data-flow-query-form>
+    <label>
+      Query
+      <select class="flow-search-input mono" name="kind" title="Flow query to run" data-flow-query-kind>
+        <%= render_flow_query_kind_options(filters.kind) %>
+      </select>
+    </label>
+    <%= render_flow_query_type_field(filters) %>
+    <%= render_flow_query_state_field(filters) %>
+    <%= render_flow_query_id_field(filters) %>
+    <%= render_flow_query_partition_field(filters) %>
+    <label>
+      Limit
+      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>">
+    </label>
+    <%= render_flow_query_time_fields(filters) %>
+    <%= render_flow_query_direction_field(filters) %>
+    <button class="flow-search-button" type="submit">Run</button>
+  </form>
+  <div class="flow-filter-note">Changing Query shows only the fields that command can use. All queries are bounded and return refs, not full payload values.</div>
+  <%= render_flow_query_dynamic_script() %>
+</div>

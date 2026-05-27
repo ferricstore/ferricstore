@@ -91,31 +91,31 @@ defmodule Ferricstore.QuorumMetrics do
       {"ferricstore_batcher_local_apply_timeout_total", :counter,
        "Total timeouts while waiting for local Raft apply"},
     wal_sync_total:
-      {"ferricstore_wal_sync_total", :counter, "Total async Ra WAL sync completions"},
+      {"ferricstore_wal_sync_total", :counter, "Total async WARaft segment sync completions"},
     wal_sync_duration_us_total:
       {"ferricstore_wal_sync_duration_us_total", :counter,
-       "Total microseconds spent waiting for async Ra WAL sync"},
+       "Total microseconds spent waiting for async WARaft segment sync"},
     wal_sync_duration_us_max:
       {"ferricstore_wal_sync_duration_us_max", :gauge,
-       "Maximum observed async Ra WAL sync duration in microseconds"},
+       "Maximum observed async WARaft segment sync duration in microseconds"},
     wal_sync_delay_us_total:
       {"ferricstore_wal_sync_delay_us_total", :counter,
-       "Total adaptive Ra WAL sync delay selected in microseconds"},
+       "Total adaptive WARaft segment sync delay selected in microseconds"},
     wal_sync_delay_us_max:
       {"ferricstore_wal_sync_delay_us_max", :gauge,
-       "Maximum adaptive Ra WAL sync delay selected in microseconds"},
+       "Maximum adaptive WARaft segment sync delay selected in microseconds"},
     wal_sync_pending_batches_total:
       {"ferricstore_wal_sync_pending_batches_total", :counter,
-       "Total Ra WAL batches released by async sync completions"},
+       "Total WARaft batches released by async sync completions"},
     wal_sync_pending_batches_max:
       {"ferricstore_wal_sync_pending_batches_max", :gauge,
-       "Maximum observed number of Ra WAL batches released by one async sync completion"},
+       "Maximum observed number of WARaft batches released by one async sync completion"},
     wal_sync_queued_batches_total:
       {"ferricstore_wal_sync_queued_batches_total", :counter,
-       "Total Ra WAL batches left queued behind async sync completions"},
+       "Total WARaft batches left queued behind async sync completions"},
     wal_sync_queued_batches_max:
       {"ferricstore_wal_sync_queued_batches_max", :gauge,
-       "Maximum observed number of Ra WAL batches left queued behind one async sync completion"},
+       "Maximum observed number of WARaft batches left queued behind one async sync completion"},
     apply_total:
       {"ferricstore_quorum_apply_total", :counter,
        "Total number of Raft state-machine apply calls"},

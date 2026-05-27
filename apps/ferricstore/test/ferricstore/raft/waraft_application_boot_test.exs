@@ -6,18 +6,10 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   alias Ferricstore.Transaction.Coordinator
   alias Ferricstore.Test.ShardHelpers
 
-  test "WARaft backend is fixed even if old env config is set" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
-    try do
-      Application.put_env(:ferricstore, :raft_backend, :ra)
-
-      assert Ferricstore.Raft.Backend.selected() == :waraft
-      assert Ferricstore.Raft.Backend.running_or_selected() == :waraft
-      assert Ferricstore.Raft.Backend.waraft?()
-    after
-      restore_backend(previous_backend)
-    end
+  test "WARaft backend is fixed" do
+    assert Ferricstore.Raft.Backend.selected() == :waraft
+    assert Ferricstore.Raft.Backend.running_or_selected() == :waraft
+    assert Ferricstore.Raft.Backend.waraft?()
   end
 
   test "WARaft default log module is durable" do
@@ -27,8 +19,27 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
              :ferricstore_waraft_spike_segment_log
   end
 
-  test "application starts WARaft backend without legacy Ra batchers" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
+  test "application prep_stop stops WARaft before shard ETS tables can terminate" do
+    source =
+      Path.expand("../../../lib/ferricstore/application.ex", __DIR__)
+      |> File.read!()
+
+    assert [_, prep_stop_source] = String.split(source, "def prep_stop(state) do", parts: 2)
+    assert [prep_stop_source, _] = String.split(prep_stop_source, "\n  @impl true\n  def stop", parts: 2)
+
+    waraft_stop_at =
+      source_offset(prep_stop_source, "shutdown_stop_waraft_backend()")
+
+    shard_flush_at = source_offset(prep_stop_source, "shutdown_flush_shards(shard_count)")
+
+    assert is_integer(waraft_stop_at),
+           "WARaft must be stopped in prep_stop/1 while shard keydir ETS tables still exist"
+
+    assert waraft_stop_at < shard_flush_at,
+           "WARaft stop must happen before shard shutdown/flush teardown can remove keydir tables"
+  end
+
+  test "application starts WARaft backend with WARaft commit batchers" do
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -42,11 +53,10 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
-      refute Process.whereis(Ferricstore.Raft.Batcher.batcher_name(0))
+      assert is_pid(Process.whereis(Ferricstore.Raft.Batcher.batcher_name(0)))
 
       acceptor =
         :wa_raft_acceptor.registered_name(:ferricstore_waraft_backend, 1)
@@ -126,7 +136,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       assert info =~ "shard_0_leader_node:#{node()}"
     after
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -136,7 +145,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "strict default cleanup works when the running backend is WARaft" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -153,7 +161,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -165,7 +172,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       assert nil == Router.get(ctx, "cleanup:key")
     after
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -175,7 +181,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "WARaft bounded membership probes do not wait on slow status calls" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -192,7 +197,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -209,7 +213,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
     after
       Process.delete(:ferricstore_waraft_backend_status_hook)
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -219,7 +222,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "INFO raft under WARaft does not wait on slow status calls" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -236,7 +238,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -260,7 +261,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
     after
       Process.delete(:ferricstore_waraft_backend_status_hook)
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -270,7 +270,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "WARaft application executes MULTI EXEC transactions through selected backend" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -284,7 +283,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 2)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -307,7 +305,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       assert "v1" == Router.get(ctx, key_1)
     after
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -317,7 +314,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "WARaft application aborts watched transactions after concurrent writes" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -334,7 +330,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 1)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
 
@@ -353,7 +348,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       assert "v2" == Router.get(ctx, key)
     after
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -363,7 +357,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "WARaft application persists generic cross-shard copy and rename commands" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -380,7 +373,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 2)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.delete_env(:ferricstore, :waraft_log_module)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
@@ -408,7 +400,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       assert "generic-value" == Router.get(restarted_ctx, renamed)
     after
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -418,7 +409,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "WARaft application persists generic cross-shard compound copy and rename commands" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_waraft_log_module = Application.get_env(:ferricstore, :waraft_log_module)
@@ -435,7 +425,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
 
       Application.put_env(:ferricstore, :data_dir, tmp_dir)
       Application.put_env(:ferricstore, :shard_count, 2)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.delete_env(:ferricstore, :waraft_log_module)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
@@ -473,7 +462,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       assert {:simple, "none"} == Generic.handle_ast({:type, copy_dest}, restarted_ctx)
     after
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:waraft_log_module, previous_waraft_log_module)
@@ -483,7 +471,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   test "WARaft application handles real RESP SET GET through TCP and durable restart" do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     previous_shard_count = Application.get_env(:ferricstore, :shard_count)
     previous_port = Application.get_env(:ferricstore, :port)
@@ -504,7 +491,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       Application.put_env(:ferricstore, :shard_count, 2)
       Application.put_env(:ferricstore, :port, 0)
       Application.put_env(:ferricstore, :health_port, 0)
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.delete_env(:ferricstore, :waraft_log_module)
 
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore_server)
@@ -524,7 +510,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
                tcp_roundtrip(restarted_port, [["GET", "waraft:resp:key"]])
     after
       stop_ferricstore()
-      restore_backend(previous_backend)
       restore_env(:data_dir, previous_data_dir)
       restore_env(:shard_count, previous_shard_count)
       restore_env(:port, previous_port)
@@ -534,9 +519,6 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       assert {:ok, _apps} = Application.ensure_all_started(:ferricstore)
     end
   end
-
-  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
-  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
@@ -590,16 +572,17 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
     end
   end
 
+  defp source_offset(source, needle) do
+    case :binary.match(source, needle) do
+      {offset, _length} -> offset
+      :nomatch -> nil
+    end
+  end
+
   defp stop_ferricstore do
     _ = Application.stop(:ferricstore_server)
     _ = Application.stop(:ferricstore)
     _ = Ferricstore.Raft.WARaftBackend.stop()
-
-    try do
-      :ra_system.stop(Ferricstore.Raft.Cluster.system_name())
-    catch
-      _, _ -> :ok
-    end
 
     :ok
   end

@@ -33,7 +33,6 @@ defmodule Ferricstore.Commands.Server do
 
   alias Ferricstore.AuditLog
   alias Ferricstore.Commands.Catalog
-  alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
@@ -458,39 +457,7 @@ defmodule Ferricstore.Commands.Server do
   # DEBUG helpers
   # ---------------------------------------------------------------------------
 
-  defp debug_batcher_stats(shard_count) do
-    if RaftBackend.waraft?() do
-      debug_waraft_stats(shard_count)
-    else
-      debug_legacy_batcher_stats(shard_count)
-    end
-  end
-
-  defp debug_legacy_batcher_stats(shard_count) do
-    if shard_count <= 0 do
-      ""
-    else
-      batcher_parts =
-        for i <- 0..(shard_count - 1) do
-          name = :"Ferricstore.Raft.Batcher.#{i}"
-
-          legacy_process_stat("B#{i}", name)
-        end
-
-      wal_name = :ra_ferricstore_raft_log_wal
-      wal_part = legacy_process_stat("WAL", wal_name)
-
-      ra_parts =
-        for i <- 0..(shard_count - 1) do
-          name = :"ferricstore_shard_#{i}"
-
-          legacy_process_stat("R#{i}", name)
-        end
-
-      all = batcher_parts ++ [wal_part] ++ ra_parts
-      Enum.join(all, " | ")
-    end
-  end
+  defp debug_batcher_stats(shard_count), do: debug_waraft_stats(shard_count)
 
   defp debug_waraft_stats(shard_count) do
     if shard_count <= 0 do
@@ -519,13 +486,6 @@ defmodule Ferricstore.Commands.Server do
       |> Enum.join(",")
 
     "WA#{shard_index}:#{body}"
-  end
-
-  defp legacy_process_stat(label, name) do
-    case process_stat(name) do
-      :down -> "#{label}=down"
-      {mq, reductions} -> "#{label}:mq=#{mq},r=#{reductions}"
-    end
   end
 
   defp component_process_stat(name) do
@@ -585,17 +545,13 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp flush_raft_batchers(%{name: :default, shard_count: shard_count}) do
-    if RaftBackend.waraft?() do
-      :ok
-    else
-      Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
-        case Ferricstore.Raft.Batcher.flush(i, 30_000) do
-          :ok -> {:cont, :ok}
-          {:error, _} = err -> {:halt, err}
-          other -> {:halt, {:error, {:batcher_flush_failed, i, other}}}
-        end
-      end)
-    end
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      case Ferricstore.Raft.Batcher.flush(i, 30_000) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+        other -> {:halt, {:error, {:batcher_flush_failed, i, other}}}
+      end
+    end)
   end
 
   defp flush_raft_batchers(_ctx), do: :ok
@@ -1223,30 +1179,26 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp waraft_info_fields(shard_index) do
-    if RaftBackend.waraft?() do
-      segment_log = WARaftBackend.segment_log_memory_status(shard_index)
+    segment_log = WARaftBackend.segment_log_memory_status(shard_index)
 
-      [
-        {"shard_#{shard_index}_waraft_inflight_commit_bytes",
-         Integer.to_string(WARaftBackend.inflight_commit_bytes(shard_index))},
-        {"shard_#{shard_index}_waraft_segment_log_ets_entries",
-         waraft_info_value(segment_log[:ets_entries])},
-        {"shard_#{shard_index}_waraft_segment_log_ets_bytes",
-         waraft_info_value(segment_log[:ets_bytes])},
-        {"shard_#{shard_index}_waraft_segment_log_disk_first_index",
-         waraft_info_value(segment_log[:disk_first_index])},
-        {"shard_#{shard_index}_waraft_segment_log_disk_last_index",
-         waraft_info_value(segment_log[:disk_last_index])},
-        {"shard_#{shard_index}_waraft_segment_log_max_ets_entries",
-         waraft_info_value(segment_log[:max_ets_entries])},
-        {"shard_#{shard_index}_waraft_segment_log_max_ets_bytes",
-         waraft_info_value(segment_log[:max_ets_bytes])},
-        {"shard_#{shard_index}_waraft_segment_log_min_ets_entries",
-         waraft_info_value(segment_log[:min_ets_entries])}
-      ]
-    else
-      []
-    end
+    [
+      {"shard_#{shard_index}_waraft_inflight_commit_bytes",
+       Integer.to_string(WARaftBackend.inflight_commit_bytes(shard_index))},
+      {"shard_#{shard_index}_waraft_segment_log_ets_entries",
+       waraft_info_value(segment_log[:ets_entries])},
+      {"shard_#{shard_index}_waraft_segment_log_ets_bytes",
+       waraft_info_value(segment_log[:ets_bytes])},
+      {"shard_#{shard_index}_waraft_segment_log_disk_first_index",
+       waraft_info_value(segment_log[:disk_first_index])},
+      {"shard_#{shard_index}_waraft_segment_log_disk_last_index",
+       waraft_info_value(segment_log[:disk_last_index])},
+      {"shard_#{shard_index}_waraft_segment_log_max_ets_entries",
+       waraft_info_value(segment_log[:max_ets_entries])},
+      {"shard_#{shard_index}_waraft_segment_log_max_ets_bytes",
+       waraft_info_value(segment_log[:max_ets_bytes])},
+      {"shard_#{shard_index}_waraft_segment_log_min_ets_entries",
+       waraft_info_value(segment_log[:min_ets_entries])}
+    ]
   end
 
   defp waraft_info_value(:infinity), do: "infinity"
@@ -1257,36 +1209,12 @@ defmodule Ferricstore.Commands.Server do
   defp waraft_info_value(value), do: inspect(value)
 
   defp local_raft_member_id(shard_index) do
-    if RaftBackend.waraft?() do
-      {:"raft_server_ferricstore_waraft_backend_#{shard_index + 1}", node()}
-    else
-      RaftCluster.shard_server_id(shard_index)
-    end
+    RaftCluster.shard_server_id(shard_index)
   end
 
   defp raft_section_counters(shard_index, local_id) do
-    if RaftBackend.waraft?() do
-      waraft_section_counters(shard_index)
-    else
-      legacy_raft_section_counters(local_id)
-    end
-  end
-
-  defp legacy_raft_section_counters(local_id) do
-    counters =
-      try do
-        :ra_counters.overview(local_id)
-      rescue
-        _ -> %{}
-      catch
-        _, _ -> %{}
-      end
-
-    {
-      Map.get(counters, :commit_index, 0),
-      Map.get(counters, :last_applied, 0),
-      Map.get(counters, :term, 0)
-    }
+    _ = local_id
+    waraft_section_counters(shard_index)
   end
 
   defp waraft_section_counters(shard_index) do

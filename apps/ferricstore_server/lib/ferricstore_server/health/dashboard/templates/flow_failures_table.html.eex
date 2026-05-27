@@ -1,0 +1,10 @@
+<% data = assigns.data %>
+<div class="section-title">Failure / Recovery Records <span class="badge badge-idle">sample <%= format_number(data.total_sampled) %> / <%= format_number(data.sample_limit) %></span></div>
+<table>
+  <thead>
+    <tr><th>ID</th><th>Type</th><th>State</th><th>Reason</th><th>Attempts</th><th>Worker</th><th>Lease Until</th><th>Updated</th><th>Values</th></tr>
+  </thead>
+  <tbody>
+    <%= render_flow_failures_rows(data.candidates) %>
+  </tbody>
+</table>

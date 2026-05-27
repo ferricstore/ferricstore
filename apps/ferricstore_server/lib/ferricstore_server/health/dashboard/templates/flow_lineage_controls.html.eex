@@ -1,0 +1,27 @@
+<% data = assigns.data %>
+<% filters = data.filters %>
+<div class="flow-policy-panel">
+  <div class="section-title">Lineage Lookup <%= info_icon("Uses FLOW.BY_PARENT, FLOW.BY_ROOT, or FLOW.BY_CORRELATION with cold projection enabled. Payload bytes are not read.") %></div>
+  <form class="flow-filter-form" action="/dashboard/flow/lineage" method="get">
+    <label>
+      Query
+      <select class="flow-search-input mono" name="mode" title="Choose lineage index">
+        <%= render_flow_lineage_mode_options(filters.mode) %>
+      </select>
+    </label>
+    <label>
+      ID
+      <input class="flow-search-input mono" type="search" name="id" value="<%= escape_attr(filters.target || "") %>" placeholder="parent/root/correlation id" title="Lineage id to query">
+    </label>
+    <label>
+      Partition
+      <input class="flow-search-input mono" type="search" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="optional" title="Optional partition key">
+    </label>
+    <label>
+      Limit
+      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>">
+    </label>
+    <button class="flow-search-button" type="submit">Search</button>
+  </form>
+</div>
+<%= render_flow_lineage_hints(data.hints) %>

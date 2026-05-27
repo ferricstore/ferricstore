@@ -112,6 +112,49 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
+  test "shard GET reads cold WARaft apply-projection locations without Bitcask file path conversion" do
+    unique = System.unique_integer([:positive])
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_shard_apply_projection_get_#{unique}")
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    keydir = :ets.new(:"shard_ets_apply_projection_get_#{unique}", [:set, :public])
+    key = "ets:cold:apply-projection-get"
+    value = "apply-projection-value"
+    projection_index = 101
+
+    File.mkdir_p!(shard_path)
+
+    try do
+      assert :ok =
+               Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                 data_dir,
+                 0,
+                 projection_index,
+                 [{key, value, 0}]
+               )
+
+      :ets.insert(
+        keydir,
+        {key, nil, 0, LFU.initial(), {:waraft_apply_projection, projection_index}, 0,
+         byte_size(value)}
+      )
+
+      state = %{
+        keydir: keydir,
+        index: 0,
+        data_dir: data_dir,
+        shard_data_path: shard_path,
+        instance_ctx: %{data_dir: data_dir, hot_cache_max_value_size: 64, shard_count: 1}
+      }
+
+      assert {:reply, [^key], ^state} = ShardReads.handle_keys(state)
+      assert {:reply, ^value, ^state} = ShardReads.handle_get(key, state)
+      assert {:reply, ^value, ^state} = ShardReads.handle_get(key, {self(), make_ref()}, state)
+    after
+      :ets.delete(keydir)
+      File.rm_rf(data_dir)
+    end
+  end
+
   test "stale direct cold-read completion does not warm over a pending write" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "ets:pending:stale-direct-read"

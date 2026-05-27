@@ -1,6 +1,6 @@
 defmodule :ferricstore_wal_nif do
   @moduledoc """
-  Rust NIF WAL I/O module for ra_log_wal.
+  Rust NIF append-log I/O module.
 
   Replaces file:write and file:datasync with a Rust background thread
   that handles O_DIRECT, commit_delay batching, and fdatasync.
@@ -9,7 +9,7 @@ defmodule :ferricstore_wal_nif do
   The blocking I/O runs on a dedicated Rust OS thread.
 
   This module is registered as an Erlang atom `:ferricstore_wal_nif`
-  so ra_log_wal can call it as IoMod:write(Handle, Data).
+  so the WARaft segment log can call it from Erlang.
   """
 
   version = Mix.Project.config()[:version]
@@ -34,7 +34,7 @@ defmodule :ferricstore_wal_nif do
   def open(_path, _commit_delay_us, _pre_allocate_bytes, _max_buffer_bytes),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Open a raw append file with no Ra WAL header offset. Used by WARaft segment logs."
+  @doc "Open a raw append file with no header offset. Used by WARaft segment logs."
   def open_raw_append(_path, _commit_delay_us, _max_buffer_bytes, _start_offset),
     do: :erlang.nif_error(:nif_not_loaded)
 

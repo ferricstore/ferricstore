@@ -48,7 +48,6 @@ defmodule Ferricstore.Store.Shard do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
-  alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.BlobValue
@@ -123,8 +122,8 @@ defmodule Ferricstore.Store.Shard do
     pending_reads: %{},
     # Monotonically increasing counter for async read/write correlation IDs.
     next_correlation_id: 0,
-    # Whether this shard has Raft infrastructure (Batcher + ra server).
-    # Application-supervised shards (0-3) always have Raft. Isolated test
+    # Whether this shard has quorum-write infrastructure.
+    # Application-supervised shards always have WARaft. Isolated test
     # shards with ad-hoc indices use the direct write path instead.
     raft?: true,
     # Maximum active file size before rotation. Cached from Application env
@@ -210,9 +209,7 @@ defmodule Ferricstore.Store.Shard do
       {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
       ensure_zset_index_table!(zset_score_index, :ordered_set)
       ensure_zset_index_table!(zset_score_lookup, :set)
-      {flow_index, flow_lookup} = FlowIndex.table_names(instance_name, index)
-      ensure_zset_index_table!(flow_index, :ordered_set)
-      ensure_zset_index_table!(flow_lookup, :set)
+      {flow_index, flow_lookup} = NativeFlowIndex.table_names(instance_name, index)
 
       # v2: recover ETS keydir from hint files or by scanning log files BEFORE
       # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
@@ -226,17 +223,8 @@ defmodule Ferricstore.Store.Shard do
       end)
 
       profile_startup_phase(index, :flow_native_index_init, fn ->
-        case Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup) do
-          nil ->
-            Ferricstore.Flow.NativeOrderedIndex.register(
-              flow_index,
-              flow_lookup,
-              Ferricstore.Flow.NativeOrderedIndex.new()
-            )
-
-          _native ->
-            :ok
-        end
+        NativeFlowIndex.reset(flow_index, flow_lookup)
+        :ok
       end)
 
       profile_startup_phase(index, :flow_history_projector_recover, fn ->
@@ -244,7 +232,7 @@ defmodule Ferricstore.Store.Shard do
       end)
 
       profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
-        Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+        Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
           path,
           keydir,
           index,
@@ -256,15 +244,10 @@ defmodule Ferricstore.Store.Shard do
         )
       end)
 
-      profile_startup_phase(index, :flow_native_index_rebuild, fn ->
-        Ferricstore.Flow.NativeOrderedIndex.merge_from_ets(flow_index, flow_lookup)
-      end)
-
       keydir = publish_rebuilt_keydir(keydir, keydir_name)
 
       # Default-instance replication is owned by WARaftBackend. Shard GenServers
-      # still own local keydir/read/recovery state, but they no longer start a
-      # legacy Ra server during init.
+      # still own local keydir/read/recovery state.
       raft? = false
 
       # Recover promoted collection instances
@@ -906,19 +889,7 @@ defmodule Ferricstore.Store.Shard do
         state
       ) do
     reply =
-      case native_flow_index_for_read(state, key) do
-        :not_native ->
-          {:ok,
-           FlowIndex.range_slice(
-             state.flow_index,
-             key,
-             min_bound,
-             max_bound,
-             reverse?,
-             offset,
-             count
-           )}
-
+      case native_flow_index_for_read(state) do
         {:ok, native} ->
           {:ok,
            NativeFlowIndex.range_slice(native, key, min_bound, max_bound, reverse?, offset, count)}
@@ -932,10 +903,7 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:flow_index_rank_range, key, start_idx, stop_idx, reverse?}, _from, state) do
     reply =
-      case native_flow_index_for_read(state, key) do
-        :not_native ->
-          {:ok, FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)}
-
+      case native_flow_index_for_read(state) do
         {:ok, native} ->
           {:ok, NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)}
 
@@ -950,11 +918,7 @@ defmodule Ferricstore.Store.Shard do
     reply =
       Enum.reduce_while(requests, {:ok, []}, fn {key, start_idx, stop_idx, reverse?},
                                                 {:ok, acc} ->
-        case native_flow_index_for_read(state, key) do
-          :not_native ->
-            result = FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)
-            {:cont, {:ok, [result | acc]}}
-
+        case native_flow_index_for_read(state) do
           {:ok, native} ->
             result = NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)
             {:cont, {:ok, [result | acc]}}
@@ -973,8 +937,7 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:flow_index_count_all, key}, _from, state) do
     reply =
-      case native_flow_index_for_read(state, key) do
-        :not_native -> {:ok, FlowIndex.count_all(state.flow_lookup, key)}
+      case native_flow_index_for_read(state) do
         {:ok, native} -> {:ok, NativeFlowIndex.count_all(native, key)}
         :unavailable -> :unavailable
       end
@@ -984,30 +947,18 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:flow_index_count_all_many, keys}, _from, state) do
     reply =
-      case native_flow_index_for_count_many(state, keys) do
-        :not_native_or_mixed ->
-          Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
-            case native_flow_index_for_read(state, key) do
-              :not_native ->
-                {:cont, {:ok, [FlowIndex.count_all(state.flow_lookup, key) | acc]}}
+      case keys do
+        [] ->
+          {:ok, []}
 
-              {:ok, native} ->
-                {:cont, {:ok, [NativeFlowIndex.count_all(native, key) | acc]}}
+        _ ->
+          case native_flow_index_for_count_many(state, keys) do
+            {:ok, native} ->
+              {:ok, NativeFlowIndex.count_many(native, keys)}
 
-              :unavailable ->
-                {:halt, :unavailable}
-            end
-          end)
-          |> case do
-            {:ok, counts} -> {:ok, Enum.reverse(counts)}
-            :unavailable -> :unavailable
+            :unavailable ->
+              :unavailable
           end
-
-        {:ok, native} ->
-          {:ok, NativeFlowIndex.count_many(native, keys)}
-
-        :unavailable ->
-          :unavailable
       end
 
     {:reply, reply, state}
@@ -1505,51 +1456,14 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  defp native_flow_index_for_count_many(_state, []), do: :not_native_or_mixed
+  defp native_flow_index_for_count_many(state, _keys), do: native_flow_index_for_read(state)
 
-  defp native_flow_index_for_count_many(state, keys) do
-    case native_flow_index_for_read(state, hd(keys)) do
-      :not_native ->
-        :not_native_or_mixed
-
-      :unavailable ->
-        :unavailable
-
-      {:ok, native} ->
-        Enum.reduce_while(keys, {:ok, native}, fn key, {:ok, first_native} ->
-          case native_flow_index_for_read(state, key) do
-            {:ok, ^first_native} -> {:cont, {:ok, first_native}}
-            :unavailable -> {:halt, :unavailable}
-            _other -> {:halt, :not_native_or_mixed}
-          end
-        end)
-        |> case do
-          {:ok, native} -> {:ok, native}
-          :unavailable -> :unavailable
-          :not_native_or_mixed -> :not_native_or_mixed
-        end
+  defp native_flow_index_for_read(state) do
+    case NativeFlowIndex.get(state.flow_index, state.flow_lookup) do
+      nil -> :unavailable
+      native -> {:ok, native}
     end
   end
-
-  defp native_flow_index_for_read(state, key) do
-    if native_flow_lifecycle_index_key?(key) do
-      case NativeFlowIndex.get(state.flow_index, state.flow_lookup) do
-        nil -> :unavailable
-        native -> {:ok, native}
-      end
-    else
-      :not_native
-    end
-  end
-
-  defp native_flow_lifecycle_index_key?(key) when is_binary(key) do
-    :binary.match(key, "}:d:") != :nomatch or
-      :binary.match(key, "}:i:s:") != :nomatch or
-      :binary.match(key, "}:i:r:") != :nomatch or
-      :binary.match(key, "}:i:w:") != :nomatch
-  end
-
-  defp native_flow_lifecycle_index_key?(_key), do: false
 
   defp maybe_emit_compaction_crc_mismatch(state, fid, source, dest, reason) do
     if compaction_crc_mismatch?(reason) do
@@ -2144,7 +2058,7 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  defp default_waraft_write_state?(%{instance_ctx: %{name: :default}}), do: RaftBackend.waraft?()
+  defp default_waraft_write_state?(%{instance_ctx: %{name: :default}}), do: true
   defp default_waraft_write_state?(_state), do: false
 
   defp reply_default_waraft_write(command, state) do

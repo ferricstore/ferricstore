@@ -66,7 +66,7 @@ defmodule Ferricstore.Application do
       Logger.info("FerricStore starting")
 
       # Create the on-disk directory layout (spec 2B.4) before any process
-      # tries to open shard directories or Raft WALs.
+      # tries to open shard directories or WARaft segment logs.
       Ferricstore.DataDir.ensure_layout!(data_dir, shard_count)
 
       replication_mode = Ferricstore.ReplicationMode.resolve!(data_dir, shard_count)
@@ -141,6 +141,7 @@ defmodule Ferricstore.Application do
 
       # Initialize waiter registry ETS for blocking commands
       Ferricstore.Waiters.init()
+      Ferricstore.Flow.ClaimWaiters.init()
       # Client tracking ETS tables initialized by FerricstoreServer.ClientTracking
       # Initialize stream metadata ETS tables (owned by this long-lived process)
       Ferricstore.Commands.Stream.init_tables()
@@ -278,7 +279,7 @@ defmodule Ferricstore.Application do
     [
       log_module: Ferricstore.Raft.WARaftBackend.default_log_module(),
       commit_batch_interval_ms: Ferricstore.Raft.WARaftBackend.default_commit_batch_interval_ms(),
-      commit_batch_max: Application.get_env(:ferricstore, :waraft_commit_batch_max, 1024)
+      commit_batch_max: Ferricstore.Raft.WARaftBackend.default_commit_batch_max()
     ]
   end
 
@@ -332,7 +333,7 @@ defmodule Ferricstore.Application do
 
     {shard_count, data_dir} = runtime_shutdown_config(state)
 
-    batcher_result = :ok
+    waraft_result = shutdown_stop_waraft_backend()
     bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
     shutdown_flush_flow_lmdb_writers(shard_count)
     bitcask_fsync_result = shutdown_fsync_bitcask(shard_count, data_dir)
@@ -341,14 +342,14 @@ defmodule Ferricstore.Application do
 
     elapsed = System.monotonic_time(:millisecond) - t0
 
-    case {batcher_result, bitcask_writer_result, bitcask_fsync_result, wal_rollover_result} do
+    case {waraft_result, bitcask_writer_result, bitcask_fsync_result, wal_rollover_result} do
       {:ok, :ok, :ok, :ok} ->
         Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
-      {batcher_result, writer_result, bitcask_result, wal_result} ->
+      {waraft_result, writer_result, bitcask_result, wal_result} ->
         Logger.warning(
           "Shutdown: graceful flush complete with warnings in #{elapsed}ms " <>
-            "(batcher=#{inspect(batcher_result)}, bitcask_writer=#{inspect(writer_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
+            "(waraft=#{inspect(waraft_result)}, bitcask_writer=#{inspect(writer_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
         )
     end
 
@@ -368,7 +369,6 @@ defmodule Ferricstore.Application do
   defp cleanup_failed_start do
     Ferricstore.Health.set_ready(false)
     _ = Ferricstore.Raft.WARaftBackend.stop()
-    _ = Ferricstore.Raft.Cluster.stop_system(:ra)
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
     :ok
@@ -399,6 +399,26 @@ defmodule Ferricstore.Application do
       n when is_integer(n) and n > 0 -> n
       _ -> 4
     end
+  end
+
+  defp shutdown_stop_waraft_backend do
+    # Stop WARaft while shard keydir ETS tables are still alive. WAraft storage
+    # can otherwise deliver late apply messages during supervisor teardown and
+    # crash when Shard termination has already removed a keydir table.
+    result =
+      try do
+        Ferricstore.Raft.WARaftBackend.stop()
+      catch
+        :exit, reason -> {:error, {:waraft_stop_exit, reason}}
+        kind, reason -> {:error, {:waraft_stop_failed, kind, reason}}
+      end
+
+    case result do
+      :ok -> Logger.info("Shutdown: WARaft backend stopped")
+      {:error, reason} -> Logger.warning("Shutdown: WARaft stop incomplete: #{inspect(reason)}")
+    end
+
+    result
   end
 
   defp shutdown_flush_bitcask_writers(shard_count) do
@@ -557,85 +577,6 @@ defmodule Ferricstore.Application do
     end
 
     Logger.info("Shutdown: shards flushed")
-  end
-
-  @doc false
-  def wal_rollover_for_shutdown(data_dir, opts \\ []) do
-    force_rollover =
-      Keyword.get(opts, :force_rollover, fn wal_name ->
-        :ra_log_wal.force_roll_over(wal_name)
-      end)
-
-    list_wal_files = Keyword.get(opts, :list_wal_files, &list_wal_files/1)
-    max_attempts = Keyword.get(opts, :max_attempts, 100)
-    poll_interval_ms = Keyword.get(opts, :poll_interval_ms, 50)
-
-    try do
-      ra_dir = Path.join(data_dir, "ra")
-      wal_name = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name()).wal
-
-      # Snapshot WAL files before rollover
-      wal_files_before = list_wal_files.(ra_dir)
-
-      case force_rollover.(wal_name) do
-        :ok ->
-          # Poll until the pre-rollover WAL files are deleted by segment writer.
-          await_wal_files_consumed(
-            ra_dir,
-            wal_files_before,
-            max_attempts,
-            poll_interval_ms,
-            list_wal_files
-          )
-
-        {:ok, _} ->
-          await_wal_files_consumed(
-            ra_dir,
-            wal_files_before,
-            max_attempts,
-            poll_interval_ms,
-            list_wal_files
-          )
-
-        {:error, reason} ->
-          {:error, {:force_rollover_failed, reason}}
-
-        other ->
-          {:error, {:force_rollover_failed, other}}
-      end
-    catch
-      kind, reason -> {:error, {kind, reason}}
-    end
-  end
-
-  defp list_wal_files(ra_dir) do
-    case Ferricstore.FS.ls(ra_dir) do
-      {:ok, files} -> Enum.filter(files, &String.ends_with?(&1, ".wal"))
-      _ -> []
-    end
-  end
-
-  defp await_wal_files_consumed(ra_dir, old_files, max, interval, list_fun) do
-    do_await_wal_files_consumed(ra_dir, old_files, max, interval, list_fun)
-  end
-
-  defp do_await_wal_files_consumed(_ra_dir, [], _max, _interval, _list_fun), do: :ok
-
-  defp do_await_wal_files_consumed(_ra_dir, old_files, 0, _interval, _list_fun) do
-    Logger.warning("Shutdown: segment writer still processing WAL files after timeout")
-    {:error, {:wal_files_unconsumed, old_files}}
-  end
-
-  defp do_await_wal_files_consumed(ra_dir, old_files, attempts, interval, list_fun) do
-    current = list_fun.(ra_dir)
-    remaining = Enum.filter(old_files, fn f -> f in current end)
-
-    if remaining == [] do
-      :ok
-    else
-      Process.sleep(interval)
-      do_await_wal_files_consumed(ra_dir, remaining, attempts - 1, interval, list_fun)
-    end
   end
 
   # ---------------------------------------------------------------------------

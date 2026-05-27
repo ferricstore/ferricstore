@@ -22,8 +22,7 @@ defmodule Ferricstore.FsUsageGuardTest do
 
   @allowed_paths MapSet.new([
                    "lib/ferricstore/fs.ex",
-                   "lib/ferricstore/bitcask/nif.ex",
-                   "lib/mix/tasks/compile/patched_wal.ex"
+                   "lib/ferricstore/bitcask/nif.ex"
                  ])
 
   test "storage production code uses Ferricstore.FS for filesystem metadata" do

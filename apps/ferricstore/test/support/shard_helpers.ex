@@ -127,6 +127,13 @@ defmodule Ferricstore.Test.ShardHelpers do
     # Prove the WARaft write/apply path is usable before handing control back.
     wait_default_waraft_ready(flush_timeout)
 
+    ctx = FerricStore.Instance.get(:default)
+
+    # Flow secondary indexes are native-only and rebuilt from durable Flow
+    # records. The key delete path above removes the durable records; reset the
+    # native projection too so test setup cannot leak in-memory index state.
+    Ferricstore.Flow.NativeOrderedIndex.reset_all(ctx.name, shard_count)
+
     # Safety net: clear any remaining compound key entries from ETS.
     # After the per-shard deletes and drain above this should be a no-op,
     # but guards against edge cases where NIF tombstones haven't propagated.
@@ -144,8 +151,6 @@ defmodule Ferricstore.Test.ShardHelpers do
     # The production code only clears pressure on a subsequent successful
     # Shard flush, which may not happen between tests — so the async write
     # path rejects new writes with "ERR disk pressure on shard N".
-    ctx = FerricStore.Instance.get(:default)
-
     Enum.each(0..(shard_count - 1), fn i ->
       Ferricstore.Store.DiskPressure.clear(ctx, i)
     end)
@@ -378,24 +383,15 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   @doc """
-  Forces a WAL rollover on the Raft system. This triggers the segment writer
-  to flush mem tables and allows ra to take snapshots, truncating the WAL.
-
-  Call before shard-kill tests to ensure WAL is small — a 256MB WAL from
-  previous tests causes 30s+ replay on restart, hanging tests.
+  Flushes WARaft namespace batchers before restart-heavy tests.
   """
   @spec compact_wal() :: :ok
   def compact_wal do
-    try do
-      wal_name = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name()).wal
-      :ra_log_wal.force_roll_over(wal_name)
-      # Give the segment writer time to process the rolled WAL
-      Process.sleep(500)
-    catch
-      _, _ -> :ok
+    Ferricstore.Raft.Batcher.flush_all(shard_count(), 10_000)
+    |> case do
+      :ok -> :ok
+      {:error, _reason} -> :ok
     end
-
-    :ok
   end
 
   @doc """
@@ -447,7 +443,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # can succeed while init is still running (warming ETS from Bitcask, setting
     # up the Raft server). The :flush call blocks until init completes and is
     # harmless (flushes the empty pending list on a fresh shard).
-    # Give each GenServer.call enough time for Raft WAL replay (can take 7+
+    # Give each GenServer.call enough time for WARaft replay (can take 7+
     # seconds on CI with large WAL files). Minimum 15s per shard.
     remaining_ms = max(deadline - System.monotonic_time(:millisecond), 15_000)
 
@@ -684,7 +680,7 @@ defmodule Ferricstore.Test.ShardHelpers do
 
         stop_app_if_started(:ferricstore_server)
         stop_app_if_started(:ferricstore)
-        stop_ra_system()
+        Ferricstore.Raft.WARaftBackend.stop()
 
         prefix = prefix |> to_string() |> String.trim_leading(":")
         node_name = :"#{prefix}_#{:erlang.unique_integer([:positive])}"
@@ -765,7 +761,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # the next shard restart fail with `:gap_between_snapshot_and_log_range`.
     stop_app_if_started(:ferricstore_server)
     stop_app_if_started(:ferricstore)
-    stop_ra_system()
+    Ferricstore.Raft.WARaftBackend.stop()
 
     # Setup needs a clean temp dir. Teardown must restore the original data dir
     # without deleting real state that existed before the isolated test.
@@ -797,16 +793,6 @@ defmodule Ferricstore.Test.ShardHelpers do
     if application_started?(app) do
       _ = Application.stop(app)
     end
-  end
-
-  defp stop_ra_system do
-    try do
-      :ra_system.stop(Ferricstore.Raft.Cluster.system_name())
-    catch
-      _, _ -> :ok
-    end
-
-    :ok
   end
 
   defp start_distribution!(node_name) do

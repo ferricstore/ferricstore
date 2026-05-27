@@ -182,21 +182,10 @@ defmodule Ferricstore.WritePathQuorumTest do
     end
   end
 
-  # =========================================================================
-  # Async WAL fdatasync (monkey-patch)
-  # =========================================================================
-
-  describe "async WAL fdatasync" do
-    test "patched WAL module is loaded" do
-      # If the patch loaded successfully, :ra_log_wal should be loaded
-      assert :ra_log_wal in Enum.map(:code.all_loaded(), fn {mod, _} -> mod end)
-    end
-
+  describe "WARaft durability" do
     test "SET returns :ok — write is durable after return" do
       key = ukey("wal")
       assert :ok = Router.put(FerricStore.Instance.get(:default), key, "durable", 0)
-      # The write returned :ok, which means ra committed it (WAL + quorum).
-      # The patched WAL still guarantees fdatasync before notifying writers.
       assert "durable" == Router.get(FerricStore.Instance.get(:default), key)
     end
 

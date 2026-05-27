@@ -1,6 +1,34 @@
 Logger.configure(level: :warning)
 :logger.set_primary_config(:level, :warning)
 
+defmodule FlowStateLMDBSoakWARaftMetrics do
+  @moduledoc false
+  @interesting_gauges [
+    :"acceptor.commit.func",
+    :"leader.apply.func",
+    :"apply_log.latency_us",
+    :"storage.apply.func",
+    :"apply.queue"
+  ]
+
+  def count(_metric), do: :ok
+  def countv(_metric, _value), do: :ok
+
+  def gather({:raft, table, metric}, value)
+      when is_integer(value) and metric in @interesting_gauges do
+    :telemetry.execute(
+      [:ferricstore, :waraft, :internal_metric],
+      %{duration_us: value, value: value},
+      %{table: table, metric: metric}
+    )
+  catch
+    _kind, _reason -> :ok
+  end
+
+  def gather(_metric, _value), do: :ok
+  def gather_latency(metric, value), do: gather(metric, value)
+end
+
 defmodule FlowStateLMDBSoak do
   @moduledoc false
 
@@ -16,11 +44,39 @@ defmodule FlowStateLMDBSoak do
     [:ferricstore, :waraft, :batcher, :slot_flush],
     [:ferricstore, :waraft, :batcher, :hot_flush],
     [:ferricstore, :waraft, :segment_log, :append],
+    [:ferricstore, :waraft, :segment_log, :projection_overlap],
     [:ferricstore, :waraft, :commit_bytes, :rejected],
     [:ferricstore, :waraft, :commit, :timeout],
+    [:ferricstore, :waraft, :internal_metric],
     [:ferricstore, :waraft, :storage_blocked],
     [:ferricstore, :waraft, :storage, :payload_fsync],
+    [:ferricstore, :waraft, :storage, :apply_phase],
     [:ferricstore, :waraft, :blob_prepare_failed]
+  ]
+
+  @flow_latency_commands [:create, :pipeline_write, :claim_due, :transition, :complete, :fail]
+
+  @latency_us_buckets [
+    100,
+    250,
+    500,
+    1_000,
+    2_000,
+    5_000,
+    10_000,
+    20_000,
+    30_000,
+    40_000,
+    50_000,
+    60_000,
+    75_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    :infinity
   ]
 
   def run do
@@ -34,6 +90,7 @@ defmodule FlowStateLMDBSoak do
     sample_interval_s = int_env("SAMPLE_INTERVAL_SECONDS", 30)
     min_free_mb = int_env("MIN_FREE_DISK_MB", 100_000)
     max_total_mem_mb = int_env("MAX_TOTAL_MEM_MB", 64_000)
+    flow_latency_sample_rate = max(int_env("FLOW_LATENCY_SAMPLE_RATE", 10), 1)
 
     normal_flows =
       case System.get_env("NORMAL_FLOWS") do
@@ -54,20 +111,28 @@ defmodule FlowStateLMDBSoak do
     IO.puts(
       "flow_state_lmdb_soak_prepare backend=waraft duration_s=#{duration_s} " <>
         "target_ops_s=#{target_ops_s} payload_bytes=#{payload_bytes} normal_flows=#{normal_flows} " <>
-        "normal_steps=#{normal_steps} long_flows=#{long_flows} long_steps=#{long_steps} " <>
+        "normal_steps=#{normal_steps} normal_claim_states_mode=#{normal_claim_states_mode()} " <>
+        "normal_worker_mode=#{normal_worker_mode()} " <>
+        "long_flows=#{long_flows} long_steps=#{long_steps} " <>
+        "long_claim_states_mode=#{long_claim_states_mode()} " <>
+        "long_worker_mode=#{long_worker_mode()} " <>
         "flow_async_history=true " <>
+        "flow_latency_sample_rate=#{flow_latency_sample_rate} " <>
         "estimated_raw_payload_gb=#{Float.round(estimate_bytes / 1_073_741_824, 2)} " <>
         "free_mb=#{free_mb_before} min_free_mb=#{min_free_mb}"
     )
 
     stop_started_apps()
     configure_app(data_dir, shards)
+    print_effective_config()
 
     table = telemetry_table()
     init_table(table)
+    :ets.insert(table, {{:config, :flow_latency_sample_rate}, flow_latency_sample_rate})
     handler_id = "flow-state-lmdb-soak-#{unique()}"
     {:ok, _} = Application.ensure_all_started(:telemetry)
-    attach_telemetry(handler_id, table)
+    attach_telemetry(handler_id, table, flow_latency_sample_rate)
+    :wa_raft_metrics.install(FlowStateLMDBSoakWARaftMetrics)
 
     started_native = System.monotonic_time()
 
@@ -81,7 +146,8 @@ defmodule FlowStateLMDBSoak do
           steps: normal_steps,
           terminal_mode: "complete",
           payload_bytes: payload_bytes,
-          claim_states_mode: env("NORMAL_CLAIM_STATES_MODE", "cursor")
+          claim_states_mode: normal_claim_states_mode(),
+          worker_mode: normal_worker_mode()
         )
 
       long_port =
@@ -91,7 +157,8 @@ defmodule FlowStateLMDBSoak do
             steps: long_steps,
             terminal_mode: "fail",
             payload_bytes: payload_bytes,
-            claim_states_mode: env("LONG_CLAIM_STATES_MODE", "all")
+            claim_states_mode: long_claim_states_mode(),
+            worker_mode: long_worker_mode()
           )
         end
 
@@ -123,11 +190,13 @@ defmodule FlowStateLMDBSoak do
         max_flow_index_entries: 0,
         max_flow_lookup_entries: 0,
         sample_count: 0,
-        outputs: %{}
+        outputs: %{},
+        process_profile: process_profile_snapshot()
       }
 
       state = sample_loop(state)
       print_summary(state)
+      maybe_keep_server_running(data_dir, port)
     after
       :telemetry.detach(handler_id)
       stop_started_apps()
@@ -144,6 +213,7 @@ defmodule FlowStateLMDBSoak do
 
   defp start_python_workload(name, port, opts) do
     payload_bytes = Keyword.fetch!(opts, :payload_bytes)
+    create_rate_per_sec = default_create_rate_per_sec(opts)
 
     args = [
       "examples/async_state_machine_workflow_benchmark.py",
@@ -166,16 +236,11 @@ defmodule FlowStateLMDBSoak do
       "--create-mode",
       env("CREATE_MODE", "many"),
       "--create-batch-size",
-      env("CREATE_BATCH_SIZE", "1000"),
+      env("CREATE_BATCH_SIZE", Integer.to_string(default_create_batch_size(create_rate_per_sec))),
       "--create-inflight",
       env("CREATE_INFLIGHT", "64"),
       "--create-rate-per-sec",
-      env(
-        "CREATE_RATE_PER_SEC",
-        Integer.to_string(
-          max(div(int_env("TARGET_OPS_PER_SEC", 50_000), Keyword.fetch!(opts, :steps) + 1), 1)
-        )
-      ),
+      env("CREATE_RATE_PER_SEC", Integer.to_string(create_rate_per_sec)),
       "--claim-batch-size",
       env("CLAIM_BATCH_SIZE", "1000"),
       "--claim-partition-batch-size",
@@ -183,11 +248,9 @@ defmodule FlowStateLMDBSoak do
       "--apply-inflight",
       env("APPLY_INFLIGHT", "8"),
       "--worker-mode",
-      env("WORKER_MODE", "owner-wakeup"),
+      Keyword.get(opts, :worker_mode, env("WORKER_MODE", "blocking")),
       "--claim-states-mode",
       Keyword.fetch!(opts, :claim_states_mode),
-      "--wake-coalesce-ms",
-      env("WAKE_COALESCE_MS", "0"),
       "--idle-sleep-ms",
       env("IDLE_SLEEP_MS", "1"),
       "--max-idle-sleep-ms",
@@ -216,6 +279,48 @@ defmodule FlowStateLMDBSoak do
       ])
 
     %{name: name, port: port_ref, status: :running, output: ""}
+  end
+
+  defp default_create_rate_per_sec(opts) do
+    max(div(int_env("TARGET_OPS_PER_SEC", 50_000), Keyword.fetch!(opts, :steps) + 1), 1)
+  end
+
+  # Cursor mode is the high-throughput state-machine lifecycle shape, but it
+  # must not long-poll one state at a time or workers sit on empty states before
+  # rotating. Long-poll/all-state remains available for separate waiter tests.
+  defp normal_claim_states_mode, do: env("NORMAL_CLAIM_STATES_MODE", "cursor")
+  defp long_claim_states_mode, do: env("LONG_CLAIM_STATES_MODE", "all")
+
+  defp normal_worker_mode do
+    env(
+      "NORMAL_WORKER_MODE",
+      if(normal_claim_states_mode() == "cursor", do: "polling", else: "blocking")
+    )
+  end
+
+  defp long_worker_mode, do: env("LONG_WORKER_MODE", env("WORKER_MODE", "blocking"))
+
+  defp default_create_batch_size(create_rate_per_sec) do
+    partition_mode = env("PARTITION_MODE", "auto")
+    create_mode = env("CREATE_MODE", "many")
+
+    if partition_mode == "auto" and create_mode == "many" do
+      # The Python benchmark buffers CREATE_MANY by auto partition. With the old
+      # fixed 1000-item bucket, a 50-step soak at 50K target ops only generated
+      # about 980 creates/sec, so a partition could wait minutes before a batch
+      # flushed and woke workers. Bound the expected per-partition flush delay
+      # while keeping larger batches on higher create-rate workloads.
+      flush_target_ms = int_env("CREATE_AUTO_FLUSH_TARGET_MS", 5_000)
+      buckets = 256
+
+      create_rate_per_sec
+      |> Kernel.*(flush_target_ms)
+      |> div(1_000 * buckets)
+      |> max(1)
+      |> min(1_000)
+    else
+      1_000
+    end
   end
 
   defp sample_loop(state) do
@@ -300,10 +405,31 @@ defmodule FlowStateLMDBSoak do
         "waraft_commit_timeout_max_us=#{telemetry.waraft_commit_timeout_max_us} " <>
         "waraft_flushes=#{telemetry.waraft_flushes} waraft_queue_wait_avg_us=#{telemetry.waraft_queue_wait_avg_us} " <>
         "waraft_queue_wait_max_us=#{telemetry.waraft_queue_wait_max_us} " <>
+        "waraft_flush_duration_avg_us=#{telemetry.waraft_flush_duration_avg_us} " <>
+        "waraft_flush_duration_max_us=#{telemetry.waraft_flush_duration_max_us} " <>
+        "waraft_total_duration_avg_us=#{telemetry.waraft_total_duration_avg_us} " <>
+        "waraft_total_duration_max_us=#{telemetry.waraft_total_duration_max_us} " <>
         "payload_fsyncs=#{telemetry.payload_fsyncs} payload_fsync_avg_us=#{telemetry.payload_fsync_avg_us} " <>
         "payload_fsync_max_us=#{telemetry.payload_fsync_max_us} payload_fsync_errors=#{telemetry.payload_fsync_errors} " <>
         "blob_prepare_failures=#{telemetry.blob_prepare_failures} storage_blocked=#{telemetry.storage_blocked} " <>
         "segment_appends=#{telemetry.segment_appends} segment_mb=#{Float.round(telemetry.segment_mb, 1)} " <>
+        "raft_segment_append_avg_us=#{telemetry.raft_segment_append_avg_us} raft_segment_append_max_us=#{telemetry.raft_segment_append_max_us} " <>
+        "projection_segment_append_avg_us=#{telemetry.projection_segment_append_avg_us} projection_segment_append_max_us=#{telemetry.projection_segment_append_max_us} " <>
+        "apply_projection_segment_append_avg_us=#{telemetry.apply_projection_segment_append_avg_us} apply_projection_segment_append_max_us=#{telemetry.apply_projection_segment_append_max_us} " <>
+        "projection_overlap=#{telemetry.projection_overlap} projection_overlap_rebuilds=#{telemetry.projection_overlap_rebuilds} " <>
+        "projection_overlap_avg_us=#{telemetry.projection_overlap_avg_us} projection_overlap_max_us=#{telemetry.projection_overlap_max_us} " <>
+        "acceptor_commit_avg_us=#{telemetry.acceptor_commit_avg_us} acceptor_commit_max_us=#{telemetry.acceptor_commit_max_us} " <>
+        "leader_apply_avg_us=#{telemetry.leader_apply_avg_us} leader_apply_max_us=#{telemetry.leader_apply_max_us} " <>
+        "apply_log_avg_us=#{telemetry.apply_log_avg_us} apply_log_max_us=#{telemetry.apply_log_max_us} " <>
+        "storage_apply_avg_us=#{telemetry.storage_apply_avg_us} storage_apply_max_us=#{telemetry.storage_apply_max_us} " <>
+        "storage_phase_cache_avg_us=#{telemetry.storage_phase_cache_avg_us} storage_phase_cache_max_us=#{telemetry.storage_phase_cache_max_us} " <>
+        "storage_phase_recovery_avg_us=#{telemetry.storage_phase_recovery_avg_us} storage_phase_recovery_max_us=#{telemetry.storage_phase_recovery_max_us} " <>
+        "storage_phase_metadata_avg_us=#{telemetry.storage_phase_metadata_avg_us} storage_phase_metadata_max_us=#{telemetry.storage_phase_metadata_max_us} " <>
+        "apply_queue_avg=#{telemetry.apply_queue_avg} apply_queue_max=#{telemetry.apply_queue_max} " <>
+        "hot_batch_flushes=#{telemetry.hot_batch_flushes} hot_batch_avg_items=#{telemetry.hot_batch_avg_items} " <>
+        "hot_batch_max_items=#{telemetry.hot_batch_max_items} hot_batch_avg_groups=#{telemetry.hot_batch_avg_groups} " <>
+        "hot_batch_queue_max_us=#{telemetry.hot_batch_queue_max_us} hot_batch_flush_max_us=#{telemetry.hot_batch_flush_max_us} " <>
+        "hot_batch_total_max_us=#{telemetry.hot_batch_total_max_us} " <>
         "disk_mb=#{Float.round(disk_mb, 1)} disk_growth_mb_s=#{Float.round(disk_growth_mb_s, 2)} " <>
         "blob_mb=#{Float.round(storage.blob_mb, 1)} blob_files=#{storage.blob_files} " <>
         "lmdb_mb=#{Float.round(storage.lmdb_mb, 1)} data_mb=#{Float.round(storage.data_mb, 1)} " <>
@@ -321,8 +447,16 @@ defmodule FlowStateLMDBSoak do
         "flow_lookup_entries=#{flow_index.lookup_entries}"
     )
 
+    print_flow_latency_line(
+      telemetry.flow_latency,
+      "latency_ms",
+      telemetry.flow_latency_sample_rate
+    )
+
     maybe_print_top_binary_holders(sample_count)
+    maybe_print_top_ets_memory_tables(sample_count)
     maybe_print_top_ets_binary_tables(sample_count)
+    process_profile = maybe_print_process_profile(state.process_profile, sample_count)
 
     %{
       state
@@ -342,7 +476,8 @@ defmodule FlowStateLMDBSoak do
         max_keydir_binary_mb: max(state.max_keydir_binary_mb, keydir.binary_mb),
         max_flow_index_entries: max(state.max_flow_index_entries, flow_index.index_entries),
         max_flow_lookup_entries: max(state.max_flow_lookup_entries, flow_index.lookup_entries),
-        sample_count: sample_count
+        sample_count: sample_count,
+        process_profile: process_profile
     }
   end
 
@@ -371,10 +506,37 @@ defmodule FlowStateLMDBSoak do
         "waraft_commit_timeout_max_us=#{telemetry.waraft_commit_timeout_max_us} " <>
         "waraft_flushes=#{telemetry.waraft_flushes} waraft_queue_wait_avg_us=#{telemetry.waraft_queue_wait_avg_us} " <>
         "waraft_queue_wait_max_us=#{telemetry.waraft_queue_wait_max_us} " <>
+        "waraft_flush_duration_avg_us=#{telemetry.waraft_flush_duration_avg_us} " <>
+        "waraft_flush_duration_max_us=#{telemetry.waraft_flush_duration_max_us} " <>
+        "waraft_total_duration_avg_us=#{telemetry.waraft_total_duration_avg_us} " <>
+        "waraft_total_duration_max_us=#{telemetry.waraft_total_duration_max_us} " <>
         "payload_fsyncs=#{telemetry.payload_fsyncs} payload_fsync_avg_us=#{telemetry.payload_fsync_avg_us} " <>
         "payload_fsync_max_us=#{telemetry.payload_fsync_max_us} payload_fsync_errors=#{telemetry.payload_fsync_errors} " <>
         "blob_prepare_failures=#{telemetry.blob_prepare_failures} storage_blocked=#{telemetry.storage_blocked} " <>
-        "segment_appends=#{telemetry.segment_appends} segment_mb=#{Float.round(telemetry.segment_mb, 1)}"
+        "segment_appends=#{telemetry.segment_appends} segment_mb=#{Float.round(telemetry.segment_mb, 1)} " <>
+        "raft_segment_append_avg_us=#{telemetry.raft_segment_append_avg_us} raft_segment_append_max_us=#{telemetry.raft_segment_append_max_us} " <>
+        "projection_segment_append_avg_us=#{telemetry.projection_segment_append_avg_us} projection_segment_append_max_us=#{telemetry.projection_segment_append_max_us} " <>
+        "apply_projection_segment_append_avg_us=#{telemetry.apply_projection_segment_append_avg_us} apply_projection_segment_append_max_us=#{telemetry.apply_projection_segment_append_max_us} " <>
+        "projection_overlap=#{telemetry.projection_overlap} projection_overlap_rebuilds=#{telemetry.projection_overlap_rebuilds} " <>
+        "projection_overlap_avg_us=#{telemetry.projection_overlap_avg_us} projection_overlap_max_us=#{telemetry.projection_overlap_max_us} " <>
+        "acceptor_commit_avg_us=#{telemetry.acceptor_commit_avg_us} acceptor_commit_max_us=#{telemetry.acceptor_commit_max_us} " <>
+        "leader_apply_avg_us=#{telemetry.leader_apply_avg_us} leader_apply_max_us=#{telemetry.leader_apply_max_us} " <>
+        "apply_log_avg_us=#{telemetry.apply_log_avg_us} apply_log_max_us=#{telemetry.apply_log_max_us} " <>
+        "storage_apply_avg_us=#{telemetry.storage_apply_avg_us} storage_apply_max_us=#{telemetry.storage_apply_max_us} " <>
+        "storage_phase_cache_avg_us=#{telemetry.storage_phase_cache_avg_us} storage_phase_cache_max_us=#{telemetry.storage_phase_cache_max_us} " <>
+        "storage_phase_recovery_avg_us=#{telemetry.storage_phase_recovery_avg_us} storage_phase_recovery_max_us=#{telemetry.storage_phase_recovery_max_us} " <>
+        "storage_phase_metadata_avg_us=#{telemetry.storage_phase_metadata_avg_us} storage_phase_metadata_max_us=#{telemetry.storage_phase_metadata_max_us} " <>
+        "apply_queue_avg=#{telemetry.apply_queue_avg} apply_queue_max=#{telemetry.apply_queue_max} " <>
+        "hot_batch_flushes=#{telemetry.hot_batch_flushes} hot_batch_avg_items=#{telemetry.hot_batch_avg_items} " <>
+        "hot_batch_max_items=#{telemetry.hot_batch_max_items} hot_batch_avg_groups=#{telemetry.hot_batch_avg_groups} " <>
+        "hot_batch_queue_max_us=#{telemetry.hot_batch_queue_max_us} hot_batch_flush_max_us=#{telemetry.hot_batch_flush_max_us} " <>
+        "hot_batch_total_max_us=#{telemetry.hot_batch_total_max_us}"
+    )
+
+    print_flow_latency_line(
+      telemetry.flow_latency,
+      "summary_latency_ms",
+      telemetry.flow_latency_sample_rate
     )
 
     Enum.each(state.ports, fn port_state ->
@@ -428,36 +590,51 @@ defmodule FlowStateLMDBSoak do
     end)
   end
 
-  defp attach_telemetry(handler_id, table) do
+  defp attach_telemetry(handler_id, table, flow_latency_sample_rate) do
     :ok =
       :telemetry.attach_many(
         handler_id,
         @events,
-        fn event, measurements, metadata, _config ->
-          record_event(table, event, measurements, metadata)
+        fn event, measurements, metadata, config ->
+          record_event(table, event, measurements, metadata, config)
         end,
-        nil
+        %{latency_sample_rate: flow_latency_sample_rate}
       )
   end
 
-  defp record_event(table, event, measurements, metadata) do
+  defp record_event(table, event, measurements, metadata, config) do
     key = event_key(event, metadata)
     duration_us = duration_us(measurements)
     item_count = item_count(measurements)
     bytes = bytes(measurements)
     max_us = max_metric_us(measurements, duration_us)
+    latency_sample_rate = latency_sample_rate(config)
 
-    :ets.update_counter(
-      table,
-      key,
-      [{2, 1}, {3, duration_us}, {4, item_count}, {5, bytes}],
-      {key, 0, 0, 0, 0}
-    )
+    [event_count, _duration_total, _item_total, _byte_total] =
+      :ets.update_counter(
+        table,
+        key,
+        [{2, 1}, {3, duration_us}, {4, item_count}, {5, bytes}],
+        {key, 0, 0, 0, 0}
+      )
 
-    update_max(table, {:max_us, key}, max_us)
+    unless flow_event_key?(key), do: update_max(table, {:max_us, key}, max_us)
+    record_flow_latency(table, key, duration_us, item_count, event_count, latency_sample_rate)
+    record_waraft_flush_timings(table, key, measurements)
+    record_waraft_hot_flush_kind(table, event, measurements, metadata)
+    record_segment_append_kind(table, event, metadata, duration_us, bytes)
+    record_projection_overlap(table, event, measurements)
   rescue
     _ -> :ok
   end
+
+  defp latency_sample_rate(%{latency_sample_rate: rate}) when is_integer(rate) and rate > 0,
+    do: rate
+
+  defp latency_sample_rate(_config), do: 1
+
+  defp flow_event_key?({:flow, command}) when command in @flow_latency_commands, do: true
+  defp flow_event_key?(_key), do: false
 
   defp event_key([:ferricstore, :flow, command, :stop], _metadata), do: {:flow, command}
 
@@ -473,17 +650,26 @@ defmodule FlowStateLMDBSoak do
   defp event_key([:ferricstore, :waraft, :segment_log, :append], metadata),
     do: {:segment_append, Map.get(metadata, :result, :unknown)}
 
+  defp event_key([:ferricstore, :waraft, :segment_log, :projection_overlap], metadata),
+    do: {:projection_overlap, Map.get(metadata, :result, :unknown)}
+
   defp event_key([:ferricstore, :waraft, :commit_bytes, :rejected], _metadata),
     do: {:waraft_commit_bytes, :rejected}
 
   defp event_key([:ferricstore, :waraft, :commit, :timeout], metadata),
     do: {:waraft_commit_timeout, Map.get(metadata, :path, :unknown)}
 
+  defp event_key([:ferricstore, :waraft, :internal_metric], metadata),
+    do: {:waraft_internal_metric, Map.get(metadata, :metric, :unknown)}
+
   defp event_key([:ferricstore, :waraft, :storage_blocked], metadata),
     do: {:waraft_storage_blocked, Map.get(metadata, :reason, :unknown)}
 
   defp event_key([:ferricstore, :waraft, :storage, :payload_fsync], metadata),
     do: {:waraft_payload_fsync, Map.get(metadata, :result, :unknown)}
+
+  defp event_key([:ferricstore, :waraft, :storage, :apply_phase], metadata),
+    do: {:storage_apply_phase, Map.get(metadata, :phase, :unknown)}
 
   defp event_key([:ferricstore, :waraft, :blob_prepare_failed], metadata),
     do: {:waraft_blob_prepare_failed, Map.get(metadata, :reason, :unknown)}
@@ -498,9 +684,28 @@ defmodule FlowStateLMDBSoak do
     pipeline_write = event_items(table, {:flow, :pipeline_write})
     claim_due = event_items(table, {:flow, :claim_due})
     {lmdb_flushes, lmdb_flush_us} = event_count_duration_prefix(table, :lmdb_flush)
-    {waraft_flushes, waraft_queue_wait_us} = event_count_duration_prefix(table, :waraft_flush)
+    {waraft_flushes, _waraft_total_event_us} = event_count_duration_prefix(table, :waraft_flush)
+    {waraft_queue_samples, waraft_queue_wait_us} = timing_count_duration(table, :queue_age)
+    {waraft_flush_samples, waraft_flush_duration_us} = timing_count_duration(table, :flush)
+    {waraft_total_samples, waraft_total_duration_us} = timing_count_duration(table, :total)
     {payload_fsyncs, payload_fsync_us} = event_count_duration_prefix(table, :waraft_payload_fsync)
     {segment_appends, segment_bytes} = event_count_bytes_prefix(table, :segment_append)
+
+    {projection_overlap, projection_overlap_us} =
+      event_count_duration_prefix(table, :projection_overlap)
+
+    raft_segment = segment_append_kind_stats(table, :raft_log)
+    projection_segment = segment_append_kind_stats(table, :segment_projection)
+    apply_projection_segment = segment_append_kind_stats(table, :apply_projection)
+    acceptor_commit = waraft_internal_metric_stats(table, :"acceptor.commit.func")
+    leader_apply = waraft_internal_metric_stats(table, :"leader.apply.func")
+    apply_log = waraft_internal_metric_stats(table, :"apply_log.latency_us")
+    storage_apply = waraft_internal_metric_stats(table, :"storage.apply.func")
+    storage_phase_cache = storage_apply_phase_stats(table, :apply_projection_cache)
+    storage_phase_recovery = storage_apply_phase_stats(table, :recovery_projection)
+    storage_phase_metadata = storage_apply_phase_stats(table, :storage_metadata)
+    apply_queue = waraft_internal_metric_stats(table, :"apply.queue")
+    hot_batch = waraft_hot_flush_kind_stats(table, :batch)
     waraft_flush_errors = event_count_matching(table, :waraft_flush, &match?({:error, _}, &1))
     waraft_apply_full = event_count(table, {:waraft_flush, {:error, :apply_queue_full}})
     waraft_commit_bytes_rejected = event_count(table, {:waraft_commit_bytes, :rejected})
@@ -522,8 +727,20 @@ defmodule FlowStateLMDBSoak do
       lmdb_flush_avg_us: if(lmdb_flushes > 0, do: div(lmdb_flush_us, lmdb_flushes), else: 0),
       waraft_flushes: waraft_flushes,
       waraft_queue_wait_avg_us:
-        if(waraft_flushes > 0, do: div(waraft_queue_wait_us, waraft_flushes), else: 0),
-      waraft_queue_wait_max_us: max_us(table, :waraft_flush),
+        if(waraft_queue_samples > 0, do: div(waraft_queue_wait_us, waraft_queue_samples), else: 0),
+      waraft_queue_wait_max_us: timing_max_us(table, :queue_age),
+      waraft_flush_duration_avg_us:
+        if(waraft_flush_samples > 0,
+          do: div(waraft_flush_duration_us, waraft_flush_samples),
+          else: 0
+        ),
+      waraft_flush_duration_max_us: timing_max_us(table, :flush),
+      waraft_total_duration_avg_us:
+        if(waraft_total_samples > 0,
+          do: div(waraft_total_duration_us, waraft_total_samples),
+          else: 0
+        ),
+      waraft_total_duration_max_us: timing_max_us(table, :total),
       waraft_flush_errors: waraft_flush_errors,
       waraft_apply_full: waraft_apply_full,
       waraft_commit_bytes_rejected: waraft_commit_bytes_rejected,
@@ -537,9 +754,382 @@ defmodule FlowStateLMDBSoak do
       blob_prepare_failures: blob_prepare_failures,
       storage_blocked: storage_blocked,
       segment_appends: segment_appends,
-      segment_mb: bytes_to_mb(segment_bytes)
+      segment_mb: bytes_to_mb(segment_bytes),
+      raft_segment_append_avg_us: raft_segment.avg_us,
+      raft_segment_append_max_us: raft_segment.max_us,
+      projection_segment_append_avg_us: projection_segment.avg_us,
+      projection_segment_append_max_us: projection_segment.max_us,
+      apply_projection_segment_append_avg_us: apply_projection_segment.avg_us,
+      apply_projection_segment_append_max_us: apply_projection_segment.max_us,
+      projection_overlap: projection_overlap,
+      projection_overlap_rebuilds: counter_value(table, {:projection_overlap_rebuilds}),
+      projection_overlap_avg_us:
+        if(projection_overlap > 0, do: div(projection_overlap_us, projection_overlap), else: 0),
+      projection_overlap_max_us: max_us(table, :projection_overlap),
+      acceptor_commit_avg_us: acceptor_commit.avg_us,
+      acceptor_commit_max_us: acceptor_commit.max_us,
+      leader_apply_avg_us: leader_apply.avg_us,
+      leader_apply_max_us: leader_apply.max_us,
+      apply_log_avg_us: apply_log.avg_us,
+      apply_log_max_us: apply_log.max_us,
+      storage_apply_avg_us: storage_apply.avg_us,
+      storage_apply_max_us: storage_apply.max_us,
+      storage_phase_cache_avg_us: storage_phase_cache.avg_us,
+      storage_phase_cache_max_us: storage_phase_cache.max_us,
+      storage_phase_recovery_avg_us: storage_phase_recovery.avg_us,
+      storage_phase_recovery_max_us: storage_phase_recovery.max_us,
+      storage_phase_metadata_avg_us: storage_phase_metadata.avg_us,
+      storage_phase_metadata_max_us: storage_phase_metadata.max_us,
+      apply_queue_avg: apply_queue.avg_us,
+      apply_queue_max: apply_queue.max_us,
+      hot_batch_flushes: hot_batch.count,
+      hot_batch_avg_items: hot_batch.avg_items,
+      hot_batch_max_items: hot_batch.max_items,
+      hot_batch_avg_groups: hot_batch.avg_groups,
+      hot_batch_queue_max_us: hot_batch.max_queue_us,
+      hot_batch_flush_max_us: hot_batch.max_flush_us,
+      hot_batch_total_max_us: hot_batch.max_total_us,
+      flow_latency_sample_rate: flow_latency_sample_rate(table),
+      flow_latency: flow_latency_snapshot(table)
     }
   end
+
+  defp record_flow_latency(
+         table,
+         {:flow, command},
+         duration_us,
+         item_count,
+         event_count,
+         latency_sample_rate
+       )
+       when command in @flow_latency_commands and is_integer(duration_us) and duration_us >= 0 and
+              is_integer(item_count) and item_count > 0 do
+    if latency_sample?(event_count, latency_sample_rate) do
+      do_record_flow_latency(table, command, duration_us, item_count)
+    end
+  end
+
+  defp record_flow_latency(
+         _table,
+         _key,
+         _duration_us,
+         _item_count,
+         _event_count,
+         _latency_sample_rate
+       ),
+       do: :ok
+
+  defp latency_sample?(event_count, latency_sample_rate)
+       when is_integer(event_count) and is_integer(latency_sample_rate) and
+              latency_sample_rate > 1 do
+    rem(event_count, latency_sample_rate) == 0
+  end
+
+  defp latency_sample?(_event_count, _latency_sample_rate), do: true
+
+  defp do_record_flow_latency(table, command, duration_us, item_count) do
+    latency_key = {:flow_latency, command}
+
+    :ets.update_counter(
+      table,
+      latency_key,
+      [{2, 1}, {3, duration_us}, {4, item_count}],
+      {latency_key, 0, 0, 0}
+    )
+
+    update_max(table, {:flow_latency_max_us, command}, duration_us)
+
+    bucket = latency_bucket(duration_us)
+
+    :ets.update_counter(
+      table,
+      {:flow_latency_bucket, command, bucket},
+      {2, 1},
+      {{:flow_latency_bucket, command, bucket}, 0}
+    )
+  end
+
+  defp record_waraft_flush_timings(table, {:waraft_flush, _status}, measurements) do
+    record_timing(table, :queue_age, Map.get(measurements, :queue_age_us))
+    record_timing(table, :flush, Map.get(measurements, :flush_duration_us))
+    record_timing(table, :total, Map.get(measurements, :total_duration_us))
+  end
+
+  defp record_waraft_flush_timings(_table, _key, _measurements), do: :ok
+
+  defp record_waraft_hot_flush_kind(
+         table,
+         [:ferricstore, :waraft, :batcher, :hot_flush],
+         measurements,
+         metadata
+       ) do
+    kind = Map.get(metadata, :kind, :unknown)
+    key = {:waraft_hot_flush_kind, kind}
+    batch_size = Map.get(measurements, :batch_size, 0)
+    group_count = Map.get(measurements, :group_count, 0)
+    queue_us = Map.get(measurements, :queue_age_us, 0)
+    flush_us = Map.get(measurements, :flush_duration_us, 0)
+    total_us = Map.get(measurements, :total_duration_us, 0)
+
+    :ets.update_counter(
+      table,
+      key,
+      [{2, 1}, {3, batch_size}, {4, group_count}, {5, queue_us}, {6, flush_us}, {7, total_us}],
+      {key, 0, 0, 0, 0, 0, 0}
+    )
+
+    update_max(table, {:max_batch_items, key}, batch_size)
+    update_max(table, {:max_batch_groups, key}, group_count)
+    update_max(table, {:max_queue_us, key}, queue_us)
+    update_max(table, {:max_flush_us, key}, flush_us)
+    update_max(table, {:max_total_us, key}, total_us)
+  end
+
+  defp record_waraft_hot_flush_kind(_table, _event, _measurements, _metadata), do: :ok
+
+  defp record_segment_append_kind(
+         table,
+         [:ferricstore, :waraft, :segment_log, :append],
+         metadata,
+         duration_us,
+         bytes
+       )
+       when is_integer(duration_us) and duration_us >= 0 do
+    kind = Map.get(metadata, :kind, :unknown)
+    key = {:segment_append_kind, kind}
+
+    :ets.update_counter(
+      table,
+      key,
+      [{2, 1}, {3, duration_us}, {4, bytes}],
+      {key, 0, 0, 0}
+    )
+
+    update_max(table, {:max_us, key}, duration_us)
+  end
+
+  defp record_segment_append_kind(_table, _event, _metadata, _duration_us, _bytes), do: :ok
+
+  defp record_projection_overlap(
+         table,
+         [:ferricstore, :waraft, :segment_log, :projection_overlap],
+         measurements
+       ) do
+    rebuilds = Map.get(measurements, :rebuilds, 0)
+
+    if is_integer(rebuilds) and rebuilds > 0 do
+      :ets.update_counter(
+        table,
+        {:projection_overlap_rebuilds},
+        {2, rebuilds},
+        {{:projection_overlap_rebuilds}, 0}
+      )
+    end
+  end
+
+  defp record_projection_overlap(_table, _event, _measurements), do: :ok
+
+  defp segment_append_kind_stats(table, kind) do
+    key = {:segment_append_kind, kind}
+
+    {count, duration_us} =
+      case :ets.lookup(table, key) do
+        [{^key, count, duration_us, _bytes}] -> {count, duration_us}
+        _ -> {0, 0}
+      end
+
+    %{
+      avg_us: if(count > 0, do: div(duration_us, count), else: 0),
+      max_us: timing_key_max_us(table, key)
+    }
+  end
+
+  defp waraft_hot_flush_kind_stats(table, kind) do
+    key = {:waraft_hot_flush_kind, kind}
+
+    {count, items, groups} =
+      case :ets.lookup(table, key) do
+        [{^key, count, items, groups, _queue_us, _flush_us, _total_us}] -> {count, items, groups}
+        _ -> {0, 0, 0}
+      end
+
+    %{
+      count: count,
+      avg_items: if(count > 0, do: div(items, count), else: 0),
+      max_items: counter_max(table, {:max_batch_items, key}),
+      avg_groups: if(count > 0, do: div(groups, count), else: 0),
+      max_groups: counter_max(table, {:max_batch_groups, key}),
+      max_queue_us: counter_max(table, {:max_queue_us, key}),
+      max_flush_us: counter_max(table, {:max_flush_us, key}),
+      max_total_us: counter_max(table, {:max_total_us, key})
+    }
+  end
+
+  defp waraft_internal_metric_stats(table, metric) do
+    key = {:waraft_internal_metric, metric}
+
+    {count, duration_us} =
+      case :ets.lookup(table, key) do
+        [{^key, count, duration_us, _items, _bytes}] -> {count, duration_us}
+        _ -> {0, 0}
+      end
+
+    %{
+      avg_us: if(count > 0, do: div(duration_us, count), else: 0),
+      max_us: max_us_for_key(table, key)
+    }
+  end
+
+  defp storage_apply_phase_stats(table, phase) do
+    key = {:storage_apply_phase, phase}
+
+    {count, duration_us} =
+      case :ets.lookup(table, key) do
+        [{^key, count, duration_us, _items, _bytes}] -> {count, duration_us}
+        _ -> {0, 0}
+      end
+
+    %{
+      avg_us: if(count > 0, do: div(duration_us, count), else: 0),
+      max_us: max_us_for_key(table, key)
+    }
+  end
+
+  defp record_timing(table, phase, value) when is_integer(value) and value >= 0 do
+    key = {:waraft_flush_timing, phase}
+
+    :ets.update_counter(
+      table,
+      key,
+      [{2, 1}, {3, value}],
+      {key, 0, 0}
+    )
+
+    update_max(table, {:max_us, key}, value)
+  end
+
+  defp record_timing(_table, _phase, _value), do: :ok
+
+  defp latency_bucket(duration_us) do
+    Enum.find(@latency_us_buckets, :infinity, fn
+      :infinity -> true
+      bucket_us -> duration_us <= bucket_us
+    end)
+  end
+
+  defp flow_latency_snapshot(table) do
+    Map.new(@flow_latency_commands, fn command ->
+      {command, flow_latency_stats(table, command)}
+    end)
+  end
+
+  defp flow_latency_sample_rate(table) do
+    case :ets.lookup(table, {:config, :flow_latency_sample_rate}) do
+      [{{:config, :flow_latency_sample_rate}, rate}] when is_integer(rate) and rate > 0 -> rate
+      _ -> 1
+    end
+  end
+
+  defp flow_latency_stats(table, command) do
+    {count, total_us, items} =
+      case :ets.lookup(table, {:flow_latency, command}) do
+        [{{:flow_latency, ^command}, count, total_us, items}] -> {count, total_us, items}
+        _ -> {0, 0, 0}
+      end
+
+    max_us =
+      case :ets.lookup(table, {:flow_latency_max_us, command}) do
+        [{{:flow_latency_max_us, ^command}, value}] when is_integer(value) -> value
+        _ -> 0
+      end
+
+    %{
+      calls: count,
+      items: items,
+      avg_us: if(count > 0, do: div(total_us, count), else: 0),
+      avg_item_us: if(items > 0, do: div(total_us, items), else: 0),
+      p50_us: flow_latency_percentile(table, command, count, max_us, 0.50),
+      p95_us: flow_latency_percentile(table, command, count, max_us, 0.95),
+      p99_us: flow_latency_percentile(table, command, count, max_us, 0.99),
+      max_us: max_us
+    }
+  end
+
+  defp flow_latency_percentile(_table, _command, count, _max_us, _percentile) when count <= 0,
+    do: 0
+
+  defp flow_latency_percentile(table, command, count, max_us, percentile) do
+    target = max(ceil(count * percentile), 1)
+
+    @latency_us_buckets
+    |> Enum.reduce_while(0, fn bucket, acc ->
+      bucket_count =
+        case :ets.lookup(table, {:flow_latency_bucket, command, bucket}) do
+          [{{:flow_latency_bucket, ^command, ^bucket}, value}] -> value
+          _ -> 0
+        end
+
+      next = acc + bucket_count
+
+      if next >= target do
+        {:halt, latency_bucket_value(bucket, max_us)}
+      else
+        {:cont, next}
+      end
+    end)
+    |> case do
+      value when is_integer(value) -> value
+      _ -> max_us
+    end
+  end
+
+  defp latency_bucket_value(:infinity, max_us), do: max_us
+  defp latency_bucket_value(bucket_us, _max_us), do: bucket_us
+
+  defp print_flow_latency_line(latency, prefix, sample_rate) do
+    parts =
+      @flow_latency_commands
+      |> Enum.map(fn command ->
+        latency
+        |> Map.get(command, empty_latency_stats())
+        |> format_flow_latency(command)
+      end)
+      |> Enum.reject(&(&1 == ""))
+
+    if parts != [] do
+      sample_tag = if sample_rate > 1, do: " sample_rate=#{sample_rate}", else: ""
+      IO.puts(prefix <> sample_tag <> " " <> Enum.join(parts, " "))
+    end
+  end
+
+  defp empty_latency_stats do
+    %{
+      calls: 0,
+      items: 0,
+      avg_us: 0,
+      avg_item_us: 0,
+      p50_us: 0,
+      p95_us: 0,
+      p99_us: 0,
+      max_us: 0
+    }
+  end
+
+  defp format_flow_latency(%{calls: calls}, _command) when calls <= 0, do: ""
+
+  defp format_flow_latency(stats, command) do
+    "#{command}=" <>
+      "calls:#{stats.calls}," <>
+      "items:#{stats.items}," <>
+      "avg:#{ms(stats.avg_us)}," <>
+      "avg_item:#{ms(stats.avg_item_us)}," <>
+      "p50<=#{ms(stats.p50_us)}," <>
+      "p95<=#{ms(stats.p95_us)}," <>
+      "p99<=#{ms(stats.p99_us)}," <>
+      "max:#{ms(stats.max_us)}"
+  end
+
+  defp ms(us) when is_integer(us), do: Float.round(us / 1000, 3)
 
   defp event_count(table, key) do
     case :ets.lookup(table, key) do
@@ -565,6 +1155,15 @@ defmodule FlowStateLMDBSoak do
       _row, acc ->
         acc
     end)
+  end
+
+  defp timing_count_duration(table, phase) do
+    key = {:waraft_flush_timing, phase}
+
+    case :ets.lookup(table, key) do
+      [{^key, count, duration}] -> {count, duration}
+      _ -> {0, 0}
+    end
   end
 
   defp event_count_bytes_prefix(table, prefix) do
@@ -607,6 +1206,47 @@ defmodule FlowStateLMDBSoak do
       {{:max_us, {^prefix, _status}}, value}, acc when is_integer(value) -> max(acc, value)
       _row, acc -> acc
     end)
+  end
+
+  defp max_us_for_key(table, timing_key) do
+    key = {:max_us, timing_key}
+
+    case :ets.lookup(table, key) do
+      [{^key, value}] when is_integer(value) -> value
+      _ -> 0
+    end
+  end
+
+  defp counter_max(table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] when is_integer(value) -> value
+      _ -> 0
+    end
+  end
+
+  defp counter_value(table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] when is_integer(value) -> value
+      _ -> 0
+    end
+  end
+
+  defp timing_max_us(table, phase) do
+    key = {:max_us, {:waraft_flush_timing, phase}}
+
+    case :ets.lookup(table, key) do
+      [{^key, value}] when is_integer(value) -> value
+      _ -> 0
+    end
+  end
+
+  defp timing_key_max_us(table, timing_key) do
+    key = {:max_us, timing_key}
+
+    case :ets.lookup(table, key) do
+      [{^key, value}] when is_integer(value) -> value
+      _ -> 0
+    end
   end
 
   defp lmdb_status do
@@ -856,6 +1496,147 @@ defmodule FlowStateLMDBSoak do
     end
   end
 
+  defp maybe_print_top_ets_memory_tables(sample_count) do
+    if diagnostic_due?("TOP_ETS_MEMORY_TABLES", "TOP_ETS_MEMORY_TABLES_EVERY_N", sample_count) do
+      limit = int_env("TOP_ETS_MEMORY_TABLES_LIMIT", 12)
+      wordsize = :erlang.system_info(:wordsize)
+
+      :ets.all()
+      |> Enum.map(fn table ->
+        %{
+          table: table,
+          memory_mb: ets_table_memory_mb(table, wordsize),
+          size: ets_table_info(table, :size),
+          owner: ets_table_info(table, :owner),
+          name: ets_table_info(table, :name),
+          type: ets_table_info(table, :type)
+        }
+      end)
+      |> Enum.filter(fn %{memory_mb: memory_mb} -> memory_mb > 0 end)
+      |> Enum.sort_by(& &1.memory_mb, :desc)
+      |> Enum.take(limit)
+      |> Enum.each(fn table ->
+        IO.puts(
+          "top_ets_memory_table table=#{inspect(table.table)} name=#{inspect(table.name)} " <>
+            "type=#{inspect(table.type)} owner=#{inspect(table.owner)} " <>
+            "memory_mb=#{Float.round(table.memory_mb, 1)} size=#{inspect(table.size)}"
+        )
+      end)
+    end
+  end
+
+  defp ets_table_memory_mb(table, wordsize) do
+    case ets_table_info(table, :memory) do
+      memory when is_integer(memory) -> bytes_to_mb(memory * wordsize)
+      _ -> 0.0
+    end
+  end
+
+  defp ets_table_info(table, key) do
+    :ets.info(table, key)
+  rescue
+    _ -> nil
+  end
+
+  defp maybe_print_process_profile(previous, sample_count) do
+    current = process_profile_snapshot()
+
+    if diagnostic_due?("PROCESS_PROFILE", "PROCESS_PROFILE_EVERY_N", sample_count) do
+      limit = int_env("PROCESS_PROFILE_TOP", 12)
+
+      rows =
+        current
+        |> Enum.map(fn {pid, info} ->
+          previous_info = Map.get(previous, pid, %{})
+          reductions = Map.get(info, :reductions, 0) - Map.get(previous_info, :reductions, 0)
+
+          Map.merge(info, %{pid: pid, reduction_delta: reductions})
+        end)
+        |> Enum.filter(&(&1.reduction_delta > 0))
+        |> Enum.sort_by(& &1.reduction_delta, :desc)
+        |> Enum.take(limit)
+
+      IO.puts("process_profile_top_reductions count=#{length(rows)}")
+
+      Enum.each(rows, fn row ->
+        IO.puts(
+          "process_profile pid=#{inspect(row.pid)} name=#{inspect(row.registered_name)} " <>
+            "reductions=#{row.reduction_delta} mq=#{row.message_queue_len} " <>
+            "memory_mb=#{Float.round(bytes_to_mb(row.memory), 2)} " <>
+            "initial=#{inspect(row.initial_call)} current=#{inspect(row.current_function)}"
+        )
+
+        maybe_print_process_stack(row)
+      end)
+    end
+
+    current
+  end
+
+  defp process_profile_snapshot do
+    if env("PROCESS_PROFILE", "false") in ["1", "true", "TRUE"] do
+      Process.list()
+      |> Enum.reduce(%{}, fn pid, acc ->
+        case Process.info(pid, [
+               :registered_name,
+               :initial_call,
+               :current_function,
+               :current_stacktrace,
+               :reductions,
+               :message_queue_len,
+               :memory
+             ]) do
+          nil ->
+            acc
+
+          info ->
+            Map.put(acc, pid, Map.new(info))
+        end
+      end)
+    else
+      %{}
+    end
+  end
+
+  defp maybe_print_process_stack(row) do
+    if env("PROCESS_PROFILE_STACK", "false") in ["1", "true", "TRUE"] do
+      depth = int_env("PROCESS_PROFILE_STACK_DEPTH", 6)
+
+      stack =
+        row
+        |> Map.get(:current_stacktrace, [])
+        |> Enum.take(depth)
+        |> Enum.map(&format_stack_frame/1)
+        |> Enum.join(" <= ")
+
+      IO.puts("process_profile_stack pid=#{inspect(row.pid)} stack=#{stack}")
+    end
+  end
+
+  defp format_stack_frame({mod, fun, arity, location}) when is_integer(arity) do
+    "#{inspect(mod)}.#{fun}/#{arity}#{format_stack_location(location)}"
+  end
+
+  defp format_stack_frame({mod, fun, args, location}) when is_list(args) do
+    "#{inspect(mod)}.#{fun}/#{length(args)}#{format_stack_location(location)}"
+  end
+
+  defp format_stack_frame(frame), do: inspect(frame)
+
+  defp format_stack_location(location) when is_list(location) do
+    case Keyword.get(location, :file) do
+      nil ->
+        ""
+
+      file ->
+        line = Keyword.get(location, :line)
+
+        ":#{Path.basename(to_string(file))}#{if line, do: ":" <> Integer.to_string(line), else: ""}"
+    end
+  end
+
+  defp format_stack_location(_location), do: ""
+
   defp diagnostic_due?(enabled_env, every_env, sample_count) do
     case env(enabled_env, "0") do
       value when value in ["1", "true", "TRUE"] ->
@@ -1077,6 +1858,21 @@ defmodule FlowStateLMDBSoak do
       :flow_history_projector_max_pending_entries
     )
 
+    put_optional_int_env(
+      "FERRICSTORE_FLOW_HISTORY_PROJECTOR_BATCH_SIZE",
+      :flow_history_projector_batch_size
+    )
+
+    put_optional_int_env(
+      "FERRICSTORE_FLOW_HISTORY_PROJECTOR_FLUSH_INTERVAL_MS",
+      :flow_history_projector_flush_interval_ms
+    )
+
+    put_optional_int_env(
+      "FERRICSTORE_FLOW_HISTORY_PROJECTOR_CHUNK_INTERVAL_MS",
+      :flow_history_projector_chunk_interval_ms
+    )
+
     put_optional_limit_env(
       [
         "FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES",
@@ -1091,6 +1887,12 @@ defmodule FlowStateLMDBSoak do
     )
 
     Application.delete_env(:ferricstore, :waraft_log_module)
+
+    put_optional_int_env(
+      "FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES",
+      :blob_side_channel_threshold_bytes
+    )
+
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
     put_optional_int_env("WARAFT_APPLY_LOG_BATCH_SIZE", :waraft_apply_log_batch_size)
@@ -1125,6 +1927,19 @@ defmodule FlowStateLMDBSoak do
     )
   end
 
+  defp print_effective_config do
+    IO.puts(
+      "flow_state_lmdb_soak_effective_config " <>
+        "wal_commit_delay_us=#{Application.get_env(:ferricstore, :wal_commit_delay_us)} " <>
+        "waraft_commit_batch_interval_ms=#{Ferricstore.Raft.WARaftBackend.default_commit_batch_interval_ms()} " <>
+        "waraft_commit_batch_max=#{Ferricstore.Raft.WARaftBackend.default_commit_batch_max()} " <>
+        "waraft_hot_batch_window_ms=#{Application.get_env(:ferricstore, :waraft_hot_batch_window_ms, 1)} " <>
+        "flow_lmdb_flush_interval_ms=#{Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)} " <>
+        "flow_lmdb_max_batch_ops=#{Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)} " <>
+        "flow_lmdb_flush_chunk_ops=#{Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops)}"
+    )
+  end
+
   defp print_header do
     IO.puts(
       "sample elapsed_s flow_ops flow_ops_s write_ops write_ops_s create transition complete fail pipeline_write claim_due " <>
@@ -1132,9 +1947,23 @@ defmodule FlowStateLMDBSoak do
         "lmdb_flush_avg_us waraft_flush_errors waraft_apply_full waraft_commit_bytes_rejected " <>
         "waraft_commit_timeouts waraft_commit_timeout_max_us " <>
         "waraft_flushes waraft_queue_wait_avg_us waraft_queue_wait_max_us " <>
+        "waraft_flush_duration_avg_us waraft_flush_duration_max_us " <>
+        "waraft_total_duration_avg_us waraft_total_duration_max_us " <>
         "payload_fsyncs payload_fsync_avg_us payload_fsync_max_us payload_fsync_errors " <>
         "blob_prepare_failures storage_blocked " <>
-        "segment_appends segment_mb disk_mb disk_growth_mb_s blob_mb blob_files lmdb_mb " <>
+        "segment_appends segment_mb raft_segment_append_avg_us raft_segment_append_max_us " <>
+        "projection_segment_append_avg_us projection_segment_append_max_us " <>
+        "apply_projection_segment_append_avg_us apply_projection_segment_append_max_us " <>
+        "projection_overlap projection_overlap_rebuilds projection_overlap_avg_us projection_overlap_max_us " <>
+        "acceptor_commit_avg_us acceptor_commit_max_us leader_apply_avg_us leader_apply_max_us " <>
+        "apply_log_avg_us apply_log_max_us storage_apply_avg_us storage_apply_max_us " <>
+        "storage_phase_cache_avg_us storage_phase_cache_max_us " <>
+        "storage_phase_recovery_avg_us storage_phase_recovery_max_us " <>
+        "storage_phase_metadata_avg_us storage_phase_metadata_max_us " <>
+        "apply_queue_avg apply_queue_max " <>
+        "hot_batch_flushes hot_batch_avg_items hot_batch_max_items hot_batch_avg_groups " <>
+        "hot_batch_queue_max_us hot_batch_flush_max_us hot_batch_total_max_us " <>
+        "disk_mb disk_growth_mb_s blob_mb blob_files lmdb_mb " <>
         "data_mb waraft_mb waraft_log_entries waraft_log_ets_mb " <>
         "free_mb mem_total_mb beam_rss_mb beam_cpu_pct mem_binary_mb ets_mb processes run_queue " <>
         "keydir_entries keydir_binary_mb keydir_state keydir_history keydir_value " <>
@@ -1259,6 +2088,22 @@ defmodule FlowStateLMDBSoak do
     end
   end
 
+  defp maybe_keep_server_running(data_dir, redis_port) do
+    if truthy_env?("KEEP_SERVER_RUNNING") do
+      health_port = FerricstoreServer.Health.Endpoint.port()
+
+      IO.puts(
+        "keep_server_running=true redis_port=#{redis_port} health_port=#{health_port} " <>
+          "dashboard_url=http://127.0.0.1:#{health_port}/dashboard data_dir=#{data_dir}"
+      )
+
+      receive do
+      after
+        :infinity -> :ok
+      end
+    end
+  end
+
   defp remove_data_dir(data_dir) do
     if System.get_env("KEEP_DATA_DIR") in ["1", "true", "TRUE", "yes", "YES"] do
       :ok
@@ -1273,6 +2118,7 @@ defmodule FlowStateLMDBSoak do
   defp python, do: env("PYTHON", Path.join(sdk_dir(), ".venv/bin/python"))
   defp sdk_dir, do: env("SDK_DIR", "/Users/yoavgea/repos/ferricstore-python")
   defp env(name, default), do: System.get_env(name) || default
+  defp truthy_env?(name), do: System.get_env(name) in ["1", "true", "TRUE", "yes", "YES"]
   defp unique, do: System.unique_integer([:positive])
 
   defp int_env(name, default) do
@@ -1324,22 +2170,6 @@ defmodule FlowStateLMDBSoak do
 
       value ->
         String.to_integer(value)
-    end
-  end
-
-  defp put_optional_bool_env(env_name, app_key) do
-    case System.get_env(env_name) do
-      nil ->
-        :ok
-
-      value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] ->
-        Application.put_env(:ferricstore, app_key, true)
-
-      value when value in ["0", "false", "FALSE", "no", "NO", "off", "OFF"] ->
-        Application.put_env(:ferricstore, app_key, false)
-
-      value ->
-        raise "unsupported #{env_name}=#{inspect(value)}; expected boolean"
     end
   end
 end

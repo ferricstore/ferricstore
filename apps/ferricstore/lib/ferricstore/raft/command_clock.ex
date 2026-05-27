@@ -21,29 +21,19 @@ defmodule Ferricstore.Raft.CommandClock do
 
   @spec process_command(term(), term()) :: term()
   def process_command(shard_id, command) do
-    if Backend.waraft?() do
-      process_waraft_command(shard_id, command)
-    else
-      :ra.process_command(shard_id, stamp(command))
-    end
+    process_waraft_command(shard_id, command)
   end
 
   @spec process_command(term(), term(), term()) :: term()
   def process_command(shard_id, command, opts) do
-    if Backend.waraft?() do
-      process_waraft_command(shard_id, command)
-    else
-      :ra.process_command(shard_id, stamp(command), opts)
-    end
+    _ = opts
+    process_waraft_command(shard_id, command)
   end
 
   @spec pipeline_command(term(), term(), reference() | integer(), atom()) :: term()
   def pipeline_command(shard_id, command, corr, priority) do
-    if Backend.waraft?() do
-      pipeline_waraft_command(shard_id, command, corr)
-    else
-      :ra.pipeline_command(shard_id, stamp(command), corr, priority)
-    end
+    _ = priority
+    pipeline_waraft_command(shard_id, command, corr)
   end
 
   defp process_waraft_command(shard_id, command) do
@@ -63,7 +53,7 @@ defmodule Ferricstore.Raft.CommandClock do
         result ->
           send(
             self(),
-            {:ra_event, nil, {:applied, [{corr, waraft_applied(result, shard_index)}]}}
+            {:raft_pipeline_applied, corr, waraft_applied(result, shard_index)}
           )
 
           :ok
@@ -95,8 +85,6 @@ defmodule Ferricstore.Raft.CommandClock do
   end
 
   defp shard_index_from_id(other), do: {:error, {:unsupported_shard_id, other}}
-
-  defp parse_shard_index_name("ferricstore_shard_" <> suffix), do: parse_zero_based_index(suffix)
 
   defp parse_shard_index_name("raft_server_ferricstore_waraft_backend_" <> suffix) do
     with {:ok, partition} <- parse_zero_based_index(suffix) do

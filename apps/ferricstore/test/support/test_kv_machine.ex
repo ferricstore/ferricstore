@@ -1,24 +1,19 @@
 defmodule Ferricstore.Bench.TestKvMachine do
   @moduledoc """
-  Minimal ra state machine for benchmarking pure ra throughput.
+  Minimal state machine for benchmarking replicated write throughput.
 
   This machine applies `:put` and `:delete` commands to an ETS table
   with zero extra overhead -- no NIF calls, no prefix indexing, no
   expiry tracking. It serves as the baseline to measure how much
-  overhead FerricStore's StateMachine.apply adds on top of raw ra
-  consensus.
+  overhead FerricStore's StateMachine.apply adds on top of consensus.
 
   Used exclusively by `Ferricstore.Bench.SingleShardProfileTest`.
   """
 
-  @behaviour :ra_machine
-
-  @impl true
   def init(config) do
     %{ets: config.ets}
   end
 
-  @impl true
   def apply(_meta, {:put, key, value}, state) do
     :ets.insert(state.ets, {key, value})
     {state, :ok}
@@ -48,6 +43,5 @@ defmodule Ferricstore.Bench.TestKvMachine do
     {state, :ok}
   end
 
-  @impl true
   def state_enter(_role, _state), do: []
 end

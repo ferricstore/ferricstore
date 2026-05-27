@@ -1,19 +1,15 @@
 defmodule Ferricstore.Test.KvMachine do
   @moduledoc """
-  Lightweight in-memory KV state machine for Raft cluster tests.
+  Lightweight in-memory KV state machine for replication cluster tests.
 
   State is a plain `%{key => value}` map. Supports `:put`, `:delete`,
   `:get`, and `:batch` commands.
 
-  Used by `RollingRotationTest`, `HeavyRotationTest`, and `ThroughputBenchTest`.
+  Used by legacy cluster benchmark fixtures.
   """
 
-  @behaviour :ra_machine
-
-  @impl true
   def init(_config), do: %{}
 
-  @impl true
   def apply(_meta, {:put, key, value}, state) do
     {Map.put(state, key, value), :ok}
   end
@@ -39,9 +35,8 @@ defmodule Ferricstore.Test.KvMachine do
 
   def apply(_meta, _cmd, state), do: {state, :ok}
 
-  @impl true
   def state_enter(_role, _state), do: []
 
-  @doc "Identity function for use as ra query MFA: {KvMachine, :identity, []}."
+  @doc "Identity function for query fixtures."
   def identity(state), do: state
 end

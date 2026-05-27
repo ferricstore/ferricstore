@@ -7,7 +7,7 @@ defmodule FerricStore.Session.Store do
 
   Unlike the default cookie store, sessions are stored server-side with automatic
   TTL expiry. Unlike ETS-based stores, sessions survive application restarts
-  because FerricStore persists all data to disk via Bitcask and Raft WAL.
+  because FerricStore persists all data to disk via Bitcask and WARaft segments.
 
   ## Options
 

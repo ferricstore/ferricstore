@@ -29,7 +29,7 @@ defmodule Ferricstore.Raft.CommandClockTest do
   end
 
   describe "to_ttb/1" do
-    test "serializes the stamped command for ra ttb submission" do
+    test "serializes the stamped command for replicated submission" do
       command = {:batch, [{:put, "clock_a", "a", 0}, {:delete, "clock_b"}]}
 
       assert {:ttb, binary} = CommandClock.to_ttb(command)
@@ -38,32 +38,15 @@ defmodule Ferricstore.Raft.CommandClockTest do
   end
 
   describe "raft submit paths" do
-    test "batcher serializes HLC-stamped payloads before pipeline submission" do
-      source = File.read!(app_path("lib/ferricstore/raft/batcher.ex"))
-
-      assert source =~ "CommandClock.to_ttb(prepared_cmd)"
-      assert source =~ "CommandClock.to_ttb(prepared_command)"
-      assert source =~ "CommandClock.to_ttb({:batch, wrapped_batch})"
-      assert source =~ "pipeline_command(state.shard_id, serialized, corr, priority)"
-    end
-
-    test "direct cross-shard raft calls go through CommandClock" do
+    test "cross-shard direct commands use stamped CommandClock submissions" do
       cross_shard = File.read!(app_path("lib/ferricstore/cross_shard_op.ex"))
       resolver = File.read!(app_path("lib/ferricstore/cross_shard_op/intent_resolver.ex"))
-      tx = File.read!(app_path("lib/ferricstore/transaction/coordinator.ex"))
 
       assert cross_shard =~ "CommandClock.process_command"
       assert resolver =~ "CommandClock.process_command"
-      assert tx =~ "CommandClock.pipeline_command"
-
-      refute cross_shard =~ ":ra.process_command("
-      refute resolver =~ ":ra.process_command("
-      refute tx =~ ":ra.pipeline_command("
     end
 
-    test "WARaft backend selection routes CommandClock submits through WARaft" do
-      previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
+    test "CommandClock submits through WARaft" do
       root =
         Path.join(
           System.tmp_dir!(),
@@ -86,7 +69,6 @@ defmodule Ferricstore.Raft.CommandClockTest do
         )
 
       try do
-        Application.put_env(:ferricstore, :raft_backend, :waraft)
         assert :ok = WARaftBackend.start(ctx)
 
         shard_id = RaftCluster.shard_server_id(0)
@@ -107,8 +89,7 @@ defmodule Ferricstore.Raft.CommandClockTest do
                    :low
                  )
 
-        assert_receive {:ra_event, _leader,
-                        {:applied, [{^corr, {:applied_at, pipe_index, :ok}}]}},
+        assert_receive {:raft_pipeline_applied, ^corr, {:applied_at, pipe_index, :ok}},
                        1_000
 
         assert is_integer(pipe_index)
@@ -117,11 +98,7 @@ defmodule Ferricstore.Raft.CommandClockTest do
         _ = WARaftBackend.stop()
         FerricStore.Instance.cleanup(ctx.name)
         File.rm_rf!(root)
-        restore_backend(previous_backend)
       end
     end
   end
-
-  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
-  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
 end

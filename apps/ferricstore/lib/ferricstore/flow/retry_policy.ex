@@ -15,7 +15,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   @default_retention %{
     ttl_ms: 604_800_000,
-    history_hot_max_events: 1,
+    history_hot_max_events: 0,
     history_max_events: 100_000
   }
 
@@ -122,13 +122,11 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   def normalize_retention_override(retention) when is_map(retention) do
     with {:ok, ttl_ms} <- optional_retention_ttl_ms(retention),
-         {:ok, history_hot_max_events} <- optional_history_hot_max_events(retention),
-         {:ok, history_max_events} <- optional_history_max_events(retention),
-         :ok <- validate_history_event_caps(history_hot_max_events, history_max_events) do
+         {:ok, nil} <- optional_history_hot_max_events(retention),
+         {:ok, history_max_events} <- optional_history_max_events(retention) do
       override =
         %{}
         |> maybe_put(:ttl_ms, ttl_ms)
-        |> maybe_put(:history_hot_max_events, history_hot_max_events)
         |> maybe_put(:history_max_events, history_max_events)
 
       {:ok, override}
@@ -431,7 +429,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   defp merge_retention(policy, override) when is_map(override) do
     Enum.reduce(override, policy, fn
-      {key, value}, acc when key in [:ttl_ms, :history_hot_max_events, :history_max_events] ->
+      {key, value}, acc when key in [:ttl_ms, :history_max_events] ->
         Map.put(acc, key, value)
 
       _entry, acc ->
@@ -458,27 +456,10 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   defp optional_history_hot_max_events(policy) do
     if has_policy_key?(policy, :history_hot_max_events, "history_hot_max_events") do
-      policy
-      |> fetch_policy(:history_hot_max_events, "history_hot_max_events", nil)
-      |> validate_history_hot_max_events()
+      {:error, "ERR flow retention history_hot_max_events is internal"}
     else
       {:ok, nil}
     end
-  end
-
-  defp validate_history_hot_max_events(value) when is_integer(value) and value > 0 do
-    max = max_history_hot_max_events()
-
-    if value <= max do
-      {:ok, value}
-    else
-      {:error, "ERR flow retention history_hot_max_events must be between 1 and #{max}"}
-    end
-  end
-
-  defp validate_history_hot_max_events(_value) do
-    max = max_history_hot_max_events()
-    {:error, "ERR flow retention history_hot_max_events must be between 1 and #{max}"}
   end
 
   defp optional_history_max_events(policy) do
@@ -504,19 +485,6 @@ defmodule Ferricstore.Flow.RetryPolicy do
   defp validate_history_max_events(_value) do
     max = max_history_max_events()
     {:error, "ERR flow retention history_max_events must be between 1 and #{max}"}
-  end
-
-  defp validate_history_event_caps(nil, _history_max_events), do: :ok
-  defp validate_history_event_caps(_history_hot_max_events, nil), do: :ok
-
-  defp validate_history_event_caps(history_hot_max_events, history_max_events)
-       when is_integer(history_hot_max_events) and is_integer(history_max_events) do
-    if history_max_events >= history_hot_max_events do
-      :ok
-    else
-      {:error,
-       "ERR flow retention history_max_events must be greater than or equal to history_hot_max_events"}
-    end
   end
 
   defp normalize_resolved_retention_caps(retention) do
@@ -547,7 +515,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
            :flow_default_history_hot_max_events,
            @default_retention.history_hot_max_events
          ) do
-      value when is_integer(value) and value > 0 -> min(value, max)
+      value when is_integer(value) and value >= 0 -> min(value, max)
       _ -> min(@default_retention.history_hot_max_events, max)
     end
   end

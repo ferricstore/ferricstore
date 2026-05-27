@@ -30,6 +30,16 @@ Prometheus / `FERRICSTORE.METRICS`:
 Alert on non-zero degraded flags, increasing enqueue/persist failures, or a
 replay-safe lag that grows instead of draining.
 
+Important tuning note: the hot-path throughput cliff during large terminal Flow
+bursts is usually not fixed by making LMDB flush more aggressively. The critical
+budget is `:waraft_apply_projection_cache_max_entries` /
+`FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES`, which buffers applied
+Flow state/value rows until lagged LMDB/history projection consumes them. If it
+is too small, WARaft has to spill/compact that cache synchronously and the
+DBOS-style 1M Flow benchmark can fall from the ~58K/s range to the ~35K/s range.
+Treat LMDB flush interval/batch knobs as lag controls; treat the apply-projection
+cache as the burst-throughput guardrail.
+
 ## Retention And Cleanup
 
 Terminal flows stay in hot indexes for `:flow_terminal_hot_ttl_ms` after LMDB
@@ -91,14 +101,14 @@ when retry exhaustion moves a Flow into `completed`, `failed`, or `cancelled`.
 
 ## History Caps
 
-History has two separate caps:
+History has one user-facing policy cap and one internal hot cache cap:
 
-- `history_hot_max_events`: default `1`, hard max `10000`
 - `history_max_events`: default `100000`, hard max `1000000`
+- internal hot history cache: default `0`
 
-The hot cap bounds the recent history kept in memory/indexed for quick reads.
-The total cap bounds durable history growth for one Flow. `history_max_events`
-must be greater than or equal to `history_hot_max_events`.
+The internal hot cache keeps history rows only until LMDB projection catches up.
+It is intentionally not exposed through `FLOW.POLICY.SET`; policies should only
+control terminal retention TTL and total durable history growth for one Flow.
 Terminal flows override the hot cap to zero after LMDB projection, because
 terminal history is not on the worker hot path.
 

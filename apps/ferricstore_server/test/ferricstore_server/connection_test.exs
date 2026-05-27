@@ -272,6 +272,59 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "single FLOW.SIGNAL command dispatches through typed AST", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    id = "signal-flow:" <> Integer.to_string(System.unique_integer([:positive]))
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, [
+      "FLOW.CREATE",
+      id,
+      "TYPE",
+      "signal-flow",
+      "STATE",
+      "waiting_payment",
+      "PARTITION",
+      partition,
+      "RUN_AT",
+      "1000"
+    ])
+
+    assert ["OK"] = recv_values(sock, 1)
+
+    send_command(sock, [
+      "FLOW.SIGNAL",
+      id,
+      "PARTITION",
+      partition,
+      "SIGNAL",
+      "payment_received",
+      "IF_STATE",
+      "waiting_payment",
+      "TRANSITION_TO",
+      "verify_payment",
+      "VALUE",
+      "payment_event",
+      "ref:payment"
+    ])
+
+    assert ["OK"] = recv_values(sock, 1)
+
+    send_command(sock, ["FLOW.HISTORY", id, "PARTITION", partition, "COUNT", "10"])
+
+    assert [history] = recv_values(sock, 1)
+
+    assert Enum.any?(history, fn
+             [_event_id, %{"event" => "signaled", "signal" => "payment_received"}] -> true
+             _entry -> false
+           end)
+
+    :gen_tcp.close(sock)
+  end
+
   test "pipelined FLOW.CREATE commands batch internally with independent replies", %{port: port} do
     handler_id = {__MODULE__, self(), :flow_create_pipeline, System.unique_integer([:positive])}
 
@@ -650,6 +703,98 @@ defmodule FerricstoreServer.ConnectionTest do
     assert_receive {:pipeline_claim_due_batch, %{commands: 3, groups: 1, coalesced_calls: 1},
                     %{source: :resp_pipeline}},
                    1_000
+
+    :gen_tcp.close(sock)
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK waits and wakes on a due create", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-claim:" <> Integer.to_string(System.unique_integer([:positive]))
+    id = "#{type}:#{System.unique_integer([:positive])}"
+
+    claim =
+      Encoder.encode([
+        "FLOW.CLAIM_DUE",
+        type,
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        partition,
+        "LIMIT",
+        "1",
+        "RETURN",
+        "JOBS_COMPACT",
+        "BLOCK",
+        "1000"
+      ])
+
+    send_raw(sock, claim)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+      "RESP claim_due waiter registered",
+      100,
+      5
+    )
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               state: "queued",
+               now_ms: 1_000,
+               run_at_ms: 1_000
+             )
+
+    assert [[[^id, ^partition, lease_token, fencing_token]]] = recv_values(sock, 1)
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK performs one empty claim attempt before waiting", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :flow_claim_due_block_once, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :claim_due, :stop],
+        &__MODULE__.handle_flow_claim_due_stop/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-empty-claim:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, [
+      "FLOW.CLAIM_DUE",
+      type,
+      "WORKER",
+      "worker-a",
+      "PARTITION",
+      partition,
+      "LIMIT",
+      "1",
+      "BLOCK",
+      "20"
+    ])
+
+    assert [[]] = recv_values(sock, 1)
+
+    assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
+    refute_receive {:flow_claim_due_stop, _measurements, %{flow_type: ^type}}, 100
 
     :gen_tcp.close(sock)
   end
@@ -1171,6 +1316,10 @@ defmodule FerricstoreServer.ConnectionTest do
 
   def handle_pipeline_claim_due_batch(_event, measurements, metadata, test_pid) do
     send(test_pid, {:pipeline_claim_due_batch, measurements, metadata})
+  end
+
+  def handle_flow_claim_due_stop(_event, measurements, metadata, test_pid) do
+    send(test_pid, {:flow_claim_due_stop, measurements, metadata})
   end
 
   defp recv_all(_sock, _pattern, 0), do: ""

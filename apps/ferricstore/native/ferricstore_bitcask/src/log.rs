@@ -539,6 +539,20 @@ impl LogReader {
         self.file.seek(SeekFrom::Start(offset))?;
         iter_metadata_tolerant(&mut self.file, offset)
     }
+
+    /// Read a bounded page of record metadata from an exact byte offset.
+    ///
+    /// This keeps BEAM startup recovery from materializing a whole large
+    /// Bitcask file scan in one NIF result. `done=true` means EOF or a tolerant
+    /// truncated/corrupt tail was reached, matching `iter_metadata_*_tolerant`.
+    pub fn iter_metadata_page_from_offset_tolerant(
+        &mut self,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(Vec<RecordMetadata>, u64, bool)> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        iter_metadata_page_tolerant(&mut self.file, offset, limit)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1101,34 @@ fn iter_metadata_tolerant(
     }
 
     Ok(records)
+}
+
+fn iter_metadata_page_tolerant(
+    reader: &mut impl Read,
+    start_offset: u64,
+    limit: usize,
+) -> Result<(Vec<RecordMetadata>, u64, bool)> {
+    let mut records = Vec::new();
+    let mut offset = start_offset;
+
+    if limit == 0 {
+        return Ok((records, offset, false));
+    }
+
+    while records.len() < limit {
+        match read_next_record_metadata(reader, offset) {
+            Ok(Some(record)) => {
+                offset = offset
+                    .checked_add(record.record_size)
+                    .ok_or_else(|| LogError("record offset overflow".into()))?;
+                records.push(record);
+            }
+            Ok(None) => return Ok((records, offset, true)),
+            Err(_err) => return Ok((records, offset, true)),
+        }
+    }
+
+    Ok((records, offset, false))
 }
 
 fn read_next_record_metadata(

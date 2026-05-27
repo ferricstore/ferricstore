@@ -2,67 +2,38 @@ defmodule Ferricstore.Cluster.DataSync do
   @moduledoc """
   Shard-by-shard data directory copy for new node sync.
 
-  Provides WAL gap detection to avoid unnecessary full copies, per-shard
-  sync status tracking, leader-aware copy source resolution, and automatic
-  retry with partial cleanup on failure.
+  Provides WARaft segment-log gap detection to avoid unnecessary full copies,
+  per-shard sync status tracking, leader-aware copy source resolution, and
+  automatic retry with partial cleanup on failure.
   """
 
   require Logger
 
-  alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @default_max_retries 3
   @copy_chunk_bytes 1_048_576
 
   # ---------------------------------------------------------------------------
-  # WAL gap detection
+  # Segment-log gap detection
   # ---------------------------------------------------------------------------
 
   @doc """
-  Reads the last applied Raft index from a ra meta.dets file on disk.
+  Reads the persisted replay-safe index for a copied shard.
 
-  Used when a node boots from a disk clone (EBS snapshot) — we need to know
-  the Raft index the cloned data is consistent up to, BEFORE starting ra
-  (since the WAL has the wrong node IDs and must be deleted).
-
-  Returns the last_applied index, or 0 if the file doesn't exist or can't be read.
+  Returns 0 when the marker is absent or unreadable.
   """
   @spec read_last_applied_from_disk(binary(), non_neg_integer()) :: non_neg_integer()
   def read_last_applied_from_disk(data_dir, shard_index) do
-    meta_path = Path.join([data_dir, "ra", "meta.dets"])
-
-    try do
-      # Open the DETS file read-only
-      dets_name = :"ferricstore_meta_read_#{shard_index}_#{System.unique_integer([:positive])}"
-
-      case :dets.open_file(dets_name, file: String.to_charlist(meta_path), access: :read) do
-        {:ok, ref} ->
-          uid = "ferricstore_shard_#{shard_index}"
-
-          result =
-            case :dets.lookup(ref, uid) do
-              [{^uid, _term, _voted_for, last_applied}] when is_integer(last_applied) ->
-                last_applied
-
-              _ ->
-                0
-            end
-
-          :dets.close(ref)
-          result
-
-        {:error, _} ->
-          0
-      end
-    catch
-      _, _ -> 0
-    end
+    data_dir
+    |> Ferricstore.DataDir.shard_data_path(shard_index)
+    |> Ferricstore.Raft.ReplaySafeIndex.read()
   end
 
   @doc """
-  Pure WAL gap check: given the target's last applied index and the leader's
-  first available WAL index, determines if WAL replay can bridge the gap.
+  Pure segment-log gap check: given the target's replay-safe index and the
+  leader's first available segment index, determines if log replay can bridge
+  the gap.
   """
   @spec wal_bridgeable?(non_neg_integer(), non_neg_integer()) :: :wal_bridgeable | :needs_resync
   def wal_bridgeable?(target_index, leader_first_index) do
@@ -84,13 +55,8 @@ defmodule Ferricstore.Cluster.DataSync do
   def __pause_shard_for_test__(node, shard_name), do: pause_shard(node, shard_name)
 
   @spec needs_resync?(non_neg_integer(), node(), node()) :: :wal_bridgeable | :needs_resync
-  def needs_resync?(shard_index, target_node, leader_node) do
-    if RaftBackend.waraft?() do
-      :needs_resync
-    else
-      do_needs_resync?(shard_index, target_node, leader_node)
-    end
-  end
+  def needs_resync?(shard_index, target_node, leader_node),
+    do: do_needs_resync?(shard_index, target_node, leader_node)
 
   defp do_needs_resync?(shard_index, target_node, leader_node) do
     # Check if the TARGET node has data files for this shard.
@@ -123,24 +89,16 @@ defmodule Ferricstore.Cluster.DataSync do
       end
 
     if target_has_data do
-      # Target has data — check if its WAL can bridge to the leader
-      target_server_id = RaftCluster.shard_server_id_on(shard_index, target_node)
-
+      # Target has data -- check whether its WARaft segment log can bridge to
+      # the leader without a full file copy.
       target_index =
-        try do
-          case RaftCluster.member_overview_on(target_node, target_server_id) do
-            {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
-            _ -> 0
-          end
-        catch
-          _, _ -> 0
+        case waraft_storage_position(target_node, shard_index) do
+          {:ok, {:raft_log_pos, index, _term}} when is_integer(index) -> index
+          _other -> 0
         end
 
-      leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
-
-      case RaftCluster.member_overview_on(leader_node, leader_server_id) do
-        {:ok, overview, _} ->
-          first_index = Map.get(overview, :first_index, 0)
+      case waraft_log_first_index(leader_node, shard_index) do
+        first_index when is_integer(first_index) ->
 
           if target_index >= first_index do
             blob_status = leader_blob_files?(shard_index, leader_node)
@@ -149,35 +107,35 @@ defmodule Ferricstore.Cluster.DataSync do
             case {result, blob_status} do
               {:wal_bridgeable, _} ->
                 Logger.info(
-                  "Shard #{shard_index}: WAL bridgeable (target=#{target_index} >= first=#{first_index})"
+                  "Shard #{shard_index}: segment log bridgeable (target=#{target_index} >= first=#{first_index})"
                 )
 
               {:needs_resync, {:ok, true}} ->
                 Logger.info(
-                  "Shard #{shard_index}: blob side-channel data present on leader, full resync required despite WAL bridgeability"
+                  "Shard #{shard_index}: blob side-channel data present on leader, full resync required despite segment-log bridgeability"
                 )
 
               {:needs_resync, {:error, reason}} ->
                 Logger.warning(
-                  "Shard #{shard_index}: could not inspect leader blob side-channel data (#{inspect(reason)}), full resync required despite WAL bridgeability"
+                  "Shard #{shard_index}: could not inspect leader blob side-channel data (#{inspect(reason)}), full resync required despite segment-log bridgeability"
                 )
 
               {:needs_resync, _} ->
                 Logger.info(
-                  "Shard #{shard_index}: full resync required despite WAL bridgeability"
+                  "Shard #{shard_index}: full resync required despite segment-log bridgeability"
                 )
             end
 
             result
           else
             Logger.info(
-              "Shard #{shard_index}: WAL gap (target=#{target_index} < first=#{first_index}), needs resync"
+              "Shard #{shard_index}: segment-log gap (target=#{target_index} < first=#{first_index}), needs resync"
             )
 
             :needs_resync
           end
 
-        _ ->
+        _other ->
           :needs_resync
       end
     else
@@ -214,11 +172,12 @@ defmodule Ferricstore.Cluster.DataSync do
 
   Resolves the current leader for the shard and copies data FROM the leader
   (not from the local node). Before copying, checks whether the target can
-  catch up via WAL replay alone -- if so, the expensive data copy is skipped.
+  catch up via WARaft segment replay alone -- if so, the expensive data copy is
+  skipped.
 
   1. Find leader for the shard
-  2. Check WAL bridgeability
-  3. If resync needed: pause writes, copy data + ra dir, resume writes
+  2. Check segment-log bridgeability
+  3. If resync needed: pause writes, copy data, resume writes
   4. Return `{:ok, detail}` with `:wal_bridgeable` or the Raft index at copy time
 
   ## Parameters
@@ -230,18 +189,14 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec sync_shard(non_neg_integer(), node(), FerricStore.Instance.t()) ::
           {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
   def sync_shard(shard_index, target_node, ctx) do
-    if RaftBackend.waraft?() do
-      {:error, :unsupported_waraft_data_sync}
-    else
-      leader_node = find_leader_for(shard_index)
+    leader_node = find_leader_for(shard_index)
 
-      case needs_resync?(shard_index, target_node, leader_node) do
-        :wal_bridgeable ->
-          {:ok, :wal_bridgeable}
+    case needs_resync?(shard_index, target_node, leader_node) do
+      :wal_bridgeable ->
+        {:ok, :wal_bridgeable}
 
-        :needs_resync ->
-          do_sync_shard(shard_index, target_node, leader_node, ctx)
-      end
+      :needs_resync ->
+        do_sync_shard(shard_index, target_node, leader_node, ctx)
     end
   end
 
@@ -259,29 +214,25 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec retry_sync_shard(non_neg_integer(), node(), FerricStore.Instance.t(), non_neg_integer()) ::
           {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
   def retry_sync_shard(shard_index, target_node, ctx, max_retries \\ @default_max_retries) do
-    if RaftBackend.waraft?() do
-      {:error, :unsupported_waraft_data_sync}
-    else
-      Enum.reduce_while(1..max_retries, {:error, :not_attempted}, fn attempt, _acc ->
-        case sync_shard(shard_index, target_node, ctx) do
-          {:ok, _} = ok ->
-            {:halt, ok}
+    Enum.reduce_while(1..max_retries, {:error, :not_attempted}, fn attempt, _acc ->
+      case sync_shard(shard_index, target_node, ctx) do
+        {:ok, _} = ok ->
+          {:halt, ok}
 
-          {:error, reason} ->
-            Logger.warning(
-              "Shard #{shard_index} sync attempt #{attempt}/#{max_retries} failed: #{inspect(reason)}"
-            )
+        {:error, reason} ->
+          Logger.warning(
+            "Shard #{shard_index} sync attempt #{attempt}/#{max_retries} failed: #{inspect(reason)}"
+          )
 
-            cleanup_partial_sync(shard_index, target_node, ctx)
+          cleanup_partial_sync(shard_index, target_node, ctx)
 
-            if attempt < max_retries do
-              {:cont, {:error, reason}}
-            else
-              {:halt, {:error, reason}}
-            end
-        end
-      end)
-    end
+          if attempt < max_retries do
+            {:cont, {:error, reason}}
+          else
+            {:halt, {:error, reason}}
+          end
+      end
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -301,13 +252,7 @@ defmodule Ferricstore.Cluster.DataSync do
     * `ctx` -- the FerricStore instance context
   """
   @spec sync_all_shards(node(), FerricStore.Instance.t()) :: {:ok, map()} | {:error, term()}
-  def sync_all_shards(target_node, ctx) do
-    if RaftBackend.waraft?() do
-      {:error, :unsupported_waraft_data_sync}
-    else
-      do_sync_all_shards(target_node, ctx)
-    end
-  end
+  def sync_all_shards(target_node, ctx), do: do_sync_all_shards(target_node, ctx)
 
   defp do_sync_all_shards(target_node, ctx) do
     Logger.info("DataSync: starting sync of #{ctx.shard_count} shards to #{target_node}")
@@ -459,14 +404,27 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
-  defp pause_batcher(_node, _shard_index) do
-    # DataSync currently fails closed before reaching this legacy Ra copy path
-    # under the production WARaft backend. Keep the helper conditional so this
-    # dead branch does not look like a successful WARaft sync primitive.
-    if RaftBackend.waraft?(), do: {:error, :unsupported_waraft_data_sync}, else: :ok
+  defp pause_batcher(node, shard_index) do
+    # WARaft writes normally bypass the Shard GenServer, so the replication
+    # write facade is the synchronization point for any direct file copy path.
+    if node == node() do
+      Ferricstore.Raft.Batcher.pause_writes_for_sync(shard_index, 30_000)
+    else
+      :erpc.call(node, Ferricstore.Raft.Batcher, :pause_writes_for_sync, [shard_index, 30_000])
+    end
+  catch
+    kind, reason -> {:error, {:pause_batcher_failed, {kind, reason}}}
   end
 
-  defp resume_batcher(_node, _shard_index), do: :ok
+  defp resume_batcher(node, shard_index) do
+    if node == node() do
+      Ferricstore.Raft.Batcher.resume_writes_for_sync(shard_index, 5_000)
+    else
+      :erpc.call(node, Ferricstore.Raft.Batcher, :resume_writes_for_sync, [shard_index, 5_000])
+    end
+  catch
+    _kind, _reason -> :ok
+  end
 
   defp pause_shard(node, shard_name) do
     if node == node() do
@@ -505,30 +463,33 @@ defmodule Ferricstore.Cluster.DataSync do
   end
 
   defp get_raft_index_with_detail(leader_node, server_id) do
-    if Ferricstore.Raft.Backend.waraft?() do
-      shard_index = shard_index_from_server_id(server_id)
+    shard_index = shard_index_from_server_id(server_id)
 
-      case waraft_storage_position(leader_node, shard_index) do
-        {:ok, {:raft_log_pos, index, term}} -> {index, "(waraft_term=#{term})"}
-        _ -> {0, "(no overview)"}
-      end
-    else
-      legacy_raft_index_with_detail(leader_node, server_id)
+    case waraft_storage_position(leader_node, shard_index) do
+      {:ok, {:raft_log_pos, index, term}} -> {index, "(waraft_term=#{term})"}
+      _ -> {0, "(no overview)"}
     end
   end
 
-  defp legacy_raft_index_with_detail(leader_node, server_id) do
-    overview_result = RaftCluster.member_overview_on(leader_node, server_id)
+  defp waraft_log_first_index(leader_node, shard_index) do
+    status =
+      if leader_node == node() do
+        Ferricstore.Raft.WARaftBackend.segment_log_memory_status(shard_index)
+      else
+        :erpc.call(
+          leader_node,
+          Ferricstore.Raft.WARaftBackend,
+          :segment_log_memory_status,
+          [shard_index]
+        )
+      end
 
-    case overview_result do
-      {:ok, overview, _} ->
-        la = Map.get(overview, :last_applied, 0)
-        ci = Map.get(overview, :commit_index, 0)
-        {la, "(commit_index=#{ci})"}
-
-      _ ->
-        {0, "(no overview)"}
+    case status do
+      %{disk_first_index: index} when is_integer(index) -> index
+      _other -> 0
     end
+  catch
+    _, _ -> 0
   end
 
   defp waraft_storage_position(leader_node, shard_index) do
@@ -544,10 +505,18 @@ defmodule Ferricstore.Cluster.DataSync do
   end
 
   defp shard_index_from_server_id({name, _node}) when is_atom(name) do
-    name
-    |> Atom.to_string()
-    |> String.trim_leading("ferricstore_shard_")
-    |> String.to_integer()
+    name = Atom.to_string(name)
+
+    cond do
+      String.starts_with?(name, "raft_server_ferricstore_waraft_backend_") ->
+        name
+        |> String.trim_leading("raft_server_ferricstore_waraft_backend_")
+        |> String.to_integer()
+        |> Kernel.-(1)
+
+      true ->
+        0
+    end
   rescue
     _ -> 0
   end

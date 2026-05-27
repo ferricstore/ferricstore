@@ -157,6 +157,8 @@ Benchmark shape used for the current worker-style WARaft flow profile:
 | Flow-17 Python 1M check | Python worker profile at `FLOWS=1000000`, `SHARDS=16`, `TRANSPORT=many` | `94,837 workflows/sec` end-to-end; create `95,651/sec`; process `94,918/sec` | Completed `1,000,000` created/claimed/completed with `0` duplicate completions. Telemetry: `5,000,000` Bitcask records over `3,072` appends, avg append batch `1,627`, `3,088` WARaft same-segment writes. |
 | Flow-18 | Flow history projector computes retention cap requirements in one pass instead of scanning the whole projection batch once per history key | Pre-fix 100K repeats: `61,595`, `58,411`, `56,631/sec`; post-fix repeats: `72,740`, `66,061`, `70,543/sec`; post-fix 1M: `70,939/sec` | Fixes the DBOS-style workload where every flow has a distinct history key. The old projector path became O(history_keys x batch_entries) even when every entry was far below `history_max_events`. New tests cover no cap loads for unique under-cap entries and one cap load for missing-cap keys. The 1M run completed `1,000,000` created/claimed/completed with `0` duplicate completions. |
 | Long-history soak 1 | `bench/flow_state_lmdb_soak.exs`, `5KB` payloads, normal flows `50` states, one long failure flow target `10K` states, `SHARDS=16`, `WORKERS=32`, `PRODUCERS=8`, `TARGET_OPS_PER_SEC=50000` | Stopped early at `901.5s`; `12,311,930` Flow ops, `24,312,877` write ops, `13,657 Flow ops/sec`, `26,969 writes/sec` | Did not hit disk/memory guards. Max LMDB pending `65,306`, oldest lag `949ms`, replay lag `27,202`, so LMDB projection was behind but not the main limiter. Max BEAM memory `70.6GB`, binary memory `38.9GB`, ETS `30.3GB`, keydir entries `36.9M`, disk `27.9GB` (`15GB` data, `11GB` WARaft, `1.4GB` blob). Failure mode was write timeout/unknown outcome plus one LMDB env-open warning; added WARAFT commit-timeout telemetry afterward. |
+| Long-history smoke 2 | SDK workers use separate blocking-claim and command clients; soak wrapper defaults to `WORKER_MODE=blocking` and no longer passes the old wake-coalesce flag | 3-minute clean smoke: `1,856,440` Flow ops, `9,986 Flow ops/sec`, `19,502 writes/sec`, max LMDB pending `11,657`, oldest lag `1.14s` | This fixed the previous stuck shape (`~7 ops/sec`) but exposed that the pipeline create driver was still underfeeding the server. Log: `bench/results/flow_state_lmdb_soak_blocking_split_smoke_20260524T213547Z.log`. |
+| Long-history smoke 3 | Python pipeline create mode now honors `--create-inflight`; unit test proves concurrent pipeline flushes | 2-minute clean smoke: `1,563,762` Flow ops, `12,519 Flow ops/sec`, `24,184 writes/sec`, max LMDB pending `9,871`, oldest lag `1.11s` | Feed rate improved, but this workload is still WARAFT/storage bound on `5KB` payload history: hot batch avg only `3` commands, WARAFT total flush avg `197ms`, p99 pipeline write `<=1s`. Log: `bench/results/flow_state_lmdb_soak_blocking_split_pipeline_inflight_smoke_20260524T214145Z.log`. |
 
 Long-history soak command:
 
@@ -169,8 +171,7 @@ FERRICSTORE_BUILD=1 MIX_ENV=bench \
   MIN_FREE_DISK_MB=300000 MAX_TOTAL_MEM_MB=96000 SHARDS=16 WORKERS=32 PRODUCERS=8 \
   PARTITIONS=4096 CREATE_MODE=pipeline CREATE_BATCH_SIZE=500 CREATE_INFLIGHT=4 \
   CLAIM_BATCH_SIZE=1000 CLAIM_PARTITION_BATCH_SIZE=64 APPLY_INFLIGHT=16 \
-  WORKER_MODE=owner-wakeup NORMAL_CLAIM_STATES_MODE=cursor LONG_CLAIM_STATES_MODE=all \
-  WAKE_COALESCE_MS=0 \
+  WORKER_MODE=blocking NORMAL_CLAIM_STATES_MODE=cursor LONG_CLAIM_STATES_MODE=all \
   mix run --no-start bench/flow_state_lmdb_soak.exs 2>&1 | tee /tmp/ferricstore_flow_long_soak.log
 ```
 
@@ -815,3 +816,484 @@ This control is lower than the earlier baseline even after the parser-plan
 runtime code was reverted, so treat it as branch/noise-sensitive rather than a
 parser-plan win/loss signal by itself. The decision to drop parser-plan is based
 on the direct before/after experiment.
+
+## Flow Claim Due Polling
+
+Goal: recover the state-machine soak latency/throughput after removing the old
+owner-wakeup path, without reintroducing local wake queues or moving LMDB back
+into the hot path.
+
+Profile finding:
+
+- `FLOW.CLAIM_DUE` polling spent visible reductions in
+  `Ferricstore.Flow.validate_claim_due_keys/4`.
+- The hot stack built due-index keys for every selected partition/state just to
+  check max key size.
+- Fixed by replacing generated key allocation with length math and one
+  `Router.max_key_size/0` read per claim.
+
+Targeted tests:
+
+```sh
+PYTHONPATH=src pytest -q \
+  tests/test_flow_worker_scheduler.py \
+  tests/test_workflow.py \
+  tests/test_async_sdk.py \
+  tests/test_async_state_machine_benchmark.py
+
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:238
+
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/flow_test.exs:3223
+```
+
+Result:
+
+- Python SDK targeted tests: `100 passed`.
+- Flow write contract and malformed-input tests: passed.
+
+Apples-to-apples polling benchmark, `payload_bytes=1000`, `SHARDS=16`,
+`WORKERS=32`, `PRODUCERS=8`, `CREATE_MODE=many`, `CLAIM_BATCH_SIZE=1000`,
+`CLAIM_PARTITION_BATCH_SIZE=32`, `WORKER_MODE=polling`,
+`NORMAL_CLAIM_STATES_MODE=cursor`.
+
+| Run | At ~64s | At ~185s | Notes |
+| --- | ---: | ---: | --- |
+| Before | `17.8K flow_ops/s` | `26.8K flow_ops/s` | `flow_state_lmdb_soak_apples_polling_fixed_20260525T042350Z.log` |
+| After claim validation fast path | `19.6K flow_ops/s` | `29.3K flow_ops/s` | `flow_state_lmdb_soak_claim_validate_fast_20260525T044458Z.log` |
+
+Latency at ~185s improved from:
+
+| Command | Before avg | After avg |
+| --- | ---: | ---: |
+| create | `88.0 ms` | `76.8 ms` |
+| claim_due | `51.6 ms` | `44.9 ms` |
+| transition | `75.3 ms` | `65.2 ms` |
+| complete | `62.9 ms` | `53.6 ms` |
+
+Rejected probes:
+
+- `WORKER_MODE=blocking`: current server long-poll path is not production-ready
+  for this soak. It dropped to about `943 flow_ops/s`, produced WARaft commit
+  timeouts, and inflated ETS memory to `3.3GB`.
+- `NORMAL_CLAIM_STATES_MODE=all`: lowered per-command latency but did not make
+  workflow progress fast enough; throughput fell to about `6.9K flow_ops/s`.
+
+Remaining gap:
+
+- The old `flow_state_lmdb_soak_final_20260524T152410Z.log` run claimed much
+  larger batches (`~560` jobs/claim at ~64s) than the current polling path
+  (`~51` jobs/claim). That came from the removed wake/credit behavior, not from
+  the key-size validation hotspot.
+
+## Flow Claim Due Long Polling, Compact Waiters, And Ready Credits
+
+Design decision:
+
+- Keep worker scheduling on `FLOW.CLAIM_DUE ... BLOCK`, not Pub/Sub.
+- Store wake credits inside the server-side waiter registry as ready hints.
+- Do not use cursor-state blocking for multi-state workers; a worker can block
+  on the wrong state and stop making progress.
+- Use `RETURN JOBS_COMPACT_STATE` for broad blocking claims so the SDK can claim
+  any ready state and still dispatch each job to the correct handler.
+
+Correctness fixes:
+
+- Router precheck now uses the requested state filter for `STATE ANY` and
+  multi-state claims. The route key can still use a cheap stable state for shard
+  selection, but an empty `"queued"` index cannot suppress ready work in another
+  state.
+- `ClaimWaiters.notify_ready_many/2` coalesces repeated ready hints by bucket,
+  records each waiter's requested `LIMIT`, and wakes only enough waiters to cover
+  the ready count. This keeps the old credit idea inside the server waiter
+  registry without Pub/Sub in the worker hot path.
+- Python SDK `claim_jobs(..., include_state=True)` requests
+  `JOBS_COMPACT_STATE`, and workflow workers use it only when all selected states
+  are compact-claim safe.
+
+Targeted tests:
+
+```sh
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/flow/claim_waiters_test.exs \
+  apps/ferricstore/test/ferricstore/flow_test.exs:1154 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:1181 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:1326 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:1430 \
+  apps/ferricstore/test/ferricstore/commands/flow_test.exs:1390 \
+  apps/ferricstore_server/test/ferricstore_server/connection_test.exs:657
+
+PYTHONPATH=src pytest -q \
+  tests/test_client.py \
+  tests/test_async_client.py \
+  tests/test_workflow.py \
+  tests/test_async_sdk.py \
+  tests/test_async_state_machine_benchmark.py
+```
+
+Results:
+
+- Elixir targeted Flow/RESP/waiter tests: `11` tests passed.
+- Python SDK/client/workflow targeted suites: `175 passed`.
+
+Soak benchmark, `payload_bytes=1000`, `SHARDS=16`, `WORKERS=32`,
+`PRODUCERS=8`, `CREATE_MODE=many`, `CLAIM_BATCH_SIZE=1000`,
+`CLAIM_PARTITION_BATCH_SIZE=32`, `WORKER_MODE=blocking`,
+`NORMAL_CLAIM_STATES_MODE=any`, `LONG_CLAIM_STATES_MODE=any`:
+
+| Run | Flow ops/sec | Write ops/sec | Claim avg | Transition avg | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Bad blocking cursor | `943/s` | n/a | very high | n/a | `flow_state_lmdb_soak_blocking_after_sdk_pool_20260525T044958Z.log`; wrong blocking shape, waiter ETS blow-up |
+| Compact waiters, cursor | `30.1K/s` | n/a | p99 `<=100ms` at first sample | p99 `<=250ms` | `flow_state_lmdb_soak_blocking_compact_waiters_20260525T0900Z.log`; row blow-up fixed but cursor-state still weaker |
+| Exact wait credits, cursor | `918/s` | n/a | n/a | n/a | `flow_state_lmdb_soak_blocking_waiter_credits_20260525T0906Z.log`; workers blocked on wrong state |
+| Explicit all states | `5.7K/s` | n/a | n/a | n/a | `flow_state_lmdb_soak_blocking_all_states_credits_20260525T0910Z.log`; correct but too much state scan/return overhead |
+| Any-state compact return | `45.6K/s` | `90.4K/s` | `53.2ms` | `96.5ms` | `flow_state_lmdb_soak_blocking_any_state_20260525T063330Z.log`; no WAraft timeouts, max memory `1.4GB` |
+| Limit-aware waiter credits | `45.0K/s` | `89.1K/s` | `53.3ms` | `97.8ms` | `flow_state_lmdb_soak_blocking_any_state_limit_credits_20260525T064721Z.log`; no WAraft timeouts, same latency class, fewer unnecessary worker wakes |
+| Real dashboard soak, 5 min | `47.6K/s` | `94.3K/s` | `67.2ms` | `127.3ms` | `1KB` payloads, `50` normal states, one `10K`-step failure flow, `SHARDS=16`, `WORKERS=32`, `PRODUCERS=8`, `CREATE_MODE=many`, `NORMAL_CLAIM_STATES_MODE=any`, `LONG_CLAIM_STATES_MODE=any`. Completed duration with no WARaft timeouts/errors. Max LMDB pending `199,804`, oldest lag `1.15s`, disk `50.9GB`, LMDB `20.0GB`, WARaft `23.1GB`, BEAM memory `2.1GB`. Live dashboard loaded but `FLOW.HISTORY COUNT 100` timed out for one completed flow under load. Restarting against the 50GB data dir did not reach the dashboard within `3.5min`; process sampled in the Bitcask NIF during recovery. Log: `/tmp/ferricstore_flow_real_soak.log`. |
+
+Conclusion:
+
+- Long polling is worth keeping. It is better than Pub/Sub wake credits for
+  worker scheduling because the blocking claim itself is the durable/atomic
+  claim point.
+- Pub/Sub should not be in the worker hot path. It can still exist later for
+  UI/event notifications, but not for Flow work delivery.
+- The next bottleneck is still WARaft/storage apply batching and transition
+  latency, not empty polling.
+
+## Flow Soak Hot Path Cleanup: Path Helpers, Small Values, Projection Writers
+
+Workload:
+
+- `DURATION_SECONDS=60`
+- `TARGET_OPS_PER_SEC=50000`
+- `PAYLOAD_BYTES=1000`
+- `NORMAL_STEPS=50`
+- `LONG_FLOWS=1`
+- `LONG_STEPS=10000`
+- `SHARDS=16`
+- `WORKERS=32`
+- `PRODUCERS=8`
+- `CREATE_MODE=many`
+- `FLOW_LATENCY_SAMPLE_RATE=10`
+- process profile enabled
+
+Changes tested:
+
+- `DataDir.shard_data_path/2` and `blob_shard_path/2` now avoid generic
+  `Path.join/1` on hot shard paths while preserving canonical slash behavior.
+- Flow apply skips `BlobValue.maybe_externalize/4` for normal small binaries,
+  but still routes blob-ref-shaped byte sizes through the blob path so user data
+  cannot be confused with internal refs.
+- Apply-projection `write_projection_batches/2` now reuses the direct nosync
+  segment writer instead of closing/reopening the segment file for every spill.
+
+Targeted tests:
+
+```sh
+FERRICSTORE_BUILD=1 mix compile --warnings-as-errors --no-validate-compile-env
+
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/data_dir_test.exs \
+  apps/ferricstore/test/ferricstore/flow_write_contract_test.exs \
+  apps/ferricstore/test/ferricstore/raft/waraft_segment_log_test.exs \
+  apps/ferricstore_server/test/ferricstore_server/connection_test.exs:710 \
+  apps/ferricstore_server/test/ferricstore_server/connection_test.exs:760
+
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:2274 \
+  apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:2292 \
+  apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:7422 \
+  apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:7577
+```
+
+Results:
+
+- Compile: passed.
+- DataDir/Flow contract/WARaft segment log/RESP blocking locations: passed.
+- WARaft apply-projection backend subset: `4` tests passed.
+
+Benchmark comparison:
+
+| Run | Flow ops/sec | Write ops/sec | Claim avg | Transition avg | Max memory | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Before these cleanups | `18.94K/s` | `37.00K/s` | `32.6ms` | `41.2ms` | `598.9MB` | `flow_state_lmdb_soak_profile_after_block_once_20260526T110108Z.log` |
+| Path + small-value skip | `18.70K/s` | `36.52K/s` | `32.5ms` | `41.2ms` | `613.3MB` | `flow_state_lmdb_soak_profile_after_path_blob_skip_20260526T111110Z.log` |
+| Projection nosync writer reuse | `18.68K/s` | `36.48K/s` | `32.9ms` | `42.3ms` | `591.9MB` | `flow_state_lmdb_soak_profile_after_nosync_writer_reuse_20260526T111904Z.log` |
+
+Conclusion:
+
+- The changes are correctness-safe and remove avoidable work, but the 60s soak
+  does not prove a throughput or latency win. Keep them only because they are
+  low-risk and make the profile cleaner.
+- The old bad stack
+  `filename.absname -> close_writer_for_path -> open_record_group_once_file_direct_nosync`
+  disappeared from the main profile after writer reuse.
+- Remaining sampled hotspots are:
+  `flow_plan_claim_candidates_native/10`,
+  `flow_read_claim_candidate_hot_values_loop/5`,
+  `flow_many_same_state_machine_shard?/2`,
+  `Ferricstore.Flow.encode_record/1`, and
+  `WARaftSegmentReader.apply_projection_cache_entries/2`.
+- Next real latency work should focus on claim planning and transition batch
+  apply, not path construction or segment writer open/close.
+
+## Flow Shard Marker And Zero-Hot History Fast Path
+
+Workload: same 60s Flow state/LMDB soak as above:
+
+- `PAYLOAD_BYTES=1000`
+- `NORMAL_STEPS=50`
+- `LONG_FLOWS=1`
+- `LONG_STEPS=10000`
+- `SHARDS=16`
+- `WORKERS=32`
+- `PRODUCERS=8`
+- `CREATE_MODE=many`
+- process stack profiling enabled
+
+Changes tested:
+
+- Router now stamps internally-built per-shard Flow batches with
+  `:__flow_shard_index__`. State-machine apply validates that stamp and skips
+  per-item `Router.shard_for/2` hashing when the batch already came from a
+  trusted per-shard router grouping. Missing or mismatched stamps fall back to
+  the old hash check.
+- Flow history projector now treats the default `history_hot_max_events=0` as a
+  direct eviction of the just-projected event after LMDB has the locator. This
+  avoids native rank/count scans for the common "keep no hot history" policy.
+  Terminal history still uses the rank path because it may need to evict older
+  retained hot events.
+
+Targeted tests:
+
+```sh
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/flow_write_contract_test.exs \
+  apps/ferricstore/test/ferricstore/flow/history_projector_test.exs --max-failures 3
+
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/flow_test.exs:847 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:1006 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:1849 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:3303 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:6171 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:6441 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:6497 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:6551 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:6645 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:6924 --max-failures 3
+```
+
+Results:
+
+- Flow write contract: `38` tests passed.
+- History projector: `22` tests passed.
+- Selected functional Flow transition/create/retention tests: `10` tests
+  passed.
+
+Benchmark comparison:
+
+| Run | Flow ops/sec | Write ops/sec | Claim avg | Transition avg | Max memory | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Projection writer reuse | `18.68K/s` | `36.48K/s` | `32.9ms` | `42.3ms` | `591.9MB` | `flow_state_lmdb_soak_profile_after_nosync_writer_reuse_20260526T111904Z.log` |
+| Shard marker only | `18.80K/s` | `36.71K/s` | `32.2ms` | `40.6ms` | `625.5MB` | `flow_state_lmdb_soak_profile_after_flow_shard_marker_20260526T112854Z.log`; removed the `flow_many_same_state_machine_shard?/2 -> Router.shard_for/2` profile frame |
+| Shard marker + zero-hot direct eviction | `20.96K/s` | `41.05K/s` | `28.7ms` | `36.2ms` | `619.6MB` | `flow_state_lmdb_soak_profile_after_zero_hot_direct_20260526T113414Z.log`; removed the `HistoryProjector.trim_history_hot_cache_by_rank/4` rank-trim profile frame for default hot-history policy |
+
+Conclusion:
+
+- The shard marker is a small but correct apply-path CPU reduction.
+- The zero-hot history fast path is the real win in this round: about `+11.5%`
+  Flow throughput over the projection-writer baseline and materially lower
+  claim/transition latency.
+- Remaining sampled hotspots are now claim planning/decode work:
+  `flow_plan_claim_candidates_native/10`,
+  `flow_decode_native_claim_plans/1`,
+  `flow_native_claim_keys/4`, and `flow_claim_due_scan/13`.
+
+## Async Apply Projection Cache Spill
+
+Workload: 120s Flow state/LMDB soak, clean temp data dir:
+
+- `TARGET_OPS_PER_SEC=50000`
+- `PAYLOAD_BYTES=1000`
+- `NORMAL_STEPS=50`
+- `LONG_FLOWS=1`
+- `LONG_STEPS=10000`
+- `SHARDS=16`
+- `FLOW_LATENCY_SAMPLE_RATE=10`
+
+Change:
+
+- `maybe_compact_apply_projection_cache/1` no longer spills the apply
+  projection cache synchronously inside storage apply.
+- Apply now starts one bounded background spill task per shard. New applies
+  skip starting another spill while one is pending.
+- This is safe because the apply projection cache is a read cache, not the
+  durability boundary. The WAraft segment remains the durable source before
+  trim, and trim/checkpoint writes durable projection data before old segment
+  removal.
+
+Targeted tests:
+
+```sh
+FERRICSTORE_BUILD=1 mix test --no-start \
+  test/ferricstore/raft/waraft_backend_test.exs:8487 \
+  test/ferricstore/raft/waraft_backend_test.exs:8520 \
+  test/ferricstore/raft/waraft_backend_test.exs:8600 \
+  test/ferricstore/raft/waraft_backend_test.exs:8623 \
+  --max-failures 3
+```
+
+Results:
+
+- Focused cache tests passed.
+- Nearby projection/restart coverage passed.
+
+Benchmark comparison:
+
+| Run | Flow ops/sec | Write ops/sec | Storage cache avg/max | Storage apply avg/max | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Sync spill | `27.36K/s` | `53.79K/s` | `1616us / 214708us` | `4550us / 215220us` | `bench/results/flow_state_lmdb_soak_spill_projection_20260527T050841Z.log` |
+| Async spill | `27.45K/s` | `53.98K/s` | `3us / 4986us` | `2947us / 26217us` | `bench/results/flow_state_lmdb_soak_async_apply_projection_cache_20260527T052012Z.log` |
+
+Conclusion:
+
+- The target hotspot moved out of the apply critical path. Cache phase max fell
+  from about `215ms` to `5ms`; storage apply max fell from about `215ms` to
+  `26ms`.
+- Overall Flow latency changed only modestly because the remaining tail is
+  batcher queue/flush pressure, not projection-cache spill.
+
+## DBOS-Style Long Poll Terminal Batch Fan-Out
+
+Workload: 100K live queue Flow DBOS-style benchmark:
+
+- `FLOWS=100000`
+- `WORKER_MODE=blocking`
+- `CLAIM_PARTITION_BATCH_SIZE=16`
+- `workers=16`
+- `producers=8`
+- `partitions=1024`
+- `shards=16`
+
+Change:
+
+- `FLOW.*_MANY independent` terminal writes now use an independent terminal
+  batch path that skips cross-shard parent/child pre-read planning.
+- Terminal shard groups are submitted through the existing batch path instead
+  of synchronously writing one shard group at a time.
+
+Targeted tests:
+
+```sh
+FERRICSTORE_BUILD=1 mix test \
+  apps/ferricstore/test/ferricstore/flow_test.exs:6989 \
+  apps/ferricstore/test/ferricstore/flow_test.exs:7146 \
+  --max-failures 3
+```
+
+Results:
+
+- Focused terminal-many tests passed.
+- New guard test proves independent terminal batches do not pre-read records for
+  cross-shard planning.
+
+Benchmark comparison:
+
+| Run | E2E flows/sec | Create/sec | Process/sec | Claim avg | Complete avg | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Long poll no-tail baseline | `16.14K/s` | `139.86K/s` | `16.14K/s` | `61.6ms` | `357.1ms` | `bench/results/dbos_style_longpoll_partitions16_notail_20260527T054330Z.log` |
+| Skip terminal pre-read only | `16.06K/s` | `139.86K/s` | `16.06K/s` | `61.6ms` | `357.1ms` | `bench/results/dbos_style_independent_terminal_fast_20260527T055745Z.log` |
+| Terminal shard fan-out | `16.47K/s` | `145.81K/s` | `16.48K/s` | `57.1ms` | `108.0ms` | `bench/results/dbos_style_terminal_parallel_shards_20260527T060132Z.log` |
+| Terminal fan-out + drain block 50ms | `16.42K/s` | `137.60K/s` | `16.43K/s` | `73.3ms` | `109.8ms` | `bench/results/dbos_style_drain_block50_100k_20260527T061300Z.log` |
+| No server BLOCK control | `58.02K/s` | `62.33K/s` | `58.07K/s` | `15.2ms` | `46.1ms` | `CLAIM_BLOCK_MS=-1 CLAIM_DRAIN_BLOCK_MS=-1`; `bench/results/dbos_style_noblock_control_100k_20260527T061545Z.log` |
+| Active scan, drain-only block | `58.58K/s` | `63.83K/s` | `58.65K/s` | `15.6ms` | `46.3ms` | `BLOCK 5000` configured, but benchmark workers only block after producers finish; `bench/results/dbos_style_active_scan_100k_20260527T071134Z.log` |
+
+Conclusion:
+
+- Removing the independent terminal pre-read is correctness/performance-clean,
+  but not enough by itself.
+- Fan-out dropped `complete_many` average latency by roughly `3.3x`.
+- Disabling server-side `BLOCK` recovers the old throughput class on this
+  100K profile, proving the regression was wait scheduling and not WARaft or
+  completion batching.
+- The fixed benchmark algorithm scans owned partition pages without `BLOCK`
+  while producers are active, then uses short `CLAIM_DRAIN_BLOCK_MS=50` only
+  after producers finish. This keeps long polling for idle drain while preserving
+  active-throughput behavior.
+
+## DBOS-Style And Flow Soak Check, 2026-05-27
+
+Purpose: verify the current WARaft/Flow branch is still in the expected DBOS
+worker throughput range, then run a clean 5-minute Flow soak to check latency,
+LMDB lag, memory, and storage behavior.
+
+DBOS-style 100K worker profile:
+
+```sh
+FERRICSTORE_BUILD=1 MIX_ENV=bench FLOWS=100000 SHARDS=16 WORKERS=16 \
+  PRODUCERS=8 TRANSPORT=many CLAIM_BLOCK_MS=5000 CLAIM_DRAIN_BLOCK_MS=50 \
+  mix run --no-start bench/flow_python_backend_profile.exs
+```
+
+Result:
+
+- `100,000` created, claimed, and completed.
+- `0` duplicate completions.
+- End-to-end throughput: `55,653 flows/sec`.
+- Create throughput: `60,223/sec`.
+- Process throughput: `55,710/sec`.
+- Log: `bench/results/dbos_style_current_100k_20260527T171219Z.log`.
+
+5-minute clean Flow soak:
+
+```sh
+FERRICSTORE_BUILD=1 MIX_ENV=bench \
+  DATA_DIR=/tmp/ferricstore_flow_soak_current KEEP_DATA_DIR=false \
+  DURATION_SECONDS=300 TARGET_OPS_PER_SEC=50000 PAYLOAD_BYTES=1000 \
+  NORMAL_STEPS=50 LONG_FLOWS=1 LONG_STEPS=10000 SAMPLE_INTERVAL_SECONDS=30 \
+  MIN_FREE_DISK_MB=5000 MAX_TOTAL_MEM_MB=64000 SHARDS=16 WORKERS=32 PRODUCERS=8 \
+  PARTITIONS=4096 CREATE_MODE=many CREATE_INFLIGHT=64 \
+  CLAIM_BATCH_SIZE=1000 CLAIM_PARTITION_BATCH_SIZE=32 APPLY_INFLIGHT=8 \
+  WORKER_MODE=blocking NORMAL_CLAIM_STATES_MODE=any LONG_CLAIM_STATES_MODE=any \
+  FLOW_LATENCY_SAMPLE_RATE=10 \
+  mix run --no-start bench/flow_state_lmdb_soak.exs
+```
+
+Result:
+
+- Flow ops: `14,788,597`.
+- Flow throughput: `48,473/sec`.
+- Write throughput: `95,999/sec`.
+- WARaft flush errors/apply-full/commit timeouts: `0`.
+- LMDB max pending: `4,356`.
+- LMDB max oldest lag: `1.01s`.
+- Max disk during run: `50.1GB`.
+- Max LMDB size: `20.6GB`.
+- Max WARaft size: `21.7GB`.
+- Max BEAM memory: `1.07GB`.
+- Max binary memory: `348MB`.
+- Max keydir binary memory: `25.8MB`.
+- Log: `bench/results/flow_state_lmdb_soak_current_5m_20260527T171303Z.log`.
+
+Sampled latency summary:
+
+| Command | Avg | Avg/item | p50 | p95 | p99 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| create | `51.4ms` | `2.73ms` | `<=50ms` | `<=250ms` | `<=250ms` | `262ms` |
+| claim_due | `35.9ms` | `0.20ms` | `<=30ms` | `<=100ms` | `<=250ms` | `242ms` |
+| transition | `69.0ms` | `1.07ms` | `<=75ms` | `<=250ms` | `<=250ms` | `288ms` |
+| complete | `69.0ms` | `0.55ms` | `<=75ms` | `<=250ms` | `<=250ms` | `211ms` |
+
+Conclusion:
+
+- DBOS-style worker path is still in the target `50K-60K/sec` band on the
+  100K profile.
+- The 5-minute soak is stable and close to the previous dashboard-soak class:
+  `48.5K flow_ops/sec`, `96.0K writes/sec`, no WARaft commit timeouts, and LMDB
+  lag around one second worst case.
+- The soak is slightly below the requested `50K/sec` target, but operationally
+  clean. Remaining work is latency/throughput tuning rather than correctness or
+  projection lag repair.

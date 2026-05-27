@@ -10,8 +10,6 @@ config :ferricstore, :ferricstore_wal_nif,
   skip_compilation?: not build_native?,
   load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
 
-config :ra, logger_module: Ferricstore.Raft.SafeRaLogger
-
 # TCP server port (default: 6379, matches Redis)
 config :ferricstore, :port, 6379
 
@@ -23,7 +21,10 @@ config :ferricstore, :shard_count, 0
 
 # Production durability path. WARaft with async segment append is the only
 # runtime backend. Keep this simple: no Ra/WARaft mode flag in normal config.
-config :ferricstore, flow_async_history: true
+config :ferricstore,
+  flow_async_history: true,
+  wal_commit_delay_us: 6_000,
+  waraft_commit_batch_max: 10_000
 
 # LFU decay: minutes per decay step (0 = no decay). Matches Redis lfu-decay-time.
 config :ferricstore, :lfu_decay_time, 1

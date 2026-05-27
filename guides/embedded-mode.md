@@ -761,7 +761,7 @@ If you routinely store values larger than 64 KB, consider:
 
 ## Testing
 
-With the instance-based architecture, each test gets its own fully isolated FerricStore instance -- separate shards, ETS tables, Raft WAL, and data directory. No shared state, supporting `async: true`.
+With the instance-based architecture, each test gets its own fully isolated FerricStore instance -- separate shards, ETS tables, WARaft segments, and data directory. No shared state, supporting `async: true`.
 
 ```elixir
 defmodule MyApp.CacheTest do

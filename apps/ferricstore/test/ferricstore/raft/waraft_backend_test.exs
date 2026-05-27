@@ -1369,28 +1369,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
-  test "WARaft default commit batch interval follows WAL commit delay floor" do
-    previous_commit_interval = Application.get_env(:ferricstore, :waraft_commit_batch_interval_ms)
-    previous_wal_delay = Application.get_env(:ferricstore, :wal_commit_delay_us)
+  test "WARaft default commit batch interval uses the production server config" do
+    assert 6 == WARaftBackend.default_commit_batch_interval_ms()
+  end
 
-    try do
-      Application.delete_env(:ferricstore, :waraft_commit_batch_interval_ms)
-
-      Application.put_env(:ferricstore, :wal_commit_delay_us, 0)
-      assert 0 == WARaftBackend.default_commit_batch_interval_ms()
-
-      Application.put_env(:ferricstore, :wal_commit_delay_us, 100)
-      assert 1 == WARaftBackend.default_commit_batch_interval_ms()
-
-      Application.put_env(:ferricstore, :wal_commit_delay_us, 6_000)
-      assert 1 == WARaftBackend.default_commit_batch_interval_ms()
-
-      Application.put_env(:ferricstore, :waraft_commit_batch_interval_ms, 7)
-      assert 7 == WARaftBackend.default_commit_batch_interval_ms()
-    after
-      restore_env(:waraft_commit_batch_interval_ms, previous_commit_interval)
-      restore_env(:wal_commit_delay_us, previous_wal_delay)
-    end
+  test "WARaft production commit batch cap uses the production server config" do
+    assert 10_000 == WARaftBackend.default_commit_batch_max()
   end
 
   test "WARaft redirect timeouts keep unknown-outcome semantics" do
@@ -8177,8 +8161,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
     state_key = Ferricstore.Flow.Keys.state_key(flow_id, partition)
 
-    assert [{^state_key, nil, 0, {:flow_state_version, _version, _lfu},
-             {:waraft_apply_projection, _index}, 0, _value_size}] =
+    assert [
+             {^state_key, nil, 0, {:flow_state_version, _version, _lfu},
+              {:waraft_apply_projection, _index}, 0, _value_size}
+           ] =
              :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
     assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) >

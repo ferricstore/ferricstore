@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow.LMDB do
 
   @default_map_size 64 * 1024 * 1024 * 1024
   @terminal_count_cache :ferricstore_flow_lmdb_terminal_count_cache
+  @u64_decimal_zero_pad "00000000000000000000"
 
   def enabled?, do: true
 
@@ -117,6 +118,14 @@ defmodule Ferricstore.Flow.LMDB do
       else: {:ok, []}
   end
 
+  def prefix_entries_after(path, prefix, after_key, limit)
+      when is_binary(path) and is_binary(prefix) and is_binary(after_key) and
+             is_integer(limit) and limit >= 0 do
+    if Ferricstore.FS.dir?(path),
+      do: NIF.lmdb_prefix_entries_after(path, prefix, after_key, limit, map_size()),
+      else: {:ok, []}
+  end
+
   def prefix_entries(path, prefix, limit, false), do: prefix_entries(path, prefix, limit)
 
   def prefix_entries(path, prefix, limit, true)
@@ -168,6 +177,70 @@ defmodule Ferricstore.Flow.LMDB do
 
   def terminal_by_state_global_prefix, do: "flow-terminal-by-state:"
 
+  def active_index_global_prefix, do: "flow-active-index:"
+
+  def active_index_prefix(index_key) when is_binary(index_key) do
+    active_index_global_prefix() <> index_key <> <<0>>
+  end
+
+  def active_index_key(index_key, id, score)
+      when is_binary(index_key) and is_binary(id) and is_integer(score) do
+    active_index_prefix(index_key) <> pad_u64(score) <> <<0>> <> id
+  end
+
+  def active_by_state_key_key(state_key) when is_binary(state_key) do
+    "flow-active-by-state:" <> state_key
+  end
+
+  def active_by_state_global_prefix, do: "flow-active-by-state:"
+
+  def active_index_put_ops(state_key, record, expire_at_ms)
+      when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) do
+    {ops, _reverse_value} = active_index_put_ops_with_reverse(state_key, record, expire_at_ms)
+    ops
+  end
+
+  def active_index_put_ops_with_reverse(state_key, record, expire_at_ms)
+      when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) do
+    entries = active_flow_index_entries(record)
+
+    active_ops =
+      Enum.map(entries, fn {index_key, id, score} ->
+        active_key = active_index_key(index_key, id, score)
+        value = encode_active_index_value(index_key, id, score, expire_at_ms, state_key)
+        {:put, active_key, value}
+      end)
+
+    active_keys = Enum.map(active_ops, fn {:put, key, _value} -> key end)
+    reverse_value = encode_active_index_reverse_value(active_keys)
+
+    {
+      [{:put, active_by_state_key_key(state_key), reverse_value} | active_ops],
+      reverse_value
+    }
+  end
+
+  def active_index_delete_ops_from_reverse(state_key, reverse_value) when is_binary(state_key) do
+    reverse_key = active_by_state_key_key(state_key)
+
+    case decode_active_index_reverse_value(reverse_value) do
+      {:ok, active_keys} ->
+        [{:delete, reverse_key} | Enum.map(active_keys, &{:delete, &1})]
+
+      :error ->
+        [{:delete, reverse_key}]
+    end
+  end
+
+  def active_index_delete_ops(path, state_key) when is_binary(path) and is_binary(state_key) do
+    reverse_key = active_by_state_key_key(state_key)
+
+    case get(path, reverse_key) do
+      {:ok, reverse_value} -> active_index_delete_ops_from_reverse(state_key, reverse_value)
+      _ -> [{:delete, reverse_key}]
+    end
+  end
+
   def query_index_prefix(index_key) when is_binary(index_key) do
     "flow-query-index:" <> index_key <> <<0>>
   end
@@ -211,6 +284,146 @@ defmodule Ferricstore.Flow.LMDB do
   def history_expire_prefix, do: "flow-history-expire:"
 
   def history_flow_expire_prefix, do: "flow-history-flow-expire:"
+
+  def segment_value_pin_prefix, do: "flow-segment-value-pin:"
+
+  def segment_value_pin_prefix(tag) when tag in [:waraft_apply_projection] do
+    segment_value_pin_prefix() <> "batch:" <> Atom.to_string(tag) <> ":"
+  end
+
+  def segment_value_pin_key({tag, index}, value_key)
+      when tag in [:waraft_apply_projection] and is_integer(index) and index > 0 and
+             is_binary(value_key) do
+    segment_value_pin_prefix(tag) <> pad_u64(index) <> <<0>> <> value_key
+  end
+
+  def segment_value_pin_key(_file_id, _value_key), do: nil
+
+  def encode_segment_value_pin_batch(file_id, entries)
+      when is_list(entries) and tuple_size(file_id) == 2 do
+    :erlang.term_to_binary({:flow_segment_value_pin_batch, 1, file_id, entries})
+  end
+
+  def segment_value_pin_put_ops(value_key, expire_at_ms, file_id, offset, value_size) do
+    segment_value_pin_batch_put_ops([{value_key, expire_at_ms, file_id, offset, value_size}])
+  end
+
+  def segment_value_pin_batch_put_ops(entries) when is_list(entries) do
+    normalized = normalize_segment_value_pin_entries(entries)
+
+    value_ops =
+      Enum.map(normalized, fn %{
+                                key: key,
+                                expire_at_ms: expire_at_ms,
+                                file_id: file_id,
+                                offset: offset,
+                                value_size: value_size
+                              } ->
+        {:put, key, encode_value_locator(expire_at_ms, file_id, offset, value_size)}
+      end)
+
+    pin_ops =
+      normalized
+      |> Enum.group_by(& &1.file_id)
+      |> Enum.map(fn {file_id, group} ->
+        batch_entries =
+          Enum.map(group, fn %{
+                               key: key,
+                               expire_at_ms: expire_at_ms,
+                               offset: offset,
+                               value_size: value_size
+                             } ->
+            {key, expire_at_ms, offset, value_size}
+          end)
+
+        {:put, segment_value_pin_batch_key(file_id, batch_entries),
+         encode_segment_value_pin_batch(file_id, batch_entries)}
+      end)
+
+    value_ops ++ pin_ops
+  end
+
+  defp normalize_segment_value_pin_entries(entries) do
+    entries
+    |> Enum.flat_map(fn
+      %{
+        key: key,
+        expire_at_ms: expire_at_ms,
+        source_file_id: file_id,
+        source_offset: offset,
+        source_value_size: value_size
+      } ->
+        normalize_segment_value_pin_entry(key, expire_at_ms, file_id, offset, value_size)
+
+      %{
+        key: key,
+        expire_at_ms: expire_at_ms,
+        file_id: file_id,
+        offset: offset,
+        value_size: value_size
+      } ->
+        normalize_segment_value_pin_entry(key, expire_at_ms, file_id, offset, value_size)
+
+      {key, expire_at_ms, file_id, offset, value_size} ->
+        normalize_segment_value_pin_entry(key, expire_at_ms, file_id, offset, value_size)
+
+      _other ->
+        []
+    end)
+  end
+
+  defp normalize_segment_value_pin_entry(
+         key,
+         expire_at_ms,
+         {:waraft_apply_projection, index} = file_id,
+         offset,
+         value_size
+       )
+       when is_binary(key) and is_integer(expire_at_ms) and is_integer(index) and index > 0 and
+              is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 do
+    [
+      %{
+        key: key,
+        expire_at_ms: expire_at_ms,
+        file_id: file_id,
+        offset: offset,
+        value_size: value_size
+      }
+    ]
+  end
+
+  defp normalize_segment_value_pin_entry(_key, _expire_at_ms, _file_id, _offset, _value_size),
+    do: []
+
+  defp segment_value_pin_batch_key({:waraft_apply_projection, index} = file_id, entries)
+       when is_integer(index) and index > 0 and is_list(entries) do
+    prefix = segment_value_pin_prefix(:waraft_apply_projection)
+    digest = :crypto.hash(:sha256, :erlang.term_to_binary({file_id, entries}))
+    prefix <> pad_u64(index) <> <<0>> <> digest
+  end
+
+  defp segment_value_pin_batch_key(file_id, _entries),
+    do: segment_value_pin_prefix() <> inspect(file_id)
+
+  def segment_value_pin_delete_ops(value_key, file_id) do
+    case segment_value_pin_key(file_id, value_key) do
+      pin_key when is_binary(pin_key) -> [{:delete, pin_key}]
+      nil -> []
+    end
+  end
+
+  def segment_value_pin_entries_before(path, trim_index, limit)
+      when is_binary(path) and is_integer(trim_index) and trim_index > 0 and is_integer(limit) and
+             limit > 0 do
+    fetch_limit = limit + 1
+
+    with {:ok, entries} <-
+           prefix_entries(path, segment_value_pin_prefix(:waraft_apply_projection), fetch_limit) do
+      decode_segment_value_pin_entries_before(entries, trim_index, limit)
+    end
+  end
+
+  def segment_value_pin_entries_before(_path, _trim_index, _limit), do: {:ok, []}
 
   def history_expire_key(expire_at_ms, history_index_key)
       when is_integer(expire_at_ms) and expire_at_ms > 0 and is_binary(history_index_key) do
@@ -287,15 +500,65 @@ defmodule Ferricstore.Flow.LMDB do
     :erlang.term_to_binary({id, normalize_ms(updated_at_ms), expire_at_ms, state_key})
   end
 
+  def encode_active_index_value(index_key, id, score, expire_at_ms, state_key)
+      when is_binary(index_key) and is_binary(id) and is_integer(score) and
+             is_integer(expire_at_ms) and is_binary(state_key) do
+    :erlang.term_to_binary({index_key, id, score, expire_at_ms, state_key})
+  end
+
+  def decode_active_index_value(blob) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      {index_key, id, score, expire_at_ms, state_key}
+      when is_binary(index_key) and is_binary(id) and is_integer(score) and
+             is_integer(expire_at_ms) and is_binary(state_key) ->
+        {:ok, {index_key, id, score, expire_at_ms, state_key}}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  def encode_active_index_reverse_value(active_keys) when is_list(active_keys) do
+    active_keys =
+      Enum.filter(active_keys, fn
+        active_key when is_binary(active_key) -> true
+        _ -> false
+      end)
+
+    :erlang.term_to_binary(active_keys)
+  end
+
+  def decode_active_index_reverse_value(blob) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      active_keys when is_list(active_keys) ->
+        active_keys =
+          Enum.filter(active_keys, fn
+            active_key when is_binary(active_key) -> true
+            _ -> false
+          end)
+
+        {:ok, active_keys}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
+
   def delete_state_artifacts(path, state_key) when is_binary(path) and is_binary(state_key) do
     reverse_key = terminal_by_state_key_key(state_key)
+    active_ops = active_index_delete_ops(path, state_key)
 
     case get(path, reverse_key) do
       {:ok, terminal_key} when is_binary(terminal_key) ->
-        delete_terminal_index_entry(path, terminal_key, state_key)
+        ops = terminal_index_delete_ops(path, terminal_key, state_key) ++ active_ops
+        write_batch(path, ops)
 
       _ ->
-        write_batch(path, [{:delete, state_key}, {:delete, reverse_key}])
+        write_batch(path, [{:delete, state_key}, {:delete, reverse_key} | active_ops])
     end
   end
 
@@ -740,6 +1003,53 @@ defmodule Ferricstore.Flow.LMDB do
     _ -> :error
   end
 
+  defp active_flow_index_entries(record) do
+    id = Map.fetch!(record, :id)
+    type = Map.fetch!(record, :type)
+    state = Map.fetch!(record, :state)
+    partition_key = Map.get(record, :partition_key)
+    updated_score = normalize_ms(Map.get(record, :updated_at_ms, 0))
+    state_index_key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
+
+    [{state_index_key, id, updated_score}]
+    |> maybe_add_due_active_entry(record, partition_key)
+    |> maybe_add_running_active_entries(record, partition_key)
+  end
+
+  defp maybe_add_due_active_entry(
+         entries,
+         %{next_run_at_ms: next_run_at_ms} = record,
+         partition_key
+       )
+       when is_integer(next_run_at_ms) do
+    priority = Map.get(record, :priority, 0)
+    due_key = Ferricstore.Flow.Keys.due_key(record.type, record.state, priority, partition_key)
+    [{due_key, record.id, normalize_ms(next_run_at_ms)} | entries]
+  end
+
+  defp maybe_add_due_active_entry(entries, _record, _partition_key), do: entries
+
+  defp maybe_add_running_active_entries(
+         entries,
+         %{state: "running", lease_deadline_ms: lease_deadline_ms} = record,
+         partition_key
+       )
+       when is_integer(lease_deadline_ms) do
+    score = normalize_ms(lease_deadline_ms)
+    inflight_key = Ferricstore.Flow.Keys.inflight_index_key(record.type, partition_key)
+
+    worker_key =
+      Ferricstore.Flow.Keys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
+
+    [
+      {worker_key, record.id, score},
+      {inflight_key, record.id, score}
+      | entries
+    ]
+  end
+
+  defp maybe_add_running_active_entries(entries, _record, _partition_key), do: entries
+
   def terminal_index_count_key(blob) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
       {_id, _updated_at_ms, _expire_at_ms, _state_key, count_key} when is_binary(count_key) ->
@@ -1083,10 +1393,108 @@ defmodule Ferricstore.Flow.LMDB do
     end
   end
 
+  defp decode_segment_value_pin_entries_before(entries, trim_index, limit) do
+    entries
+    |> Enum.reduce_while({:ok, [], false}, fn entry, {:ok, acc, _future?} ->
+      case decode_segment_value_pin_entry(entry) do
+        {:ok, %{file_id: {_tag, index}} = pin} when index < trim_index ->
+          pins = List.wrap(pin.pins)
+
+          if length(acc) + length(pins) > limit do
+            {:halt, {:error, {:flow_segment_value_pin_scan_limit, limit}}}
+          else
+            {:cont, {:ok, :lists.reverse(pins, acc), false}}
+          end
+
+        {:ok, %{file_id: {_tag, index}}} when index >= trim_index ->
+          {:halt, {:ok, acc, true}}
+
+        :skip ->
+          {:cont, {:ok, acc, false}}
+      end
+    end)
+    |> case do
+      {:ok, pins, saw_future?} ->
+        if length(entries) > limit and not saw_future? do
+          {:error, {:flow_segment_value_pin_scan_limit, limit}}
+        else
+          {:ok, Enum.reverse(pins)}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp decode_segment_value_pin_entry({pin_key, blob})
+       when is_binary(pin_key) and is_binary(blob) do
+    with {:ok, {tag, index}} <- decode_segment_value_pin_key(pin_key),
+         {:ok, {{^tag, ^index} = file_id, entries}} <-
+           decode_segment_value_pin_batch_value(blob) do
+      pins =
+        entries
+        |> Enum.flat_map(fn
+          {value_key, expire_at_ms, offset, value_size}
+          when is_binary(value_key) and is_integer(expire_at_ms) and is_integer(offset) and
+                 offset >= 0 and is_integer(value_size) and value_size >= 0 ->
+            [
+              %{
+                key: value_key,
+                expire_at_ms: expire_at_ms,
+                file_id: file_id,
+                offset: offset,
+                value_size: value_size,
+                pin_key: pin_key
+              }
+            ]
+
+          _bad ->
+            []
+        end)
+
+      {:ok, %{file_id: file_id, pin_key: pin_key, pins: pins}}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp decode_segment_value_pin_entry(_entry), do: :skip
+
+  defp decode_segment_value_pin_key(pin_key) do
+    prefix = segment_value_pin_prefix(:waraft_apply_projection)
+    prefix_size = byte_size(prefix)
+
+    with true <- byte_size(pin_key) > prefix_size + 21,
+         ^prefix <- binary_part(pin_key, 0, prefix_size),
+         digits <- binary_part(pin_key, prefix_size, 20),
+         <<0>> <- binary_part(pin_key, prefix_size + 20, 1),
+         {index, ""} <- Integer.parse(digits) do
+      {:ok, {:waraft_apply_projection, index}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp decode_segment_value_pin_batch_value(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      {:flow_segment_value_pin_batch, 1, {:waraft_apply_projection, index} = file_id, entries}
+      when is_integer(index) and index > 0 and is_list(entries) ->
+        {:ok, {file_id, entries}}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
+
   defp pad_u64(value) do
-    value
-    |> Integer.to_string()
-    |> String.pad_leading(20, "0")
+    encoded = Integer.to_string(value)
+
+    case byte_size(encoded) do
+      size when size < 20 -> binary_part(@u64_decimal_zero_pad, 0, 20 - size) <> encoded
+      _size -> encoded
+    end
   end
 
   defp normalize_ms(value) when is_integer(value), do: value

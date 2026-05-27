@@ -681,8 +681,8 @@ defmodule Ferricstore.CrossShardOp do
 
   # The ferricstore state machine wraps every reply as `{:applied_at, ra_index, real}`
   # so the Batcher can gate on local-apply for read-your-write. CrossShardOp uses
-  # `:ra.process_command/2` which surfaces that wrap directly to the caller —
-  # unwrap before pattern-matching against `{:ok, :ok, _}` etc.
+  # Direct command submission surfaces that wrap to the caller, so unwrap before
+  # pattern-matching against `{:ok, :ok, _}` etc.
   defp unwrap_ra_reply({:ok, {:applied_at, _idx, real}, leader}), do: {:ok, real, leader}
   defp unwrap_ra_reply(other), do: other
 end

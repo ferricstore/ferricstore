@@ -115,12 +115,9 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "WARaft remote join skips legacy data sync and target Ra stop/start" do
+    test "WARaft remote join uses the WARaft add/barrier/marker path" do
       target = :"waraft_join_target@127.0.0.1"
       parent = self()
-      previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
         {:ok, false}
@@ -163,7 +160,6 @@ defmodule Ferricstore.Cluster.ManagerTest do
       end)
 
       on_exit(fn ->
-        restore_backend(previous_backend)
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
         Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
@@ -201,9 +197,6 @@ defmodule Ferricstore.Cluster.ManagerTest do
     test "WARaft partial add rolls back shards that were newly added" do
       target = :"waraft_partial_add_target@127.0.0.1"
       parent = self()
-      previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
 
       Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 2 ->
         {:ok, false}
@@ -229,7 +222,6 @@ defmodule Ferricstore.Cluster.ManagerTest do
       end)
 
       on_exit(fn ->
-        restore_backend(previous_backend)
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
@@ -1396,7 +1388,4 @@ defmodule Ferricstore.Cluster.ManagerTest do
       assert Manager.mode() == :standalone
     end
   end
-
-  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
-  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
 end

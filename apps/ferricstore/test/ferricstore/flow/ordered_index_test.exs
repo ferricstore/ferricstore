@@ -6,9 +6,39 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
   alias Ferricstore.Flow.Keys, as: FlowKeys
 
   setup do
-    index = :ets.new(:flow_ordered_index_test_index, [:ordered_set])
-    lookup = :ets.new(:flow_ordered_index_test_lookup, [:set])
+    instance_name = :"flow_ordered_index_test_#{System.unique_integer([:positive, :monotonic])}"
+    {index, lookup} = OrderedIndex.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(index, lookup)
+
     {:ok, index: index, lookup: lookup}
+  end
+
+  test "native bulk delete removes members across keys in one call", %{
+    index: index,
+    lookup: lookup
+  } do
+    native = NativeOrderedIndex.get(index, lookup)
+
+    :ok =
+      NativeOrderedIndex.put_entries(native, [
+        {"history:1", "1000-1", 1_000},
+        {"history:1", "1001-2", 1_001},
+        {"history:2", "1000-1", 1_000},
+        {"history:2", "1001-2", 1_001}
+      ])
+
+    assert :ok =
+             NativeOrderedIndex.delete_entries(native, [
+               {"history:1", "1000-1"},
+               {"history:2", "1001-2"},
+               {"history:missing", "1000-1"}
+             ])
+
+    assert NativeOrderedIndex.range_slice(native, "history:1", :neg_inf, :inf, false, 0, :all) ==
+             [{"1001-2", 1_001.0}]
+
+    assert NativeOrderedIndex.range_slice(native, "history:2", :neg_inf, :inf, false, 0, :all) ==
+             [{"1000-1", 1_000.0}]
   end
 
   test "native claim planner encodes next state and index entry" do
@@ -90,6 +120,103 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert entry ==
              {"flow-1", from_due_key, 20.0, to_due_key, 75.0, from_state_key, 11.0, to_state_key,
               25.0, inflight_key, worker_key, 75.0}
+  end
+
+  test "native claim planner can produce history-ready claim entries" do
+    partition_key = "tenant-a"
+
+    record = %{
+      id: "flow-1",
+      type: "email",
+      state: "queued",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 10,
+      updated_at_ms: 11,
+      next_run_at_ms: 20,
+      priority: 0,
+      ttl_ms: nil,
+      history_hot_max_events: 1,
+      history_max_events: 10,
+      retention_ttl_ms: nil,
+      terminal_retention_until_ms: nil,
+      partition_key: partition_key,
+      payload_ref: "payload-1",
+      parent_flow_id: nil,
+      parent_partition_key: nil,
+      root_flow_id: "flow-1",
+      correlation_id: nil,
+      result_ref: nil,
+      error_ref: nil,
+      lease_owner: nil,
+      lease_token: nil,
+      lease_deadline_ms: nil,
+      run_state: "queued",
+      rewound_to_event_id: nil,
+      child_groups: %{}
+    }
+
+    tag = FlowKeys.tag(partition_key)
+    from_due_key = FlowKeys.due_key("email", "queued", 0, partition_key)
+    to_due_key = FlowKeys.due_key("email", "running", 0, partition_key)
+    from_state_key = FlowKeys.state_index_key("email", "queued", partition_key)
+    to_state_key = FlowKeys.state_index_key("email", "running", partition_key)
+    inflight_key = FlowKeys.inflight_index_key("email", partition_key)
+    worker_key = FlowKeys.worker_index_key("worker-a", partition_key)
+    state_key_prefix = FlowKeys.state_key("", partition_key)
+    history_key_prefix = "f:" <> tag <> ":h:"
+
+    assert {:ok,
+            [
+              {
+                next_value,
+                _entry,
+                state_key,
+                11,
+                {history_key, event_id, event_ms, 2, history_entry_key, history_value, 1, 10,
+                 false}
+              }
+            ], [], 1} =
+             NativeOrderedIndex.plan_claims_with_history(
+               [{"flow-1", 20.0}],
+               [Ferricstore.Flow.encode_record(record)],
+               "email",
+               "queued",
+               "worker-a",
+               50,
+               25,
+               10,
+               from_due_key,
+               to_due_key,
+               from_state_key,
+               to_state_key,
+               inflight_key,
+               worker_key,
+               state_key_prefix,
+               history_key_prefix
+             )
+
+    next = Ferricstore.Flow.decode_record(next_value)
+
+    assert history_value == Ferricstore.Flow.encode_history_fields(next, "claimed", 25, %{})
+
+    history_fields =
+      history_value
+      |> Ferricstore.Flow.decode_history_fields(next)
+      |> Enum.chunk_every(2)
+      |> Map.new(fn [key, value] -> {key, value} end)
+
+    assert state_key == FlowKeys.state_key("flow-1", partition_key)
+    assert history_key == FlowKeys.history_key("flow-1", partition_key)
+    assert event_id == "25-2"
+    assert event_ms == 25
+    assert history_entry_key == FlowKeys.stream_entry_key("flow-1", event_id, partition_key)
+    assert history_fields["event"] == "claimed"
+    assert history_fields["version"] == "2"
+    assert history_fields["state"] == "running"
+    assert history_fields["lease_owner"] == "worker-a"
+    assert history_fields["lease_deadline_ms"] == "75"
   end
 
   test "native claim planner reports stale missing records and skips state mismatches" do
@@ -240,7 +367,6 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert :ok = OrderedIndex.delete_members(index, lookup, "worker:empty", ["flow-1"])
 
     assert 0 = OrderedIndex.count_all(lookup, "worker:empty")
-    assert [] = :ets.lookup(lookup, {:count, "worker:empty"})
     assert [] = OrderedIndex.count_keys(lookup)
   end
 
@@ -265,14 +391,16 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert [due_b] == OrderedIndex.due_count_keys(lookup)
   end
 
-  test "due_count_keys filters legacy positive counts", %{
+  test "due_count_keys filters positive native counts", %{
+    index: index,
     lookup: lookup
   } do
     due_key = "f:{f:legacy}:d:email:queued:p0"
     non_due_key = "f:{f:legacy}:i:s:email:queued"
+    native = NativeOrderedIndex.get(index, lookup)
 
-    :ets.insert(lookup, {{:count, due_key}, 2})
-    :ets.insert(lookup, {{:count, non_due_key}, 2})
+    assert :ok = NativeOrderedIndex.restore_count(native, due_key, 2)
+    assert :ok = NativeOrderedIndex.restore_count(native, non_due_key, 2)
 
     assert [due_key] == OrderedIndex.due_count_keys(lookup)
   end
@@ -323,7 +451,7 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert_index_invariants(index, lookup)
   end
 
-  test "native ordered index matches ETS ordered index core semantics", %{
+  test "native ordered index facade matches native core semantics", %{
     index: index,
     lookup: lookup
   } do
@@ -380,14 +508,13 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
              NativeOrderedIndex.rank_range(native, "running", 0, 10, false)
   end
 
-  test "native ordered index rebuilds and registers from ETS", %{
+  test "native ordered index facade writes directly to native storage", %{
     index: index,
     lookup: lookup
   } do
     due_key = "f:{f:native}:d:email:queued:p0"
 
     assert :ok = OrderedIndex.put_members(index, lookup, due_key, [{"flow-1", 1}])
-    assert :ok = NativeOrderedIndex.rebuild_from_ets(index, lookup)
 
     native = NativeOrderedIndex.get(index, lookup)
 
@@ -483,6 +610,22 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
              ])
   end
 
+  test "native apply_batch preserves grouped op order for duplicate members" do
+    native = NativeOrderedIndex.new()
+
+    assert :ok =
+             NativeOrderedIndex.apply_batch(native, [
+               {:put_entries, [{"idx", "flow-1", 1}]},
+               {:put_entries, [{"idx", "flow-1", 2}]},
+               {:move_entries, [{"idx", "running", "flow-1", 3}]},
+               {:move_entries, [{"running", "later", "flow-1", 4}]}
+             ])
+
+    assert [] = NativeOrderedIndex.rank_range(native, "idx", 0, 10, false)
+    assert [] = NativeOrderedIndex.rank_range(native, "running", 0, 10, false)
+    assert [{"flow-1", 4.0}] = NativeOrderedIndex.rank_range(native, "later", 0, 10, false)
+  end
+
   test "native take_due returns due members in order and removes them" do
     native = NativeOrderedIndex.new()
 
@@ -502,29 +645,9 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
   end
 
   defp assert_index_invariants(index, lookup) do
-    lookup_entries =
-      lookup
-      |> :ets.tab2list()
-      |> Enum.filter(fn
-        {{:count, _key}, _count} -> false
-        {{_key, _member}, _score} -> true
-      end)
-
-    index_entries = :ets.tab2list(index)
-
-    counts =
-      Enum.reduce(lookup_entries, %{}, fn {{key, member}, score}, acc ->
-        assert :ets.member(index, {key, score, member})
-        Map.update(acc, key, 1, &(&1 + 1))
-      end)
-
-    Enum.each(index_entries, fn
-      {{key, score, member}, true} ->
-        assert [{{^key, ^member}, ^score}] = :ets.lookup(lookup, {key, member})
-    end)
-
-    Enum.each(counts, fn {key, count} ->
-      assert count == OrderedIndex.count_all(lookup, key)
+    Enum.each(OrderedIndex.count_keys(lookup), fn key ->
+      members = OrderedIndex.range_slice(index, key, :neg_inf, :inf, false, 0, :all)
+      assert length(members) == OrderedIndex.count_all(lookup, key)
     end)
   end
 end

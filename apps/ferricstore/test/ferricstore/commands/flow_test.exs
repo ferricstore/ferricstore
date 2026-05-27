@@ -138,7 +138,7 @@ defmodule Ferricstore.Commands.FlowTest do
                  "RETENTION_TTL",
                  "60000",
                  "HISTORY_HOT_MAX_EVENTS",
-                 "5",
+                 "0",
                  "HISTORY_MAX_EVENTS",
                  "25"
                ],
@@ -151,6 +151,7 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "root_flow_id" => "checkout-root",
              "correlation_id" => "order-123",
+             "history_hot_max_events" => 0,
              "history_max_events" => 25
            } =
              Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
@@ -1396,6 +1397,53 @@ defmodule Ferricstore.Commands.FlowTest do
     assert is_integer(fencing_token)
   end
 
+  test "dispatches Flow claim_due with compact job-state return through Rust AST" do
+    type = uid("flow-command-claim-jobs-compact-state")
+    id = uid("flow-command-claim-jobs-compact-state-id")
+    partition_key = uid("tenant")
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 id,
+                 "TYPE",
+                 type,
+                 "STATE",
+                 "ready",
+                 "PARTITION",
+                 partition_key,
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000"
+               ],
+               MockStore.make()
+             )
+
+    assert [[^id, ^partition_key, lease_token, fencing_token, "ready"]] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 type,
+                 "WORKER",
+                 "worker-a",
+                 "LIMIT",
+                 "1",
+                 "NOW",
+                 "1000",
+                 "PARTITION",
+                 partition_key,
+                 "RETURN",
+                 "JOBS_COMPACT_STATE"
+               ],
+               MockStore.make()
+             )
+
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
+  end
+
   test "dispatches Flow claim_due with any partition and repeated states through Rust AST" do
     type = uid("flow-command-claim-any")
     partition = uid("tenant")
@@ -1605,7 +1653,7 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch_ast(
                {:flow_policy_set, type,
                 [
-                  retention: [ttl_ms: 60_000, history_hot_max_events: 32, history_max_events: 320],
+                  retention: [ttl_ms: 60_000, history_max_events: 320],
                   retry: [
                     max_retries: 5,
                     backoff: [kind: :fixed, base_ms: 1_000, max_ms: 5_000, jitter_pct: 0],
@@ -1616,7 +1664,6 @@ defmodule Ferricstore.Commands.FlowTest do
                       retry: [max_retries: 1, exhausted_to: "payment_failed"],
                       retention: [
                         ttl_ms: 30_000,
-                        history_hot_max_events: 16,
                         history_max_events: 160
                       ]
                     ]
@@ -1628,11 +1675,15 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "retention" => %{
                "ttl_ms" => 60_000,
-               "history_hot_max_events" => 32,
                "history_max_events" => 320
              }
            } =
              Dispatcher.dispatch_ast({:flow_policy_get, type, []}, MockStore.make())
+
+    refute Map.has_key?(
+             Dispatcher.dispatch_ast({:flow_policy_get, type, []}, MockStore.make())["retention"],
+             "history_hot_max_events"
+           )
 
     assert %{
              "type" => ^type,
@@ -1640,7 +1691,6 @@ defmodule Ferricstore.Commands.FlowTest do
              "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
              "retention" => %{
                "ttl_ms" => 30_000,
-               "history_hot_max_events" => 16,
                "history_max_events" => 160
              }
            } =
@@ -1682,8 +1732,6 @@ defmodule Ferricstore.Commands.FlowTest do
                  "0",
                  "RETENTION_TTL",
                  "60000",
-                 "HISTORY_HOT_MAX_EVENTS",
-                 "32",
                  "HISTORY_MAX_EVENTS",
                  "320",
                  "EXHAUSTED_TO",
@@ -1696,8 +1744,6 @@ defmodule Ferricstore.Commands.FlowTest do
                  "payment_failed",
                  "RETENTION_TTL",
                  "30000",
-                 "HISTORY_HOT_MAX_EVENTS",
-                 "16",
                  "HISTORY_MAX_EVENTS",
                  "160"
                ],
@@ -1707,11 +1753,15 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "retention" => %{
                "ttl_ms" => 60_000,
-               "history_hot_max_events" => 32,
                "history_max_events" => 320
              }
            } =
              Dispatcher.dispatch("FLOW.POLICY.GET", [type], MockStore.make())
+
+    refute Map.has_key?(
+             Dispatcher.dispatch("FLOW.POLICY.GET", [type], MockStore.make())["retention"],
+             "history_hot_max_events"
+           )
 
     assert %{
              "type" => ^type,
@@ -1719,7 +1769,6 @@ defmodule Ferricstore.Commands.FlowTest do
              "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
              "retention" => %{
                "ttl_ms" => 30_000,
-               "history_hot_max_events" => 16,
                "history_max_events" => 160
              }
            } =
@@ -1733,6 +1782,13 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch(
                "FLOW.POLICY.SET",
                [type, "STATE", "queued", "MAX_RETRIES"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR flow retention history_hot_max_events is internal"} =
+             Dispatcher.dispatch(
+               "FLOW.POLICY.SET",
+               [type, "HISTORY_HOT_MAX_EVENTS", "1"],
                MockStore.make()
              )
   end
