@@ -6,6 +6,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
+  alias Ferricstore.Raft.WARaftStorage
   alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
@@ -46,6 +47,22 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
   def handle_commit_timeout_telemetry(event, measurements, metadata, parent) do
     send(parent, {:waraft_commit_timeout, event, measurements, metadata})
+  end
+
+  def handle_storage_startup_phase_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:waraft_storage_startup_phase, event, measurements, metadata})
+  end
+
+  def handle_storage_apply_phase_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:waraft_storage_apply_phase, event, measurements, metadata})
+  end
+
+  def handle_segment_projection_checkpoint_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:waraft_segment_projection_checkpoint, event, measurements, metadata})
+  end
+
+  def handle_segment_projection_trim_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:waraft_segment_projection_trim, event, measurements, metadata})
   end
 
   def handle_store_unavailable_telemetry(event, measurements, metadata, parent) do
@@ -252,6 +269,53 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  test "unified segment storage keeps Flow value and history payloads cold", %{ctx: ctx} do
+    previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      normal_key = "segment-keydir:hot-normal"
+      flow_value_key = Ferricstore.Flow.Keys.value_key("cold-flow", :payload, 1, "tenant-cold")
+      flow_history_key = Ferricstore.Flow.Keys.history_key("cold-flow", "tenant-cold")
+
+      assert {:ok, [:ok, :ok, :ok]} =
+               WARaftBackend.write_put_batch(0, [
+                 {normal_key, "normal", 0},
+                 {flow_value_key, "small-payload-value", 0},
+                 {flow_history_key, "small-history-value", 0}
+               ])
+
+      assert [{^normal_key, "normal", 0, _lfu, {:waraft_segment, _index}, _offset, 6}] =
+               :ets.lookup(elem(ctx.keydir_refs, 0), normal_key)
+
+      assert [
+               {^flow_value_key, nil, 0, _lfu, {:waraft_segment, value_index}, value_offset,
+                value_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), flow_value_key)
+
+      assert is_integer(value_index) and value_index > 0
+      assert is_integer(value_offset) and value_offset >= 0
+      assert value_size == byte_size("small-payload-value")
+
+      assert [
+               {^flow_history_key, nil, 0, _lfu, {:waraft_segment, history_index}, history_offset,
+                history_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), flow_history_key)
+
+      assert is_integer(history_index) and history_index > 0
+      assert is_integer(history_offset) and history_offset >= 0
+      assert history_size == byte_size("small-history-value")
+
+      assert "small-payload-value" == Router.get(ctx, flow_value_key)
+      assert "small-history-value" == Router.get(ctx, flow_history_key)
+    after
+      restore_env(:waraft_storage_apply_mode, previous_mode)
+    end
+  end
+
   test "unified segment string put reuses the keydir lookup before compound clear" do
     source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
 
@@ -423,82 +487,51 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
       clear_apply_projection_cache!()
 
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-      id = "segment-keydir:flow-trim-cache"
-      partition = flow_partition_for_shard(ctx, id, 0)
+      payload_ref = "f:{segment-keydir-flow-trim-cache}:v:p:segment-keydir-flow-trim-cache:1"
       payload = :binary.copy("p", 1_024)
       encoded_payload = Ferricstore.Flow.encode_value(payload)
 
-      assert :ok =
-               Ferricstore.Flow.create(ctx, id,
-                 type: "segment-keydir-flow-trim-cache",
-                 partition_key: partition,
-                 payload: payload,
-                 run_at_ms: 1_000,
-                 now_ms: 900
-               )
+      {_log, value_index} =
+        append_waraft_fence!("segment-keydir:flow-trim-cache-index", "v")
 
-      assert {:ok, created} = Ferricstore.Flow.get(ctx, id, partition_key: partition)
-      payload_ref = created.payload_ref
-
-      assert [
-               {^payload_ref, nil, 0, _lfu, {:waraft_apply_projection, value_index}, value_offset,
-                value_size}
-             ] = :ets.lookup(elem(ctx.keydir_refs, 0), payload_ref)
+      {_lfu, value_offset, value_size} =
+        insert_apply_projection_ref!(root, ctx, value_index, payload_ref, encoded_payload)
 
       assert value_offset == 0
       assert value_size == byte_size(encoded_payload)
-      refute apply_projection_cache_contains?(root, 0, value_index, payload_ref)
-
-      Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, value_index, [
-        {payload_ref, encoded_payload, 0}
-      ])
-
       assert apply_projection_cache_contains?(root, 0, value_index, payload_ref)
       assert apply_projection_cache_value_bytes(root, 0, value_index) >= value_size
 
-      newer_id = "segment-keydir:flow-trim-cache-newer"
+      newer_payload_ref =
+        "f:{segment-keydir-flow-trim-cache}:v:p:segment-keydir-flow-trim-cache-newer:1"
+
       newer_payload = :binary.copy("n", 1_024)
       newer_encoded_payload = Ferricstore.Flow.encode_value(newer_payload)
 
-      assert :ok =
-               Ferricstore.Flow.create(ctx, newer_id,
-                 type: "segment-keydir-flow-trim-cache",
-                 partition_key: partition,
-                 payload: newer_payload,
-                 run_at_ms: 1_000,
-                 now_ms: 901
-               )
+      {log, newer_value_index} =
+        append_waraft_fence!("segment-keydir:flow-trim-cache-newer-index", "v")
 
-      assert {:ok, newer_created} = Ferricstore.Flow.get(ctx, newer_id, partition_key: partition)
-      newer_payload_ref = newer_created.payload_ref
-
-      assert [
-               {^newer_payload_ref, nil, 0, _newer_lfu,
-                {:waraft_apply_projection, newer_value_index}, _newer_value_offset,
-                newer_value_size}
-             ] = :ets.lookup(elem(ctx.keydir_refs, 0), newer_payload_ref)
+      {_newer_lfu, _newer_value_offset, newer_value_size} =
+        insert_apply_projection_ref!(
+          root,
+          ctx,
+          newer_value_index,
+          newer_payload_ref,
+          newer_encoded_payload
+        )
 
       assert newer_value_index > value_index
       assert newer_value_size == byte_size(newer_encoded_payload)
-      refute apply_projection_cache_contains?(root, 0, newer_value_index, newer_payload_ref)
-
-      Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, newer_value_index, [
-        {newer_payload_ref, newer_encoded_payload, 0}
-      ])
-
       assert apply_projection_cache_contains?(root, 0, newer_value_index, newer_payload_ref)
 
-      log = waraft_segment_log_record(0)
       assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, value_index + 1, %{})
 
       refute apply_projection_cache_contains?(root, 0, value_index, payload_ref)
@@ -523,25 +556,26 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert is_integer(newer_projection_index) and newer_projection_index > 0
       assert is_integer(newer_projection_offset) and newer_projection_offset > 0
 
-      assert {:ok, fetched} =
-               Ferricstore.Flow.get(ctx, id,
-                 partition_key: partition,
-                 full: true,
-                 payload_max_bytes: byte_size(payload)
+      assert {:ok, stored_payload} =
+               Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                 ctx,
+                 0,
+                 {:waraft_projection, projection_index},
+                 payload_ref
                )
 
-      assert fetched.payload == payload
+      assert Ferricstore.Flow.decode_value(stored_payload) == payload
 
-      assert {:ok, newer_fetched} =
-               Ferricstore.Flow.get(ctx, newer_id,
-                 partition_key: partition,
-                 full: true,
-                 payload_max_bytes: byte_size(newer_payload)
+      assert {:ok, stored_newer_payload} =
+               Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                 ctx,
+                 0,
+                 {:waraft_projection, newer_projection_index},
+                 newer_payload_ref
                )
 
-      assert newer_fetched.payload == newer_payload
+      assert Ferricstore.Flow.decode_value(stored_newer_payload) == newer_payload
     after
-      restore_backend(previous_backend)
       restore_env(:waraft_storage_apply_mode, previous_mode)
     end
   end
@@ -551,46 +585,28 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
          root: root,
          ctx: ctx
        } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
 
     previous_hook =
       Application.get_env(:ferricstore, :waraft_segment_projection_before_relocate_hook)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
       clear_apply_projection_cache!()
 
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-      id = "segment-keydir:flow-trim-cache-still-referenced"
-      partition = flow_partition_for_shard(ctx, id, 0)
+      payload_ref =
+        "f:{segment-keydir-flow-trim-cache}:v:p:segment-keydir-flow-trim-cache-still-referenced:1"
+
       payload = :binary.copy("r", 1_024)
       encoded_payload = Ferricstore.Flow.encode_value(payload)
 
-      assert :ok =
-               Ferricstore.Flow.create(ctx, id,
-                 type: "segment-keydir-flow-trim-cache",
-                 partition_key: partition,
-                 payload: payload,
-                 run_at_ms: 1_000,
-                 now_ms: 900
-               )
+      {_log, value_index} =
+        append_waraft_fence!("segment-keydir:flow-trim-cache-still-referenced-index", "v")
 
-      assert {:ok, created} = Ferricstore.Flow.get(ctx, id, partition_key: partition)
-      payload_ref = created.payload_ref
-
-      assert [
-               {^payload_ref, nil, 0, lfu, {:waraft_apply_projection, value_index}, value_offset,
-                value_size}
-             ] = :ets.lookup(elem(ctx.keydir_refs, 0), payload_ref)
-
-      refute apply_projection_cache_contains?(root, 0, value_index, payload_ref)
-
-      Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, value_index, [
-        {payload_ref, encoded_payload, 0}
-      ])
+      {lfu, value_offset, value_size} =
+        insert_apply_projection_ref!(root, ctx, value_index, payload_ref, encoded_payload)
 
       assert apply_projection_cache_contains?(root, 0, value_index, payload_ref)
       test_pid = self()
@@ -628,18 +644,120 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert apply_projection_cache_contains?(root, 0, value_index, payload_ref)
 
-      assert {:ok, fetched} =
-               Ferricstore.Flow.get(ctx, id,
-                 partition_key: partition,
-                 full: true,
-                 payload_max_bytes: byte_size(payload)
+      assert {:ok, stored_payload} =
+               Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                 ctx,
+                 0,
+                 {:waraft_apply_projection, value_index},
+                 payload_ref
                )
 
-      assert fetched.payload == payload
+      assert Ferricstore.Flow.decode_value(stored_payload) == payload
     after
       restore_env(:waraft_segment_projection_before_relocate_hook, previous_hook)
-      restore_backend(previous_backend)
       restore_env(:waraft_storage_apply_mode, previous_mode)
+    end
+  end
+
+  test "unified segment trim relocates LMDB-pinned Flow value locators", %{
+    root: root,
+    ctx: ctx
+  } do
+    previous_sync_hook = Application.get_env(:ferricstore, :waraft_segment_log_file_sync_hook)
+
+    clear_apply_projection_cache!()
+
+    try do
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      payload_ref =
+        "f:{segment-keydir-flow-trim-pin}:v:p:segment-keydir-flow-trim-pin-relocated:1"
+
+      payload = :binary.copy("p", 1_024)
+      encoded_payload = Ferricstore.Flow.encode_value(payload)
+
+      {log, value_index} =
+        append_waraft_fence!("segment-keydir:flow-trim-pin-relocated-index", "v")
+
+      {_lfu, value_offset, value_size} =
+        insert_apply_projection_ref!(root, ctx, value_index, payload_ref, encoded_payload)
+
+      lmdb_path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(0)
+        |> Ferricstore.Flow.LMDB.path()
+
+      assert :ok =
+               Ferricstore.Flow.LMDB.write_batch(
+                 lmdb_path,
+                 Ferricstore.Flow.LMDB.segment_value_pin_put_ops(
+                   payload_ref,
+                   0,
+                   {:waraft_apply_projection, value_index},
+                   value_offset,
+                   value_size
+                 )
+               )
+
+      :ets.delete(elem(ctx.keydir_refs, 0), payload_ref)
+
+      assert apply_projection_cache_contains?(root, 0, value_index, payload_ref)
+
+      assert :ok =
+               WARaftBackend.write(
+                 0,
+                 {:put, "segment-keydir:flow-trim-pin-relocated-fence", "v", 0}
+               )
+
+      Application.put_env(
+        :ferricstore,
+        :waraft_segment_log_file_sync_hook,
+        {:notify_with_method, self()}
+      )
+
+      assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, value_index + 1, %{})
+
+      assert_receive_apply_projection_sync()
+
+      assert {:ok, []} =
+               Ferricstore.Flow.LMDB.segment_value_pin_entries_before(
+                 lmdb_path,
+                 value_index + 1,
+                 100
+               )
+
+      assert {:ok, lmdb_value} = Ferricstore.Flow.LMDB.get(lmdb_path, payload_ref)
+
+      assert {:ok, {{:waraft_apply_projection, ^value_index}, ^value_offset, ^value_size}} =
+               Ferricstore.Flow.LMDB.decode_value_locator(lmdb_value, 1_000)
+
+      refute apply_projection_cache_contains?(root, 0, value_index, payload_ref)
+
+      assert {:ok, stored_payload} =
+               Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                 ctx,
+                 0,
+                 {:waraft_apply_projection, value_index},
+                 payload_ref
+               )
+
+      assert Ferricstore.Flow.decode_value(stored_payload) == payload
+      assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), payload_ref)
+
+      assert :ok = WARaftBackend.stop()
+      FerricStore.Instance.cleanup(ctx.name)
+
+      restarted_ctx = build_ctx(root)
+
+      assert :ok =
+               WARaftBackend.start(restarted_ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log
+               )
+
+      assert [] = :ets.lookup(elem(restarted_ctx.keydir_refs, 0), payload_ref)
+      assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(restarted_ctx, [payload_ref])
+    after
+      restore_env(:waraft_segment_log_file_sync_hook, previous_sync_hook)
     end
   end
 
@@ -1048,7 +1166,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
   test "invalid WARaft queue and commit knobs fail closed before partition start", %{ctx: ctx} do
     previous_pending = Application.get_env(:ferricstore, :waraft_max_pending_reads)
-    previous_async_append = Application.get_env(:ferricstore, :waraft_async_log_append)
+    existing_sup = Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
 
     try do
       assert_raise ArgumentError, ~r/max_pending_high_priority_commits/, fn ->
@@ -1058,7 +1176,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
         )
       end
 
-      refute Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
+      assert Process.whereis(:raft_sup_ferricstore_waraft_backend_1) == existing_sup
 
       assert_raise ArgumentError, ~r/commit_batch_max/, fn ->
         WARaftBackend.start(ctx,
@@ -1067,7 +1185,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
         )
       end
 
-      refute Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
+      assert Process.whereis(:raft_sup_ferricstore_waraft_backend_1) == existing_sup
 
       Application.put_env(:ferricstore, :waraft_max_pending_reads, "bad")
 
@@ -1075,19 +1193,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
         WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
       end
 
-      refute Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
+      assert Process.whereis(:raft_sup_ferricstore_waraft_backend_1) == existing_sup
 
       Application.delete_env(:ferricstore, :waraft_max_pending_reads)
-      Application.put_env(:ferricstore, :waraft_async_log_append, "true")
-
-      assert_raise ArgumentError, ~r/waraft_async_log_append/, fn ->
-        WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-      end
-
-      refute Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
     after
       restore_env(:waraft_max_pending_reads, previous_pending)
-      restore_env(:waraft_async_log_append, previous_async_append)
     end
   end
 
@@ -1553,7 +1663,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   end
 
   test "configured namespace windows coalesce WARaft writes before segment apply", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     handler_id = {__MODULE__, :namespace_window_flush, make_ref()}
 
     :telemetry.attach(
@@ -1566,7 +1675,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = Ferricstore.NamespaceConfig.set("waraftns", "window_ms", "25")
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -1587,17 +1695,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "v1" == Router.get(ctx, "waraftns:key1")
       assert "v2" == Router.get(ctx, "waraftns:key2")
     after
-      restore_backend(previous_backend)
       Ferricstore.NamespaceConfig.reset("waraftns")
     end
   end
 
   test "configured namespace SET windows commit with the compact put batch shape", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
       assert :ok = Ferricstore.NamespaceConfig.set("waraftput", "window_ms", "25")
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
@@ -1617,18 +1722,15 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "v1" == Router.get(ctx, "waraftput:key1")
       assert "v2" == Router.get(ctx, "waraftput:key2")
     after
-      restore_backend(previous_backend)
       restore_env(:waraft_backend_batcher_call_hook, previous_hook)
       Ferricstore.NamespaceConfig.reset("waraftput")
     end
   end
 
   test "configured namespace DEL windows commit with the compact delete batch shape", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = Ferricstore.NamespaceConfig.set("waraftdel", "window_ms", "25")
 
       assert :ok =
@@ -1657,17 +1759,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert nil == Router.get(ctx, "waraftdel:key1")
       assert nil == Router.get(ctx, "waraftdel:key2")
     after
-      restore_backend(previous_backend)
       restore_env(:waraft_backend_batcher_call_hook, previous_hook)
       Ferricstore.NamespaceConfig.reset("waraftdel")
     end
   end
 
   test "configured namespace windows ignore stale flush messages", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = Ferricstore.NamespaceConfig.set("stale-win", "window_ms", "200")
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -1684,7 +1782,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert :ok = Task.await(task, 1_000)
       assert "v" == Router.get(ctx, "stale-win:key")
     after
-      restore_backend(previous_backend)
       Ferricstore.NamespaceConfig.reset("stale-win")
     end
   end
@@ -2062,7 +2159,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   end
 
   test "apply projection append failure is not on the user write ack path", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_append_hook)
 
     flow_type = "apply-projection-async-#{System.unique_integer([:positive])}"
@@ -2070,7 +2166,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     partition = "apply-projection-async-partition"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       Application.put_env(
@@ -2098,7 +2193,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  now_ms: 1_000
                )
     after
-      restore_backend(previous_backend)
       restore_env(:waraft_segment_log_append_hook, previous_hook)
     end
   end
@@ -2199,22 +2293,95 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
            "trim rewrite must not materialize every kept record before staging"
   end
 
-  test "segment log config lookup walks backward instead of folding the full log" do
+  test "segment log config lookup uses cached latest config on append hot path" do
     source =
       Path.expand("../../../src/ferricstore_waraft_spike_segment_log.erl", __DIR__)
       |> File.read!()
 
     assert [_, config_source] =
-             String.split(source, "config(#raft_log{name = Name}) ->", parts: 2)
+             String.split(source, "\nconfig(Log) ->", parts: 2)
 
     assert [config_source, _] =
-             String.split(config_source, "config_from_entry", parts: 2)
+             String.split(config_source, "\nconfig_from_index", parts: 2)
 
     refute config_source =~ "ets:foldl",
            "config lookup must not scan every log entry when the latest config is near the tail"
 
-    assert config_source =~ "ets:last(Name)"
-    assert source =~ "ets:prev(Name, Index)"
+    assert config_source =~ "cached_config(Log)"
+    assert String.split(config_source, "cached_config(Log)", parts: 2) |> length() == 2
+
+    assert String.split(config_source, "config_from_index(Log, Last, First)", parts: 2)
+           |> length() == 2
+
+    assert :binary.match(config_source, "cached_config(Log)") <
+             :binary.match(config_source, "config_from_index(Log, Last, First)"),
+           "append refresh_config must check the cache before walking disk-backed log records"
+
+    assert source =~ "update_latest_config_from_records(Dir, Records)"
+
+    assert [_, cached_source] =
+             String.split(source, "\ncached_config(Log) ->", parts: 2)
+
+    assert [cached_source, _] =
+             String.split(cached_source, "\nupdate_latest_config_from_records", parts: 2)
+
+    refute cached_source =~ "Index >= First",
+           "trimmed configs are still the latest known config; rejecting them forces append to rescan disk"
+
+    assert source =~ "cache_latest_config_not_found(Dir, Last)",
+           "snapshot-backed bootstraps may have no config entry in the log; cache that miss instead of rescanning on every append"
+
+    assert config_source =~ "none_cached",
+           "cached config misses must return without falling through to config_from_index/3"
+  end
+
+  test "apply projection spill coalesces segment writes" do
+    reader_source =
+      Path.expand("../../../lib/ferricstore/raft/waraft_segment_reader.ex", __DIR__)
+      |> File.read!()
+
+    segment_source =
+      Path.expand("../../../src/ferricstore_waraft_spike_segment_log.erl", __DIR__)
+      |> File.read!()
+
+    assert reader_source =~ "write_projection_batches",
+           "spilling apply-projection cache should write one segment batch, not one file append per Ra index"
+
+    refute reader_source =~ "write_apply_projection_spill(projection_root, index, batch)",
+           "per-index projection writes reopen segment files and show up as write/open/close in the hot profile"
+
+    assert segment_source =~ "write_projection_batches/2"
+  end
+
+  test "WARaft storage opens apply-projection segment config before spill hot path", %{
+    root: root,
+    ctx: ctx
+  } do
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+    apply_projection_config =
+      root
+      |> waraft_segment_log_dir(0)
+      |> Path.dirname()
+      |> Path.join("apply_projection_log/segment_log/segment_config.term")
+
+    assert File.exists?(apply_projection_config),
+           "apply-projection spill should not create segment config from the apply hot path"
+  end
+
+  test "segment config cache key avoids absolute-path filesystem normalization on hot path" do
+    source =
+      Path.expand("../../../src/ferricstore_waraft_spike_segment_log.erl", __DIR__)
+      |> File.read!()
+
+    assert [_, cache_key_source] =
+             String.split(source, "\nsegment_config_cache_key(Dir) ->", parts: 2)
+
+    assert [cache_key_source, _] =
+             String.split(cache_key_source, "\nlatest_config_cache_key", parts: 2)
+
+    refute cache_key_source =~ "filename:absname",
+           "records_per_segment/1 runs while appending projection spills; absolute dirs must not call filename:absname/1 through the file server"
   end
 
   test "segment log append grouping stays linear for monotonic Raft batches" do
@@ -2340,6 +2507,34 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       WARaftBackend.stop()
       restore_env(:waraft_segment_log_records_per_segment, previous)
     end
+  end
+
+  test "segment log open caches config miss from loaded records", %{root: root, ctx: ctx} do
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+    for idx <- 1..10 do
+      assert :ok = WARaftBackend.write(0, {:put, "log-config-miss:#{idx}", "v#{idx}", 0})
+    end
+
+    assert :ok = WARaftBackend.stop()
+
+    segment_dir = waraft_segment_log_dir(root, 0)
+
+    cache_key =
+      {:ferricstore_waraft_spike_segment_log, :latest_config,
+       segment_dir |> Path.absname() |> String.to_charlist()}
+
+    assert :persistent_term.get(cache_key, :missing) == :missing
+
+    log = waraft_segment_log_record(0)
+    assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+    assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+    last_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+    assert is_integer(last_index) and last_index >= 10
+    assert :persistent_term.get(cache_key, :missing) == {:not_found, last_index}
+  after
+    WARaftBackend.stop()
   end
 
   test "segment log fails closed when persisted segment sizing metadata is corrupt", %{
@@ -3066,8 +3261,16 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert_receive {:waraft_namespace_batcher_flush,
                       [:ferricstore, :waraft, :batcher, :hot_flush],
-                      %{batch_size: 2, group_count: 2}, %{kind: :put_batch}},
+                      %{batch_size: 2, group_count: 2} = measurements, %{kind: :put_batch}},
                      1_000
+
+      assert is_integer(measurements.queue_age_us)
+      assert measurements.queue_age_us >= 0
+      assert is_integer(measurements.flush_duration_us)
+      assert measurements.flush_duration_us >= 0
+      assert is_integer(measurements.total_duration_us)
+      assert measurements.total_duration_us >= measurements.queue_age_us
+      assert measurements.total_duration_us >= measurements.flush_duration_us
 
       assert "v1" == Router.get(ctx, "hot-put-batch:1")
       assert "v2" == Router.get(ctx, "hot-put-batch:2")
@@ -3162,6 +3365,76 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       restore_env(:waraft_hot_batch_window_ms, previous_window)
       restore_env(:waraft_generic_batch_window_ms, previous_generic_window)
+    end
+  end
+
+  test "WARaft generic batches coalesce behind an in-flight flush by default", %{ctx: ctx} do
+    previous_generic_window = Application.get_env(:ferricstore, :waraft_generic_batch_window_ms)
+    previous_during_flush = Application.get_env(:ferricstore, :waraft_generic_batch_during_flush)
+    previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_generic_batch_window_ms, 0)
+      Application.delete_env(:ferricstore, :waraft_generic_batch_during_flush)
+      Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+
+      assert :ok =
+               WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log,
+                 commit_batch_interval_ms: 1,
+                 commit_batch_max: 10_000
+               )
+
+      first =
+        Task.async(fn ->
+          WARaftBackend.write_batch(0, [
+            {:put, "generic-default-flush:1:a", "v1a", 0},
+            {:put, "generic-default-flush:1:b", "v1b", 0}
+          ])
+        end)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, first_ref,
+                      first_worker},
+                     1_000
+
+      second =
+        Task.async(fn ->
+          WARaftBackend.write_batch(0, [
+            {:put, "generic-default-flush:2:a", "v2a", 0},
+            {:put, "generic-default-flush:2:b", "v2b", 0}
+          ])
+        end)
+
+      third =
+        Task.async(fn ->
+          WARaftBackend.write_batch(0, [
+            {:put, "generic-default-flush:3:a", "v3a", 0},
+            {:put, "generic-default-flush:3:b", "v3b", 0}
+          ])
+        end)
+
+      refute_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, _ref, _worker}, 50
+
+      send(first_worker, {first_ref, :continue})
+      assert {:ok, [:ok, :ok]} = Task.await(first, 5_000)
+
+      assert_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, second_ref,
+                      second_worker},
+                     1_000
+
+      refute_receive {:waraft_backend_batcher_call, :__commit_batch_direct__, _ref, _worker}, 50
+      send(second_worker, {second_ref, :continue})
+
+      assert {:ok, [:ok, :ok]} = Task.await(second, 5_000)
+      assert {:ok, [:ok, :ok]} = Task.await(third, 5_000)
+
+      assert "v1a" == Router.get(ctx, "generic-default-flush:1:a")
+      assert "v2a" == Router.get(ctx, "generic-default-flush:2:a")
+      assert "v3a" == Router.get(ctx, "generic-default-flush:3:a")
+    after
+      restore_env(:waraft_generic_batch_window_ms, previous_generic_window)
+      restore_env(:waraft_generic_batch_during_flush, previous_during_flush)
+      restore_env(:waraft_backend_batcher_call_hook, previous_hook)
     end
   end
 
@@ -3384,7 +3657,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   test "Router multi-shard WARaft put batches still use hot per-shard coalescing", %{
     root: root
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
     handler_id = {__MODULE__, :router_hot_put_flush, make_ref()}
     multi_root = Path.join(root, "router-multishard-hot-put")
@@ -3402,7 +3674,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :waraft_hot_batch_window_ms, 25)
 
       assert :ok =
@@ -3454,7 +3725,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "v1a" == Router.get(multi_ctx, k1a)
       assert "v1b" == Router.get(multi_ctx, k1b)
     after
-      restore_backend(previous_backend)
       restore_env(:waraft_hot_batch_window_ms, previous_window)
       FerricStore.Instance.cleanup(multi_ctx.name)
       File.rm_rf!(multi_root)
@@ -3638,11 +3908,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     key0 = key_for_shard(ctx, 0, "waraft-parallel-batch")
     key1 = key_for_shard(ctx, 1, "waraft-parallel-batch")
     previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       Application.put_env(:ferricstore, :standalone_durability_hook, fn _file_path, batch ->
         if Enum.any?(batch, &delayed_parallel_batch_record?/1), do: Process.sleep(200)
         :passthrough
@@ -3657,7 +3924,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "v1" == Router.get(ctx, key1)
     after
       restore_env(:standalone_durability_hook, previous_hook)
-      restore_backend(previous_backend)
     end
   end
 
@@ -3782,6 +4048,45 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     assert post_index > pre_index
   end
 
+  test "startup storage replay wait tolerates trailing Raft no-op entries", %{
+    root: root,
+    ctx: ctx
+  } do
+    previous_wait = Application.get_env(:ferricstore, :waraft_start_wait_timeout_ms)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_start_wait_timeout_ms, 100)
+
+      key = "startup-noop-tail:k"
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+      assert :ok = WARaftBackend.write(0, {:put, key, "v1", 0})
+      assert {:ok, {:raft_log_pos, applied_index, term}} = WARaftBackend.storage_position(0)
+      assert :ok = WARaftBackend.stop()
+      FerricStore.Instance.cleanup(ctx.name)
+
+      append_raw_waraft_segment_record!(
+        root,
+        0,
+        {applied_index + 1, {term + 1, {make_ref(), :noop}}}
+      )
+
+      restarted_ctx = build_ctx(root)
+
+      try do
+        assert :ok =
+                 WARaftBackend.start(restarted_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert "v1" == Router.get(restarted_ctx, key)
+      after
+        FerricStore.Instance.cleanup(restarted_ctx.name)
+      end
+    after
+      restore_env(:waraft_start_wait_timeout_ms, previous_wait)
+    end
+  end
+
   test "storage metadata hot writes fsync journal without rewriting current metadata", %{ctx: ctx} do
     test_pid = self()
     previous_hook = Application.get_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook)
@@ -3813,6 +4118,472 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       restore_env(:waraft_storage_metadata_fsync_file_hook, previous_hook)
       restore_env(:waraft_storage_metadata_persist_every, previous_every)
       restore_env(:waraft_bitcask_payload_fsync_every, previous_payload_every)
+    end
+  end
+
+  test "storage apply phase telemetry breaks down hot write tail latency", %{ctx: ctx} do
+    assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
+
+    handler_id = {__MODULE__, :storage_apply_phase_profile, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :storage, :apply_phase],
+      &__MODULE__.handle_storage_apply_phase_telemetry/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+
+    previous_payload_every =
+      Application.get_env(:ferricstore, :waraft_bitcask_payload_fsync_every)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
+      Application.put_env(:ferricstore, :waraft_bitcask_payload_fsync_every, 1)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+      assert :ok = WARaftBackend.write(0, {:put, "apply-phase:k", "v", 0})
+
+      assert_receive {:waraft_storage_apply_phase,
+                      [:ferricstore, :waraft, :storage, :apply_phase], %{duration_us: cache_us},
+                      %{
+                        phase: :apply_projection_cache,
+                        shard_index: 0,
+                        position: {:raft_log_pos, _, _}
+                      }},
+                     1_000
+
+      assert is_integer(cache_us) and cache_us >= 0
+
+      assert_receive {:waraft_storage_apply_phase,
+                      [:ferricstore, :waraft, :storage, :apply_phase],
+                      %{duration_us: projection_us},
+                      %{phase: :recovery_projection, shard_index: 0}},
+                     1_000
+
+      assert is_integer(projection_us) and projection_us >= 0
+
+      assert_receive {:waraft_storage_apply_phase,
+                      [:ferricstore, :waraft, :storage, :apply_phase],
+                      %{duration_us: metadata_us}, %{phase: :storage_metadata, shard_index: 0}},
+                     1_000
+
+      assert is_integer(metadata_us) and metadata_us >= 0
+    after
+      restore_env(:waraft_storage_metadata_persist_every, previous_every)
+      restore_env(:waraft_bitcask_payload_fsync_every, previous_payload_every)
+    end
+  end
+
+  test "hot metadata persistence does not checkpoint segment projection on apply", %{ctx: ctx} do
+    assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
+
+    handler_id = {__MODULE__, :hot_apply_no_segment_projection_checkpoint, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :segment_log, :append],
+      &__MODULE__.handle_segment_log_telemetry/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+
+    previous_payload_every =
+      Application.get_env(:ferricstore, :waraft_bitcask_payload_fsync_every)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
+      Application.put_env(:ferricstore, :waraft_bitcask_payload_fsync_every, 1)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+      flush_segment_append_telemetry()
+
+      assert :ok = WARaftBackend.write(0, {:put, "hot-no-checkpoint:k", "v", 0})
+      assert "v" == Router.get(ctx, "hot-no-checkpoint:k")
+
+      refute_receive {:waraft_segment_log_telemetry,
+                      [:ferricstore, :waraft, :segment_log, :append], _measurements,
+                      %{kind: :segment_projection}},
+                     200
+    after
+      restore_env(:waraft_storage_metadata_persist_every, previous_every)
+      restore_env(:waraft_bitcask_payload_fsync_every, previous_payload_every)
+    end
+  end
+
+  test "segment projection checkpoint runs in background with pending guard", %{ctx: ctx} do
+    assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
+
+    parent = self()
+    handler_id = {__MODULE__, :segment_projection_checkpoint_pending_guard, make_ref()}
+
+    :telemetry.attach_many(
+      handler_id,
+      [
+        [:ferricstore, :waraft, :segment_projection_checkpoint, :start],
+        [:ferricstore, :waraft, :segment_projection_checkpoint, :stop]
+      ],
+      &__MODULE__.handle_segment_projection_checkpoint_telemetry/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    previous_every =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_every)
+
+    previous_interval =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms)
+
+    previous_hook =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_hook)
+
+    hook = fn
+      :before_write, metadata ->
+        send(parent, {:checkpoint_before_write, self(), metadata})
+
+        receive do
+          :release_checkpoint -> :ok
+        after
+          5_000 -> :ok
+        end
+
+      _phase, _metadata ->
+        :ok
+    end
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 2)
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms, 0)
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_hook, hook)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      assert :ok = WARaftBackend.write(0, {:put, "checkpoint-bg:k1", "v1", 0})
+
+      assert_receive {:checkpoint_before_write, checkpoint_pid,
+                      %{position: {:raft_log_pos, checkpoint_index, _}}},
+                     1_000
+
+      assert is_integer(checkpoint_index) and checkpoint_index > 0
+
+      assert_receive {:waraft_segment_projection_checkpoint,
+                      [:ferricstore, :waraft, :segment_projection_checkpoint, :start],
+                      %{entries: entries}, %{position: {:raft_log_pos, ^checkpoint_index, _}}},
+                     1_000
+
+      assert entries >= 1
+
+      assert :ok = WARaftBackend.write(0, {:put, "checkpoint-bg:k2", "v2", 0})
+      assert "v2" == Router.get(ctx, "checkpoint-bg:k2")
+      refute_receive {:checkpoint_before_write, _other_pid, _metadata}, 100
+
+      status = waraft_storage_status(0)
+      assert Keyword.fetch!(status, :segment_projection_checkpoint_pending?) == true
+
+      send(checkpoint_pid, :release_checkpoint)
+
+      assert_receive {:waraft_segment_projection_checkpoint,
+                      [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+                      %{duration_us: duration_us},
+                      %{result: :ok, position: {:raft_log_pos, ^checkpoint_index, _}}},
+                     2_000
+
+      assert is_integer(duration_us) and duration_us >= 0
+
+      assert_eventually(
+        fn ->
+          status = waraft_storage_status(0)
+
+          {
+            Keyword.fetch!(status, :segment_projection_checkpoint_pending?),
+            position_index(Keyword.fetch!(status, :segment_projection_position))
+          }
+        end,
+        {false, checkpoint_index}
+      )
+    after
+      restore_env(:waraft_segment_projection_checkpoint_every, previous_every)
+      restore_env(:waraft_segment_projection_checkpoint_min_interval_ms, previous_interval)
+      restore_env(:waraft_segment_projection_checkpoint_hook, previous_hook)
+    end
+  end
+
+  test "trim reuses background segment projection checkpoint", %{ctx: ctx} do
+    assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
+
+    parent = self()
+    checkpoint_handler_id = {__MODULE__, :segment_projection_trim_checkpoint, make_ref()}
+    trim_handler_id = {__MODULE__, :segment_projection_trim_reuse, make_ref()}
+
+    :telemetry.attach(
+      checkpoint_handler_id,
+      [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+      &__MODULE__.handle_segment_projection_checkpoint_telemetry/4,
+      parent
+    )
+
+    :telemetry.attach(
+      trim_handler_id,
+      [:ferricstore, :waraft, :segment_projection_trim, :checkpoint_reuse],
+      &__MODULE__.handle_segment_projection_trim_telemetry/4,
+      parent
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(checkpoint_handler_id)
+      :telemetry.detach(trim_handler_id)
+    end)
+
+    previous_every =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_every)
+
+    previous_interval =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 3)
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms, 0)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      assert :ok = WARaftBackend.write(0, {:put, "checkpoint-trim:k1", "v1", 0})
+      assert :ok = WARaftBackend.write(0, {:put, "checkpoint-trim:k2", "v2", 0})
+
+      assert_receive {:waraft_segment_projection_checkpoint,
+                      [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+                      _measurements,
+                      %{
+                        result: :ok,
+                        position: {:raft_log_pos, checkpoint_index, _},
+                        entries: entries
+                      }},
+                     2_000
+
+      assert checkpoint_index >= 4
+      assert entries >= 2
+
+      log = waraft_segment_log_record(0)
+
+      assert {:ok, _state} =
+               :ferricstore_waraft_spike_segment_log.trim(log, checkpoint_index, %{})
+
+      assert_receive {:waraft_segment_projection_trim,
+                      [:ferricstore, :waraft, :segment_projection_trim, :checkpoint_reuse],
+                      %{relocations: relocations},
+                      %{
+                        trim_index: ^checkpoint_index,
+                        checkpoint_index: ^checkpoint_index
+                      }},
+                     1_000
+
+      assert relocations >= 1
+      assert "v1" == Router.get(ctx, "checkpoint-trim:k1")
+
+      assert [
+               {"checkpoint-trim:k1", "v1", 0, _lfu, {:waraft_projection, projection_index},
+                projection_offset, 2}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), "checkpoint-trim:k1")
+
+      assert is_integer(projection_index) and projection_index > 0
+      assert is_integer(projection_offset) and projection_offset > 0
+    after
+      restore_env(:waraft_segment_projection_checkpoint_every, previous_every)
+      restore_env(:waraft_segment_projection_checkpoint_min_interval_ms, previous_interval)
+    end
+  end
+
+  test "background segment projection checkpoint does not clobber active projection rows", %{
+    root: root,
+    ctx: ctx
+  } do
+    assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
+
+    parent = self()
+    checkpoint_handler_id = {__MODULE__, :segment_projection_no_clobber, make_ref()}
+
+    :telemetry.attach(
+      checkpoint_handler_id,
+      [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+      &__MODULE__.handle_segment_projection_checkpoint_telemetry/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(checkpoint_handler_id) end)
+
+    previous_every =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_every)
+
+    previous_interval =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms)
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms, 0)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      z_key = Ferricstore.Flow.Keys.value_key("checkpoint-clobber:z", :payload, 1, "p")
+      m_key = Ferricstore.Flow.Keys.value_key("checkpoint-clobber:m", :payload, 1, "p")
+      a_key = Ferricstore.Flow.Keys.value_key("checkpoint-clobber:a", :payload, 1, "p")
+
+      assert :ok = WARaftBackend.write(0, {:put, z_key, "z", 0})
+      assert :ok = WARaftBackend.write(0, {:put, m_key, "m", 0})
+
+      log = waraft_segment_log_record(0)
+      trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+      assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
+
+      assert [
+               {^z_key, nil, 0, _lfu, {:waraft_projection, old_projection_index},
+                old_projection_offset, 1}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
+
+      assert is_integer(old_projection_index) and old_projection_index > 0
+      assert is_integer(old_projection_offset) and old_projection_offset > 0
+
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+
+      assert :ok = WARaftBackend.write(0, {:put, a_key, "a", 0})
+
+      assert_receive {:waraft_segment_projection_checkpoint,
+                      [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+                      _measurements, %{result: :ok}},
+                     2_000
+
+      assert "z" == Router.get(ctx, z_key)
+
+      assert [
+               {^z_key, nil, 0, _lfu, {:waraft_projection, ^old_projection_index},
+                ^old_projection_offset, 1}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
+
+      assert File.exists?(
+               Path.join([
+                 root,
+                 "waraft",
+                 "ferricstore_waraft_backend.1",
+                 "segment_projection_checkpoint_log"
+               ])
+             )
+    after
+      restore_env(:waraft_segment_projection_checkpoint_every, previous_every)
+      restore_env(:waraft_segment_projection_checkpoint_min_interval_ms, previous_interval)
+    end
+  end
+
+  test "background segment projection checkpoint is serialized with projection trim", %{ctx: ctx} do
+    assert {:ok, _apps} = Application.ensure_all_started(:telemetry)
+
+    parent = self()
+    checkpoint_handler_id = {__MODULE__, :segment_projection_checkpoint_trim_race, make_ref()}
+
+    :telemetry.attach(
+      checkpoint_handler_id,
+      [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+      &__MODULE__.handle_segment_projection_checkpoint_telemetry/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(checkpoint_handler_id) end)
+
+    previous_every =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_every)
+
+    previous_interval =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms)
+
+    previous_hook =
+      Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_hook)
+
+    hook = fn
+      :before_write, metadata ->
+        send(parent, {:checkpoint_before_write, self(), metadata})
+
+        receive do
+          :release_checkpoint -> :ok
+        after
+          5_000 -> :ok
+        end
+
+      _phase, _metadata ->
+        :ok
+    end
+
+    try do
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, :never)
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms, 0)
+
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      z_key = Ferricstore.Flow.Keys.value_key("checkpoint-race:z", :payload, 1, "p")
+      m_key = Ferricstore.Flow.Keys.value_key("checkpoint-race:m", :payload, 1, "p")
+      a_key = Ferricstore.Flow.Keys.value_key("checkpoint-race:a", :payload, 1, "p")
+
+      assert :ok = WARaftBackend.write(0, {:put, z_key, "z", 0})
+      assert :ok = WARaftBackend.write(0, {:put, m_key, "m", 0})
+
+      log = waraft_segment_log_record(0)
+      first_trim_index = :ferricstore_waraft_spike_segment_log.last_index(log)
+
+      assert {:ok, _state} =
+               :ferricstore_waraft_spike_segment_log.trim(log, first_trim_index, %{})
+
+      assert [
+               {^z_key, nil, 0, _lfu, {:waraft_projection, old_projection_index},
+                old_projection_offset, 1}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
+
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 1)
+      Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_hook, hook)
+
+      assert :ok = WARaftBackend.write(0, {:put, a_key, "a", 0})
+
+      assert_receive {:checkpoint_before_write, checkpoint_pid,
+                      %{position: {:raft_log_pos, checkpoint_index, _}}},
+                     1_000
+
+      assert checkpoint_index > first_trim_index
+
+      trim_ref = make_ref()
+
+      spawn(fn ->
+        send(
+          parent,
+          {trim_ref, :ferricstore_waraft_spike_segment_log.trim(log, checkpoint_index, %{})}
+        )
+      end)
+
+      refute_receive {^trim_ref, _trim_result}, 100
+
+      send(checkpoint_pid, :release_checkpoint)
+
+      assert_receive {^trim_ref, {:ok, _state}}, 2_000
+
+      assert_receive {:waraft_segment_projection_checkpoint,
+                      [:ferricstore, :waraft, :segment_projection_checkpoint, :stop],
+                      _measurements, %{result: :ok}},
+                     2_000
+
+      assert "z" == Router.get(ctx, z_key)
+
+      assert [
+               {^z_key, nil, 0, _lfu, {:waraft_projection, current_projection_index},
+                current_projection_offset, 1}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
+
+      assert {current_projection_index, current_projection_offset} !=
+               {old_projection_index, old_projection_offset}
+    after
+      restore_env(:waraft_segment_projection_checkpoint_every, previous_every)
+      restore_env(:waraft_segment_projection_checkpoint_min_interval_ms, previous_interval)
+      restore_env(:waraft_segment_projection_checkpoint_hook, previous_hook)
     end
   end
 
@@ -3989,8 +4760,236 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
-  test "segment-keydir storage does not persist full metadata on hot write interval by default",
-       %{ctx: ctx} do
+  test "WARaft storage recovery trusts durable segment projection newer than metadata", %{
+    root: root,
+    ctx: ctx
+  } do
+    storage_root = waraft_storage_root(root, 0)
+    key = "projection-newer-than-metadata:k"
+    position = {:raft_log_pos, 42, 7}
+
+    File.mkdir_p!(storage_root)
+
+    assert :ok =
+             :ferricstore_waraft_spike_segment_log.write_projection(
+               to_charlist(Path.join(storage_root, "segment_projection_log")),
+               position,
+               [{key, "v1", 0}]
+             )
+
+    write_waraft_storage_metadata!(root, 0, %{
+      version: 1,
+      position: {:raft_log_pos, 1, 1},
+      label: nil,
+      config: nil
+    })
+
+    context_key = {{WARaftBackend, :context}, :ferricstore_waraft_backend}
+    :persistent_term.put(context_key, ctx)
+
+    handle = WARaftStorage.open(%{table: :ferricstore_waraft_backend, partition: 1}, storage_root)
+
+    try do
+      assert WARaftStorage.position(handle) == position
+
+      assert [
+               {^key, "v1", 0, _lfu, {:waraft_projection, 1}, _offset, 2}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+    after
+      WARaftStorage.close(handle)
+      :persistent_term.erase(context_key)
+    end
+  end
+
+  test "WARaft storage recovery fast-forwards one-node segment keydir when metadata lags", %{
+    root: root,
+    ctx: ctx
+  } do
+    key = key_for_shard(ctx, 0, "storage-fast-forward")
+
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+    assert :ok = WARaftBackend.write(0, {:put, key, "v1", 0})
+
+    assert {:ok, {:raft_log_pos, applied_index, _term} = applied_position} =
+             WARaftBackend.storage_position(0)
+
+    assert applied_index > 1
+    assert :ok = WARaftBackend.stop()
+
+    storage_root = waraft_storage_root(root, 0)
+    metadata = waraft_latest_storage_metadata(root, 0)
+
+    assert {{:raft_log_pos, 1, 1}, %{participants: participants, witness: []}} = metadata.config
+    assert length(participants) == 1
+
+    assert {:ok, folded_entries} =
+             :ferricstore_waraft_spike_segment_log.fold_disk(
+               storage_root,
+               fn index, entry, acc -> [{index, entry} | acc] end,
+               []
+             )
+
+    assert Enum.any?(folded_entries, fn
+             {^applied_index, {_term, {:default, {_corr, {:ttb, _payload}}}}} -> true
+             {^applied_index, {_term, {:default, {_corr, {:put, ^key, "v1", 0}}}}} -> true
+             {^applied_index, {_term, {_corr, {:ttb, _payload}}}} -> true
+             {^applied_index, {_term, {_corr, {:put, ^key, "v1", 0}}}} -> true
+             _other -> false
+           end)
+
+    File.rm_rf!(Path.join(storage_root, "segment_projection_log"))
+
+    write_waraft_storage_metadata!(
+      root,
+      0,
+      Map.put(metadata, :position, {:raft_log_pos, 1, 1})
+    )
+
+    FerricStore.Instance.cleanup(ctx.name)
+    restarted_ctx = build_ctx(root)
+    context_key = {{WARaftBackend, :context}, :ferricstore_waraft_backend}
+    :persistent_term.put(context_key, restarted_ctx)
+
+    try do
+      log =
+        capture_log(fn ->
+          handle =
+            WARaftStorage.open(%{table: :ferricstore_waraft_backend, partition: 1}, storage_root)
+
+          try do
+            assert [
+                     {^key, "v1", 0, _lfu, {:waraft_segment, ^applied_index}, _offset, 2}
+                   ] = :ets.lookup(elem(restarted_ctx.keydir_refs, 0), key)
+
+            assert WARaftStorage.position(handle) == applied_position
+          after
+            WARaftStorage.close(handle)
+          end
+        end)
+
+      refute log =~ "unrecognized command: :noop"
+    after
+      :persistent_term.erase(context_key)
+      FerricStore.Instance.cleanup(restarted_ctx.name)
+    end
+  end
+
+  test "WARaft storage recovery reuses segment locations for Flow replay", %{
+    root: root,
+    ctx: ctx
+  } do
+    {id, partition_key, key} = flow_key_for_shard(ctx, 0, "storage-flow-fast-forward")
+
+    attrs = %{
+      id: id,
+      type: "storage-flow-fast-forward",
+      state: "queued",
+      partition_key: partition_key,
+      run_at_ms: 1,
+      now_ms: 1,
+      payload: "payload-v1"
+    }
+
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+    assert :ok = WARaftBackend.write(0, {:flow_create, key, attrs})
+
+    assert {:ok, {:raft_log_pos, applied_index, _term} = applied_position} =
+             WARaftBackend.storage_position(0)
+
+    assert applied_index > 1
+    assert :ok = WARaftBackend.stop()
+
+    storage_root = waraft_storage_root(root, 0)
+    metadata = waraft_latest_storage_metadata(root, 0)
+    File.rm_rf!(Path.join(storage_root, "segment_projection_log"))
+
+    write_waraft_storage_metadata!(
+      root,
+      0,
+      Map.put(metadata, :position, {:raft_log_pos, 1, 1})
+    )
+
+    FerricStore.Instance.cleanup(ctx.name)
+    restarted_ctx = build_ctx(root)
+    context_key = {{WARaftBackend, :context}, :ferricstore_waraft_backend}
+    :persistent_term.put(context_key, restarted_ctx)
+
+    try do
+      handle =
+        WARaftStorage.open(%{table: :ferricstore_waraft_backend, partition: 1}, storage_root)
+
+      try do
+        keydir_rows = :ets.tab2list(elem(restarted_ctx.keydir_refs, 0))
+
+        assert Enum.any?(keydir_rows, fn
+                 {^key, _value, _expire_at_ms, _lfu, {:waraft_segment, ^applied_index}, _offset,
+                  _value_size} ->
+                   true
+
+                 _row ->
+                   false
+               end)
+
+        refute Enum.any?(keydir_rows, fn
+                 {_key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, _index}, _offset,
+                  _value_size} ->
+                   true
+
+                 _row ->
+                   false
+               end)
+
+        assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
+                 restarted_ctx.data_dir,
+                 0
+               ) == 0
+
+        assert WARaftStorage.position(handle) == applied_position
+      after
+        WARaftStorage.close(handle)
+      end
+    after
+      :persistent_term.erase(context_key)
+      FerricStore.Instance.cleanup(restarted_ctx.name)
+    end
+  end
+
+  test "WARaft storage emits startup phase telemetry", %{ctx: ctx} do
+    parent = self()
+    handler_id = "waraft-storage-startup-phase-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :waraft, :storage, :startup_phase],
+      &__MODULE__.handle_storage_startup_phase_telemetry/4,
+      parent
+    )
+
+    try do
+      assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      assert_receive {:waraft_storage_startup_phase,
+                      [:ferricstore, :waraft, :storage, :startup_phase],
+                      %{duration_us: duration_us}, %{phase: :read_metadata, shard_index: 0}},
+                     1_000
+
+      assert is_integer(duration_us)
+      assert duration_us >= 0
+
+      assert_receive {:waraft_storage_startup_phase,
+                      [:ferricstore, :waraft, :storage, :startup_phase], %{duration_us: build_us},
+                      %{phase: :build_state, shard_index: 0}},
+                     1_000
+
+      assert is_integer(build_us)
+      assert build_us >= 0
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  test "segment-keydir storage persists replay cursor on hot write interval by default",
+       %{root: root, ctx: ctx} do
     parent = self()
     previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
     previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
@@ -4010,11 +5009,17 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
       drain_storage_metadata_fsyncs()
 
-      for index <- 1..140 do
+      for index <- 1..1_100 do
         assert :ok = WARaftBackend.write(0, {:put, "segment-metadata-default:#{index}", "v", 0})
       end
 
-      refute_receive {:storage_metadata_fsync, _path}, 100
+      assert_receive {:storage_metadata_fsync, path}, 1_000
+      assert String.ends_with?(path, "ferricstore_storage.term.journal")
+
+      assert %{position: {:raft_log_pos, persisted_index, _term}} =
+               waraft_latest_storage_metadata(root, 0)
+
+      assert persisted_index >= 1_024
     after
       restore_env(:waraft_storage_apply_mode, previous_mode)
       restore_env(:waraft_storage_metadata_persist_every, previous_every)
@@ -4276,12 +5281,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
   test "experimental WARaft replay-safe no-sync deterministic no-ops do not dirty payload",
        %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
     previous_frontier = Application.get_env(:ferricstore, :waraft_bitcask_payload_fsync_every)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :waraft_storage_apply_mode, :replay_safe_nosync)
       Application.put_env(:ferricstore, :waraft_bitcask_payload_fsync_every, 2)
 
@@ -4334,7 +5337,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert Keyword.fetch!(waraft_storage_status(0), :payload_dirty?) == false
     after
-      restore_backend(previous_backend)
       restore_env(:waraft_storage_apply_mode, previous_mode)
       restore_env(:waraft_bitcask_payload_fsync_every, previous_frontier)
     end
@@ -6736,6 +7738,47 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     assert wait_source =~ "backend_call(fn -> :wa_raft_server.status(server) end)"
   end
 
+  test "startup wait budget is configurable for large recovered logs" do
+    source =
+      Path.expand("../../../lib/ferricstore/raft/waraft_backend.ex", __DIR__)
+      |> File.read!()
+
+    assert source =~ "defp startup_wait_attempts"
+    assert source =~ ":waraft_start_wait_timeout_ms"
+
+    assert [_, finish_source] = String.split(source, "defp finish_start_partition", parts: 2)
+
+    assert [finish_source, _rest] =
+             String.split(finish_source, "defp finish_start_status", parts: 2)
+
+    assert finish_source =~ "wait_attempts = startup_wait_attempts()"
+    assert finish_source =~ "wait_status(server, wait_attempts)"
+    assert finish_source =~ "wait_log_replayed(server, replay_target, wait_attempts)"
+    assert finish_source =~ "wait_storage_replayed(shard_index, replay_target, wait_attempts)"
+    refute finish_source =~ "wait_status(server, 100)"
+  end
+
+  test "startup leader and replay waits retry transient status misses" do
+    source =
+      Path.expand("../../../lib/ferricstore/raft/waraft_backend.ex", __DIR__)
+      |> File.read!()
+
+    assert [_, leader_source] = String.split(source, "defp wait_leader", parts: 2)
+
+    assert [leader_source, replay_and_rest] =
+             String.split(leader_source, "defp wait_log_replayed", parts: 2)
+
+    assert [replay_source, _rest] = String.split(replay_and_rest, "defp log_replayed?", parts: 2)
+
+    assert leader_source =~ "wait_leader(server, attempts - 1, {:status_error, reason})"
+
+    assert replay_source =~
+             "wait_log_replayed(server, target_index, attempts - 1, {:status_error, reason})"
+
+    refute leader_source =~ "{:error, _reason} = error ->\n        error"
+    refute replay_source =~ "{:error, _reason} = error ->\n        error"
+  end
+
   test "storage durable-position polling wraps WARaft exits" do
     source =
       Path.expand("../../../lib/ferricstore/raft/waraft_backend.ex", __DIR__)
@@ -6788,10 +7831,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   end
 
   test "Router can use WARaft as the selected durable write backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert :ok = Router.put(ctx, "router:k", "router:v", 0)
@@ -6805,29 +7845,23 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert nil == Router.get(ctx, "router:b1")
       assert nil == Router.get(ctx, "router:b2")
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "Router forced-quorum commands use WARaft as the selected backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert 1 = Router.pfadd(ctx, "router:pf", ["a"])
       assert 0 = Router.pfadd(ctx, "router:pf", ["a"])
       assert is_binary(Router.get(ctx, "router:pf"))
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "Router get_version uses WARaft shared counters without shard fallback telemetry", %{
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     handler_id = {__MODULE__, :waraft_get_version_no_shard_fallback, make_ref()}
     parent = self()
 
@@ -6839,7 +7873,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     )
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert :ok = Router.put(ctx, "router:version:k", "v", 0)
@@ -6848,15 +7881,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       refute_receive {:store_unavailable, _event, _measurements, _metadata}, 50
     after
       :telemetry.detach(handler_id)
-      restore_backend(previous_backend)
     end
   end
 
   test "key expiry and persist commands survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       key = "router:ttl:#{System.unique_integer([:positive])}"
@@ -6898,15 +7927,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "ttl-value" == Router.get(persisted_ctx, key)
       assert -1 = Ferricstore.Commands.Expiry.handle_ast({:pttl, key}, persisted_ctx)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "Router compound commands use WARaft as the selected backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       redis_key = "router:hash"
@@ -6918,15 +7943,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert :ok = Router.compound_delete(ctx, redis_key, field_key)
       assert nil == Router.compound_get(ctx, redis_key, field_key)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "Router JSON bitmap and native commands use WARaft as the selected backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert :ok = Router.json_set(ctx, "router:json", "$", ~s({"n":1}), [])
@@ -6942,12 +7963,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert ["allowed", 3, 0, _] = Router.ratelimit_add(ctx, "router:rl", 1_000, 3, 2)
       assert ["denied", 3, 0, _] = Router.ratelimit_add(ctx, "router:rl", 1_000, 3, 1)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "JSON and bitmap mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     suffix = System.unique_integer([:positive])
     json_key = "router:json-restart:#{suffix}"
     bitmap_a = "router:bitmap-restart:a:#{suffix}"
@@ -6955,8 +7974,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     bitmap_dest = "router:bitmap-restart:dest:#{suffix}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -7011,17 +8028,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  restarted_ctx
                )
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "Flow writes claims and transitions use WARaft as the selected backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     flow_type = "router-flow-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-id-#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert :ok =
@@ -7068,21 +8082,17 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert transitioned.state == "waiting"
       assert transitioned.version >= claimed.version + 1
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "Flow WARaft apply does not use standalone Bitcask append fallback", %{ctx: ctx} do
     parent = self()
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
     flow_type = "router-flow-segment-only-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-segment-only-id-#{System.unique_integer([:positive])}"
     partition = "tenant-segment-only"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       Application.put_env(:ferricstore, :standalone_durability_hook, fn _file_path, batch ->
         send(parent, {:unexpected_standalone_bitcask_append, batch})
         {:error, :standalone_bitcask_append_forbidden}
@@ -7127,18 +8137,115 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
     after
       restore_env(:standalone_durability_hook, previous_hook)
-      restore_backend(previous_backend)
     end
   end
 
+  test "Flow terminal LMDB flush prunes WARaft apply projection cache", %{ctx: ctx} do
+    flow_type = "router-flow-terminal-projection-prune-#{System.unique_integer([:positive])}"
+    flow_id = "router-flow-terminal-projection-prune-id-#{System.unique_integer([:positive])}"
+    partition = "tenant-terminal-projection-prune"
+
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, flow_id,
+               type: flow_type,
+               partition_key: partition,
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               partition_key: partition,
+               worker: "worker-terminal-projection-prune",
+               limit: 1,
+               now_ms: 2,
+               lease_ms: 10_000
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, flow_id, claimed.lease_token,
+               partition_key: partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: 3
+             )
+
+    state_key = Ferricstore.Flow.Keys.state_key(flow_id, partition)
+
+    assert [{^state_key, nil, 0, {:flow_state_version, _version, _lfu},
+             {:waraft_apply_projection, _index}, 0, _value_size}] =
+             :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
+
+    assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) >
+             0
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+    assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
+    assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) == 0
+  end
+
+  test "Flow history projection materializes empty generated values without pinning WARaft apply cache",
+       %{ctx: ctx} do
+    flow_type = "router-flow-empty-value-projection-prune-#{System.unique_integer([:positive])}"
+    flow_id = "router-flow-empty-value-projection-prune-id-#{System.unique_integer([:positive])}"
+    partition = "tenant-empty-value-projection-prune"
+
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, flow_id,
+               type: flow_type,
+               partition_key: partition,
+               run_at_ms: 1,
+               now_ms: 1,
+               payload: <<>>
+             )
+
+    assert {:ok, created} = Ferricstore.Flow.get(ctx, flow_id, partition_key: partition)
+    assert is_binary(created.payload_ref)
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               partition_key: partition,
+               worker: "worker-empty-value-projection-prune",
+               limit: 1,
+               now_ms: 2,
+               lease_ms: 10_000
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, flow_id, claimed.lease_token,
+               partition_key: partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: 3
+             )
+
+    assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) >
+             0
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 30_000)
+
+    assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), created.payload_ref)
+    assert {:ok, [<<>>]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
+    assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) == 0
+  end
+
   test "Flow create_many and transition_many use WARaft as the selected backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     flow_type = "router-flow-many-#{System.unique_integer([:positive])}"
     partition = "tenant-many-#{System.unique_integer([:positive])}"
     ids = for n <- 1..3, do: "router-flow-many-#{n}-#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       start_supervised!(
@@ -7180,12 +8287,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert Enum.all?(claimed, &(&1.state == "running"))
       assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "multi-shard Flow terminal batches publish WARaft keydir locations", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     shard_count = 16
     flow_type = "router-flow-pending-publish-#{System.unique_integer([:positive])}"
     ids = for n <- 1..64, do: "router-flow-pending-publish-#{n}"
@@ -7202,7 +8307,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     ctx = build_ctx(root, shard_count: shard_count)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       items =
@@ -7248,7 +8352,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert_pending_keydir_rows(ctx, 0)
     after
-      restore_backend(previous_backend)
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
       File.rm_rf!(root)
@@ -7256,14 +8359,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   end
 
   test "WARaft apply passes log index to Flow history projection", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     flow_type = "router-flow-history-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-history-id-#{System.unique_integer([:positive])}"
     partition = "tenant-history-#{System.unique_integer([:positive])}"
     shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert :ok =
@@ -7287,30 +8388,30 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert Ferricstore.Flow.HistoryProjectedIndex.read(shard_data_path) >= applied_index
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "async Flow history projection gates WARaft durable position, not applied position", %{
+    root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
 
     previous_history_flush =
       Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
 
     previous_history_batch = Application.get_env(:ferricstore, :flow_history_projector_batch_size)
+    previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
     flow_type = "router-flow-history-sync-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-history-sync-id-#{System.unique_integer([:positive])}"
     partition = "tenant-history-sync-#{System.unique_integer([:positive])}"
     shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :flow_async_history, true)
       Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
       Application.put_env(:ferricstore, :flow_history_projector_batch_size, 10_000)
+      Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
 
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
@@ -7344,11 +8445,78 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert applied_index > projected_index
       assert durable_index <= before_index
+
+      assert {:ok, {{:raft_log_pos, ^applied_index, _term}, count}} =
+               read_segment_projection_header(root, 0)
+
+      assert count > 0
     after
-      restore_backend(previous_backend)
       restore_env(:flow_async_history, previous_async_history)
       restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
       restore_env(:flow_history_projector_batch_size, previous_history_batch)
+      restore_env(:waraft_storage_metadata_persist_every, previous_every)
+    end
+  end
+
+  test "WARaft storage close flushes async Flow history before persisting replay cursor", %{
+    root: root,
+    ctx: ctx
+  } do
+    previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    previous_history_flush =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    previous_history_batch = Application.get_env(:ferricstore, :flow_history_projector_batch_size)
+    previous_every = Application.get_env(:ferricstore, :waraft_storage_metadata_persist_every)
+    flow_type = "router-flow-history-close-#{System.unique_integer([:positive])}"
+    flow_id = "router-flow-history-close-id-#{System.unique_integer([:positive])}"
+    partition = "tenant-history-close-#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+    try do
+      Application.put_env(:ferricstore, :flow_async_history, true)
+      Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+      Application.put_env(:ferricstore, :flow_history_projector_batch_size, 10_000)
+      Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, :never)
+
+      assert :ok =
+               WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      start_supervised!(
+        {Ferricstore.Flow.HistoryProjector,
+         [
+           shard_index: 0,
+           shard_data_path: shard_data_path,
+           instance_ctx: ctx,
+           recover_on_init: false
+         ]}
+      )
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, flow_id,
+                 type: flow_type,
+                 partition_key: partition,
+                 run_at_ms: 1_000,
+                 now_ms: 900
+               )
+
+      assert {:ok, {:raft_log_pos, applied_index, _term}} = WARaftBackend.storage_position(0)
+      assert Ferricstore.Flow.HistoryProjectedIndex.read(shard_data_path) < applied_index
+
+      assert :ok = WARaftBackend.stop()
+
+      assert Ferricstore.Flow.HistoryProjectedIndex.read(shard_data_path) >= applied_index
+
+      assert %{position: {:raft_log_pos, persisted_index, _persisted_term}} =
+               waraft_latest_storage_metadata(root, 0)
+
+      assert persisted_index >= applied_index
+    after
+      restore_env(:flow_async_history, previous_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
+      restore_env(:flow_history_projector_batch_size, previous_history_batch)
+      restore_env(:waraft_storage_metadata_persist_every, previous_every)
     end
   end
 
@@ -7356,7 +8524,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     flow_type = "router-flow-cache-projection-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-cache-projection-id-#{System.unique_integer([:positive])}"
     partition = "tenant-cache-projection-#{System.unique_integer([:positive])}"
@@ -7372,8 +8539,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -7393,14 +8558,15 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                       %{kind: :apply_projection}},
                      250
 
-      refute File.exists?(
-               Path.join([
-                 root,
-                 "waraft",
-                 "ferricstore_waraft_backend.1",
-                 "apply_projection_log"
-               ])
-             )
+      apply_projection_root =
+        Path.join([
+          root,
+          "waraft",
+          "ferricstore_waraft_backend.1",
+          "apply_projection_log"
+        ])
+
+      assert [] == Path.wildcard(Path.join([apply_projection_root, "segment_log", "*.seg"]))
 
       assert :ok = WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
@@ -7415,7 +8581,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert {:ok, %{id: ^flow_id, state: "queued"}} =
                Ferricstore.Flow.get(restarted_ctx, flow_id, partition_key: partition)
     after
-      restore_backend(previous_backend)
     end
   end
 
@@ -7423,14 +8588,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_limit = Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_entries)
     flow_type = "router-flow-cache-compact-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-cache-compact-id-#{System.unique_integer([:positive])}"
     partition = "tenant-cache-compact-#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :waraft_apply_projection_cache_max_entries, 0)
       clear_apply_projection_cache!()
 
@@ -7448,9 +8611,137 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert {:ok, %{id: ^flow_id, state: "queued"}} =
                Ferricstore.Flow.get(ctx, flow_id, partition_key: partition)
 
-      assert apply_projection_cache_rows(root, 0) == 0
+      assert eventually(fn -> apply_projection_cache_rows(root, 0) == 0 end)
     after
-      restore_backend(previous_backend)
+      restore_env(:waraft_apply_projection_cache_max_entries, previous_limit)
+    end
+  end
+
+  test "Flow WARaft apply projection cache compaction does not block apply", %{
+    root: root,
+    ctx: ctx
+  } do
+    previous_limit = Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_entries)
+    previous_hook = Application.get_env(:ferricstore, :waraft_apply_projection_cache_compact_hook)
+    flow_type = "router-flow-cache-async-compact-#{System.unique_integer([:positive])}"
+    flow_id = "router-flow-cache-async-compact-id-#{System.unique_integer([:positive])}"
+    partition = "tenant-cache-async-compact-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    hook = fn
+      :before_spill, metadata ->
+        send(parent, {:apply_projection_cache_before_spill, self(), metadata})
+
+        receive do
+          :release_apply_projection_cache_compaction -> :ok
+        after
+          5_000 -> :ok
+        end
+
+      _phase, _metadata ->
+        :ok
+    end
+
+    try do
+      Application.put_env(:ferricstore, :waraft_apply_projection_cache_max_entries, 0)
+      Application.put_env(:ferricstore, :waraft_apply_projection_cache_compact_hook, hook)
+      clear_apply_projection_cache!()
+
+      assert :ok =
+               WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, flow_id,
+                 type: flow_type,
+                 partition_key: partition,
+                 payload: :binary.copy("payload-", 128),
+                 run_at_ms: 1_000,
+                 now_ms: 900
+               )
+
+      assert_receive {:apply_projection_cache_before_spill, compactor_pid,
+                      %{shard_index: 0, count: count, limit: 0}},
+                     1_000
+
+      assert count > 0
+      assert apply_projection_cache_rows(root, 0) > 0
+
+      assert {:ok, %{id: ^flow_id, state: "queued"}} =
+               Ferricstore.Flow.get(ctx, flow_id, partition_key: partition)
+
+      send(compactor_pid, :release_apply_projection_cache_compaction)
+      assert eventually(fn -> apply_projection_cache_rows(root, 0) == 0 end)
+    after
+      restore_env(:waraft_apply_projection_cache_max_entries, previous_limit)
+      restore_env(:waraft_apply_projection_cache_compact_hook, previous_hook)
+    end
+  end
+
+  test "restart drops stale Flow apply projection spill log and rebuilds from WARaft segments", %{
+    root: root,
+    ctx: ctx
+  } do
+    previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    previous_history_flush =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    previous_limit = Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_entries)
+
+    flow_type = "router-flow-cache-restart-#{System.unique_integer([:positive])}"
+    flow_id = "router-flow-cache-restart-id-#{System.unique_integer([:positive])}"
+    partition = "tenant-cache-restart-#{System.unique_integer([:positive])}"
+    apply_projection_root = waraft_apply_projection_root(root, 0)
+
+    try do
+      Application.put_env(:ferricstore, :flow_async_history, true)
+      Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+      Application.put_env(:ferricstore, :waraft_apply_projection_cache_max_entries, 0)
+      clear_apply_projection_cache!()
+
+      assert :ok =
+               WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, flow_id,
+                 type: flow_type,
+                 partition_key: partition,
+                 payload: :binary.copy("payload-", 128),
+                 run_at_ms: 1_000,
+                 now_ms: 900
+               )
+
+      assert {:ok, %{id: ^flow_id, state: "queued"}} =
+               Ferricstore.Flow.get(ctx, flow_id, partition_key: partition)
+
+      assert eventually(fn ->
+               apply_projection_segment_files(apply_projection_root) != []
+             end)
+
+      assert :ok = WARaftBackend.stop()
+      FerricStore.Instance.cleanup(ctx.name)
+      clear_apply_projection_cache!()
+
+      assert apply_projection_segment_files(apply_projection_root) != []
+
+      restarted_ctx = build_ctx(root)
+
+      try do
+        assert :ok =
+                 WARaftBackend.start(restarted_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert {:ok, %{id: ^flow_id, state: "queued"}} =
+                 Ferricstore.Flow.get(restarted_ctx, flow_id, partition_key: partition)
+
+        assert [] == apply_projection_segment_files(apply_projection_root)
+      after
+        FerricStore.Instance.cleanup(restarted_ctx.name)
+      end
+    after
+      restore_env(:flow_async_history, previous_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, previous_history_flush)
       restore_env(:waraft_apply_projection_cache_max_entries, previous_limit)
     end
   end
@@ -7458,7 +8749,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   test "failed async Flow history projection does not advance WARaft storage position", %{
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     previous_async_history = Application.get_env(:ferricstore, :flow_async_history)
     flow_type = "router-flow-history-fail-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-history-fail-id-#{System.unique_integer([:positive])}"
@@ -7467,7 +8757,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     history_path = Ferricstore.Flow.HistoryProjector.history_file_path(shard_data_path, 0)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       Application.put_env(:ferricstore, :flow_async_history, true)
 
       assert :ok =
@@ -7489,7 +8778,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert {:ok, ^pre_position} = WARaftBackend.storage_position(0)
     after
-      restore_backend(previous_backend)
       restore_env(:flow_async_history, previous_async_history)
     end
   end
@@ -7498,15 +8786,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     flow_type = "router-flow-restart-#{System.unique_integer([:positive])}"
     flow_id = "router-flow-restart-id-#{System.unique_integer([:positive])}"
     running_id = "router-flow-running-restart-id-#{System.unique_integer([:positive])}"
     partition = "tenant-restart-#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -7591,12 +8876,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert claim.id == flow_id
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "Flow cross-shard spawn_children uses WARaft as the selected backend", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "flow-cross-shard"), shard_count: 2)
     parent_id = "router-flow-parent-#{System.unique_integer([:positive])}"
     child_id = "router-flow-child-#{System.unique_integer([:positive])}"
@@ -7604,7 +8887,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     child_partition = flow_partition_for_shard(ctx, child_id, 1)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert :ok =
@@ -7646,13 +8928,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert child.parent_partition_key == parent_partition
       assert child.partition_key == child_partition
     after
-      restore_backend(previous_backend)
       FerricStore.Instance.cleanup(ctx.name)
     end
   end
 
   test "Flow cross-shard child completion resolves parent through WARaft", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "flow-cross-shard-complete"), shard_count: 2)
     parent_id = "router-flow-parent-complete-#{System.unique_integer([:positive])}"
     child_id = "router-flow-child-complete-#{System.unique_integer([:positive])}"
@@ -7660,7 +8940,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     child_partition = flow_partition_for_shard(ctx, child_id, 1)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert {:ok, _waiting_parent} =
@@ -7695,13 +8974,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert done_parent.child_groups["complete-fanout"]["children"][child_id] == "completed"
       assert done_parent.child_groups["complete-fanout"]["summary"]["completed"] == 1
     after
-      restore_backend(previous_backend)
       FerricStore.Instance.cleanup(ctx.name)
     end
   end
 
   test "Flow cross-shard retry exhaustion resolves parent through WARaft", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "flow-cross-shard-retry"), shard_count: 2)
     parent_id = "router-flow-parent-retry-#{System.unique_integer([:positive])}"
     child_id = "router-flow-child-retry-#{System.unique_integer([:positive])}"
@@ -7709,7 +8986,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     child_partition = flow_partition_for_shard(ctx, child_id, 1)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert {:ok, _waiting_parent} =
@@ -7745,13 +9021,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert failed_parent.child_groups["retry-fanout"]["children"][child_id] == "failed"
       assert failed_parent.child_groups["retry-fanout"]["summary"]["failed"] == 1
     after
-      restore_backend(previous_backend)
       FerricStore.Instance.cleanup(ctx.name)
     end
   end
 
   test "Flow cross-shard fail and cancel propagate parent policy through WARaft", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "flow-cross-shard-fail-cancel"), shard_count: 2)
     fail_parent = "router-flow-parent-fail-#{System.unique_integer([:positive])}"
     fail_child = "router-flow-child-fail-#{System.unique_integer([:positive])}"
@@ -7763,7 +9037,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     cancel_child_partition = flow_partition_for_shard(ctx, cancel_child, 1)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert {:ok, _waiting_parent} =
@@ -7822,13 +9095,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert cancelled_parent.child_groups["cancel-fanout"]["children"][cancel_child] ==
                "cancelled"
     after
-      restore_backend(previous_backend)
       FerricStore.Instance.cleanup(ctx.name)
     end
   end
 
   test "Flow retention cleanup scans all WARaft shards", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "flow-retention-cleanup"), shard_count: 2)
     flow_type = "router-flow-retention-#{System.unique_integer([:positive])}"
     flow_a = "router-flow-retention-a-#{System.unique_integer([:positive])}"
@@ -7839,7 +9110,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     cleanup_now_ms = now_ms + 1_000
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       for {id, partition, worker} <- [
@@ -7884,13 +9154,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert {:ok, nil} = Ferricstore.Flow.get(ctx, flow_a, partition_key: partition_a)
       assert {:ok, nil} = Ferricstore.Flow.get(ctx, flow_b, partition_key: partition_b)
     after
-      restore_backend(previous_backend)
       FerricStore.Instance.cleanup(ctx.name)
     end
   end
 
   test "Flow cross-shard terminal many commands resolve parents through WARaft", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "flow-cross-terminal-many"), shard_count: 2)
     complete_parent = "router-flow-many-parent-complete-#{System.unique_integer([:positive])}"
     complete_child = "router-flow-many-child-complete-#{System.unique_integer([:positive])}"
@@ -7902,7 +9170,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     cancel_child = "router-flow-many-child-cancel-#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       {complete_parent_partition, complete_child_partition} =
@@ -8020,16 +9287,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert cancelled_child.state == "cancelled"
     after
-      restore_backend(previous_backend)
       FerricStore.Instance.cleanup(ctx.name)
     end
   end
 
   test "file-backed probabilistic commands use WARaft as the selected backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       meta = {:bloom_meta, %{capacity: 128, error_rate: 0.01}}
@@ -8049,15 +9312,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                )
              )
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "CMS Cuckoo TopK and TDigest commands use WARaft as the selected backend", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       assert :ok =
@@ -8114,12 +9373,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert median != "nan"
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "file-backed probabilistic commands survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     suffix = System.unique_integer([:positive])
 
     bloom_key = "router:bf-restart:#{suffix}"
@@ -8129,8 +9386,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     tdigest_key = "router:td-restart:#{suffix}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8211,12 +9466,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert median != "nan"
       FerricStore.Instance.cleanup(restarted_ctx.name)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "probabilistic merge commands survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     suffix = System.unique_integer([:positive])
 
     hll_src1 = "router:hll-merge-src1:#{suffix}"
@@ -8232,8 +9485,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     td_dest = "router:td-merge-dest:#{suffix}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8314,15 +9565,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert median != "nan"
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "stream XADD uses WARaft-backed compound writes", %{ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       key = "router:stream:#{System.unique_integer([:positive])}"
@@ -8335,16 +9582,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert 1 = Ferricstore.Commands.Stream.handle_ast({:xlen, key}, ctx)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "stream consumer group state survives WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8406,16 +9648,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  acked_ctx
                )
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "stream XDEL and XTRIM mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8458,16 +9695,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  restarted_ctx
                )
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "hash field metadata reads survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8512,17 +9744,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert extended_ttl > ttl_after
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "advanced hash mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     key = "router:hash-advanced:#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8587,7 +9815,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert expiretime == -1
     after
-      restore_backend(previous_backend)
     end
   end
 
@@ -8595,11 +9822,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8636,17 +9859,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert {:ok, [{"b", 2.0}]} =
                Router.zset_score_range_slice(restarted_ctx, key, :neg_inf, :inf, false, 1, 1)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "zset update and pop mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     key = "router:zset-mutate:#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8686,17 +9905,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  restarted_ctx
                )
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "advanced zset range and pop mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     key = "router:zset-advanced:#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8756,16 +9971,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       refute "a" in scanned
       refute "d" in scanned
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "list commands survive WARaft restart without shard process reads", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8794,18 +10004,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert ["b", "c"] =
                Ferricstore.Commands.List.handle_ast({:lrange, key, 0, -1}, restarted_ctx)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "advanced list mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     key = "router:list-advanced:#{System.unique_integer([:positive])}"
     missing_key = "router:list-advanced:missing:#{System.unique_integer([:positive])}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8835,16 +10041,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert 1 = Ferricstore.Commands.List.handle("LPOS", [key, "B"], restarted_ctx)
       assert 0 = Ferricstore.Commands.List.handle_ast({:llen, missing_key}, restarted_ctx)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "set commands survive WARaft restart without shard process reads", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8880,12 +10081,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert 2 = Ferricstore.Commands.Set.handle_ast({:scard, key}, restarted_ctx)
       assert 0 = Ferricstore.Commands.Set.handle_ast({:sismember, key, "b"}, restarted_ctx)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "advanced set store and pop mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     suffix = System.unique_integer([:positive])
     left = "router:set-advanced:left:#{suffix}"
     right = "router:set-advanced:right:#{suffix}"
@@ -8894,8 +10093,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     pop = "router:set-advanced:pop:#{suffix}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -8940,12 +10137,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "c" in scanned
       refute "a" in scanned
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "cross-shard list and set mutations survive WARaft restart", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "compound-cross-shard"), shard_count: 2)
 
     list_src = key_for_shard(ctx, 0, "router:list-cross:src")
@@ -8955,8 +10150,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     set_union_dst = key_for_shard(ctx, 1, "router:set-cross:union")
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9005,12 +10198,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
-      restore_backend(previous_backend)
     end
   end
 
   test "blocking list immediate mutations survive WARaft restart", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "blocking-list"), shard_count: 2)
 
     blpop_key = key_for_shard(ctx, 0, "router:blocking:blpop")
@@ -9019,8 +10210,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     move_dst = key_for_shard(ctx, 1, "router:blocking:move-dst")
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9071,16 +10260,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
-      restore_backend(previous_backend)
     end
   end
 
   test "geo commands survive WARaft restart without shard process reads", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9134,7 +10318,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  restarted_ctx
                )
     after
-      restore_backend(previous_backend)
     end
   end
 
@@ -9142,11 +10325,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9175,7 +10354,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
       assert 2 = Ferricstore.Commands.Server.handle("DBSIZE", [], restarted_ctx)
     after
-      restore_backend(previous_backend)
     end
   end
 
@@ -9183,7 +10361,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     root: root,
     ctx: ctx
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     suffix = System.unique_integer([:positive])
 
     plain_key = "router:flush:plain:#{suffix}"
@@ -9191,8 +10368,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     list_key = "router:flush:list:#{suffix}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9228,16 +10403,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert 0 = Ferricstore.Commands.Hash.handle_ast({:hlen, hash_key}, restarted_ctx)
       assert 0 = Ferricstore.Commands.List.handle_ast({:llen, list_key}, restarted_ctx)
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "generic key mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
-
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9282,12 +10452,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "rename-value" == Router.get(restarted_ctx, "router:generic:renamed")
       assert nil == Router.get(restarted_ctx, "router:generic:unlink")
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "cross-shard generic key mutations survive WARaft restart", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "generic-cross-shard"), shard_count: 2)
 
     source = key_for_shard(ctx, 0, "router:generic-cross:source")
@@ -9296,8 +10464,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     renamed = key_for_shard(ctx, 1, "router:generic-cross:renamed")
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9333,14 +10499,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
-      restore_backend(previous_backend)
     end
   end
 
   test "cross-shard generic key mutations preserve blob-backed values after WARaft restart", %{
     root: root
   } do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "generic-cross-shard-blob"), shard_count: 2)
 
     copy_source = key_for_shard(ctx, 0, "router:generic-cross-blob:copy-source")
@@ -9355,8 +10519,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     assert byte_size(rename_payload) > ctx.blob_side_channel_threshold_bytes
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9398,20 +10560,16 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
-      restore_backend(previous_backend)
     end
   end
 
   test "native CAS lock and ratelimit mutations survive WARaft restart", %{root: root, ctx: ctx} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     suffix = System.unique_integer([:positive])
     cas_key = "router:native:cas:#{suffix}"
     lock_key = "router:native:lock:#{suffix}"
     ratelimit_key = "router:native:rl:#{suffix}"
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9470,12 +10628,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                  restarted_ctx
                )
     after
-      restore_backend(previous_backend)
     end
   end
 
   test "extended string RMW commands survive WARaft restart", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "strings-rmw"), shard_count: 2)
 
     getset_key = key_for_shard(ctx, 0, "router:strings-rmw:getset")
@@ -9486,8 +10642,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     msetnx_b = key_for_shard(ctx, 1, "router:strings-rmw:msetnx-b")
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9537,12 +10691,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
-      restore_backend(previous_backend)
     end
   end
 
   test "numeric append and expiring string commands survive WARaft restart", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "strings-numeric"), shard_count: 2)
 
     int_key = key_for_shard(ctx, 0, "router:strings-numeric:int")
@@ -9552,8 +10704,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     psetex_key = key_for_shard(ctx, 1, "router:strings-numeric:psetex")
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
-
       assert :ok =
                WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -9604,16 +10754,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     after
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
-      restore_backend(previous_backend)
     end
   end
 
   test "Router WARaft backend keeps shard partitions isolated", %{root: root} do
-    previous_backend = Application.get_env(:ferricstore, :raft_backend)
     ctx = build_ctx(Path.join(root, "multi"), shard_count: 4)
 
     try do
-      Application.put_env(:ferricstore, :raft_backend, :waraft)
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
       entries =
@@ -9633,7 +10780,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
         assert index >= 2
       end
     after
-      restore_backend(previous_backend)
       FerricStore.Instance.cleanup(ctx.name)
     end
   end
@@ -11349,7 +12495,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
 
     for node <- names do
-      :rpc.call(node, Application, :put_env, [:ferricstore, :raft_backend, :waraft])
     end
 
     leader = start_waraft_backend_peer_cluster!(initial_nodes, unique)
@@ -11416,7 +12561,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
 
     for node <- names do
-      :rpc.call(node, Application, :put_env, [:ferricstore, :raft_backend, :waraft])
     end
 
     leader = start_waraft_backend_peer_cluster!(initial_nodes, unique)
@@ -11484,7 +12628,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
 
     for node <- names do
-      :rpc.call(node, Application, :put_env, [:ferricstore, :raft_backend, :waraft])
     end
 
     leader = start_waraft_backend_peer_cluster!(initial_nodes, unique)
@@ -11564,7 +12707,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
 
     for node <- names do
-      :rpc.call(node, Application, :put_env, [:ferricstore, :raft_backend, :waraft])
     end
 
     leader = start_waraft_backend_peer_cluster!(nodes, unique)
@@ -11630,7 +12772,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
 
     for node <- names do
-      :rpc.call(node, Application, :put_env, [:ferricstore, :raft_backend, :waraft])
     end
 
     leader = start_waraft_backend_peer_cluster!(nodes, unique)
@@ -11698,7 +12839,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
 
     for node <- names do
-      :rpc.call(node, Application, :put_env, [:ferricstore, :raft_backend, :waraft])
     end
 
     leader = start_waraft_backend_peer_cluster!(nodes, unique)
@@ -11747,7 +12887,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
 
     for node <- names do
-      :rpc.call(node, Application, :put_env, [:ferricstore, :raft_backend, :waraft])
     end
 
     leader = start_waraft_backend_peer_cluster!(nodes, unique)
@@ -12154,11 +13293,33 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     ]
   end
 
-  defp restore_backend(nil), do: Application.delete_env(:ferricstore, :raft_backend)
-  defp restore_backend(value), do: Application.put_env(:ferricstore, :raft_backend, value)
-
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp assert_receive_apply_projection_sync do
+    deadline = System.monotonic_time(:millisecond) + 1_000
+    assert_receive_apply_projection_sync(deadline, [])
+  end
+
+  defp assert_receive_apply_projection_sync(deadline, seen) do
+    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:waraft_segment_log_file_sync, path, :datasync} ->
+        path_string = to_string(path)
+
+        if String.contains?(path_string, "apply_projection_log") do
+          :ok
+        else
+          assert_receive_apply_projection_sync(deadline, [path_string | seen])
+        end
+    after
+      timeout ->
+        flunk(
+          "trim-time Flow value pin materialization must be fdatasynced before the old segment can be removed; saw syncs: #{inspect(Enum.reverse(seen))}"
+        )
+    end
+  end
 
   defp restore_waraft_app_env(key, nil),
     do: Application.delete_env(:ferricstore_waraft_backend, key)
@@ -12244,6 +13405,46 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     waraft_storage_metadata_path(root, shard_index) <> ".journal"
   end
 
+  defp write_waraft_storage_metadata!(root, shard_index, metadata) do
+    path = waraft_storage_metadata_path(root, shard_index)
+
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, :erlang.term_to_binary(metadata))
+    File.rm(waraft_storage_metadata_previous_path(root, shard_index))
+    File.rm(waraft_storage_metadata_journal_path(root, shard_index))
+  end
+
+  defp read_segment_projection_header(root, shard_index) do
+    projection_root =
+      Path.join([
+        root,
+        "waraft",
+        "ferricstore_waraft_backend.#{shard_index + 1}",
+        "segment_projection_log"
+      ])
+
+    fold_fun = fn
+      _index, {0, {:ferricstore_segment_projection_header, position, count}}, acc ->
+        Map.put(acc, :header, {position, count})
+
+      _index, {_term, {:ferricstore_segment_projection_header, position, count}}, acc ->
+        Map.put(acc, :header, {position, count})
+
+      _index, _entry, acc ->
+        acc
+    end
+
+    case :ferricstore_waraft_spike_segment_log.fold_disk(
+           to_charlist(projection_root),
+           fold_fun,
+           %{}
+         ) do
+      {:ok, %{header: header}} -> {:ok, header}
+      {:ok, %{}} -> :not_found
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp waraft_segment_log_dir(root, shard_index) do
     Path.join([
       root,
@@ -12253,12 +13454,35 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     ])
   end
 
+  defp append_raw_waraft_segment_record!(root, shard_index, {index, _entry} = record)
+       when is_integer(index) and index > 0 do
+    # Test-only helper for disk states that can happen after a leader election:
+    # Raft may have a no-op tail entry that is not application storage work.
+    path = Path.join(waraft_segment_log_dir(root, shard_index), "0.seg")
+    File.write!(path, encode_segment_record(record), [:append])
+  end
+
+  defp encode_segment_record(record) do
+    payload = :erlang.term_to_binary(record)
+    <<byte_size(payload)::32, :erlang.crc32(payload)::32, payload::binary>>
+  end
+
   defp waraft_storage_root(root, shard_index) do
     Path.join([
       root,
       "waraft",
       "ferricstore_waraft_backend.#{shard_index + 1}"
     ])
+  end
+
+  defp waraft_apply_projection_root(root, shard_index) do
+    Path.join([waraft_storage_root(root, shard_index), "apply_projection_log"])
+  end
+
+  defp apply_projection_segment_files(apply_projection_root) do
+    apply_projection_root
+    |> Path.join("segment_log/*.seg")
+    |> Path.wildcard()
   end
 
   defp clear_apply_projection_cache! do
@@ -12346,6 +13570,31 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
     {:raft_log, :"raft_log_ferricstore_waraft_backend_#{partition}", :ferricstore_waraft_backend,
      :ferricstore_waraft_backend, partition, :ferricstore_waraft_spike_segment_log}
+  end
+
+  defp append_waraft_fence!(key, value) do
+    assert :ok = WARaftBackend.write(0, {:put, key, value, 0})
+    log = waraft_segment_log_record(0)
+    index = :ferricstore_waraft_spike_segment_log.last_index(log)
+    assert is_integer(index) and index > 0
+    {log, index}
+  end
+
+  defp insert_apply_projection_ref!(root, ctx, index, key, value) do
+    lfu = Ferricstore.Store.LFU.initial()
+    value_size = byte_size(value)
+
+    :ets.insert(
+      elem(ctx.keydir_refs, 0),
+      {key, nil, 0, lfu, {:waraft_apply_projection, index}, 0, value_size}
+    )
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, index, [
+               {key, value, 0}
+             ])
+
+    {lfu, 0, value_size}
   end
 
   defp key_for_shard(ctx, shard_idx) do
@@ -12646,6 +13895,19 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     end
   end
 
+  defp flush_segment_append_telemetry do
+    receive do
+      {:waraft_segment_log_telemetry, [:ferricstore, :waraft, :segment_log, :append],
+       _measurements, _metadata} ->
+        flush_segment_append_telemetry()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp position_index({:raft_log_pos, index, _term}) when is_integer(index), do: index
+  defp position_index(_position), do: 0
+
   defp assert_eventually(fun, expected, attempts \\ 50)
 
   defp assert_eventually(_fun, expected, 0),
@@ -12877,6 +14139,17 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     1..10_000
     |> Enum.map(&"#{prefix}:#{shard_index}:#{&1}")
     |> Enum.find(&(Router.shard_for(ctx, &1) == shard_index))
+  end
+
+  defp flow_key_for_shard(ctx, shard_index, prefix) do
+    1..10_000
+    |> Enum.map(fn n ->
+      id = "#{prefix}:#{shard_index}:#{n}"
+      partition_key = "#{prefix}:partition:#{shard_index}:#{n}"
+      key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+      {id, partition_key, key}
+    end)
+    |> Enum.find(fn {_id, _partition_key, key} -> Router.shard_for(ctx, key) == shard_index end)
   end
 
   defp delayed_parallel_batch_record?(

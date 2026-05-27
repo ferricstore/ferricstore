@@ -27,11 +27,11 @@ defmodule Ferricstore.MemoryBudget do
   @segment_entry_budget_bytes 1024
   @segment_max_entries_cap 262_144
 
-  @apply_projection_cache_memory_percent 1
+  @apply_projection_cache_memory_percent 2
   @apply_projection_cache_entry_bytes 512
   @apply_projection_cache_min_entries 1_024
-  @apply_projection_cache_total_max_entries 262_144
-  @apply_projection_cache_per_shard_max_entries 16_384
+  @apply_projection_cache_total_max_entries 4_194_304
+  @apply_projection_cache_per_shard_max_entries 262_144
 
   @history_pending_memory_percent 2
   @history_pending_entry_bytes 2_048

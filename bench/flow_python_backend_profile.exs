@@ -9,12 +9,14 @@ defmodule FlowPythonBackendProfile do
     [:ferricstore, :flow, :claim_due, :stop],
     [:ferricstore, :flow, :complete, :stop],
     [:ferricstore, :flow, :pipeline_claim_due_batch],
+    [:ferricstore, :flow, :lmdb_writer, :flush],
     [:ferricstore, :batcher, :slot_flush],
     [:ferricstore, :batcher, :quorum_submit],
     [:ferricstore, :bitcask, :append],
     [:ferricstore, :waraft, :batcher, :slot_flush],
     [:ferricstore, :waraft, :batcher, :hot_flush],
     [:ferricstore, :waraft, :segment_log, :append],
+    [:ferricstore, :waraft, :apply_projection_cache, :compact],
     [:ferricstore, :waraft, :storage, :payload_fsync],
     [:ferricstore, :waraft, :storage_blocked],
     [:ferricstore, :waraft, :commit_bytes, :rejected]
@@ -148,13 +150,13 @@ defmodule FlowPythonBackendProfile do
       "--mode",
       "queued",
       "--queued-shape",
-      "live",
+      env("QUEUED_SHAPE", "live"),
       "--transport",
       env("TRANSPORT", "many"),
       "--worker-api",
-      "lowlevel",
+      env("WORKER_API", "lowlevel"),
       "--worker-mode",
-      "owner-wakeup",
+      env("WORKER_MODE", "blocking"),
       "--partition-mode",
       "auto",
       "--flows",
@@ -169,6 +171,10 @@ defmodule FlowPythonBackendProfile do
       env("CLAIM_BATCH_SIZE", "1000"),
       "--claim-partition-batch-size",
       env("CLAIM_PARTITION_BATCH_SIZE", "16"),
+      "--claim-block-ms",
+      env("CLAIM_BLOCK_MS", "5000"),
+      "--claim-drain-block-ms",
+      env("CLAIM_DRAIN_BLOCK_MS", "50"),
       "--create-batch-size",
       env("CREATE_BATCH_SIZE", "1000"),
       "--complete-async-depth",
@@ -196,7 +202,7 @@ defmodule FlowPythonBackendProfile do
   defp record_event(table, event, measurements, metadata) do
     key = {event, event_group(event, metadata)}
     duration_us = duration_us(measurements)
-    batch_size = int_measurement(measurements, :batch_size)
+    batch_size = int_measurement(measurements, :batch_size) + int_measurement(measurements, :op_count)
     count = int_measurement(measurements, :count)
     bytes = int_measurement(measurements, :batch_bytes) + int_measurement(measurements, :bytes)
 
@@ -237,6 +243,12 @@ defmodule FlowPythonBackendProfile do
     do:
       {Map.get(metadata, :kind, :unknown),
        if(Map.get(metadata, :new_segment), do: :new_segment, else: :same_segment)}
+
+  defp event_group([:ferricstore, :flow, :lmdb_writer, :flush], metadata),
+    do: Map.get(metadata, :status, :unknown)
+
+  defp event_group([:ferricstore, :waraft, :apply_projection_cache, :compact], metadata),
+    do: Map.get(metadata, :result, :unknown)
 
   defp event_group(_event, _metadata), do: :all
 
@@ -346,6 +358,24 @@ defmodule FlowPythonBackendProfile do
         bytes = words * :erlang.system_info(:wordsize)
 
         IO.puts("apply_projection_cache: rows=#{size} ets_bytes=#{bytes}")
+        maybe_print_apply_projection_cache_sample(tid)
+    end
+  end
+
+  defp maybe_print_apply_projection_cache_sample(tid) do
+    if System.get_env("INSPECT_APPLY_PROJECTION_SAMPLE") in ["1", "true", "TRUE", "yes", "YES"] do
+      sample =
+        :ets.tab2list(tid)
+        |> Enum.take(20)
+        |> Enum.map(fn
+          {{root, index, key}, value, expire_at_ms} ->
+            {Path.basename(root), index, key, expire_at_ms, byte_size(value)}
+
+          other ->
+            other
+        end)
+
+      IO.inspect(sample, label: "apply_projection_cache_sample")
     end
   end
 
@@ -531,21 +561,6 @@ defmodule FlowPythonBackendProfile do
     end
   end
 
-  defp put_optional_bool_env(env_name, app_key) do
-    case System.get_env(env_name) do
-      nil ->
-        :ok
-
-      value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] ->
-        Application.put_env(:ferricstore, app_key, true)
-
-      value when value in ["0", "false", "FALSE", "no", "NO", "off", "OFF"] ->
-        Application.put_env(:ferricstore, app_key, false)
-
-      value ->
-        raise "unsupported #{env_name}=#{inspect(value)}; expected boolean"
-    end
-  end
 end
 
 FlowPythonBackendProfile.run()

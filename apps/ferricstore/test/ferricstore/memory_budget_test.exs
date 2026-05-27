@@ -19,7 +19,19 @@ defmodule Ferricstore.MemoryBudgetTest do
       assert limits.waraft_segment_log_max_ets_bytes == 16 * @mib
       assert limits.waraft_segment_log_min_ets_entries == 512
       assert limits.waraft_segment_log_max_ets_entries == 16_384
-      assert limits.waraft_apply_projection_cache_max_entries == 16_384
+      assert limits.waraft_apply_projection_cache_max_entries == 83_886
+    end
+
+    test "lets large machines absorb a one-million Flow terminal burst without immediate spill" do
+      limits =
+        MemoryBudget.adaptive_limits(%{
+          memory_limit_bytes: 100 * @gib,
+          disk_free_bytes: 500 * @gib,
+          schedulers_online: 16,
+          shard_count: 16
+        })
+
+      assert limits.waraft_apply_projection_cache_max_entries >= 250_000
     end
 
     test "keeps small machines bounded but still leaves a useful disk-backed tail" do
@@ -34,7 +46,7 @@ defmodule Ferricstore.MemoryBudgetTest do
       assert limits.waraft_segment_log_max_ets_bytes == 8 * @mib
       assert limits.waraft_segment_log_min_ets_entries == 128
       assert limits.waraft_segment_log_max_ets_entries == 8_192
-      assert limits.waraft_apply_projection_cache_max_entries == 2_621
+      assert limits.waraft_apply_projection_cache_max_entries == 5_242
     end
 
     test "uses disk pressure to reduce async projection queues before memory grows" do
