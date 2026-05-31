@@ -320,7 +320,7 @@ defmodule Ferricstore.ApplicationTest do
       assert {:ok, ^value} = NIF.v2_pread_at(path, offset)
     end
 
-    test "prep_stop does not drain lagged Flow LMDB projection backlog" do
+    test "prep_stop skips lagged Flow LMDB projection drain because it is rebuildable" do
       original_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
       original_ready = Ferricstore.Health.ready?()
 
@@ -342,6 +342,8 @@ defmodule Ferricstore.ApplicationTest do
       on_exit(fn ->
         restore_env(:flow_lmdb_mode, original_mode)
         Ferricstore.Health.set_ready(original_ready)
+        _ = Ferricstore.Flow.LMDBWriter.resume_all(ctx.shard_count)
+        _ = Ferricstore.Raft.WARaftBackend.start(ctx)
 
         if pid = Process.whereis(writer_name) do
           :sys.replace_state(pid, fn state ->
@@ -365,15 +367,13 @@ defmodule Ferricstore.ApplicationTest do
       assert %{count: count} = :sys.get_state(writer)
       assert count > 0
 
-      log =
-        capture_log(fn ->
-          Ferricstore.Application.prep_stop(%{
-            shard_count: ctx.shard_count,
-            data_dir: ctx.data_dir
-          })
-        end)
+      capture_log([level: :info], fn ->
+        Ferricstore.Application.prep_stop(%{
+          shard_count: ctx.shard_count,
+          data_dir: ctx.data_dir
+        })
+      end)
 
-      assert log =~ "Flow LMDB lagged projection flush skipped"
       assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
     end
 

@@ -1271,16 +1271,20 @@ defmodule Ferricstore.Commands.Strings do
     do: Ops.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
 
   defp clear_compound_prefix(key, "stream", store) do
-    Enum.reduce_while(
-      [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)],
-      :ok,
-      fn prefix, :ok ->
-        case Ops.compound_delete_prefix(store, key, prefix) do
-          :ok -> {:cont, :ok}
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end
-    )
+    with :ok <-
+           Enum.reduce_while(
+             [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)],
+             :ok,
+             fn prefix, :ok ->
+               case Ops.compound_delete_prefix(store, key, prefix) do
+                 :ok -> {:cont, :ok}
+                 {:error, _reason} = error -> {:halt, error}
+               end
+             end
+           ),
+         :ok <- Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key)) do
+      :ok
+    end
   end
 
   defp clear_compound_prefix(_key, _type, _store), do: :ok
@@ -1311,7 +1315,14 @@ defmodule Ferricstore.Commands.Strings do
         []
       end
 
-    type_entries ++ list_meta_entries
+    stream_meta_entries =
+      if type == "stream" do
+        compound_key_backup_entry(key, CompoundKey.stream_meta_key(key), store)
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries ++ stream_meta_entries
   end
 
   defp compound_clear_member_entries(key, type, store) do
@@ -1451,6 +1462,7 @@ defmodule Ferricstore.Commands.Strings do
   defp delete_compound_key_data(key, type_str, prefix, store) do
     with :ok <- delete_compound_prefix_if_present(key, prefix, store),
          :ok <- delete_stream_groups_if_needed(key, type_str, store),
+         :ok <- delete_stream_durable_meta_if_needed(key, type_str, store),
          :ok <- delete_list_meta_if_needed(key, type_str, store),
          :ok <- delete_stream_metadata_if_needed(key, type_str),
          :ok <- TypeRegistry.delete_type(key, store) do
@@ -1475,6 +1487,12 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp delete_stream_groups_if_needed(_key, _type_str, _store), do: :ok
+
+  defp delete_stream_durable_meta_if_needed(key, "stream", store) do
+    Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key))
+  end
+
+  defp delete_stream_durable_meta_if_needed(_key, _type_str, _store), do: :ok
 
   defp delete_stream_metadata_if_needed(key, "stream") do
     cleanup_stream_metadata(key)
@@ -1527,11 +1545,14 @@ defmodule Ferricstore.Commands.Strings do
   defp maybe_delete_stream_key(key, store) do
     prefix = CompoundKey.stream_prefix(key)
     group_prefix = CompoundKey.stream_group_prefix(key)
+    meta_key = CompoundKey.stream_meta_key(key)
 
     if Ops.compound_scan(store, key, prefix) != [] or
-         Ops.compound_scan(store, key, group_prefix) != [] or stream_metadata_exists?(key) do
+         Ops.compound_scan(store, key, group_prefix) != [] or
+         Ops.compound_get(store, key, meta_key) != nil or stream_metadata_exists?(key) do
       with :ok <- Ops.compound_delete_prefix(store, key, prefix),
-           :ok <- Ops.compound_delete_prefix(store, key, group_prefix) do
+           :ok <- Ops.compound_delete_prefix(store, key, group_prefix),
+           :ok <- Ops.compound_delete(store, key, meta_key) do
         cleanup_stream_metadata(key)
         true
       else

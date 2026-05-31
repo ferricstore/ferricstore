@@ -229,7 +229,10 @@ defmodule Ferricstore.FlowWriteContractTest do
     source = File.read!("lib/ferricstore/raft/state_machine.ex")
 
     [function_source] =
-      Regex.run(~r/defp flow_transition_move_due_indexes\(state, plans\).*?^  end/ms, source)
+      Regex.run(
+        ~r/defp flow_transition_move_due_indexes\(state, plans\).*?^  end/ms,
+        source
+      )
 
     assert function_source =~ "from_due_cache"
     assert function_source =~ "flow_claim_cached_due_index_key(from_due_cache, record)"
@@ -294,7 +297,7 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     [attrs_check_source] =
       Regex.run(
-        ~r/defp flow_many_same_state_machine_shard\?\(.*?^  defp flow_many_same_state_machine_shard\?\(_state, _attrs_list\)/ms,
+        ~r/defp flow_many_same_state_machine_shard\?\(.*?^  defp flow_many_same_state_machine_shard\?\(_state, _attrs_list, _stamped_shard\)/ms,
         state_machine_source
       )
 
@@ -311,6 +314,31 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert key_info_check_source =~ "Router.shard_for(ctx, key)"
   end
 
+  test "flow many apply uses the command-level shard stamp before per-record rehash fallback" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~
+             "flow_many_partitions_valid?(state, attrs_list, Map.get(attrs, @flow_shard_marker))"
+
+    [valid_source] =
+      Regex.run(
+        ~r/defp flow_many_partitions_valid\?\(state, attrs_list, stamped_shard\).*?^  defp flow_many_partition_keys_present/ms,
+        source
+      )
+
+    assert valid_source =~ "flow_many_same_state_machine_shard?(state, attrs_list, stamped_shard)"
+
+    [same_shard_source] =
+      Regex.run(
+        ~r/defp flow_many_same_state_machine_shard\?\(\n         %\{instance_ctx: ctx, shard_index: shard_index\},\n         attrs_list,\n         stamped_shard\n       \).*?^  defp flow_many_same_state_machine_shard\?\(_state, _attrs_list, _stamped_shard\)/ms,
+        source
+      )
+
+    assert same_shard_source =~ "stamped_shard == shard_index"
+    assert same_shard_source =~ "flow_attrs_same_stamped_shard?"
+    assert same_shard_source =~ "Router.shard_for(ctx, key)"
+  end
+
   test "flow claim_due validates due-index key size without building every due key" do
     source = File.read!("lib/ferricstore/flow.ex")
 
@@ -324,6 +352,21 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     refute function_source =~ "__MODULE__.Keys.due_key",
            "claim_due can probe many partitions per poll; validation must use length math instead of allocating every generated due-index key"
+  end
+
+  test "flow claim_due fast index path avoids generic per-plan tuple dispatch" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    [function_source] =
+      Regex.run(
+        ~r/defp flow_claim_fast_index_entries\(_state, plans\).*?^  defp flow_claim_cached_due_index_key/ms,
+        source
+      )
+
+    assert function_source =~ "flow_claim_fast_index_entries_loop(plans,"
+
+    refute function_source =~ "flow_claim_plan_pair(plan)",
+           "claim_due fast index apply is on the WARaft apply hot path; it should dispatch plan tuple shapes directly instead of calling the generic plan-pair helper for every item"
   end
 
   test "flow non-idempotent create fast path does not synchronously query LMDB for existence" do

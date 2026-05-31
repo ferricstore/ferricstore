@@ -117,6 +117,8 @@ defmodule Ferricstore.Test.ClusterHelper do
       :rpc.call(n1, Node, :connect, [n2])
     end
 
+    :ok = ensure_nodes_reachable(node_names, timeout: timeout)
+
     # Phase 3: Configure all nodes with cluster_nodes and app env,
     # then start the FerricStore application.
     Enum.each(nodes, fn node ->
@@ -154,6 +156,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     # Wait for all app starts to complete. Each takes ~2s (4 shards * 500ms
     # election wait). With concurrent start, this is ~2s total instead of 6s.
     Enum.each(tasks, fn task -> Task.await(task, 30_000) end)
+    :ok = ensure_peer_mesh_reachable(node_names, timeout: timeout)
 
     # Re-trigger elections only for shards that don't have a leader yet.
     # Triggering on all nodes causes split-votes on slow CI machines.
@@ -178,6 +181,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     # Phase 5: Wait for all shards to have elected leaders with full
     # membership across the cluster.
     :ok = wait_for_cluster_ready(nodes, shards, timeout)
+    :ok = ensure_peer_mesh_reachable(node_names, timeout: timeout)
 
     nodes
   end
@@ -274,7 +278,33 @@ defmodule Ferricstore.Test.ClusterHelper do
       end)
     end
 
+    :ok = ensure_node_reachable(node_name, timeout: 10_000)
+
     node_name
+  end
+
+  @doc """
+  Ensures the test runner has an Erlang distribution connection to a peer node.
+
+  Cluster tests use `:erpc.call/5` for strict remote calls. `:erpc` does not
+  hide transient host-to-peer disconnects, so destructive suites should call
+  this before remote operations when previous tests may have torn down peers.
+  """
+  @spec ensure_node_reachable(atom(), keyword()) :: :ok | {:error, :noconnection}
+  def ensure_node_reachable(node_name, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 5_000)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_ensure_node_reachable(node_name, deadline)
+  end
+
+  @spec ensure_nodes_reachable([atom()], keyword()) :: :ok | {:error, {atom(), :noconnection}}
+  def ensure_nodes_reachable(node_names, opts \\ []) when is_list(node_names) do
+    Enum.reduce_while(node_names, :ok, fn node_name, :ok ->
+      case ensure_node_reachable(node_name, opts) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {node_name, reason}}}
+      end
+    end)
   end
 
   @doc """
@@ -295,6 +325,7 @@ defmodule Ferricstore.Test.ClusterHelper do
           _, _ -> :ok
         end
 
+        wait_peer_node_down(node_name)
         File.rm_rf(data_dir)
         :ok
 
@@ -318,6 +349,7 @@ defmodule Ferricstore.Test.ClusterHelper do
         _, _ -> :ok
       end
 
+      wait_peer_node_down(node.name)
       File.rm_rf(node.data_dir)
     end)
 
@@ -336,16 +368,27 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec kill_node([map()], map()) :: {map(), [map()]}
   def kill_node(nodes, target) when is_map(target) do
+    remaining = Enum.reject(nodes, &(&1.name == target.name))
+
     try do
       :peer.stop(target.peer)
     catch
       _, _ -> :ok
     end
 
-    remaining = Enum.reject(nodes, &(&1.name == target.name))
-
     for node <- remaining do
       :rpc.call(node.name, :erlang, :disconnect_node, [target.name])
+    end
+
+    wait_peer_node_down(target.name)
+
+    remaining
+    |> Enum.filter(fn node -> Process.alive?(node.peer) end)
+    |> Enum.map(& &1.name)
+    |> ensure_nodes_reachable(timeout: 15_000)
+    |> case do
+      :ok -> :ok
+      {:error, _reason} -> :ok
     end
 
     {target, remaining}
@@ -868,6 +911,70 @@ defmodule Ferricstore.Test.ClusterHelper do
 
   defp ensure_distribution! do
     Ferricstore.Test.ShardHelpers.ensure_distribution_started!(:ferric_runner)
+  end
+
+  defp wait_peer_node_down(node_name, attempts \\ 50)
+
+  defp wait_peer_node_down(_node_name, 0), do: :ok
+
+  defp wait_peer_node_down(node_name, attempts) do
+    Node.disconnect(node_name)
+
+    case Node.ping(node_name) do
+      :pang ->
+        :ok
+
+      :pong ->
+        Process.sleep(100)
+        wait_peer_node_down(node_name, attempts - 1)
+    end
+  end
+
+  defp do_ensure_node_reachable(node_name, deadline) do
+    case Node.ping(node_name) do
+      :pong ->
+        :ok
+
+      :pang ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :noconnection}
+        else
+          Process.sleep(100)
+          do_ensure_node_reachable(node_name, deadline)
+        end
+    end
+  end
+
+  defp ensure_peer_mesh_reachable(node_names, opts) do
+    timeout = Keyword.get(opts, :timeout, 15_000)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_ensure_peer_mesh_reachable(node_names, deadline)
+  end
+
+  defp do_ensure_peer_mesh_reachable(node_names, deadline) do
+    all_connected? =
+      Enum.all?(node_names, fn n1 ->
+        Enum.all?(node_names, fn
+          ^n1 ->
+            true
+
+          n2 ->
+            :rpc.call(n1, Node, :connect, [n2])
+            :rpc.call(n1, Node, :ping, [n2]) == :pong
+        end)
+      end)
+
+    cond do
+      all_connected? ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :peer_mesh_unreachable}
+
+      true ->
+        Process.sleep(100)
+        do_ensure_peer_mesh_reachable(node_names, deadline)
+    end
   end
 
   defp members_on_node(node_name, shard, timeout \\ :default)

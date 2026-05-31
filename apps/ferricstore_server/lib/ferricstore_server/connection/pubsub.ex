@@ -59,8 +59,10 @@ defmodule FerricstoreServer.Connection.PubSub do
   @spec dispatch_unsubscribe([binary()], map()) ::
           {:continue, iodata(), map()} | {:quit, iodata(), map()}
   def dispatch_unsubscribe([], state) do
-    if state.pubsub_channels == nil do
-      {:continue, [], state}
+    state = ensure_pubsub_sets(state)
+
+    if MapSet.size(state.pubsub_channels) == 0 do
+      {:continue, Encoder.encode({:push, ["unsubscribe", nil, subscription_count(state)]}), state}
     else
       dispatch_unsubscribe(MapSet.to_list(state.pubsub_channels), state)
     end
@@ -129,8 +131,11 @@ defmodule FerricstoreServer.Connection.PubSub do
   @spec dispatch_punsubscribe([binary()], map()) ::
           {:continue, iodata(), map()} | {:quit, iodata(), map()}
   def dispatch_punsubscribe([], state) do
-    if state.pubsub_patterns == nil do
-      {:continue, [], state}
+    state = ensure_pubsub_sets(state)
+
+    if MapSet.size(state.pubsub_patterns) == 0 do
+      {:continue, Encoder.encode({:push, ["punsubscribe", nil, subscription_count(state)]}),
+       state}
     else
       dispatch_punsubscribe(MapSet.to_list(state.pubsub_patterns), state)
     end
@@ -159,4 +164,8 @@ defmodule FerricstoreServer.Connection.PubSub do
   end
 
   defp ensure_pubsub_sets(state), do: state
+
+  defp subscription_count(state) do
+    MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
+  end
 end

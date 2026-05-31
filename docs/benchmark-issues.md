@@ -19,9 +19,9 @@ Issues found while setting up the tuning benchmark suite on Azure VMs.
 
 ### 2. NIF .so not compiled for prod
 **Symptom:** `UndefinedFunctionError: function Ferricstore.Bitcask.NIF.v2_scan_file/1 is undefined`
-**Cause:** `MIX_ENV=prod mix compile` doesn't trigger `cargo build` — the NIF compile hook only runs if `FERRICSTORE_BUILD_NIF=1` is set, and the output goes to `priv/native/` not the `_build/prod/` path.
-**Fix:** Manually ran `cargo build --release` and copied `.so` to `_build/prod/lib/ferricstore/priv/native/`.
-**Action needed:** The NIF compile hook should handle prod builds correctly, or the bench script should build and copy the NIF.
+**Cause:** Older config skipped native compilation unless a build env flag was set, so prod builds could load stale or missing `.so` files.
+**Fix:** Repo checkouts now source-build NIFs by default through Rustler config. `MIX_ENV=prod mix compile` is enough.
+**Action needed:** None for repo checkouts. Packaged dependency users continue to use RustlerPrecompiled artifacts.
 
 ## Azure / Cloud-Init Issues
 

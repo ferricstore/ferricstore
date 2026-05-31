@@ -253,7 +253,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
           score_input(),
           non_neg_integer(),
           non_neg_integer()
-        ) :: [{binary(), binary(), float()}]
+        ) :: [{binary(), [{binary(), float()}]}]
   def claim_due_candidates(_resource, _keys, _now_score, 0, _max_scan), do: []
   def claim_due_candidates(_resource, _keys, _now_score, _limit, 0), do: []
 

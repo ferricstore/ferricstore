@@ -252,8 +252,9 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
       # EXEC must fail because the watched key was modified (even by us)
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
+
       assert result == nil,
-        "EXEC should return nil when watched key is modified by same connection, got: #{inspect(result)}"
+             "EXEC should return nil when watched key is modified by same connection, got: #{inspect(result)}"
 
       # Value should remain as the modification before MULTI
       send_cmd(sock, ["GET", k])
@@ -291,8 +292,9 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       send_cmd(sock1, ["EXEC"])
       result = recv_response(sock1)
+
       assert result == nil,
-        "EXEC should return nil when a watched non-existent key was created, got: #{inspect(result)}"
+             "EXEC should return nil when a watched non-existent key was created, got: #{inspect(result)}"
 
       :gen_tcp.close(sock1)
     end
@@ -330,8 +332,9 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       send_cmd(sock1, ["EXEC"])
       result = recv_response(sock1)
+
       assert result == nil,
-        "EXEC should return nil when a watched key was DEL'd, got: #{inspect(result)}"
+             "EXEC should return nil when a watched key was DEL'd, got: #{inspect(result)}"
 
       :gen_tcp.close(sock1)
     end
@@ -363,7 +366,7 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       # Every result should be OK
       assert Enum.all?(result, &(&1 == {:simple, "OK"})),
-        "All SET results should be OK"
+             "All SET results should be OK"
 
       # Spot-check a few keys outside the transaction
       send_cmd(sock, ["GET", "#{prefix}:0"])
@@ -386,14 +389,13 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
   # the command returns an error at queue time AND the transaction is marked
   # "dirty". Subsequent EXEC returns -EXECABORT.
   #
-  # FerricStore does NOT implement the dirty/abort flag. Instead, syntax
-  # errors during MULTI return an error immediately, the command is NOT
-  # queued, and EXEC still executes the remaining valid commands. This test
-  # documents this behavioral divergence from Redis.
+  # FerricStore marks the transaction dirty after queue-time syntax/unknown
+  # command errors. Later valid commands can still queue, but EXEC aborts the
+  # entire transaction instead of committing a partial write set.
   # ---------------------------------------------------------------------------
 
   describe "MULTI with syntax error in queue" do
-    test "syntax error at queue time returns error but valid commands still execute", %{port: port} do
+    test "syntax error at queue time makes EXEC abort queued writes", %{port: port} do
       sock = connect_and_hello(port)
       k = ukey("syntax_err")
 
@@ -413,22 +415,18 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
       send_cmd(sock, ["GET", k])
       assert recv_response(sock) == {:simple, "QUEUED"}
 
-      # EXEC executes the 2 valid queued commands
-      # NOTE: Redis would return EXECABORT here. FerricStore does not implement
-      # the dirty transaction flag, so it executes valid commands.
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
 
-      # FerricStore behavior: executes the 2 valid queued commands
-      assert is_list(result), "EXEC result should be a list, got: #{inspect(result)}"
-      assert length(result) == 2
-      assert Enum.at(result, 0) == {:simple, "OK"}
-      assert Enum.at(result, 1) == "hello"
+      assert {:error, "EXECABORT" <> _} = result
+
+      send_cmd(sock, ["GET", k])
+      assert recv_response(sock) == nil
 
       :gen_tcp.close(sock)
     end
 
-    test "unknown command at queue time returns error but valid commands still execute", %{port: port} do
+    test "unknown command at queue time makes EXEC abort queued writes", %{port: port} do
       sock = connect_and_hello(port)
       k = ukey("unknown_cmd")
 
@@ -448,10 +446,10 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
-      assert is_list(result)
-      assert length(result) == 2
-      assert Enum.at(result, 0) == {:simple, "OK"}
-      assert Enum.at(result, 1) == "before"
+      assert {:error, "EXECABORT" <> _} = result
+
+      send_cmd(sock, ["GET", k])
+      assert recv_response(sock) == nil
 
       :gen_tcp.close(sock)
     end
@@ -505,8 +503,10 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       send_cmd(sock1, ["EXEC"])
       result = recv_response(sock1)
+
       assert is_list(result),
-        "EXEC should succeed after DISCARD cleared watches, got: #{inspect(result)}"
+             "EXEC should succeed after DISCARD cleared watches, got: #{inspect(result)}"
+
       assert length(result) == 1
       assert Enum.at(result, 0) == "modified_after_discard"
 
@@ -574,8 +574,9 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       send_cmd(sock1, ["EXEC"])
       result = recv_response(sock1)
+
       assert result == nil,
-        "EXEC should return nil because k2 (from second WATCH) was modified, got: #{inspect(result)}"
+             "EXEC should return nil because k2 (from second WATCH) was modified, got: #{inspect(result)}"
 
       :gen_tcp.close(sock1)
     end
@@ -612,8 +613,9 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       send_cmd(sock1, ["EXEC"])
       result = recv_response(sock1)
+
       assert result == nil,
-        "EXEC should return nil because k1 (from first WATCH) was modified, got: #{inspect(result)}"
+             "EXEC should return nil because k1 (from first WATCH) was modified, got: #{inspect(result)}"
 
       :gen_tcp.close(sock1)
     end
@@ -649,8 +651,9 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       send_cmd(sock1, ["EXEC"])
       result = recv_response(sock1)
+
       assert result == nil,
-        "EXEC should abort when any of the multi-WATCH keys is modified"
+             "EXEC should abort when any of the multi-WATCH keys is modified"
 
       :gen_tcp.close(sock1)
     end
@@ -711,15 +714,15 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
       assert length(result) == 9, "Expected 9 results, got #{length(result)}"
 
       # Verify each result matches the corresponding queued command
-      assert Enum.at(result, 0) == {:simple, "OK"},     "result[0]: SET -> OK"
-      assert Enum.at(result, 1) == "first",              "result[1]: GET -> 'first'"
-      assert Enum.at(result, 2) == {:simple, "OK"},     "result[2]: SET -> OK"
-      assert Enum.at(result, 3) == "second",             "result[3]: GET -> 'second'"
-      assert Enum.at(result, 4) == 1,                    "result[4]: DEL -> 1"
-      assert Enum.at(result, 5) == 0,                    "result[5]: EXISTS -> 0"
-      assert Enum.at(result, 6) == {:simple, "OK"},     "result[6]: SET -> OK"
-      assert Enum.at(result, 7) == "third",              "result[7]: GET -> 'third'"
-      assert Enum.at(result, 8) == {:simple, "PONG"},   "result[8]: PING -> PONG"
+      assert Enum.at(result, 0) == {:simple, "OK"}, "result[0]: SET -> OK"
+      assert Enum.at(result, 1) == "first", "result[1]: GET -> 'first'"
+      assert Enum.at(result, 2) == {:simple, "OK"}, "result[2]: SET -> OK"
+      assert Enum.at(result, 3) == "second", "result[3]: GET -> 'second'"
+      assert Enum.at(result, 4) == 1, "result[4]: DEL -> 1"
+      assert Enum.at(result, 5) == 0, "result[5]: EXISTS -> 0"
+      assert Enum.at(result, 6) == {:simple, "OK"}, "result[6]: SET -> OK"
+      assert Enum.at(result, 7) == "third", "result[7]: GET -> 'third'"
+      assert Enum.at(result, 8) == {:simple, "PONG"}, "result[8]: PING -> PONG"
 
       :gen_tcp.close(sock)
     end
@@ -761,12 +764,12 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
       assert is_list(result)
       assert length(result) == 6
 
-      assert Enum.at(result, 0) == {:simple, "OK"},  "SET -> OK"
-      assert Enum.at(result, 1) == 11,                "INCR 10 -> 11"
-      assert Enum.at(result, 2) == "11",               "GET -> '11' (string after INCR)"
-      assert Enum.at(result, 3) == 1,                 "EXISTS -> 1"
-      assert Enum.at(result, 4) == 1,                 "DEL -> 1"
-      assert Enum.at(result, 5) == nil,               "GET deleted -> nil"
+      assert Enum.at(result, 0) == {:simple, "OK"}, "SET -> OK"
+      assert Enum.at(result, 1) == 11, "INCR 10 -> 11"
+      assert Enum.at(result, 2) == "11", "GET -> '11' (string after INCR)"
+      assert Enum.at(result, 3) == 1, "EXISTS -> 1"
+      assert Enum.at(result, 4) == 1, "DEL -> 1"
+      assert Enum.at(result, 5) == nil, "GET deleted -> nil"
 
       :gen_tcp.close(sock)
     end

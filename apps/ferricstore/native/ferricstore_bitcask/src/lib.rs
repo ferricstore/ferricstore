@@ -2283,6 +2283,29 @@ fn lmdb_write_batch_with_originals<'a>(
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+fn lmdb_clear<'a>(env: Env<'a>, path: String, map_size: u64) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let mut wtxn = match store.env.write_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            if let Err(e) = store.db.clear(&mut wtxn) {
+                return Ok((atoms::error(), e.to_string()).encode(env));
+            }
+
+            match wtxn.commit() {
+                Ok(()) => Ok(atoms::ok().encode(env)),
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_entries<'a>(
     env: Env<'a>,
     path: String,
@@ -2426,6 +2449,78 @@ fn lmdb_prefix_entries_reverse<'a>(
                         entries.push((key_term, value_term).encode(env));
                     }
                     Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                }
+            }
+
+            Ok((atoms::ok(), entries).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_prefix_entries_reverse_before<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    before_key: Binary<'a>,
+    limit: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let max = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut entries = Vec::new();
+
+            if before_key.as_slice().is_empty() {
+                let iter = match store.db.rev_prefix_iter(&rtxn, prefix.as_slice()) {
+                    Ok(iter) => iter,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                for item in iter.take(max) {
+                    match item {
+                        Ok((key, value)) => {
+                            let key_term = binary_term(env, key)?;
+                            let value_term = binary_term(env, value)?;
+                            entries.push((key_term, value_term).encode(env));
+                        }
+                        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                    }
+                }
+            } else {
+                let range = (
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Included(before_key.as_slice()),
+                );
+                let iter = match store.db.rev_range(&rtxn, &range) {
+                    Ok(iter) => iter,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                for item in iter {
+                    if entries.len() >= max {
+                        break;
+                    }
+
+                    match item {
+                        Ok((key, value)) => {
+                            if !key.starts_with(prefix.as_slice()) {
+                                break;
+                            }
+
+                            let key_term = binary_term(env, key)?;
+                            let value_term = binary_term(env, value)?;
+                            entries.push((key_term, value_term).encode(env));
+                        }
+                        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                    }
                 }
             }
 

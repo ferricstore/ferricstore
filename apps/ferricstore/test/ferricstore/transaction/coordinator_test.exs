@@ -48,6 +48,17 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     end
   end
 
+  describe "performance guards" do
+    test "result reassembly does not scan shard result lists by position" do
+      source =
+        Path.expand("../../../lib/ferricstore/transaction/coordinator.ex", __DIR__)
+        |> File.read!()
+
+      refute source =~ "Enum.at(results_for_shard",
+             "EXEC result reassembly must stay linear; zip shard results to original indices instead"
+    end
+  end
+
   describe "single-shard transactions" do
     test "executes when all commands target the same shard", %{same1: s1, same2: s2} do
       queue = [{"SET", [s1, "100"]}, {"SET", [s2, "200"]}, {"GET", [s1]}]
@@ -327,6 +338,26 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert Router.get(FerricStore.Instance.get(:default), s1) == "updated"
     end
 
+    test "aborts when a watched key changes after preflight before apply", %{same1: s1, same2: s2} do
+      Router.put(FerricStore.Instance.get(:default), s1, "original", 0)
+
+      watched = %{s1 => Router.watch_token(FerricStore.Instance.get(:default), s1)}
+
+      Process.put(:ferricstore_tx_after_watch_preflight_hook, fn ->
+        Router.put(FerricStore.Instance.get(:default), s1, "raced", 0)
+      end)
+
+      try do
+        result = Coordinator.execute([{"SET", [s2, "should_not_commit"]}], watched, nil)
+
+        assert result == nil
+        assert Router.get(FerricStore.Instance.get(:default), s1) == "raced"
+        assert Router.get(FerricStore.Instance.get(:default), s2) == nil
+      after
+        Process.delete(:ferricstore_tx_after_watch_preflight_hook)
+      end
+    end
+
     test "cross-shard WATCH succeeds when watches pass", %{k0: k0, k1: k1} do
       Router.put(FerricStore.Instance.get(:default), k0, "orig_k0", 0)
 
@@ -424,7 +455,9 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   end
 
   defp raft_applied_count(shard_index) do
-    {:ok, {:raft_log_pos, index, _term}} = Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+    {:ok, {:raft_log_pos, index, _term}} =
+      Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+
     index
   end
 end

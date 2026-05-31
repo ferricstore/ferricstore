@@ -332,6 +332,12 @@ defmodule Ferricstore.Store.CompoundKey do
   end
 
   @doc """
+  Builds the durable metadata key for a stream's length and last-generated-id.
+  """
+  @spec stream_meta_key(binary()) :: binary()
+  def stream_meta_key(redis_key), do: "XM:" <> redis_key
+
+  @doc """
   Builds the durable consumer-group metadata key for a stream group.
   """
   @spec stream_group(binary(), binary()) :: binary()
@@ -389,6 +395,8 @@ defmodule Ferricstore.Store.CompoundKey do
   def internal_key?(<<"S:", _rest::binary>>), do: true
   def internal_key?(<<"Z:", _rest::binary>>), do: true
   def internal_key?(<<"X:", _rest::binary>>), do: true
+  def internal_key?(<<"XM:", _rest::binary>>), do: true
+  def internal_key?(<<"XG:", _rest::binary>>), do: true
   def internal_key?(<<"T:", _rest::binary>>), do: true
   def internal_key?(<<"V:", _rest::binary>>), do: true
   def internal_key?(<<"VM:", _rest::binary>>), do: true
@@ -426,6 +434,9 @@ defmodule Ferricstore.Store.CompoundKey do
   def extract_redis_key(<<"L:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"S:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"Z:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"X:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"XM:", rest::binary>>), do: rest
+  def extract_redis_key(<<"XG:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"T:", rest::binary>>), do: rest
   def extract_redis_key(<<"LM:", rest::binary>>), do: rest
   def extract_redis_key(<<"VM:", rest::binary>>), do: extract_before_separator(rest)

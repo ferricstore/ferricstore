@@ -850,10 +850,13 @@ callback_mode() ->
 -spec terminate(Reason :: term(), State :: state(), Data :: #raft_state{}) -> ok.
 terminate(Reason, State, #raft_state{name = Name, table = Table, partition = Partition, handover = Handover} = Data0) ->
     ?SERVER_LOG_NOTICE(State, Data0, "terminating due to ~0P", [Reason, 20]),
-    case Handover of
-        {Peer, _, _} -> cancel_pending_and_queued({error, {notify_redirect, Peer}}, Data0);
-        undefined    -> cancel_pending_and_queued({error, not_leader}, Data0)
-    end,
+    CancelReason =
+        case Handover of
+            {Peer, _, _} -> {error, {notify_redirect, Peer}};
+            undefined    -> {error, not_leader}
+        end,
+    Data1 = cancel_async_append_in_flight(State, CancelReason, Data0),
+    cancel_pending_and_queued(CancelReason, Data1),
     wa_raft_durable_state:sync(Data0),
     wa_raft_info:clear(Table, Partition, Name),
     ok.
@@ -1167,6 +1170,18 @@ stalled(
 %% [Command] Defer to common handling for generic RAFT server commands
 stalled(Type, ?RAFT_COMMAND(_, _) = Event, #raft_state{} = State) ->
     command(?FUNCTION_NAME, Type, Event, State);
+
+%% [Async Log Append]
+%% A stale completion can arrive after a leader stepped down. Since the client
+%% request is cancelled, rollback any local append bytes so they cannot replay
+%% as an unacknowledged write after restart.
+stalled(info, {async_log_append_complete, Ref, Result}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_after_leadership_loss(?FUNCTION_NAME, Ref, Result, State0),
+    {keep_state, State1};
+
+stalled(info, {'DOWN', MonitorRef, process, WorkerPid, Reason}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_down(?FUNCTION_NAME, MonitorRef, WorkerPid, Reason, State0),
+    {keep_state, State1};
 
 %% [Fallback] Report unhandled events
 stalled(Type, Event, #raft_state{} = State) ->
@@ -1652,6 +1667,12 @@ leader(info, {async_log_append_complete, Ref, Result}, #raft_state{} = State0) -
     update_status(?FUNCTION_NAME, State4),
     {keep_state, State4, ?HEARTBEAT_TIMEOUT(State4)};
 
+leader(info, {'DOWN', MonitorRef, process, WorkerPid, Reason}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_down(?FUNCTION_NAME, MonitorRef, WorkerPid, Reason, State0),
+    State2 = append_entries_to_followers(State1),
+    update_status(?FUNCTION_NAME, State2),
+    {keep_state, State2, ?HEARTBEAT_TIMEOUT(State2)};
+
 %% [Fallback] Report unhandled events
 leader(Type, Event, #raft_state{} = State) ->
     ?SERVER_LOG_WARNING(State, "did not know how to handle ~0p event ~0P", [Type, Event, 20]),
@@ -1801,6 +1822,17 @@ follower(state_timeout, _, #raft_state{
 %% [Command] Defer to common handling for generic RAFT server commands
 follower(Type, ?RAFT_COMMAND(_, _) = Event, #raft_state{} = State) ->
     command(?FUNCTION_NAME, Type, Event, State);
+
+%% [Async Log Append]
+%% Completion can arrive after resign/term change. Since the client request is
+%% cancelled, rollback any local append bytes before releasing it as not-leader.
+follower(info, {async_log_append_complete, Ref, Result}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_after_leadership_loss(?FUNCTION_NAME, Ref, Result, State0),
+    {keep_state, State1};
+
+follower(info, {'DOWN', MonitorRef, process, WorkerPid, Reason}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_down(?FUNCTION_NAME, MonitorRef, WorkerPid, Reason, State0),
+    {keep_state, State1};
 
 %% [Fallback] Report unhandled events
 follower(Type, Event, #raft_state{} = State) ->
@@ -2070,6 +2102,17 @@ candidate(
 candidate(Type, ?RAFT_COMMAND(_, _) = Event, #raft_state{} = State) ->
     command(?FUNCTION_NAME, Type, Event, State);
 
+%% [Async Log Append]
+%% The append may finish while this node is campaigning. Preserve disk/log-view
+%% consistency, but do not report the stale leader's client request as committed.
+candidate(info, {async_log_append_complete, Ref, Result}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_after_leadership_loss(?FUNCTION_NAME, Ref, Result, State0),
+    {keep_state, State1};
+
+candidate(info, {'DOWN', MonitorRef, process, WorkerPid, Reason}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_down(?FUNCTION_NAME, MonitorRef, WorkerPid, Reason, State0),
+    {keep_state, State1};
+
 %% [Fallback] Report unhandled events
 candidate(Type, Event, #raft_state{} = State) ->
     ?SERVER_LOG_WARNING(State, "did not know how to handle ~0p event ~0P.", [Type, Event, 20]),
@@ -2172,6 +2215,17 @@ disabled({call, From}, ?ENABLE_COMMAND, #raft_state{} = State0) ->
 %% [Command] Defer to common handling for generic RAFT server commands
 disabled(Type, ?RAFT_COMMAND(_, _) = Event, #raft_state{} = State) ->
     command(?FUNCTION_NAME, Type, Event, State);
+
+%% [Async Log Append]
+%% Disabled nodes must still consume a stale async append completion so the
+%% append gate cannot leak across enable/restart paths.
+disabled(info, {async_log_append_complete, Ref, Result}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_after_leadership_loss(?FUNCTION_NAME, Ref, Result, State0),
+    {keep_state, State1};
+
+disabled(info, {'DOWN', MonitorRef, process, WorkerPid, Reason}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_down(?FUNCTION_NAME, MonitorRef, WorkerPid, Reason, State0),
+    {keep_state, State1};
 
 %% [Fallback] Report unhandled events
 disabled(Type, Event, #raft_state{} = State) ->
@@ -2277,6 +2331,17 @@ witness(state_timeout, _, #raft_state{} = State) ->
 %% [Command] Defer to common handling for generic RAFT server commands
 witness(Type, ?RAFT_COMMAND(_, _) = Event, #raft_state{} = State) ->
     command(?FUNCTION_NAME, Type, Event, State);
+
+%% [Async Log Append]
+%% Witness state should not normally own local log appends, but consume stale
+%% completions defensively after role changes.
+witness(info, {async_log_append_complete, Ref, Result}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_after_leadership_loss(?FUNCTION_NAME, Ref, Result, State0),
+    {keep_state, State1};
+
+witness(info, {'DOWN', MonitorRef, process, WorkerPid, Reason}, #raft_state{} = State0) ->
+    State1 = complete_async_log_append_down(?FUNCTION_NAME, MonitorRef, WorkerPid, Reason, State0),
+    {keep_state, State1};
 
 %% [Fallback] Report unhandled events
 witness(Type, Event, #raft_state{} = State) ->
@@ -3038,8 +3103,20 @@ apply_log(
             MaxRotateDelay = ?RAFT_MAX_RETAINED_ENTRIES(App, Table),
             RotateIndex = max(LimitedIndex - MaxRotateDelay, min(NewLastApplied, TrimIndex)),
             RotateIndex =/= infinity orelse error(bad_state),
-            {ok, View2} = wa_raft_log:rotate(View1, RotateIndex),
-            Data2 = Data1#raft_state{log_view = View2},
+            Data2 =
+                case maybe_rotate_log(View1, RotateIndex, Data1) of
+                    {ok, View2} ->
+                        Data1#raft_state{log_view = View2};
+                    {error, Reason} ->
+                        ?RAFT_COUNT(Table, 'log.rotate.error'),
+                        ?SERVER_LOG_WARNING(
+                            State,
+                            Data1,
+                            "failed to rotate log at ~0p due to ~0P; leaving log view unchanged.",
+                            [RotateIndex, Reason, 30]
+                        ),
+                        Data1
+                end,
             ?RAFT_GATHER(Table, 'apply_log.latency_us', erlang:monotonic_time(microsecond) - StartTUsec),
             Data2;
         true ->
@@ -3051,6 +3128,16 @@ apply_log(
     end;
 apply_log(_, _, #raft_state{} = Data) ->
     Data.
+
+-spec maybe_rotate_log(View :: wa_raft_log:view(), RotateIndex :: wa_raft_log:log_index(), Data :: #raft_state{}) ->
+    {ok, wa_raft_log:view()} | {error, term()}.
+maybe_rotate_log(View, _RotateIndex, #raft_state{append_in_flight = {_Ref, _WorkerPid, _MonitorRef, _Priority, _Pending, _NewLabel}}) ->
+    %% Async append writes the provider from a spawned process. Log rotation is
+    %% destructive for providers with segment rewrite/swap semantics, so defer
+    %% it until the in-flight append has completed and the provider is quiescent.
+    {ok, View};
+maybe_rotate_log(View, RotateIndex, #raft_state{}) ->
+    wa_raft_log:rotate(View, RotateIndex).
 
 -spec apply_op(
     State :: state(),
@@ -3270,7 +3357,7 @@ add_pending(From, Op, low, #raft_state{pending_low = PendingLow} = Data) ->
     Data#raft_state{pending_low = [{From, Op} | PendingLow]}.
 
 -spec commit_pending(Data :: #raft_state{}, Priority :: wa_raft_acceptor:priority()) -> #raft_state{}.
-commit_pending(#raft_state{append_in_flight = {_Ref, _AppendPriority, _Pending, _NewLabel}} = Data, _Priority) ->
+commit_pending(#raft_state{append_in_flight = {_Ref, _WorkerPid, _MonitorRef, _AppendPriority, _Pending, _NewLabel}} = Data, _Priority) ->
     Data;
 commit_pending(#raft_state{pending_high = [], pending_low = [], pending_read = false} = Data, _Priority) ->
     Data;
@@ -3354,7 +3441,7 @@ should_async_log_append(#raft_state{}, _Priority) ->
 start_async_log_append(#raft_state{log_view = View} = Data0, Priority, Pending, Entries, NewLabel) ->
     Ref = make_ref(),
     Parent = self(),
-    spawn(fun() ->
+    {WorkerPid, MonitorRef} = spawn_monitor(fun() ->
         Result =
             try wa_raft_log:try_append(View, Entries, Priority) of
                 AppendResult -> AppendResult
@@ -3367,7 +3454,7 @@ start_async_log_append(#raft_state{log_view = View} = Data0, Priority, Pending, 
         Priority,
         Data0#raft_state{
             pending_read = false,
-            append_in_flight = {Ref, Priority, Pending, NewLabel}
+            append_in_flight = {Ref, WorkerPid, MonitorRef, Priority, Pending, NewLabel}
         }
     ).
 
@@ -3375,8 +3462,9 @@ start_async_log_append(#raft_state{log_view = View} = Data0, Priority, Pending, 
 complete_async_log_append(
     Ref,
     {ok, NewView},
-    #raft_state{table = Table, queued = Queued, append_in_flight = {Ref, Priority, Pending, NewLabel}} = Data
+    #raft_state{table = Table, queued = Queued, append_in_flight = {Ref, _WorkerPid, MonitorRef, Priority, Pending, NewLabel}} = Data
 ) ->
+    _ = erlang:demonitor(MonitorRef, [flush]),
     Last = wa_raft_log:last_index(NewView),
     {_, NewQueued} =
         lists:foldl(
@@ -3396,20 +3484,190 @@ complete_async_log_append(
 complete_async_log_append(
     Ref,
     skipped,
-    #raft_state{table = Table, append_in_flight = {Ref, Priority, Pending, _NewLabel}} = Data
+    #raft_state{table = Table, append_in_flight = {Ref, _WorkerPid, MonitorRef, Priority, Pending, _NewLabel}} = Data
 ) ->
+    _ = erlang:demonitor(MonitorRef, [flush]),
     ?RAFT_COUNTV(Table, {'commit.async_append.skipped', Priority}, length(Pending)),
     ?SERVER_LOG_WARNING(leader, Data, "skipped async pre-heartbeat sync for ~0p log entr(ies).", [length(Pending)]),
     cancel_pending({error, commit_stalled}, Data#raft_state{append_in_flight = undefined});
 complete_async_log_append(
     Ref,
     {error, Error},
-    #raft_state{table = Table, append_in_flight = {Ref, Priority, Pending, _NewLabel}} = Data
+    #raft_state{table = Table, append_in_flight = {Ref, _WorkerPid, MonitorRef, Priority, Pending, _NewLabel}} = Data
 ) ->
+    _ = erlang:demonitor(MonitorRef, [flush]),
     ?RAFT_COUNTV(Table, {'commit.async_append.error', Priority}, length(Pending)),
     ?SERVER_LOG_ERROR(leader, Data, "async sync failed due to ~0P.", [Error, 20]),
-    error(Error);
+    Data1 = cancel_async_append_pending(
+        {error, {commit_call_failed_after_submit, Error}},
+        Priority,
+        Pending,
+        Data#raft_state{append_in_flight = undefined}
+    ),
+    rollback_async_append_disk(leader, Data1);
 complete_async_log_append(_Ref, _Result, #raft_state{} = Data) ->
+    Data.
+
+-spec complete_async_log_append_after_leadership_loss(
+    StateName :: state(),
+    Ref :: reference(),
+    Result :: term(),
+    Data :: #raft_state{}
+) -> #raft_state{}.
+complete_async_log_append_after_leadership_loss(
+    StateName,
+    Ref,
+    {ok, _NewView},
+    #raft_state{
+        table = Table,
+        append_in_flight = {Ref, _WorkerPid, MonitorRef, Priority, Pending, _NewLabel}
+    } = Data
+) ->
+    _ = erlang:demonitor(MonitorRef, [flush]),
+    ?RAFT_COUNTV(Table, {'commit.async_append.not_leader', Priority}, length(Pending)),
+    ?SERVER_LOG_NOTICE(StateName, Data, "completed stale async append after leadership loss; cancelling ~0p entr(ies).", [length(Pending)]),
+    Data1 = cancel_async_append_pending({error, not_leader}, Priority, Pending, Data#raft_state{
+        append_in_flight = undefined
+    }),
+    rollback_async_append_disk(StateName, Data1);
+complete_async_log_append_after_leadership_loss(
+    StateName,
+    Ref,
+    skipped,
+    #raft_state{
+        table = Table,
+        append_in_flight = {Ref, _WorkerPid, MonitorRef, Priority, Pending, _NewLabel}
+    } = Data
+) ->
+    _ = erlang:demonitor(MonitorRef, [flush]),
+    ?RAFT_COUNTV(Table, {'commit.async_append.not_leader.skipped', Priority}, length(Pending)),
+    ?SERVER_LOG_WARNING(StateName, Data, "stale async append skipped after leadership loss for ~0p entr(ies).", [length(Pending)]),
+    cancel_async_append_pending({error, not_leader}, Priority, Pending, Data#raft_state{
+        append_in_flight = undefined
+    });
+complete_async_log_append_after_leadership_loss(
+    StateName,
+    Ref,
+    {error, Error},
+    #raft_state{
+        table = Table,
+        append_in_flight = {Ref, _WorkerPid, MonitorRef, Priority, Pending, _NewLabel}
+    } = Data
+) ->
+    _ = erlang:demonitor(MonitorRef, [flush]),
+    ?RAFT_COUNTV(Table, {'commit.async_append.not_leader.error', Priority}, length(Pending)),
+    ?SERVER_LOG_WARNING(StateName, Data, "stale async append failed after leadership loss due to ~0P.", [Error, 20]),
+    cancel_async_append_pending({error, not_leader}, Priority, Pending, Data#raft_state{
+        append_in_flight = undefined
+    });
+complete_async_log_append_after_leadership_loss(_StateName, _Ref, _Result, #raft_state{} = Data) ->
+    Data.
+
+-spec complete_async_log_append_down(
+    StateName :: state(),
+    MonitorRef :: reference(),
+    WorkerPid :: pid(),
+    Reason :: term(),
+    Data :: #raft_state{}
+) -> #raft_state{}.
+complete_async_log_append_down(
+    StateName,
+    MonitorRef,
+    WorkerPid,
+    Reason,
+    #raft_state{
+        table = Table,
+        append_in_flight = {_Ref, WorkerPid, MonitorRef, Priority, Pending, _NewLabel}
+    } = Data
+) ->
+    ?RAFT_COUNTV(Table, {'commit.async_append.down', Priority}, length(Pending)),
+    ?SERVER_LOG_WARNING(StateName, Data, "async append worker exited before completion due to ~0P; cancelling ~0p entr(ies).", [Reason, 20, length(Pending)]),
+    Data1 = cancel_async_append_pending({error, commit_stalled}, Priority, Pending, Data#raft_state{
+        append_in_flight = undefined
+    }),
+    rollback_async_append_disk(StateName, Data1);
+complete_async_log_append_down(_StateName, _MonitorRef, _WorkerPid, _Reason, #raft_state{} = Data) ->
+    Data.
+
+-spec cancel_async_append_in_flight(
+    StateName :: state(),
+    Reason :: wa_raft_acceptor:common_error(),
+    Data :: #raft_state{}
+) -> #raft_state{}.
+cancel_async_append_in_flight(
+    StateName,
+    Reason,
+    #raft_state{
+        append_in_flight = {_Ref, WorkerPid, MonitorRef, Priority, Pending, _NewLabel}
+    } = Data
+) ->
+    exit(WorkerPid, kill),
+    case await_async_append_worker_down(WorkerPid, MonitorRef) of
+        ok ->
+            Data1 = cancel_async_append_pending(Reason, Priority, Pending, Data#raft_state{
+                append_in_flight = undefined
+            }),
+            rollback_async_append_disk(StateName, Data1);
+        {error, WaitReason} ->
+            ?SERVER_LOG_ERROR(StateName, Data, "failed to stop async append worker due to ~0P.", [WaitReason, 20]),
+            error({async_append_cancel_failed, WaitReason})
+    end;
+cancel_async_append_in_flight(_StateName, _Reason, #raft_state{} = Data) ->
+    Data.
+
+-spec await_async_append_worker_down(WorkerPid :: pid(), MonitorRef :: reference()) -> ok | {error, term()}.
+await_async_append_worker_down(WorkerPid, MonitorRef) ->
+    receive
+        {'DOWN', MonitorRef, process, WorkerPid, _Reason} ->
+            ok
+    after 5000 ->
+        _ = erlang:demonitor(MonitorRef, [flush]),
+        {error, async_append_worker_kill_timeout}
+    end.
+
+-spec rollback_async_append_disk(StateName :: state(), Data :: #raft_state{}) -> #raft_state{}.
+rollback_async_append_disk(StateName, #raft_state{table = Table, log_view = View} = Data) ->
+    %% The async worker writes the provider before the Raft server advances
+    %% log_view. If that append is later cancelled, persisted bytes beyond this
+    %% view must be removed or restart can replay an unacknowledged command.
+    TruncateIndex = wa_raft_log:last_index(View) + 1,
+    case close_async_append_owner_writers(View) of
+        ok ->
+            case wa_raft_log:truncate(View, TruncateIndex) of
+                {ok, NewView} ->
+                    ?RAFT_COUNT(Table, 'commit.async_append.rollback.ok'),
+                    Data#raft_state{log_view = NewView};
+                {error, Reason} ->
+                    ?RAFT_COUNT(Table, 'commit.async_append.rollback.error'),
+                    ?SERVER_LOG_ERROR(StateName, Data, "failed to rollback cancelled async append at ~0p due to ~0P.", [TruncateIndex, Reason, 30]),
+                    error({async_append_rollback_failed, Reason})
+            end;
+        {error, Reason} ->
+            ?RAFT_COUNT(Table, 'commit.async_append.rollback.error'),
+            ?SERVER_LOG_ERROR(StateName, Data, "failed to close caller-owned writers before async append rollback due to ~0P.", [Reason, 30]),
+            error({async_append_rollback_failed, Reason})
+    end.
+
+-spec close_async_append_owner_writers(View :: wa_raft_log:view()) -> ok | {error, term()}.
+close_async_append_owner_writers(View) ->
+    case wa_raft_log:provider(View) of
+        ferricstore_waraft_spike_segment_log ->
+            ferricstore_waraft_spike_segment_log:close_process_writers(wa_raft_log:log(View));
+        _OtherProvider ->
+            ok
+    end.
+
+-spec cancel_async_append_pending(
+    Reason :: wa_raft_acceptor:common_error(),
+    Priority :: wa_raft_acceptor:priority(),
+    Pending :: [{gen_server:from(), wa_raft_acceptor:op()}],
+    Data :: #raft_state{}
+) -> #raft_state{}.
+cancel_async_append_pending(Reason, Priority, Pending, #raft_state{queues = Queues} = Data) ->
+    [
+        wa_raft_queue:commit_cancelled(Queues, From, Reason, Priority)
+     || {From, _Op} <- lists:reverse(Pending)
+    ],
     Data.
 
 -spec clear_pending_priority(Priority :: wa_raft_acceptor:priority(), Data :: #raft_state{}) -> #raft_state{}.

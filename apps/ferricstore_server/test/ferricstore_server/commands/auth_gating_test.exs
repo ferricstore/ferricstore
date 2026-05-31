@@ -9,6 +9,8 @@ defmodule FerricstoreServer.Commands.AuthGatingTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Config
+  alias Ferricstore.Store.Router
+  alias FerricstoreServer.Acl
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
@@ -29,6 +31,23 @@ defmodule FerricstoreServer.Commands.AuthGatingTest do
 
   defp recv_response(sock) do
     recv_response(sock, "")
+  end
+
+  defp recv_responses(sock, count) do
+    recv_responses(sock, count, "", [])
+  end
+
+  defp recv_responses(_sock, count, _buf, acc) when length(acc) >= count,
+    do: Enum.take(acc, count)
+
+  defp recv_responses(sock, count, buf, acc) do
+    {:ok, data} = :gen_tcp.recv(sock, 0, 5000)
+    buf2 = buf <> data
+
+    case Parser.parse(buf2) do
+      {:ok, [], _} -> recv_responses(sock, count, buf2, acc)
+      {:ok, values, rest} -> recv_responses(sock, count, rest, acc ++ values)
+    end
   end
 
   defp recv_response(sock, buf) do
@@ -143,6 +162,72 @@ defmodule FerricstoreServer.Commands.AuthGatingTest do
 
       assert {:error, msg} = response
       assert msg =~ "NOAUTH"
+
+      :gen_tcp.close(sock)
+    end
+  end
+
+  describe "with ACL password on default user" do
+    setup do
+      Acl.reset!()
+      Config.set("requirepass", "")
+      on_exit(fn -> Acl.reset!() end)
+      :ok
+    end
+
+    test "pipelined fast-path writes are rejected before AUTH", %{port: port} do
+      key1 = "acl_pipeline_noauth_#{System.unique_integer([:positive])}:1"
+      key2 = "acl_pipeline_noauth_#{System.unique_integer([:positive])}:2"
+      assert :ok = Acl.set_user("default", ["on", ">pipepass", "+@all"])
+
+      sock = connect_raw(port)
+
+      payload =
+        IO.iodata_to_binary([
+          Encoder.encode(["SET", key1, "v1"]),
+          Encoder.encode(["SET", key2, "v2"])
+        ])
+
+      :ok = :gen_tcp.send(sock, payload)
+
+      assert [
+               {:error, "NOAUTH" <> _},
+               {:error, "NOAUTH" <> _}
+             ] = recv_responses(sock, 2)
+
+      ctx = FerricStore.Instance.get(:default)
+      assert Router.get(ctx, key1) == nil
+      assert Router.get(ctx, key2) == nil
+
+      :gen_tcp.close(sock)
+    end
+
+    test "HELLO 3 AUTH authenticates the connection before later commands", %{port: port} do
+      key = "hello_auth_#{System.unique_integer([:positive])}"
+      assert :ok = Acl.set_user("default", ["on", ">hellopass", "+@all"])
+
+      sock = connect_raw(port)
+      send_cmd(sock, ["HELLO", "3", "AUTH", "default", "hellopass"])
+      assert %{"proto" => 3} = recv_response(sock)
+
+      send_cmd(sock, ["SET", key, "v1"])
+      assert {:simple, "OK"} = recv_response(sock)
+      assert Router.get(FerricStore.Instance.get(:default), key) == "v1"
+
+      :gen_tcp.close(sock)
+    end
+
+    test "CLIENT HELLO 3 AUTH authenticates the connection", %{port: port} do
+      key = "client_hello_auth_#{System.unique_integer([:positive])}"
+      assert :ok = Acl.set_user("default", ["on", ">clienthellopass", "+@all"])
+
+      sock = connect_raw(port)
+      send_cmd(sock, ["CLIENT", "HELLO", "3", "AUTH", "default", "clienthellopass"])
+      assert %{"proto" => 3} = recv_response(sock)
+
+      send_cmd(sock, ["SET", key, "v1"])
+      assert {:simple, "OK"} = recv_response(sock)
+      assert Router.get(FerricStore.Instance.get(:default), key) == "v1"
 
       :gen_tcp.close(sock)
     end

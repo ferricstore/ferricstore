@@ -7,7 +7,7 @@
 # updates for small and larger records.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/flow_kv_record_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/flow_kv_record_bench.exs
 #
 # Options:
 #   FLOW_KV_SIZES=128,512,4096,65536

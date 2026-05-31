@@ -8,7 +8,7 @@
 #   * 100 x FLOW.TRANSITION in one TCP pipeline
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start \
+#   MIX_ENV=bench mix run --no-start \
 #     -e 'Code.require_file("bench/flow_resp_pipeline_bench.exs")'
 #
 # Options:

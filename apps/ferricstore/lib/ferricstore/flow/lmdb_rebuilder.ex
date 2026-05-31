@@ -8,11 +8,21 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.ZSetIndex
+  alias Ferricstore.Raft.WARaftSegmentReader
 
   @batch_size 512
   @cold_read_timeout_ms 30_000
   @active_index_rebuild_batch_size 4096
   @startup_active_rebuild_slots :ferricstore_flow_lmdb_startup_active_rebuild_slots
+
+  defguardp valid_waraft_segment_location(file_id, offset, value_size)
+            when is_tuple(file_id) and tuple_size(file_id) == 2 and
+                   (elem(file_id, 0) == :waraft_segment or
+                      elem(file_id, 0) == :waraft_projection or
+                      elem(file_id, 0) == :waraft_apply_projection) and
+                   is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
+                   is_integer(offset) and offset >= 0 and is_integer(value_size) and
+                   value_size >= 0
 
   @doc false
   def __startup_active_rebuild_concurrency_for_test__, do: startup_active_rebuild_concurrency()
@@ -33,35 +43,37 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       ) do
     Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
 
-    stats =
-      keydir
-      |> select_state_entries()
-      |> Enum.reduce(%{seen: 0, active: 0, terminal: 0, cold_read_errors: 0}, fn entries, acc ->
-        entries
-        |> read_and_decode(shard_path, shard_index, instance_ctx)
-        |> Enum.reduce(%{acc | seen: acc.seen + length(entries)}, fn {_key, _value, _expire_at_ms,
-                                                                      record},
-                                                                     next_acc ->
-          if LMDB.terminal_state?(Map.get(record, :state)) do
-            %{next_acc | terminal: next_acc.terminal + 1}
-          else
-            rebuild_active_indexes(zset_score_index, zset_score_lookup, record)
-            rebuild_active_flow_indexes(flow_index, flow_lookup, record)
-            %{next_acc | active: next_acc.active + 1}
-          end
+    try do
+      stats =
+        keydir
+        |> select_state_entries()
+        |> Enum.reduce(%{seen: 0, active: 0, terminal: 0, cold_read_errors: 0}, fn entries, acc ->
+          entries
+          |> read_and_decode(shard_path, shard_index, instance_ctx)
+          |> Enum.reduce(%{acc | seen: acc.seen + length(entries)}, fn {_key, _value,
+                                                                        _expire_at_ms, record},
+                                                                       next_acc ->
+            if LMDB.terminal_state?(Map.get(record, :state)) do
+              %{next_acc | terminal: next_acc.terminal + 1}
+            else
+              rebuild_active_indexes(zset_score_index, zset_score_lookup, record)
+              rebuild_active_flow_indexes(flow_index, flow_lookup, record)
+              %{next_acc | active: next_acc.active + 1}
+            end
+          end)
         end)
-      end)
-      |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
+        |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
 
-    Process.delete(:flow_lmdb_rebuild_cold_read_errors)
+      :telemetry.execute(
+        [:ferricstore, :flow, :active_index_rebuild],
+        stats,
+        %{shard_index: shard_index}
+      )
 
-    :telemetry.execute(
-      [:ferricstore, :flow, :active_index_rebuild],
-      stats,
-      %{shard_index: shard_index}
-    )
-
-    :ok
+      :ok
+    after
+      Process.delete(:flow_lmdb_rebuild_cold_read_errors)
+    end
   end
 
   def reconcile_shard(
@@ -77,44 +89,40 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     lmdb_path = LMDB.path(shard_path)
     Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
 
-    stats =
-      keydir
-      |> select_state_entries()
-      |> Enum.reduce(
-        initial_reconcile_stats(lmdb_path, keydir, shard_path),
-        fn entries, acc ->
-          reconcile_batch(
-            entries,
-            shard_path,
-            lmdb_path,
-            keydir,
-            shard_index,
-            instance_ctx,
-            zset_score_index,
-            zset_score_lookup,
-            flow_index,
-            flow_lookup,
-            acc
-          )
-        end
-      )
-      |> persist_terminal_counts(lmdb_path)
+    try do
+      stats =
+        keydir
+        |> select_state_entries()
+        |> Enum.reduce(
+          initial_reconcile_stats(lmdb_path, keydir, shard_path),
+          fn entries, acc ->
+            reconcile_batch(
+              entries,
+              shard_path,
+              lmdb_path,
+              keydir,
+              shard_index,
+              instance_ctx,
+              zset_score_index,
+              zset_score_lookup,
+              flow_index,
+              flow_lookup,
+              acc
+            )
+          end
+        )
+        |> persist_terminal_counts(lmdb_path)
 
-    lmdb_active_rebuilt =
-      rebuild_active_flow_indexes_from_lmdb(
-        lmdb_path,
-        zset_score_index,
-        zset_score_lookup,
-        flow_index,
-        flow_lookup
-      )
+      lmdb_active_rebuilt =
+        rebuild_active_flow_indexes_from_lmdb(
+          lmdb_path,
+          zset_score_index,
+          zset_score_lookup,
+          flow_index,
+          flow_lookup
+        )
 
-    stats =
-      stats
-      |> Map.put(:lmdb_active_rebuilt, lmdb_active_rebuilt)
-      |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
-      |> Map.put(
-        :history,
+      {history_count, history_lmdb_errors} =
         maybe_rebuild_flow_history_indexes(
           keydir,
           shard_path,
@@ -124,53 +132,32 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           flow_index,
           flow_lookup
         )
+
+      stats =
+        stats
+        |> Map.put(:lmdb_active_rebuilt, lmdb_active_rebuilt)
+        |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
+        |> Map.put(:history, history_count)
+        |> Map.put(:history_lmdb_errors, history_lmdb_errors)
+        |> Map.update!(:lmdb_errors, &(&1 + history_lmdb_errors))
+
+      publish_mirror_health(instance_ctx, shard_index, stats)
+
+      telemetry_stats =
+        stats
+        |> Map.put(:terminal_count_keys, map_size(stats.terminal_counts))
+        |> Map.delete(:terminal_counts)
+
+      :telemetry.execute(
+        [:ferricstore, :flow, :lmdb_rebuild],
+        telemetry_stats,
+        %{shard_index: shard_index}
       )
 
-    Process.delete(:flow_lmdb_rebuild_cold_read_errors)
-    publish_mirror_health(instance_ctx, shard_index, stats)
-
-    telemetry_stats =
-      stats
-      |> Map.put(:terminal_count_keys, map_size(stats.terminal_counts))
-      |> Map.delete(:terminal_counts)
-
-    :telemetry.execute(
-      [:ferricstore, :flow, :lmdb_rebuild],
-      telemetry_stats,
-      %{shard_index: shard_index}
-    )
-
-    :ok
-  end
-
-  def reconcile_startup_shard(
-        shard_path,
-        _keydir,
-        shard_index,
-        %{name: :default},
-        zset_score_index,
-        zset_score_lookup,
-        flow_index,
-        flow_lookup
-      ) do
-    lmdb_path = LMDB.path(shard_path)
-
-    rebuilt =
-      rebuild_active_flow_indexes_from_lmdb(
-        lmdb_path,
-        zset_score_index,
-        zset_score_lookup,
-        flow_index,
-        flow_lookup
-      )
-
-    :telemetry.execute(
-      [:ferricstore, :flow, :lmdb_startup_rebuild],
-      %{lmdb_active_rebuilt: rebuilt, full_reconcile: 0},
-      %{shard_index: shard_index, mode: :default_waraft_active_projection}
-    )
-
-    :ok
+      :ok
+    after
+      Process.delete(:flow_lmdb_rebuild_cold_read_errors)
+    end
   end
 
   def reconcile_startup_shard(
@@ -181,7 +168,143 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         zset_score_index,
         zset_score_lookup,
         flow_index,
-        flow_lookup
+        flow_lookup,
+        opts \\ []
+      )
+
+  def reconcile_startup_shard(
+        shard_path,
+        keydir,
+        shard_index,
+        %{name: :default} = instance_ctx,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup,
+        opts
+      ) do
+    lmdb_path = LMDB.path(shard_path)
+
+    cond do
+      Keyword.get(opts, :force_full_reconcile?, false) ->
+        flush_marker? = LMDB.flush_in_progress?(lmdb_path)
+
+        :ok =
+          reconcile_shard(
+            shard_path,
+            keydir,
+            shard_index,
+            instance_ctx,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup
+          )
+
+        if flush_marker? do
+          # The forced path is used after WARaft segment replay mutates the keydir.
+          # If a previous LMDB flush marker also survived a crash, the full
+          # reconcile repaired the projection and can clear it now.
+          :ok = LMDB.write_batch(lmdb_path, [LMDB.flush_in_progress_delete_op()])
+        end
+
+        :telemetry.execute(
+          [:ferricstore, :flow, :lmdb_startup_rebuild],
+          %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+          %{
+            shard_index: shard_index,
+            mode: :default_waraft_active_projection,
+            reason: Keyword.get(opts, :reason, :forced_full_reconcile)
+          }
+        )
+
+        :ok
+
+      LMDB.flush_in_progress?(lmdb_path) ->
+        :ok =
+          reconcile_shard(
+            shard_path,
+            keydir,
+            shard_index,
+            instance_ctx,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup
+          )
+
+        # A crash can leave the marker behind after LMDB has only part of one
+        # logical projection. Full reconcile repairs from the durable Flow source,
+        # then clears the marker so future boots can take the cheap active rebuild.
+        :ok = LMDB.write_batch(lmdb_path, [LMDB.flush_in_progress_delete_op()])
+
+        :telemetry.execute(
+          [:ferricstore, :flow, :lmdb_startup_rebuild],
+          %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+          %{
+            shard_index: shard_index,
+            mode: :default_waraft_active_projection,
+            reason: :incomplete_lmdb_flush
+          }
+        )
+
+        :ok
+
+      not LMDB.env_present?(lmdb_path) ->
+        :ok =
+          reconcile_shard(
+            shard_path,
+            keydir,
+            shard_index,
+            instance_ctx,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup
+          )
+
+        :telemetry.execute(
+          [:ferricstore, :flow, :lmdb_startup_rebuild],
+          %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+          %{
+            shard_index: shard_index,
+            mode: :default_waraft_active_projection,
+            reason: :missing_lmdb_env
+          }
+        )
+
+        :ok
+
+      true ->
+        rebuilt =
+          rebuild_active_flow_indexes_from_lmdb(
+            lmdb_path,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup
+          )
+
+        :telemetry.execute(
+          [:ferricstore, :flow, :lmdb_startup_rebuild],
+          %{lmdb_active_rebuilt: rebuilt, full_reconcile: 0},
+          %{shard_index: shard_index, mode: :default_waraft_active_projection}
+        )
+
+        :ok
+    end
+  end
+
+  def reconcile_startup_shard(
+        shard_path,
+        keydir,
+        shard_index,
+        instance_ctx,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup,
+        _opts
       ) do
     reconcile_shard(
       shard_path,
@@ -288,12 +411,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
           reverse_key = LMDB.terminal_by_state_key_key(key)
           metadata_ops = query_metadata_index_ops(record, expire_at_ms)
+          active_delete_ops = LMDB.active_index_delete_ops(lmdb_path, key)
 
           {
             [
               {:put, reverse_key, terminal_key},
               {:put, terminal_key, terminal_value}
-              | terminal_expire_ops ++ metadata_ops ++ lmdb_ops
+              | active_delete_ops ++ terminal_expire_ops ++ metadata_ops ++ lmdb_ops
             ],
             [{key, record} | prunes],
             active,
@@ -517,7 +641,11 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       {key, nil, expire_at_ms, _lfu, fid, off, vsize}
       when is_integer(fid) and is_integer(off) and is_integer(vsize) and off >= 0 and vsize >= 0 ->
         path = ShardETS.file_path(shard_path, fid)
-        [{path, off, key, expire_at_ms}]
+        [{:bitcask, path, off, key, expire_at_ms}]
+
+      {key, nil, expire_at_ms, _lfu, fid, off, vsize}
+      when valid_waraft_segment_location(fid, off, vsize) ->
+        [{:waraft, fid, key, expire_at_ms}]
 
       _entry ->
         []
@@ -527,14 +655,28 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp read_cold_locations([], _shard_index, _instance_ctx), do: []
 
   defp read_cold_locations(locations, shard_index, instance_ctx) do
-    reads = Enum.map(locations, fn {path, off, key, _expire_at_ms} -> {path, off, key} end)
+    {bitcask_locations, waraft_locations} =
+      Enum.split_with(locations, fn
+        {:bitcask, _path, _off, _key, _expire_at_ms} -> true
+        _ -> false
+      end)
+
+    read_bitcask_cold_locations(bitcask_locations, shard_index, instance_ctx) ++
+      read_waraft_cold_locations(waraft_locations, shard_index, instance_ctx)
+  end
+
+  defp read_bitcask_cold_locations([], _shard_index, _instance_ctx), do: []
+
+  defp read_bitcask_cold_locations(locations, shard_index, instance_ctx) do
+    reads =
+      Enum.map(locations, fn {:bitcask, path, off, key, _expire_at_ms} -> {path, off, key} end)
 
     case ColdRead.pread_batch_keyed(reads, @cold_read_timeout_ms) do
       {:ok, values} ->
         locations
         |> Enum.zip(values)
         |> Enum.flat_map(fn
-          {{_path, _off, key, expire_at_ms}, value} when is_binary(value) ->
+          {{:bitcask, _path, _off, key, expire_at_ms}, value} when is_binary(value) ->
             decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx)
 
           _ ->
@@ -546,6 +688,34 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         observe_cold_read_error(length(locations), reason)
         []
     end
+  end
+
+  defp read_waraft_cold_locations([], _shard_index, _instance_ctx), do: []
+
+  defp read_waraft_cold_locations(locations, shard_index, instance_ctx) do
+    locations
+    |> Enum.group_by(fn {:waraft, file_id, _key, _expire_at_ms} -> file_id end)
+    |> Enum.flat_map(fn {file_id, grouped} ->
+      keys = Enum.map(grouped, fn {:waraft, _file_id, key, _expire_at_ms} -> key end)
+
+      case WARaftSegmentReader.read_values_from_location(instance_ctx, shard_index, file_id, keys) do
+        {:ok, values_by_key} when is_map(values_by_key) ->
+          Enum.flat_map(grouped, fn {:waraft, _file_id, key, expire_at_ms} ->
+            case Map.get(values_by_key, key) do
+              value when is_binary(value) ->
+                decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx)
+
+              _ ->
+                observe_cold_read_error(1, :missing_waraft_value)
+                []
+            end
+          end)
+
+        {:error, reason} ->
+          observe_cold_read_error(length(grouped), {:waraft_segment_read_failed, reason})
+          []
+      end
+    end)
   end
 
   defp observe_cold_read_error(count, reason) do
@@ -654,6 +824,26 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp rebuild_active_flow_indexes_from_lmdb(
+         lmdb_path,
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup
+       ) do
+    if not LMDB.env_present?(lmdb_path) do
+      0
+    else
+      do_rebuild_active_flow_indexes_from_lmdb(
+        lmdb_path,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup
+      )
+    end
+  end
+
+  defp do_rebuild_active_flow_indexes_from_lmdb(
          lmdb_path,
          zset_score_index,
          zset_score_lookup,
@@ -877,7 +1067,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          nil,
          _flow_lookup
        ),
-       do: 0
+       do: {0, 0}
 
   defp rebuild_flow_history_indexes(
          _keydir,
@@ -888,7 +1078,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          _flow_index,
          nil
        ),
-       do: 0
+       do: {0, 0}
 
   defp rebuild_flow_history_indexes(
          keydir,
@@ -941,16 +1131,17 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       history_keys
     )
 
-    rebuild_lmdb_history_projections(
-      keydir,
-      shard_path,
-      lmdb_path,
-      shard_index,
-      instance_ctx,
-      history_entries_by_key
-    )
+    history_lmdb_errors =
+      rebuild_lmdb_history_projections(
+        keydir,
+        shard_path,
+        lmdb_path,
+        shard_index,
+        instance_ctx,
+        history_entries_by_key
+      )
 
-    count
+    {count, history_lmdb_errors}
   end
 
   defp maybe_rebuild_flow_history_indexes(
@@ -963,7 +1154,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          flow_lookup
        ) do
     if flow_async_history_enabled?() do
-      0
+      {0, 0}
     else
       rebuild_flow_history_indexes(
         keydir,
@@ -1042,7 +1233,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          instance_ctx,
          history_entries_by_key
        ) do
-    Enum.each(history_entries_by_key, fn {history_key, entries} ->
+    Enum.reduce(history_entries_by_key, 0, fn {history_key, entries}, errors ->
       with {:ok, state_key} <- state_key_from_history_key(history_key),
            {:ok, record} <-
              read_rebuild_state_record(
@@ -1054,9 +1245,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                instance_ctx
              ),
            true <- LMDB.terminal_state?(Map.get(record, :state)) do
-        rebuild_lmdb_history_projection(lmdb_path, history_key, record, entries)
+        errors + rebuild_lmdb_history_projection(lmdb_path, history_key, record, entries)
       else
-        _ -> :ok
+        _ -> errors
       end
     end)
   end
@@ -1064,7 +1255,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp rebuild_lmdb_history_projection(lmdb_path, history_key, record, entries) do
     expire_at_ms = flow_record_expire_at(record)
 
-    delete_ops =
+    {delete_ops, scan_errors} =
       lmdb_path
       |> LMDB.prefix_entries(
         history_key |> LMDB.history_index_prefix(),
@@ -1072,18 +1263,24 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       )
       |> case do
         {:ok, existing} ->
-          Enum.flat_map(existing, fn {history_index_key, _value} ->
-            LMDB.history_index_delete_ops(lmdb_path, history_index_key)
-          end)
+          {
+            Enum.flat_map(existing, fn {history_index_key, _value} ->
+              LMDB.history_index_delete_ops(lmdb_path, history_index_key)
+            end),
+            0
+          }
 
         {:error, _reason} ->
-          []
+          {[], 1}
       end
 
-    put_ops =
+    retained_entries =
       entries
       |> Enum.sort_by(fn {event_id, event_ms, _compound_key} -> {event_ms, event_id} end)
       |> take_latest_history_events(Map.get(record, :history_max_events))
+
+    event_ops =
+      retained_entries
       |> Enum.flat_map(fn {event_id, event_ms, compound_key} ->
         history_index_key = LMDB.history_index_key(history_key, event_id, event_ms)
 
@@ -1092,30 +1289,52 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
            LMDB.encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms)}
         ]
 
-        ops =
-          case LMDB.history_expire_key(expire_at_ms, history_index_key) do
-            nil ->
-              ops
-
-            expire_key ->
-              [{:put, expire_key, LMDB.encode_history_expire_value(history_index_key)} | ops]
-          end
-
-        case LMDB.history_flow_expire_key(expire_at_ms, history_key) do
+        case LMDB.history_expire_key(expire_at_ms, history_index_key) do
           nil ->
             ops
 
           expire_key ->
-            [
-              {:put, expire_key, LMDB.encode_history_flow_expire_value(history_key, expire_at_ms)}
-              | ops
-            ]
+            [{:put, expire_key, LMDB.encode_history_expire_value(history_index_key)} | ops]
         end
       end)
 
-    (delete_ops ++ put_ops)
-    |> Enum.chunk_every(@batch_size)
-    |> Enum.each(fn ops -> LMDB.write_batch(lmdb_path, ops) end)
+    put_ops =
+      case {retained_entries, LMDB.history_flow_expire_key(expire_at_ms, history_key)} do
+        {[], _expire_key} ->
+          event_ops
+
+        {_entries, nil} ->
+          event_ops
+
+        {_entries, expire_key} ->
+          [
+            {:put, expire_key, LMDB.encode_history_flow_expire_value(history_key, expire_at_ms)}
+            | event_ops
+          ]
+      end
+
+    write_errors =
+      (delete_ops ++ put_ops)
+      |> Enum.chunk_every(@batch_size)
+      |> Enum.reduce(0, fn ops, errors ->
+        case write_lmdb_history_projection_batch(lmdb_path, ops) do
+          :ok -> errors
+          {:error, _reason} -> errors + 1
+        end
+      end)
+
+    scan_errors + write_errors
+  end
+
+  defp write_lmdb_history_projection_batch(lmdb_path, ops) do
+    case Application.get_env(:ferricstore, :flow_lmdb_rebuild_history_write_hook) do
+      fun when is_function(fun, 2) -> fun.(lmdb_path, ops)
+      _ -> LMDB.write_batch(lmdb_path, ops)
+    end
+  rescue
+    reason -> {:error, {:history_projection_write_hook_failed, reason}}
+  catch
+    kind, reason -> {:error, {:history_projection_write_hook_failed, kind, reason}}
   end
 
   defp take_latest_history_events(entries, max) when is_integer(max) and max > 0,

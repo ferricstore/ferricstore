@@ -16,8 +16,7 @@ defmodule Ferricstore.Bitcask.NIF do
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-musl
       x86_64-unknown-linux-musl
-    ),
-    force_build: System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
+    )
 
   # -- Tracking allocator --
   @spec rust_allocated_bytes() :: {:ok, non_neg_integer()} | {:error, term()}
@@ -107,7 +106,7 @@ defmodule Ferricstore.Bitcask.NIF do
           float(),
           non_neg_integer(),
           non_neg_integer()
-        ) :: [{binary(), binary(), float()}]
+        ) :: [{binary(), [{binary(), float()}]}]
   def flow_index_claim_due_candidates(_resource, _keys, _max_score, _limit, _max_scan),
     do: :erlang.nif_error(:nif_not_loaded)
 
@@ -499,6 +498,9 @@ defmodule Ferricstore.Bitcask.NIF do
   def lmdb_write_batch_with_originals(_path, _ops, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_clear(binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def lmdb_clear(_path, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_prefix_entries(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
@@ -518,6 +520,17 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec lmdb_prefix_entries_reverse(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries_reverse(_path, _prefix, _limit, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_prefix_entries_reverse_before(
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{binary(), binary()}]} | {:error, term()}
+  def lmdb_prefix_entries_reverse_before(_path, _prefix, _before_key, _limit, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @spec lmdb_prefix_count(binary(), binary(), non_neg_integer()) ::

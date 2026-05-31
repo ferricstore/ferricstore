@@ -6,7 +6,7 @@
 #   - terminal LMDB projection queries after complete
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/flow_lineage_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/flow_lineage_bench.exs
 
 backlog = System.get_env("FLOW_LINEAGE_BACKLOG", "100000") |> String.to_integer()
 iterations = System.get_env("FLOW_LINEAGE_ITER", "200") |> String.to_integer()

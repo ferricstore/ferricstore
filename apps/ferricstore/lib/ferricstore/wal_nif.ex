@@ -27,8 +27,7 @@ defmodule :ferricstore_wal_nif do
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-musl
       x86_64-unknown-linux-musl
-    ),
-    force_build: System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
+    )
 
   @doc "Open a WAL file. Spawns background I/O thread."
   def open(_path, _commit_delay_us, _pre_allocate_bytes, _max_buffer_bytes),

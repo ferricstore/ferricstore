@@ -396,6 +396,264 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
       :gen_tcp.close(sock)
     end
 
+    test "EXEC rechecks permissions for queued commands after ACL changes", %{port: port} do
+      key = "acl:tx:#{System.unique_integer([:positive])}"
+
+      :ok =
+        Acl.set_user("tx_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+multi",
+          "+exec",
+          "+discard",
+          "+get",
+          "+set",
+          "~*"
+        ])
+
+      {sock, _} = connect_and_auth(port, "tx_user", "txpass")
+
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["SET", key, "must_not_write"])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      :ok =
+        Acl.set_user("tx_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+multi",
+          "+exec",
+          "+discard",
+          "+get",
+          "~*"
+        ])
+
+      ConnAuth.broadcast_acl_invalidation("tx_user")
+      Process.sleep(50)
+
+      send_cmd(sock, ["EXEC"])
+      assert {:error, "NOPERM" <> _} = recv_response(sock)
+
+      :ok =
+        Acl.set_user("tx_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+get",
+          "~*"
+        ])
+
+      ConnAuth.broadcast_acl_invalidation("tx_user")
+      Process.sleep(50)
+
+      send_cmd(sock, ["GET", key])
+      assert recv_response(sock) == nil
+
+      :gen_tcp.close(sock)
+    end
+
+    test "EXEC uses fresh ACL even before invalidation message is processed", %{port: port} do
+      key = "acl:tx:fresh:#{System.unique_integer([:positive])}"
+
+      :ok =
+        Acl.set_user("tx_fresh_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+multi",
+          "+exec",
+          "+discard",
+          "+get",
+          "+set",
+          "~*"
+        ])
+
+      {sock, _} = connect_and_auth(port, "tx_fresh_user", "txpass")
+
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["SET", key, "must_not_write"])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      :ok =
+        Acl.set_user("tx_fresh_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+multi",
+          "+exec",
+          "+discard",
+          "+get",
+          "~*"
+        ])
+
+      send_cmd(sock, ["EXEC"])
+      assert {:error, "NOPERM" <> _} = recv_response(sock)
+
+      :ok =
+        Acl.set_user("tx_fresh_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+get",
+          "~*"
+        ])
+
+      send_cmd(sock, ["GET", key])
+      assert recv_response(sock) == nil
+
+      :gen_tcp.close(sock)
+    end
+
+    test "ACL denial inside MULTI aborts the whole transaction", %{port: port} do
+      key = "acl:tx:queue-denied:#{System.unique_integer([:positive])}"
+
+      :ok =
+        Acl.set_user("tx_queue_denied_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+multi",
+          "+exec",
+          "+discard",
+          "+get",
+          "+set",
+          "~*"
+        ])
+
+      {sock, _} = connect_and_auth(port, "tx_queue_denied_user", "txpass")
+
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["SET", key, "must_not_write"])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      send_cmd(sock, ["DEL", key])
+      assert {:error, "NOPERM" <> _} = recv_response(sock)
+
+      send_cmd(sock, ["EXEC"])
+      assert {:error, "EXECABORT" <> _} = recv_response(sock)
+
+      :ok =
+        Acl.set_user("tx_queue_denied_user", [
+          "on",
+          ">txpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+get",
+          "~*"
+        ])
+
+      send_cmd(sock, ["GET", key])
+      assert recv_response(sock) == nil
+
+      :gen_tcp.close(sock)
+    end
+
+    test "WATCH requires read access to watched keys, not write access", %{port: port} do
+      key = "tenant:watch:#{System.unique_integer([:positive])}"
+
+      :ok =
+        Acl.set_user("watch_reader_user", [
+          "on",
+          ">watchpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+watch",
+          "%R~tenant:watch:*"
+        ])
+
+      {sock, _} = connect_and_auth(port, "watch_reader_user", "watchpass")
+
+      send_cmd(sock, ["WATCH", key])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :gen_tcp.close(sock)
+    end
+
+    test "EXEC rechecks WATCH permissions after ACL changes", %{port: port} do
+      watched_key = "tenant:watch:#{System.unique_integer([:positive])}"
+      write_key = "tenant:tx:#{System.unique_integer([:positive])}"
+
+      :ok =
+        Acl.set_user("watch_reauth_user", [
+          "on",
+          ">watchpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+watch",
+          "+multi",
+          "+exec",
+          "+discard",
+          "+set",
+          "+get",
+          "%R~tenant:watch:*",
+          "%W~tenant:tx:*",
+          "%R~tenant:tx:*"
+        ])
+
+      {sock, _} = connect_and_auth(port, "watch_reauth_user", "watchpass")
+
+      send_cmd(sock, ["WATCH", watched_key])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["SET", write_key, "must_not_commit"])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      :ok =
+        Acl.set_user("watch_reauth_user", [
+          "on",
+          ">watchpass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+watch",
+          "+multi",
+          "+exec",
+          "+discard",
+          "+set",
+          "+get",
+          "resetkeys",
+          "%R~tenant:other:*",
+          "%W~tenant:tx:*",
+          "%R~tenant:tx:*"
+        ])
+
+      send_cmd(sock, ["EXEC"])
+      assert {:error, "NOPERM" <> _} = recv_response(sock)
+
+      send_cmd(sock, ["GET", write_key])
+      assert recv_response(sock) == nil
+
+      :gen_tcp.close(sock)
+    end
+
     test "user with -@all gets NOPERM on every command over TCP", %{port: port} do
       :ok = Acl.set_user("blocked", ["on", ">blockedpass", "-@all", "+auth", "+hello"])
 
@@ -438,9 +696,62 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "disabled authenticated user cannot continue using ACL WHOAMI", %{port: port} do
+      :ok =
+        Acl.set_user("whoami_disabled", [
+          "on",
+          ">pass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+acl|whoami"
+        ])
+
+      {sock, resp} = connect_and_auth(port, "whoami_disabled", "pass")
+      assert resp == {:simple, "OK"}
+
+      send_cmd(sock, ["ACL", "WHOAMI"])
+      assert recv_response(sock) == "whoami_disabled"
+
+      :ok =
+        Acl.set_user("whoami_disabled", [
+          "off",
+          ">pass",
+          "-@all",
+          "+auth",
+          "+hello",
+          "+acl|whoami"
+        ])
+
+      ConnAuth.broadcast_acl_invalidation("whoami_disabled")
+      Process.sleep(50)
+
+      send_cmd(sock, ["ACL", "WHOAMI"])
+      assert {:error, "NOPERM" <> _} = recv_response(sock)
+
+      :gen_tcp.close(sock)
+    end
   end
 
   describe "TCP: no-auth ACL enforcement" do
+    test "default user password requires AUTH even when requirepass is empty", %{port: port} do
+      :ok = Acl.set_user("default", ["on", ">testpass", "+@all", "~*"])
+
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["GET", "acl:default-password"])
+      assert match?({:error, "NOAUTH" <> _}, recv_response(sock))
+
+      send_cmd(sock, ["AUTH", "default", "testpass"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock) == {:simple, "PONG"}
+
+      :gen_tcp.close(sock)
+    end
+
     test "default user denied commands are enforced without requirepass", %{port: port} do
       :ok = Acl.set_user("default", ["on", "nopass", "+@all", "~*", "-ping"])
 
@@ -523,6 +834,186 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
 
       assert {"PSUBSCRIBE", ["tenant:*"]} = parsed_command_keys("psubscribe tenant:*\r\n")
       assert {"PUBSUB", ["tenant:a"]} = parsed_command_keys("pubsub numsub tenant:a\r\n")
+    end
+  end
+
+  describe "mixed key access ACL enforcement" do
+    test "BITOP requires write on destination and read on sources" do
+      :ok =
+        Acl.set_user("bitop_mixed_access", [
+          "on",
+          ">pass",
+          "+@all",
+          "%W~tenant:dst:*",
+          "%R~tenant:src:*"
+        ])
+
+      cache = ConnAuth.build_acl_cache("bitop_mixed_access")
+
+      assert {"BITOP", ["tenant:dst:bits", "tenant:src:a", "tenant:src:b"]} =
+               parsed_command_keys("bitop AND tenant:dst:bits tenant:src:a tenant:src:b\r\n")
+
+      assert :ok =
+               ConnAuth.check_keys_cached(cache, "BITOP", [
+                 "tenant:dst:bits",
+                 "tenant:src:a",
+                 "tenant:src:b"
+               ])
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "BITOP", [
+                 "tenant:src:not-destination",
+                 "tenant:src:a"
+               ])
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "BITOP", [
+                 "tenant:dst:bits",
+                 "tenant:dst:not-readable-source"
+               ])
+    end
+
+    test "copy and store commands require read sources and write destination" do
+      :ok =
+        Acl.set_user("store_mixed_access", [
+          "on",
+          ">pass",
+          "+@all",
+          "%W~tenant:dst:*",
+          "%R~tenant:src:*"
+        ])
+
+      cache = ConnAuth.build_acl_cache("store_mixed_access")
+
+      for {command, wire, keys} <- [
+            {"COPY", "copy tenant:src:a tenant:dst:a\r\n", ["tenant:src:a", "tenant:dst:a"]},
+            {"PFMERGE", "pfmerge tenant:dst:h tenant:src:h1 tenant:src:h2\r\n",
+             ["tenant:dst:h", "tenant:src:h1", "tenant:src:h2"]},
+            {"SDIFFSTORE", "sdiffstore tenant:dst:s tenant:src:s1 tenant:src:s2\r\n",
+             ["tenant:dst:s", "tenant:src:s1", "tenant:src:s2"]},
+            {"SINTERSTORE", "sinterstore tenant:dst:s tenant:src:s1 tenant:src:s2\r\n",
+             ["tenant:dst:s", "tenant:src:s1", "tenant:src:s2"]},
+            {"SUNIONSTORE", "sunionstore tenant:dst:s tenant:src:s1 tenant:src:s2\r\n",
+             ["tenant:dst:s", "tenant:src:s1", "tenant:src:s2"]},
+            {"GEOSEARCHSTORE",
+             "geosearchstore tenant:dst:g tenant:src:g FROMMEMBER Palermo BYRADIUS 10 km\r\n",
+             ["tenant:dst:g", "tenant:src:g"]}
+          ] do
+        assert {^command, ^keys} = parsed_command_keys(wire)
+        assert :ok = ConnAuth.check_keys_cached(cache, command, keys)
+      end
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "COPY", [
+                 "tenant:dst:not-readable",
+                 "tenant:dst:a"
+               ])
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "PFMERGE", [
+                 "tenant:src:not-writable",
+                 "tenant:src:h1"
+               ])
+    end
+
+    test "move commands require read/write source and write destination" do
+      :ok =
+        Acl.set_user("move_mixed_access", [
+          "on",
+          ">pass",
+          "+@all",
+          "%R~tenant:rw-src:*",
+          "%W~tenant:rw-src:*",
+          "%R~tenant:read-only-src:*",
+          "%W~tenant:dst:*"
+        ])
+
+      cache = ConnAuth.build_acl_cache("move_mixed_access")
+
+      for {command, wire, keys} <- [
+            {"RENAME", "rename tenant:rw-src:a tenant:dst:a\r\n",
+             ["tenant:rw-src:a", "tenant:dst:a"]},
+            {"RENAMENX", "renamenx tenant:rw-src:a tenant:dst:a\r\n",
+             ["tenant:rw-src:a", "tenant:dst:a"]},
+            {"LMOVE", "lmove tenant:rw-src:list tenant:dst:list LEFT RIGHT\r\n",
+             ["tenant:rw-src:list", "tenant:dst:list"]},
+            {"BLMOVE", "blmove tenant:rw-src:list tenant:dst:list LEFT RIGHT 1\r\n",
+             ["tenant:rw-src:list", "tenant:dst:list"]},
+            {"RPOPLPUSH", "rpoplpush tenant:rw-src:list tenant:dst:list\r\n",
+             ["tenant:rw-src:list", "tenant:dst:list"]},
+            {"SMOVE", "smove tenant:rw-src:set tenant:dst:set member\r\n",
+             ["tenant:rw-src:set", "tenant:dst:set"]}
+          ] do
+        assert {^command, ^keys} = parsed_command_keys(wire)
+        assert :ok = ConnAuth.check_keys_cached(cache, command, keys)
+      end
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "RENAME", [
+                 "tenant:read-only-src:a",
+                 "tenant:dst:a"
+               ])
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "SMOVE", [
+                 "tenant:rw-src:set",
+                 "tenant:read-only-src:dest"
+               ])
+    end
+
+    test "value-returning mutation commands require read and write on mutated keys" do
+      :ok =
+        Acl.set_user("pop_write_only", [
+          "on",
+          ">pass",
+          "+@all",
+          "%W~tenant:pop:*"
+        ])
+
+      :ok =
+        Acl.set_user("pop_read_write", [
+          "on",
+          ">pass",
+          "+@all",
+          "%R~tenant:pop:*",
+          "%W~tenant:pop:*"
+        ])
+
+      write_only = ConnAuth.build_acl_cache("pop_write_only")
+      read_write = ConnAuth.build_acl_cache("pop_read_write")
+
+      for {command, keys} <- [
+            {"LPOP", ["tenant:pop:list"]},
+            {"RPOP", ["tenant:pop:list"]},
+            {"BLPOP", ["tenant:pop:list"]},
+            {"BRPOP", ["tenant:pop:list"]},
+            {"BLMPOP", ["tenant:pop:list"]},
+            {"SPOP", ["tenant:pop:set"]},
+            {"ZPOPMIN", ["tenant:pop:zset"]},
+            {"ZPOPMAX", ["tenant:pop:zset"]},
+            {"HGETDEL", ["tenant:pop:hash"]},
+            {"HGETEX", ["tenant:pop:hash"]},
+            {"XREADGROUP", ["tenant:pop:stream"]}
+          ] do
+        assert {:error, "NOPERM" <> _} = ConnAuth.check_keys_cached(write_only, command, keys)
+        assert :ok = ConnAuth.check_keys_cached(read_write, command, keys)
+      end
+    end
+  end
+
+  describe "TCP: global keyspace enumeration with restricted key patterns" do
+    test "global keyspace enumeration commands are denied for restricted users", %{port: port} do
+      :ok = Acl.set_user("tenant_reader", ["on", ">pass", "+@read", "~tenant-a:*"])
+
+      {sock, resp} = connect_and_auth(port, "tenant_reader", "pass")
+      assert resp == {:simple, "OK"}
+
+      for cmd <- [["KEYS", "*"], ["SCAN", "0"], ["RANDOMKEY"], ["DBSIZE"]] do
+        send_cmd(sock, cmd)
+        assert match?({:error, "NOPERM" <> _}, recv_response(sock))
+      end
+
+      :gen_tcp.close(sock)
     end
   end
 
@@ -704,10 +1195,14 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
       write_cmds =
         ~w(
           BF.ADD CF.DEL CMS.MERGE TOPK.INCRBY TDIGEST.MERGE FLOW.COMPLETE
-          FLOW.TRANSITION_MANY FLOW.RETENTION_CLEANUP HEXPIRE HSETEX XREADGROUP
+          FLOW.TRANSITION_MANY FLOW.RETENTION_CLEANUP HEXPIRE HSETEX
         )
 
-      read_write_cmds = ~w(GETEX GETDEL GETSET HGETEX HGETDEL CAS)
+      read_write_cmds =
+        ~w(
+          GETEX GETDEL GETSET HGETEX HGETDEL CAS
+          LPOP RPOP BLPOP BRPOP BLMPOP SPOP ZPOPMIN ZPOPMAX XREADGROUP
+        )
 
       for cmd <- read_cmds do
         assert FerricstoreServer.Connection.Auth.command_access_type(cmd) == :read
@@ -763,12 +1258,25 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     test "@dangerous category includes dangerous commands" do
       :ok = Acl.set_user("cat_danger", ["on", ">pass", "-@all", "+@dangerous"])
 
-      dangerous_cmds = ~w(FLUSHDB FLUSHALL DEBUG CONFIG KEYS SHUTDOWN)
+      dangerous_cmds = ~w(FLUSHDB FLUSHALL DEBUG CONFIG KEYS SHUTDOWN CLIENT.KILL)
 
       for cmd <- dangerous_cmds do
         assert :ok = Acl.check_command("cat_danger", cmd),
                "@dangerous should include #{cmd}"
       end
+    end
+
+    test "@connection does not grant destructive CLIENT subcommands" do
+      :ok = Acl.set_user("cat_connection", ["on", ">pass", "-@all", "+@connection"])
+
+      assert :ok = Acl.check_command("cat_connection", "CLIENT.ID")
+      assert :ok = Acl.check_command("cat_connection", "CLIENT.SETNAME")
+      assert {:error, _} = Acl.check_command("cat_connection", "CLIENT.KILL")
+      assert {:error, _} = Acl.check_command("cat_connection", "CLIENT.LIST")
+
+      assert {:error, _} =
+               ConnAuth.acl_command_name("CLIENT", ["KILL", "ID", "1"], {:client, "KILL", []})
+               |> then(&Acl.check_command("cat_connection", &1))
     end
   end
 

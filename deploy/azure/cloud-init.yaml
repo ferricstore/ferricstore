@@ -141,7 +141,6 @@ write_files:
       git fetch origin
       git checkout ${git_branch}
       git pull --ff-only origin ${git_branch}
-      export FERRICSTORE_BUILD=1
       mix local.hex --force
       mix local.rebar --force
       mix deps.get

@@ -216,10 +216,15 @@ defmodule Ferricstore.Application do
             Ferricstore.AuditLog,
             Ferricstore.Config,
             Ferricstore.NamespaceConfig,
+            Ferricstore.Doctor,
             Ferricstore.HLC,
             Ferricstore.QuorumMetrics,
             Ferricstore.PrefixMetricsCache,
-            Ferricstore.Store.BlobStore.TableOwner
+            Ferricstore.Waiters.Monitor,
+            Ferricstore.Flow.HistoryProjector.TableOwner,
+            Ferricstore.Store.BlobStore.TableOwner,
+            Ferricstore.Raft.WARaftBackend.BatcherSupervisor,
+            {Ferricstore.Store.KeydirTableOwner, instance_ctx: default_ctx}
           ] ++
           bitcask_writer_children ++
           [{Ferricstore.Flow.LMDBFlushCoordinator, []}] ++
@@ -251,6 +256,7 @@ defmodule Ferricstore.Application do
         {:ok, pid} ->
           case Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts()) do
             :ok ->
+              :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(data_dir, shard_count)
               mark_started(shard_count)
               {:ok, pid, app_state}
 
@@ -335,21 +341,22 @@ defmodule Ferricstore.Application do
 
     waraft_result = shutdown_stop_waraft_backend()
     bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
-    shutdown_flush_flow_lmdb_writers(shard_count)
+    flow_lmdb_result = shutdown_flush_flow_lmdb_writers(shard_count)
     bitcask_fsync_result = shutdown_fsync_bitcask(shard_count, data_dir)
     shutdown_flush_shards(shard_count)
     wal_rollover_result = :ok
 
     elapsed = System.monotonic_time(:millisecond) - t0
 
-    case {waraft_result, bitcask_writer_result, bitcask_fsync_result, wal_rollover_result} do
-      {:ok, :ok, :ok, :ok} ->
+    case {waraft_result, bitcask_writer_result, flow_lmdb_result, bitcask_fsync_result,
+          wal_rollover_result} do
+      {:ok, :ok, :ok, :ok, :ok} ->
         Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
-      {waraft_result, writer_result, bitcask_result, wal_result} ->
+      {waraft_result, writer_result, flow_lmdb_result, bitcask_result, wal_result} ->
         Logger.warning(
           "Shutdown: graceful flush complete with warnings in #{elapsed}ms " <>
-            "(waraft=#{inspect(waraft_result)}, bitcask_writer=#{inspect(writer_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
+            "(waraft=#{inspect(waraft_result)}, bitcask_writer=#{inspect(writer_result)}, flow_lmdb=#{inspect(flow_lmdb_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
         )
     end
 
@@ -442,12 +449,12 @@ defmodule Ferricstore.Application do
   end
 
   defp shutdown_flush_flow_lmdb_writers(shard_count) do
+    _ = Ferricstore.Flow.LMDBWriter.suspend_all(shard_count, flush: false)
     Logger.info("Shutdown: Flow LMDB lagged projection flush skipped")
-    Ferricstore.Flow.LMDBWriter.suspend_all(shard_count)
     :ok
   catch
     :exit, reason ->
-      _ = Ferricstore.Flow.LMDBWriter.suspend_all(shard_count)
+      _ = Ferricstore.Flow.LMDBWriter.suspend_all(shard_count, flush: false)
       Logger.warning("Shutdown: Flow LMDB writer flush failed: #{inspect(reason)}")
       {:error, reason}
   end

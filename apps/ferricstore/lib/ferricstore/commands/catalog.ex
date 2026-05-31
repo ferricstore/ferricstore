@@ -320,6 +320,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Runs conservative garbage collection for unreferenced large-value blobs."
     },
     %{
+      name: "ferricstore.doctor",
+      arity: -2,
+      flags: ["admin", "slow"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Runs storage/projection diagnostics and safe background repair jobs."
+    },
+    %{
       name: "ferricstore.key_info",
       arity: 2,
       flags: ["readonly", "fast"],
@@ -356,6 +365,24 @@ defmodule Ferricstore.Commands.Catalog do
       last_key: 1,
       step: 1,
       summary: "Creates child workflow records and updates parent wait groups."
+    },
+    %{
+      name: "flow.value.put",
+      arity: -2,
+      flags: ["write", "denyoom"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Stores a reusable Flow value payload and returns its reference."
+    },
+    %{
+      name: "flow.signal",
+      arity: -4,
+      flags: ["write", "denyoom"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Appends a signal event to a workflow and optionally transitions it."
     },
     %{
       name: "flow.get",
@@ -858,7 +885,7 @@ defmodule Ferricstore.Commands.Catalog do
     do: {:ok, args_at(args, flow_partition_key_indices(args, 1))}
 
   defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.CREATE", "FLOW.GET", "FLOW.HISTORY"],
+       when name in ["FLOW.CREATE", "FLOW.GET", "FLOW.HISTORY", "FLOW.SIGNAL"],
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
 
   defp flow_dynamic_keys(name, args)

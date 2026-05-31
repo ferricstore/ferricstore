@@ -28,7 +28,8 @@ defmodule FerricstoreServer.Bugs.TransactionSandboxWatchTest do
       multi_queue: [],
       multi_queue_count: 0,
       watched_keys: %{},
-      sandbox_namespace: sandbox
+      sandbox_namespace: sandbox,
+      acl_cache: :full_access
     }
 
     assert {:continue, _ok, watched_state} = Transaction.dispatch_watch([key], state)
@@ -40,7 +41,7 @@ defmodule FerricstoreServer.Bugs.TransactionSandboxWatchTest do
     assert {:continue, _ok, multi_state} = Transaction.dispatch_multi([], watched_state)
 
     assert {:continue, _queued, queued_state} =
-             Transaction.dispatch_queue("SET", [key, "tx"], {:set, key, "tx"}, multi_state)
+             Transaction.dispatch_queue("SET", [key, "tx"], {:set, key, "tx"}, [key], multi_state)
 
     assert {:continue, exec_response, _done_state} = Transaction.dispatch_exec([], queued_state)
     assert IO.iodata_to_binary(exec_response) == "_\r\n"

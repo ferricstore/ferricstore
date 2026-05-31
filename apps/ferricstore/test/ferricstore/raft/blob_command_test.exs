@@ -32,6 +32,51 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
+  test "protected prepare keeps pre-apply blob refs out of GC", %{ctx: ctx, root: root} do
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_segment_gc_grace_ms) end)
+
+    payload = :binary.copy("G", 1024)
+
+    assert {:ok, {:put_blob_ref, "k", encoded_ref, 0}, protection} =
+             BlobCommand.prepare_protected(ctx, 0, {:put, "k", payload, 0}, single_member?: true)
+
+    assert protection != nil
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, {path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+    assert File.exists?(path)
+
+    assert {:ok, %{deleted_files: 0}} = BlobStore.sweep_unreferenced(root, 0, [])
+    assert File.exists?(path)
+
+    assert :ok = BlobStore.unprotect(protection)
+    assert {:ok, %{deleted_files: 1}} = BlobStore.sweep_unreferenced(root, 0, [])
+    refute File.exists?(path)
+  end
+
+  test "protected prepare expires abandoned pre-apply refs", %{ctx: ctx, root: root} do
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+    Process.put(:ferricstore_blob_store_protection_ttl_ms, 0)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+      Process.delete(:ferricstore_blob_store_protection_ttl_ms)
+    end)
+
+    payload = :binary.copy("E", 1024)
+
+    assert {:ok, {:put_blob_ref, "k", encoded_ref, 0}, protection} =
+             BlobCommand.prepare_protected(ctx, 0, {:put, "k", payload, 0}, single_member?: true)
+
+    assert protection != nil
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, {path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+    assert File.exists?(path)
+
+    assert {:ok, %{deleted_files: 1}} = BlobStore.sweep_unreferenced(root, 0, [])
+    refute File.exists?(path)
+  end
+
   test "prepares large conditional set as a pre-externalized blob ref", %{
     ctx: ctx,
     root: root
@@ -325,6 +370,83 @@ defmodule Ferricstore.Raft.BlobCommandTest do
              }}} = BlobCommand.prepare(ctx, 0, command, single_member?: true)
 
     assert_flow_blob_marker(root, marker, payload)
+  end
+
+  test "prepares idempotent Flow create payloads as pre-externalized value refs", %{
+    ctx: ctx,
+    root: root
+  } do
+    payload = :binary.copy("I", 1024)
+
+    command =
+      {:flow_create, nil,
+       %{
+         id: "flow-idempotent",
+         type: "bench",
+         state: "queued",
+         partition_key: "tenant-a",
+         payload: payload,
+         idempotent: true
+       }}
+
+    assert BlobCommand.side_channel_candidate?(ctx, command)
+
+    assert {:ok, {:flow_create, nil, %{payload: marker, idempotent: true}}} =
+             BlobCommand.prepare(ctx, 0, command, single_member?: true)
+
+    assert_flow_blob_marker(root, marker, payload)
+  end
+
+  test "keeps idempotent Flow named value maps inline to preserve digest semantics", %{ctx: ctx} do
+    value = :binary.copy("D", 1024)
+
+    command =
+      {:flow_create, nil,
+       %{
+         id: "flow-idempotent-values",
+         type: "bench",
+         state: "queued",
+         partition_key: "tenant-a",
+         values: %{"doc" => value},
+         idempotent: true
+       }}
+
+    refute BlobCommand.side_channel_candidate?(ctx, command)
+  end
+
+  test "prepares Flow named value puts as pre-externalized value refs", %{ctx: ctx, root: root} do
+    value = :binary.copy("V", 1024)
+
+    command =
+      {:flow_named_value_put, nil,
+       %{id: "flow-1", partition_key: "tenant-a", name: "doc", value: value}}
+
+    assert BlobCommand.side_channel_candidate?(ctx, command)
+
+    assert {:ok, {:flow_named_value_put, nil, %{value: marker}}} =
+             BlobCommand.prepare(ctx, 0, command, single_member?: true)
+
+    assert_flow_blob_marker(root, marker, value)
+  end
+
+  test "prepares Flow named values maps as pre-externalized value refs", %{ctx: ctx, root: root} do
+    value = :binary.copy("M", 1024)
+
+    command =
+      {:flow_create, nil,
+       %{
+         id: "flow-1",
+         type: "bench",
+         partition_key: "tenant-a",
+         values: %{"doc" => value, "small" => "ok"}
+       }}
+
+    assert BlobCommand.side_channel_candidate?(ctx, command)
+
+    assert {:ok, {:flow_create, nil, %{values: %{"doc" => marker, "small" => "ok"}}}} =
+             BlobCommand.prepare(ctx, 0, command, single_member?: true)
+
+    assert_flow_blob_marker(root, marker, value)
   end
 
   test "prepares Flow create, complete, and fail values in one generic batch", %{

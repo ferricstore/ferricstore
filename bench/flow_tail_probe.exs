@@ -1,7 +1,7 @@
 # Targeted Flow tail-latency probe for Flow hot commands.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 \
+#   MIX_ENV=bench \
 #     FLOW_TAIL_BACKLOG=100000 FLOW_TAIL_ITER=400 mix run --no-start bench/flow_tail_probe.exs
 
 backlog = System.get_env("FLOW_TAIL_BACKLOG", "100000") |> String.to_integer()

@@ -197,7 +197,7 @@ defmodule Ferricstore.Store.Shard do
       keydir_name =
         if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
 
-      keydir = prepare_rebuilding_keydir(keydir_name, ctx, index)
+      keydir = prepare_startup_keydir(keydir_name, ctx, index)
 
       # Remove any leftover hot_cache table from a previous run.
       case :ets.whereis(:"hot_cache_#{index}") do
@@ -219,11 +219,18 @@ defmodule Ferricstore.Store.Shard do
       # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
       # Must run BEFORE recover_promoted so PM: markers are in ETS.
       profile_startup_phase(index, :recover_keydir, fn ->
-        ShardLifecycle.recover_keydir(path, keydir, index, ctx)
+        unless raft_projection_owner?(ctx) do
+          ShardLifecycle.recover_keydir(path, keydir, index, ctx)
+        end
+
+        :ok
       end)
 
       profile_startup_phase(index, :flow_native_index_init, fn ->
-        NativeFlowIndex.reset(flow_index, flow_lookup)
+        unless raft_projection_owner?(ctx) do
+          NativeFlowIndex.reset(flow_index, flow_lookup)
+        end
+
         :ok
       end)
 
@@ -232,19 +239,23 @@ defmodule Ferricstore.Store.Shard do
       end)
 
       profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
-        Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
-          path,
-          keydir,
-          index,
-          ctx,
-          zset_score_index,
-          zset_score_lookup,
-          flow_index,
-          flow_lookup
-        )
+        unless raft_projection_owner?(ctx) do
+          Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+            path,
+            keydir,
+            index,
+            ctx,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup
+          )
+        end
+
+        :ok
       end)
 
-      keydir = publish_rebuilt_keydir(keydir, keydir_name)
+      keydir = publish_startup_keydir(keydir, keydir_name, ctx)
 
       # Default-instance replication is owned by WARaftBackend. Shard GenServers
       # still own local keydir/read/recovery state.
@@ -405,6 +416,39 @@ defmodule Ferricstore.Store.Shard do
     :ets.new(temp_name, keydir_table_options())
   end
 
+  defp prepare_startup_keydir(keydir_name, ctx, index) do
+    if raft_projection_owner?(ctx) do
+      ensure_live_keydir(ctx, keydir_name)
+    else
+      prepare_rebuilding_keydir(keydir_name, ctx, index)
+    end
+  end
+
+  defp publish_startup_keydir(keydir, keydir_name, ctx) do
+    if raft_projection_owner?(ctx) do
+      keydir
+    else
+      publish_rebuilt_keydir(keydir, keydir_name)
+    end
+  end
+
+  defp ensure_live_keydir(ctx, keydir_name) do
+    if is_map(ctx) do
+      Ferricstore.Store.KeydirTableOwner.ensure_tables(ctx)
+    end
+
+    case :ets.whereis(keydir_name) do
+      :undefined -> :ets.new(keydir_name, keydir_table_options())
+      _tid -> keydir_name
+    end
+  rescue
+    _ ->
+      case :ets.whereis(keydir_name) do
+        :undefined -> :ets.new(keydir_name, keydir_table_options())
+        _tid -> keydir_name
+      end
+  end
+
   defp publish_rebuilt_keydir(temp_name, keydir_name) do
     delete_keydir_table(keydir_name)
     :ets.rename(temp_name, keydir_name)
@@ -436,6 +480,14 @@ defmodule Ferricstore.Store.Shard do
 
   defp reset_keydir_binary_counter(%{keydir_binary_bytes: keydir_binary_bytes}, index) do
     :atomics.put(keydir_binary_bytes, index + 1, 0)
+  end
+
+  defp raft_projection_owner?(%{name: name}) when name not in [nil, :default], do: false
+
+  defp raft_projection_owner?(_ctx) do
+    Ferricstore.ReplicationMode.raft?()
+  rescue
+    _ -> false
   end
 
   defp profile_startup_phase(index, phase, fun) when is_function(fun, 0) do
@@ -964,6 +1016,16 @@ defmodule Ferricstore.Store.Shard do
     {:reply, reply, state}
   end
 
+  def handle_call(:flow_due_count_keys, _from, state) do
+    reply =
+      case native_flow_index_for_read(state) do
+        {:ok, native} -> {:ok, NativeFlowIndex.due_count_keys(native)}
+        :unavailable -> :unavailable
+      end
+
+    {:reply, reply, state}
+  end
+
   # -------------------------------------------------------------------
   # handle_call — native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD
   # -------------------------------------------------------------------
@@ -1244,31 +1306,46 @@ defmodule Ferricstore.Store.Shard do
               tombstone_offsets = needed_tombstone_offsets(sp, fid, source)
 
               copy_result =
-                if tombstone_offsets == [] do
-                  NIF.v2_copy_records(source, dest, offsets)
-                else
-                  NIF.v2_copy_records_preserve_tombstones(
-                    source,
-                    dest,
-                    offsets,
-                    tombstone_offsets
-                  )
+                case prepare_compaction_temp(dest) do
+                  :ok ->
+                    if tombstone_offsets == [] do
+                      NIF.v2_copy_records(source, dest, offsets)
+                    else
+                      NIF.v2_copy_records_preserve_tombstones(
+                        source,
+                        dest,
+                        offsets,
+                        tombstone_offsets
+                      )
+                    end
+
+                  {:error, reason} ->
+                    {:error, {:temp_remove_failed, reason}}
                 end
 
               case copy_result do
                 {:ok, results} when length(results) == length(live_entries) ->
-                  remove_hint_for_file(sp, fid)
-                  Ferricstore.FS.rename!(dest, source)
-                  update_compacted_ets_locations(state.keydir, fid, live_entries, results)
+                  case remove_hint_for_file(sp, fid) do
+                    :ok ->
+                      Ferricstore.FS.rename!(dest, source)
+                      update_compacted_ets_locations(state.keydir, fid, live_entries, results)
 
-                  new_size =
-                    case File.stat(source) do
-                      {:ok, %{size: s}} -> s
-                      _ -> 0
-                    end
+                      new_size =
+                        case File.stat(source) do
+                          {:ok, %{size: s}} -> s
+                          _ -> 0
+                        end
 
-                  {written + length(live_entries), dropped,
-                   reclaimed + max(old_size - new_size, 0), [fid | compacted], skipped, failures}
+                      {written + length(live_entries), dropped,
+                       reclaimed + max(old_size - new_size, 0), [fid | compacted], skipped,
+                       failures}
+
+                    {:error, reason} ->
+                      remove_compaction_temp(state, dest)
+
+                      {written, dropped, reclaimed, compacted, skipped,
+                       [{fid, {:hint_remove_failed, reason}} | failures]}
+                  end
 
                 {:ok, results} ->
                   Logger.error(
@@ -1305,31 +1382,42 @@ defmodule Ferricstore.Store.Shard do
                 end
 
               if tombstone_file?(source) do
-                remove_hint_for_file(sp, fid)
-
-                if tombstone_file_still_needed?(sp, fid, source) do
-                  {written, dropped, reclaimed, compacted, [fid | skipped], failures}
-                else
-                  case remove_compacted_source(state, source) do
-                    :ok ->
-                      {written, dropped, reclaimed + old_size, [fid | compacted], skipped,
-                       failures}
-
-                    {:error, reason} ->
-                      {written, dropped, reclaimed, compacted, skipped,
-                       [{fid, {:remove_failed, reason}} | failures]}
-                  end
-                end
-              else
-                remove_hint_for_file(sp, fid)
-
-                case remove_compacted_source(state, source) do
+                case remove_hint_for_file(sp, fid) do
                   :ok ->
-                    {written, dropped, reclaimed + old_size, [fid | compacted], skipped, failures}
+                    if tombstone_file_still_needed?(sp, fid, source) do
+                      {written, dropped, reclaimed, compacted, [fid | skipped], failures}
+                    else
+                      case remove_compacted_source(state, source) do
+                        :ok ->
+                          {written, dropped, reclaimed + old_size, [fid | compacted], skipped,
+                           failures}
+
+                        {:error, reason} ->
+                          {written, dropped, reclaimed, compacted, skipped,
+                           [{fid, {:remove_failed, reason}} | failures]}
+                      end
+                    end
 
                   {:error, reason} ->
                     {written, dropped, reclaimed, compacted, skipped,
-                     [{fid, {:remove_failed, reason}} | failures]}
+                     [{fid, {:hint_remove_failed, reason}} | failures]}
+                end
+              else
+                case remove_hint_for_file(sp, fid) do
+                  :ok ->
+                    case remove_compacted_source(state, source) do
+                      :ok ->
+                        {written, dropped, reclaimed + old_size, [fid | compacted], skipped,
+                         failures}
+
+                      {:error, reason} ->
+                        {written, dropped, reclaimed, compacted, skipped,
+                         [{fid, {:remove_failed, reason}} | failures]}
+                    end
+
+                  {:error, reason} ->
+                    {written, dropped, reclaimed, compacted, skipped,
+                     [{fid, {:hint_remove_failed, reason}} | failures]}
                 end
               end
           end
@@ -2482,25 +2570,58 @@ defmodule Ferricstore.Store.Shard do
 
   defp remove_hint_for_file(shard_path, fid) do
     # Compaction rewrites or invalidates offsets in the paired log file.
-    # Dropping the hint forces startup to scan the log instead of trusting
-    # stale offsets that can resurrect deleted keys.
-    hint_name = "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"
-    hint_path = Path.join(shard_path, hint_name)
-
-    case Ferricstore.FS.rm(hint_path) do
-      :ok ->
-        :ok
-
-      {:error, {:not_found, _}} ->
-        :ok
-
-      {:error, reason} ->
+    # Dropping every numeric alias for this fid forces startup to scan the log
+    # instead of trusting stale offsets that can hide or resurrect keys.
+    with {:ok, files} <- Ferricstore.FS.ls(shard_path),
+         hint_names = hint_names_for_file(files, fid),
+         :ok <- remove_hint_files(shard_path, hint_names) do
+      :ok
+    else
+      {:error, reason} = error ->
         Logger.warning(
-          "failed to remove stale compaction hint file #{hint_path}: #{inspect(reason)}"
+          "failed to remove stale compaction hint file(s) for fid #{fid} under #{shard_path}: #{inspect(reason)}"
         )
-    end
 
-    :ok
+        error
+    end
+  end
+
+  defp hint_names_for_file(files, fid) do
+    files
+    |> Enum.filter(&(hint_file_id(&1) == fid))
+    |> case do
+      [] -> ["#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"]
+      names -> names
+    end
+  end
+
+  defp hint_file_id(name) do
+    with true <- String.ends_with?(name, ".hint"),
+         false <- String.starts_with?(name, "compact_"),
+         stem <- String.trim_trailing(name, ".hint"),
+         {parsed, ""} <- Integer.parse(stem),
+         true <- parsed >= 0 do
+      parsed
+    else
+      _ -> nil
+    end
+  end
+
+  defp remove_hint_files(shard_path, hint_names) do
+    Enum.reduce_while(hint_names, :ok, fn hint_name, :ok ->
+      hint_path = Path.join(shard_path, hint_name)
+
+      case Ferricstore.FS.rm(hint_path) do
+        :ok ->
+          {:cont, :ok}
+
+        {:error, {:not_found, _}} ->
+          {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt, {:error, {hint_path, reason}}}
+      end
+    end)
   end
 
   defp remove_compaction_temp(state, path) do
@@ -2515,6 +2636,14 @@ defmodule Ferricstore.Store.Shard do
         Logger.warning(
           "Shard #{state.index}: failed to remove compaction temp file #{path}: #{inspect(reason)}"
         )
+    end
+  end
+
+  defp prepare_compaction_temp(path) do
+    case Ferricstore.FS.rm(path) do
+      :ok -> :ok
+      {:error, {:not_found, _}} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 

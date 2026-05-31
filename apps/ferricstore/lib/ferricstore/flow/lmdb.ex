@@ -21,6 +21,22 @@ defmodule Ferricstore.Flow.LMDB do
 
   def path(shard_data_path), do: Path.join(shard_data_path, "flow_lmdb")
 
+  def ensure_shard_dirs(data_dir, shard_count)
+      when is_binary(data_dir) and is_integer(shard_count) and shard_count >= 0 do
+    Enum.reduce_while(0..max(shard_count - 1, -1)//1, :ok, fn shard_index, :ok ->
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> path()
+      |> Ferricstore.FS.mkdir_p()
+      |> case do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  def ensure_shard_dirs(_data_dir, _shard_count), do: {:error, :badarg}
+
   # LMDB stores Flow state as a wrapper around the already-versioned Flow record
   # bytes: {expire_at_ms, encoded_record}. The wrapper owns TTL semantics only.
   # Do not version Flow metadata here or decode user payload here. If the wrapper
@@ -105,6 +121,53 @@ defmodule Ferricstore.Flow.LMDB do
     NIF.lmdb_write_batch(path, ops, map_size())
   end
 
+  def clear_all(data_dir, shard_count)
+      when is_binary(data_dir) and is_integer(shard_count) and shard_count >= 0 do
+    Enum.reduce_while(0..max(shard_count - 1, -1)//1, :ok, fn shard_index, :ok ->
+      path =
+        data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> path()
+
+      case clear(path) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  def clear(path) when is_binary(path) do
+    clear_cached_terminal_counts_for_path(path)
+
+    if Ferricstore.FS.dir?(path) do
+      NIF.lmdb_clear(path, map_size())
+    else
+      :ok
+    end
+  end
+
+  def flush_in_progress_key, do: "flow-lmdb-flush-in-progress"
+
+  def flush_in_progress?(path) when is_binary(path) do
+    if env_present?(path) do
+      case get(path, flush_in_progress_key()) do
+        {:ok, _value} -> true
+        _ -> false
+      end
+    else
+      false
+    end
+  end
+
+  def env_present?(path) when is_binary(path) do
+    File.regular?(Path.join(path, "data.mdb")) or File.regular?(Path.join(path, "lock.mdb"))
+  end
+
+  def env_present?(_path), do: false
+
+  def flush_in_progress_put_op, do: {:put, flush_in_progress_key(), <<1>>}
+  def flush_in_progress_delete_op, do: {:delete, flush_in_progress_key()}
+
   def write_batch_with_originals(_path, []), do: {:ok, []}
 
   def write_batch_with_originals(path, ops) when is_binary(path) and is_list(ops) do
@@ -132,6 +195,14 @@ defmodule Ferricstore.Flow.LMDB do
       when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
     if Ferricstore.FS.dir?(path),
       do: NIF.lmdb_prefix_entries_reverse(path, prefix, limit, map_size()),
+      else: {:ok, []}
+  end
+
+  def prefix_entries_reverse_before(path, prefix, before_key, limit)
+      when is_binary(path) and is_binary(prefix) and is_binary(before_key) and
+             is_integer(limit) and limit >= 0 do
+    if Ferricstore.FS.dir?(path),
+      do: NIF.lmdb_prefix_entries_reverse_before(path, prefix, before_key, limit, map_size()),
       else: {:ok, []}
   end
 
@@ -287,12 +358,12 @@ defmodule Ferricstore.Flow.LMDB do
 
   def segment_value_pin_prefix, do: "flow-segment-value-pin:"
 
-  def segment_value_pin_prefix(tag) when tag in [:waraft_apply_projection] do
+  def segment_value_pin_prefix(tag) when tag in [:waraft_segment, :waraft_apply_projection] do
     segment_value_pin_prefix() <> "batch:" <> Atom.to_string(tag) <> ":"
   end
 
   def segment_value_pin_key({tag, index}, value_key)
-      when tag in [:waraft_apply_projection] and is_integer(index) and index > 0 and
+      when tag in [:waraft_segment, :waraft_apply_projection] and is_integer(index) and index > 0 and
              is_binary(value_key) do
     segment_value_pin_prefix(tag) <> pad_u64(index) <> <<0>> <> value_key
   end
@@ -375,11 +446,12 @@ defmodule Ferricstore.Flow.LMDB do
   defp normalize_segment_value_pin_entry(
          key,
          expire_at_ms,
-         {:waraft_apply_projection, index} = file_id,
+         {tag, index} = file_id,
          offset,
          value_size
        )
-       when is_binary(key) and is_integer(expire_at_ms) and is_integer(index) and index > 0 and
+       when tag in [:waraft_segment, :waraft_apply_projection] and is_binary(key) and
+              is_integer(expire_at_ms) and is_integer(index) and index > 0 and
               is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 do
     [
       %{
@@ -395,9 +467,10 @@ defmodule Ferricstore.Flow.LMDB do
   defp normalize_segment_value_pin_entry(_key, _expire_at_ms, _file_id, _offset, _value_size),
     do: []
 
-  defp segment_value_pin_batch_key({:waraft_apply_projection, index} = file_id, entries)
-       when is_integer(index) and index > 0 and is_list(entries) do
-    prefix = segment_value_pin_prefix(:waraft_apply_projection)
+  defp segment_value_pin_batch_key({tag, index} = file_id, entries)
+       when tag in [:waraft_segment, :waraft_apply_projection] and is_integer(index) and
+              index > 0 and is_list(entries) do
+    prefix = segment_value_pin_prefix(tag)
     digest = :crypto.hash(:sha256, :erlang.term_to_binary({file_id, entries}))
     prefix <> pad_u64(index) <> <<0>> <> digest
   end
@@ -418,12 +491,63 @@ defmodule Ferricstore.Flow.LMDB do
     fetch_limit = limit + 1
 
     with {:ok, entries} <-
-           prefix_entries(path, segment_value_pin_prefix(:waraft_apply_projection), fetch_limit) do
+           segment_value_pin_entries_before_for_tags(path, trim_index, limit, fetch_limit) do
       decode_segment_value_pin_entries_before(entries, trim_index, limit)
     end
   end
 
   def segment_value_pin_entries_before(_path, _trim_index, _limit), do: {:ok, []}
+
+  def segment_value_pin_entries_before_page(path, trim_index, after_key, limit)
+      when is_binary(path) and is_integer(trim_index) and trim_index > 0 and
+             is_binary(after_key) and is_integer(limit) and limit > 0 do
+    with {:ok, entries} <-
+           segment_value_pin_entries_before_page_for_tags(path, after_key, limit) do
+      decode_segment_value_pin_entries_before_page(entries, trim_index, after_key, limit)
+    end
+  end
+
+  def segment_value_pin_entries_before_page(_path, _trim_index, after_key, _limit)
+      when is_binary(after_key),
+      do: {:ok, [], after_key, true}
+
+  defp segment_value_pin_entries_before_for_tags(path, _trim_index, _limit, fetch_limit) do
+    segment_value_pin_entries_for_tags(path, <<>>, fetch_limit)
+  end
+
+  defp segment_value_pin_entries_before_page_for_tags(path, after_key, limit) do
+    segment_value_pin_entries_for_tags(path, after_key, limit)
+  end
+
+  defp segment_value_pin_entries_for_tags(path, after_key, limit) do
+    [:waraft_apply_projection, :waraft_segment]
+    |> Enum.reduce_while({:ok, []}, fn tag, {:ok, acc} ->
+      result =
+        if after_key == <<>> do
+          prefix_entries(path, segment_value_pin_prefix(tag), limit)
+        else
+          prefix_entries_after(path, segment_value_pin_prefix(tag), after_key, limit)
+        end
+
+      case result do
+        {:ok, entries} -> {:cont, {:ok, entries ++ acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, entries} ->
+        entries =
+          entries
+          |> Enum.uniq_by(fn {key, _value} -> key end)
+          |> Enum.sort_by(fn {key, _value} -> key end)
+          |> Enum.take(limit)
+
+        {:ok, entries}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   def history_expire_key(expire_at_ms, history_index_key)
       when is_integer(expire_at_ms) and expire_at_ms > 0 and is_binary(history_index_key) do
@@ -678,9 +802,13 @@ defmodule Ferricstore.Flow.LMDB do
         counts =
           missing
           |> Enum.zip(fetched)
-          |> Enum.reduce(cached, fn {{index, count_key}, count}, acc ->
-            put_cached_terminal_count_key(path, count_key, count)
-            Map.put(acc, index, count)
+          |> Enum.reduce(cached, fn
+            {{index, count_key}, {:cache, count}}, acc ->
+              put_cached_terminal_count_key(path, count_key, count)
+              Map.put(acc, index, count)
+
+            {{index, _count_key}, :missing}, acc ->
+              Map.put(acc, index, 0)
           end)
 
         {:ok, Enum.map(0..(length(count_keys) - 1)//1, &Map.fetch!(counts, &1))}
@@ -717,6 +845,12 @@ defmodule Ferricstore.Flow.LMDB do
     :ok
   end
 
+  def clear_cached_terminal_counts_for_path(path) when is_binary(path) do
+    ensure_terminal_count_cache()
+    :ets.match_delete(@terminal_count_cache, {{path, :_}, :_})
+    :ok
+  end
+
   defp terminal_count_key_uncached(path, count_key) do
     case get(path, count_key) do
       {:ok, blob} ->
@@ -726,7 +860,6 @@ defmodule Ferricstore.Flow.LMDB do
         end
 
       :not_found ->
-        put_cached_terminal_count_key(path, count_key, 0)
         :not_found
 
       {:error, _reason} = error ->
@@ -743,12 +876,12 @@ defmodule Ferricstore.Flow.LMDB do
           Enum.map(results, fn
             {:ok, blob} ->
               case decode_count(blob) do
-                {:ok, count} -> count
-                :error -> 0
+                {:ok, count} -> {:cache, count}
+                :error -> :missing
               end
 
             :not_found ->
-              0
+              :missing
           end)
 
         {:ok, counts}
@@ -1249,7 +1382,7 @@ defmodule Ferricstore.Flow.LMDB do
             )
 
           :not_found ->
-            {[{:delete, expire_key}], counts, 0}
+            expired_missing_terminal_ops(path, expire_key, state_key, counts)
 
           {:error, _reason} ->
             {[], counts, 0}
@@ -1299,9 +1432,9 @@ defmodule Ferricstore.Flow.LMDB do
         count = max(current_count - 1, 0)
 
         ops =
-          [{:delete, expire_key}, {:delete, terminal_key}]
+          [{:delete, terminal_key}]
           |> maybe_delete_key(reverse_key)
-          |> maybe_delete_key(state_key)
+          |> maybe_delete_expire_key(path, expire_key, state_key)
 
         {ops, Map.put(counts, count_key, count), 1}
 
@@ -1310,9 +1443,41 @@ defmodule Ferricstore.Flow.LMDB do
     end
   end
 
+  defp expired_missing_terminal_ops(_path, expire_key, state_key, counts)
+       when not is_binary(state_key) do
+    {[{:delete, expire_key}], counts, 0}
+  end
+
+  defp expired_missing_terminal_ops(path, expire_key, state_key, counts) do
+    case get(path, state_key) do
+      {:ok, _state_value} ->
+        {[], counts, 0}
+
+      :not_found ->
+        {[{:delete, expire_key}], counts, 0}
+
+      {:error, _reason} ->
+        {[], counts, 0}
+    end
+  end
+
   defp terminal_expire_key_time(key) do
     expire_key_time(key, terminal_expire_prefix())
   end
+
+  defp maybe_delete_expire_key(ops, path, expire_key, state_key)
+       when is_binary(expire_key) and is_binary(state_key) do
+    case get(path, state_key) do
+      :not_found -> [{:delete, expire_key} | ops]
+      {:ok, _state_value} -> ops
+      {:error, _reason} -> ops
+    end
+  end
+
+  defp maybe_delete_expire_key(ops, _path, expire_key, _state_key) when is_binary(expire_key),
+    do: [{:delete, expire_key} | ops]
+
+  defp maybe_delete_expire_key(ops, _path, _expire_key, _state_key), do: ops
 
   defp expire_key_time(key, prefix) do
     size = byte_size(prefix)
@@ -1426,6 +1591,26 @@ defmodule Ferricstore.Flow.LMDB do
     end
   end
 
+  defp decode_segment_value_pin_entries_before_page(entries, trim_index, after_key, limit) do
+    {pins, last_key, saw_future?} =
+      Enum.reduce_while(entries, {[], after_key, false}, fn {key, _blob} = entry,
+                                                            {acc, _last_key, _future?} ->
+        case decode_segment_value_pin_entry(entry) do
+          {:ok, %{file_id: {_tag, index}} = pin} when index < trim_index ->
+            {:cont, {:lists.reverse(List.wrap(pin.pins), acc), key, false}}
+
+          {:ok, %{file_id: {_tag, index}}} when index >= trim_index ->
+            {:halt, {acc, key, true}}
+
+          :skip ->
+            {:cont, {acc, key, false}}
+        end
+      end)
+
+    done? = saw_future? or length(entries) < limit
+    {:ok, Enum.reverse(pins), last_key, done?}
+  end
+
   defp decode_segment_value_pin_entry({pin_key, blob})
        when is_binary(pin_key) and is_binary(blob) do
     with {:ok, {tag, index}} <- decode_segment_value_pin_key(pin_key),
@@ -1461,24 +1646,27 @@ defmodule Ferricstore.Flow.LMDB do
   defp decode_segment_value_pin_entry(_entry), do: :skip
 
   defp decode_segment_value_pin_key(pin_key) do
-    prefix = segment_value_pin_prefix(:waraft_apply_projection)
-    prefix_size = byte_size(prefix)
+    Enum.find_value([:waraft_apply_projection, :waraft_segment], :error, fn tag ->
+      prefix = segment_value_pin_prefix(tag)
+      prefix_size = byte_size(prefix)
 
-    with true <- byte_size(pin_key) > prefix_size + 21,
-         ^prefix <- binary_part(pin_key, 0, prefix_size),
-         digits <- binary_part(pin_key, prefix_size, 20),
-         <<0>> <- binary_part(pin_key, prefix_size + 20, 1),
-         {index, ""} <- Integer.parse(digits) do
-      {:ok, {:waraft_apply_projection, index}}
-    else
-      _ -> :error
-    end
+      with true <- byte_size(pin_key) > prefix_size + 21,
+           ^prefix <- binary_part(pin_key, 0, prefix_size),
+           digits <- binary_part(pin_key, prefix_size, 20),
+           <<0>> <- binary_part(pin_key, prefix_size + 20, 1),
+           {index, ""} <- Integer.parse(digits) do
+        {:ok, {tag, index}}
+      else
+        _ -> false
+      end
+    end)
   end
 
   defp decode_segment_value_pin_batch_value(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
-      {:flow_segment_value_pin_batch, 1, {:waraft_apply_projection, index} = file_id, entries}
-      when is_integer(index) and index > 0 and is_list(entries) ->
+      {:flow_segment_value_pin_batch, 1, {tag, index} = file_id, entries}
+      when tag in [:waraft_segment, :waraft_apply_projection] and is_integer(index) and
+             index > 0 and is_list(entries) ->
         {:ok, {file_id, entries}}
 
       _ ->

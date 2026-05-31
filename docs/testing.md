@@ -12,8 +12,8 @@ failures that do not reproduce in isolation.
 Safe pattern:
 
 ```sh
-FERRICSTORE_BUILD=1 mix test apps/ferricstore/test/ferricstore/flow_codec_test.exs apps/ferricstore/test/ferricstore/flow_test.exs --max-failures 5
-FERRICSTORE_BUILD=1 mix test apps/ferricstore/test/ferricstore/raft/state_machine_test.exs --max-failures 3
+mix test apps/ferricstore/test/ferricstore/flow_codec_test.exs apps/ferricstore/test/ferricstore/flow_test.exs --max-failures 5
+mix test apps/ferricstore/test/ferricstore/raft/state_machine_test.exs --max-failures 3
 (cd apps/ferricstore/native/ferricstore_bitcask && cargo test)
 ```
 

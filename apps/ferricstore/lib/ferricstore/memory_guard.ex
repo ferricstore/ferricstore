@@ -829,17 +829,38 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   defp host_total_memory do
-    try do
-      data = apply(:memsup, :get_system_memory_data, [])
+    memsup_total_memory() || sysctl_total_memory()
+  end
 
-      case data do
-        list when is_list(list) -> Keyword.get(list, :total_memory)
-        _ -> nil
-      end
-    rescue
+  defp memsup_total_memory do
+    data = apply(:memsup, :get_system_memory_data, [])
+
+    case data do
+      list when is_list(list) -> Keyword.get(list, :total_memory)
       _ -> nil
-    catch
-      _, _ -> nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp sysctl_total_memory do
+    case System.cmd("sysctl", ["-n", "hw.memsize"], stderr_to_stdout: true) do
+      {output, 0} -> parse_sysctl_memsize(output)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  @doc false
+  def parse_sysctl_memsize(output) when is_binary(output) do
+    case Integer.parse(String.trim(output)) do
+      {bytes, ""} when bytes > 0 -> bytes
+      _ -> nil
     end
   end
 

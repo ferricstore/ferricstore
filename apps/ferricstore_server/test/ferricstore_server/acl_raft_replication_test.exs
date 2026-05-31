@@ -60,6 +60,19 @@ defmodule FerricstoreServer.AclRaftReplicationTest do
       assert Acl.get_user("raft_user") != nil
     end
 
+    test "acl_setuser invalidates connection ACL caches when applied from raft" do
+      group = FerricstoreServer.Connection.acl_pg_group()
+      :ok = :pg.join(group, group, self())
+
+      task =
+        Task.async(fn ->
+          Acl.handle_raft_command({:acl_setuser, "raft_user", ["on", ">raftpass"]})
+        end)
+
+      assert :ok = Task.await(task)
+      assert_receive {:acl_invalidate, "raft_user"}, 500
+    end
+
     test "acl_deluser removes a user" do
       Acl.handle_raft_command({:acl_setuser, "raft_user", ["on", ">raftpass"]})
 
@@ -72,6 +85,25 @@ defmodule FerricstoreServer.AclRaftReplicationTest do
 
       assert :ok = Acl.handle_raft_command({:acl_reset})
       assert Acl.get_user("raft_user") == nil
+    end
+
+    test "acl_load applies validated ACL file contents from raft" do
+      data_dir =
+        Path.join(System.tmp_dir!(), "ferricstore-acl-load-#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf(data_dir) end)
+
+      assert :ok = Acl.set_user("raft_loaded", ["on", ">loadedpass", "~*", "+GET"])
+      assert :ok = Acl.save(data_dir)
+      assert {:ok, contents} = File.read(Acl.acl_file_path(data_dir))
+
+      assert :ok = Acl.reset!()
+      assert :ok = Acl.set_user("stale_local", ["on", ">stale", "~*", "+GET"])
+
+      assert :ok = Acl.handle_raft_command({:acl_load, contents})
+
+      assert Acl.get_user("raft_loaded") != nil
+      assert Acl.get_user("stale_local") == nil
     end
 
     test "unknown command returns error" do
@@ -166,7 +198,9 @@ defmodule FerricstoreServer.AclRaftReplicationTest do
       assert result =~ "redis_mode:standalone"
     end
 
-    test "INFO clients section contains connected_clients from connected_clients_fn", %{port: port} do
+    test "INFO clients section contains connected_clients from connected_clients_fn", %{
+      port: port
+    } do
       sock = connect_and_hello(port)
       send_cmd(sock, ["INFO", "clients"])
       result = recv_response(sock)

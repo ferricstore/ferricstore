@@ -27,6 +27,7 @@ defmodule FerricstoreServer.AclSecurityTest do
       Application.put_env(:ferricstore, :audit_log_enabled, false)
       Application.delete_env(:ferricstore, :max_acl_users)
       Application.delete_env(:ferricstore, :protected_mode)
+      Ferricstore.Config.set("requirepass", "")
     end)
 
     :ok
@@ -295,6 +296,16 @@ defmodule FerricstoreServer.AclSecurityTest do
       refute Acl.has_configured_users?()
     end
 
+    test "has_configured_users? returns true when default user has a password" do
+      assert :ok = Acl.set_user("default", ["on", ">s3cret"])
+      assert Acl.has_configured_users?()
+    end
+
+    test "has_configured_users? returns true when requirepass is configured" do
+      assert :ok = Ferricstore.Config.set("requirepass", "s3cret")
+      assert Acl.has_configured_users?()
+    end
+
     test "has_configured_users? returns true when non-default user with password exists" do
       assert :ok = Acl.set_user("admin", ["on", ">s3cret"])
       assert Acl.has_configured_users?()
@@ -345,6 +356,20 @@ defmodule FerricstoreServer.AclSecurityTest do
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert :ok = Acl.set_user("admin", ["on", ">s3cret"])
+      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
+    end
+
+    test "check_protected_mode allows non-localhost when default user is passworded" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      assert :ok = Acl.set_user("default", ["on", ">s3cret"])
+      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
+    end
+
+    test "check_protected_mode allows non-localhost when requirepass is configured" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      assert :ok = Ferricstore.Config.set("requirepass", "s3cret")
       assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
     end
 

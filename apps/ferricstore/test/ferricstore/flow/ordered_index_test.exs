@@ -644,6 +644,29 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert [{"flow-4", 5.0}] = NativeOrderedIndex.rank_range(native, "due:other", 0, 10, false)
   end
 
+  test "native claim_due_candidates returns ordered due-key runs directly" do
+    native = NativeOrderedIndex.new()
+
+    assert :ok =
+             NativeOrderedIndex.put_new_entries(native, [
+               {"due:queued", "queued-1", 100.0},
+               {"due:queued", "queued-2", 101.0},
+               {"due:retry", "retry-1", 10.0}
+             ])
+
+    assert [
+             {"due:retry", [{"retry-1", 10.0}]},
+             {"due:queued", [{"queued-1", 100.0}, {"queued-2", 101.0}]}
+           ] =
+             NativeOrderedIndex.claim_due_candidates(
+               native,
+               ["due:queued", "due:retry"],
+               200.0,
+               3,
+               16
+             )
+  end
+
   defp assert_index_invariants(index, lookup) do
     Enum.each(OrderedIndex.count_keys(lookup), fn key ->
       members = OrderedIndex.range_slice(index, key, :neg_inf, :inf, false, 0, :all)

@@ -130,6 +130,19 @@ defmodule Ferricstore.Commands.ListTest do
       assert ["c", "b", "a"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
     end
 
+    test "notifies one blocking waiter so FIFO pops can chain wakes" do
+      parent = self()
+
+      store =
+        MockStore.make()
+        |> Map.put(:on_push, fn key, count ->
+          send(parent, {:on_push, key, count})
+        end)
+
+      assert 3 == List.handle("LPUSH", ["mylist", "a", "b", "c"], store)
+      assert_receive {:on_push, "mylist", 1}
+    end
+
     test "returns error for missing arguments" do
       store = MockStore.make()
       assert {:error, msg} = List.handle("LPUSH", [], store)
@@ -209,6 +222,19 @@ defmodule Ferricstore.Commands.ListTest do
       store = MockStore.make()
       assert 3 == List.handle("RPUSH", ["mylist", "a", "b", "c"], store)
       assert ["a", "b", "c"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
+    end
+
+    test "notifies one blocking waiter so FIFO pops can chain wakes" do
+      parent = self()
+
+      store =
+        MockStore.make()
+        |> Map.put(:on_push, fn key, count ->
+          send(parent, {:on_push, key, count})
+        end)
+
+      assert 3 == List.handle("RPUSH", ["mylist", "a", "b", "c"], store)
+      assert_receive {:on_push, "mylist", 1}
     end
 
     test "returns error for missing arguments" do

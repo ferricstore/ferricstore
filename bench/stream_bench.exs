@@ -3,7 +3,7 @@
 # Stream baseline/optimization bench.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/stream_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/stream_bench.exs
 #
 # Options:
 #   STREAM_BENCH_SIZES=100,1000,5000

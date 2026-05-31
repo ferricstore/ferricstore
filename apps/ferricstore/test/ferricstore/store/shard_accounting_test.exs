@@ -52,7 +52,7 @@ defmodule Ferricstore.Store.ShardAccountingTest do
       end
     end
 
-    test "overwrite counts old empty records in file 0" do
+    test "pending overwrite counts old empty records in file 0" do
       keydir = new_keydir()
       key = "accounting:empty:overwrite"
 
@@ -65,6 +65,7 @@ defmodule Ferricstore.Store.ShardAccountingTest do
           file_stats: %{0 => {100, 2}, 1 => {0, 0}}
         }
 
+        ShardETS.ets_insert(state, key, "new-value", 0)
         state = ShardFlush.update_ets_locations(state, [{key, "new-value", 0}], [{30, 35}])
 
         assert state.file_stats[0] == {100, 2 + @record_header_size + byte_size(key)}
@@ -133,6 +134,33 @@ defmodule Ferricstore.Store.ShardAccountingTest do
 
         assert state.file_stats[old_fid] == {120, old_record_size}
         assert state.file_stats[3] == {0, first_record_size}
+      after
+        :ets.delete(keydir)
+      end
+    end
+
+    test "stale flush metadata does not overwrite a newer committed ETS row" do
+      keydir = new_keydir()
+      key = "accounting:async:set:stale-flush"
+
+      try do
+        :ets.insert(keydir, {key, "newer-value", 0, LFU.initial(), 4, 80, 11})
+
+        state = %{
+          keydir: keydir,
+          active_file_id: 3,
+          file_stats: %{3 => {0, 0}, 4 => {120, 0}}
+        }
+
+        state =
+          ShardFlush.update_ets_locations(
+            state,
+            [{key, "stale-value", 0}],
+            [{30, 37}]
+          )
+
+        assert [{^key, "newer-value", 0, _lfu, 4, 80, 11}] = :ets.lookup(keydir, key)
+        assert state.file_stats[4] == {120, 0}
       after
         :ets.delete(keydir)
       end

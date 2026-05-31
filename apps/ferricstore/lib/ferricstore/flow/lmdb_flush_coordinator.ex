@@ -5,6 +5,10 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
 
   @default_max_concurrent 1
 
+  def default_max_concurrent do
+    @default_max_concurrent
+  end
+
   def start_link(opts) do
     instance_name = Keyword.get(opts, :instance_name, :default)
     GenServer.start_link(__MODULE__, opts, name: name(instance_name))
@@ -38,7 +42,7 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
     max_concurrent =
       opts
       |> Keyword.get(:max_concurrent, configured_max_concurrent())
-      |> normalize_positive_integer(@default_max_concurrent)
+      |> normalize_positive_integer(default_max_concurrent())
 
     {:ok, %{max: max_concurrent, available: max_concurrent, queue: :queue.new(), holders: %{}}}
   end
@@ -80,7 +84,7 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
     Application.get_env(
       :ferricstore,
       :flow_lmdb_max_concurrent_flushes,
-      @default_max_concurrent
+      default_max_concurrent()
     )
   end
 

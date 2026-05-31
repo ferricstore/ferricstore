@@ -628,7 +628,10 @@ fn parse_command_array<'a>(
     };
 
     if count == 0 {
-        return ParseResult::Skip(after_crlf);
+        return ParseResult::Error(make_binary_term(
+            env,
+            b"ERR protocol error: empty command array",
+        ));
     }
 
     let (cmd_start, cmd_len, mut cur) =
@@ -7803,9 +7806,8 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
 
         b"MSET" | b"MSETNX" => stepped_indices(0, argc, 2),
 
-        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" | b"GEOSEARCHSTORE" => {
-            first_n_indices(argc, 2)
-        }
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" | b"SMOVE"
+        | b"GEOSEARCHSTORE" => first_n_indices(argc, 2),
 
         b"BITOP" => range_indices(1, argc),
         b"PFMERGE" | b"SDIFFSTORE" | b"SINTERSTORE" | b"SUNIONSTORE" => all_indices(argc),
@@ -7945,7 +7947,6 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         | b"SCARD"
         | b"SRANDMEMBER"
         | b"SPOP"
-        | b"SMOVE"
         | b"SSCAN"
         | b"ZADD"
         | b"ZREM"
@@ -8545,6 +8546,7 @@ fn command_tag_name(cmd: &[u8]) -> Option<&'static str> {
         b"FERRICSTORE.CONFIG" => Some("ferricstore_config"),
         b"FERRICSTORE.METRICS" => Some("ferricstore_metrics"),
         b"FERRICSTORE.BLOBGC" => Some("ferricstore_blobgc"),
+        b"FERRICSTORE.DOCTOR" => Some("ferricstore_doctor"),
         b"FERRICSTORE.KEY_INFO" => Some("ferricstore_key_info"),
         b"MEMORY" => Some("memory"),
         b"HELLO" => Some("hello"),
@@ -9611,6 +9613,10 @@ mod tests {
             command_tag_name(b"FERRICSTORE.BLOBGC"),
             Some("ferricstore_blobgc")
         );
+        assert_eq!(
+            command_tag_name(b"FERRICSTORE.DOCTOR"),
+            Some("ferricstore_doctor")
+        );
         assert_eq!(command_tag_name(b"CLUSTER.ENABLE"), None);
         assert_eq!(command_tag_name(b"CLUSTER.DURABILITY"), None);
         assert_eq!(command_tag_name(b"NO_SUCH_COMMAND"), None);
@@ -10114,6 +10120,10 @@ mod tests {
         assert_eq!(
             command_key_indices(b"BITOP", &[b"AND", b"dst", b"a", b"b"]),
             vec![1, 2, 3]
+        );
+        assert_eq!(
+            command_key_indices(b"SMOVE", &[b"src", b"dst", b"member"]),
+            vec![0, 1]
         );
         assert_eq!(
             command_key_indices(b"JSON.MGET", &[b"a", b"b", b"$"]),

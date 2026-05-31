@@ -208,19 +208,6 @@ if config_env() == :prod do
   config :ferricstore,
     release_cursor_interval:
       String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")),
-    raft_batcher_max_pending:
-      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_PENDING", "256")),
-    raft_batcher_max_pending_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_PENDING_BYTES", "0")),
-    raft_batcher_max_batch_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_BATCH_BYTES", "4194304")),
-    raft_pipeline_priority: System.get_env("FERRICSTORE_RAFT_PIPELINE_PRIORITY", "low"),
-    raft_direct_batch_commands: System.get_env("FERRICSTORE_RAFT_DIRECT_BATCH_COMMANDS", "true"),
-    raft_compact_hot_batches: System.get_env("FERRICSTORE_RAFT_COMPACT_HOT_BATCHES", "true"),
-    raft_put_batch_apply_fast_path:
-      System.get_env("FERRICSTORE_RAFT_PUT_BATCH_APPLY_FAST_PATH", "true"),
-    raft_delete_batch_apply_fast_path:
-      System.get_env("FERRICSTORE_RAFT_DELETE_BATCH_APPLY_FAST_PATH", "true"),
     waraft_log_rotation_interval:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_INTERVAL", "50000")),
     waraft_log_rotation_keep:
@@ -229,6 +216,8 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES", "100000")),
     waraft_commit_batch_max:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_COMMIT_BATCH_MAX", "10000")),
+    waraft_apply_log_batch_size:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_APPLY_LOG_BATCH_SIZE", "4096")),
     promotion_threshold:
       String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100")),
     wal_commit_delay_us:

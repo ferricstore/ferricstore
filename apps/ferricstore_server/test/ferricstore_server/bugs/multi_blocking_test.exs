@@ -99,6 +99,40 @@ defmodule FerricstoreServer.Bugs.MultiBlockingTest do
     end
   end
 
+  describe "FLOW.CLAIM_DUE inside MULTI" do
+    test "FLOW.CLAIM_DUE BLOCK 0 should be rejected at queue time inside MULTI", %{port: port} do
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["MULTI"])
+      assert {:simple, "OK"} = recv_response(sock)
+
+      send_cmd(sock, [
+        "FLOW.CLAIM_DUE",
+        "multi-block-flow",
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        "1000",
+        "LIMIT",
+        "1",
+        "BLOCK",
+        "0"
+      ])
+
+      response = recv_response(sock, 3_000)
+
+      assert match?({:error, _}, response),
+             "FLOW.CLAIM_DUE BLOCK 0 inside MULTI should be rejected with error, " <>
+               "but got: #{inspect(response)}"
+
+      send_cmd(sock, ["DISCARD"])
+      recv_response(sock, 3_000)
+      :gen_tcp.close(sock)
+    end
+  end
+
   describe "SUBSCRIBE inside MULTI" do
     test "SUBSCRIBE should be rejected inside MULTI", %{port: port} do
       sock = connect_and_hello(port)
@@ -142,6 +176,60 @@ defmodule FerricstoreServer.Bugs.MultiBlockingTest do
       assert match?({:error, _}, response),
              "BRPOP inside MULTI should be rejected with error at queue time, " <>
                "but got: #{inspect(response)} (was silently queued)"
+
+      send_cmd(sock, ["DISCARD"])
+      recv_response(sock, 3_000)
+      :gen_tcp.close(sock)
+    end
+  end
+
+  describe "stream blocking reads inside MULTI" do
+    test "XREAD BLOCK should be rejected at queue time inside MULTI", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("xread_multi")
+
+      send_cmd(sock, ["MULTI"])
+      assert {:simple, "OK"} = recv_response(sock)
+
+      send_cmd(sock, ["XREAD", "BLOCK", "1000", "STREAMS", k, "$"])
+      response = recv_response(sock, 3_000)
+
+      assert match?({:error, _}, response),
+             "XREAD BLOCK inside MULTI should be rejected with error at queue time, " <>
+               "but got: #{inspect(response)}"
+
+      send_cmd(sock, ["DISCARD"])
+      recv_response(sock, 3_000)
+      :gen_tcp.close(sock)
+    end
+
+    test "XREADGROUP BLOCK should be rejected at queue time inside MULTI", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("xreadgroup_multi")
+
+      send_cmd(sock, ["XGROUP", "CREATE", k, "g", "$", "MKSTREAM"])
+      assert {:simple, "OK"} = recv_response(sock)
+
+      send_cmd(sock, ["MULTI"])
+      assert {:simple, "OK"} = recv_response(sock)
+
+      send_cmd(sock, [
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c1",
+        "BLOCK",
+        "1000",
+        "STREAMS",
+        k,
+        ">"
+      ])
+
+      response = recv_response(sock, 3_000)
+
+      assert match?({:error, _}, response),
+             "XREADGROUP BLOCK inside MULTI should be rejected with error at queue time, " <>
+               "but got: #{inspect(response)}"
 
       send_cmd(sock, ["DISCARD"])
       recv_response(sock, 3_000)

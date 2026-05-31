@@ -107,6 +107,12 @@ defmodule FerricstoreServer.AclTest do
       user = Acl.get_user("charlie")
       assert user.keys == []
     end
+
+    test "rejects unknown concrete command names" do
+      assert {:error, msg} = Acl.set_user("typo", ["on", "-@all", "+gett"])
+      assert msg =~ "Unknown command 'gett'"
+      assert Acl.get_user("typo") == nil
+    end
   end
 
   describe "set_user/2 with password modifier" do
@@ -262,6 +268,28 @@ defmodule FerricstoreServer.AclTest do
       user = Acl.get_user("alice")
       assert MapSet.member?(user.commands, "GET")
       refute MapSet.member?(user.commands, "get")
+    end
+
+    test "+command accepts Redis subcommand pipe syntax without granting parent command" do
+      assert :ok = Acl.set_user("alice", ["on", "-@all", "+acl|whoami"])
+
+      user = Acl.get_user("alice")
+      assert MapSet.member?(user.commands, "ACL.WHOAMI")
+      assert :ok = Acl.check_command("alice", "ACL.WHOAMI")
+      assert {:error, _} = Acl.check_command("alice", "ACL.SETUSER")
+    end
+
+    test "+parent command grants known ACL subcommands for existing admin rules" do
+      assert :ok = Acl.set_user("alice", ["on", "-@all", "+acl"])
+
+      assert :ok = Acl.check_command("alice", "ACL.SETUSER")
+      assert :ok = Acl.check_command("alice", "ACL.GETUSER")
+    end
+
+    test "+command rejects unknown Redis subcommand pipe syntax" do
+      assert {:error, msg} = Acl.set_user("alice", ["on", "-@all", "+acl|notacommand"])
+      assert msg =~ "Unknown command 'acl|notacommand'"
+      assert Acl.get_user("alice") == nil
     end
 
     test "-command from :all adds to denied_commands" do
@@ -522,6 +550,17 @@ defmodule FerricstoreServer.AclTest do
       ch_idx = Enum.find_index(info, &(&1 == "channels"))
       channels = Enum.at(info, ch_idx + 1)
       assert channels == "&*"
+    end
+
+    test "channels reports explicit channel ACL patterns" do
+      assert :ok = Acl.set_user("subscriber", ["on", "nopass", "-@all", "+subscribe", "&news:*"])
+
+      info = Acl.get_user_info("subscriber")
+      ch_idx = Enum.find_index(info, &(&1 == "channels"))
+      channels = Enum.at(info, ch_idx + 1)
+
+      assert channels == "&news:*"
+      assert Enum.any?(Acl.list_users(), &String.contains?(&1, "&news:*"))
     end
   end
 

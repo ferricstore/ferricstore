@@ -24,7 +24,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
-  alias Ferricstore.Raft.PerfToggles
+  alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
 
@@ -87,7 +87,7 @@ defmodule Ferricstore.Store.Router do
       |> Enum.reduce_while({:ok, initial}, fn idx, {:ok, acc} ->
         case sweep_blob_garbage_shard(ctx, idx) do
           {:ok, %{skipped: true} = stats} ->
-            {:halt, {:ok, Map.merge(blob_gc_empty_stats(), stats)}}
+            {:cont, {:ok, blob_gc_merge_stats(acc, Map.merge(blob_gc_empty_stats(), stats))}}
 
           {:ok, stats} ->
             {:cont, {:ok, blob_gc_merge_stats(acc, stats)}}
@@ -109,58 +109,133 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp sweep_blob_garbage_shard(ctx, idx) do
-    state = :sys.get_state(resolve_shard(ctx, idx))
-
-    with :ok <- blob_gc_replay_safe?(state, idx),
+    with {:ok, hardened_ids, hardened_stats} <- blob_gc_reconcile_hardened_protections(ctx, idx),
+         state <- :sys.get_state(resolve_shard(ctx, idx)),
+         :ok <- blob_gc_replay_safe?(state, idx),
          :ok <- blob_gc_fsync_active_file(state),
          {:ok, stats} <-
-           BlobStore.sweep_unreferenced_with_live_refs(ctx.data_dir, idx, fn ->
+           BlobStore.sweep_unreferenced_releasing_hardened_with_live_refs(
+             ctx.data_dir,
+             idx,
+             hardened_ids,
+             fn ->
              with {:ok, live_refs} <- blob_gc_live_refs(ctx, idx, state),
                   :ok <- blob_gc_after_live_refs_hook(ctx, idx, live_refs) do
                {:ok, live_refs}
              end
-           end) do
-      {:ok, Map.merge(blob_gc_empty_stats(), stats)}
+             end
+           ) do
+      {:ok, blob_gc_merge_stats(Map.merge(blob_gc_empty_stats(), hardened_stats), stats)}
     end
   catch
     :exit, reason -> {:error, {:blob_gc_shard_unavailable, reason}}
   end
 
-  defp blob_gc_replay_safe?(%{raft?: true, instance_ctx: instance_ctx}, idx) do
+  defp blob_gc_reconcile_hardened_protections(ctx, idx) do
+    if Application.get_env(:ferricstore, :blob_protection_reconcile_enabled, true) == false do
+      {:ok, [], %{hardened_protections_blocked: 0}}
+    else
+      limit = blob_gc_reconcile_limit()
+      ids = BlobStore.hardened_protection_ids(ctx.data_dir, idx, limit)
+
+      case ids do
+        [] ->
+          {:ok, [], %{hardened_protections_seen: 0, hardened_protections_blocked: 0}}
+
+        [_ | _] ->
+          timeout_ms = blob_gc_reconcile_barrier_timeout_ms()
+
+          with :ok <- Ferricstore.Raft.WARaftBackend.blob_protection_barrier(idx, timeout_ms),
+               :ok <- blob_gc_wait_replay_safe(ctx, idx, timeout_ms) do
+            emit_blob_protection_reconcile(ctx, idx, length(ids), 0)
+            {:ok, ids, %{hardened_protections_seen: length(ids), hardened_protections_blocked: 0}}
+          else
+            {:ok, %{skipped: true, reason: reason}} ->
+              emit_blob_protection_reconcile_failed(ctx, idx, length(ids), reason)
+
+              {:ok, [],
+               %{hardened_protections_seen: length(ids), hardened_protections_blocked: length(ids)}}
+
+            {:error, reason} ->
+              emit_blob_protection_reconcile_failed(ctx, idx, length(ids), reason)
+
+              {:ok, [],
+               %{hardened_protections_seen: length(ids), hardened_protections_blocked: length(ids)}}
+          end
+      end
+    end
+  end
+
+  defp blob_gc_wait_replay_safe(ctx, idx, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + max(timeout_ms, 0)
+    blob_gc_wait_replay_safe_until(ctx, idx, deadline)
+  end
+
+  defp blob_gc_wait_replay_safe_until(ctx, idx, deadline_ms) do
+    state = :sys.get_state(resolve_shard(ctx, idx))
+
+    case blob_gc_replay_safe?(state, idx) do
+      :ok ->
+        :ok
+
+      {:ok, %{skipped: true} = skipped} ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          {:ok, skipped}
+        else
+          Process.sleep(10)
+          blob_gc_wait_replay_safe_until(ctx, idx, deadline_ms)
+        end
+    end
+  catch
+    :exit, reason -> {:error, {:blob_gc_replay_wait_shard_unavailable, reason}}
+  end
+
+  defp blob_gc_reconcile_limit do
+    case Application.get_env(:ferricstore, :blob_protection_reconcile_max_records, 1_000) do
+      value when is_integer(value) and value > 0 -> value
+      _other -> 1_000
+    end
+  end
+
+  defp blob_gc_reconcile_barrier_timeout_ms do
+    case Application.get_env(:ferricstore, :blob_protection_reconcile_barrier_timeout_ms, 30_000) do
+      value when is_integer(value) and value >= 0 -> value
+      _other -> 30_000
+    end
+  end
+
+  defp blob_gc_replay_safe?(%{instance_ctx: instance_ctx}, idx) when is_map(instance_ctx) do
     with %{last_applied_index: applied_ref, last_released_cursor_index: released_ref} <-
            instance_ctx,
          {:ok, applied} <- blob_gc_read_replay_index(applied_ref, idx),
          {:ok, released} <- blob_gc_read_replay_index(released_ref, idx) do
       if applied > released do
-        {:ok,
-         %{
-           deleted_files: 0,
-           deleted_bytes: 0,
-           kept_files: 0,
-           deleted_tmp_files: 0,
-           deleted_tmp_bytes: 0,
-           skipped: true,
-           reason: {:raft_replay_gap, applied, released}
-         }}
+        blob_gc_skipped({:raft_replay_gap, applied, released})
       else
         :ok
       end
     else
-      _ ->
-        {:ok,
-         %{
-           deleted_files: 0,
-           deleted_bytes: 0,
-           kept_files: 0,
-           deleted_tmp_files: 0,
-           deleted_tmp_bytes: 0,
-           skipped: true,
-           reason: :missing_raft_replay_metrics
-         }}
+      _ -> blob_gc_skipped(:missing_raft_replay_metrics)
     end
   end
 
+  defp blob_gc_replay_safe?(%{raft?: true}, _idx),
+    do: blob_gc_skipped(:missing_raft_replay_metrics)
+
   defp blob_gc_replay_safe?(_state, _idx), do: :ok
+
+  defp blob_gc_skipped(reason) do
+    {:ok,
+     %{
+       deleted_files: 0,
+       deleted_bytes: 0,
+       kept_files: 0,
+       deleted_tmp_files: 0,
+       deleted_tmp_bytes: 0,
+       skipped: true,
+       reason: reason
+     }}
+  end
 
   defp blob_gc_read_replay_index(ref, idx) do
     value = :atomics.get(ref, idx + 1)
@@ -190,24 +265,127 @@ defmodule Ferricstore.Store.Router do
 
   defp blob_gc_live_refs(ctx, idx, state) do
     keydir = Map.get(state, :ets) || resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
 
-    keydir
-    |> :ets.tab2list()
-    |> Enum.reduce_while({:ok, MapSet.new()}, fn entry, {:ok, refs} ->
-      case blob_gc_entry_ref(ctx, idx, state, entry) do
+    with {:ok, keydir_refs} <- blob_gc_keydir_live_refs(ctx, idx, state, keydir, now),
+         {:ok, lmdb_refs} <- blob_gc_flow_lmdb_live_refs(ctx, idx, now) do
+      {:ok, MapSet.union(keydir_refs, lmdb_refs)}
+    end
+  end
+
+  defp blob_gc_keydir_live_refs(ctx, idx, state, keydir, now) do
+    refs =
+      :ets.foldl(
+        fn entry, refs ->
+          case blob_gc_entry_ref(ctx, idx, state, entry, now) do
+            {:ok, nil} -> refs
+            {:ok, %BlobRef{} = ref} -> MapSet.put(refs, ref)
+            {:error, _reason} = error -> throw({:blob_gc_keydir_live_refs_error, error})
+          end
+        end,
+        MapSet.new(),
+        keydir
+      )
+
+    {:ok, refs}
+  rescue
+    ArgumentError ->
+      {:error, {:blob_gc_keydir_scan_failed, idx}}
+  catch
+    {:blob_gc_keydir_live_refs_error, {:error, _reason} = error} ->
+      error
+  end
+
+  defp blob_gc_flow_lmdb_live_refs(ctx, idx, now) do
+    ctx.data_dir
+    |> Ferricstore.DataDir.shard_data_path(idx)
+    |> Ferricstore.Flow.LMDB.path()
+    |> blob_gc_scan_flow_lmdb_refs("", MapSet.new(), now)
+  end
+
+  defp blob_gc_scan_flow_lmdb_refs(path, after_key, refs, now) do
+    page_size = blob_gc_flow_lmdb_page_size()
+
+    case Ferricstore.Flow.LMDB.prefix_entries_after(path, "f:", after_key, page_size) do
+      {:ok, []} ->
+        {:ok, refs}
+
+      {:ok, entries} ->
+        with {:ok, refs} <- blob_gc_collect_lmdb_value_refs(entries, refs, now) do
+          {last_key, _} = List.last(entries)
+
+          if length(entries) < page_size or last_key == after_key do
+            {:ok, refs}
+          else
+            blob_gc_scan_flow_lmdb_refs(path, last_key, refs, now)
+          end
+        end
+
+      {:error, reason} ->
+        {:error, {:blob_gc_flow_lmdb_scan_failed, reason}}
+    end
+  end
+
+  defp blob_gc_collect_lmdb_value_refs(entries, refs, now) do
+    Enum.reduce_while(entries, {:ok, refs}, fn {key, blob}, {:ok, refs} ->
+      case blob_gc_lmdb_value_ref(blob, now) do
         {:ok, nil} -> {:cont, {:ok, refs}}
         {:ok, %BlobRef{} = ref} -> {:cont, {:ok, MapSet.put(refs, ref)}}
-        {:error, _reason} = error -> {:halt, error}
+        {:error, reason} -> {:halt, {:error, {:blob_gc_flow_lmdb_ref_decode_failed, key, reason}}}
       end
     end)
   end
 
-  defp blob_gc_entry_ref(_ctx, _idx, _state, {key, value, _exp, _lfu, _fid, _off, _size})
+  defp blob_gc_lmdb_value_ref(blob, now) do
+    case Ferricstore.Flow.LMDB.decode_value_locator(blob, now) do
+      {:ok, _locator} ->
+        {:ok, nil}
+
+      :expired ->
+        {:ok, nil}
+
+      :not_locator ->
+        case Ferricstore.Flow.LMDB.decode_value(blob, now) do
+          {:ok, value} -> blob_gc_decode_ref(value)
+          :expired -> {:ok, nil}
+          :error -> {:error, :invalid_value_wrapper}
+        end
+
+      :error ->
+        {:error, :invalid_value_locator}
+    end
+  end
+
+  defp blob_gc_flow_lmdb_page_size do
+    case Application.get_env(:ferricstore, :blob_gc_flow_lmdb_page_size, 1024) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> 1024
+    end
+  end
+
+  defp blob_gc_entry_ref(ctx, idx, state, {key, value, exp, lfu, fid, off, size}, now)
+       when is_binary(key) and is_integer(exp) and exp != 0 and exp <= now do
+    if blob_gc_retention_metadata_key?(key) do
+      blob_gc_live_entry_ref(ctx, idx, state, {key, value, exp, lfu, fid, off, size})
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp blob_gc_entry_ref(ctx, idx, state, entry, _now),
+    do: blob_gc_live_entry_ref(ctx, idx, state, entry)
+
+  defp blob_gc_live_entry_ref(
+         _ctx,
+         _idx,
+         _state,
+         {key, value, _exp, _lfu, _fid, _off, _size}
+       )
        when is_binary(key) and is_binary(value) do
     blob_gc_decode_ref(value)
   end
 
-  defp blob_gc_entry_ref(ctx, idx, state, {key, _value, _exp, _lfu, fid, off, _size})
+  defp blob_gc_live_entry_ref(ctx, idx, state, {key, _value, _exp, _lfu, fid, off, _size})
        when is_binary(key) and is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 do
     path = blob_gc_entry_file_path(ctx, idx, state, key, fid)
 
@@ -217,9 +395,9 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp blob_gc_entry_ref(ctx, idx, _state, {key, _value, _exp, _lfu, fid, off, value_size})
+  defp blob_gc_live_entry_ref(ctx, idx, _state, {key, _value, _exp, _lfu, fid, off, value_size})
        when is_binary(key) and valid_waraft_segment_location(fid, off, value_size) do
-    if blob_ref_candidate?(ctx, value_size) do
+    if blob_gc_waraft_ref_candidate?(ctx, value_size) do
       case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, fid, key) do
         {:ok, value} -> blob_gc_decode_ref(value)
         :not_found -> {:error, {:blob_gc_live_ref_scan_failed, key, :not_found}}
@@ -230,12 +408,26 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp blob_gc_entry_ref(_ctx, _idx, _state, _entry), do: {:ok, nil}
+  defp blob_gc_live_entry_ref(_ctx, _idx, _state, _entry), do: {:ok, nil}
+
+  defp blob_gc_waraft_ref_candidate?(ctx, value_size) do
+    threshold = BlobValue.threshold(ctx)
+
+    threshold > 0 and
+      (BlobRef.encoded_size?(value_size) or
+         (is_integer(value_size) and value_size >= threshold))
+  end
 
   defp blob_gc_after_live_refs_hook(ctx, idx, live_refs) do
-    case Process.get(:ferricstore_blob_gc_after_live_refs_hook) do
-      fun when is_function(fun, 3) -> fun.(ctx, idx, live_refs)
-      _other -> :ok
+    with :ok <-
+           Ferricstore.FaultInjection.maybe_pause(:after_blob_gc_live_refs, %{
+             shard_index: idx,
+             live_ref_count: Enum.count(live_refs)
+           }) do
+      case Process.get(:ferricstore_blob_gc_after_live_refs_hook) do
+        fun when is_function(fun, 3) -> fun.(ctx, idx, live_refs)
+        _other -> :ok
+      end
     end
   end
 
@@ -245,6 +437,15 @@ defmodule Ferricstore.Store.Router do
       _ -> {:ok, nil}
     end
   end
+
+  defp blob_gc_retention_metadata_key?(key) do
+    FlowKeys.state_key?(key) or FlowKeys.value_key?(key) or blob_gc_flow_history_entry_key?(key)
+  end
+
+  defp blob_gc_flow_history_entry_key?(<<"X:f:{", rest::binary>>),
+    do: :binary.match(rest, "}:h:") != :nomatch
+
+  defp blob_gc_flow_history_entry_key?(_key), do: false
 
   defp blob_gc_entry_file_path(ctx, idx, state, key, fid) do
     redis_key = CompoundKey.extract_redis_key(key)
@@ -264,12 +465,31 @@ defmodule Ferricstore.Store.Router do
       deleted_bytes: 0,
       kept_files: 0,
       deleted_tmp_files: 0,
-      deleted_tmp_bytes: 0
+      deleted_tmp_bytes: 0,
+      hardened_protections_seen: 0,
+      hardened_protections_released: 0,
+      hardened_protections_blocked: 0
     }
   end
 
   defp blob_gc_merge_stats(acc, stats) do
     Map.merge(acc, stats, fn _key, a, b when is_integer(a) and is_integer(b) -> a + b end)
+  end
+
+  defp emit_blob_protection_reconcile(ctx, idx, released_count, blocked_count) do
+    :telemetry.execute(
+      [:ferricstore, :blob, :protection, :reconcile],
+      %{released: released_count, blocked: blocked_count},
+      %{instance: ctx.name, shard_index: idx}
+    )
+  end
+
+  defp emit_blob_protection_reconcile_failed(ctx, idx, blocked_count, reason) do
+    :telemetry.execute(
+      [:ferricstore, :blob, :protection, :reconcile, :failed],
+      %{blocked: blocked_count},
+      %{instance: ctx.name, shard_index: idx, reason: reason}
+    )
   end
 
   defp emit_blob_gc(ctx, stats) do
@@ -864,6 +1084,27 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp waraft_logical_value_size(ctx, idx, key, file_id, value_size) do
+    if blob_ref_candidate?(ctx, value_size) do
+      case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, file_id, key) do
+        {:ok, value} ->
+          case BlobRef.decode(value) do
+            {:ok, %BlobRef{size: size}} -> size
+            :error -> value_size
+          end
+
+        :not_found ->
+          nil
+
+        {:error, reason} ->
+          emit_waraft_segment_read_error(ctx, idx, file_id, reason, 1)
+          nil
+      end
+    else
+      value_size
+    end
+  end
+
   # -------------------------------------------------------------------
   # Routing helpers
   # -------------------------------------------------------------------
@@ -981,14 +1222,17 @@ defmodule Ferricstore.Store.Router do
 
         case file_ref_from_cold_location(ctx, idx, path, offset, key, value_size, true) do
           {:ok, {file_ref_path, value_offset, size}} ->
+            Stats.record_cold_read(ctx, key)
             {file_ref_path, value_offset, size}
 
           nil ->
             case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
               {:cold_ref, retry_path, value_offset, retry_size} ->
+                Stats.record_cold_read(ctx, key)
                 {retry_path, value_offset, retry_size}
 
               _ ->
+                record_keyspace_miss(ctx, key)
                 nil
             end
         end
@@ -996,8 +1240,20 @@ defmodule Ferricstore.Store.Router do
       {:cold, _file_id, _offset, _value_size} ->
         # Invalid file ref — fall back to GenServer.
         case safe_read_call(ctx, idx, {:get_file_ref, key}) do
-          {:ok, result} -> result
-          :unavailable -> nil
+          {:ok, {path, value_offset, value_size} = result}
+          when is_binary(path) and is_integer(value_offset) and is_integer(value_size) ->
+            Stats.record_cold_read(ctx, key)
+            result
+
+          {:ok, nil} ->
+            record_keyspace_miss(ctx, key)
+            nil
+
+          {:ok, _other} ->
+            nil
+
+          :unavailable ->
+            nil
         end
 
       :expired ->
@@ -1006,6 +1262,7 @@ defmodule Ferricstore.Store.Router do
 
       :miss ->
         # Key doesn't exist. No GenServer needed.
+        record_keyspace_miss(ctx, key)
         nil
 
       :no_table ->
@@ -1076,15 +1333,37 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_waraft_segment_location(file_id, offset, value_size) ->
-        case read_waraft_segment_materialized(ctx, idx, file_id, key) do
-          {:ok, value} when is_binary(value) ->
+        case read_waraft_segment_file_ref_or_value(ctx, idx, file_id, key, validate_blob_ref?) do
+          {:cold_ref, path, value_offset, size} ->
+            Stats.record_cold_read(ctx, key)
+            {:cold_ref, path, value_offset, size}
+
+          {:cold_value, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
             {:cold_value, value}
 
-          _ ->
-            record_keyspace_miss(ctx, key)
-            :miss
+          :not_found ->
+            retry_changed_waraft_segment_file_ref_result(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now,
+              validate_blob_ref?
+            )
+
+          {:error, _reason} ->
+            retry_changed_waraft_segment_file_ref_result(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now,
+              validate_blob_ref?
+            )
         end
 
       {:cold, _file_id, _offset, _value_size} ->
@@ -1178,47 +1457,8 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp blob_ref_file_ref(ctx, idx, %BlobRef{} = ref, true) do
+  defp blob_ref_file_ref(ctx, idx, %BlobRef{} = ref, _validate_blob_ref?) do
     BlobStore.file_ref(ctx.data_dir, idx, ref)
-  end
-
-  defp blob_ref_file_ref(ctx, idx, %BlobRef{} = ref, false) do
-    if BlobRef.valid?(ref),
-      do: unchecked_blob_ref_file_ref(ctx, idx, ref),
-      else: {:error, :invalid_blob_ref}
-  end
-
-  defp unchecked_blob_ref_file_ref(ctx, idx, %BlobRef{version: 1, size: size} = ref) do
-    path = BlobRef.path(ctx.data_dir, idx, ref)
-
-    case File.stat(path) do
-      {:ok, %{type: :regular, size: ^size}} -> {:ok, {path, 0, size}}
-      {:ok, %{type: :regular}} -> {:error, :size_mismatch}
-      {:ok, _other} -> {:error, :invalid_blob_file}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp unchecked_blob_ref_file_ref(
-         ctx,
-         idx,
-         %BlobRef{version: 2, size: size, offset: offset} = ref
-       ) do
-    path = BlobRef.path(ctx.data_dir, idx, ref)
-
-    case File.stat(path) do
-      {:ok, %{type: :regular, size: file_size}} when file_size >= offset + size ->
-        {:ok, {path, offset, size}}
-
-      {:ok, %{type: :regular}} ->
-        {:error, :size_mismatch}
-
-      {:ok, _other} ->
-        {:error, :invalid_blob_file}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
   end
 
   defp validated_file_ref(path, record_offset, key, value_size) do
@@ -1232,12 +1472,36 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
-    case retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
+  defp retry_changed_file_ref(
+         ctx,
+         idx,
+         keydir,
+         key,
+         original_location,
+         now,
+         validate_blob_ref? \\ true
+       ) do
+    case retry_changed_file_ref_once(
+           ctx,
+           idx,
+           keydir,
+           key,
+           original_location,
+           now,
+           validate_blob_ref?
+         ) do
       :unchanged_cold ->
         retry_after_unchanged_cold_location(
           fn ->
-            retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now)
+            retry_changed_file_ref_once(
+              ctx,
+              idx,
+              keydir,
+              key,
+              original_location,
+              now,
+              validate_blob_ref?
+            )
           end,
           cold_retry_metadata(ctx, idx, key, :file_ref)
         )
@@ -1247,7 +1511,15 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
+  defp retry_changed_file_ref_once(
+         ctx,
+         idx,
+         keydir,
+         key,
+         original_location,
+         now,
+         validate_blob_ref?
+       ) do
     case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
@@ -1267,11 +1539,55 @@ defmodule Ferricstore.Store.Router do
         end
 
       {:cold, file_id, offset, value_size}
+      when valid_waraft_segment_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} != original_location ->
+        case read_waraft_segment_file_ref_or_value(ctx, idx, file_id, key, validate_blob_ref?) do
+          {:cold_ref, file_ref_path, value_offset, size} ->
+            {:cold_ref, file_ref_path, value_offset, size}
+
+          {:cold_value, value} when is_binary(value) ->
+            Stats.record_cold_read(ctx, key)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
+            {:hot, value}
+
+          _ ->
+            :miss
+        end
+
+      {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) and
              {file_id, offset, value_size} == original_location ->
         :unchanged_cold
 
+      {:cold, file_id, offset, value_size}
+      when valid_waraft_segment_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} == original_location ->
+        :unchanged_cold
+
       _ ->
+        :miss
+    end
+  end
+
+  defp retry_changed_waraft_segment_file_ref_result(
+         ctx,
+         idx,
+         keydir,
+         key,
+         original_location,
+         now,
+         validate_blob_ref?
+       ) do
+    case retry_changed_file_ref(ctx, idx, keydir, key, original_location, now, validate_blob_ref?) do
+      {:cold_ref, retry_path, value_offset, retry_size} ->
+        Stats.record_cold_read(ctx, key)
+        {:cold_ref, retry_path, value_offset, retry_size}
+
+      {:hot, value} ->
+        {:hot, value}
+
+      :miss ->
+        record_keyspace_miss(ctx, key)
         :miss
     end
   end
@@ -1464,9 +1780,25 @@ defmodule Ferricstore.Store.Router do
             warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
             value
 
-          _ ->
-            record_keyspace_miss(ctx, key)
-            nil
+          :not_found ->
+            retry_changed_waraft_segment_value_result(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now
+            )
+
+          {:error, _reason} ->
+            retry_changed_waraft_segment_value_result(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now
+            )
         end
 
       {:cold, _file_id, _offset, _value_size} ->
@@ -1525,37 +1857,34 @@ defmodule Ferricstore.Store.Router do
   def batch_get(ctx, keys) do
     now = HLC.now_ms()
 
-    {results, {cold_entries, _cold_count, hot_hits}} =
-      Enum.map_reduce(keys, {[], 0, []}, fn key, {cold_entries, cold_count, hot_hits} ->
+    {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, hot_hits}} =
+      Enum.map_reduce(keys, {[], 0, [], 0, []}, fn key,
+                                                   {cold_entries, cold_count, waraft_entries,
+                                                    waraft_count, hot_hits} ->
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
 
         case ets_get_full(ctx, idx, keydir, key, now) do
           {:hit, value, lfu} ->
-            {{:value, value}, {cold_entries, cold_count, [{keydir, key, lfu} | hot_hits]}}
+            {{:value, value},
+             {cold_entries, cold_count, waraft_entries, waraft_count,
+              [{keydir, key, lfu} | hot_hits]}}
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) ->
             path = cold_file_path(ctx, idx, file_id)
 
             entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-            {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1, hot_hits}}
+
+            {{:cold, cold_count},
+             {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, hot_hits}}
 
           {:cold, file_id, offset, value_size}
           when valid_waraft_segment_location(file_id, offset, value_size) ->
-            result =
-              case read_waraft_segment_materialized(ctx, idx, file_id, key) do
-                {:ok, value} when is_binary(value) ->
-                  Stats.record_cold_read(ctx, key)
-                  warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
-                  value
+            entry = {ctx, idx, keydir, key, file_id, offset, value_size}
 
-                _ ->
-                  record_keyspace_miss(ctx, key)
-                  nil
-              end
-
-            {{:value, result}, {cold_entries, cold_count, hot_hits}}
+            {{:waraft, waraft_count},
+             {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1, hot_hits}}
 
           {:cold, _file_id, _offset, _value_size} ->
             result =
@@ -1570,15 +1899,15 @@ defmodule Ferricstore.Store.Router do
               record_keyspace_miss(ctx, key)
             end
 
-            {{:value, result}, {cold_entries, cold_count, hot_hits}}
+            {{:value, result}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
           :expired ->
             record_keyspace_miss(ctx, key)
-            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
+            {{:value, nil}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
           :miss ->
             record_keyspace_miss(ctx, key)
-            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
+            {{:value, nil}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
           :no_table ->
             result =
@@ -1593,7 +1922,7 @@ defmodule Ferricstore.Store.Router do
               record_keyspace_miss(ctx, key)
             end
 
-            {{:value, result}, {cold_entries, cold_count, hot_hits}}
+            {{:value, result}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
         end
       end)
 
@@ -1605,9 +1934,16 @@ defmodule Ferricstore.Store.Router do
       |> read_cold_batch_async(now)
       |> List.to_tuple()
 
+    waraft_values =
+      waraft_entries
+      |> Enum.reverse()
+      |> read_waraft_segment_batch_materialized()
+      |> List.to_tuple()
+
     Enum.map(results, fn
       {:value, value} -> value
       {:cold, index} -> elem(cold_values, index)
+      {:waraft, index} -> elem(waraft_values, index)
     end)
   end
 
@@ -1637,14 +1973,18 @@ defmodule Ferricstore.Store.Router do
   defp do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, validate_blob_ref?) do
     now = HLC.now_ms()
 
-    {results, {cold_entries, _cold_count, hot_hits}} =
-      Enum.map_reduce(keys, {[], 0, []}, fn key, {cold_entries, cold_count, hot_hits} ->
+    {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, hot_hits}} =
+      Enum.map_reduce(keys, {[], 0, [], 0, []}, fn key,
+                                                   {cold_entries, cold_count, waraft_entries,
+                                                    waraft_count, hot_hits} ->
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
 
         case ets_get_full(ctx, idx, keydir, key, now) do
           {:hit, value, lfu} ->
-            {{:value, value}, {cold_entries, cold_count, [{keydir, key, lfu} | hot_hits]}}
+            {{:value, value},
+             {cold_entries, cold_count, waraft_entries, waraft_count,
+              [{keydir, key, lfu} | hot_hits]}}
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) ->
@@ -1662,25 +2002,18 @@ defmodule Ferricstore.Store.Router do
               min_file_ref_size,
               cold_entries,
               cold_count,
+              waraft_entries,
+              waraft_count,
               hot_hits,
               now
             )
 
           {:cold, file_id, offset, value_size}
           when valid_waraft_segment_location(file_id, offset, value_size) ->
-            result =
-              case read_waraft_segment_materialized(ctx, idx, file_id, key) do
-                {:ok, value} when is_binary(value) ->
-                  Stats.record_cold_read(ctx, key)
-                  warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
-                  value
+            entry = {ctx, idx, keydir, key, file_id, offset, value_size}
 
-                _ ->
-                  record_keyspace_miss(ctx, key)
-                  nil
-              end
-
-            {{:value, result}, {cold_entries, cold_count, hot_hits}}
+            {{:waraft, waraft_count},
+             {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1, hot_hits}}
 
           {:cold, _file_id, _offset, _value_size} ->
             result =
@@ -1695,15 +2028,15 @@ defmodule Ferricstore.Store.Router do
               record_keyspace_miss(ctx, key)
             end
 
-            {{:value, result}, {cold_entries, cold_count, hot_hits}}
+            {{:value, result}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
           :expired ->
             record_keyspace_miss(ctx, key)
-            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
+            {{:value, nil}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
           :miss ->
             record_keyspace_miss(ctx, key)
-            {{:value, nil}, {cold_entries, cold_count, hot_hits}}
+            {{:value, nil}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
           :no_table ->
             result =
@@ -1718,7 +2051,7 @@ defmodule Ferricstore.Store.Router do
               record_keyspace_miss(ctx, key)
             end
 
-            {{:value, result}, {cold_entries, cold_count, hot_hits}}
+            {{:value, result}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
         end
       end)
 
@@ -1730,10 +2063,20 @@ defmodule Ferricstore.Store.Router do
       |> read_cold_batch_file_ref_async(now, min_file_ref_size, validate_blob_ref?)
       |> List.to_tuple()
 
+    waraft_values =
+      waraft_entries
+      |> Enum.reverse()
+      |> read_waraft_segment_batch_file_ref_or_materialized(
+        min_file_ref_size,
+        validate_blob_ref?
+      )
+      |> List.to_tuple()
+
     Enum.map(results, fn
       {:value, value} -> value
       {:file_ref, path, offset, size} -> {:file_ref, path, offset, size}
       {:cold, index} -> elem(cold_values, index)
+      {:waraft, index} -> elem(waraft_values, index)
     end)
   end
 
@@ -1815,18 +2158,24 @@ defmodule Ferricstore.Store.Router do
          min_file_ref_size,
          cold_entries,
          cold_count,
+         waraft_entries,
+         waraft_count,
          hot_hits,
          now
        )
        when value_size >= min_file_ref_size do
     if blob_ref_candidate?(ctx, value_size) do
       entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-      {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1, hot_hits}}
+
+      {{:cold, cold_count},
+       {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, hot_hits}}
     else
       case file_ref_from_cold_location(ctx, idx, path, offset, key, value_size, true) do
         {:ok, {file_ref_path, value_offset, size}} ->
           Stats.record_cold_read(ctx, key)
-          {{:file_ref, file_ref_path, value_offset, size}, {cold_entries, cold_count, hot_hits}}
+
+          {{:file_ref, file_ref_path, value_offset, size},
+           {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
         nil ->
           case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
@@ -1834,14 +2183,15 @@ defmodule Ferricstore.Store.Router do
               Stats.record_cold_read(ctx, key)
 
               {{:file_ref, retry_path, value_offset, retry_size},
-               {cold_entries, cold_count, hot_hits}}
+               {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
             {:hot, value} ->
-              {{:value, value}, {cold_entries, cold_count, hot_hits}}
+              {{:value, value},
+               {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
 
             :miss ->
               record_keyspace_miss(ctx, key)
-              {{:value, nil}, {cold_entries, cold_count, hot_hits}}
+              {{:value, nil}, {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
           end
       end
     end
@@ -1859,11 +2209,15 @@ defmodule Ferricstore.Store.Router do
          _min_file_ref_size,
          cold_entries,
          cold_count,
+         waraft_entries,
+         waraft_count,
          hot_hits,
          _now
        ) do
     entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-    {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1, hot_hits}}
+
+    {{:cold, cold_count},
+     {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, hot_hits}}
   end
 
   defp read_cold_batch_async([], _now), do: []
@@ -1886,6 +2240,277 @@ defmodule Ferricstore.Store.Router do
       |> List.to_tuple()
 
     Enum.map(value_indexes, fn index -> elem(unique_values, index) end)
+  end
+
+  defp read_waraft_segment_batch_materialized([]), do: []
+
+  defp read_waraft_segment_batch_materialized(entries) do
+    entries
+    |> Enum.with_index()
+    |> Enum.group_by(
+      fn {{ctx, idx, _keydir, _key, file_id, _offset, _value_size}, _index} ->
+        {ctx.data_dir, idx, file_id}
+      end,
+      fn indexed_entry -> indexed_entry end
+    )
+    |> Enum.reduce(%{}, &read_waraft_segment_group/2)
+    |> waraft_segment_results(entries)
+  end
+
+  defp read_waraft_segment_batch_file_ref_or_materialized(
+         [],
+         _min_file_ref_size,
+         _validate_blob_ref?
+       ),
+       do: []
+
+  defp read_waraft_segment_batch_file_ref_or_materialized(
+         entries,
+         min_file_ref_size,
+         validate_blob_ref?
+       ) do
+    entries
+    |> Enum.with_index()
+    |> Enum.group_by(
+      fn {{ctx, idx, _keydir, _key, file_id, _offset, _value_size}, _index} ->
+        {ctx.data_dir, idx, file_id}
+      end,
+      fn indexed_entry -> indexed_entry end
+    )
+    |> Enum.reduce(%{}, fn group, acc ->
+      read_waraft_segment_file_ref_group(group, min_file_ref_size, validate_blob_ref?, acc)
+    end)
+    |> waraft_segment_results(entries)
+  end
+
+  defp read_waraft_segment_file_ref_group(
+         {_group_key,
+          [{{ctx, idx, _keydir, _key, file_id, _offset, _value_size}, _index} | _] =
+            indexed_entries},
+         min_file_ref_size,
+         validate_blob_ref?,
+         acc
+       ) do
+    keys =
+      indexed_entries
+      |> Enum.map(fn {{_ctx, _idx, _keydir, key, _file_id, _offset, _value_size}, _index} ->
+        key
+      end)
+      |> Enum.uniq()
+
+    case read_waraft_segment_values(ctx, idx, file_id, keys, length(indexed_entries)) do
+      {:ok, value_by_key} ->
+        Enum.reduce(indexed_entries, acc, fn
+          {{ctx, idx, keydir, key, file_id, offset, value_size}, index}, acc ->
+            case Map.fetch(value_by_key, key) do
+              {:ok, value} when is_binary(value) ->
+                case waraft_segment_file_ref_or_materialized_value(
+                       ctx,
+                       idx,
+                       keydir,
+                       key,
+                       file_id,
+                       offset,
+                       value_size,
+                       value,
+                       min_file_ref_size,
+                       validate_blob_ref?
+                     ) do
+                  {:ok, result} -> Map.put(acc, index, result)
+                  {:error, reason} -> Map.put(acc, index, {:waraft_read_error, reason})
+                end
+
+              _missing ->
+                acc
+            end
+        end)
+
+      {:error, reason} ->
+        put_waraft_read_errors(acc, indexed_entries, reason)
+    end
+  end
+
+  defp waraft_segment_file_ref_or_materialized_value(
+         ctx,
+         idx,
+         keydir,
+         key,
+         file_id,
+         offset,
+         _value_size,
+         value,
+         min_file_ref_size,
+         validate_blob_ref?
+       ) do
+    if blob_ref_candidate?(ctx, byte_size(value)) do
+      case BlobRef.decode(value) do
+        {:ok, %BlobRef{size: blob_size} = ref} when blob_size >= min_file_ref_size ->
+          case blob_ref_file_ref(ctx, idx, ref, validate_blob_ref?) do
+            {:ok, {path, value_offset, size}} ->
+              Stats.record_cold_read(ctx, key)
+              {:ok, {:file_ref, path, value_offset, size}}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+
+        {:ok, %BlobRef{} = ref} ->
+          case BlobStore.get(ctx.data_dir, idx, ref) do
+            {:ok, materialized} ->
+              Stats.record_cold_read(ctx, key)
+              warm_ets_after_cold_read(ctx, idx, keydir, key, materialized, file_id, offset)
+              {:ok, materialized}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+
+        :error ->
+          Stats.record_cold_read(ctx, key)
+          warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
+          {:ok, value}
+      end
+    else
+      Stats.record_cold_read(ctx, key)
+      warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
+      {:ok, value}
+    end
+  end
+
+  defp read_waraft_segment_group(
+         {_group_key,
+          [{{ctx, idx, _keydir, _key, file_id, _offset, _value_size}, _index} | _] =
+            indexed_entries},
+         acc
+       ) do
+    keys =
+      indexed_entries
+      |> Enum.map(fn {{_ctx, _idx, _keydir, key, _file_id, _offset, _value_size}, _index} ->
+        key
+      end)
+      |> Enum.uniq()
+
+    case read_waraft_segment_values(ctx, idx, file_id, keys, length(indexed_entries)) do
+      {:ok, value_by_key} ->
+        read_waraft_segment_found_values(ctx, idx, indexed_entries, value_by_key, acc)
+
+      {:error, reason} ->
+        put_waraft_read_errors(acc, indexed_entries, reason)
+    end
+  end
+
+  defp read_waraft_segment_found_values(ctx, idx, indexed_entries, value_by_key, acc) do
+    found =
+      indexed_entries
+      |> Enum.reduce([], fn
+        {{ctx, idx, keydir, key, file_id, offset, _value_size}, index}, found ->
+          case Map.fetch(value_by_key, key) do
+            {:ok, value} when is_binary(value) ->
+              [{index, ctx, idx, keydir, key, file_id, offset, value} | found]
+
+            _missing ->
+              found
+          end
+      end)
+      |> Enum.reverse()
+
+    materialized =
+      found
+      |> Enum.map(fn {_index, _ctx, _idx, _keydir, _key, _file_id, _offset, value} -> value end)
+      |> then(fn values ->
+        BlobValue.maybe_materialize_many(ctx.data_dir, idx, BlobValue.threshold(ctx), values)
+      end)
+
+    found
+    |> Enum.zip(materialized)
+    |> Enum.reduce(acc, fn
+      {{index, ctx, idx, keydir, key, file_id, offset, _raw_value}, {:ok, value}}, acc
+      when is_binary(value) ->
+        Stats.record_cold_read(ctx, key)
+        warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
+        Map.put(acc, index, value)
+
+      {{index, _ctx, _idx, _keydir, _key, _file_id, _offset, _raw_value}, {:error, reason}},
+      acc ->
+        Map.put(acc, index, {:waraft_read_error, reason})
+    end)
+  end
+
+  defp waraft_segment_results(result_by_index, entries) do
+    entries
+    |> Enum.with_index()
+    |> Enum.map(fn {{ctx, idx, keydir, key, file_id, offset, value_size}, index} ->
+      case Map.fetch(result_by_index, index) do
+        {:ok, {:waraft_read_error, _reason}} ->
+          retry_changed_waraft_segment_value_result(
+            ctx,
+            idx,
+            keydir,
+            key,
+            {file_id, offset, value_size},
+            HLC.now_ms()
+          )
+
+        {:ok, value} ->
+          value
+
+        :error ->
+          retry_changed_waraft_segment_value_result(
+            ctx,
+            idx,
+            keydir,
+            key,
+            {file_id, offset, value_size},
+            HLC.now_ms()
+          )
+      end
+    end)
+  end
+
+  defp read_waraft_segment_values(ctx, idx, file_id, keys, count) do
+    case Ferricstore.Raft.WARaftSegmentReader.read_values_from_location(ctx, idx, file_id, keys) do
+      {:ok, values} when is_map(values) ->
+        {:ok, values}
+
+      {:error, reason} ->
+        emit_waraft_segment_read_error(ctx, idx, file_id, reason, count)
+        {:error, reason}
+
+      _unexpected ->
+        emit_waraft_segment_read_error(ctx, idx, file_id, :bad_segment_read_result, count)
+        {:error, :bad_segment_read_result}
+    end
+  end
+
+  defp put_waraft_read_errors(acc, indexed_entries, reason) do
+    Enum.reduce(indexed_entries, acc, fn {_entry, index}, acc ->
+      Map.put(acc, index, {:waraft_read_error, reason})
+    end)
+  end
+
+  defp emit_waraft_segment_read_error(ctx, idx, file_id, reason, count) do
+    path = waraft_segment_read_path(ctx, idx, file_id)
+    reason = cold_batch_read_error_reason({:error, reason})
+    emit_batch_cold_read_corruption(%{{path, reason} => count})
+  end
+
+  defp waraft_segment_read_path(ctx, idx, {tag, index})
+       when tag in [:waraft_segment, :waraft_projection, :waraft_apply_projection] do
+    Path.join([
+      ctx.data_dir,
+      "waraft",
+      "ferricstore_waraft_backend.#{idx + 1}",
+      "#{tag}-#{index}"
+    ])
+  end
+
+  defp waraft_segment_read_path(ctx, idx, file_id) do
+    Path.join([
+      ctx.data_dir,
+      "waraft",
+      "ferricstore_waraft_backend.#{idx + 1}",
+      inspect(file_id)
+    ])
   end
 
   defp dedupe_cold_batch_entries(entries) do
@@ -2075,7 +2700,7 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
-  defp batch_blob_file_ref_results(entry_values, min_file_ref_size, validate_blob_ref?) do
+  defp batch_blob_file_ref_results(entry_values, min_file_ref_size, _validate_blob_ref?) do
     grouped =
       entry_values
       |> Enum.with_index()
@@ -2098,12 +2723,7 @@ defmodule Ferricstore.Store.Router do
       indexed_refs = Enum.reverse(indexed_refs)
       {indexes, refs} = Enum.unzip(indexed_refs)
 
-      results =
-        if validate_blob_ref? do
-          BlobStore.file_refs_many(data_dir, idx, refs)
-        else
-          Enum.map(refs, &blob_ref_file_ref(%{data_dir: data_dir}, idx, &1, false))
-        end
+      results = BlobStore.file_refs_many(data_dir, idx, refs)
 
       indexes
       |> Enum.zip(results)
@@ -2246,6 +2866,9 @@ defmodule Ferricstore.Store.Router do
   defp cold_batch_read_error_reason({:error, :batch_result_length_mismatch}),
     do: :batch_result_length_mismatch
 
+  defp cold_batch_read_error_reason({:error, :segment_entry_not_found}),
+    do: :missing_segment_entry
+
   defp cold_batch_read_error_reason({:error, _reason}), do: :corrupt_record
 
   defp cold_batch_read_error_reason(_value), do: :nil_from_cold_location
@@ -2262,12 +2885,57 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp read_waraft_segment_materialized(ctx, idx, file_id, key) do
-    with {:ok, value} <-
-           Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, file_id, key),
-         {:ok, materialized} <- materialize_blob_value(ctx, idx, value) do
-      {:ok, materialized}
+    case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, file_id, key) do
+      {:ok, value} ->
+        materialize_blob_value(ctx, idx, value)
+
+      :not_found ->
+        :not_found
+
+      {:error, reason} = error ->
+        emit_waraft_segment_read_error(ctx, idx, file_id, reason, 1)
+        error
     end
   end
+
+  defp read_waraft_segment_file_ref_or_value(ctx, idx, file_id, key, validate_blob_ref?) do
+    case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, file_id, key) do
+      {:ok, value} ->
+        case waraft_segment_blob_file_ref(ctx, idx, value, validate_blob_ref?) do
+          {:ok, {path, value_offset, size}} ->
+            {:cold_ref, path, value_offset, size}
+
+          :not_blob ->
+            case materialize_blob_value(ctx, idx, value) do
+              {:ok, materialized} -> {:cold_value, materialized}
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      :not_found ->
+        :not_found
+
+      {:error, reason} ->
+        emit_waraft_segment_read_error(ctx, idx, file_id, reason, 1)
+        {:error, reason}
+    end
+  end
+
+  defp waraft_segment_blob_file_ref(ctx, idx, value, validate_blob_ref?) when is_binary(value) do
+    if blob_ref_candidate?(ctx, byte_size(value)) do
+      case BlobRef.decode(value) do
+        {:ok, %BlobRef{} = ref} -> blob_ref_file_ref(ctx, idx, ref, validate_blob_ref?)
+        :error -> :not_blob
+      end
+    else
+      :not_blob
+    end
+  end
+
+  defp waraft_segment_blob_file_ref(_ctx, _idx, _value, _validate_blob_ref?), do: :not_blob
 
   defp materialize_blob_value(ctx, idx, value) do
     BlobValue.maybe_materialize(ctx.data_dir, idx, BlobValue.threshold(ctx), value)
@@ -2309,12 +2977,40 @@ defmodule Ferricstore.Store.Router do
         end
 
       {:cold, file_id, offset, value_size}
+      when valid_waraft_segment_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} != original_location ->
+        case read_waraft_segment_materialized(ctx, idx, file_id, key) do
+          {:ok, value} when is_binary(value) -> {:cold, value, file_id, offset}
+          _ -> :miss
+        end
+
+      {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} == original_location ->
+        :unchanged_cold
+
+      {:cold, file_id, offset, value_size}
+      when valid_waraft_segment_location(file_id, offset, value_size) and
              {file_id, offset, value_size} == original_location ->
         :unchanged_cold
 
       _ ->
         :miss
+    end
+  end
+
+  defp retry_changed_waraft_segment_value_result(ctx, idx, keydir, key, original_location, now) do
+    case retry_changed_cold_value(ctx, idx, keydir, key, original_location, now) do
+      {:cold, value, retry_file_id, retry_offset} ->
+        Stats.record_cold_read(ctx, key)
+        warm_ets_after_cold_read(ctx, idx, keydir, key, value, retry_file_id, retry_offset)
+        value
+
+      {:hot, value} ->
+        value
+
+      :miss ->
+        nil
     end
   end
 
@@ -2349,13 +3045,41 @@ defmodule Ferricstore.Store.Router do
           _ -> :miss
         end
 
+      {:cold, file_id, offset, value_size, expire_at_ms}
+      when valid_waraft_segment_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} != original_location ->
+        case read_waraft_segment_materialized(ctx, idx, file_id, key) do
+          {:ok, value} when is_binary(value) -> {:cold, value, expire_at_ms, file_id, offset}
+          _ -> :miss
+        end
+
       {:cold, file_id, offset, value_size, _expire_at_ms}
       when valid_cold_location(file_id, offset, value_size) and
              {file_id, offset, value_size} == original_location ->
         :unchanged_cold
 
+      {:cold, file_id, offset, value_size, _expire_at_ms}
+      when valid_waraft_segment_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} == original_location ->
+        :unchanged_cold
+
       _ ->
         :miss
+    end
+  end
+
+  defp retry_changed_waraft_segment_meta_result(ctx, idx, keydir, key, original_location, now) do
+    case retry_changed_cold_meta(ctx, idx, keydir, key, original_location, now) do
+      {:cold, value, retry_expire_at_ms, retry_file_id, retry_offset} ->
+        Stats.record_cold_read(ctx, key)
+        warm_ets_after_cold_read(ctx, idx, keydir, key, value, retry_file_id, retry_offset)
+        {value, retry_expire_at_ms}
+
+      {:hot, value, retry_expire_at_ms} ->
+        {value, retry_expire_at_ms}
+
+      :miss ->
+        nil
     end
   end
 
@@ -2478,9 +3202,25 @@ defmodule Ferricstore.Store.Router do
             warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
             {value, expire_at_ms}
 
-          _ ->
-            record_keyspace_miss(ctx, key)
-            nil
+          :not_found ->
+            retry_changed_waraft_segment_meta_result(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now
+            )
+
+          {:error, _reason} ->
+            retry_changed_waraft_segment_meta_result(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now
+            )
         end
 
       {:cold, _file_id, _offset, _value_size, _expire_at_ms} ->
@@ -2603,7 +3343,7 @@ defmodule Ferricstore.Store.Router do
 
         [{^key, nil, 0, _lfu, fid, off, vsize}]
         when valid_waraft_segment_location(fid, off, vsize) ->
-          vsize
+          waraft_logical_value_size(ctx, idx, key, fid, vsize)
 
         [{^key, nil, 0, _lfu, :pending, _off, vsize}]
         when valid_pending_value_size(vsize) ->
@@ -2618,7 +3358,7 @@ defmodule Ferricstore.Store.Router do
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-          vsize
+          waraft_logical_value_size(ctx, idx, key, fid, vsize)
 
         [{^key, nil, exp, _lfu, :pending, _off, vsize}]
         when exp > now and valid_pending_value_size(vsize) ->
@@ -2729,8 +3469,11 @@ defmodule Ferricstore.Store.Router do
             warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
             range_from_value(value, start_idx, end_idx)
 
-          _ ->
+          :not_found ->
             record_keyspace_miss(ctx, key)
+            nil
+
+          {:error, _reason} ->
             nil
         end
 
@@ -3253,7 +3996,7 @@ defmodule Ferricstore.Store.Router do
   def pipeline_write_batch(_ctx, []), do: []
 
   def pipeline_write_batch(ctx, keyed_commands) when is_list(keyed_commands) do
-    if ctx.name == :default and PerfToggles.direct_batch_commands?() do
+    if ctx.name == :default do
       # Homogeneous hot pipeline batches go straight to final Ra command shapes.
       # That avoids allocating per-key command tuples just to compact them later.
       # The matching state-machine path must stay equally compact: for pure
@@ -3373,10 +4116,12 @@ defmodule Ferricstore.Store.Router do
   defp batch_quorum_put(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_put(ctx, kv_pairs, origin_node) do
-    if PerfToggles.direct_batch_commands?() do
-      do_batch_quorum_put_entries(ctx, kv_pairs, origin_node)
-    else
-      batch_quorum_commands(ctx, put_entries_to_keyed_commands(kv_pairs), origin_node)
+    cond do
+      not durable_raft_ctx?(ctx) ->
+        local_batch_put_entries(ctx, kv_pairs)
+
+      true ->
+        do_batch_quorum_put_entries(ctx, kv_pairs, origin_node)
     end
   end
 
@@ -3391,22 +4136,28 @@ defmodule Ferricstore.Store.Router do
   defp batch_quorum_delete(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_delete(ctx, keys, origin_node) do
-    if PerfToggles.direct_batch_commands?() do
-      do_batch_quorum_delete_keys(ctx, keys, origin_node)
-    else
-      batch_quorum_commands(ctx, delete_keys_to_keyed_commands(keys), origin_node)
+    cond do
+      not durable_raft_ctx?(ctx) ->
+        local_batch_delete_keys(ctx, keys)
+
+      true ->
+        do_batch_quorum_delete_keys(ctx, keys, origin_node)
     end
   end
 
-  defp put_entries_to_keyed_commands(entries) do
+  defp local_batch_put_entries(ctx, entries) do
     Enum.map(entries, fn entry ->
       {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
-      {key, {:put, key, value, expire_at_ms}}
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:put, key, value, expire_at_ms})
     end)
   end
 
-  defp delete_keys_to_keyed_commands(keys) do
-    Enum.map(keys, fn key -> {key, {:delete, key}} end)
+  defp local_batch_delete_keys(ctx, keys) do
+    Enum.map(keys, fn key ->
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:delete, key})
+    end)
   end
 
   defp waraft_batch_commands(_ctx, []), do: []
@@ -4327,7 +5078,7 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp flow_many_by_shard(ctx, attrs_list, command, batch_id)
+  defp flow_many_by_shard(ctx, attrs_list, command, _batch_id)
        when command in [
               :flow_create_many,
               :flow_complete_many,
@@ -4338,24 +5089,23 @@ defmodule Ferricstore.Store.Router do
             ] do
     {buckets, count} =
       Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
-        %{id: id, partition_key: partition_key} = attrs, {buckets, idx}
-        when is_binary(id) and is_binary(partition_key) ->
+        %{id: id} = attrs, {buckets, idx} when is_binary(id) ->
+          partition_key = Map.get(attrs, :partition_key)
           key = Ferricstore.Flow.Keys.state_key(id, partition_key)
           shard_idx = shard_for(ctx, key)
 
-          {flow_put_shard_bucket(buckets, shard_idx, {idx, attrs}), idx + 1}
+          {flow_put_shard_bucket(buckets, shard_idx, {idx, key, attrs}), idx + 1}
       end)
 
     groups =
       flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
         group = Enum.reverse(entries)
-        attrs = Enum.map(group, fn {_idx, attrs} -> attrs end)
-        partition_key = attrs |> hd() |> Map.fetch!(:partition_key)
-        key = Ferricstore.Flow.Keys.state_key(batch_id, partition_key)
-        original_indices = Enum.map(group, fn {idx, _attrs} -> idx end)
+        route_key = group |> hd() |> elem(1)
+        attrs = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
+        original_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
         command_attrs = flow_many_command_attrs(command, attrs)
         command_attrs = flow_stamp_shard(command_attrs, shard_idx)
-        {shard_idx, key, original_indices, {command, key, command_attrs}}
+        {shard_idx, route_key, original_indices, {command, route_key, command_attrs}}
       end)
 
     case Enum.find(groups, fn {_shard_idx, key, _indices, _cmd} ->
@@ -7583,6 +8333,25 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  @spec flow_due_count_keys(FerricStore.Instance.t()) :: {:ok, [binary()]} | :unavailable
+  def flow_due_count_keys(ctx) do
+    shard_count = max(1, Map.get(ctx, :shard_count, 1))
+
+    0..(shard_count - 1)//1
+    |> Enum.reduce_while({:ok, []}, fn idx, {:ok, acc} ->
+      case flow_due_count_keys(ctx, idx) do
+        {:ok, keys} when is_list(keys) -> {:cont, {:ok, [keys | acc]}}
+        :unavailable -> {:halt, :unavailable}
+        _other -> {:halt, :unavailable}
+      end
+    end)
+    |> case do
+      {:ok, key_groups} -> {:ok, key_groups |> Enum.reverse() |> List.flatten() |> Enum.uniq()}
+      :unavailable -> :unavailable
+    end
+  end
+
   @spec zset_rank_range(
           FerricStore.Instance.t(),
           binary(),
@@ -7678,6 +8447,16 @@ defmodule Ferricstore.Store.Router do
     |> case do
       {:ok, counts} -> {:ok, Enum.reverse(counts)}
       :unavailable -> :unavailable
+    end
+  end
+
+  defp flow_due_count_keys(ctx, idx) do
+    if selected_waraft_ctx?(ctx) do
+      direct_flow_index_read(ctx, idx, &NativeFlowIndex.due_count_keys/1)
+    else
+      ctx
+      |> safe_read_call(idx, :flow_due_count_keys)
+      |> unwrap_zset_index_reply()
     end
   end
 

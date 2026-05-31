@@ -33,31 +33,46 @@ defmodule Ferricstore.Flow.LMDBReplaySafeIndex do
   @spec persist(binary(), non_neg_integer()) :: :ok | {:error, term()}
   def persist(shard_data_path, index) when is_integer(index) and index >= 0 do
     marker_path = path(shard_data_path)
-    tmp_path = marker_path <> ".tmp"
-    contents = Integer.to_string(index) <> "\n"
+    with_marker_lock(marker_path, fn -> persist_locked(shard_data_path, marker_path, index) end)
+  end
 
-    result =
-      with :ok <- Ferricstore.FS.mkdir_p(shard_data_path),
-           :ok <- File.write(tmp_path, contents),
-           :ok <- fsync(NIF.v2_fsync(tmp_path), tmp_path),
-           :ok <- Ferricstore.FS.rename(tmp_path, marker_path),
-           :ok <- fsync(NIF.v2_fsync_dir(shard_data_path), shard_data_path) do
-        :ok
+  defp persist_locked(shard_data_path, marker_path, index) do
+    current = read(shard_data_path)
+    target = max(current, index)
+
+    if current >= target and File.regular?(marker_path) do
+      :ok
+    else
+      tmp_path = marker_path <> ".tmp." <> Integer.to_string(:erlang.unique_integer([:positive]))
+      contents = Integer.to_string(target) <> "\n"
+
+      result =
+        with :ok <- Ferricstore.FS.mkdir_p(shard_data_path),
+             :ok <- File.write(tmp_path, contents),
+             :ok <- fsync(NIF.v2_fsync(tmp_path), tmp_path),
+             :ok <- Ferricstore.FS.rename(tmp_path, marker_path),
+             :ok <- fsync(NIF.v2_fsync_dir(shard_data_path), shard_data_path) do
+          :ok
+        end
+
+      case result do
+        :ok ->
+          :ok
+
+        {:error, _reason} = error ->
+          cleanup_tmp(tmp_path)
+
+          Logger.warning(
+            "failed to persist Flow LMDB replay-safe index #{target}: #{inspect(error)}"
+          )
+
+          error
       end
-
-    case result do
-      :ok ->
-        :ok
-
-      {:error, _reason} = error ->
-        cleanup_tmp(tmp_path)
-
-        Logger.warning(
-          "failed to persist Flow LMDB replay-safe index #{index}: #{inspect(error)}"
-        )
-
-        error
     end
+  end
+
+  defp with_marker_lock(marker_path, fun) when is_function(fun, 0) do
+    :global.trans({{__MODULE__, :marker, marker_path}, self()}, fun, [node()])
   end
 
   defp cleanup_tmp(tmp_path) do

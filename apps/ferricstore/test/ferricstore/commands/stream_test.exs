@@ -988,6 +988,33 @@ defmodule Ferricstore.Commands.StreamTest do
       assert info["groups"] == 2
     end
 
+    test "XINFO STREAM rebuilds empty MKSTREAM metadata after local state clear" do
+      store = MockStore.make()
+      key = ustream()
+
+      assert :ok == Stream.handle("XGROUP", ["CREATE", key, "workers", "0", "MKSTREAM"], store)
+      Stream.clear_local_state()
+
+      info = Stream.handle("XINFO", ["STREAM", key], store)
+      assert info["length"] == 0
+      assert info["last-generated-id"] == "0-0"
+      assert info["groups"] == 1
+    end
+
+    test "empty stream keeps last generated id after local state clear" do
+      store = MockStore.make()
+      key = ustream()
+
+      assert "500-0" == Stream.handle("XADD", [key, "500-0", "f", "v"], store)
+      assert 1 == Stream.handle("XTRIM", [key, "MAXLEN", "0"], store)
+      Stream.clear_local_state()
+
+      assert {:error, _} = Stream.handle("XADD", [key, "100-0", "old", "id"], store)
+      new_id = Stream.handle("XADD", [key, "*", "new", "value"], store)
+      [new_ms, _new_seq] = new_id |> String.split("-") |> Enum.map(&String.to_integer/1)
+      assert new_ms >= 500
+    end
+
     test "XINFO wrong arguments" do
       store = MockStore.make()
       assert {:error, _} = Stream.handle("XINFO", [], store)

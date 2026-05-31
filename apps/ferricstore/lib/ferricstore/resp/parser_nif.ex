@@ -20,8 +20,7 @@ defmodule Ferricstore.Resp.ParserNif do
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-musl
       x86_64-unknown-linux-musl
-    ),
-    force_build: System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
+    )
 
   @spec parse(binary(), non_neg_integer()) :: {:ok, list(), binary()} | {:error, term()}
   def parse(_data, _max_value_size), do: :erlang.nif_error(:nif_not_loaded)

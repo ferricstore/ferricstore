@@ -1,5 +1,10 @@
 import Config
 
+# Keep test runs quiet by default. A warning floor prevents debug/info/notice
+# floods from dominating CI time and hiding real failures; tests that need to
+# assert logs should use ExUnit.CaptureLog or set Logger locally.
+config :logger, level: :warning
+
 # Use port 0 in test so the OS assigns an ephemeral port.
 # Tests that need the port call Application.get_env(:ferricstore, :port).
 config :ferricstore, :port, 0

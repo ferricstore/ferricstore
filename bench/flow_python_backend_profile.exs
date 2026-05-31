@@ -1,6 +1,35 @@
 Logger.configure(level: :warning)
 :logger.set_primary_config(:level, :warning)
 
+defmodule FlowPythonBackendProfileWARaftMetrics do
+  @moduledoc false
+
+  @interesting_gauges [
+    :"acceptor.commit.func",
+    :"leader.apply.func",
+    :"apply_log.latency_us",
+    :"storage.apply.func",
+    :"apply.queue"
+  ]
+
+  def count(_metric), do: :ok
+  def countv(_metric, _value), do: :ok
+
+  def gather({:raft, table, metric}, value)
+      when is_integer(value) and metric in @interesting_gauges do
+    :telemetry.execute(
+      [:ferricstore, :waraft, :internal_metric],
+      %{duration_us: value, value: value},
+      %{table: table, metric: metric}
+    )
+  catch
+    _kind, _reason -> :ok
+  end
+
+  def gather(_metric, _value), do: :ok
+  def gather_latency(metric, value), do: gather(metric, value)
+end
+
 defmodule FlowPythonBackendProfile do
   @moduledoc false
 
@@ -16,11 +45,34 @@ defmodule FlowPythonBackendProfile do
     [:ferricstore, :waraft, :batcher, :slot_flush],
     [:ferricstore, :waraft, :batcher, :hot_flush],
     [:ferricstore, :waraft, :segment_log, :append],
+    [:ferricstore, :waraft, :internal_metric],
+    [:ferricstore, :waraft, :storage, :apply_phase],
     [:ferricstore, :waraft, :apply_projection_cache, :compact],
     [:ferricstore, :waraft, :storage, :payload_fsync],
     [:ferricstore, :waraft, :storage_blocked],
     [:ferricstore, :waraft, :commit_bytes, :rejected]
   ]
+
+  @dbos_profile_defaults %{
+    queued_shape: "live",
+    transport: "many",
+    worker_api: "lowlevel",
+    worker_mode: "blocking",
+    partition_mode: "auto",
+    flows: "1000000",
+    workers: "16",
+    producers: "8",
+    partitions: "1024",
+    claim_batch_size: "1000",
+    claim_partition_batch_size: "16",
+    claim_block_ms: "5000",
+    claim_drain_block_ms: "50",
+    claim_drain_batches: "1",
+    create_batch_size: "1000",
+    complete_async_depth: "4",
+    shards: "16",
+    wake_coalesce_ms: "0"
+  }
 
   def run do
     run_backend(:waraft)
@@ -29,11 +81,19 @@ defmodule FlowPythonBackendProfile do
   defp run_backend(backend) do
     stop_started_apps()
 
-    table = telemetry_table(backend)
-    init_table(table)
+    telemetry_profile? = telemetry_profile?()
+    table = if telemetry_profile?, do: telemetry_table(backend), else: nil
     handler_id = "flow-python-backend-profile-#{backend}-#{System.unique_integer([:positive])}"
-    {:ok, _} = Application.ensure_all_started(:telemetry)
-    attach!(handler_id, table)
+
+    if telemetry_profile? do
+      init_table(table)
+      {:ok, _} = Application.ensure_all_started(:telemetry)
+      attach!(handler_id, table)
+    end
+
+    if telemetry_profile? and internal_waraft_profile?() do
+      :wa_raft_metrics.install(FlowPythonBackendProfileWARaftMetrics)
+    end
 
     data_dir =
       Path.join(
@@ -57,12 +117,12 @@ defmodule FlowPythonBackendProfile do
 
       IO.puts("\n=== backend=#{backend} status=#{status} elapsed_ms=#{elapsed_ms} ===")
       IO.write(output)
-      print_profile(table)
+      if telemetry_profile?, do: print_profile(table)
       maybe_flush_flow_projection()
       maybe_print_pending_keydir()
       maybe_print_storage_breakdown()
     after
-      :telemetry.detach(handler_id)
+      if telemetry_profile?, do: :telemetry.detach(handler_id)
       stop_started_apps()
       remove_data_dir(data_dir)
     end
@@ -76,7 +136,7 @@ defmodule FlowPythonBackendProfile do
     Application.put_env(:ferricstore, :data_dir, data_dir)
     Application.put_env(:ferricstore, :port, 0)
     Application.put_env(:ferricstore, :health_port, 0)
-    Application.put_env(:ferricstore, :shard_count, int_env("SHARDS", 16))
+    Application.put_env(:ferricstore, :shard_count, int_env_default("SHARDS", :shards))
     Application.put_env(:ferricstore, :protected_mode, false)
     Application.put_env(:ferricstore, :max_memory_bytes, 100_000_000_000)
     Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
@@ -106,6 +166,8 @@ defmodule FlowPythonBackendProfile do
     Application.delete_env(:ferricstore, :waraft_log_module)
     put_optional_int_env("WARAFT_COMMIT_BATCH_INTERVAL_MS", :waraft_commit_batch_interval_ms)
     put_optional_int_env("WARAFT_COMMIT_BATCH_MAX", :waraft_commit_batch_max)
+    put_optional_int_env("WARAFT_LOG_ROTATION_INTERVAL", :waraft_log_rotation_interval)
+    put_optional_int_env("WARAFT_LOG_ROTATION_KEEP", :waraft_log_rotation_keep)
 
     put_optional_int_env(
       "WARAFT_MAX_LOG_ENTRIES_PER_HEARTBEAT",
@@ -142,6 +204,15 @@ defmodule FlowPythonBackendProfile do
     )
   end
 
+  defp internal_waraft_profile? do
+    System.get_env("PROFILE_WARAFT_INTERNAL") in ["1", "true", "TRUE", "yes", "YES"]
+  end
+
+  defp telemetry_profile? do
+    System.get_env("PROFILE_TELEMETRY") in ["1", "true", "TRUE", "yes", "YES"] or
+      internal_waraft_profile?()
+  end
+
   defp benchmark_args(port) do
     [
       "examples/dbos_style_benchmark.py",
@@ -150,39 +221,41 @@ defmodule FlowPythonBackendProfile do
       "--mode",
       "queued",
       "--queued-shape",
-      env("QUEUED_SHAPE", "live"),
+      env_default("QUEUED_SHAPE", :queued_shape),
       "--transport",
-      env("TRANSPORT", "many"),
+      env_default("TRANSPORT", :transport),
       "--worker-api",
-      env("WORKER_API", "lowlevel"),
+      env_default("WORKER_API", :worker_api),
       "--worker-mode",
-      env("WORKER_MODE", "blocking"),
+      env_default("WORKER_MODE", :worker_mode),
       "--partition-mode",
-      "auto",
+      env_default("PARTITION_MODE", :partition_mode),
       "--flows",
-      env("FLOWS", "1000000"),
+      env_default("FLOWS", :flows),
       "--workers",
-      env("WORKERS", "16"),
+      env_default("WORKERS", :workers),
       "--producers",
-      env("PRODUCERS", "8"),
+      env_default("PRODUCERS", :producers),
       "--partitions",
-      env("PARTITIONS", "1024"),
+      env_default("PARTITIONS", :partitions),
       "--claim-batch-size",
-      env("CLAIM_BATCH_SIZE", "1000"),
+      env_default("CLAIM_BATCH_SIZE", :claim_batch_size),
       "--claim-partition-batch-size",
-      env("CLAIM_PARTITION_BATCH_SIZE", "16"),
+      env_default("CLAIM_PARTITION_BATCH_SIZE", :claim_partition_batch_size),
       "--claim-block-ms",
-      env("CLAIM_BLOCK_MS", "5000"),
+      env_default("CLAIM_BLOCK_MS", :claim_block_ms),
       "--claim-drain-block-ms",
-      env("CLAIM_DRAIN_BLOCK_MS", "50"),
+      env_default("CLAIM_DRAIN_BLOCK_MS", :claim_drain_block_ms),
+      "--claim-drain-batches",
+      env_default("CLAIM_DRAIN_BATCHES", :claim_drain_batches),
       "--create-batch-size",
-      env("CREATE_BATCH_SIZE", "1000"),
+      env_default("CREATE_BATCH_SIZE", :create_batch_size),
       "--complete-async-depth",
-      env("COMPLETE_ASYNC_DEPTH", "4"),
+      env_default("COMPLETE_ASYNC_DEPTH", :complete_async_depth),
       "--server-shards",
-      env("SHARDS", "16"),
+      env_default("SHARDS", :shards),
       "--wake-coalesce-ms",
-      "0",
+      env_default("WAKE_COALESCE_MS", :wake_coalesce_ms),
       "--claim-job-only"
     ]
   end
@@ -202,9 +275,14 @@ defmodule FlowPythonBackendProfile do
   defp record_event(table, event, measurements, metadata) do
     key = {event, event_group(event, metadata)}
     duration_us = duration_us(measurements)
-    batch_size = int_measurement(measurements, :batch_size) + int_measurement(measurements, :op_count)
+
+    batch_size =
+      int_measurement(measurements, :batch_size) + int_measurement(measurements, :op_count)
+
     count = int_measurement(measurements, :count)
     bytes = int_measurement(measurements, :batch_bytes) + int_measurement(measurements, :bytes)
+    queue_wait_us = int_measurement(measurements, :queue_wait_us)
+    flush_duration_us = int_measurement(measurements, :flush_duration_us)
 
     :ets.update_counter(
       table,
@@ -214,9 +292,11 @@ defmodule FlowPythonBackendProfile do
         {3, duration_us},
         {4, batch_size},
         {5, count},
-        {6, bytes}
+        {6, bytes},
+        {7, queue_wait_us},
+        {8, flush_duration_us}
       ],
-      {key, 0, 0, 0, 0, 0}
+      {key, 0, 0, 0, 0, 0, 0, 0}
     )
 
     update_max(table, {:max_batch, key}, batch_size)
@@ -243,6 +323,12 @@ defmodule FlowPythonBackendProfile do
     do:
       {Map.get(metadata, :kind, :unknown),
        if(Map.get(metadata, :new_segment), do: :new_segment, else: :same_segment)}
+
+  defp event_group([:ferricstore, :waraft, :internal_metric], metadata),
+    do: Map.get(metadata, :metric, :unknown)
+
+  defp event_group([:ferricstore, :waraft, :storage, :apply_phase], metadata),
+    do: {Map.get(metadata, :phase, :unknown), Map.get(metadata, :result, :unknown)}
 
   defp event_group([:ferricstore, :flow, :lmdb_writer, :flush], metadata),
     do: Map.get(metadata, :status, :unknown)
@@ -283,23 +369,27 @@ defmodule FlowPythonBackendProfile do
     rows =
       table
       |> :ets.tab2list()
-      |> Enum.filter(&match?({{event, _group}, _, _, _, _, _} when is_list(event), &1))
-      |> Enum.sort_by(fn {{event, group}, _events, _duration, _batch, _count, _bytes} ->
+      |> Enum.filter(&match?({{event, _group}, _, _, _, _, _, _, _} when is_list(event), &1))
+      |> Enum.sort_by(fn {{event, group}, _events, _duration, _batch, _count, _bytes, _queue,
+                          _flush} ->
         {Enum.join(Enum.map(event, &to_string/1), "."), inspect(group)}
       end)
 
     IO.puts("telemetry_profile:")
 
-    Enum.each(rows, fn {key = {event, group}, events, duration_us, batch_size, count, bytes} ->
+    Enum.each(rows, fn {key = {event, group}, events, duration_us, batch_size, count, bytes,
+                        queue_wait_us, flush_duration_us} ->
       max_batch = lookup(table, {:max_batch, key})
       avg_duration_us = if events > 0, do: div(duration_us, events), else: 0
       avg_batch = if events > 0, do: Float.round(batch_size / events, 2), else: 0.0
+      avg_queue_us = if events > 0, do: div(queue_wait_us, events), else: 0
+      avg_flush_us = if events > 0, do: div(flush_duration_us, events), else: 0
 
       IO.puts(
         "  event=#{Enum.join(Enum.map(event, &to_string/1), ".")} group=#{inspect(group)} " <>
           "events=#{events} count=#{count} batch_sum=#{batch_size} avg_batch=#{avg_batch} " <>
           "max_batch=#{max_batch} bytes=#{bytes} total_ms=#{Float.round(duration_us / 1000, 3)} " <>
-          "avg_us=#{avg_duration_us}"
+          "avg_us=#{avg_duration_us} queue_avg_us=#{avg_queue_us} flush_avg_us=#{avg_flush_us}"
       )
     end)
   end
@@ -530,6 +620,9 @@ defmodule FlowPythonBackendProfile do
     |> String.to_integer()
   end
 
+  defp int_env_default(name, key), do: String.to_integer(env_default(name, key))
+  defp env_default(name, key), do: env(name, profile_default!(key))
+  defp profile_default!(key), do: Map.fetch!(@dbos_profile_defaults, key)
   defp env(name, default), do: System.get_env(name) || default
 
   defp put_optional_int_env(env_name, app_key) do
@@ -560,7 +653,6 @@ defmodule FlowPythonBackendProfile do
         String.to_integer(value)
     end
   end
-
 end
 
 FlowPythonBackendProfile.run()

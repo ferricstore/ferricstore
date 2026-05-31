@@ -35,7 +35,7 @@ Benchmark shape unless noted:
 Tests for SET-1:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:215 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:250 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:258 \
@@ -48,7 +48,7 @@ Result: `5 tests, 0 failures`.
 Tests for SET-2 through SET-4:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/store/router_test.exs:143 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:2677 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:6297 \
@@ -61,7 +61,7 @@ Result: `5 tests, 0 failures`.
 Tests for SET-5:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:1276 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:1310 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:1237 \
@@ -74,7 +74,7 @@ Result: targeted namespace-window compact-shape tests passed.
 Tests for SET-6:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:276 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:1444
 ```
@@ -84,7 +84,7 @@ Result: targeted segment projection tests passed.
 Tests for SET-7:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:284 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:276 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:1444
@@ -95,7 +95,7 @@ Result: `3 tests, 0 failures`.
 Tests for SET-8:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:276 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:284 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:1444 \
@@ -107,7 +107,7 @@ Result: targeted segment projection tests passed.
 Tests for SET-9:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/store/shard_ets_test.exs:13 \
   apps/ferricstore/test/ferricstore/store/shard_ets_test.exs:51 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:276 \
@@ -164,14 +164,13 @@ Long-history soak command:
 
 ```sh
 rm -rf /tmp/ferricstore_flow_long_soak /tmp/ferricstore_flow_long_soak.log
-FERRICSTORE_BUILD=1 MIX_ENV=bench \
+MIX_ENV=bench \
   DATA_DIR=/tmp/ferricstore_flow_long_soak KEEP_DATA_DIR=true DURATION_SECONDS=3600 \
   TARGET_OPS_PER_SEC=50000 PAYLOAD_BYTES=5000 BLOB_SIDE_CHANNEL_THRESHOLD_BYTES=4096 \
   NORMAL_STEPS=50 LONG_FLOWS=1 LONG_STEPS=10000 SAMPLE_INTERVAL_SECONDS=60 \
   MIN_FREE_DISK_MB=300000 MAX_TOTAL_MEM_MB=96000 SHARDS=16 WORKERS=32 PRODUCERS=8 \
   PARTITIONS=4096 CREATE_MODE=pipeline CREATE_BATCH_SIZE=500 CREATE_INFLIGHT=4 \
   CLAIM_BATCH_SIZE=1000 CLAIM_PARTITION_BATCH_SIZE=64 APPLY_INFLIGHT=16 \
-  WORKER_MODE=blocking NORMAL_CLAIM_STATES_MODE=cursor LONG_CLAIM_STATES_MODE=all \
   mix run --no-start bench/flow_state_lmdb_soak.exs 2>&1 | tee /tmp/ferricstore_flow_long_soak.log
 ```
 
@@ -193,7 +192,7 @@ Long-history soak interpretation:
 Tests for Flow-3/Flow-4:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:23 \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:31 \
   apps/ferricstore/test/ferricstore/commands/flow_test.exs:51 \
@@ -206,7 +205,7 @@ Result: `5 tests, 0 failures`.
 Tests for Flow-5:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:37 \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:327 \
   apps/ferricstore/test/ferricstore/flow_test.exs:1439 \
@@ -219,7 +218,7 @@ Result: `5 tests, 0 failures`.
 Tests for Flow-6:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:44 \
   apps/ferricstore/test/ferricstore/flow_test.exs:3935 \
   apps/ferricstore/test/ferricstore/flow_test.exs:3985 \
@@ -231,7 +230,7 @@ Result: targeted claim aggregation tests passed.
 Tests for Flow-7:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:51 \
   apps/ferricstore/test/ferricstore/flow_test.exs:774 \
   apps/ferricstore/test/ferricstore/flow_test.exs:804 \
@@ -243,7 +242,7 @@ Result: `4 tests, 0 failures`.
 Tests for Flow-10:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:72 \
   apps/ferricstore/test/ferricstore/flow_test.exs:3330 \
   apps/ferricstore/test/ferricstore/flow_test.exs:6772
@@ -254,7 +253,7 @@ Result: `3 tests, 0 failures`.
 Tests for Flow-11:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:82
 ```
 
@@ -263,7 +262,7 @@ Result: targeted Flow history projection contract passed.
 Tests for Flow-12:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:91 \
   apps/ferricstore/test/ferricstore/flow_test.exs:5595 \
   apps/ferricstore/test/ferricstore/flow_test.exs:5649 \
@@ -275,7 +274,7 @@ Result: `4 tests, 0 failures`.
 Tests for Flow-13:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:99 \
   apps/ferricstore/test/ferricstore/flow_test.exs:3935 \
   apps/ferricstore/test/ferricstore/flow_test.exs:3985 \
@@ -287,7 +286,7 @@ Result: `4 tests, 0 failures`.
 Tests for Flow-14:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:106 \
   apps/ferricstore/test/ferricstore/flow_test.exs:1439 \
   apps/ferricstore/test/ferricstore/commands/flow_test.exs:51
@@ -298,7 +297,7 @@ Result: `3 tests, 0 failures`.
 Tests for Flow-15:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:113 \
   apps/ferricstore/test/ferricstore/flow_test.exs:5650 \
   apps/ferricstore/test/ferricstore/flow_test.exs:5832 \
@@ -310,7 +309,7 @@ Result: `4 tests, 0 failures`.
 Tests for Flow-16:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:121 \
   apps/ferricstore/test/ferricstore/flow_test.exs:1439 \
   apps/ferricstore/test/ferricstore/flow_test.exs:5650 \
@@ -322,7 +321,7 @@ Result: `4 tests, 0 failures`.
 Tests for Flow-8:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_test.exs:903 \
   apps/ferricstore/test/ferricstore/flow_test.exs:941 \
   apps/ferricstore/test/ferricstore/flow_test.exs:1022 \
@@ -335,7 +334,7 @@ Result: targeted claim pipeline/coalescing tests passed.
 Tests for Flow-9:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:60 \
   apps/ferricstore/test/ferricstore/flow_test.exs:926 \
   apps/ferricstore/test/ferricstore/flow_test.exs:965 \
@@ -347,7 +346,7 @@ Result: `4 tests, 0 failures`.
 Dedicated RESP Flow pipeline bench:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=bench \
+MIX_ENV=bench \
   FLOW_RESP_BACKLOG=10000 FLOW_RESP_ITER=30 FLOW_RESP_BATCH=100 \
   FLOW_RESP_SHARDS=16 FLOW_RESP_PARTITIONS=1024 \
   mix run --no-start bench/flow_resp_pipeline_bench.exs
@@ -388,7 +387,7 @@ FERRICSTORE_BUILD=1 MIX_ENV=bench \
 Tests for Streams-1:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore_server/test/ferricstore_server/integration/stream_tcp_test.exs:506 \
   apps/ferricstore_server/test/ferricstore_server/commands/blocking_tracking_test.exs:86 \
   apps/ferricstore_server/test/ferricstore_server/commands/blocking_tracking_test.exs:124 \
@@ -400,7 +399,7 @@ Result: targeted stream blocking tests passed.
 Tests for Streams-2:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:768 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:784 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:805 \
@@ -415,7 +414,7 @@ Result: targeted stream delete/trim tests passed.
 Tests for Streams-3:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1144 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1098 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1125 \
@@ -427,7 +426,7 @@ Result: targeted XREADGROUP tests passed.
 Tests for Streams-4:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:580 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:620 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:632
@@ -438,7 +437,7 @@ Result: `3 tests, 0 failures`.
 Tests for Streams-5:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1041 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1032 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1084 \
@@ -450,7 +449,7 @@ Result: `4 tests, 0 failures`.
 Tests for Streams-6:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1057 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1146 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:1084
@@ -461,7 +460,7 @@ Result: `3 tests, 0 failures`.
 Tests for Streams-7:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:781 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:833 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:685 \
@@ -473,7 +472,7 @@ Result: `4 tests, 0 failures`.
 Tests for Streams-8:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:574 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:525 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:544 \
@@ -485,7 +484,7 @@ Result: `4 tests, 0 failures`.
 Tests for Streams-9:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:781 \
   apps/ferricstore/test/ferricstore/commands/stream_test.exs:833
 ```
@@ -495,7 +494,7 @@ Result: `2 tests, 0 failures`.
 Short local Stream bench after Streams-9:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=bench BENCH_WARMUP=0 BENCH_TIME=1 BENCH_PARALLEL=1 \
+MIX_ENV=bench BENCH_WARMUP=0 BENCH_TIME=1 BENCH_PARALLEL=1 \
   STREAM_BENCH_SIZES=1000 STREAM_BENCH_BATCH_DEPTH=100 \
   mix run --no-start bench/stream_bench.exs
 ```
@@ -514,7 +513,7 @@ about `155-158 pipelines/sec` for 100 commands.
 Tests for Pipeline-1:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:188 \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:217 \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:534 \
@@ -538,7 +537,7 @@ Result: `4 tests, 0 failures`.
 Tests for PubSub-1:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:29 \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:63 \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:154
@@ -549,7 +548,7 @@ Result: `3 tests, 0 failures`.
 Tests for PubSub-2:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs
 ```
 
@@ -558,7 +557,7 @@ Result: `22 tests, 0 failures`.
 Tests for PubSub-3:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:71 \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:63 \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:181
@@ -569,7 +568,7 @@ Result: `3 tests, 0 failures`.
 Tests for PubSub-4:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:95 \
   apps/ferricstore_server/test/ferricstore_server/pubsub_test.exs:107 \
   apps/ferricstore_server/test/ferricstore_server/pubsub_test.exs:124 \
@@ -581,7 +580,7 @@ Result: targeted Pub/Sub bulk API tests passed.
 Tests for PubSub-5:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:192 \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs:181
 ```
@@ -591,7 +590,7 @@ Result: `2 tests, 0 failures`.
 Tests for PubSub-6/PubSub-7:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/pubsub_commands_test.exs \
   apps/ferricstore_server/test/ferricstore_server/pubsub_test.exs \
   apps/ferricstore_server/test/ferricstore_server/pubsub_bug_hunt_test.exs \
@@ -603,7 +602,7 @@ Result: `118 tests, 0 failures`.
 Local Pub/Sub bench:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=bench mix run --no-start bench/pubsub_bench.exs
+MIX_ENV=bench mix run --no-start bench/pubsub_bench.exs
 ```
 
 Result:
@@ -649,7 +648,7 @@ After PubSub-6/PubSub-7 rerun:
 Tests for Sets-1:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/set_test.exs \
   apps/ferricstore/test/ferricstore/commands/set_store_commands_test.exs
 ```
@@ -659,7 +658,7 @@ Result: `170 tests, 0 failures`.
 Tests for Sets-2:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/set_test.exs:73 \
   apps/ferricstore/test/ferricstore/commands/set_test.exs:217 \
   apps/ferricstore/test/ferricstore/commands/set_test.exs:25 \
@@ -683,7 +682,7 @@ Result: `4 tests, 0 failures`.
 Tests for Hashes-1/Hashes-2:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/hash_test.exs:122 \
   apps/ferricstore/test/ferricstore/commands/hash_test.exs:112 \
   apps/ferricstore/test/ferricstore/commands/hash_test.exs:132 \
@@ -712,7 +711,7 @@ Latest targeted subsets passed; last metadata-write run: `4 tests, 0 failures`.
 Tests for ZSets-1 through ZSets-3:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/sorted_set_test.exs:168 \
   apps/ferricstore/test/ferricstore/commands/sorted_set_test.exs:159 \
   apps/ferricstore/test/ferricstore/commands/sorted_set_test.exs:87 \
@@ -734,7 +733,7 @@ Result: latest ZSets-3 targeted run: `6 tests, 0 failures`.
 Tests for TopK-1:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore/test/ferricstore/commands/topk_test.exs:394 \
   apps/ferricstore/test/ferricstore/commands/topk_test.exs:384 \
   apps/ferricstore/test/ferricstore/commands/topk_test.exs:503
@@ -751,7 +750,7 @@ socket pressure is intentionally not part of this round.
 Benchmark command:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore_server/test/ferricstore_server/bench/tcp_pipeline_profile_test.exs \
   --include bench
 ```
@@ -777,7 +776,7 @@ Kept checks:
 Targeted guard tests:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=test mix test \
+MIX_ENV=test mix test \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:189 \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:198 \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:209
@@ -841,10 +840,10 @@ PYTHONPATH=src pytest -q \
   tests/test_async_sdk.py \
   tests/test_async_state_machine_benchmark.py
 
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs:238
 
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/flow_test.exs:3223
 ```
 
@@ -915,7 +914,7 @@ Correctness fixes:
 Targeted tests:
 
 ```sh
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/flow/claim_waiters_test.exs \
   apps/ferricstore/test/ferricstore/flow_test.exs:1154 \
   apps/ferricstore/test/ferricstore/flow_test.exs:1181 \
@@ -992,16 +991,16 @@ Changes tested:
 Targeted tests:
 
 ```sh
-FERRICSTORE_BUILD=1 mix compile --warnings-as-errors --no-validate-compile-env
+mix compile --warnings-as-errors --no-validate-compile-env
 
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/data_dir_test.exs \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs \
   apps/ferricstore/test/ferricstore/raft/waraft_segment_log_test.exs \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:710 \
   apps/ferricstore_server/test/ferricstore_server/connection_test.exs:760
 
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:2274 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:2292 \
   apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs:7422 \
@@ -1069,11 +1068,11 @@ Changes tested:
 Targeted tests:
 
 ```sh
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/flow_write_contract_test.exs \
   apps/ferricstore/test/ferricstore/flow/history_projector_test.exs --max-failures 3
 
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/flow_test.exs:847 \
   apps/ferricstore/test/ferricstore/flow_test.exs:1006 \
   apps/ferricstore/test/ferricstore/flow_test.exs:1849 \
@@ -1138,7 +1137,7 @@ Change:
 Targeted tests:
 
 ```sh
-FERRICSTORE_BUILD=1 mix test --no-start \
+mix test --no-start \
   test/ferricstore/raft/waraft_backend_test.exs:8487 \
   test/ferricstore/raft/waraft_backend_test.exs:8520 \
   test/ferricstore/raft/waraft_backend_test.exs:8600 \
@@ -1188,7 +1187,7 @@ Change:
 Targeted tests:
 
 ```sh
-FERRICSTORE_BUILD=1 mix test \
+mix test \
   apps/ferricstore/test/ferricstore/flow_test.exs:6989 \
   apps/ferricstore/test/ferricstore/flow_test.exs:7146 \
   --max-failures 3
@@ -1233,7 +1232,7 @@ LMDB lag, memory, and storage behavior.
 DBOS-style 100K worker profile:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=bench FLOWS=100000 SHARDS=16 WORKERS=16 \
+MIX_ENV=bench FLOWS=100000 SHARDS=16 WORKERS=16 \
   PRODUCERS=8 TRANSPORT=many CLAIM_BLOCK_MS=5000 CLAIM_DRAIN_BLOCK_MS=50 \
   mix run --no-start bench/flow_python_backend_profile.exs
 ```
@@ -1250,14 +1249,13 @@ Result:
 5-minute clean Flow soak:
 
 ```sh
-FERRICSTORE_BUILD=1 MIX_ENV=bench \
+MIX_ENV=bench \
   DATA_DIR=/tmp/ferricstore_flow_soak_current KEEP_DATA_DIR=false \
   DURATION_SECONDS=300 TARGET_OPS_PER_SEC=50000 PAYLOAD_BYTES=1000 \
   NORMAL_STEPS=50 LONG_FLOWS=1 LONG_STEPS=10000 SAMPLE_INTERVAL_SECONDS=30 \
   MIN_FREE_DISK_MB=5000 MAX_TOTAL_MEM_MB=64000 SHARDS=16 WORKERS=32 PRODUCERS=8 \
   PARTITIONS=4096 CREATE_MODE=many CREATE_INFLIGHT=64 \
   CLAIM_BATCH_SIZE=1000 CLAIM_PARTITION_BATCH_SIZE=32 APPLY_INFLIGHT=8 \
-  WORKER_MODE=blocking NORMAL_CLAIM_STATES_MODE=any LONG_CLAIM_STATES_MODE=any \
   FLOW_LATENCY_SAMPLE_RATE=10 \
   mix run --no-start bench/flow_state_lmdb_soak.exs
 ```
@@ -1297,3 +1295,207 @@ Conclusion:
 - The soak is slightly below the requested `50K/sec` target, but operationally
   clean. Remaining work is latency/throughput tuning rather than correctness or
   projection lag repair.
+
+## DBOS-Style Audit-Fix Performance Repair, 2026-05-31
+
+Context: follow-up audit fixes introduced two performance risks on the Flow
+DBOS-style path:
+
+- WARaft trim became synchronous for correctness; the first implementation made
+  the segment provider physically rewrite trimmed files on the commit path.
+- A ClaimWaiters wake optimization scanned the waiter table for large ready
+  fanout.
+
+Fixes:
+
+- Keep synchronous WARaft trim correctness, but make trim persist a logical
+  trim floor and remove old entries from in-memory/offset views only. Physical
+  segment cleanup is no longer in the commit path; recovery honors the durable
+  floor and will not replay trimmed entries.
+- Drop the waiter-table scan optimization. It benchmarked worse than direct
+  ready-bucket lookups.
+
+Targeted tests:
+
+```sh
+mix test \
+  apps/ferricstore/test/ferricstore/raft/waraft_segment_log_test.exs \
+  apps/ferricstore/test/ferricstore/flow/claim_waiters_test.exs
+```
+
+Results:
+
+- Segment log: `38 tests, 0 failures`.
+- Claim waiters: `22 tests, 0 failures`.
+
+100K DBOS-style repair run:
+
+```sh
+MIX_ENV=bench FLOWS=100000 SHARDS=16 WORKERS=16 \
+  PRODUCERS=8 TRANSPORT=many CLAIM_BLOCK_MS=5000 CLAIM_DRAIN_BLOCK_MS=50 \
+  mix run --no-start bench/flow_python_backend_profile.exs
+```
+
+Result:
+
+- End-to-end throughput: `51,359 flows/sec`.
+- Create throughput: `56,408/sec`.
+- Process throughput: `51,409/sec`.
+- Claim calls: `864`, empty claims: `628`, average claim batch: `115.7`.
+- Log: `bench/results/dbos_style_after_audit_perf_repair_100k_20260531T092201Z.log`.
+
+Rejected experiment:
+
+- One non-blocking partition probe followed by one `BLOCK` claim across all
+  owned partitions reduced claim calls to `238`, but throughput collapsed to
+  `15,716 flows/sec`.
+- Reason: multi-partition blocking over all owned partitions is too expensive
+  for this hot worker benchmark, even though it reduces empty polling.
+- Log: `bench/results/dbos_style_one_probe_then_block_100k_20260531T091944Z.log`.
+
+Conclusion:
+
+- The physical trim rewrite was a real bug/performance conflict and is fixed
+  without weakening restart correctness.
+- The waiter-table scan was a real regression and should stay out.
+- The first repaired run returned to the `50K-60K/sec` target band, though
+  below the best May 27 run (`55,653/sec`). Follow-up repeats below showed
+  local variance; the remaining difference is mostly WARaft hot-flush time, not
+  segment append bytes.
+
+Follow-up repair:
+
+- A clean pre-audit worktree rerun with the current Python SDK shape produced
+  `49,301 flows/sec`, so the full drop from the older `55K/sec` run was not
+  reproduced before the audit fixes either.
+- A failed current benchmark exposed build contamination from the pre-audit
+  worktree: WARaft BEAM debug paths referenced `/tmp/ferricstore-preaudit`, and
+  a stale segment-log module missed `reset_disk_to_position/2`. Cleaning
+  `_build/prod` and `_build/bench` restored the correct export.
+- The remaining reproducible short-run cost was background LMDB projection
+  flush contention. The writer now defers timer and replay-safe flushes while
+  writes are still arriving, bounded by a `5s` max projection lag; the default
+  quiet window is `1s`.
+
+Tests:
+
+```sh
+mix test apps/ferricstore/test/ferricstore/flow_lmdb_test.exs
+mix test apps/ferricstore/test/ferricstore/raft/waraft_segment_log_test.exs
+mix test apps/ferricstore/test/ferricstore/flow/claim_waiters_test.exs
+```
+
+Results:
+
+- Flow LMDB: `130 tests, 0 failures`.
+- Segment log: `38 tests, 0 failures`.
+- Claim waiters: `22 tests, 0 failures`.
+
+100K DBOS-style results after adaptive LMDB flush and opt-in internal profiling:
+
+- Best repeat: `52,305 flows/sec`, hot_flush avg `46.2ms`.
+- Median of three local repeats: ~`48.3K flows/sec`.
+- Worst repeat: `43,359 flows/sec`, with one small LMDB flush and hot_flush
+  avg `59.5ms`; this looks like local scheduler/disk noise rather than a
+  correctness-fix regression.
+- Two of the three repeats had `0` LMDB flush events during the hot profile.
+- Logs:
+  - `bench/results/dbos_style_no_internal_profile_quiet1s_100k_20260531T095122Z.log`
+  - `bench/results/dbos_style_no_internal_profile_quiet1s_repeat_100k_20260531T095146Z.log`
+  - `bench/results/dbos_style_no_internal_profile_quiet1s_repeat2_100k_20260531T095212Z.log`
+
+Clean default validation after LMDB shutdown fix:
+
+- Problem observed: raising `flow_lmdb_max_concurrent_flushes` to an adaptive
+  default bounded shutdown but cut the 1M DBOS-style run to ~`29K flows/sec`.
+- Final fix: keep steady-state LMDB projection flushes serial by default,
+  request `flush_all` concurrently when explicitly called, and skip the
+  rebuildable lagged LMDB projection drain during node shutdown.
+- Clean no-arg command:
+
+```sh
+MIX_ENV=bench mix run --no-start bench/flow_python_backend_profile.exs
+```
+
+Result:
+
+- Created/completed: `1,000,000 / 1,000,000`, duplicates: `0`.
+- Create throughput: `50,825 flows/sec`.
+- Process throughput: `49,368 flows/sec`.
+- End-to-end throughput: `49,346 flows/sec`.
+- Shutdown exited cleanly with no Flow LMDB flush timeout.
+- LMDB flush profile during workload: `6` flushes, `80,000` projected ops,
+  average batch `13,333`.
+
+DBOS-style benchmark profiler/arg audit:
+
+- The benchmark telemetry profiler is now opt-in through `PROFILE_TELEMETRY=1`
+  (or `PROFILE_WARAFT_INTERNAL=1`). Clean runs no longer attach the ETS
+  telemetry collector by default.
+- No-profiler controls showed the remaining gap was not mostly logs or
+  profiling: 100K default runs landed in the `47K-52K/sec` band depending on
+  local scheduler/disk noise; a no-BLOCK control was only ~`51K/sec`.
+- A rejected short-run arg tweak, `PRODUCERS=16`, reached `56.2K/sec` on 100K
+  but collapsed the 1M run to ~`21.4K/sec`, so it is not a production/default
+  fix.
+- Real planner fix: the low-level DBOS-style benchmark now uses shard-aware
+  auto-partition ownership, matching the SDK worker planner. TDD added a unit
+  test proving a single auto-partition claim page stays on one server shard.
+- Default-profile fix: `bench/flow_python_backend_profile.exs` now has one
+  guarded DBOS production profile for the no-arg benchmark path. The profile is
+  `1M` flows, `16` workers, `8` producers, `1024` auto partitions, claim page
+  size `16`, one drain batch, async complete depth `4`, and `16` server shards.
+  This avoids hidden run-to-run drift from scattered literal defaults.
+- Validation after the planner fix:
+  - 100K default: `50,079 flows/sec`.
+  - 1M default: `51,735 flows/sec`.
+  - 1M clean no-arg profile after centralized defaults: `50,023 flows/sec`,
+    created/completed `1,000,000 / 1,000,000`, duplicates `0`.
+  - 1M with `CLAIM_PARTITION_BATCH_SIZE=32`: `51,400 flows/sec`, so the default
+    `16` remains better for this profile.
+
+## Flow Claim-Due Ordered Native Runs, 2026-06-01
+
+Problem:
+
+- Multi-state `FLOW.CLAIM_DUE` used native due candidates, then regrouped them
+  in Elixir. That extra grouping could reintroduce state/key bias and added
+  avoidable hot-path allocation after the native scan had already produced
+  ordered candidates.
+
+Fix:
+
+- The native ordered-index claim scan now merges due candidates by score across
+  due keys and returns adjacent ordered runs directly:
+  `{due_key, [{member, score}, ...]}`.
+- The state-machine apply path consumes those ordered runs as-is. This preserves
+  global due-time order while avoiding the Elixir regrouping pass.
+
+TDD / verification:
+
+```sh
+mix test apps/ferricstore/test/ferricstore/flow/ordered_index_test.exs --max-failures 3
+mix test apps/ferricstore/test/ferricstore/flow_test.exs:1268 --max-failures 1
+mix test apps/ferricstore/test/ferricstore/flow_test.exs --max-failures 3
+(cd apps/ferricstore/native/ferricstore_bitcask && cargo test)
+```
+
+Results:
+
+- Native ordered-index wrapper: `20 tests, 0 failures`.
+- Focused multi-state fairness regression: `1 test, 0 failures`.
+- Flow suite: `212 tests, 0 failures`.
+- Native bitcask crate: `564 tests, 0 failures`.
+
+Clean DBOS-style default benchmark:
+
+```sh
+MIX_ENV=bench mix run --no-start bench/flow_python_backend_profile.exs
+```
+
+Result:
+
+- Created/completed: `1,000,000 / 1,000,000`, duplicates: `0`.
+- Create throughput: `56,892 flows/sec`.
+- Process throughput: `56,355 flows/sec`.
+- End-to-end throughput: `56,329 flows/sec`.

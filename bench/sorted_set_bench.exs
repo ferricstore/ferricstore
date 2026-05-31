@@ -3,7 +3,7 @@
 # Current sorted-set baseline.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/sorted_set_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/sorted_set_bench.exs
 #
 # Options:
 #   ZSET_BENCH_SIZES=100,1000,5000

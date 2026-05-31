@@ -312,6 +312,11 @@ defmodule Ferricstore.MemoryGuardTest do
   # ---------------------------------------------------------------------------
 
   describe "configuration" do
+    test "parses macOS sysctl host memory output" do
+      assert MemoryGuard.parse_sysctl_memsize("137438953472\n") == 137_438_953_472
+      assert MemoryGuard.parse_sysctl_memsize("not-a-number\n") == nil
+    end
+
     test "custom interval is respected" do
       test_pid = self()
       handler_id = "test-custom-interval-#{System.unique_integer([:positive])}"

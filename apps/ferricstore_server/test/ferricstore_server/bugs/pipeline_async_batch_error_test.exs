@@ -600,7 +600,9 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
              Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
 
     assert_receive {:pipeline_response, response}
-    assert response =~ "-ERR internal error:"
+    assert response =~ "-ERR internal error"
+    refute response =~ "write key latch timeout"
+    refute response =~ "RuntimeError"
     assert response =~ "+PONG\r\n"
   end
 

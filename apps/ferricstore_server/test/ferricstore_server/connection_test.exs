@@ -186,6 +186,35 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "pipelined GET preserves non-binary string values and keeps connection open", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "pipeline-get-non-binary:" <> Integer.to_string(System.unique_integer([:positive]))
+    missing_key = key <> ":missing"
+
+    send_command(sock, ["INCR", key])
+    assert [1] = recv_values(sock, 1)
+
+    send_command(sock, ["GET", key])
+    [single_get] = recv_values(sock, 1)
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["GET", key]),
+        Encoder.encode(["GET", missing_key])
+      ])
+
+    send_raw(sock, pipeline)
+    assert [^single_get, nil] = recv_values(sock, 2)
+
+    send_command(sock, ["PING"])
+    assert [{:simple, "PONG"}] = recv_values(sock, 1)
+
+    :gen_tcp.close(sock)
+  end
+
   test "BLPOP timeout preserves PING sent while the connection is blocked", %{port: port} do
     sock = connect(port)
     send_raw(sock, hello3())
@@ -200,6 +229,108 @@ defmodule FerricstoreServer.ConnectionTest do
     assert [nil, {:simple, "PONG"}] = recv_values(sock, 2)
 
     :gen_tcp.close(sock)
+  end
+
+  test "blocked command buffer overflow returns error and closes connection", %{port: port} do
+    old_max = Application.get_env(:ferricstore_server, :blocked_command_buffer_max_bytes)
+    Application.put_env(:ferricstore_server, :blocked_command_buffer_max_bytes, 16)
+
+    on_exit(fn ->
+      case old_max do
+        nil ->
+          Application.delete_env(:ferricstore_server, :blocked_command_buffer_max_bytes)
+
+        value ->
+          Application.put_env(:ferricstore_server, :blocked_command_buffer_max_bytes, value)
+      end
+    end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "blocked-overflow:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, ["BLPOP", key, "2"])
+    Process.sleep(20)
+    send_command(sock, ["ECHO", String.duplicate("x", 64)])
+
+    assert [{:error, reason}] = recv_values(sock, 1)
+    assert reason =~ "blocked command buffer overflow"
+    assert closed_or_eof?(sock)
+  end
+
+  test "active once blocked BLPOP client disconnect unregisters waiter promptly", %{port: port} do
+    old_mode = Application.get_env(:ferricstore, :socket_active_mode)
+    Application.put_env(:ferricstore, :socket_active_mode, :once)
+
+    on_exit(fn ->
+      case old_mode do
+        nil -> Application.delete_env(:ferricstore, :socket_active_mode)
+        value -> Application.put_env(:ferricstore, :socket_active_mode, value)
+      end
+    end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "blocked-active-once:" <> Integer.to_string(System.unique_integer([:positive]))
+    send_command(sock, ["BLPOP", key, "5"])
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> Ferricstore.Waiters.count(key) == 1 end,
+      "active once waiter registered",
+      1_000,
+      10
+    )
+
+    :gen_tcp.close(sock)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> Ferricstore.Waiters.count(key) == 0 end,
+      "active once waiter unregistered after disconnect",
+      500,
+      10
+    )
+  end
+
+  test "active once blocked BLPOP re-arms socket and observes disconnect before timeout", %{
+    port: port
+  } do
+    old_mode = Application.get_env(:ferricstore, :socket_active_mode)
+    Application.put_env(:ferricstore, :socket_active_mode, :once)
+
+    on_exit(fn ->
+      case old_mode do
+        nil -> Application.delete_env(:ferricstore, :socket_active_mode)
+        value -> Application.put_env(:ferricstore, :socket_active_mode, value)
+      end
+    end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "blocked-active-once-rearm:" <> Integer.to_string(System.unique_integer([:positive]))
+    send_command(sock, ["BLPOP", key, "30"])
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> Ferricstore.Waiters.count(key) == 1 end,
+      "active once waiter registered",
+      1_000,
+      10
+    )
+
+    :ok = send_command(sock, ["PING"])
+    :gen_tcp.close(sock)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> Ferricstore.Waiters.count(key) == 0 end,
+      "active once waiter unregistered promptly after queued input and disconnect",
+      30,
+      10
+    )
   end
 
   test "CLIENT KILL ID interrupts a blocked BLPOP connection", %{port: port} do
@@ -252,6 +383,16 @@ defmodule FerricstoreServer.ConnectionTest do
            "connection documentation must not advertise the old per-command Task pipeline model"
   end
 
+  test "sequential pipeline fallback does not TCP-cork blocking commands" do
+    pipeline_source = File.read!("lib/ferricstore_server/connection/pipeline.ex")
+
+    assert pipeline_source =~ "sequential_cork_safe?(commands)",
+           "restricted-ACL sequential fallback must not cork a batch containing a blocking command"
+
+    assert pipeline_source =~ "pipeline_contains_blocking_command?(commands)",
+           "blocking commands need an explicit uncork boundary so earlier replies flush before the wait"
+  end
+
   test "generic pure fallback coalesces a pipeline into one socket send" do
     ctx = FerricStore.Instance.get(:default)
 
@@ -287,6 +428,34 @@ defmodule FerricstoreServer.ConnectionTest do
 
     assert_received {:send_response, :fake_socket, :fake_transport, "+PONG\r\n+PONG\r\n+PONG\r\n"}
     refute_received {:send_response, _, _, _}
+  end
+
+  test "generic pure fallback stops when coalesced socket send fails" do
+    ctx = FerricStore.Instance.get(:default)
+
+    state = %FerricstoreServer.Connection{
+      socket: :fake_socket,
+      transport: :fake_transport,
+      instance_ctx: ctx,
+      stats_counter: ctx.stats_counter,
+      authenticated: true,
+      require_auth: false,
+      acl_cache: :full_access
+    }
+
+    commands = [
+      {:command, "PING", [], :ping, []},
+      {:command, "PING", [], :ping, []}
+    ]
+
+    send_response = fn _socket, _transport, _iodata -> {:error, :closed} end
+
+    handle_command = fn _cmd, _state ->
+      flunk("pure fallback pipeline should not dispatch through sequential handle_command/2")
+    end
+
+    assert {:quit, _state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command, send_response)
   end
 
   test "single FLOW.CREATE command dispatches through typed AST", %{port: port} do
@@ -367,6 +536,50 @@ defmodule FerricstoreServer.ConnectionTest do
              [_event_id, %{"event" => "signaled", "signal" => "payment_received"}] -> true
              _entry -> false
            end)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "single FLOW terminal query commands dispatch through typed AST", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    type = "empty-terminal-flow:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, ["FLOW.TERMINALS", type, "COUNT", "10"])
+    send_command(sock, ["FLOW.FAILURES", type, "COUNT", "10"])
+
+    assert [[], []] = recv_values(sock, 2)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipelined FETCH_OR_COMPUTE flushes compute owner before a same-key waiter blocks", %{
+    port: port
+  } do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "pipeline-fetch-compute:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    on_exit(fn ->
+      _ = Ferricstore.FetchOrCompute.fetch_or_compute_error(key, "test cleanup")
+    end)
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["FETCH_OR_COMPUTE", key, "5000", "hint"]),
+        Encoder.encode(["FETCH_OR_COMPUTE", key, "5000", "hint"])
+      ])
+
+    send_raw(sock, pipeline)
+
+    assert [["compute", "hint"]] = recv_values(sock, 1)
+
+    assert :ok = Ferricstore.FetchOrCompute.fetch_or_compute_result(key, "computed-value", 5_000)
+    assert [["hit", "computed-value"]] = recv_values(sock, 1)
 
     :gen_tcp.close(sock)
   end
@@ -728,6 +941,8 @@ defmodule FerricstoreServer.ConnectionTest do
       Encoder.encode([
         "FLOW.CLAIM_DUE",
         type,
+        "STATE",
+        "queued",
         "WORKER",
         "worker-a",
         "PARTITION",
@@ -749,6 +964,70 @@ defmodule FerricstoreServer.ConnectionTest do
     assert_receive {:pipeline_claim_due_batch, %{commands: 3, groups: 1, coalesced_calls: 1},
                     %{source: :resp_pipeline}},
                    1_000
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipelined FLOW.CLAIM_DUE preserves partition lists and named value hydration", %{
+    port: port
+  } do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    suffix = Integer.to_string(System.unique_integer([:positive]))
+    type = "pipeline-claim-values:" <> suffix
+    partition_a = "tenant-a:" <> suffix
+    partition_b = "tenant-b:" <> suffix
+    partition_c = "tenant-c:" <> suffix
+
+    for {partition, idx} <- [{partition_a, 1}, {partition_b, 2}, {partition_c, 3}] do
+      assert :ok =
+               FerricStore.flow_create("#{type}:#{idx}",
+                 type: type,
+                 partition_key: partition,
+                 values: %{"payment" => "payment-#{idx}", "ignored" => "ignored-#{idx}"},
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+    end
+
+    claim =
+      Encoder.encode([
+        "FLOW.CLAIM_DUE",
+        type,
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-a",
+        "PARTITIONS",
+        "2",
+        partition_a,
+        partition_b,
+        "LIMIT",
+        "2",
+        "NOW",
+        "2000",
+        "NOPAYLOAD",
+        "VALUE",
+        "payment"
+      ])
+
+    send_raw(sock, IO.iodata_to_binary([claim, claim]))
+
+    assert [claimed, []] = recv_values(sock, 2)
+    assert length(claimed) == 2
+
+    claimed_by_partition = Map.new(claimed, &{Map.fetch!(&1, "partition_key"), &1})
+
+    assert Map.keys(claimed_by_partition) |> MapSet.new() ==
+             MapSet.new([partition_a, partition_b])
+
+    refute Map.has_key?(claimed_by_partition, partition_c)
+
+    assert %{"payment" => "payment-1"} = claimed_by_partition[partition_a]["values"]
+    assert %{"payment" => "payment-2"} = claimed_by_partition[partition_b]["values"]
+    refute Map.has_key?(claimed_by_partition[partition_a]["values"], "ignored")
 
     :gen_tcp.close(sock)
   end
@@ -803,6 +1082,152 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "pipelined FLOW.CLAIM_DUE BLOCK 0 waits forever and holds later commands", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-forever-claim:" <> Integer.to_string(System.unique_integer([:positive]))
+    id = "#{type}:#{System.unique_integer([:positive])}"
+
+    claim =
+      Encoder.encode([
+        "FLOW.CLAIM_DUE",
+        type,
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        partition,
+        "LIMIT",
+        "1",
+        "RETURN",
+        "JOBS_COMPACT",
+        "BLOCK",
+        "0"
+      ])
+
+    send_raw(sock, IO.iodata_to_binary([claim, Encoder.encode(["PING"])]))
+
+    assert {:error, :timeout} = :gen_tcp.recv(sock, 0, 80)
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               state: "queued",
+               now_ms: 1_000,
+               run_at_ms: 1_000
+             )
+
+    assert [[[^id, ^partition, lease_token, fencing_token]], {:simple, "PONG"}] =
+             recv_values(sock, 2)
+
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK returns an error when waiter row cap is reached", %{port: port} do
+    previous_max = Application.get_env(:ferricstore, :flow_claim_due_max_waiter_rows)
+    Application.put_env(:ferricstore, :flow_claim_due_max_waiter_rows, 1)
+
+    occupying_keys = Ferricstore.Flow.ClaimWaiters.wait_keys("occupied", "queued", 0, "p1")
+    deadline = System.monotonic_time(:millisecond) + 5_000
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    try do
+      assert :ok = Ferricstore.Flow.ClaimWaiters.register(occupying_keys, self(), deadline)
+
+      send_command(sock, [
+        "FLOW.CLAIM_DUE",
+        "blocked-cap:" <> Integer.to_string(System.unique_integer([:positive])),
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        "tenant:" <> Integer.to_string(System.unique_integer([:positive])),
+        "LIMIT",
+        "1",
+        "BLOCK",
+        "1000"
+      ])
+
+      assert [{:error, "ERR max blocked claim_due waiters reached"}] = recv_values(sock, 1)
+    after
+      :gen_tcp.close(sock)
+      Ferricstore.Flow.ClaimWaiters.unregister(occupying_keys, self())
+
+      case previous_max do
+        nil -> Application.delete_env(:ferricstore, :flow_claim_due_max_waiter_rows)
+        value -> Application.put_env(:ferricstore, :flow_claim_due_max_waiter_rows, value)
+      end
+    end
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK re-registers after a spurious wake", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-reregister-claim:" <> Integer.to_string(System.unique_integer([:positive]))
+    id = "#{type}:#{System.unique_integer([:positive])}"
+
+    try do
+      send_command(sock, [
+        "FLOW.CLAIM_DUE",
+        type,
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        partition,
+        "LIMIT",
+        "1",
+        "RETURN",
+        "JOBS_COMPACT",
+        "BLOCK",
+        "3000"
+      ])
+
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        "RESP claim_due waiter registered",
+        100,
+        5
+      )
+
+      assert 1 = Ferricstore.Flow.ClaimWaiters.notify_ready(type, "queued", 0, partition, 1)
+
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        "RESP claim_due waiter re-registered after empty wake",
+        200,
+        10
+      )
+
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition,
+                 state: "queued",
+                 now_ms: 1_000,
+                 run_at_ms: 1_000
+               )
+
+      assert [[[^id, ^partition, lease_token, fencing_token]]] = recv_values(sock, 1)
+      assert is_binary(lease_token)
+      assert is_integer(fencing_token)
+    after
+      :gen_tcp.close(sock)
+    end
+  end
+
   test "FLOW.CLAIM_DUE BLOCK performs one empty claim attempt before waiting", %{port: port} do
     handler_id =
       {__MODULE__, self(), :flow_claim_due_block_once, System.unique_integer([:positive])}
@@ -845,7 +1270,267 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
-  test "empty command frames are skipped and do not poison the connection buffer", %{port: port} do
+  test "FLOW.CLAIM_DUE BLOCK stays idle until wake instead of polling", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :flow_claim_due_block_idle, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :claim_due, :stop],
+        &__MODULE__.handle_flow_claim_due_stop/4,
+        self()
+      )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+    end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-idle-claim:" <> Integer.to_string(System.unique_integer([:positive]))
+    id = "#{type}:#{System.unique_integer([:positive])}"
+
+    try do
+      send_command(sock, [
+        "FLOW.CLAIM_DUE",
+        type,
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        partition,
+        "LIMIT",
+        "1",
+        "RETURN",
+        "JOBS_COMPACT",
+        "BLOCK",
+        "500"
+      ])
+
+      assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
+      refute_receive {:flow_claim_due_stop, _measurements, %{flow_type: ^type}}, 90
+
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition,
+                 state: "queued",
+                 now_ms: 1_000,
+                 run_at_ms: 1_000
+               )
+
+      assert [[[^id, ^partition, _lease_token, _fencing_token]]] = recv_values(sock, 1)
+    after
+      :gen_tcp.close(sock)
+    end
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK schedules an existing delayed job without polling", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :flow_claim_due_block_delayed, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :claim_due, :stop],
+        &__MODULE__.handle_flow_claim_due_stop/4,
+        self()
+      )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+    end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-delayed-claim:" <> Integer.to_string(System.unique_integer([:positive]))
+    id = "#{type}:#{System.unique_integer([:positive])}"
+    now = Ferricstore.CommandTime.now_ms()
+    run_at = now + 80
+
+    try do
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition,
+                 state: "queued",
+                 now_ms: now,
+                 run_at_ms: run_at
+               )
+
+      send_command(sock, [
+        "FLOW.CLAIM_DUE",
+        type,
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        partition,
+        "LIMIT",
+        "1",
+        "RETURN",
+        "JOBS_COMPACT",
+        "BLOCK",
+        "1000"
+      ])
+
+      assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
+      refute_receive {:flow_claim_due_stop, _measurements, %{flow_type: ^type}}, 40
+      assert [[[^id, ^partition, _lease_token, _fencing_token]]] = recv_values(sock, 1)
+    after
+      :gen_tcp.close(sock)
+    end
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK reschedules delayed job after empty wake", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :flow_claim_due_block_delayed_after_empty_wake,
+       System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :claim_due, :stop],
+        &__MODULE__.handle_flow_claim_due_stop/4,
+        self()
+      )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+    end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-delayed-empty-wake:" <> Integer.to_string(System.unique_integer([:positive]))
+    id = "#{type}:#{System.unique_integer([:positive])}"
+    now = Ferricstore.CommandTime.now_ms()
+    run_at = now + 120
+
+    try do
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition,
+                 state: "queued",
+                 now_ms: now,
+                 run_at_ms: run_at
+               )
+
+      send_command(sock, [
+        "FLOW.CLAIM_DUE",
+        type,
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        partition,
+        "LIMIT",
+        "1",
+        "RETURN",
+        "JOBS_COMPACT",
+        "BLOCK",
+        "1000"
+      ])
+
+      assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
+
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        "RESP claim_due waiter registered for delayed job",
+        100,
+        5
+      )
+
+      assert 1 = Ferricstore.Flow.ClaimWaiters.notify_ready(type, "queued", 0, partition, 1)
+
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        "RESP claim_due waiter re-registered after empty delayed wake",
+        200,
+        10
+      )
+
+      assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
+      refute_receive {:flow_claim_due_stop, _measurements, %{flow_type: ^type}}, 40
+      assert [[[^id, ^partition, _lease_token, _fencing_token]]] = recv_values(sock, 1)
+    after
+      :gen_tcp.close(sock)
+    end
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK schedules existing delayed jobs for any partition", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :flow_claim_due_block_delayed_any, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :claim_due, :stop],
+        &__MODULE__.handle_flow_claim_due_stop/4,
+        self()
+      )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+    end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "block-delayed-any-partition:" <> Integer.to_string(System.unique_integer([:positive]))
+    id = "#{type}:#{System.unique_integer([:positive])}"
+    now = Ferricstore.CommandTime.now_ms()
+    run_at = now + 350
+
+    try do
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition,
+                 state: "queued",
+                 now_ms: now,
+                 run_at_ms: run_at
+               )
+
+      send_command(sock, [
+        "FLOW.CLAIM_DUE",
+        type,
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        "ANY",
+        "LIMIT",
+        "1",
+        "RETURN",
+        "JOBS_COMPACT",
+        "BLOCK",
+        "1200"
+      ])
+
+      assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
+      refute_receive {:flow_claim_due_stop, _measurements, %{flow_type: ^type}}, 150
+      assert [[[^id, ^partition, _lease_token, _fencing_token]]] = recv_values(sock, 1)
+    after
+      :gen_tcp.close(sock)
+    end
+  end
+
+  test "empty RESP command frame returns protocol error before later commands", %{port: port} do
     sock = connect(port)
     send_raw(sock, hello3())
     _greeting = recv(sock)
@@ -853,7 +1538,8 @@ defmodule FerricstoreServer.ConnectionTest do
     send_raw(sock, "\r\n*0\r\nPING\r\n")
 
     data = recv(sock)
-    assert data == "+PONG\r\n"
+    assert data =~ "-ERR protocol error"
+    assert closed_or_eof?(sock)
     :gen_tcp.close(sock)
   end
 
@@ -1154,17 +1840,15 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
-  test "empty command list is handled gracefully", %{port: port} do
+  test "empty RESP command list closes with protocol error", %{port: port} do
     sock = connect(port)
     send_raw(sock, hello3())
     _greeting = recv(sock)
 
     send_raw(sock, "*0\r\n")
-    assert {:error, :timeout} = :gen_tcp.recv(sock, 0, 50)
-
-    send_command(sock, ["PING"])
-    pong = recv(sock)
-    assert pong == "+PONG\r\n"
+    data = recv(sock)
+    assert data =~ "-ERR protocol error"
+    assert closed_or_eof?(sock)
     :gen_tcp.close(sock)
   end
 

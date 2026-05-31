@@ -31,12 +31,14 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
 
   alias Ferricstore.{DataDir, Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
+  alias Ferricstore.Commands.Server, as: ServerCommands
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.{BlobRef, CompoundKey}
 
   require EEx
+  require Logger
 
   @doc false
   defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
@@ -120,6 +122,15 @@ defmodule FerricstoreServer.Health.Dashboard do
     :defp,
     :template_storage,
     Path.join(@templates_dir, "storage.html.eex"),
+    [
+      :assigns
+    ]
+  )
+
+  EEx.function_from_file(
+    :defp,
+    :template_doctor,
+    Path.join(@templates_dir, "doctor.html.eex"),
     [
       :assigns
     ]
@@ -554,10 +565,16 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec collect_raft_page() :: %{raft_shards: [raft_shard_data()], cluster: cluster_data()}
   def collect_raft_page do
-    %{
-      raft_shards: collect_raft_shards(),
-      cluster: collect_cluster()
-    }
+    case Application.get_env(:ferricstore, :dashboard_raft_page_fun) do
+      fun when is_function(fun, 0) ->
+        fun.()
+
+      _other ->
+        %{
+          raft_shards: collect_raft_shards(),
+          cluster: collect_cluster()
+        }
+    end
   end
 
   @doc """
@@ -635,6 +652,62 @@ defmodule FerricstoreServer.Health.Dashboard do
   end
 
   # ---------------------------------------------------------------------------
+  # Public API -- Doctor Admin Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects doctor diagnostics through the same Redis command handler exposed to
+  administrators. The dashboard must not bypass command/ACL semantics for
+  repair-oriented tools.
+  """
+  @spec collect_doctor_page(map() | keyword()) :: map()
+  def collect_doctor_page(opts \\ %{}) do
+    check = doctor_command(["CHECK"])
+    jobs = doctor_command(["LIST"])
+
+    %{
+      check: check,
+      jobs: Map.get(jobs, "jobs", []),
+      flash: doctor_flash(opts),
+      command_reference: doctor_command_reference()
+    }
+  end
+
+  @doc """
+  Renders the doctor admin page.
+  """
+  @spec render_doctor_page(map()) :: binary()
+  def render_doctor_page(data) do
+    render_template(template_doctor(%{data: data}))
+  end
+
+  @doc false
+  def apply_doctor_form(params) when is_map(params) do
+    case Map.get(params, "action", "") do
+      "start_check" ->
+        scope = Map.get(params, "scope", "ALL")
+        normalize_doctor_form_result(doctor_command(["START", "CHECK", "SCOPE", scope]))
+
+      "repair_flow_lmdb" ->
+        normalize_doctor_form_result(
+          doctor_command(["START", "REPAIR", "PROJECTIONS", "SCOPE", "FLOW_LMDB"])
+        )
+
+      "cancel" ->
+        job_id = params |> Map.get("job_id", "") |> String.trim()
+
+        if job_id == "" do
+          {:error, "missing doctor job id"}
+        else
+          normalize_doctor_form_result(doctor_command(["CANCEL", job_id]))
+        end
+
+      _ ->
+        {:error, "unknown doctor action"}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Public API -- Prefixes Sub-page
   # ---------------------------------------------------------------------------
 
@@ -690,7 +763,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec collect_keyspace_page(keyword() | map()) :: map()
   def collect_keyspace_page(opts \\ []) do
     filters = keyspace_filters(opts)
+    acl_username = keyspace_acl_username(opts)
     {rows, sampled} = collect_keyspace_rows(filters)
+    rows = filter_keyspace_rows_for_acl(rows, acl_username)
 
     %{
       filters: filters,
@@ -774,7 +849,13 @@ defmodule FerricstoreServer.Health.Dashboard do
   def collect_flow_page(opts \\ []) when is_list(opts) do
     filters = flow_overview_filters_from_opts(opts)
     sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
-    records = filter_flow_records_by_partition(sampled_records, filters.partition_key)
+    acl_username = keyspace_acl_username(opts)
+
+    records =
+      sampled_records
+      |> filter_flow_records_for_acl(acl_username)
+      |> filter_flow_records_by_partition(filters.partition_key)
+
     types = flow_type_summaries(records)
 
     %{
@@ -974,7 +1055,8 @@ defmodule FerricstoreServer.Health.Dashboard do
     limit =
       flow_retention_limit!(Keyword.get(opts, :limit, @flow_dashboard_retention_default_limit))
 
-    records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+    sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+    records = filter_flow_records_for_acl(sampled_records, keyspace_acl_username(opts))
     candidates = flow_retention_candidates(records, now_ms)
     terminal_sampled = Enum.count(records, &flow_retention_terminal_record?/1)
 
@@ -982,7 +1064,8 @@ defmodule FerricstoreServer.Health.Dashboard do
       now_ms: now_ms,
       limit: limit,
       sample_limit: @flow_dashboard_sample_limit,
-      total_sampled: length(records),
+      total_sampled: length(sampled_records),
+      filtered_sampled: length(records),
       terminal_sampled: terminal_sampled,
       active_sampled: max(length(records) - terminal_sampled, 0),
       eligible_sampled: length(candidates),
@@ -1106,6 +1189,65 @@ defmodule FerricstoreServer.Health.Dashboard do
   Builds a live component payload for dashboard API paths.
   """
   @spec live_payload(binary()) :: {:ok, map()} | :not_found
+  @spec live_payload(binary(), keyword() | map()) :: {:ok, map()} | :not_found
+  def live_payload("keyspace", opts) do
+    data = collect_keyspace_page(opts)
+
+    live_component_payload(%{
+      "keyspace_inspector" => render_keyspace_inspector(data.inspected),
+      "keyspace_table" => render_keyspace_table(data)
+    })
+  end
+
+  def live_payload("keyspace?" <> query, opts) do
+    data =
+      query
+      |> URI.decode_query()
+      |> Map.merge(keyspace_live_payload_opts(opts))
+      |> collect_keyspace_page()
+
+    live_component_payload(%{
+      "keyspace_inspector" => render_keyspace_inspector(data.inspected),
+      "keyspace_table" => render_keyspace_table(data)
+    })
+  end
+
+  def live_payload("flow/states", opts), do: live_flow_states_payload("", opts)
+  def live_payload("flow/states?" <> query, opts), do: live_flow_states_payload(query, opts)
+
+  def live_payload("flow/workers", opts) do
+    data = collect_flow_workers_page(flow_acl_opts(opts))
+
+    live_component_payload(%{
+      "flow_workers_chart" => render_flow_workers_chart(data.workers),
+      "flow_workers" => render_flow_workers(data.workers),
+      "flow_running_records" =>
+        render_flow_running_records(data.running_records, data.total_sampled, data.sample_limit)
+    })
+  end
+
+  def live_payload("flow/due", opts) do
+    data = collect_flow_due_page(flow_acl_opts(opts))
+
+    live_component_payload(%{
+      "flow_due_chart" => render_flow_due_chart(data.due_now, data.scheduled),
+      "flow_due_now" =>
+        render_flow_due_records("Due Now", data.due_now, data.total_sampled, data.sample_limit),
+      "flow_scheduled" =>
+        render_flow_due_records(
+          "Scheduled Future",
+          data.scheduled,
+          data.total_sampled,
+          data.sample_limit
+        )
+    })
+  end
+
+  def live_payload("flow/signals", opts), do: live_flow_signals_payload("", opts)
+  def live_payload("flow/signals?" <> query, opts), do: live_flow_signals_payload(query, opts)
+
+  def live_payload(path, _opts), do: live_payload(path)
+
   def live_payload("slowlog") do
     data = collect_slowlog_page()
 
@@ -1303,10 +1445,11 @@ defmodule FerricstoreServer.Health.Dashboard do
     end
   rescue
     error ->
-      {:ok, live_flow_value_error("", "value lookup failed: #{inspect(error, limit: 5)}")}
+      {:ok, live_flow_value_error("", dashboard_internal_error("value lookup failed", error))}
   catch
     :exit, error ->
-      {:ok, live_flow_value_error("", "value lookup exited: #{inspect(error, limit: 5)}")}
+      {:ok,
+       live_flow_value_error("", dashboard_internal_error("value lookup exited", :exit, error))}
   end
 
   @spec live_flow_value_payload_from_ref(binary()) :: {:ok, map()}
@@ -1331,7 +1474,7 @@ defmodule FerricstoreServer.Health.Dashboard do
         {:ok, live_flow_value_error(ref, "unexpected value result count")}
 
       {:ok, {:error, reason}} ->
-        {:ok, live_flow_value_error(ref, "value lookup failed: #{inspect(reason, limit: 5)}")}
+        {:ok, live_flow_value_error(ref, dashboard_internal_error("value lookup failed", reason))}
 
       {:ok, _other} ->
         {:ok, live_flow_value_error(ref, "unexpected value lookup result")}
@@ -1340,7 +1483,7 @@ defmodule FerricstoreServer.Health.Dashboard do
         {:ok, live_flow_value_error(ref, "value lookup timed out")}
 
       {:error, reason} ->
-        {:ok, live_flow_value_error(ref, "value lookup failed: #{inspect(reason, limit: 5)}")}
+        {:ok, live_flow_value_error(ref, dashboard_internal_error("value lookup failed", reason))}
     end
   end
 
@@ -1355,8 +1498,12 @@ defmodule FerricstoreServer.Health.Dashboard do
     }
   end
 
-  defp live_flow_signals_payload(query) do
-    data = collect_flow_signals_page(flow_signals_opts_from_query(query))
+  defp live_flow_signals_payload(query, opts \\ []) do
+    data =
+      query
+      |> flow_signals_opts_from_query()
+      |> Keyword.merge(flow_acl_opts(opts))
+      |> collect_flow_signals_page()
 
     live_component_payload(%{
       "flow_signals_table" =>
@@ -1370,8 +1517,12 @@ defmodule FerricstoreServer.Health.Dashboard do
     })
   end
 
-  defp live_flow_states_payload(query) do
-    data = collect_flow_states_page(flow_states_opts_from_query(query))
+  defp live_flow_states_payload(query, opts \\ []) do
+    data =
+      query
+      |> flow_states_opts_from_query()
+      |> Keyword.merge(flow_acl_opts(opts))
+      |> collect_flow_states_page()
 
     live_component_payload(%{
       "flow_states_chart" => render_flow_states_chart(data.states),
@@ -1447,12 +1598,20 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec collect_flow_states_page(keyword()) :: map()
   def collect_flow_states_page(opts \\ []) do
     filters = flow_state_filters_from_opts(opts)
-    records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+    acl_username = keyspace_acl_username(opts)
+
+    records =
+      @flow_dashboard_sample_limit
+      |> collect_flow_records_sample()
+      |> filter_flow_records_for_acl(acl_username)
+
     available_types = flow_available_types(records)
     terminal_records = collect_flow_states_terminal_records(filters, available_types)
 
     type_records =
-      records |> merge_flow_records(terminal_records) |> filter_flow_records_by_type(filters.type)
+      records
+      |> merge_flow_records(filter_flow_records_for_acl(terminal_records, acl_username))
+      |> filter_flow_records_by_type(filters.type)
 
     filtered_records = filter_flow_records(type_records, filters)
 
@@ -1628,9 +1787,12 @@ defmodule FerricstoreServer.Health.Dashboard do
     do: Map.get(data, :limit, @flow_dashboard_recent_limit)
 
   @doc "Collects data for the Flow workers and leases page."
-  @spec collect_flow_workers_page() :: map()
-  def collect_flow_workers_page do
-    records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+  @spec collect_flow_workers_page(keyword()) :: map()
+  def collect_flow_workers_page(opts \\ []) do
+    records =
+      @flow_dashboard_sample_limit
+      |> collect_flow_records_sample()
+      |> filter_flow_records_for_acl(keyspace_acl_username(opts))
 
     %{
       workers: flow_worker_summaries(records),
@@ -1647,9 +1809,12 @@ defmodule FerricstoreServer.Health.Dashboard do
   end
 
   @doc "Collects data for the Flow due and scheduled work page."
-  @spec collect_flow_due_page() :: map()
-  def collect_flow_due_page do
-    records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+  @spec collect_flow_due_page(keyword()) :: map()
+  def collect_flow_due_page(opts \\ []) do
+    records =
+      @flow_dashboard_sample_limit
+      |> collect_flow_records_sample()
+      |> filter_flow_records_for_acl(keyspace_acl_username(opts))
 
     %{
       due_now: Enum.filter(records, &flow_due_now?/1),
@@ -1669,7 +1834,12 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec collect_flow_failures_page(keyword()) :: map()
   def collect_flow_failures_page(opts \\ []) when is_list(opts) do
     filters = flow_failures_filters_from_opts(opts)
-    sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+    acl_username = keyspace_acl_username(opts)
+
+    sampled_records =
+      @flow_dashboard_sample_limit
+      |> collect_flow_records_sample()
+      |> filter_flow_records_for_acl(acl_username)
 
     available_types =
       sampled_records
@@ -1685,7 +1855,7 @@ defmodule FerricstoreServer.Health.Dashboard do
 
     records =
       sampled_records
-      |> merge_flow_records(queried_records)
+      |> merge_flow_records(filter_flow_records_for_acl(queried_records, acl_username))
       |> filter_flow_records_by_type(filters.type)
       |> filter_flow_records_by_partition(filters.partition_key)
       |> filter_flow_records_by_name(filters.q)
@@ -1813,8 +1983,17 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec collect_flow_lineage_page(keyword()) :: map()
   def collect_flow_lineage_page(opts \\ []) when is_list(opts) do
     filters = flow_lineage_filters_from_opts(opts)
-    sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
-    result = flow_lineage_query_result(filters)
+    acl_username = keyspace_acl_username(opts)
+
+    sampled_records =
+      @flow_dashboard_sample_limit
+      |> collect_flow_records_sample()
+      |> filter_flow_records_for_acl(acl_username)
+
+    result =
+      filters
+      |> flow_lineage_query_result()
+      |> flow_lineage_filter_result_for_acl(acl_username)
 
     %{
       filters: filters,
@@ -1856,11 +2035,16 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec collect_flow_query_page(keyword()) :: map()
   def collect_flow_query_page(opts \\ []) when is_list(opts) do
     filters = flow_query_filters_from_opts(opts)
-    sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+    acl_username = keyspace_acl_username(opts)
+
+    sampled_records =
+      @flow_dashboard_sample_limit
+      |> collect_flow_records_sample()
+      |> filter_flow_records_for_acl(acl_username)
 
     %{
       filters: filters,
-      result: flow_query_execute(filters),
+      result: flow_query_execute(filters) |> flow_query_filter_result_for_acl(acl_username),
       available_types: flow_available_types(sampled_records),
       total_sampled: length(sampled_records),
       sample_limit: @flow_dashboard_sample_limit,
@@ -1901,7 +2085,12 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec collect_flow_signals_page(keyword()) :: map()
   def collect_flow_signals_page(opts \\ []) when is_list(opts) do
     filters = flow_signals_filters_from_opts(opts)
-    records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+
+    records =
+      @flow_dashboard_sample_limit
+      |> collect_flow_records_sample()
+      |> filter_flow_records_for_acl(keyspace_acl_username(opts))
+
     type_records = filter_flow_records_by_type(records, filters.type)
     filtered_records = filter_flow_records_by_name(type_records, filters.q)
 
@@ -2848,6 +3037,97 @@ defmodule FerricstoreServer.Health.Dashboard do
     }
   end
 
+  defp keyspace_acl_username(opts) do
+    case dashboard_param(opts, "acl_username") do
+      username when is_binary(username) ->
+        username
+        |> String.trim()
+        |> case do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp keyspace_live_payload_opts(opts) do
+    case keyspace_acl_username(opts) do
+      nil -> %{}
+      username -> %{"acl_username" => username}
+    end
+  end
+
+  defp flow_acl_opts(opts) do
+    case keyspace_acl_username(opts) do
+      nil -> []
+      username -> [acl_username: username]
+    end
+  end
+
+  defp filter_flow_records_for_acl(records, nil), do: records
+
+  defp filter_flow_records_for_acl(records, username) when is_list(records) do
+    Enum.filter(records, &flow_record_acl_allowed?(&1, username))
+  end
+
+  defp flow_record_acl_allowed?(record, username) when is_map(record) do
+    keys = flow_record_acl_keys(record)
+
+    keys != [] and
+      Enum.any?(keys, fn key ->
+        case FerricstoreServer.Acl.check_key_access(username, key, :read) do
+          :ok -> true
+          {:error, _reason} -> false
+        end
+      end)
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  defp flow_record_acl_allowed?(_record, _username), do: false
+
+  defp flow_record_acl_keys(record) when is_map(record) do
+    [flow_record_partition_key(record), flow_record_id(record), flow_record_type(record)]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.uniq()
+  end
+
+  defp flow_query_filter_result_for_acl(result, nil), do: result
+
+  defp flow_query_filter_result_for_acl(result, username) when is_map(result) do
+    rows =
+      result
+      |> Map.get(:rows, [])
+      |> filter_flow_query_rows_for_acl(username)
+
+    result
+    |> Map.put(:rows, rows)
+    |> Map.put(:message, "#{length(rows)} visible row(s)")
+  end
+
+  defp filter_flow_query_rows_for_acl(rows, username) when is_list(rows) do
+    Enum.filter(rows, fn
+      row when is_map(row) ->
+        case flow_record_acl_keys(row) do
+          [] -> true
+          _keys -> flow_record_acl_allowed?(row, username)
+        end
+
+      _row ->
+        true
+    end)
+  end
+
+  defp flow_lineage_filter_result_for_acl(result, nil), do: result
+
+  defp flow_lineage_filter_result_for_acl(result, username) when is_map(result) do
+    Map.update(result, :records, [], &filter_flow_records_for_acl(&1, username))
+  end
+
   @spec collect_keyspace_rows(map()) :: {[map()], non_neg_integer()}
   defp collect_keyspace_rows(%{key: key} = filters) when key != "" do
     rows =
@@ -2982,6 +3262,17 @@ defmodule FerricstoreServer.Health.Dashboard do
     internal_ok? and prefix_ok?
   end
 
+  defp filter_keyspace_rows_for_acl(rows, nil), do: rows
+
+  defp filter_keyspace_rows_for_acl(rows, username) do
+    Enum.filter(rows, fn row ->
+      case FerricstoreServer.Acl.check_key_access(username, row.key, :read) do
+        :ok -> true
+        {:error, _reason} -> false
+      end
+    end)
+  end
+
   defp keyspace_entry_type(<<"T:", _rest::binary>>, value) when is_binary(value), do: value
   defp keyspace_entry_type(<<"H:", _rest::binary>>, _value), do: "hash field"
   defp keyspace_entry_type(<<"L:", _rest::binary>>, _value), do: "list element"
@@ -3053,7 +3344,19 @@ defmodule FerricstoreServer.Health.Dashboard do
   defp dashboard_param(opts, key) when is_map(opts), do: Map.get(opts, key, "")
 
   defp dashboard_param(opts, key) when is_list(opts) do
-    Keyword.get(opts, String.to_atom(key), Keyword.get(opts, key, ""))
+    atom_key = String.to_atom(key)
+
+    cond do
+      Keyword.keyword?(opts) ->
+        Keyword.get(opts, atom_key, "")
+
+      match?({^key, _value}, List.keyfind(opts, key, 0)) ->
+        {_key, value} = List.keyfind(opts, key, 0)
+        value
+
+      true ->
+        ""
+    end
   end
 
   defp dashboard_param(_opts, _key), do: ""
@@ -4597,8 +4900,8 @@ defmodule FerricstoreServer.Health.Dashboard do
       {:ok, %{} = record} -> {:ok, record}
       {:ok, nil} -> {:error, "ERR flow not found"}
       {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, inspect(reason)}
-      other -> {:error, "ERR unexpected flow_get result: #{inspect(other, limit: 5)}"}
+      {:error, reason} -> {:error, dashboard_internal_error("ERR FLOW.GET failed", reason)}
+      other -> {:error, dashboard_internal_error("ERR unexpected FLOW.GET result", other)}
     end
   end
 
@@ -4632,10 +4935,10 @@ defmodule FerricstoreServer.Health.Dashboard do
         {:error, reason}
 
       {:error, reason} ->
-        {:error, inspect(reason)}
+        {:error, dashboard_internal_error("ERR FLOW.HISTORY failed", reason)}
 
       other ->
-        {:error, "ERR unexpected flow_history result: #{inspect(other, limit: 5)}"}
+        {:error, dashboard_internal_error("ERR unexpected FLOW.HISTORY result", other)}
     end
   end
 
@@ -4656,8 +4959,8 @@ defmodule FerricstoreServer.Health.Dashboard do
       :ok -> :ok
       {:ok, _record} -> :ok
       {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, inspect(reason)}
-      other -> {:error, "ERR unexpected flow_rewind result: #{inspect(other, limit: 5)}"}
+      {:error, reason} -> {:error, dashboard_internal_error("ERR FLOW.REWIND failed", reason)}
+      other -> {:error, dashboard_internal_error("ERR unexpected FLOW.REWIND result", other)}
     end
   end
 
@@ -9074,10 +9377,10 @@ defmodule FerricstoreServer.Health.Dashboard do
           "Flow lookup timed out. The Flow record may still exist, but the dashboard did not wait for a slow FLOW.GET path."
 
         {:error, error} ->
-          "Flow lookup failed: #{inspect(error, limit: 5)}"
+          dashboard_internal_error("Flow lookup failed", error)
 
         {:exit, error} ->
-          "Flow lookup exited: #{inspect(error, limit: 5)}"
+          dashboard_internal_error("Flow lookup exited", :exit, error)
 
         _ ->
           "Flow #{data.id} was not found in the hot state sample or default Flow lookup."
@@ -9309,11 +9612,11 @@ defmodule FerricstoreServer.Health.Dashboard do
   defp flow_value_store_preview(:timeout, _values_by_ref, _ref), do: "Value lookup timed out."
 
   defp flow_value_store_preview({:error, reason}, _values_by_ref, _ref) do
-    "Value lookup failed: #{inspect(reason, limit: 5)}"
+    dashboard_internal_error("Value lookup failed", reason)
   end
 
   defp flow_value_store_preview({:exit, reason}, _values_by_ref, _ref) do
-    "Value lookup exited: #{inspect(reason, limit: 5)}"
+    dashboard_internal_error("Value lookup exited", :exit, reason)
   end
 
   defp flow_value_store_preview(_status, _values_by_ref, _ref),
@@ -9646,12 +9949,12 @@ defmodule FerricstoreServer.Health.Dashboard do
         match?({:error, _}, status) ->
           {_tag, reason} = status
 
-          ~s(<tr><td colspan="8" class="c-muted">History temporarily unavailable: #{escape(inspect(reason, limit: 5))}</td></tr>)
+          ~s(<tr><td colspan="8" class="c-muted">History temporarily unavailable: #{escape(dashboard_internal_error("FLOW.HISTORY failed", reason))}</td></tr>)
 
         match?({:exit, _}, status) ->
           {_tag, reason} = status
 
-          ~s(<tr><td colspan="8" class="c-muted">History temporarily unavailable: #{escape(inspect(reason, limit: 5))}</td></tr>)
+          ~s(<tr><td colspan="8" class="c-muted">History temporarily unavailable: #{escape(dashboard_internal_error("FLOW.HISTORY exited", :exit, reason))}</td></tr>)
 
         history == [] ->
           ~s(<tr><td colspan="8" class="c-muted">No history events found yet</td></tr>)
@@ -10354,6 +10657,192 @@ defmodule FerricstoreServer.Health.Dashboard do
       <tbody>
         #{rows}
       </tbody>
+    </table>
+    """
+  end
+
+  # ---------------------------------------------------------------------------
+  # HTML rendering -- Doctor Sub-page
+  # ---------------------------------------------------------------------------
+
+  @spec render_doctor_flash(map()) :: binary()
+  defp render_doctor_flash(%{status: status, message: message})
+       when status in ["ok", "error"] and is_binary(message) and message != "" do
+    klass = if status == "ok", do: "c-green", else: "c-red"
+
+    """
+    <div class="flow-card flow-card-wide" role="status">
+      <div class="flow-card-label">Doctor action</div>
+      <div class="flow-card-value #{klass}" style="font-size:1rem;">#{escape(message)}</div>
+    </div>
+    """
+  end
+
+  defp render_doctor_flash(_flash), do: ""
+
+  @spec render_doctor_summary(map()) :: binary()
+  defp render_doctor_summary(check) do
+    status = Map.get(check, "status", "error")
+    checks = Map.get(check, "checks", [])
+    failed = Enum.count(checks, &(Map.get(&1, "status") == "error"))
+    warnings = Enum.count(checks, &(Map.get(&1, "status") == "warning"))
+
+    render_ops_summary("Doctor Summary", [
+      %{
+        label: "Status",
+        value: status,
+        class: doctor_status_class(status),
+        detail: "aggregated check result"
+      },
+      %{label: "Checks", value: format_number(length(checks)), detail: "bounded metadata probes"},
+      %{
+        label: "Warnings",
+        value: format_number(warnings),
+        class: if(warnings > 0, do: "c-yellow", else: "c-green")
+      },
+      %{
+        label: "Errors",
+        value: format_number(failed),
+        class: if(failed > 0, do: "c-red", else: "c-green")
+      },
+      %{
+        label: "Duration",
+        value: format_duration_ms(Map.get(check, "duration_ms", 0)),
+        detail: "inline CHECK time"
+      }
+    ])
+  end
+
+  @spec render_doctor_checks(map()) :: binary()
+  defp render_doctor_checks(check) do
+    rows =
+      case Map.get(check, "checks", []) do
+        [] ->
+          ~s(<tr><td colspan="5" class="c-muted">No doctor checks returned</td></tr>)
+
+        checks ->
+          Enum.map_join(checks, "\n", fn item ->
+            metrics = Map.get(item, "metrics", %{})
+
+            """
+            <tr>
+              <td class="mono">#{escape(Map.get(item, "scope", ""))}</td>
+              <td class="#{doctor_status_class(Map.get(item, "status", ""))}">#{escape(Map.get(item, "status", ""))}</td>
+              <td>#{escape(Map.get(item, "message", ""))}</td>
+              <td>#{escape(doctor_metric_summary(Map.get(item, "scope"), metrics))}</td>
+              <td class="mono">FERRICSTORE.DOCTOR CHECK SCOPE #{escape(String.upcase(Map.get(item, "scope", "")))}</td>
+            </tr>
+            """
+          end)
+      end
+
+    """
+    <div class="section-title">Checks</div>
+    <table>
+      <thead>
+        <tr><th>Scope</th><th>Status</th><th>Meaning</th><th>Key metrics</th><th>Command</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    """
+  end
+
+  @spec render_doctor_actions() :: binary()
+  defp render_doctor_actions do
+    """
+    <div class="section-title">Actions</div>
+    <div class="flow-card-grid">
+      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post">
+        <input type="hidden" name="action" value="start_check">
+        <div class="flow-card-label">Start background check</div>
+        <div class="flow-card-detail">Runs the selected doctor scope as a background job and keeps the result queryable by job id.</div>
+        <label class="flow-form-label" for="doctor-scope">Scope</label>
+        <select id="doctor-scope" name="scope">
+          <option value="ALL">All</option>
+          <option value="BITCASK">Bitcask / keydir</option>
+          <option value="BLOB_REFS">Blob refs</option>
+          <option value="FLOW_LMDB">Flow LMDB</option>
+        </select>
+        <button type="submit" class="flow-action-button">Start</button>
+      </form>
+      <form class="flow-card flow-card-wide" action="/dashboard/doctor" method="post">
+        <input type="hidden" name="action" value="repair_flow_lmdb">
+        <div class="flow-card-label">Repair Flow projection</div>
+        <div class="flow-card-detail">Starts FERRICSTORE.DOCTOR START REPAIR PROJECTIONS for the LMDB cold/query projection. Flow hot indexes stay on the normal apply path.</div>
+        <button type="submit" class="flow-action-button">Repair Flow LMDB</button>
+      </form>
+    </div>
+    """
+  end
+
+  @spec render_doctor_jobs([map()]) :: binary()
+  defp render_doctor_jobs(jobs) do
+    rows =
+      case jobs do
+        [] ->
+          ~s(<tr><td colspan="6" class="c-muted">No doctor jobs yet</td></tr>)
+
+        _ ->
+          Enum.map_join(jobs, "\n", fn job ->
+            cancel =
+              if Map.get(job, "status") == "running" do
+                """
+                <form action="/dashboard/doctor" method="post" style="display:inline">
+                  <input type="hidden" name="action" value="cancel">
+                  <input type="hidden" name="job_id" value="#{escape_attr(Map.get(job, "job_id", ""))}">
+                  <button type="submit" class="flow-link-button">Cancel</button>
+                </form>
+                """
+              else
+                ""
+              end
+
+            """
+            <tr>
+              <td class="mono">#{escape(Map.get(job, "job_id", ""))}</td>
+              <td>#{escape(Map.get(job, "kind", ""))}</td>
+              <td class="#{doctor_status_class(Map.get(job, "status", ""))}">#{escape(Map.get(job, "status", ""))}</td>
+              <td>#{escape(Enum.join(Map.get(job, "scopes", []), ", "))}</td>
+              <td>#{escape(doctor_job_result_summary(job))}</td>
+              <td>#{cancel}</td>
+            </tr>
+            """
+          end)
+      end
+
+    """
+    <div class="section-title">Background Jobs</div>
+    <table>
+      <thead>
+        <tr><th>Job</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Result</th><th>Action</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    """
+  end
+
+  @spec render_doctor_command_reference([map()]) :: binary()
+  defp render_doctor_command_reference(commands) do
+    rows =
+      Enum.map_join(commands, "\n", fn entry ->
+        """
+        <tr>
+          <td class="mono">#{escape(entry.command)}</td>
+          <td>#{escape(entry.purpose)}</td>
+          <td>#{escape(entry.permission)}</td>
+        </tr>
+        """
+      end)
+
+    """
+    <div class="section-title">Command Reference</div>
+    <table>
+      <thead><tr><th>Command</th><th>Purpose</th><th>Permission</th></tr></thead>
+      <tbody>#{rows}</tbody>
     </table>
     """
   end
@@ -11136,7 +11625,8 @@ defmodule FerricstoreServer.Health.Dashboard do
       "storage" => storage_badge,
       "keyspace" => "",
       "reads" => "",
-      "commands" => ""
+      "commands" => "",
+      "doctor" => ""
     })
   end
 
@@ -11152,7 +11642,8 @@ defmodule FerricstoreServer.Health.Dashboard do
       "storage" => "",
       "keyspace" => "",
       "reads" => "",
-      "commands" => ""
+      "commands" => "",
+      "doctor" => ""
     })
   end
 
@@ -11166,6 +11657,7 @@ defmodule FerricstoreServer.Health.Dashboard do
       {"slowlog", "/dashboard/slowlog", "Slow Log"},
       {"merge", "/dashboard/merge", "Merge Status"},
       {"storage", "/dashboard/storage", "Storage"},
+      {"doctor", "/dashboard/doctor", "Doctor"},
       {"raft", "/dashboard/raft", "Consensus"},
       {"config", "/dashboard/config", "Config"},
       {"clients", "/dashboard/clients", "Clients"},
@@ -11194,6 +11686,118 @@ defmodule FerricstoreServer.Health.Dashboard do
     </nav>
     """
   end
+
+  defp doctor_command(args) do
+    case ServerCommands.handle("FERRICSTORE.DOCTOR", args, doctor_command_store()) do
+      %{} = result -> result
+      {:error, reason} -> %{"status" => "error", "error" => reason, "checks" => []}
+      other -> %{"status" => "error", "error" => inspect(other), "checks" => []}
+    end
+  rescue
+    exception ->
+      %{"status" => "error", "error" => Exception.message(exception), "checks" => []}
+  catch
+    kind, reason ->
+      %{"status" => "error", "error" => inspect({kind, reason}), "checks" => []}
+  end
+
+  defp doctor_command_store do
+    %{instance_ctx: FerricStore.Instance.get(:default)}
+  rescue
+    _ -> %{}
+  end
+
+  defp normalize_doctor_form_result(%{"job_id" => job_id, "status" => status}) do
+    {:ok, "doctor job #{job_id} is #{status}"}
+  end
+
+  defp normalize_doctor_form_result(%{"status" => status}) when is_binary(status) do
+    {:ok, "doctor action returned #{status}"}
+  end
+
+  defp normalize_doctor_form_result(%{"error" => error}) when is_binary(error),
+    do: {:error, error}
+
+  defp normalize_doctor_form_result(other), do: {:error, inspect(other)}
+
+  defp doctor_flash(opts) do
+    status = dashboard_param(opts, "status")
+    message = dashboard_param(opts, "message")
+
+    cond do
+      status in ["ok", "error"] -> %{status: status, message: message}
+      true -> %{}
+    end
+  end
+
+  defp doctor_command_reference do
+    [
+      %{
+        command: "FERRICSTORE.DOCTOR CHECK [SCOPE <scope>]",
+        purpose: "Run bounded read-only diagnostics immediately.",
+        permission: "ADMIN FERRICSTORE.DOCTOR"
+      },
+      %{
+        command: "FERRICSTORE.DOCTOR START CHECK [SCOPE <scope>]",
+        purpose: "Run diagnostics as a background job.",
+        permission: "ADMIN FERRICSTORE.DOCTOR"
+      },
+      %{
+        command: "FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB",
+        purpose: "Flush and reconcile the Flow LMDB cold projection from durable records.",
+        permission: "ADMIN + DANGEROUS FERRICSTORE.DOCTOR"
+      },
+      %{
+        command: "FERRICSTORE.DOCTOR STATUS <job_id> / LIST / CANCEL <job_id>",
+        purpose: "Inspect or cancel doctor jobs.",
+        permission: "ADMIN FERRICSTORE.DOCTOR"
+      }
+    ]
+  end
+
+  defp doctor_status_class("ok"), do: "c-green"
+  defp doctor_status_class("done"), do: "c-green"
+  defp doctor_status_class("warning"), do: "c-yellow"
+  defp doctor_status_class("running"), do: "c-yellow"
+  defp doctor_status_class("error"), do: "c-red"
+  defp doctor_status_class("failed"), do: "c-red"
+  defp doctor_status_class("cancelled"), do: "c-muted"
+  defp doctor_status_class(_status), do: "c-muted"
+
+  defp doctor_metric_summary("bitcask", metrics) do
+    keys = metrics |> Map.get("total_keydir_keys", 0) |> format_number()
+    bytes = metrics |> Map.get("total_data_bytes", 0) |> format_bytes()
+    files = metrics |> Map.get("total_data_files", 0) |> format_number()
+    "#{keys} keys, #{files} files, #{bytes}"
+  end
+
+  defp doctor_metric_summary("blob_refs", metrics) do
+    files = metrics |> Map.get("total_segment_files", 0) |> format_number()
+    bytes = metrics |> Map.get("total_segment_bytes", 0) |> format_bytes()
+    protected = metrics |> Map.get("protected_refs", 0) |> format_number()
+    "#{files} blob segments, #{bytes}, #{protected} protected"
+  end
+
+  defp doctor_metric_summary("flow_lmdb", metrics) do
+    pending = metrics |> Map.get("pending_ops", 0) |> format_number()
+    age = metrics |> Map.get("max_oldest_pending_age_ms", 0) |> format_duration_ms()
+    degraded = metrics |> Map.get("degraded_shards", 0) |> format_number()
+    "#{pending} pending, oldest #{age}, #{degraded} degraded"
+  end
+
+  defp doctor_metric_summary(_scope, metrics) when is_map(metrics), do: inspect(metrics)
+  defp doctor_metric_summary(_scope, _metrics), do: ""
+
+  defp doctor_job_result_summary(%{"error" => error}) when is_binary(error) and error != "",
+    do: error
+
+  defp doctor_job_result_summary(%{"result" => %{"status" => status, "duration_ms" => ms}})
+       when is_binary(status) do
+    "#{status}, #{format_duration_ms(ms)}"
+  end
+
+  defp doctor_job_result_summary(%{"status" => "running"}), do: "running"
+  defp doctor_job_result_summary(_job), do: ""
 
   # ---------------------------------------------------------------------------
   # Formatting helpers (private)
@@ -11350,6 +11954,19 @@ defmodule FerricstoreServer.Health.Dashboard do
   end
 
   defp format_duration_ms(ms), do: "#{ms}ms"
+
+  @spec dashboard_internal_error(binary(), term()) :: binary()
+  defp dashboard_internal_error(message, reason),
+    do: dashboard_internal_error(message, :error, reason)
+
+  @spec dashboard_internal_error(binary(), atom(), term()) :: binary()
+  defp dashboard_internal_error(message, kind, reason) do
+    Logger.error(fn ->
+      "FerricStore dashboard internal error: #{message}: #{inspect({kind, reason}, limit: 20)}"
+    end)
+
+    message
+  end
 
   @spec escape(binary()) :: binary()
   defp escape(str) do

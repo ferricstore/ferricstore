@@ -1,13 +1,16 @@
 import Config
 
-build_native? = System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
+# Repo checkouts build native crates from source by default. Packaged
+# dependency users still get RustlerPrecompiled artifacts because dependency
+# config files are not imported into the parent application.
+config :rustler_precompiled, :force_build, ferricstore: true
 
 config :ferricstore, Ferricstore.Bitcask.NIF,
-  skip_compilation?: not build_native?,
+  skip_compilation?: false,
   load_from: {:ferricstore, "priv/native/ferricstore_bitcask"}
 
 config :ferricstore, :ferricstore_wal_nif,
-  skip_compilation?: not build_native?,
+  skip_compilation?: false,
   load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
 
 # TCP server port (default: 6379, matches Redis)
@@ -24,7 +27,15 @@ config :ferricstore, :shard_count, 0
 config :ferricstore,
   flow_async_history: true,
   wal_commit_delay_us: 6_000,
-  waraft_commit_batch_max: 10_000
+  waraft_commit_batch_max: 10_000,
+  waraft_apply_log_batch_size: 4_096
+
+# Flow retention cleanup is correctness-safe as a normal durable Flow command,
+# but it can be storage-heavy. Run it on a maintenance cadence by default so
+# hot claim/transition workloads are not interrupted every minute.
+config :ferricstore,
+  flow_retention_sweeper_initial_delay_ms: 600_000,
+  flow_retention_sweeper_interval_ms: 600_000
 
 # LFU decay: minutes per decay step (0 = no decay). Matches Redis lfu-decay-time.
 config :ferricstore, :lfu_decay_time, 1

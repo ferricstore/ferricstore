@@ -457,33 +457,50 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
   end
 
   test "custom durable segment log decodes recovered records safely", %{root: root} do
-    assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
-    assert :ok = :ferricstore_waraft_spike.put("safe-decode:logged", "value")
-    assert :ok = :ferricstore_waraft_spike.stop()
+    table = :"ferricstore_waraft_safe_decode_#{System.unique_integer([:positive])}"
+    partition = 1
+    log_name = :wa_raft_log.registered_name(table, partition)
+
+    log =
+      {:raft_log, log_name, :ferricstore, table, partition, :ferricstore_waraft_spike_segment_log}
+
+    raft_root = Path.join(List.to_string(root), "safe-decode")
+    previous_database = Application.get_env(:ferricstore, :raft_database)
+    previous_waraft_database = Application.get_env(:wa_raft, :raft_database)
 
     atom_name = "ferricstore_waraft_corrupt_#{System.unique_integer([:positive])}"
     refute existing_atom?(atom_name)
 
-    path = overwrite_first_segment_with_unknown_atom_record!(root, atom_name)
-    parent = self()
-    handler = {:waraft_segment_log_safe_decode, self(), make_ref()}
+    Application.put_env(:ferricstore, :raft_database, String.to_charlist(raft_root))
+    Application.put_env(:wa_raft, :raft_database, String.to_charlist(raft_root))
 
-    :telemetry.attach(
-      handler,
-      [:ferricstore, :waraft, :segment_log_corrupt],
-      &__MODULE__.handle_segment_log_corrupt/4,
-      parent
+    :wa_raft_part_sup.prepare_spec(:ferricstore, %{
+      table: table,
+      partition: partition,
+      log_module: :ferricstore_waraft_spike_segment_log
+    })
+
+    assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+
+    segment_dir = Path.join(raft_root, "#{table}.#{partition}/segment_log")
+    File.mkdir_p!(segment_dir)
+    write_segment_config_fixture!(segment_dir, 65_536)
+    payload = unknown_atom_record_payload(atom_name, 1)
+    File.write!(
+      Path.join(segment_dir, "0.seg"),
+      <<byte_size(payload)::32, :erlang.crc32(payload)::32, payload::binary>>
     )
 
     try do
-      assert {:error, _reason} = :ferricstore_waraft_spike.start_segment_log(root)
+      assert {:error, {:bad_term, _reason}} = :ferricstore_waraft_spike_segment_log.open(log)
       refute existing_atom?(atom_name)
-
-      assert_receive {:segment_log_corrupt, [:ferricstore, :waraft, :segment_log_corrupt],
-                      %{count: 1}, %{path: ^path, reason: {:bad_term, _reason}}},
-                     1_000
     after
-      :telemetry.detach(handler)
+      restore_env(:raft_database, previous_database)
+      restore_app_env(:wa_raft, :raft_database, previous_waraft_database)
+
+      if :ets.info(log_name) != :undefined do
+        :ets.delete(log_name)
+      end
     end
   end
 
@@ -500,6 +517,26 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
              :wa_raft_log.append(view, [unknown_atom_payload(atom_name)])
 
     refute existing_atom?(atom_name)
+  end
+
+  test "public log trim reports provider failure instead of advancing the view", %{root: root} do
+    assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
+    status = :ferricstore_waraft_spike.status()
+    term = Keyword.fetch!(status, :current_term)
+
+    view =
+      status
+      |> segment_log_view()
+      |> append_entries!(
+        for i <- 1..5 do
+          {term, {make_ref(), {:write, :ferricstore_waraft_spike, "trim-fail:#{i}", "v"}}}
+        end
+      )
+
+    trim_index = log_view_first(view) + 2
+    File.mkdir_p!(Path.join(List.to_string(root), "ferricstore_waraft_spike.1/segment_projection_log"))
+
+    assert {:error, _reason} = :wa_raft_log.trim(view, trim_index)
   end
 
   test "WARaft heartbeat comparison decodes binary entries safely", %{root: root} do
@@ -561,16 +598,12 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
 
     try do
-      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 4096)
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
       status = :ferricstore_waraft_spike.status()
       term = Keyword.fetch!(status, :current_term)
       view = segment_log_view(status)
-      filler_count = max(0, 4094 - Keyword.fetch!(status, :log_last))
-
-      filler_entries = for _ <- 1..filler_count, do: {term, {make_ref(), :noop}}
-      view = append_entries!(view, filler_entries)
-      assert log_view_last(view) == 4094
+      view = advance_to_split_pair_boundary!(view, term, 2)
 
       Application.put_env(
         :ferricstore,
@@ -605,16 +638,12 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
 
     try do
-      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 4096)
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
       status = :ferricstore_waraft_spike.status()
       term = Keyword.fetch!(status, :current_term)
       view = segment_log_view(status)
-      filler_count = max(0, 4094 - Keyword.fetch!(status, :log_last))
-
-      filler_entries = for _ <- 1..filler_count, do: {term, {make_ref(), :noop}}
-      view = append_entries!(view, filler_entries)
-      assert log_view_last(view) == 4094
+      view = advance_to_split_pair_boundary!(view, term, 2)
 
       Application.put_env(
         :ferricstore,
@@ -669,8 +698,10 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     root: root
   } do
     previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_append_hook)
+    previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
 
     try do
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 4096)
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
       status = :ferricstore_waraft_spike.status()
       term = Keyword.fetch!(status, :current_term)
@@ -696,6 +727,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
       refute File.exists?(Path.join(segment_dir, "10.seg"))
     after
       restore_env(:waraft_segment_log_append_hook, previous_hook)
+      restore_env(:waraft_segment_log_records_per_segment, previous_records)
     end
   end
 
@@ -706,16 +738,12 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
 
     try do
-      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 4096)
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
       status = :ferricstore_waraft_spike.status()
       term = Keyword.fetch!(status, :current_term)
       view = segment_log_view(status)
-      filler_count = max(0, 4095 - Keyword.fetch!(status, :log_last))
-
-      filler_entries = for _ <- 1..filler_count, do: {term, {make_ref(), :noop}}
-      view = append_entries!(view, filler_entries)
-      assert log_view_last(view) == 4095
+      view = advance_to_next_segment_boundary!(view, term, 2)
 
       Application.put_env(:ferricstore, :waraft_segment_log_sync_dir_hook, {:notify, self()})
 
@@ -1057,16 +1085,13 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     previous_records = Application.get_env(:ferricstore, :waraft_segment_log_records_per_segment)
 
     try do
-      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 4096)
+      Application.put_env(:ferricstore, :waraft_segment_log_records_per_segment, 2)
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
       status = :ferricstore_waraft_spike.status()
       term = Keyword.fetch!(status, :current_term)
       view = segment_log_view(status)
-      filler_count = max(0, 4095 - Keyword.fetch!(status, :log_last))
-
-      filler_entries = for _ <- 1..filler_count, do: {term, {make_ref(), :noop}}
-      view = append_entries!(view, filler_entries)
-      assert log_view_last(view) == 4095
+      view = advance_to_next_segment_boundary!(view, term, 2)
+      failed_index = log_view_last(view) + 1
 
       segment_dir = segment_log_dir(root)
       Application.put_env(:ferricstore, :waraft_segment_log_sync_dir_hook, {:fail_once, self()})
@@ -1080,7 +1105,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
       assert_receive {:waraft_segment_log_sync_dir, ^segment_dir}, 1_000
 
       {:log_view, log, _first, _last, _config} = view
-      assert :not_found = :ferricstore_waraft_spike_segment_log.get(log, 4096)
+      assert :not_found = :ferricstore_waraft_spike_segment_log.get(log, failed_index)
 
       assert :ok = :ferricstore_waraft_spike.stop()
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
@@ -1089,8 +1114,8 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
       recovered_view = segment_log_view(:ferricstore_waraft_spike.status())
       {:log_view, recovered_log, _first, recovered_last, _config} = recovered_view
 
-      if recovered_last >= 4096 do
-        case :ferricstore_waraft_spike_segment_log.get(recovered_log, 4096) do
+      if recovered_last >= failed_index do
+        case :ferricstore_waraft_spike_segment_log.get(recovered_log, failed_index) do
           {:ok, {^term, {_ref, {:write, :ferricstore_waraft_spike, "segment:rejected", "value"}}}} ->
             flunk("recovered the rejected segment append")
 
@@ -1222,11 +1247,21 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
 
     try do
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
-      assert :ok = :ferricstore_waraft_spike.put("rewrite-cleanup:1", "v1")
-      assert :ok = :ferricstore_waraft_spike.put("rewrite-cleanup:2", "v2")
 
       status = :ferricstore_waraft_spike.status()
-      {:log_view, log, _first, _last, _config} = segment_log_view(status)
+      term = Keyword.fetch!(status, :current_term)
+
+      view =
+        status
+        |> segment_log_view()
+        |> append_entries!([
+          {term, {make_ref(), {:write, :ferricstore_waraft_spike, "rewrite-cleanup:1", "v1"}}},
+          {term, {make_ref(), {:write, :ferricstore_waraft_spike, "rewrite-cleanup:2", "v2"}}}
+        ])
+
+      {:log_view, log, _first, _last, _config} = view
+      assert :ok = :ferricstore_waraft_spike_segment_log.close_process_writers(log)
+
       parent = segment_log_dir(root) |> Path.dirname()
 
       Application.put_env(
@@ -1236,7 +1271,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
       )
 
       assert {:error, {:sync_dir_hook, ^parent, 7}} =
-               :ferricstore_waraft_spike_segment_log.trim(log, 2, %{})
+               :wa_raft_log.trim(view, 2)
 
       assert_receive {:waraft_segment_log_sync_dir, ^parent, 7}, 1_000
     after
@@ -1639,7 +1674,15 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     ]
 
     File.write!(path, Enum.map(records, &encode_segment_record/1))
+    clear_segment_offset_registry!()
     path
+  end
+
+  defp clear_segment_offset_registry! do
+    case :ets.info(:ferricstore_waraft_segment_offset_registry) do
+      :undefined -> :ok
+      _info -> :ets.delete_all_objects(:ferricstore_waraft_segment_offset_registry)
+    end
   end
 
   defp overwrite_first_segment_with_index_gap!(root) do
@@ -1691,29 +1734,14 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     File.write!(Path.join(segment_dir, "segment_config.term"), payload)
   end
 
-  defp overwrite_first_segment_with_unknown_atom_record!(root, atom_name) do
-    path =
-      root
-      |> segment_log_dir()
-      |> Path.join("*.seg")
-      |> Path.wildcard()
-      |> Enum.sort()
-      |> hd()
-
-    payload = unknown_atom_record_payload(atom_name)
-    crc = :erlang.crc32(payload)
-    File.write!(path, <<byte_size(payload)::32, crc::32, payload::binary>>)
-    path
-  end
-
   defp encode_segment_record(record) do
     payload = :erlang.term_to_binary(record)
     <<byte_size(payload)::32, :erlang.crc32(payload)::32, payload::binary>>
   end
 
-  defp unknown_atom_record_payload(atom_name)
-       when is_binary(atom_name) and byte_size(atom_name) < 256 do
-    <<131, 104, 2, 97, 1, 104, 2, 97, 1, 119, byte_size(atom_name), atom_name::binary>>
+  defp unknown_atom_record_payload(atom_name, index)
+       when is_binary(atom_name) and byte_size(atom_name) < 256 and index in 0..255 do
+    <<131, 104, 2, 97, index, 104, 2, 97, 1, 119, byte_size(atom_name), atom_name::binary>>
   end
 
   defp unknown_atom_payload(atom_name) when is_binary(atom_name) and byte_size(atom_name) < 256 do
@@ -1752,7 +1780,19 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     end
   end
 
+  defp advance_to_split_pair_boundary!(view, term, records_per_segment) do
+    next_index = log_view_last(view) + 1
+
+    if rem(next_index, records_per_segment) == records_per_segment - 1 do
+      view
+    else
+      entry = {term, {make_ref(), :noop}}
+      advance_to_split_pair_boundary!(append_entries!(view, [entry]), term, records_per_segment)
+    end
+  end
+
   defp log_view_last({:log_view, _log, _first, last, _config}), do: last
+  defp log_view_first({:log_view, _log, first, _last, _config}), do: first
 
   defp existing_atom?(atom_name) do
     _ = String.to_existing_atom(atom_name)

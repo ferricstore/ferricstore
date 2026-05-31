@@ -51,6 +51,8 @@ defmodule FerricstoreServer.Health.Endpoint do
   alias FerricstoreServer.Connection.Send, as: ConnSend
   alias FerricstoreServer.Acl
 
+  require Logger
+
   @listener_ref :"#{__MODULE__}"
   @max_request_bytes 8_192
   @request_recv_timeout_ms 5_000
@@ -337,6 +339,54 @@ defmodule FerricstoreServer.Health.Endpoint do
          socket,
          transport,
          "POST",
+         "/dashboard/doctor",
+         peer,
+         headers,
+         body
+       ) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      params = decode_form_body(body)
+
+      case authorize_command_request(peer, headers, {"FERRICSTORE.DOCTOR", []}, :html) do
+        :ok ->
+          location =
+            case FerricstoreServer.Health.Dashboard.apply_doctor_form(params) do
+              {:ok, message} ->
+                "/dashboard/doctor?" <>
+                  URI.encode_query(%{"status" => "ok", "message" => message})
+
+              {:error, reason} ->
+                "/dashboard/doctor?" <>
+                  URI.encode_query(%{"status" => "error", "message" => reason})
+            end
+
+          send_redirect_response(socket, transport, location)
+
+        {:redirect_login, location} ->
+          send_redirect_response(socket, transport, location)
+
+        {:unauthorized, reason} ->
+          send_response(
+            socket,
+            transport,
+            401,
+            "Unauthorized",
+            "application/json",
+            Jason.encode!(%{error: reason})
+          )
+
+        {:forbidden, requirement, reason} ->
+          send_forbidden_response(socket, transport, "/dashboard/doctor", requirement, reason)
+      end
+    end
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "POST",
          "/dashboard/flow/policies",
          peer,
          headers,
@@ -347,20 +397,50 @@ defmodule FerricstoreServer.Health.Endpoint do
     else
       params = decode_form_body(body)
 
-      location =
-        case FerricstoreServer.Health.Dashboard.apply_flow_policy_form(params) do
-          {:ok, type} ->
-            "/dashboard/flow/policies?" <>
-              URI.encode_query(%{"status" => "ok", "type" => type, "edit" => type})
+      case authorize_command_request(
+             peer,
+             headers,
+             flow_policy_form_requirement(params),
+             :html
+           ) do
+        :ok ->
+          location =
+            case FerricstoreServer.Health.Dashboard.apply_flow_policy_form(params) do
+              {:ok, type} ->
+                "/dashboard/flow/policies?" <>
+                  URI.encode_query(%{"status" => "ok", "type" => type, "edit" => type})
 
-          {:error, reason} ->
-            type = Map.get(params, "type", "")
+              {:error, reason} ->
+                type = Map.get(params, "type", "")
 
-            "/dashboard/flow/policies?" <>
-              URI.encode_query(%{"status" => "error", "message" => reason, "edit" => type})
-        end
+                "/dashboard/flow/policies?" <>
+                  URI.encode_query(%{"status" => "error", "message" => reason, "edit" => type})
+            end
 
-      send_redirect_response(socket, transport, location)
+          send_redirect_response(socket, transport, location)
+
+        {:redirect_login, location} ->
+          send_redirect_response(socket, transport, location)
+
+        {:unauthorized, reason} ->
+          send_response(
+            socket,
+            transport,
+            401,
+            "Unauthorized",
+            "application/json",
+            Jason.encode!(%{error: reason})
+          )
+
+        {:forbidden, requirement, reason} ->
+          send_forbidden_response(
+            socket,
+            transport,
+            "/dashboard/flow/policies",
+            requirement,
+            reason
+          )
+      end
     end
   end
 
@@ -378,31 +458,61 @@ defmodule FerricstoreServer.Health.Endpoint do
     else
       params = decode_form_body(body)
 
-      location =
-        case FerricstoreServer.Health.Dashboard.apply_flow_retention_form(params) do
-          {:ok, :dry_run, result} ->
-            "/dashboard/flow/retention?" <>
-              URI.encode_query(%{
-                "status" => "dry_run",
-                "limit" => Map.get(result, :limit, 100)
-              })
+      case authorize_command_request(
+             peer,
+             headers,
+             flow_retention_form_requirement(params),
+             :html
+           ) do
+        :ok ->
+          location =
+            case FerricstoreServer.Health.Dashboard.apply_flow_retention_form(params) do
+              {:ok, :dry_run, result} ->
+                "/dashboard/flow/retention?" <>
+                  URI.encode_query(%{
+                    "status" => "dry_run",
+                    "limit" => Map.get(result, :limit, 100)
+                  })
 
-          {:ok, :cleanup, result} ->
-            "/dashboard/flow/retention?" <>
-              URI.encode_query(%{
-                "status" => "ok",
-                "limit" => Map.get(result, :limit, 100),
-                "flows" => Map.get(result, :flows, 0),
-                "history" => Map.get(result, :history, 0),
-                "values" => Map.get(result, :values, 0)
-              })
+              {:ok, :cleanup, result} ->
+                "/dashboard/flow/retention?" <>
+                  URI.encode_query(%{
+                    "status" => "ok",
+                    "limit" => Map.get(result, :limit, 100),
+                    "flows" => Map.get(result, :flows, 0),
+                    "history" => Map.get(result, :history, 0),
+                    "values" => Map.get(result, :values, 0)
+                  })
 
-          {:error, reason} ->
-            "/dashboard/flow/retention?" <>
-              URI.encode_query(%{"status" => "error", "message" => reason})
-        end
+              {:error, reason} ->
+                "/dashboard/flow/retention?" <>
+                  URI.encode_query(%{"status" => "error", "message" => reason})
+            end
 
-      send_redirect_response(socket, transport, location)
+          send_redirect_response(socket, transport, location)
+
+        {:redirect_login, location} ->
+          send_redirect_response(socket, transport, location)
+
+        {:unauthorized, reason} ->
+          send_response(
+            socket,
+            transport,
+            401,
+            "Unauthorized",
+            "application/json",
+            Jason.encode!(%{error: reason})
+          )
+
+        {:forbidden, requirement, reason} ->
+          send_forbidden_response(
+            socket,
+            transport,
+            "/dashboard/flow/retention",
+            requirement,
+            reason
+          )
+      end
     end
   end
 
@@ -420,22 +530,52 @@ defmodule FerricstoreServer.Health.Endpoint do
     else
       params = decode_form_body(body)
 
-      location =
-        case FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params) do
-          {:ok, result} ->
-            "/dashboard/flow/failures?" <>
-              URI.encode_query(%{
-                "status" => "reclaimed",
-                "type" => Map.get(result, :type, ""),
-                "count" => Map.get(result, :reclaimed, 0)
-              })
+      case authorize_command_request(
+             peer,
+             headers,
+             flow_reclaim_form_requirement(params),
+             :html
+           ) do
+        :ok ->
+          location =
+            case FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params) do
+              {:ok, result} ->
+                "/dashboard/flow/failures?" <>
+                  URI.encode_query(%{
+                    "status" => "reclaimed",
+                    "type" => Map.get(result, :type, ""),
+                    "count" => Map.get(result, :reclaimed, 0)
+                  })
 
-          {:error, reason} ->
-            "/dashboard/flow/failures?" <>
-              URI.encode_query(%{"status" => "error", "message" => reason})
-        end
+              {:error, reason} ->
+                "/dashboard/flow/failures?" <>
+                  URI.encode_query(%{"status" => "error", "message" => reason})
+            end
 
-      send_redirect_response(socket, transport, location)
+          send_redirect_response(socket, transport, location)
+
+        {:redirect_login, location} ->
+          send_redirect_response(socket, transport, location)
+
+        {:unauthorized, reason} ->
+          send_response(
+            socket,
+            transport,
+            401,
+            "Unauthorized",
+            "application/json",
+            Jason.encode!(%{error: reason})
+          )
+
+        {:forbidden, requirement, reason} ->
+          send_forbidden_response(
+            socket,
+            transport,
+            "/dashboard/flow/failures",
+            requirement,
+            reason
+          )
+      end
     end
   end
 
@@ -458,21 +598,51 @@ defmodule FerricstoreServer.Health.Endpoint do
             |> decode_form_body()
             |> Map.put_new("id", id)
 
-          location =
-            case FerricstoreServer.Health.Dashboard.apply_flow_rewind_form(params) do
-              {:ok, id, partition_key} ->
-                flow_detail_location(id, partition_key, %{"status" => "rewound"})
+          case authorize_command_request(
+                 peer,
+                 headers,
+                 flow_rewind_form_requirement(id, params),
+                 :html
+               ) do
+            :ok ->
+              location =
+                case FerricstoreServer.Health.Dashboard.apply_flow_rewind_form(params) do
+                  {:ok, id, partition_key} ->
+                    flow_detail_location(id, partition_key, %{"status" => "rewound"})
 
-              {:error, reason} ->
-                partition_key = Map.get(params, "partition_key", "")
+                  {:error, reason} ->
+                    partition_key = Map.get(params, "partition_key", "")
 
-                flow_detail_location(id, partition_key, %{
-                  "status" => "error",
-                  "message" => reason
-                })
-            end
+                    flow_detail_location(id, partition_key, %{
+                      "status" => "error",
+                      "message" => reason
+                    })
+                end
 
-          send_redirect_response(socket, transport, location)
+              send_redirect_response(socket, transport, location)
+
+            {:redirect_login, location} ->
+              send_redirect_response(socket, transport, location)
+
+            {:unauthorized, reason} ->
+              send_response(
+                socket,
+                transport,
+                401,
+                "Unauthorized",
+                "application/json",
+                Jason.encode!(%{error: reason})
+              )
+
+            {:forbidden, requirement, reason} ->
+              send_forbidden_response(
+                socket,
+                transport,
+                "/dashboard/flow/" <> encoded_action,
+                requirement,
+                reason
+              )
+          end
 
         :not_found ->
           send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
@@ -548,7 +718,10 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      case FerricstoreServer.Health.Dashboard.live_payload(api_path) do
+      case FerricstoreServer.Health.Dashboard.live_payload(
+             api_path,
+             dashboard_collect_opts(peer, headers)
+           ) do
         {:ok, payload} ->
           send_response(
             socket,
@@ -605,10 +778,15 @@ defmodule FerricstoreServer.Health.Endpoint do
         send_html_response(socket, transport, 200, "OK", body)
       catch
         kind, reason ->
-          body =
-            "<html><body style='background:#0d1117;color:#f85149;padding:20px;font-family:monospace;'><h2>Raft Page Error</h2><pre>#{inspect(kind)}: #{inspect(reason, pretty: true, limit: 10)}</pre><a href='/dashboard' style='color:#58a6ff;'>← Dashboard</a></body></html>"
+          log_dashboard_page_error("/dashboard/raft", kind, reason)
 
-          send_html_response(socket, transport, 200, "OK", body)
+          send_html_response(
+            socket,
+            transport,
+            200,
+            "OK",
+            dashboard_internal_error_body("Consensus")
+          )
       end
     end
   end
@@ -639,6 +817,14 @@ defmodule FerricstoreServer.Health.Endpoint do
       body = FerricstoreServer.Health.Dashboard.render_storage_page(data)
       send_html_response(socket, transport, 200, "OK", body)
     end
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/doctor", peer, headers) do
+    handle_doctor_page(socket, transport, peer, headers, "")
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/doctor?" <> query, peer, headers) do
+    handle_doctor_page(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/keyspace", peer, headers) do
@@ -728,7 +914,11 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      data = FerricstoreServer.Health.Dashboard.collect_flow_workers_page()
+      data =
+        peer
+        |> dashboard_flow_collect_opts(headers)
+        |> FerricstoreServer.Health.Dashboard.collect_flow_workers_page()
+
       body = FerricstoreServer.Health.Dashboard.render_flow_workers_page(data)
       send_html_response(socket, transport, 200, "OK", body)
     end
@@ -738,7 +928,11 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      data = FerricstoreServer.Health.Dashboard.collect_flow_due_page()
+      data =
+        peer
+        |> dashboard_flow_collect_opts(headers)
+        |> FerricstoreServer.Health.Dashboard.collect_flow_due_page()
+
       body = FerricstoreServer.Health.Dashboard.render_flow_due_page(data)
       send_html_response(socket, transport, 200, "OK", body)
     end
@@ -888,8 +1082,27 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      data = FerricstoreServer.Health.Dashboard.collect_keyspace_page(URI.decode_query(query))
+      data =
+        query
+        |> URI.decode_query()
+        |> Map.merge(dashboard_collect_opts(peer, headers))
+        |> FerricstoreServer.Health.Dashboard.collect_keyspace_page()
+
       body = FerricstoreServer.Health.Dashboard.render_keyspace_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  defp handle_doctor_page(socket, transport, peer, headers, query) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data =
+        query
+        |> URI.decode_query()
+        |> FerricstoreServer.Health.Dashboard.collect_doctor_page()
+
+      body = FerricstoreServer.Health.Dashboard.render_doctor_page(data)
       send_html_response(socket, transport, 200, "OK", body)
     end
   end
@@ -901,6 +1114,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       data =
         query
         |> FerricstoreServer.Health.Dashboard.flow_opts_from_query()
+        |> dashboard_flow_collect_opts(peer, headers)
         |> FerricstoreServer.Health.Dashboard.collect_flow_page()
 
       body = data |> FerricstoreServer.Health.Dashboard.live_flow_payload() |> Jason.encode!()
@@ -915,6 +1129,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       data =
         query
         |> FerricstoreServer.Health.Dashboard.flow_opts_from_query()
+        |> dashboard_flow_collect_opts(peer, headers)
         |> FerricstoreServer.Health.Dashboard.collect_flow_page()
 
       body = FerricstoreServer.Health.Dashboard.render_flow_page(data)
@@ -926,7 +1141,11 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      opts = FerricstoreServer.Health.Dashboard.flow_states_opts_from_query(query)
+      opts =
+        query
+        |> FerricstoreServer.Health.Dashboard.flow_states_opts_from_query()
+        |> dashboard_flow_collect_opts(peer, headers)
+
       data = FerricstoreServer.Health.Dashboard.collect_flow_states_page(opts)
       body = FerricstoreServer.Health.Dashboard.render_flow_states_page(data)
       send_html_response(socket, transport, 200, "OK", body)
@@ -937,7 +1156,11 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      opts = FerricstoreServer.Health.Dashboard.flow_signals_opts_from_query(query)
+      opts =
+        query
+        |> FerricstoreServer.Health.Dashboard.flow_signals_opts_from_query()
+        |> dashboard_flow_collect_opts(peer, headers)
+
       data = FerricstoreServer.Health.Dashboard.collect_flow_signals_page(opts)
       body = FerricstoreServer.Health.Dashboard.render_flow_signals_page(data)
       send_html_response(socket, transport, 200, "OK", body)
@@ -968,10 +1191,12 @@ defmodule FerricstoreServer.Health.Endpoint do
       params = decode_form_body(query)
 
       data =
-        FerricstoreServer.Health.Dashboard.collect_flow_retention_page(
+        [
           flash: FerricstoreServer.Health.Dashboard.flow_retention_flash_from_query(query),
           limit: Map.get(params, "limit", "")
-        )
+        ]
+        |> dashboard_flow_collect_opts(peer, headers)
+        |> FerricstoreServer.Health.Dashboard.collect_flow_retention_page()
 
       body = FerricstoreServer.Health.Dashboard.render_flow_retention_page(data)
       send_html_response(socket, transport, 200, "OK", body)
@@ -985,6 +1210,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       data =
         query
         |> FerricstoreServer.Health.Dashboard.flow_failures_opts_from_query()
+        |> dashboard_flow_collect_opts(peer, headers)
         |> FerricstoreServer.Health.Dashboard.collect_flow_failures_page()
 
       body = FerricstoreServer.Health.Dashboard.render_flow_failures_page(data)
@@ -999,6 +1225,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       data =
         query
         |> FerricstoreServer.Health.Dashboard.flow_lineage_opts_from_query()
+        |> dashboard_flow_collect_opts(peer, headers)
         |> FerricstoreServer.Health.Dashboard.collect_flow_lineage_page()
 
       body = FerricstoreServer.Health.Dashboard.render_flow_lineage_page(data)
@@ -1013,6 +1240,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       data =
         query
         |> FerricstoreServer.Health.Dashboard.flow_query_opts_from_query()
+        |> dashboard_flow_collect_opts(peer, headers)
         |> FerricstoreServer.Health.Dashboard.collect_flow_query_page()
 
       body = FerricstoreServer.Health.Dashboard.render_flow_query_page(data)
@@ -1129,7 +1357,7 @@ defmodule FerricstoreServer.Health.Endpoint do
         authorize_dashboard_request(method, path, peer, headers)
 
       path == "/metrics" ->
-        authorize_command_request(peer, headers, {"INFO", []}, :json)
+        authorize_command_request(peer, headers, {"FERRICSTORE.METRICS", []}, :json)
 
       true ->
         :ok
@@ -1209,6 +1437,26 @@ defmodule FerricstoreServer.Health.Endpoint do
     end
   end
 
+  defp dashboard_collect_opts(peer, headers) do
+    case dashboard_identity(peer, headers) do
+      {:ok, {:acl, username}} -> %{"acl_username" => username}
+      _other -> %{}
+    end
+  end
+
+  defp dashboard_flow_collect_opts(peer, headers),
+    do: dashboard_flow_collect_opts([], peer, headers)
+
+  defp dashboard_flow_collect_opts(opts, peer, headers) when is_list(opts) do
+    case dashboard_collect_opts(peer, headers) do
+      %{"acl_username" => username} when is_binary(username) ->
+        Keyword.put(opts, :acl_username, username)
+
+      _other ->
+        opts
+    end
+  end
+
   defp dashboard_path?("/dashboard"), do: true
   defp dashboard_path?("/dashboard?" <> _query), do: true
   defp dashboard_path?("/dashboard/" <> _rest), do: true
@@ -1228,8 +1476,9 @@ defmodule FerricstoreServer.Health.Endpoint do
       "/dashboard/config" -> {"CONFIG", []}
       "/dashboard/raft" -> {"CLUSTER.STATUS", []}
       "/dashboard/consensus" -> {"CLUSTER.STATUS", []}
-      "/dashboard/clients" -> {"CLIENT", []}
+      "/dashboard/clients" -> {"CLIENT.LIST", []}
       "/dashboard/storage" -> {"INFO", []}
+      "/dashboard/doctor" -> {"FERRICSTORE.DOCTOR", []}
       "/dashboard/keyspace" -> keyspace_requirement(query)
       "/dashboard/commands" -> {"INFO", []}
       "/dashboard/reads" -> {"INFO", []}
@@ -1239,7 +1488,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       "/dashboard/flow/states" -> {"FLOW.LIST", []}
       "/dashboard/flow/workers" -> {"FLOW.LIST", []}
       "/dashboard/flow/due" -> {"FLOW.LIST", []}
-      "/dashboard/flow/failures" -> {"FLOW.FAILURES", []}
+      "/dashboard/flow/failures" -> flow_index_view_requirement("FLOW.FAILURES", query)
       "/dashboard/flow/lineage" -> flow_lineage_requirement(query)
       "/dashboard/flow/query" -> flow_query_requirement(query)
       "/dashboard/flow/signals" -> {"FLOW.HISTORY", []}
@@ -1258,13 +1507,13 @@ defmodule FerricstoreServer.Health.Endpoint do
       "/dashboard/api/slowlog" -> {"SLOWLOG", []}
       "/dashboard/api/merge" -> {"INFO", []}
       "/dashboard/api/raft" -> {"CLUSTER.STATUS", []}
-      "/dashboard/api/clients" -> {"CLIENT", []}
+      "/dashboard/api/clients" -> {"CLIENT.LIST", []}
       "/dashboard/api/storage" -> {"INFO", []}
       "/dashboard/api/keyspace" -> keyspace_requirement(query)
       "/dashboard/api/commands" -> {"INFO", []}
       "/dashboard/api/reads" -> {"INFO", []}
       "/dashboard/api/prefixes" -> {"SCAN", []}
-      _ -> flow_detail_or_default_requirement(clean_path)
+      _ -> flow_detail_or_default_requirement(clean_path, query)
     end
   end
 
@@ -1279,7 +1528,10 @@ defmodule FerricstoreServer.Health.Endpoint do
         {"FLOW.POLICY.SET", []}
 
       "/dashboard/flow/retention" ->
-        {"FLOW.RETENTION_CLEANUP", []}
+        {"FLOW.LIST", []}
+
+      "/dashboard/doctor" ->
+        {"FERRICSTORE.DOCTOR", []}
 
       _ ->
         flow_rewind_or_default_requirement(clean_path)
@@ -1288,6 +1540,15 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   defp dashboard_route_requirement(_method, _path), do: {"*", []}
 
+  defp flow_retention_form_requirement(%{"action" => "cleanup"}) do
+    # Retention cleanup is a global destructive command. Requiring write
+    # access to "*" prevents a tenant-scoped dashboard user from cleaning
+    # terminal rows outside their ACL key scope. Dry-run stays read-only.
+    {"FLOW.RETENTION_CLEANUP", key: {"*", :write}}
+  end
+
+  defp flow_retention_form_requirement(_params), do: {"FLOW.LIST", []}
+
   defp flow_lookup_requirement(query) do
     id =
       query
@@ -1295,10 +1556,52 @@ defmodule FerricstoreServer.Health.Endpoint do
       |> Map.get("id", "")
       |> String.trim()
 
-    if id == "" do
-      {"FLOW.GET", []}
-    else
-      {"FLOW.GET", key: {id, :read}}
+    partition_key = flow_partition_key_from_query(query)
+
+    cond do
+      id == "" ->
+        {"FLOW.GET", []}
+
+      partition_key != "" ->
+        {"FLOW.GET", key: {partition_key, :read}}
+
+      true ->
+        {"FLOW.GET", key: {id, :read}}
+    end
+  rescue
+    _ -> {"FLOW.GET", []}
+  end
+
+  defp flow_detail_or_default_requirement("/dashboard/flow/" <> encoded_id, query) do
+    id = URI.decode(encoded_id)
+    {"FLOW.GET", key: {flow_acl_key_from_query(id, query), :read}}
+  end
+
+  defp flow_detail_or_default_requirement("/dashboard/api/flow/" <> encoded_id, query) do
+    id = URI.decode(encoded_id)
+    {"FLOW.GET", key: {flow_acl_key_from_query(id, query), :read}}
+  end
+
+  defp flow_detail_or_default_requirement(_path, _query), do: {"INFO", []}
+
+  defp flow_value_requirement(query) do
+    flow_id =
+      query
+      |> URI.decode_query()
+      |> Map.get("flow", "")
+      |> String.trim()
+
+    partition_key = flow_partition_key_from_query(query)
+
+    cond do
+      flow_id == "" ->
+        {"FLOW.GET", []}
+
+      partition_key != "" ->
+        {"FLOW.GET", key: {partition_key, :read}}
+
+      true ->
+        {"FLOW.GET", key: {flow_id, :read}}
     end
   rescue
     _ -> {"FLOW.GET", []}
@@ -1326,69 +1629,171 @@ defmodule FerricstoreServer.Health.Endpoint do
       |> URI.decode_query()
       |> Map.get("mode", "root")
 
-    case mode do
-      "parent" -> {"FLOW.BY_PARENT", []}
-      "correlation" -> {"FLOW.BY_CORRELATION", []}
-      _ -> {"FLOW.BY_ROOT", []}
+    command =
+      case mode do
+        "parent" -> "FLOW.BY_PARENT"
+        "correlation" -> "FLOW.BY_CORRELATION"
+        _ -> "FLOW.BY_ROOT"
+      end
+
+    case flow_partition_key_from_query(query) do
+      "" -> {command, []}
+      partition_key -> {command, key: {partition_key, :read}}
     end
   rescue
     _ -> {"FLOW.BY_ROOT", []}
   end
 
   defp flow_query_requirement(query) do
-    kind =
-      query
-      |> URI.decode_query()
-      |> Map.get("kind", "list")
+    params = URI.decode_query(query)
+    kind = Map.get(params, "kind", "list")
+    command = flow_query_command_requirement(kind)
+    partition_key = flow_partition_key_from_query(query)
+    type = params |> Map.get("type", "") |> String.trim()
 
-    case kind do
-      "terminals" -> {"FLOW.TERMINALS", []}
-      "failures" -> {"FLOW.FAILURES", []}
-      "stuck" -> {"FLOW.STUCK", []}
-      "history" -> {"FLOW.HISTORY", []}
-      "by_parent" -> {"FLOW.BY_PARENT", []}
-      "by_root" -> {"FLOW.BY_ROOT", []}
-      "by_correlation" -> {"FLOW.BY_CORRELATION", []}
-      _ -> {"FLOW.LIST", []}
-    end
+    key =
+      params
+      |> Map.get("id", "")
+      |> String.trim()
+      |> flow_acl_key_from_query(query)
+
+    flow_query_key_requirement(command, kind, key, partition_key, type)
   rescue
     _ -> {"FLOW.LIST", []}
   end
 
-  defp flow_detail_or_default_requirement("/dashboard/flow/" <> encoded_id) do
-    {"FLOW.GET", key: {URI.decode(encoded_id), :read}}
-  end
+  defp flow_index_view_requirement(command, query) do
+    params = URI.decode_query(query)
 
-  defp flow_detail_or_default_requirement("/dashboard/api/flow/" <> encoded_id) do
-    {"FLOW.GET", key: {URI.decode(encoded_id), :read}}
-  end
-
-  defp flow_detail_or_default_requirement(_path), do: {"INFO", []}
-
-  defp flow_value_requirement(query) do
-    flow_id =
-      query
-      |> URI.decode_query()
-      |> Map.get("flow", "")
+    partition_key =
+      params
+      |> Map.get("partition_key", "")
       |> String.trim()
 
-    if flow_id == "" do
-      {"FLOW.GET", []}
-    else
-      {"FLOW.GET", key: {flow_id, :read}}
+    type =
+      params
+      |> Map.get("type", "")
+      |> String.trim()
+
+    cond do
+      partition_key != "" -> {command, key: {partition_key, :read}}
+      type != "" -> {command, key: {type, :read}}
+      true -> {command, []}
     end
   rescue
-    _ -> {"FLOW.GET", []}
+    _ -> {command, []}
   end
+
+  defp flow_query_key_requirement(command, "history", "", _partition_key, _type),
+    do: {command, []}
+
+  defp flow_query_key_requirement(command, "history", key, _partition_key, _type),
+    do: {command, key: {key, :read}}
+
+  defp flow_query_key_requirement(command, kind, _key, partition_key, type)
+       when kind in ["failures", "list", "stuck", "terminals"] do
+    cond do
+      partition_key != "" -> {command, key: {partition_key, :read}}
+      type != "" -> {command, key: {type, :read}}
+      true -> {command, []}
+    end
+  end
+
+  defp flow_query_key_requirement(command, _kind, _key, "", _type) do
+    {command, []}
+  end
+
+  defp flow_query_key_requirement(command, _kind, _key, partition_key, _type) do
+    {command, key: {partition_key, :read}}
+  end
+
+  defp flow_query_command_requirement(kind) when is_binary(kind) do
+    case kind do
+      "terminals" -> "FLOW.TERMINALS"
+      "failures" -> "FLOW.FAILURES"
+      "stuck" -> "FLOW.STUCK"
+      "history" -> "FLOW.HISTORY"
+      "by_parent" -> "FLOW.BY_PARENT"
+      "by_root" -> "FLOW.BY_ROOT"
+      "by_correlation" -> "FLOW.BY_CORRELATION"
+      _ -> "FLOW.LIST"
+    end
+  end
+
+  defp flow_query_command_requirement(_kind), do: "FLOW.LIST"
 
   defp flow_rewind_or_default_requirement("/dashboard/flow/" <> encoded_action) do
     case decode_flow_rewind_action(encoded_action) do
-      {:ok, id} -> {"FLOW.REWIND", key: {id, :write}}
+      {:ok, _id} -> {"FLOW.REWIND", []}
       :not_found -> {"FLOW.REWIND", []}
     end
   end
 
   defp flow_rewind_or_default_requirement(_path), do: {"INFO", []}
+
+  defp flow_rewind_form_requirement(id, params) do
+    key =
+      params
+      |> Map.get("partition_key", "")
+      |> String.trim()
+      |> case do
+        "" -> id
+        partition_key -> partition_key
+      end
+
+    if key == "" do
+      {"FLOW.REWIND", []}
+    else
+      {"FLOW.REWIND", key: {key, :write}}
+    end
+  end
+
+  defp flow_acl_key_from_query(id, query) do
+    case flow_partition_key_from_query(query) do
+      "" -> id
+      partition_key -> partition_key
+    end
+  end
+
+  defp flow_partition_key_from_query(query) do
+    query
+    |> URI.decode_query()
+    |> Map.get("partition_key", "")
+    |> String.trim()
+  rescue
+    _ -> ""
+  end
+
+  defp flow_policy_form_requirement(params) do
+    type =
+      params
+      |> Map.get("type", "")
+      |> String.trim()
+
+    if type == "" do
+      {"FLOW.POLICY.SET", []}
+    else
+      {"FLOW.POLICY.SET", key: {type, :write}}
+    end
+  end
+
+  defp flow_reclaim_form_requirement(params) do
+    type =
+      params
+      |> Map.get("type", "")
+      |> String.trim()
+
+    partition_key =
+      params
+      |> Map.get("partition_key", "")
+      |> String.trim()
+
+    cond do
+      partition_key != "" -> {"FLOW.RECLAIM", key: {partition_key, :write}}
+      type != "" -> {"FLOW.RECLAIM", key: {type, :write}}
+      true -> {"FLOW.RECLAIM", []}
+    end
+  end
 
   defp split_path_query(path) do
     case String.split(path, "?", parts: 2) do
@@ -1661,6 +2066,22 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp constant_time_equal?(_left, _right), do: false
+
+  defp log_dashboard_page_error(path, kind, reason) do
+    Logger.error(fn ->
+      "FerricStore dashboard page error at #{path}: #{inspect({kind, reason}, limit: 20)}"
+    end)
+  end
+
+  defp dashboard_internal_error_body(page_name) do
+    """
+    <html><body style="background:#0d1117;color:#f85149;padding:20px;font-family:monospace;">
+    <h2>#{page_name} Page Error</h2>
+    <pre>Internal dashboard error. See server logs.</pre>
+    <a href="/dashboard" style="color:#58a6ff;">← Dashboard</a>
+    </body></html>
+    """
+  end
 
   # ---------------------------------------------------------------------------
   # HTTP response writing

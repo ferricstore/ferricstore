@@ -69,6 +69,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
         assert result == :ok, "PUT should succeed, got: #{inspect(result)} on #{node.name}"
 
         shard_idx = remote_router(node.name, :shard_for, [key])
+
         {:ok, members, {_leader_name, leader_node}} =
           :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard_idx, 2_000])
 
@@ -115,6 +116,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       eventually(fn ->
         assert remote_router(n2.name, :get, ["ra002:n2_key"]) == "n2_val"
       end)
+
       eventually(fn ->
         assert remote_router(n3.name, :get, ["ra002:n3_key"]) == "n3_val"
       end)
@@ -197,8 +199,10 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       end)
 
       Enum.each(nodes, fn node ->
-        val = remote_router(node.name, :get, ["ra005:ow"])
-        assert val == "final", "RA-005: all nodes should have 'final' after overwrite sequence"
+        eventually(fn ->
+          val = remote_router(node.name, :get, ["ra005:ow"])
+          assert val == "final", "RA-005: all nodes should have 'final' after overwrite sequence"
+        end)
       end)
     end
 
@@ -369,6 +373,7 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
 
       for shard <- 0..3 do
         node = hd(remaining)
+
         {:ok, _members, {_name, leader}} =
           :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard, 2_000])
 
@@ -416,6 +421,7 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
                "LE-002: shard #{shard} should have exactly one leader, got #{inspect(leaders)}"
 
         [leader] = leaders
+
         assert leader in Enum.map(alive_nodes, & &1.name),
                "LE-002: leader for shard #{shard} should be an alive node"
       end

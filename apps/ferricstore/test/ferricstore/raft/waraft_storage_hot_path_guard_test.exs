@@ -1,8 +1,18 @@
 defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
   use ExUnit.Case, async: true
 
+  test "LMDB release-cursor poke is explicitly opt-in" do
+    source = File.read!(Path.expand("../../../lib/ferricstore/flow/lmdb_writer.ex", __DIR__))
+
+    assert source =~ ":flow_lmdb_release_cursor_poke_enabled"
+    assert source =~ "Application.get_env(:ferricstore, :flow_lmdb_release_cursor_poke_enabled, false)"
+  end
+
   @source_path Path.expand("../../../lib/ferricstore/raft/waraft_storage.ex", __DIR__)
-  @segment_log_source_path Path.expand("../../../src/ferricstore_waraft_spike_segment_log.erl", __DIR__)
+  @segment_log_source_path Path.expand(
+                             "../../../src/ferricstore_waraft_spike_segment_log.erl",
+                             __DIR__
+                           )
 
   test "segment projection registration caches expanded root path on the storage handle" do
     source = File.read!(@source_path)
@@ -67,5 +77,31 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
 
     assert open_source =~ "validate_segment_file_for_append(Path)",
            "new writer opens must still reject unsafe segment paths"
+  end
+
+  test "segment projection checkpoints do not copy the whole keydir with tab2list" do
+    # Segment projection checkpoint/snapshot paths can run with millions of
+    # keydir rows. :ets.tab2list/1 makes one large BEAM list of every row before
+    # the code can skip expired/non-projectable entries, creating avoidable
+    # memory spikes and scheduler latency. Use ETS folding/streaming instead.
+    assert tab2list_calls(@source_path) == []
+  end
+
+  defp tab2list_calls(path) do
+    {:ok, ast} =
+      path
+      |> File.read!()
+      |> Code.string_to_quoted(columns: true)
+
+    {_ast, calls} =
+      Macro.prewalk(ast, [], fn
+        {{:., meta, [:ets, :tab2list]}, _call_meta, _args} = node, acc ->
+          {node, [{path, meta[:line], meta[:column]} | acc]}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(calls)
   end
 end

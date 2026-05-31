@@ -76,6 +76,8 @@ defmodule FerricstoreServer.Connection do
 
   alias Ferricstore.PubSub, as: PS
 
+  require Logger
+
   # Connection safety limits -- prevent unbounded memory growth per connection.
   # Maximum receive buffer size before the connection is closed (128 MB).
   @max_buffer_size 134_217_728
@@ -94,6 +96,7 @@ defmodule FerricstoreServer.Connection do
     multi_state: :none,
     multi_queue: [],
     multi_queue_count: 0,
+    multi_error: false,
     watched_keys: %{},
     authenticated: false,
     require_auth: false,
@@ -132,8 +135,9 @@ defmodule FerricstoreServer.Connection do
           instance_ctx: FerricStore.Instance.t(),
           stats_counter: reference(),
           multi_state: multi_state(),
-          multi_queue: [{binary(), [binary()]}],
+          multi_queue: [{binary(), [binary()], term(), [binary()]}],
           multi_queue_count: non_neg_integer(),
+          multi_error: boolean(),
           watched_keys: %{binary() => term()},
           require_auth: boolean(),
           tracking: ClientTracking.tracking_config() | nil,
@@ -227,7 +231,7 @@ defmodule FerricstoreServer.Connection do
               peer: peer,
               instance_ctx: ctx,
               stats_counter: ctx.stats_counter,
-              require_auth: Ferricstore.Config.get_value("requirepass") != "",
+              require_auth: ConnAuth.user_requires_auth?("default"),
               tracking: ClientTracking.new_config(),
               acl_cache: default_cache,
               active_mode: active_mode
@@ -304,7 +308,12 @@ defmodule FerricstoreServer.Connection do
         transport.close(socket)
 
       {:acl_invalidate, username} ->
-        loop(ConnAuth.maybe_refresh_acl_cache(state, username))
+        refreshed_state =
+          state
+          |> ConnAuth.maybe_refresh_acl_cache(username)
+          |> enforce_pubsub_acl_after_refresh()
+
+        loop(maybe_sync_connection_registry(state, refreshed_state))
     end
   end
 
@@ -408,10 +417,10 @@ defmodule FerricstoreServer.Connection do
        )
        when is_binary(cmd) and is_list(args) do
     if live_requirepass_enabled?() do
-      handle_command_parts(cmd, args, ast, [], %{state | require_auth: true})
+      handle_command_parts(cmd, args, ast, [], state)
     else
       Stats.incr_commands(state.stats_counter)
-      dispatch_parsed(cmd, args, ast, state)
+      dispatch_parsed(cmd, args, ast, [], state)
     end
   end
 
@@ -425,54 +434,68 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp handle_command_parts(cmd, args, ast, keys, state) do
+    acl_cmd = ConnAuth.acl_command_name(cmd, args, ast)
+
     cond do
-      requires_auth?(state) and cmd not in @pre_auth_cmds ->
+      requires_auth?(state) and acl_cmd not in @pre_auth_cmds ->
         {:continue, Encoder.encode({:error, "NOAUTH Authentication required."}), state}
 
-      cmd not in @acl_bypass_cmds ->
-        with :ok <- ConnAuth.check_command_cached(state.acl_cache, cmd),
-             :ok <- ConnAuth.check_keys_cached(state.acl_cache, cmd, keys) do
+      acl_cmd not in @acl_bypass_cmds ->
+        with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
+             :ok <- ConnAuth.check_keys_cached(state.acl_cache, acl_cmd, acl_key_args(cmd, keys)),
+             :ok <- ConnAuth.check_channels_cached(state.acl_cache, acl_channel_args(cmd, args)) do
           Stats.incr_commands(state.stats_counter)
-          dispatch_parsed(cmd, args, ast, state)
+          dispatch_parsed(cmd, args, ast, keys, state)
         else
           {:error, _reason} = err ->
             FerricstoreServer.Acl.log_command_denied(
               state.username,
-              cmd,
+              acl_cmd,
               format_peer(state.peer),
               state.client_id
             )
 
+            state = maybe_mark_multi_queue_error(state, ast)
             {:continue, Encoder.encode(err), state}
         end
 
       true ->
         Stats.incr_commands(state.stats_counter)
-        dispatch_parsed(cmd, args, ast, state)
+        dispatch_parsed(cmd, args, ast, keys, state)
     end
   end
 
   defp requires_auth?(state) do
-    not state.authenticated and live_requirepass_enabled?()
+    not state.authenticated and (state.require_auth or live_requirepass_enabled?())
   end
+
+  defp maybe_mark_multi_queue_error(%{multi_state: :queuing} = state, ast) do
+    if connection_passthrough_ast?(ast) do
+      state
+    else
+      %{state | multi_error: true}
+    end
+  end
+
+  defp maybe_mark_multi_queue_error(state, _ast), do: state
 
   defp live_requirepass_enabled? do
     Ferricstore.Config.get_value("requirepass") not in [nil, ""]
   end
 
-  defp dispatch_parsed(cmd, args, ast, state) do
+  defp dispatch_parsed(cmd, args, ast, keys, state) do
     cond do
       state.multi_state == :queuing and connection_passthrough_ast?(ast) ->
         dispatch_connection_ast(ast, state)
 
       state.multi_state == :queuing ->
-        ConnTransaction.dispatch_queue(cmd, args, ast, state)
+        ConnTransaction.dispatch_queue(cmd, args, ast, keys, state)
 
       in_pubsub_mode?(state) ->
         dispatch_pubsub_mode_ast(cmd, args, ast, state)
 
       connection_ast?(ast) ->
-        dispatch_connection_ast(ast, state)
+        dispatch_connection_command(cmd, args, ast, state)
 
       cmd == "GET" and state.transport in [:ranch_tcp, :ranch_ssl] ->
         dispatch_get_sendfile_ast(args, ast, state)
@@ -527,7 +550,7 @@ defmodule FerricstoreServer.Connection do
           {{:error, "ERR server not ready, shard process unavailable"}, conn_state}
 
         :exit, {reason, _} ->
-          {{:error, "ERR internal error: #{inspect(reason)}"}, conn_state}
+          {internal_error(:exit, reason), conn_state}
 
         kind, reason ->
           {internal_error(kind, reason), conn_state}
@@ -551,6 +574,7 @@ defmodule FerricstoreServer.Connection do
       | multi_state: :none,
         multi_queue: [],
         multi_queue_count: 0,
+        multi_error: false,
         watched_keys: %{},
         sandbox_namespace: nil,
         tracking: ClientTracking.new_config(),
@@ -558,6 +582,7 @@ defmodule FerricstoreServer.Connection do
         username: "default",
         pubsub_channels: nil,
         pubsub_patterns: nil,
+        require_auth: ConnAuth.user_requires_auth?("default"),
         acl_cache: ConnAuth.build_acl_cache("default")
     }
 
@@ -651,7 +676,7 @@ defmodule FerricstoreServer.Connection do
           {:error, "ERR server not ready, shard process unavailable"}
 
         :exit, {reason, _} ->
-          {:error, "ERR internal error: #{inspect(reason)}"}
+          internal_error(:exit, reason)
 
         kind, reason ->
           internal_error(kind, reason)
@@ -773,8 +798,13 @@ defmodule FerricstoreServer.Connection do
   defp namespace_keys(namespace, keys) when is_binary(namespace),
     do: Enum.map(keys, &(namespace <> &1))
 
-  defp internal_error(kind, reason),
-    do: {:error, "ERR internal error: #{inspect({kind, reason})}"}
+  defp internal_error(kind, reason) do
+    Logger.error(fn ->
+      "FerricStore connection internal error: #{inspect({kind, reason}, limit: 20)}"
+    end)
+
+    {:error, "ERR internal error"}
+  end
 
   defp dispatch_get_sendfile_ast([key], ast, state)
        when byte_size(key) > 0 and byte_size(key) <= 65_535 do
@@ -856,6 +886,60 @@ defmodule FerricstoreServer.Connection do
        do: true
 
   defp pubsub_allowed_connection_ast?(_ast), do: false
+
+  defp dispatch_connection_command("HELLO", args, ast, state),
+    do: dispatch_hello(args, ast, state)
+
+  defp dispatch_connection_command("CLIENT", ["HELLO" | args], ast, state),
+    do: dispatch_hello(args, ast, state)
+
+  defp dispatch_connection_command(_cmd, _args, ast, state),
+    do: dispatch_connection_ast(ast, state)
+
+  defp dispatch_hello(_args, {:hello, {:error, _} = err}, state),
+    do: {:continue, Encoder.encode(err), state}
+
+  defp dispatch_hello(args, ast, state) when ast in [:hello, {:hello, 3}] do
+    case hello_auth_args(args) do
+      {:ok, nil} ->
+        {:continue, Encoder.encode(greeting_map(state)), state}
+
+      {:ok, {username, password}} ->
+        case ConnAuth.dispatch_auth([username, password], state) do
+          {:continue, _auth_reply, %{authenticated: true} = auth_state} ->
+            {:continue, Encoder.encode(greeting_map(auth_state)), auth_state}
+
+          other ->
+            other
+        end
+
+      {:error, reason} ->
+        {:continue, Encoder.encode({:error, reason}), state}
+    end
+  end
+
+  defp dispatch_hello(_args, ast, state), do: dispatch_connection_ast(ast, state)
+
+  defp hello_auth_args([]), do: {:ok, nil}
+  defp hello_auth_args(["3"]), do: {:ok, nil}
+
+  defp hello_auth_args(["3" | rest]), do: hello_auth_args_after_version(rest, nil)
+
+  defp hello_auth_args(_args),
+    do: {:error, "NOPROTO this server does not support the requested protocol version"}
+
+  defp hello_auth_args_after_version([], auth), do: {:ok, auth}
+
+  defp hello_auth_args_after_version([option, username, password | rest], _auth)
+       when is_binary(option) and is_binary(username) and is_binary(password) do
+    case String.upcase(option) do
+      "AUTH" -> hello_auth_args_after_version(rest, {username, password})
+      _other -> {:error, "ERR Syntax error in HELLO option '#{option}'"}
+    end
+  end
+
+  defp hello_auth_args_after_version([option | _rest], _auth) when is_binary(option),
+    do: {:error, "ERR Syntax error in HELLO option '#{option}'"}
 
   defp dispatch_connection_ast(:hello, state),
     do: {:continue, Encoder.encode(greeting_map(state)), state}
@@ -950,7 +1034,7 @@ defmodule FerricstoreServer.Connection do
   defp blocking_ast?({:blmpop, _, _, _, _}), do: true
 
   defp blocking_ast?({:flow_claim_due, _type, opts}) when is_list(opts),
-    do: Keyword.get(opts, :block_ms, 0) > 0
+    do: Keyword.has_key?(opts, :block_ms)
 
   defp blocking_ast?(_ast), do: false
 
@@ -1001,7 +1085,7 @@ defmodule FerricstoreServer.Connection do
        do: true
 
   defp ast_store_command?({tag, _, _})
-       when tag in ~w(set incrby decrby incrbyfloat append getset getex setnx expire pexpire expireat pexpireat lpop rpop lindex lpos rpoplpush hget hexists hstrlen hrandfield hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex sismember srandmember spop sscan sintercard zscore zrank zrevrank zadd zcount zpopmin zpopmax zscan zrangebyscore zrevrangebyscore getbit bitcount bitpos rename renamenx scan object wait xadd xrange xrevrange xtrim xdel xgroup json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrlen json_toggle json_clear json_mget geosearch bf_reserve cf_reserve cms_initbydim cms_initbyprob cms_incrby cms_merge topk_reserve topk_incrby topk_list tdigest_create tdigest_add tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_merge cas lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error ferricstore_key_info ratelimit_add flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
+       when tag in ~w(set incrby decrby incrbyfloat append getset getex setnx expire pexpire expireat pexpireat lpop rpop lindex lpos rpoplpush hget hexists hstrlen hrandfield hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex sismember srandmember spop sscan sintercard zscore zrank zrevrank zadd zcount zpopmin zpopmax zscan zrangebyscore zrevrangebyscore getbit bitcount bitpos rename renamenx scan object wait xadd xrange xrevrange xtrim xdel xgroup json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrlen json_toggle json_clear json_mget geosearch bf_reserve cf_reserve cms_initbydim cms_initbyprob cms_incrby cms_merge topk_reserve topk_incrby topk_list tdigest_create tdigest_add tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_merge cas lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error ferricstore_key_info ratelimit_add flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
        do: true
 
   defp ast_store_command?({tag, _, _, _})
@@ -1048,8 +1132,7 @@ defmodule FerricstoreServer.Connection do
   # ---------------------------------------------------------------------------
 
   defp send_response(socket, transport, iodata) do
-    _ = ConnSend.send(socket, transport, iodata, :response)
-    :ok
+    ConnSend.send(socket, transport, iodata, :response)
   end
 
   defp send_tracked(%__MODULE__{socket: socket, transport: transport} = state, iodata, phase) do
@@ -1135,7 +1218,18 @@ defmodule FerricstoreServer.Connection do
         transport.close(socket)
 
       {:acl_invalidate, username} ->
-        pubsub_loop(ConnAuth.maybe_refresh_acl_cache(state, username))
+        refreshed_state =
+          state
+          |> ConnAuth.maybe_refresh_acl_cache(username)
+          |> enforce_pubsub_acl_after_refresh()
+
+        refreshed_state = maybe_sync_connection_registry(state, refreshed_state)
+
+        if in_pubsub_mode?(refreshed_state) do
+          pubsub_loop(refreshed_state)
+        else
+          loop(refreshed_state)
+        end
     end
   end
 
@@ -1143,6 +1237,59 @@ defmodule FerricstoreServer.Connection do
 
   defp in_pubsub_mode?(state),
     do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+
+  defp enforce_pubsub_acl_after_refresh(%{pubsub_channels: nil} = state), do: state
+
+  defp enforce_pubsub_acl_after_refresh(state) do
+    if pubsub_acl_still_allowed?(state) do
+      state
+    else
+      # ACL changes are rare; removing the subscription here keeps PUBLISH hot
+      # path free of per-message permission checks while still failing closed.
+      cleanup_pubsub(state)
+      %{state | pubsub_channels: nil, pubsub_patterns: nil}
+    end
+  end
+
+  defp pubsub_acl_still_allowed?(state) do
+    exact_channels = MapSet.to_list(state.pubsub_channels)
+    patterns = MapSet.to_list(state.pubsub_patterns)
+
+    pubsub_exact_acl_allowed?(state.acl_cache, exact_channels) and
+      pubsub_pattern_acl_allowed?(state.acl_cache, patterns)
+  end
+
+  defp pubsub_exact_acl_allowed?(_cache, []), do: true
+
+  defp pubsub_exact_acl_allowed?(cache, channels) do
+    with :ok <- ConnAuth.check_command_cached(cache, "SUBSCRIBE"),
+         :ok <- ConnAuth.check_channels_cached(cache, channels) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp pubsub_pattern_acl_allowed?(_cache, []), do: true
+
+  defp pubsub_pattern_acl_allowed?(cache, patterns) do
+    with :ok <- ConnAuth.check_command_cached(cache, "PSUBSCRIBE"),
+         :ok <- ConnAuth.check_channels_cached(cache, patterns) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp acl_key_args(cmd, _keys)
+       when cmd in ~w(PUBLISH SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE),
+       do: []
+
+  defp acl_key_args(_cmd, keys), do: keys
+
+  defp acl_channel_args("PUBLISH", [channel | _]) when is_binary(channel), do: [channel]
+  defp acl_channel_args(cmd, args) when cmd in ~w(SUBSCRIBE PSUBSCRIBE), do: args
+  defp acl_channel_args(_cmd, _args), do: []
 
   defp cleanup_connection(state) do
     duration_ms = System.monotonic_time(:millisecond) - state.created_at

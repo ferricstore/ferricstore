@@ -191,6 +191,28 @@ defmodule Ferricstore.Commands.GenericTest do
                Stream.handle("XRANGE", [destination, "-", "+"], store)
     end
 
+    test "RENAME preserves stream consumer groups" do
+      Stream.ensure_meta_table()
+      store = MockStore.make()
+      source = "stream_src_groups_#{System.unique_integer([:positive])}"
+      destination = "stream_dst_groups_#{System.unique_integer([:positive])}"
+
+      assert "1-0" == Stream.handle("XADD", [source, "1-0", "f", "v"], store)
+      assert :ok == Stream.handle("XGROUP", ["CREATE", source, "workers", "0"], store)
+
+      assert :ok = Generic.handle("RENAME", [source, destination], store)
+
+      info = Stream.handle("XINFO", ["STREAM", destination], store)
+      assert info["groups"] == 1
+
+      assert [[^destination, [["1-0", "f", "v"]]]] =
+               Stream.handle(
+                 "XREADGROUP",
+                 ["GROUP", "workers", "c1", "STREAMS", destination, ">"],
+                 store
+               )
+    end
+
     test "RENAME with no args returns error" do
       assert {:error, _} = Generic.handle("RENAME", [], MockStore.make())
     end
@@ -326,6 +348,28 @@ defmodule Ferricstore.Commands.GenericTest do
 
       assert map_size(entries_by_key) == 3
       refute_receive {:compound_batch_put, _}
+    end
+
+    test "COPY preserves stream consumer groups" do
+      Stream.ensure_meta_table()
+      store = MockStore.make()
+      source = "stream_copy_src_groups_#{System.unique_integer([:positive])}"
+      destination = "stream_copy_dst_groups_#{System.unique_integer([:positive])}"
+
+      assert "1-0" == Stream.handle("XADD", [source, "1-0", "f", "v"], store)
+      assert :ok == Stream.handle("XGROUP", ["CREATE", source, "workers", "0"], store)
+
+      assert 1 = Generic.handle("COPY", [source, destination], store)
+
+      info = Stream.handle("XINFO", ["STREAM", destination], store)
+      assert info["groups"] == 1
+
+      assert [[^destination, [["1-0", "f", "v"]]]] =
+               Stream.handle(
+                 "XREADGROUP",
+                 ["GROUP", "workers", "c1", "STREAMS", destination, ">"],
+                 store
+               )
     end
 
     test "COPY preserves TTL" do

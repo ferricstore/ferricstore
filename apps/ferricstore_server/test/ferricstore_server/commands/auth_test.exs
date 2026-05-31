@@ -9,10 +9,12 @@ defmodule FerricstoreServer.Commands.AuthTest do
   # Reset requirepass after each test to avoid contaminating other tests.
   setup do
     FerricstoreServer.Acl.reset!()
+
     on_exit(fn ->
       Config.set("requirepass", "")
       FerricstoreServer.Acl.reset!()
     end)
+
     %{port: Listener.port()}
   end
 
@@ -181,6 +183,19 @@ defmodule FerricstoreServer.Commands.AuthTest do
       # HELLO returns the greeting map, not an error
       assert is_map(response)
       assert response["server"] == "ferricstore"
+
+      :gen_tcp.close(sock)
+    end
+
+    test "CLIENT HELLO is allowed before authentication", %{port: port} do
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["CLIENT", "HELLO", "3"])
+      response = recv_response(sock)
+
+      assert is_map(response)
+      assert response["server"] == "ferricstore"
+      assert response["proto"] == 3
 
       :gen_tcp.close(sock)
     end
@@ -666,6 +681,29 @@ defmodule FerricstoreServer.Commands.AuthTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "ACL DELUSER with multiple users is atomic when a later delete errors", %{port: port} do
+      admin = connect_and_hello(port)
+      alice = connect_and_hello(port)
+
+      send_cmd(admin, ["ACL", "SETUSER", "alice", "on", ">pass", "~*", "+@all"])
+      assert recv_response(admin) == {:simple, "OK"}
+
+      send_cmd(alice, ["AUTH", "alice", "pass"])
+      assert recv_response(alice) == {:simple, "OK"}
+
+      send_cmd(admin, ["ACL", "DELUSER", "alice", "default"])
+      assert {:error, msg} = recv_response(admin)
+      assert msg =~ "default"
+
+      assert FerricstoreServer.Acl.get_user("alice") != nil
+
+      send_cmd(alice, ["PING"])
+      assert recv_response(alice) == {:simple, "PONG"}
+
+      :gen_tcp.close(admin)
+      :gen_tcp.close(alice)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -759,11 +797,58 @@ defmodule FerricstoreServer.Commands.AuthTest do
       :gen_tcp.close(sock)
     end
 
+    test "ACL GETUSER and LIST show explicit denied commands", %{port: port} do
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["ACL", "SETUSER", "deny_get", "on", "nopass", "~*", "+@all", "-get"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["ACL", "GETUSER", "deny_get"])
+      response = recv_response(sock)
+      commands_idx = Enum.find_index(response, &(&1 == "commands"))
+      commands = Enum.at(response, commands_idx + 1)
+      assert commands =~ "+@all"
+      assert commands =~ "-get"
+
+      send_cmd(sock, ["ACL", "LIST"])
+      list = recv_response(sock)
+      assert Enum.any?(list, &String.contains?(&1, "user deny_get"))
+      assert Enum.any?(list, &String.contains?(&1, "-get"))
+
+      :gen_tcp.close(sock)
+    end
+
     test "ACL GETUSER for nonexistent user returns nil", %{port: port} do
       sock = connect_and_hello(port)
 
       send_cmd(sock, ["ACL", "GETUSER", "nonexistent"])
       assert recv_response(sock) == nil
+
+      :gen_tcp.close(sock)
+    end
+  end
+
+  describe "ACL persistence commands" do
+    setup %{port: port} do
+      on_exit(fn -> FerricstoreServer.Acl.reset!() end)
+      %{port: port}
+    end
+
+    test "ACL SAVE and LOAD are available over RESP", %{port: port} do
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["ACL", "SETUSER", "persisted_user", "on", "nopass", "~*", "+get"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["ACL", "SAVE"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      FerricstoreServer.Acl.reset!()
+      assert FerricstoreServer.Acl.get_user("persisted_user") == nil
+
+      send_cmd(sock, ["ACL", "LOAD"])
+      assert recv_response(sock) == {:simple, "OK"}
+      assert FerricstoreServer.Acl.get_user("persisted_user") != nil
 
       :gen_tcp.close(sock)
     end

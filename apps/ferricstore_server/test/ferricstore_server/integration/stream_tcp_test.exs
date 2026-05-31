@@ -543,6 +543,30 @@ defmodule FerricstoreServer.Integration.StreamTcpTest do
   # ===========================================================================
 
   describe "pipelining stream commands" do
+    test "pipeline XREAD BLOCK holds the pipeline until stream data arrives", %{port: port} do
+      sock = connect_and_hello(port)
+      producer = connect_and_hello(port)
+      key = ustream()
+
+      pipeline =
+        IO.iodata_to_binary([
+          Encoder.encode(["XREAD", "BLOCK", "1000", "STREAMS", key, "0-0"]),
+          Encoder.encode(["PING"])
+        ])
+
+      :ok = :gen_tcp.send(sock, pipeline)
+      assert {:error, :timeout} = :gen_tcp.recv(sock, 0, 100)
+
+      send_cmd(producer, ["XADD", key, "1-0", "f", "v"])
+      assert recv_response(producer) == "1-0"
+
+      responses = recv_n(sock, 2)
+      assert [[[key, [["1-0", "f", "v"]]]], {:simple, "PONG"}] == responses
+
+      :gen_tcp.close(sock)
+      :gen_tcp.close(producer)
+    end
+
     test "pipeline XADD then XLEN then XRANGE", %{port: port} do
       sock = connect_and_hello(port)
       key = ustream()

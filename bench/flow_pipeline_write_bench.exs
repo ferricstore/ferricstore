@@ -7,7 +7,7 @@
 #   * flow_transition_many batch
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start \
+#   MIX_ENV=bench mix run --no-start \
 #     -e 'Code.require_file("bench/flow_pipeline_write_bench.exs")'
 #
 # Options:

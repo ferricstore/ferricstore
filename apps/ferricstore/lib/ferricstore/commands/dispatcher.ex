@@ -240,7 +240,8 @@ defmodule Ferricstore.Commands.Dispatcher do
     tdigest_max: "tdigest.max",
     tdigest_info: "tdigest.info",
     tdigest_merge: "tdigest.merge",
-    ferricstore_blobgc: "ferricstore.blobgc"
+    ferricstore_blobgc: "ferricstore.blobgc",
+    ferricstore_doctor: "ferricstore.doctor"
   }
 
   @single_value_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist expiretime pexpiretime llen lpop rpop hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel smembers scard srandmember spop zscore zrank zrevrank zcard zpopmin zpopmax zrandmember bitcount bitpos type xlen)a
@@ -526,6 +527,9 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   def dispatch_ast({:ferricstore_blobgc, args}, store),
     do: Server.handle("FERRICSTORE.BLOBGC", args, store)
+
+  def dispatch_ast({:ferricstore_doctor, args}, store),
+    do: Server.handle("FERRICSTORE.DOCTOR", args, store)
 
   def dispatch_ast({:memory, []}, _store),
     do: {:error, "ERR wrong number of arguments for 'memory' command"}

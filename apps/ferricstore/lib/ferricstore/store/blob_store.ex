@@ -17,6 +17,7 @@ defmodule Ferricstore.Store.BlobStore do
   @segment_id 0
   @default_segment_max_bytes 256 * 1024 * 1024
   @default_segment_gc_grace_ms 600_000
+  @default_protection_ttl_ms 300_000
   @segment_header_magic <<0, ?F, ?S, ?B, ?L, ?O, ?G, 1>>
   @segment_header_bytes 48
   @segment_next_id_filename "next_segment_id"
@@ -24,10 +25,16 @@ defmodule Ferricstore.Store.BlobStore do
   @segment_table :ferricstore_blob_store_segments
   @lock_table :ferricstore_blob_store_locks
   @dir_table :ferricstore_blob_store_dirs
+  @protected_table :ferricstore_blob_store_protected_refs
+  @hardened_table :ferricstore_blob_store_hardened_protections
   @held_locks_key :ferricstore_blob_store_held_locks
   @lock_retry_ms 1
 
   @type reason :: term()
+  @type protection_token ::
+          nil
+          | {:blob_store_protection, binary(), non_neg_integer(), [binary()]}
+          | [protection_token()]
 
   @doc false
   @spec init_tables() :: :ok
@@ -47,6 +54,23 @@ defmodule Ferricstore.Store.BlobStore do
     with_blob_lock(data_dir, shard_index, fn ->
       case do_put_many(data_dir, shard_index, batch) do
         {:ok, [ref]} -> {:ok, ref}
+        {:ok, refs} when is_list(refs) -> {:error, {:unexpected_blob_ref_count, length(refs)}}
+        {:error, _reason} = error -> error
+      end
+    end)
+  end
+
+  @doc false
+  @spec put_protected(binary(), non_neg_integer(), binary()) ::
+          {:ok, BlobRef.t(), protection_token()} | {:error, reason()}
+  def put_protected(data_dir, shard_index, payload)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_binary(payload) do
+    batch = prepare_single_payload_batch(payload)
+
+    with_blob_lock(data_dir, shard_index, fn ->
+      case do_put_many(data_dir, shard_index, batch) do
+        {:ok, [ref]} -> {:ok, ref, protect_refs(data_dir, shard_index, [ref])}
         {:ok, refs} when is_list(refs) -> {:error, {:unexpected_blob_ref_count, length(refs)}}
         {:error, _reason} = error -> error
       end
@@ -101,6 +125,105 @@ defmodule Ferricstore.Store.BlobStore do
         error
     end
   end
+
+  @doc false
+  @spec put_many_protected(binary(), non_neg_integer(), [binary()]) ::
+          {:ok, [BlobRef.t()], protection_token()} | {:error, reason()}
+  def put_many_protected(data_dir, shard_index, payloads)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(payloads) do
+    case prepare_payload_batch(payloads) do
+      {:ok, %{batch_bytes: 0}} ->
+        {:ok, [], nil}
+
+      {:ok, batch} ->
+        with_blob_lock(data_dir, shard_index, fn ->
+          case do_put_many(data_dir, shard_index, batch) do
+            {:ok, refs} -> {:ok, refs, protect_refs(data_dir, shard_index, refs)}
+            {:error, _reason} = error -> error
+          end
+        end)
+
+      {:error, :invalid_blob_payload} = error ->
+        error
+    end
+  end
+
+  @doc false
+  @spec unprotect(protection_token()) :: :ok
+  def unprotect(nil), do: :ok
+
+  def unprotect(tokens) when is_list(tokens) do
+    Enum.each(tokens, &unprotect/1)
+    :ok
+  end
+
+  def unprotect({:blob_store_protection, data_dir, shard_index, relative_paths})
+      when is_binary(data_dir) and is_integer(shard_index) and is_list(relative_paths) do
+    ensure_protected_table()
+
+    Enum.each(relative_paths, fn relative_path ->
+      key = {data_dir, shard_index, relative_path}
+
+      case :ets.lookup(@protected_table, key) do
+        [{^key, count, deadline_ms}] when is_integer(count) and count > 1 ->
+          :ets.insert(@protected_table, {key, count - 1, deadline_ms})
+
+        [{^key, _count, _deadline_ms}] ->
+          :ets.delete(@protected_table, key)
+
+        [{^key, count}] when is_integer(count) and count > 1 ->
+          :ets.update_counter(@protected_table, key, {2, -1})
+
+        [{^key, _count}] ->
+          :ets.delete(@protected_table, key)
+
+        [] ->
+          :ok
+      end
+    end)
+
+    :ok
+  end
+
+  def unprotect(_token), do: :ok
+
+  @doc false
+  @spec harden_protection(protection_token()) :: :ok
+  @spec harden_protection(protection_token(), keyword() | map() | term()) :: :ok
+  def harden_protection(token, metadata \\ [])
+
+  def harden_protection(nil, _metadata), do: :ok
+
+  def harden_protection(tokens, metadata) when is_list(tokens) do
+    Enum.each(tokens, &harden_protection(&1, metadata))
+    :ok
+  end
+
+  def harden_protection({:blob_store_protection, data_dir, shard_index, relative_paths}, metadata)
+      when is_binary(data_dir) and is_integer(shard_index) and is_list(relative_paths) do
+    ensure_protected_table()
+
+    Enum.each(relative_paths, fn relative_path ->
+      key = {data_dir, shard_index, relative_path}
+
+      case :ets.lookup(@protected_table, key) do
+        [{^key, count, _deadline_ms}] when is_integer(count) and count > 0 ->
+          :ets.insert(@protected_table, {key, count, :infinity})
+
+        [{^key, count}] when is_integer(count) and count > 0 ->
+          :ets.insert(@protected_table, {key, count, :infinity})
+
+        [] ->
+          :ets.insert(@protected_table, {key, 1, :infinity})
+      end
+    end)
+
+    register_hardened_protection(data_dir, shard_index, relative_paths, metadata)
+    :ok
+  end
+
+  def harden_protection(_token, _metadata), do: :ok
 
   @doc "Reads and validates a blob by ref."
   @spec get(binary(), non_neg_integer(), BlobRef.t()) :: {:ok, binary()} | {:error, reason()}
@@ -198,11 +321,6 @@ defmodule Ferricstore.Store.BlobStore do
       :ok ->
         :ok
 
-      :mismatch ->
-        error = {:error, :checksum_mismatch}
-        emit_error(:verify, shard_index, path, ref, :checksum_mismatch)
-        error
-
       {:error, reason} = error ->
         emit_error(:verify, shard_index, path, ref, reason)
         error
@@ -221,11 +339,6 @@ defmodule Ferricstore.Store.BlobStore do
     case result do
       :ok ->
         :ok
-
-      :mismatch ->
-        error = {:error, :checksum_mismatch}
-        emit_error(:verify, shard_index, path, ref, :checksum_mismatch)
-        error
 
       {:error, reason} = error ->
         emit_error(:verify, shard_index, path, ref, reason)
@@ -388,11 +501,6 @@ defmodule Ferricstore.Store.BlobStore do
         case result do
           :ok ->
             {:cont, :ok}
-
-          :mismatch ->
-            error = {:error, :checksum_mismatch}
-            emit_error(:verify, shard_index, path, ref, :checksum_mismatch)
-            {:halt, error}
 
           {:error, reason} = error ->
             emit_error(:verify, shard_index, path, ref, reason)
@@ -775,11 +883,13 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   @doc """
-  Reads a byte range from a blob ref without materializing the full payload.
+  Reads a byte range from a blob ref.
 
-  Segment refs still validate their record header and full declared extent
-  before the range pread. This keeps range reads aligned with the sendfile path:
-  cheap pointer validation, no full-payload hash on every read.
+  This materialized range API is used by commands that return bytes through
+  BEAM. Segment-backed partial ranges validate the record header and pread only
+  the requested bytes; full-range reads still validate the full payload checksum.
+  `file_ref/3` remains the stat/header-validated streaming path for full
+  large-value reads.
   """
   @spec get_range(binary(), non_neg_integer(), BlobRef.t(), non_neg_integer(), non_neg_integer()) ::
           {:ok, binary()} | {:error, reason()}
@@ -814,8 +924,9 @@ defmodule Ferricstore.Store.BlobStore do
     result =
       with :ok <- validate_blob_range(size, relative_offset, count),
            :ok <- stat_regular_size(path, size),
-           {:ok, payload} <- read_file_range(path, relative_offset, count) do
-        {:ok, payload}
+           :ok <- file_matches_ref?(path, ref),
+           {:ok, slice} <- read_blob_file_range(path, relative_offset, count) do
+        {:ok, slice}
       end
 
     case result do
@@ -839,10 +950,9 @@ defmodule Ferricstore.Store.BlobStore do
 
     result =
       with :ok <- validate_blob_range(size, relative_offset, count),
-           :ok <- stat_regular_min_size(path, offset + size),
-           {:ok, payload} <-
+           {:ok, slice} <-
              read_segment_payload_range(path, offset, size, ref, relative_offset, count) do
-        {:ok, payload}
+        {:ok, slice}
       end
 
     case result do
@@ -917,11 +1027,10 @@ defmodule Ferricstore.Store.BlobStore do
 
   The caller owns producing a complete live set. This function is deliberately
   conservative for append segments: a segment is kept while any live v2 ref
-  points into it, and fresh dead segments are kept for a grace window before
-  they can be reclaimed. The freshness guard covers side-channel refs that have
-  been durably appended to blob storage but have not yet reached the Bitcask
-  keydir through Raft apply. The shard must still guard Ra replay safety before
-  calling this, because unreleased Ra log entries can contain older blob refs.
+  points into it, prepared refs can register a short protection token until Raft
+  apply finishes, and fresh dead segments are kept for a grace window as a final
+  safety net. The shard must still guard Ra replay safety before calling this,
+  because unreleased Ra log entries can contain older blob refs.
   """
   @spec sweep_unreferenced(binary(), non_neg_integer(), Enumerable.t()) ::
           {:ok,
@@ -959,6 +1068,110 @@ defmodule Ferricstore.Store.BlobStore do
         do_sweep_unreferenced(data_dir, shard_index, live_refs)
       end
     end)
+  end
+
+  @doc false
+  @spec sweep_unreferenced_releasing_hardened(
+          binary(),
+          non_neg_integer(),
+          [reference()],
+          Enumerable.t()
+        ) :: {:ok, map()} | {:error, term()}
+  def sweep_unreferenced_releasing_hardened(data_dir, shard_index, hardened_ids, live_refs)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(hardened_ids) do
+    with_blob_lock(data_dir, shard_index, fn ->
+      released = release_hardened_protections(data_dir, shard_index, hardened_ids)
+
+      case do_sweep_unreferenced(data_dir, shard_index, live_refs) do
+        {:ok, stats} -> {:ok, Map.put(stats, :hardened_protections_released, released)}
+        {:error, _reason} = error -> error
+      end
+    end)
+  end
+
+  @doc false
+  @spec sweep_unreferenced_releasing_hardened_with_live_refs(
+          binary(),
+          non_neg_integer(),
+          [reference()],
+          (-> {:ok, Enumerable.t()} | {:error, term()})
+        ) :: {:ok, map()} | {:error, term()}
+  def sweep_unreferenced_releasing_hardened_with_live_refs(
+        data_dir,
+        shard_index,
+        hardened_ids,
+        live_refs_fun
+      )
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(hardened_ids) and is_function(live_refs_fun, 0) do
+    with_blob_lock(data_dir, shard_index, fn ->
+      released = release_hardened_protections(data_dir, shard_index, hardened_ids)
+
+      with {:ok, live_refs} <- live_refs_fun.(),
+           {:ok, stats} <- do_sweep_unreferenced(data_dir, shard_index, live_refs) do
+        {:ok, Map.put(stats, :hardened_protections_released, released)}
+      end
+    end)
+  end
+
+  @doc false
+  @spec hardened_protection_ids(binary(), non_neg_integer()) :: [reference()]
+  @spec hardened_protection_ids(binary(), non_neg_integer(), non_neg_integer()) :: [reference()]
+  def hardened_protection_ids(data_dir, shard_index, limit \\ 1_000)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(limit) and limit >= 0 do
+    ensure_hardened_table()
+
+    @hardened_table
+    |> :ets.match_object({:_, data_dir, shard_index, :_, :_, :_})
+    |> Enum.sort_by(fn {_id, _dir, _shard, _paths, hardened_at_ms, _metadata} ->
+      hardened_at_ms
+    end)
+    |> Enum.take(limit)
+    |> Enum.map(fn {id, _dir, _shard, _paths, _hardened_at_ms, _metadata} -> id end)
+  end
+
+  @doc false
+  @spec hardened_protection_stats(binary()) :: %{count: non_neg_integer(), oldest_age_ms: non_neg_integer()}
+  def hardened_protection_stats(data_dir) when is_binary(data_dir) do
+    hardened_protection_stats(data_dir, :all)
+  end
+
+  @doc false
+  @spec hardened_protection_stats(binary(), non_neg_integer() | :all) :: %{
+          count: non_neg_integer(),
+          oldest_age_ms: non_neg_integer()
+        }
+  def hardened_protection_stats(data_dir, shard_index)
+      when is_binary(data_dir) and
+             (shard_index == :all or (is_integer(shard_index) and shard_index >= 0)) do
+    ensure_hardened_table()
+
+    now_ms = System.monotonic_time(:millisecond)
+
+    rows =
+      case shard_index do
+        :all -> :ets.match_object(@hardened_table, {:_, data_dir, :_, :_, :_, :_})
+        idx -> :ets.match_object(@hardened_table, {:_, data_dir, idx, :_, :_, :_})
+      end
+
+    oldest_at =
+      Enum.reduce(rows, nil, fn {_id, _dir, _shard, _paths, hardened_at_ms, _metadata}, acc ->
+        cond do
+          not is_integer(hardened_at_ms) -> acc
+          is_nil(acc) -> hardened_at_ms
+          true -> min(acc, hardened_at_ms)
+        end
+      end)
+
+    oldest_age_ms =
+      case oldest_at do
+        nil -> 0
+        hardened_at_ms -> max(now_ms - hardened_at_ms, 0)
+      end
+
+    %{count: length(rows), oldest_age_ms: oldest_age_ms}
   end
 
   @doc """
@@ -1062,7 +1275,8 @@ defmodule Ferricstore.Store.BlobStore do
   defp do_put_many_once(data_dir, shard_index, batch) do
     with {:ok, _stats} <- ensure_recovered(data_dir, shard_index),
          :ok <- ensure_segment_dir(data_dir, shard_index),
-         {:ok, segment} <- writable_segment(data_dir, shard_index, batch.batch_bytes) do
+         {:ok, segment} <- writable_segment(data_dir, shard_index, batch.batch_bytes),
+         :ok <- ensure_safe_segment_file_for_append(segment.path) do
       case File.open(segment.path, [:append, :raw, :binary]) do
         {:ok, io} ->
           try do
@@ -1157,9 +1371,14 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp write_file(io, iodata) do
-    case blob_store_write_hook() do
-      fun when is_function(fun, 2) -> fun.(io, iodata)
-      _ -> :file.write(io, iodata)
+    with :ok <-
+           (case blob_store_write_hook() do
+             fun when is_function(fun, 2) -> fun.(io, iodata)
+             _ -> :file.write(io, iodata)
+           end) do
+      Ferricstore.FaultInjection.maybe_pause(:after_blob_store_write, %{
+        bytes: :erlang.iolist_size(iodata)
+      })
     end
   end
 
@@ -1331,7 +1550,7 @@ defmodule Ferricstore.Store.BlobStore do
     with {:ok, paths} <- segment_files(shard_path) do
       Enum.reduce_while(paths, {:ok, nil}, fn path, {:ok, latest} ->
         with {:ok, id} <- segment_id_from_path(path),
-             {:ok, %{type: :regular, size: size}} <- File.stat(path) do
+             {:ok, size} <- safe_segment_lstat_size(path) do
           latest =
             case latest do
               nil -> %{id: id, path: path, size: size}
@@ -1341,9 +1560,6 @@ defmodule Ferricstore.Store.BlobStore do
 
           {:cont, {:ok, latest}}
         else
-          {:ok, %{type: type}} ->
-            {:halt, {:error, {:invalid_blob_segment_file, path, type}}}
-
           {:error, reason} ->
             {:halt, {:error, reason}}
         end
@@ -1357,7 +1573,10 @@ defmodule Ferricstore.Store.BlobStore do
 
     case blob_files(shard_path) do
       {:ok, paths} ->
+        pending_paths = protected_relative_paths(data_dir, shard_index)
+
         with {:ok, protected_paths} <- protected_dead_segment_paths(shard_path, paths, live_paths),
+             protected_paths <- MapSet.union(protected_paths, pending_paths),
              :ok <-
                ensure_next_segment_id_for_dead_segments(
                  shard_path,
@@ -1457,6 +1676,204 @@ defmodule Ferricstore.Store.BlobStore do
     ensure_segment_table()
     :ets.delete(@segment_table, {data_dir, shard_index})
     :ok
+  end
+
+  defp protect_refs(data_dir, shard_index, refs) do
+    relative_paths =
+      refs
+      |> Enum.reduce(MapSet.new(), fn
+        %BlobRef{} = ref, acc ->
+          if BlobRef.valid?(ref), do: MapSet.put(acc, BlobRef.relative_path(ref)), else: acc
+
+        _other, acc ->
+          acc
+      end)
+      |> MapSet.to_list()
+
+    case relative_paths do
+      [] ->
+        nil
+
+      [_ | _] ->
+        ensure_protected_table()
+        deadline_ms = protection_deadline_ms()
+
+        Enum.each(relative_paths, fn relative_path ->
+          key = {data_dir, shard_index, relative_path}
+          protect_ref_path(key, deadline_ms)
+        end)
+
+        {:blob_store_protection, data_dir, shard_index, relative_paths}
+    end
+  end
+
+  defp protect_ref_path(key, deadline_ms) do
+    case :ets.lookup(@protected_table, key) do
+      [{^key, count, existing_deadline}] when is_integer(count) ->
+        :ets.insert(
+          @protected_table,
+          {key, count + 1, max_deadline(existing_deadline, deadline_ms)}
+        )
+
+      [{^key, count}] when is_integer(count) ->
+        :ets.insert(@protected_table, {key, count + 1, deadline_ms})
+
+      [] ->
+        :ets.insert(@protected_table, {key, 1, deadline_ms})
+    end
+  end
+
+  defp register_hardened_protection(_data_dir, _shard_index, [], _metadata), do: :ok
+
+  defp register_hardened_protection(data_dir, shard_index, relative_paths, metadata) do
+    ensure_hardened_table()
+
+    paths =
+      relative_paths
+      |> Enum.filter(&is_binary/1)
+      |> Enum.uniq()
+
+    case paths do
+      [] ->
+        :ok
+
+      [_ | _] ->
+        metadata = normalize_hardened_metadata(metadata)
+        id = make_ref()
+        hardened_at_ms = System.monotonic_time(:millisecond)
+
+        :ets.insert(@hardened_table, {id, data_dir, shard_index, paths, hardened_at_ms, metadata})
+
+        :telemetry.execute(
+          [:ferricstore, :blob, :protection, :hardened],
+          %{count: 1, path_count: length(paths)},
+          %{data_dir: data_dir, shard_index: shard_index, id: id, metadata: metadata}
+        )
+
+        :ok
+    end
+  end
+
+  defp normalize_hardened_metadata(metadata) when is_map(metadata), do: metadata
+
+  defp normalize_hardened_metadata(metadata) when is_list(metadata) do
+    Map.new(metadata)
+  rescue
+    _ -> %{metadata: metadata}
+  end
+
+  defp normalize_hardened_metadata(metadata), do: %{metadata: metadata}
+
+  defp release_hardened_protections(_data_dir, _shard_index, []), do: 0
+
+  defp release_hardened_protections(data_dir, shard_index, hardened_ids) do
+    ensure_hardened_table()
+
+    Enum.reduce(hardened_ids, 0, fn id, released ->
+      case :ets.lookup(@hardened_table, id) do
+        [{^id, ^data_dir, ^shard_index, relative_paths, _hardened_at_ms, _metadata}]
+        when is_list(relative_paths) ->
+          :ets.delete(@hardened_table, id)
+          unprotect({:blob_store_protection, data_dir, shard_index, relative_paths})
+          released + 1
+
+        _missing_or_other_shard ->
+          released
+      end
+    end)
+  end
+
+  defp protected_relative_paths(data_dir, shard_index) do
+    ensure_protected_table()
+    now_ms = System.monotonic_time(:millisecond)
+
+    new_shape =
+      :ets.match_object(@protected_table, {{data_dir, shard_index, :_}, :_, :_})
+
+    old_shape =
+      :ets.match_object(@protected_table, {{data_dir, shard_index, :_}, :_})
+
+    Enum.reduce(new_shape ++ old_shape, MapSet.new(), fn
+      {{^data_dir, ^shard_index, relative_path} = key, count, deadline_ms}, acc
+      when is_binary(relative_path) and is_integer(count) and count > 0 ->
+        if protection_expired?(deadline_ms, now_ms) do
+          :ets.delete(@protected_table, key)
+          acc
+        else
+          MapSet.put(acc, relative_path)
+        end
+
+      {{^data_dir, ^shard_index, relative_path}, count}, acc
+      when is_binary(relative_path) and is_integer(count) and count > 0 ->
+        key = {data_dir, shard_index, relative_path}
+        :ets.delete(@protected_table, key)
+        acc
+
+      _other, acc ->
+        acc
+    end)
+  end
+
+  defp protection_deadline_ms do
+    case protection_ttl_ms() do
+      :infinity -> :infinity
+      ttl_ms -> System.monotonic_time(:millisecond) + ttl_ms
+    end
+  end
+
+  defp protection_ttl_ms do
+    configured =
+      Process.get(
+        :ferricstore_blob_store_protection_ttl_ms,
+        Application.get_env(
+          :ferricstore,
+          :blob_side_channel_protection_ttl_ms,
+          @default_protection_ttl_ms
+        )
+      )
+
+    case configured do
+      :infinity -> :infinity
+      ttl_ms when is_integer(ttl_ms) and ttl_ms >= 0 -> ttl_ms
+      _other -> @default_protection_ttl_ms
+    end
+  end
+
+  defp protection_expired?(:infinity, _now_ms), do: false
+
+  defp protection_expired?(deadline_ms, now_ms)
+       when is_integer(deadline_ms) and is_integer(now_ms),
+       do: deadline_ms <= now_ms
+
+  defp protection_expired?(_deadline_ms, _now_ms), do: false
+
+  defp max_deadline(:infinity, _deadline_ms), do: :infinity
+  defp max_deadline(_existing_deadline, :infinity), do: :infinity
+
+  defp max_deadline(existing_deadline, deadline_ms)
+       when is_integer(existing_deadline) and is_integer(deadline_ms),
+       do: max(existing_deadline, deadline_ms)
+
+  defp max_deadline(_existing_deadline, deadline_ms), do: deadline_ms
+
+  defp ensure_protected_table do
+    case :ets.whereis(@protected_table) do
+      :undefined ->
+        TableOwner.ensure_tables()
+
+      tid ->
+        tid
+    end
+  end
+
+  defp ensure_hardened_table do
+    case :ets.whereis(@hardened_table) do
+      :undefined ->
+        TableOwner.ensure_tables()
+
+      tid ->
+        tid
+    end
   end
 
   defp ensure_segment_table do
@@ -1577,7 +1994,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp stat_regular_size(path, expected_size) do
-    case File.stat(path) do
+    case File.lstat(path) do
       {:ok, %{type: :regular, size: ^expected_size}} -> :ok
       {:ok, %{type: :regular}} -> {:error, :size_mismatch}
       {:ok, _other} -> {:error, :invalid_blob_file}
@@ -1586,7 +2003,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp stat_regular_min_size(path, min_size) do
-    case File.stat(path) do
+    case File.lstat(path) do
       {:ok, %{type: :regular, size: size}} when size >= min_size -> :ok
       {:ok, %{type: :regular}} -> {:error, :size_mismatch}
       {:ok, _other} -> {:error, :invalid_blob_file}
@@ -1606,9 +2023,39 @@ defmodule Ferricstore.Store.BlobStore do
   defp open_read_file(path) do
     modes = [:read, :raw, :binary]
 
-    case Process.get(:ferricstore_blob_store_open_read_hook) do
-      fun when is_function(fun, 2) -> fun.(path, modes)
-      _other -> File.open(path, modes)
+    with :ok <- ensure_safe_blob_file_for_read(path) do
+      case Process.get(:ferricstore_blob_store_open_read_hook) do
+        fun when is_function(fun, 2) -> fun.(path, modes)
+        _other -> File.open(path, modes)
+      end
+    end
+  end
+
+  defp ensure_safe_blob_file_for_read(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :regular}} -> :ok
+      {:ok, %{type: :symlink}} -> {:error, {:unsafe_blob_file_path, path, :symlink}}
+      {:ok, %{type: type}} -> {:error, {:invalid_blob_file_path, path, type}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_safe_segment_file_for_append(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :regular}} -> :ok
+      {:error, :enoent} -> :ok
+      {:ok, %{type: :symlink}} -> {:error, {:unsafe_blob_segment_path, path, :symlink}}
+      {:ok, %{type: type}} -> {:error, {:invalid_blob_segment_file, path, type}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp safe_segment_lstat_size(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :regular, size: size}} -> {:ok, size}
+      {:ok, %{type: :symlink}} -> {:error, {:unsafe_blob_segment_path, path, :symlink}}
+      {:ok, %{type: type}} -> {:error, {:invalid_blob_segment_file, path, type}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1651,7 +2098,7 @@ defmodule Ferricstore.Store.BlobStore do
         try do
           case hash_file(io, :crypto.hash_init(:sha256)) do
             {:ok, ^expected_checksum} -> :ok
-            {:ok, _other_checksum} -> :mismatch
+            {:ok, _other_checksum} -> {:error, :checksum_mismatch}
             {:error, reason} -> {:error, reason}
           end
         after
@@ -1681,14 +2128,11 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp read_segment_payload_range(path, offset, size, %BlobRef{} = ref, relative_offset, count) do
+  defp read_blob_file_range(path, relative_offset, count) do
     case open_read_file(path) do
       {:ok, io} ->
         try do
-          with :ok <- validate_open_segment_record(io, offset, size, ref),
-               {:ok, payload} <- pread_exact_open(io, offset + relative_offset, count) do
-            {:ok, payload}
-          end
+          pread_exact_open(io, relative_offset, count)
         after
           :file.close(io)
         end
@@ -1698,11 +2142,29 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp read_file_range(path, offset, count) do
+  defp read_segment_payload_range(
+         path,
+         offset,
+         size,
+         %BlobRef{} = ref,
+         relative_offset,
+         count
+       ) do
     case open_read_file(path) do
       {:ok, io} ->
         try do
-          pread_exact_open(io, offset, count)
+          with :ok <- validate_open_segment_record(io, offset, size, ref),
+               :ok <-
+                 maybe_validate_open_segment_payload_range(
+                   io,
+                   offset,
+                   size,
+                   ref,
+                   relative_offset,
+                   count
+                 ) do
+            pread_exact_open(io, offset + relative_offset, count)
+          end
         after
           :file.close(io)
         end
@@ -1764,10 +2226,24 @@ defmodule Ferricstore.Store.BlobStore do
   defp open_file_range_matches_ref?(io, offset, size, %BlobRef{checksum: expected_checksum}) do
     case hash_file_range(io, offset, size, :crypto.hash_init(:sha256)) do
       {:ok, ^expected_checksum} -> :ok
-      {:ok, _other_checksum} -> :mismatch
+      {:ok, _other_checksum} -> {:error, :checksum_mismatch}
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp maybe_validate_open_segment_payload_range(io, offset, size, ref, 0, count)
+       when count == size,
+       do: open_file_range_matches_ref?(io, offset, size, ref)
+
+  defp maybe_validate_open_segment_payload_range(
+         _io,
+         _offset,
+         _size,
+         _ref,
+         _relative_offset,
+         _count
+       ),
+       do: :ok
 
   defp hash_file(io, hash_state) do
     case :file.read(io, @hash_chunk_bytes) do
@@ -1808,21 +2284,32 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp recover_segment(path, can_truncate?) do
-    case File.open(path, [:read, :write, :raw, :binary]) do
-      {:ok, io} ->
-        try do
-          with {:ok, size} <- file_size(io),
-               {:ok, valid_size} <- scan_segment(io, 0, size),
-               {:ok, truncated_bytes} <-
-                 maybe_truncate_segment(io, path, size, valid_size, can_truncate?) do
-            {:ok, truncated_bytes}
+    with :ok <- ensure_safe_segment_file_for_recovery(path) do
+      case File.open(path, [:read, :write, :raw, :binary]) do
+        {:ok, io} ->
+          try do
+            with {:ok, size} <- file_size(io),
+                 {:ok, valid_size} <- scan_segment(io, 0, size),
+                 {:ok, truncated_bytes} <-
+                   maybe_truncate_segment(io, path, size, valid_size, can_truncate?) do
+              {:ok, truncated_bytes}
+            end
+          after
+            :file.close(io)
           end
-        after
-          :file.close(io)
-        end
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp ensure_safe_segment_file_for_recovery(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :regular}} -> :ok
+      {:ok, %{type: :symlink}} -> {:error, {:unsafe_blob_segment_path, path, :symlink}}
+      {:ok, %{type: type}} -> {:error, {:invalid_blob_segment_file, path, type}}
+      {:error, reason} -> {:error, reason}
     end
   end
 

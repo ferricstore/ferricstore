@@ -35,14 +35,16 @@ defmodule SendfileColdReadBench do
     attach_stream_counter(transport)
     seed(host, port, values)
 
-    IO.puts("transport,pipeline,ops,seconds,ops_per_sec,mb_per_sec,stream_events,stream_mb")
+    IO.puts(
+      "transport,pipeline,ops,seconds,ops_per_sec,mb_per_sec,stream_events,stream_mb,checksum_events,checksum_mb,checksum_ms"
+    )
 
     for pipeline <- pipelines do
       reset_stream_counter()
       {ops, micros} = measure(host, port, keys, values, rounds, pipeline)
       seconds = micros / 1_000_000
       total_bytes = ops * value_bytes
-      {events, stream_bytes} = stream_counter()
+      {events, stream_bytes, checksum_events, checksum_bytes, checksum_us} = stream_counter()
 
       IO.puts(
         Enum.join(
@@ -54,7 +56,10 @@ defmodule SendfileColdReadBench do
             Float.round(ops / seconds, 1),
             Float.round(total_bytes / seconds / 1_048_576, 1),
             events,
-            Float.round(stream_bytes / 1_048_576, 1)
+            Float.round(stream_bytes / 1_048_576, 1),
+            checksum_events,
+            Float.round(checksum_bytes / 1_048_576, 1),
+            Float.round(checksum_us / 1_000, 1)
           ],
           ","
         )
@@ -241,12 +246,19 @@ defmodule SendfileColdReadBench do
   end
 
   defp attach_stream_counter(transport) do
-    :persistent_term.put({__MODULE__, :counter}, :counters.new(2, []))
+    :persistent_term.put({__MODULE__, :counter}, :counters.new(5, []))
 
     :telemetry.attach(
       {__MODULE__, :stream_counter},
       telemetry_event(transport),
       &__MODULE__.handle_stream/4,
+      nil
+    )
+
+    :telemetry.attach(
+      {__MODULE__, :blob_checksum_counter},
+      [:ferricstore, :server, :sendfile, :blob_checksum],
+      &__MODULE__.handle_blob_checksum/4,
       nil
     )
   rescue
@@ -261,15 +273,39 @@ defmodule SendfileColdReadBench do
 
   def handle_stream(_event, _measurements, _metadata, _config), do: :ok
 
+  def handle_blob_checksum(
+        _event,
+        %{bytes: bytes, duration_us: duration_us},
+        %{result: :ok},
+        _config
+      ) do
+    counters = :persistent_term.get({__MODULE__, :counter})
+    :counters.add(counters, 3, 1)
+    :counters.add(counters, 4, bytes)
+    :counters.add(counters, 5, duration_us)
+  end
+
+  def handle_blob_checksum(_event, _measurements, _metadata, _config), do: :ok
+
   defp reset_stream_counter do
     counters = :persistent_term.get({__MODULE__, :counter})
     :counters.put(counters, 1, 0)
     :counters.put(counters, 2, 0)
+    :counters.put(counters, 3, 0)
+    :counters.put(counters, 4, 0)
+    :counters.put(counters, 5, 0)
   end
 
   defp stream_counter do
     counters = :persistent_term.get({__MODULE__, :counter})
-    {:counters.get(counters, 1), :counters.get(counters, 2)}
+
+    {
+      :counters.get(counters, 1),
+      :counters.get(counters, 2),
+      :counters.get(counters, 3),
+      :counters.get(counters, 4),
+      :counters.get(counters, 5)
+    }
   end
 
   defp telemetry_event(:tcp), do: [:ferricstore, :server, :sendfile]

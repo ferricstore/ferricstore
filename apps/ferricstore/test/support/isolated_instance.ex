@@ -50,6 +50,7 @@ defmodule Ferricstore.Test.IsolatedInstance do
 
     # Ensure data dir layout (ETS tables created by Shard.init)
     Ferricstore.DataDir.ensure_layout!(tmp_dir, shard_count)
+    :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(tmp_dir, shard_count)
 
     for i <- 0..(shard_count - 1) do
       {:ok, _pid} =

@@ -3,7 +3,7 @@
 # Baseline public Flow command latency with a large active state set.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/flow_100k_state_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/flow_100k_state_bench.exs
 #
 # Options:
 #   FLOW_100K_BACKLOG=100000

@@ -43,7 +43,11 @@ defmodule FerricStore.Instance do
           flow_lmdb_writer_oldest_pending_age_us: reference(),
           flow_lmdb_writer_flush_failures: reference(),
           flow_history_projected_index: reference(),
+          flow_history_requested_index: reference(),
+          flow_history_projector_pending_entries: reference(),
+          flow_history_projector_oldest_pending_age_us: reference(),
           flow_history_projector_flush_failures: reference(),
+          flow_history_projector_queue_full: reference(),
           last_applied_index: reference(),
           last_released_cursor_index: reference(),
           pending_release_cursor_checkpoint_count: reference(),
@@ -98,7 +102,11 @@ defmodule FerricStore.Instance do
     :flow_lmdb_writer_oldest_pending_age_us,
     :flow_lmdb_writer_flush_failures,
     :flow_history_projected_index,
+    :flow_history_requested_index,
+    :flow_history_projector_pending_entries,
+    :flow_history_projector_oldest_pending_age_us,
     :flow_history_projector_flush_failures,
+    :flow_history_projector_queue_full,
     :last_applied_index,
     :last_released_cursor_index,
     :pending_release_cursor_checkpoint_count,
@@ -315,9 +323,45 @@ defmodule FerricStore.Instance do
         :atomics.new(shard_count, signed: false)
       end
 
+    flow_history_requested_index =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_history_requested_index, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
+    flow_history_projector_pending_entries =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_history_projector_pending_entries, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
+    flow_history_projector_oldest_pending_age_us =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_history_projector_oldest_pending_age_us, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
     flow_history_projector_flush_failures =
       if name == :default do
         try_get_pt(:ferricstore_flow_history_projector_flush_failures, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
+    flow_history_projector_queue_full =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_history_projector_queue_full, fn ->
           :atomics.new(shard_count, signed: false)
         end)
       else
@@ -463,7 +507,11 @@ defmodule FerricStore.Instance do
       flow_lmdb_writer_oldest_pending_age_us: flow_lmdb_writer_oldest_pending_age_us,
       flow_lmdb_writer_flush_failures: flow_lmdb_writer_flush_failures,
       flow_history_projected_index: flow_history_projected_index,
+      flow_history_requested_index: flow_history_requested_index,
+      flow_history_projector_pending_entries: flow_history_projector_pending_entries,
+      flow_history_projector_oldest_pending_age_us: flow_history_projector_oldest_pending_age_us,
       flow_history_projector_flush_failures: flow_history_projector_flush_failures,
+      flow_history_projector_queue_full: flow_history_projector_queue_full,
       last_applied_index: last_applied_index,
       last_released_cursor_index: last_released_cursor_index,
       pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,
@@ -663,7 +711,11 @@ defmodule FerricStore.Instance do
   end
 
   defp detect_memory_limit do
-    cgroup_v2_limit() || cgroup_v1_limit() || host_total_memory() || 1_073_741_824
+    cgroup_v2_limit() ||
+      cgroup_v1_limit() ||
+      host_total_memory() ||
+      Ferricstore.MemoryGuard.detect_memory_limit() ||
+      1_073_741_824
   end
 
   defp cgroup_v2_limit do

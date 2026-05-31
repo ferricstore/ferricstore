@@ -272,6 +272,20 @@ defmodule FerricstoreServer.Health.DashboardTest do
     end
   end
 
+  describe "Doctor dashboard page" do
+    test "renders doctor checks and admin command hints" do
+      html =
+        Dashboard.collect_doctor_page()
+        |> Dashboard.render_doctor_page()
+
+      assert html =~ "Doctor"
+      assert html =~ "FERRICSTORE.DOCTOR CHECK"
+      assert html =~ "flow_lmdb"
+      assert html =~ "Start background check"
+      assert html =~ "Repair Flow projection"
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Dashboard.render/1
   # ---------------------------------------------------------------------------
@@ -608,6 +622,236 @@ defmodule FerricstoreServer.Health.DashboardTest do
       assert extract_body(retention_response) =~ "Required ACL command"
     end
 
+    test "metrics endpoint requires the metrics ACL command instead of INFO" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("metrics-only", [
+          "on",
+          ">secret",
+          "~*",
+          "-@all",
+          "+FERRICSTORE.METRICS"
+        ])
+
+      :ok =
+        FerricstoreServer.Acl.set_user("info-only", [
+          "on",
+          ">secret",
+          "~*",
+          "-@all",
+          "+INFO"
+        ])
+
+      metrics_login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "metrics-only",
+          "password" => "secret",
+          "next" => "/metrics"
+        })
+
+      metrics_response =
+        http_get(HealthEndpoint.port(), "/metrics", [
+          {"Cookie", dashboard_session_cookie(metrics_login)}
+        ])
+
+      assert extract_status_code(metrics_response) == 200
+      assert metrics_response =~ "text/plain"
+
+      info_login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "info-only",
+          "password" => "secret",
+          "next" => "/metrics"
+        })
+
+      info_response =
+        http_get(HealthEndpoint.port(), "/metrics", [
+          {"Cookie", dashboard_session_cookie(info_login)}
+        ])
+
+      assert extract_status_code(info_response) == 403
+      assert extract_body(info_response) =~ "FERRICSTORE.METRICS"
+      assert extract_body(info_response) =~ "+FERRICSTORE.METRICS"
+    end
+
+    test "retention dry-run only needs Flow read permission" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-retention-dry-run", [
+          "on",
+          ">secret",
+          "~*",
+          "-@all",
+          "+FLOW.LIST"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-retention-dry-run",
+          "password" => "secret"
+        })
+
+      response =
+        http_post_form(
+          HealthEndpoint.port(),
+          "/dashboard/flow/retention",
+          %{"action" => "dry_run", "limit" => "1"},
+          [{"Cookie", dashboard_session_cookie(login)}]
+        )
+
+      assert extract_status_code(response) == 302
+      assert extract_header(response, "location") =~ "status=dry_run"
+    end
+
+    test "dashboard retention cleanup requires global Flow write key access" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-retention-tenant", [
+          "on",
+          ">secret",
+          "%W~tenant-a:*",
+          "-@all",
+          "+FLOW.LIST",
+          "+FLOW.RETENTION_CLEANUP"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-retention-tenant",
+          "password" => "secret"
+        })
+
+      response =
+        http_post_form(
+          HealthEndpoint.port(),
+          "/dashboard/flow/retention",
+          %{"action" => "cleanup", "limit" => "1", "confirm_cleanup" => "true"},
+          [{"Cookie", dashboard_session_cookie(login)}]
+        )
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.RETENTION_CLEANUP"
+      assert extract_body(response) =~ "key"
+    end
+
+    test "dashboard policy POST enforces ACL key patterns from form type" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+      denied_type = "denied:email:#{System.unique_integer([:positive])}"
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-policy-writer", [
+          "on",
+          ">secret",
+          "%W~allowed:*",
+          "-@all",
+          "+FLOW.POLICY.SET"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-policy-writer",
+          "password" => "secret"
+        })
+
+      response =
+        http_post_form(
+          HealthEndpoint.port(),
+          "/dashboard/flow/policies",
+          %{"type" => denied_type, "max_attempts" => "3"},
+          [{"Cookie", dashboard_session_cookie(login)}]
+        )
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.POLICY.SET"
+      assert extract_body(response) =~ "%W~#{denied_type}"
+
+      policy_key = Ferricstore.Flow.Keys.policy_key(denied_type)
+      assert nil == Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), policy_key)
+    end
+
+    test "dashboard failure reclaim POST enforces ACL key patterns from form type" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+      denied_type = "denied:reclaim:#{System.unique_integer([:positive])}"
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-reclaimer", [
+          "on",
+          ">secret",
+          "%W~allowed:*",
+          "-@all",
+          "+FLOW.RECLAIM"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-reclaimer",
+          "password" => "secret"
+        })
+
+      response =
+        http_post_form(
+          HealthEndpoint.port(),
+          "/dashboard/flow/failures",
+          %{
+            "action" => "reclaim",
+            "type" => denied_type,
+            "limit" => "1",
+            "lease_ms" => "30000",
+            "confirm_reclaim" => "true"
+          },
+          [{"Cookie", dashboard_session_cookie(login)}]
+        )
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.RECLAIM"
+      assert extract_body(response) =~ "%W~#{denied_type}"
+      assert extract_body(response) =~ "write"
+    end
+
+    test "dashboard failure reclaim POST enforces ACL key patterns from form partition" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+      type = "email"
+      denied_partition = "tenant-denied:#{System.unique_integer([:positive])}"
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-reclaimer-partition", [
+          "on",
+          ">secret",
+          "%W~#{type}",
+          "-@all",
+          "+FLOW.RECLAIM"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-reclaimer-partition",
+          "password" => "secret"
+        })
+
+      response =
+        http_post_form(
+          HealthEndpoint.port(),
+          "/dashboard/flow/failures",
+          %{
+            "action" => "reclaim",
+            "type" => type,
+            "partition_key" => denied_partition,
+            "limit" => "1",
+            "lease_ms" => "30000",
+            "confirm_reclaim" => "true"
+          },
+          [{"Cookie", dashboard_session_cookie(login)}]
+        )
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.RECLAIM"
+      assert extract_body(response) =~ "%W~#{denied_partition}"
+      assert extract_body(response) =~ "write"
+    end
+
     test "dashboard rewind action reports missing command and write key permission" do
       Application.put_env(:ferricstore, :protected_mode, true)
 
@@ -617,7 +861,8 @@ defmodule FerricstoreServer.Health.DashboardTest do
           ">secret",
           "~tenant-a:*",
           "-@all",
-          "+FLOW.GET"
+          "+FLOW.GET",
+          "+FLOW.REWIND"
         ])
 
       login =
@@ -670,6 +915,210 @@ defmodule FerricstoreServer.Health.DashboardTest do
       assert extract_body(response) =~ "~tenant-b:flow-1"
       assert extract_body(response) =~ "read"
       assert extract_body(response) =~ "key"
+    end
+
+    test "flow detail pages enforce ACL partition key from query" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-id-only-reader", [
+          "on",
+          ">secret",
+          "~flow-1",
+          "-@all",
+          "+FLOW.GET"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-id-only-reader",
+          "password" => "secret"
+        })
+
+      query = URI.encode_query(%{"partition_key" => "tenant-b"})
+
+      response =
+        http_get(HealthEndpoint.port(), "/dashboard/flow/flow-1?#{query}", [
+          {"Cookie", dashboard_session_cookie(login)}
+        ])
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.GET"
+      assert extract_body(response) =~ "%R~tenant-b"
+      assert extract_body(response) =~ "read"
+    end
+
+    test "flow query history enforces ACL key patterns from query id" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-history-tenant-a", [
+          "on",
+          ">secret",
+          "~tenant-a:*",
+          "-@all",
+          "+FLOW.HISTORY"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-history-tenant-a",
+          "password" => "secret"
+        })
+
+      query =
+        URI.encode_query(%{
+          "kind" => "history",
+          "id" => "tenant-b:flow-1"
+        })
+
+      response =
+        http_get(HealthEndpoint.port(), "/dashboard/flow/query?#{query}", [
+          {"Cookie", dashboard_session_cookie(login)}
+        ])
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.HISTORY"
+      assert extract_body(response) =~ "%R~tenant-b:flow-1"
+      assert extract_body(response) =~ "read"
+    end
+
+    test "flow query pages enforce ACL key patterns from partition filters" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-list-tenant-a", [
+          "on",
+          ">secret",
+          "~tenant-a:*",
+          "-@all",
+          "+FLOW.LIST"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-list-tenant-a",
+          "password" => "secret"
+        })
+
+      query =
+        URI.encode_query(%{
+          "kind" => "list",
+          "type" => "email",
+          "partition_key" => "tenant-b:queue"
+        })
+
+      response =
+        http_get(HealthEndpoint.port(), "/dashboard/flow/query?#{query}", [
+          {"Cookie", dashboard_session_cookie(login)}
+        ])
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.LIST"
+      assert extract_body(response) =~ "%R~tenant-b:queue"
+      assert extract_body(response) =~ "read"
+    end
+
+    test "flow query pages enforce ACL type keys when no partition filter exists" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-failures-billing-only", [
+          "on",
+          ">secret",
+          "~billing",
+          "-@all",
+          "+FLOW.FAILURES"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-failures-billing-only",
+          "password" => "secret"
+        })
+
+      query =
+        URI.encode_query(%{
+          "kind" => "failures",
+          "type" => "checkout"
+        })
+
+      response =
+        http_get(HealthEndpoint.port(), "/dashboard/flow/query?#{query}", [
+          {"Cookie", dashboard_session_cookie(login)}
+        ])
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.FAILURES"
+      assert extract_body(response) =~ "%R~checkout"
+      assert extract_body(response) =~ "read"
+    end
+
+    test "flow failures page enforces ACL key patterns from partition filters" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-failures-tenant-a", [
+          "on",
+          ">secret",
+          "~tenant-a:*",
+          "-@all",
+          "+FLOW.FAILURES"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-failures-tenant-a",
+          "password" => "secret"
+        })
+
+      query =
+        URI.encode_query(%{
+          "type" => "email",
+          "partition_key" => "tenant-b:queue"
+        })
+
+      response =
+        http_get(HealthEndpoint.port(), "/dashboard/flow/failures?#{query}", [
+          {"Cookie", dashboard_session_cookie(login)}
+        ])
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.FAILURES"
+      assert extract_body(response) =~ "%R~tenant-b:queue"
+      assert extract_body(response) =~ "read"
+    end
+
+    test "dashboard rewind action enforces ACL partition key from form" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      :ok =
+        FerricstoreServer.Acl.set_user("flow-id-only-rewinder", [
+          "on",
+          ">secret",
+          "~flow-1",
+          "-@all",
+          "+FLOW.REWIND"
+        ])
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "flow-id-only-rewinder",
+          "password" => "secret"
+        })
+
+      response =
+        http_post_form(
+          HealthEndpoint.port(),
+          "/dashboard/flow/flow-1/rewind",
+          %{"partition_key" => "tenant-b", "to_event" => "1", "confirm_rewind" => "true"},
+          [{"Cookie", dashboard_session_cookie(login)}]
+        )
+
+      assert extract_status_code(response) == 403
+      assert extract_body(response) =~ "FLOW.REWIND"
+      assert extract_body(response) =~ "%W~tenant-b"
+      assert extract_body(response) =~ "write"
     end
 
     test "dashboard API forbidden replies include required ACL command and key details" do
@@ -736,6 +1185,235 @@ defmodule FerricstoreServer.Health.DashboardTest do
       assert extract_body(response) =~ "GET"
       assert extract_body(response) =~ "+GET"
       assert extract_body(response) =~ "%R~tenant-b:1"
+    end
+
+    test "keyspace sampled rows are filtered by dashboard ACL key patterns" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      suffix = System.unique_integer([:positive])
+      allowed_key = "tenant-a:dash-keyspace:#{suffix}"
+      denied_key = "tenant-b:dash-keyspace:#{suffix}"
+
+      assert :ok = FerricStore.set(allowed_key, "visible")
+      assert :ok = FerricStore.set(denied_key, "hidden")
+
+      ShardHelpers.eventually(
+        fn ->
+          keys =
+            %{"limit" => "200"}
+            |> Dashboard.collect_keyspace_page()
+            |> Map.fetch!(:rows)
+            |> Enum.map(& &1.key)
+
+          allowed_key in keys and denied_key in keys
+        end,
+        "expected keyspace dashboard sample to include setup keys",
+        50,
+        20
+      )
+
+      :ok =
+        FerricstoreServer.Acl.set_user("tenant-a-keyspace", [
+          "on",
+          ">secret",
+          "~tenant-a:*",
+          "-@all",
+          "+SCAN"
+        ])
+
+      keys =
+        %{"limit" => "200", "acl_username" => "tenant-a-keyspace"}
+        |> Dashboard.collect_keyspace_page()
+        |> Map.fetch!(:rows)
+        |> Enum.map(& &1.key)
+
+      assert allowed_key in keys
+      refute denied_key in keys
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "tenant-a-keyspace",
+          "password" => "secret"
+        })
+
+      cookie = dashboard_session_cookie(login)
+
+      page =
+        http_get(HealthEndpoint.port(), "/dashboard/keyspace?limit=200", [
+          {"Cookie", cookie}
+        ])
+
+      assert extract_status_code(page) == 200
+      assert extract_body(page) =~ allowed_key
+      refute extract_body(page) =~ denied_key
+
+      live =
+        http_get(HealthEndpoint.port(), "/dashboard/api/keyspace?limit=200", [
+          {"Cookie", cookie}
+        ])
+
+      assert extract_status_code(live) == 200
+      assert extract_body(live) =~ allowed_key
+      refute extract_body(live) =~ denied_key
+    end
+
+    test "Flow overview sampled rows are filtered by dashboard ACL key patterns" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      suffix = System.unique_integer([:positive])
+      allowed_partition = "tenant-a:dash-flow:#{suffix}"
+      denied_partition = "tenant-b:dash-flow:#{suffix}"
+      allowed_id = "dash-flow-allowed-#{suffix}"
+      denied_id = "dash-flow-denied-#{suffix}"
+
+      assert :ok =
+               FerricStore.flow_create(allowed_id,
+                 type: "dash-acl-flow",
+                 state: "queued",
+                 partition_key: allowed_partition,
+                 run_at_ms: 1_000
+               )
+
+      assert :ok =
+               FerricStore.flow_create(denied_id,
+                 type: "dash-acl-flow",
+                 state: "queued",
+                 partition_key: denied_partition,
+                 run_at_ms: 1_000
+               )
+
+      ShardHelpers.eventually(
+        fn ->
+          records = Dashboard.collect_flow_page(partition_key: denied_partition).records
+          Enum.any?(records, &(&1.id == denied_id))
+        end,
+        "expected Flow dashboard sample to include setup record",
+        50,
+        20
+      )
+
+      :ok =
+        FerricstoreServer.Acl.set_user("tenant-a-flow-dashboard", [
+          "on",
+          ">secret",
+          "~tenant-a:*",
+          "-@all",
+          "+FLOW.LIST"
+        ])
+
+      denied_records =
+        Dashboard.collect_flow_page(
+          partition_key: denied_partition,
+          acl_username: "tenant-a-flow-dashboard"
+        ).records
+
+      refute Enum.any?(denied_records, &(&1.id == denied_id))
+
+      allowed_records =
+        Dashboard.collect_flow_page(
+          partition_key: allowed_partition,
+          acl_username: "tenant-a-flow-dashboard"
+        ).records
+
+      assert Enum.any?(allowed_records, &(&1.id == allowed_id))
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "tenant-a-flow-dashboard",
+          "password" => "secret"
+        })
+
+      cookie = dashboard_session_cookie(login)
+      query = URI.encode_query(%{"partition_key" => denied_partition})
+
+      page =
+        http_get(HealthEndpoint.port(), "/dashboard/flow?#{query}", [
+          {"Cookie", cookie}
+        ])
+
+      assert extract_status_code(page) == 200
+      refute extract_body(page) =~ denied_id
+    end
+
+    test "Flow retention page filters sampled candidates by dashboard ACL key patterns" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      suffix = System.unique_integer([:positive])
+      now_ms = System.system_time(:millisecond)
+      allowed_partition = "tenant-a:dash-retention:#{suffix}"
+      denied_partition = "tenant-b:dash-retention:#{suffix}"
+      allowed_id = "dash-retention-allowed-#{suffix}"
+      denied_id = "dash-retention-denied-#{suffix}"
+
+      for {id, partition} <- [{allowed_id, allowed_partition}, {denied_id, denied_partition}] do
+        key = Ferricstore.Flow.Keys.state_key(id, partition)
+
+        record = %{
+          id: id,
+          type: "dash-retention-acl",
+          state: "completed",
+          version: 1,
+          attempts: 1,
+          fencing_token: 1,
+          created_at_ms: now_ms - 10_000,
+          updated_at_ms: now_ms - 5_000,
+          next_run_at_ms: now_ms - 5_000,
+          priority: 0,
+          retention_ttl_ms: 1_000,
+          terminal_retention_until_ms: now_ms - 1_000,
+          partition_key: partition,
+          run_state: "terminal"
+        }
+
+        assert :ok = FerricStore.set(key, Ferricstore.Flow.encode_record(record))
+      end
+
+      ShardHelpers.eventually(
+        fn ->
+          ids =
+            Dashboard.collect_flow_retention_page(limit: 200).candidates
+            |> Enum.map(& &1.id)
+
+          allowed_id in ids and denied_id in ids
+        end,
+        "expected Flow retention dashboard sample to include setup candidates",
+        50,
+        20
+      )
+
+      :ok =
+        FerricstoreServer.Acl.set_user("tenant-a-retention-dashboard", [
+          "on",
+          ">secret",
+          "~tenant-a:*",
+          "-@all",
+          "+FLOW.LIST"
+        ])
+
+      filtered_ids =
+        Dashboard.collect_flow_retention_page(
+          limit: 200,
+          acl_username: "tenant-a-retention-dashboard"
+        ).candidates
+        |> Enum.map(& &1.id)
+
+      assert allowed_id in filtered_ids
+      refute denied_id in filtered_ids
+
+      login =
+        http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+          "username" => "tenant-a-retention-dashboard",
+          "password" => "secret"
+        })
+
+      page =
+        http_get(HealthEndpoint.port(), "/dashboard/flow/retention?limit=200", [
+          {"Cookie", dashboard_session_cookie(login)}
+        ])
+
+      assert extract_status_code(page) == 200
+      assert extract_body(page) =~ allowed_id
+      refute extract_body(page) =~ denied_id
     end
 
     test "removed Flow projections live endpoint is not authorized as a Flow id" do
@@ -1340,6 +2018,12 @@ defmodule FerricstoreServer.Health.DashboardTest do
           clients: []
         }),
         Dashboard.render_storage_page(%{total_disk_bytes: 0, total_files: 0, shards: []}),
+        Dashboard.render_doctor_page(%{
+          check: %{"status" => "ok", "checks" => []},
+          jobs: [],
+          flash: %{},
+          command_reference: []
+        }),
         Dashboard.render_prefixes_page(%{total_sampled: 0, prefixes: []})
       ]
 
@@ -1375,6 +2059,26 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
       assert extract_status_code(response) == 302
       assert extract_header(response, "location") == "/dashboard/raft"
+    end
+
+    test "/dashboard/raft hides internal collection errors" do
+      previous = Application.get_env(:ferricstore, :dashboard_raft_page_fun)
+
+      on_exit(fn ->
+        restore_env(:dashboard_raft_page_fun, previous)
+      end)
+
+      Application.put_env(:ferricstore, :dashboard_raft_page_fun, fn ->
+        raise RuntimeError, "secret raft page failure"
+      end)
+
+      response = http_get(HealthEndpoint.port(), "/dashboard/raft")
+      body = extract_body(response)
+
+      assert extract_status_code(response) == 200
+      assert body =~ "Internal dashboard error"
+      refute body =~ "secret raft page failure"
+      refute body =~ "RuntimeError"
     end
 
     test "subpage shell exposes semantic heading and active navigation state" do
@@ -2892,6 +3596,47 @@ defmodule FerricstoreServer.Health.DashboardTest do
       refute_receive {:unexpected_dashboard_value_api_refs, _}
     end
 
+    test "Flow value live payload hides internal lookup error details" do
+      id = "dashboard-flow-value-error/#{System.unique_integer([:positive])}"
+      previous_get = Application.get_env(:ferricstore, :flow_dashboard_flow_get_fun)
+      previous_history = Application.get_env(:ferricstore, :flow_dashboard_flow_history_fun)
+      previous_values = Application.get_env(:ferricstore, :flow_dashboard_flow_value_mget_fun)
+
+      Application.put_env(:ferricstore, :flow_dashboard_flow_get_fun, fn ^id, _opts ->
+        {:ok,
+         %{
+           id: id,
+           type: "email",
+           state: "queued",
+           payload_ref: "flow-value:payload",
+           run_at_ms: 1_000,
+           updated_at_ms: 1_000
+         }}
+      end)
+
+      Application.put_env(:ferricstore, :flow_dashboard_flow_history_fun, fn ^id, _opts ->
+        {:ok, []}
+      end)
+
+      Application.put_env(:ferricstore, :flow_dashboard_flow_value_mget_fun, fn _refs ->
+        {:error, {:lmdb_corruption, "/secret/data/file.mdb"}}
+      end)
+
+      on_exit(fn ->
+        restore_env(:flow_dashboard_flow_get_fun, previous_get)
+        restore_env(:flow_dashboard_flow_history_fun, previous_history)
+        restore_env(:flow_dashboard_flow_value_mget_fun, previous_values)
+      end)
+
+      query = URI.encode_query(%{"flow" => id, "ref" => "flow-value:payload"})
+
+      assert {:ok, payload} = Dashboard.live_payload("flow/value?" <> query)
+      assert payload.status == "error"
+      assert payload.error =~ "value lookup failed"
+      refute payload.error =~ "lmdb_corruption"
+      refute payload.error =~ "/secret/data/file.mdb"
+    end
+
     test "renders Flow debug inspector with lease, storage, values, and history hints" do
       data = %{
         id: "debug-flow-1",
@@ -3769,7 +4514,8 @@ defmodule FerricstoreServer.Health.DashboardTest do
             {"/dashboard/keyspace", "Keyspace"},
             {"/dashboard/keyspace?key=missing-key", "Keyspace"},
             {"/dashboard/commands", "Commands"},
-            {"/dashboard/reads", "Read Path"}
+            {"/dashboard/reads", "Read Path"},
+            {"/dashboard/doctor", "Doctor"}
           ] do
         response = http_get(port, path)
 

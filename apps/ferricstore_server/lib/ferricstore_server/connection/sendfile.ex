@@ -1272,25 +1272,38 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  # TCP sendfile and encrypted file streaming keep the hot path one-pass: the
-  # already-opened blob segment is checked for a valid record header and
-  # expected payload length, while payload checksum verification is left to
-  # write-time validation, materialized reads, and background scrub.
   defp maybe_verify_segment_blob_payload(
-         _fd,
-         _value_offset,
-         _value_size,
-         _expected_checksum,
+         fd,
+         value_offset,
+         value_size,
+         expected_checksum,
          mode
-       )
-       when mode in [:sendfile, :file_stream],
-       do: :ok
+       ) do
+    # Blob side-channel files are addressed by checksum. Validate the payload
+    # before sending any RESP header so TCP sendfile cannot expose corrupt bytes.
+    started = System.monotonic_time()
 
-  defp maybe_verify_segment_blob_payload(fd, value_offset, value_size, expected_checksum, _mode) do
-    case hash_open_file_range(fd, value_offset, value_size) do
-      {:ok, ^expected_checksum} -> :ok
-      _other -> :mismatch
-    end
+    result =
+      case hash_open_file_range(fd, value_offset, value_size) do
+        {:ok, ^expected_checksum} -> :ok
+        _other -> :mismatch
+      end
+
+    emit_blob_checksum_validation(value_size, started, mode, result)
+    result
+  end
+
+  defp emit_blob_checksum_validation(bytes, started, mode, result) do
+    duration =
+      System.monotonic_time()
+      |> Kernel.-(started)
+      |> System.convert_time_unit(:native, :microsecond)
+
+    :telemetry.execute(
+      [:ferricstore, :server, :sendfile, :blob_checksum],
+      %{bytes: bytes, duration_us: duration},
+      %{mode: mode, result: result}
+    )
   end
 
   defp decode_blob_segment_header(

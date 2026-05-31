@@ -111,14 +111,25 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert IO.iodata_to_binary(sends |> Enum.drop(1) |> Enum.drop(-1)) == value
   end
 
-  test "tcp segment blob sendfile validates header without pre-reading payload" do
+  test "tcp segment blob sendfile validates payload before sending header" do
     root = tmp_blob_root!()
-    value = :binary.copy("z", Sendfile.threshold_bytes() + 4096)
+    chunk_bytes = Sendfile.file_stream_chunk_bytes()
+    value = :binary.copy("z", chunk_bytes + 4096)
     assert {:ok, ref} = BlobStore.put(root, 0, value)
     assert {:ok, {path, offset, size}} = BlobStore.file_ref(root, 0, ref)
     assert size == byte_size(value)
 
     parent = self()
+    telemetry_id = {:sendfile_blob_checksum, self(), make_ref()}
+
+    :telemetry.attach(
+      telemetry_id,
+      [:ferricstore, :server, :sendfile, :blob_checksum],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:blob_checksum_event, event, measurements, metadata})
+      end,
+      nil
+    )
 
     Process.put(:ferricstore_sendfile_pread_hook, fn fd, read_offset, read_size ->
       send(parent, {:sendfile_pread, read_offset, read_size})
@@ -139,15 +150,27 @@ defmodule FerricstoreServer.Connection.SendfileTest do
                Sendfile.send_file_ref_response("blob-key", path, offset, size, state)
 
       assert recv_until(client_socket, "\r\n") =~ "$#{size}\r\n"
-      assert collect_sendfile_preads() == [{offset - 48, 48}]
+
+      assert collect_sendfile_preads() == [
+               {offset - @blob_segment_header_bytes, @blob_segment_header_bytes},
+               {offset, chunk_bytes},
+               {offset + chunk_bytes, 4096}
+             ]
+
+      assert_receive {:blob_checksum_event, [:ferricstore, :server, :sendfile, :blob_checksum],
+                      %{bytes: ^size, duration_us: duration_us}, %{mode: :sendfile, result: :ok}}
+
+      assert is_integer(duration_us)
+      assert duration_us >= 0
     after
+      :telemetry.detach(telemetry_id)
       Process.delete(:ferricstore_sendfile_pread_hook)
       :gen_tcp.close(server_socket)
       :gen_tcp.close(client_socket)
     end
   end
 
-  test "encrypted segment blob stream validates header without pre-reading payload twice" do
+  test "encrypted segment blob stream validates payload before streaming bounded chunks" do
     root = tmp_blob_root!()
     chunk_bytes = Sendfile.file_stream_chunk_bytes()
     value = IO.iodata_to_binary([:binary.copy("s", chunk_bytes), :binary.copy("t", 19)])
@@ -180,6 +203,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
       assert collect_sendfile_preads() == [
                {offset - @blob_segment_header_bytes, @blob_segment_header_bytes},
+               {offset, chunk_bytes},
+               {offset + chunk_bytes, 19},
                {offset, chunk_bytes},
                {offset + chunk_bytes, 19}
              ]
@@ -369,7 +394,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
-  test "MGET defers blob ref validation to the streaming layer" do
+  test "MGET validates blob refs before streaming" do
     ctx =
       IsolatedInstance.checkout(
         shard_count: 1,
@@ -417,7 +442,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
       sends = collect_fake_tls_sends()
       assert {:ok, [[^value1, ^value2]], ""} = Parser.parse(IO.iodata_to_binary(sends))
-      refute_received {:blob_store_open, _path}
+      assert [blob_path] = collect_blob_store_opens()
+      assert Path.extname(blob_path) == ".bloblog"
       assert [path] = collect_sendfile_opens()
       assert Path.extname(path) == ".bloblog"
     after
@@ -426,7 +452,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
-  test "GET defers blob ref validation to the streaming layer" do
+  test "GET validates blob ref before streaming" do
     ctx =
       IsolatedInstance.checkout(
         shard_count: 1,
@@ -472,7 +498,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
       sends = collect_fake_tls_sends()
       assert {:ok, [^value], ""} = Parser.parse(IO.iodata_to_binary(sends))
-      refute_received {:blob_store_open, _path}
+      assert [blob_path] = collect_blob_store_opens()
+      assert Path.extname(blob_path) == ".bloblog"
       assert [path] = collect_sendfile_opens()
       assert Path.extname(path) == ".bloblog"
     after
@@ -552,7 +579,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     {server_socket, client_socket} = tcp_pair()
 
     key = "pipeline-blob-sendfile-validation"
-    value = :binary.copy("v", Sendfile.threshold_bytes() + 1024)
+    chunk_bytes = Sendfile.file_stream_chunk_bytes()
+    value = :binary.copy("v", chunk_bytes + 1024)
 
     assert :ok = Router.put(ctx, key, value, 0)
 
@@ -589,7 +617,11 @@ defmodule FerricstoreServer.Connection.SendfileTest do
       response = recv_until(client_socket, "$#{byte_size(value)}\r\n", "", 100)
       assert response =~ "$#{byte_size(value)}\r\n"
 
-      assert [{_header_offset, @blob_segment_header_bytes}] = collect_sendfile_preads()
+      assert collect_sendfile_preads() == [
+               {48 - @blob_segment_header_bytes, @blob_segment_header_bytes},
+               {48, chunk_bytes},
+               {48 + chunk_bytes, 1024}
+             ]
     after
       Process.delete(:ferricstore_sendfile_pread_hook)
       :gen_tcp.close(server_socket)
@@ -791,7 +823,13 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   end
 
   test "sandboxed mixed GET SET pipeline validates stream refs with internal lookup keys" do
-    ctx = FerricStore.Instance.get(:default)
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1024,
+        blob_side_channel_threshold_bytes: 0
+      )
+
     sandbox = "sandbox:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
     cold_key = "mixed-pipeline-cold-sandbox-sendfile"
     set_key = "mixed-pipeline-set-sandbox-sendfile"
@@ -855,6 +893,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
       Router.delete(ctx, set_lookup_key)
       :gen_tcp.close(server_socket)
       :gen_tcp.close(client_socket)
+      IsolatedInstance.checkin(ctx)
     end
   end
 
@@ -1028,6 +1067,46 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
+  test "GET does not stream a large blob file ref with corrupt payload bytes" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "large-corrupt-blob-payload-sendfile-get"
+    value = :binary.copy("B", Sendfile.threshold_bytes() + 512)
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, blob_offset, size} = Router.get_with_file_ref(ctx, key)
+      assert size == byte_size(value)
+
+      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
+
+      state = %{
+        socket: self(),
+        transport: FakeTlsTransport,
+        client_id: :test_client,
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn "GET", [^key], fallback_state ->
+        {:continue, FerricstoreServer.Resp.Encoder.encode(Router.get(ctx, key)), fallback_state}
+      end
+
+      assert {:continue, encoded, ^state} = Sendfile.dispatch_get([key], state, fallback)
+      assert IO.iodata_to_binary(encoded) == "_\r\n"
+      assert collect_fake_tls_sends() == []
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "GETRANGE rejects a small blob file ref range whose segment header no longer matches" do
     ctx =
       IsolatedInstance.checkout(
@@ -1106,7 +1185,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
       assert IO.iodata_to_binary(encoded) == "$6\r\ntarget\r\n"
 
       assert collect_sendfile_preads() == [
-               {blob_offset - 48, 48},
+               {blob_offset - @blob_segment_header_bytes, @blob_segment_header_bytes},
+               {blob_offset, size},
                {blob_offset + 2048, 6}
              ]
 
@@ -1117,7 +1197,109 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
-  test "GETRANGE defers blob ref validation to the streaming layer" do
+  test "TCP GET does not sendfile a large blob file ref with corrupt payload bytes" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "tcp-large-corrupt-blob-payload-sendfile-get"
+    value = :binary.copy("T", Sendfile.threshold_bytes() + 512)
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, blob_offset, size} = Router.get_with_file_ref(ctx, key)
+      assert size == byte_size(value)
+
+      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
+
+      {server_socket, client_socket} = tcp_pair()
+
+      state = %{
+        socket: server_socket,
+        transport: :ranch_tcp,
+        client_id: :test_client,
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn "GET", [^key], fallback_state ->
+        {:continue, FerricstoreServer.Resp.Encoder.encode(Router.get(ctx, key)), fallback_state}
+      end
+
+      try do
+        assert {:continue, encoded, ^state} = Sendfile.dispatch_get([key], state, fallback)
+        assert IO.iodata_to_binary(encoded) == "_\r\n"
+        assert {:error, :timeout} = :gen_tcp.recv(client_socket, 0, 10)
+      after
+        :gen_tcp.close(server_socket)
+        :gen_tcp.close(client_socket)
+      end
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "GETRANGE does not stream a large blob file ref range when full payload checksum fails" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "large-corrupt-blob-payload-sendfile-getrange"
+    value = :binary.copy("R", Sendfile.threshold_bytes() + 512)
+    args = [key, "0", Integer.to_string(Sendfile.threshold_bytes())]
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, blob_offset, size} = Router.get_with_file_ref(ctx, key)
+      assert size == byte_size(value)
+
+      overwrite_file_range!(
+        blob_path,
+        blob_offset + Sendfile.threshold_bytes() + 128,
+        :binary.copy("x", 32)
+      )
+
+      state = %{
+        socket: self(),
+        transport: FakeTlsTransport,
+        client_id: :test_client,
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn fallback_state ->
+        value = Sendfile.materialize_getrange(key, 0, Sendfile.threshold_bytes(), fallback_state)
+        {:continue, FerricstoreServer.Resp.Encoder.encode(value), fallback_state}
+      end
+
+      assert {:continue, encoded, ^state} =
+               Sendfile.dispatch_getrange(
+                 args,
+                 key,
+                 0,
+                 Sendfile.threshold_bytes(),
+                 state,
+                 fallback
+               )
+
+      assert IO.iodata_to_binary(encoded) == "$0\r\n\r\n"
+      assert collect_fake_tls_sends() == []
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "GETRANGE validates blob ref before streaming" do
     ctx =
       IsolatedInstance.checkout(
         shard_count: 1,
@@ -1163,7 +1345,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
       sends = collect_fake_tls_sends()
       assert {:ok, [^value], ""} = Parser.parse(IO.iodata_to_binary(sends))
-      refute_received {:blob_store_open, _path}
+      assert [blob_path] = collect_blob_store_opens()
+      assert Path.extname(blob_path) == ".bloblog"
       assert [path] = collect_sendfile_opens()
       assert Path.extname(path) == ".bloblog"
     after
@@ -1360,6 +1543,14 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   defp collect_sendfile_opens(acc \\ []) do
     receive do
       {:sendfile_open, path} -> collect_sendfile_opens([path | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp collect_blob_store_opens(acc \\ []) do
+    receive do
+      {:blob_store_open, path} -> collect_blob_store_opens([path | acc])
     after
       0 -> Enum.reverse(acc)
     end

@@ -38,6 +38,7 @@ defmodule FerricstoreServer.Connection.Store do
           raw.ratelimit_add.(ns <> key, window, max, count)
         end,
         list_op: fn key, op -> raw.list_op.(ns <> key, op) end,
+        on_push: fn key, count -> raw.on_push.(ns <> key, count) end,
         compound_get: fn redis_key, compound_key ->
           raw.compound_get.(ns <> redis_key, namespace_compound_key(ns, redis_key, compound_key))
         end,
@@ -237,7 +238,7 @@ defmodule FerricstoreServer.Connection.Store do
         Path.join(shard_path, "prob")
       end,
       flush_prob_dirs: fn -> Ferricstore.ProbCleanup.flush_all(ctx.data_dir, ctx.shard_count) end,
-      on_push: &Ferricstore.Waiters.notify_push/1
+      on_push: &Ferricstore.Waiters.notify_push/2
     }
   end
 

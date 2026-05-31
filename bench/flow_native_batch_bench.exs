@@ -8,7 +8,7 @@
 #   state KV record + due zset entry + history stream entry blob.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/flow_native_batch_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/flow_native_batch_bench.exs
 #
 # Options:
 #   FLOW_PRIMITIVE_BACKLOGS=1000,10000

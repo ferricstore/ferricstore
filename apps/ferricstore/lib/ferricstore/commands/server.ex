@@ -449,6 +449,15 @@ defmodule Ferricstore.Commands.Server do
     {:error, "ERR wrong number of arguments for 'ferricstore.blobgc' command"}
   end
 
+  def handle("FERRICSTORE.DOCTOR", args, store) when is_list(args) do
+    with {:ok, ctx} <- server_instance_ctx(store) do
+      Ferricstore.Doctor.handle_command(normalize_doctor_args(args), ctx)
+    else
+      {:error, :no_default_instance} ->
+        {:error, "ERR no default instance available for 'ferricstore.doctor' command"}
+    end
+  end
+
   # ===========================================================================
   # Private helpers
   # ===========================================================================
@@ -1042,6 +1051,22 @@ defmodule Ferricstore.Commands.Server do
         flow_lmdb_writer_flush_failures =
           atomic_metric(instance_ctx, :flow_lmdb_writer_flush_failures, i)
 
+        flow_history_projected = atomic_metric(instance_ctx, :flow_history_projected_index, i)
+        flow_history_requested = atomic_metric(instance_ctx, :flow_history_requested_index, i)
+        flow_history_lag = max(flow_history_requested - flow_history_projected, 0)
+
+        flow_history_projector_pending_entries =
+          atomic_metric(instance_ctx, :flow_history_projector_pending_entries, i)
+
+        flow_history_projector_oldest_pending_age_us =
+          atomic_metric(instance_ctx, :flow_history_projector_oldest_pending_age_us, i)
+
+        flow_history_projector_flush_failures =
+          atomic_metric(instance_ctx, :flow_history_projector_flush_failures, i)
+
+        flow_history_projector_queue_full =
+          atomic_metric(instance_ctx, :flow_history_projector_queue_full, i)
+
         release_gap = max(last_applied - last_released, 0)
 
         release_cursor_blocked_apply_count =
@@ -1077,6 +1102,17 @@ defmodule Ferricstore.Commands.Server do
            Integer.to_string(flow_lmdb_writer_oldest_pending_age_us)},
           {"shard_#{i}_flow_lmdb_writer_flush_failures",
            Integer.to_string(flow_lmdb_writer_flush_failures)},
+          {"shard_#{i}_flow_history_projected_index", Integer.to_string(flow_history_projected)},
+          {"shard_#{i}_flow_history_requested_index", Integer.to_string(flow_history_requested)},
+          {"shard_#{i}_flow_history_projection_lag", Integer.to_string(flow_history_lag)},
+          {"shard_#{i}_flow_history_projector_pending_entries",
+           Integer.to_string(flow_history_projector_pending_entries)},
+          {"shard_#{i}_flow_history_projector_oldest_pending_age_us",
+           Integer.to_string(flow_history_projector_oldest_pending_age_us)},
+          {"shard_#{i}_flow_history_projector_flush_failures",
+           Integer.to_string(flow_history_projector_flush_failures)},
+          {"shard_#{i}_flow_history_projector_queue_full",
+           Integer.to_string(flow_history_projector_queue_full)},
           {"shard_#{i}_release_cursor_gap", Integer.to_string(release_gap)},
           {"shard_#{i}_release_cursor_blocked_apply_count",
            Integer.to_string(release_cursor_blocked_apply_count)},
@@ -1472,6 +1508,42 @@ defmodule Ferricstore.Commands.Server do
 
   defp upcase_local_modifier(args), do: args
 
+  defp normalize_doctor_args([]), do: []
+
+  defp normalize_doctor_args([command | rest]) when is_binary(command) do
+    case String.upcase(command) do
+      "CHECK" -> ["CHECK" | normalize_doctor_scope_args(rest)]
+      "START" -> ["START" | normalize_doctor_start_args(rest)]
+      "STATUS" -> ["STATUS" | rest]
+      "LIST" -> ["LIST" | rest]
+      "CANCEL" -> ["CANCEL" | rest]
+      other -> [other | rest]
+    end
+  end
+
+  defp normalize_doctor_args(args), do: args
+
+  defp normalize_doctor_start_args([kind, subject | rest])
+       when is_binary(kind) and is_binary(subject) do
+    [String.upcase(kind), String.upcase(subject) | normalize_doctor_scope_args(rest)]
+  end
+
+  defp normalize_doctor_start_args([kind | rest]) when is_binary(kind),
+    do: [String.upcase(kind) | rest]
+
+  defp normalize_doctor_start_args(args), do: args
+
+  defp normalize_doctor_scope_args([scope_kw, scope | rest])
+       when is_binary(scope_kw) and is_binary(scope) do
+    case String.upcase(scope_kw) do
+      "SCOPE" -> ["SCOPE", scope | rest]
+      "SCOPES" -> ["SCOPES", scope | rest]
+      _other -> [scope_kw, scope | rest]
+    end
+  end
+
+  defp normalize_doctor_scope_args(args), do: args
+
   defp server_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: {:ok, ctx}
 
   defp server_instance_ctx(_store) do
@@ -1491,7 +1563,13 @@ defmodule Ferricstore.Commands.Server do
       "deleted_tmp_files",
       Map.get(stats, :deleted_tmp_files, 0),
       "deleted_tmp_bytes",
-      Map.get(stats, :deleted_tmp_bytes, 0)
+      Map.get(stats, :deleted_tmp_bytes, 0),
+      "hardened_protections_seen",
+      Map.get(stats, :hardened_protections_seen, 0),
+      "hardened_protections_released",
+      Map.get(stats, :hardened_protections_released, 0),
+      "hardened_protections_blocked",
+      Map.get(stats, :hardened_protections_blocked, 0)
     ]
   end
 

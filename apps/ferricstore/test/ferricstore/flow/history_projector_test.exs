@@ -80,6 +80,255 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     assert HistoryProjector.durable?(ctx, 0, dir, 42)
   end
 
+  test "request publishes requested index and pending backlog metrics without flushing hot path" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_metrics_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_metrics_#{unique}")
+
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_metrics_keydir_#{unique}", [:set, :public])
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_requested_index: :atomics.new(1, signed: false),
+      flow_history_projector_pending_entries: :atomics.new(1, signed: false),
+      flow_history_projector_oldest_pending_age_us: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false),
+      flow_history_projector_queue_full: :atomics.new(1, signed: false)
+    }
+
+    {:ok, pid} =
+      HistoryProjector.start_link(
+        shard_index: 0,
+        shard_data_path: dir,
+        instance_ctx: ctx,
+        recover_on_init: false
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(dir)
+    end)
+
+    entry = %{
+      key: Ferricstore.Flow.Keys.stream_entry_key("flow-metrics", "1000-1", nil),
+      expire_at_ms: 0,
+      history_key: Ferricstore.Flow.Keys.history_key("flow-metrics"),
+      event_id: "1000-1",
+      event_ms: 1_000,
+      version: 1,
+      value: "history-metrics",
+      ra_index: 42
+    }
+
+    assert :requested = HistoryProjector.request(ctx, 0, dir, 42)
+    assert :ok = HistoryProjector.enqueue(ctx, 0, [entry], 42)
+
+    assert :atomics.get(ctx.flow_history_requested_index, 1) == 42
+    assert :atomics.get(ctx.flow_history_projector_pending_entries, 1) == 1
+    assert :atomics.get(ctx.flow_history_projector_oldest_pending_age_us, 1) >= 0
+  end
+
+  test "projection fsyncs history log before publishing LMDB locations without watermark" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_fsync_order_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_fsync_order_#{unique}")
+    test_pid = self()
+
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_fsync_order_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    old_fsync_hook = Application.get_env(:ferricstore, :flow_history_projector_fsync_hook)
+    old_lmdb_hook = Application.get_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+
+    Application.put_env(:ferricstore, :flow_history_projector_fsync_hook, fn path ->
+      send(test_pid, {:history_fsync, path})
+      :ok
+    end)
+
+    Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, fn _shard_path,
+                                                                                    _file_id,
+                                                                                    _entries ->
+      send(test_pid, :history_lmdb_publish)
+      :ok
+    end)
+
+    on_exit(fn ->
+      restore_env(:flow_history_projector_fsync_hook, old_fsync_hook)
+      restore_env(:flow_history_projector_lmdb_publish_hook, old_lmdb_hook)
+      File.rm_rf(dir)
+    end)
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    history_key = Ferricstore.Flow.Keys.history_key("flow-fsync-order")
+    event_id = "1000-1"
+
+    entry = %{
+      key: Ferricstore.Flow.Keys.stream_entry_key("flow-fsync-order", event_id, nil),
+      expire_at_ms: 0,
+      history_key: history_key,
+      event_id: event_id,
+      event_ms: 1_000,
+      version: 1,
+      value: "history-fsync-order",
+      ra_index: 42
+    }
+
+    assert :ok = HistoryProjector.write_entries_sync(ctx, 0, dir, [entry], nil)
+
+    history_path = HistoryProjector.history_file_path(dir, 0)
+    assert_receive {:history_fsync, ^history_path}, 500
+    assert_receive :history_lmdb_publish, 500
+  end
+
+  test "sync projection does not publish hot keydir or native index when LMDB publish fails" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_lmdb_publish_fail_#{unique}"
+
+    dir =
+      Path.join(System.tmp_dir!(), "ferricstore_history_projector_lmdb_publish_fail_#{unique}")
+
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_lmdb_publish_fail_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    old_lmdb_hook = Application.get_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
+
+    Application.put_env(:ferricstore, :flow_history_projector_lmdb_publish_hook, fn _path,
+                                                                                    _file_id,
+                                                                                    _entries ->
+      {:error, :boom}
+    end)
+
+    on_exit(fn ->
+      restore_env(:flow_history_projector_lmdb_publish_hook, old_lmdb_hook)
+      File.rm_rf(dir)
+    end)
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    history_key = Ferricstore.Flow.Keys.history_key("flow-lmdb-publish-fail")
+    event_id = "1000-1"
+    key = Ferricstore.Flow.Keys.stream_entry_key("flow-lmdb-publish-fail", event_id, nil)
+
+    entry = %{
+      key: key,
+      expire_at_ms: 0,
+      history_key: history_key,
+      event_id: event_id,
+      event_ms: 1_000,
+      version: 1,
+      value: "history-lmdb-publish-fail",
+      ra_index: 42
+    }
+
+    assert {:error, :boom} = HistoryProjector.write_entries_sync(ctx, 0, dir, [entry], 42)
+    assert [] = :ets.lookup(keydir, key)
+    assert OrderedIndex.count_all(flow_lookup, history_key) == 0
+    assert OrderedIndex.rank_range(flow_index, history_key, 0, 1, false) == []
+    refute HistoryProjector.durable?(ctx, 0, dir, 42)
+  end
+
+  test "hard history cap fsyncs tombstones before removing old LMDB locations" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_cap_tombstone_fsync_#{unique}"
+
+    dir =
+      Path.join(System.tmp_dir!(), "ferricstore_history_projector_cap_tombstone_fsync_#{unique}")
+
+    test_pid = self()
+
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_cap_tombstone_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    old_fsync_hook = Application.get_env(:ferricstore, :flow_history_projector_fsync_hook)
+
+    Application.put_env(:ferricstore, :flow_history_projector_fsync_hook, fn path ->
+      send(test_pid, {:history_fsync, path})
+      :ok
+    end)
+
+    on_exit(fn ->
+      restore_env(:flow_history_projector_fsync_hook, old_fsync_hook)
+      File.rm_rf(dir)
+    end)
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      data_dir: Path.dirname(dir),
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    history_key = Ferricstore.Flow.Keys.history_key("flow-hard-cap-fsync")
+
+    entries =
+      for version <- 1..2 do
+        event_ms = 1_000 + version
+        event_id = "#{event_ms}-#{version}"
+
+        %{
+          key: Ferricstore.Flow.Keys.stream_entry_key("flow-hard-cap-fsync", event_id, nil),
+          expire_at_ms: 0,
+          history_key: history_key,
+          event_id: event_id,
+          event_ms: event_ms,
+          version: version,
+          value: "history-hard-cap-#{version}",
+          history_max_events: 1,
+          history_hot_max_events: 1,
+          ra_index: 50 + version
+        }
+      end
+
+    assert :ok = HistoryProjector.write_entries_sync(ctx, 0, dir, entries, nil)
+
+    history_path = HistoryProjector.history_file_path(dir, 0)
+    assert_receive {:history_fsync, ^history_path}, 500
+
+    old_lmdb_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1001-1", 1001)
+    assert :not_found = Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(dir), old_lmdb_key)
+  end
+
   test "sync projection evicts old hot history only after LMDB stores direct cold locations" do
     unique = System.unique_integer([:positive])
     instance_name = :"history_projector_hot_cap_#{unique}"
@@ -288,6 +537,82 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
              Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(dir), lmdb_key)
 
     assert {:ok, {_event_id, 3_001, _expire, _compound, {:flow_history, 0}, _offset, _size}} =
+             Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
+  end
+
+  test "recover with zero hot history scans log when projected marker is behind LMDB" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_behind_recover_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_behind_#{unique}")
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_behind_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    previous_hot = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
+    Application.put_env(:ferricstore, :flow_default_history_hot_max_events, 0)
+
+    on_exit(fn ->
+      restore_env(:flow_default_history_hot_max_events, previous_hot)
+      File.rm_rf(dir)
+    end)
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      data_dir: Path.dirname(dir),
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    history_key = Ferricstore.Flow.Keys.history_key("flow-behind-recover")
+
+    projected_entry = %{
+      key: Ferricstore.Flow.Keys.stream_entry_key("flow-behind-recover", "3003-1", nil),
+      expire_at_ms: 0,
+      history_key: history_key,
+      event_id: "3003-1",
+      event_ms: 3_003,
+      version: 1,
+      value: "history-already-projected",
+      history_hot_max_events: 0,
+      ra_index: 301
+    }
+
+    assert :ok = HistoryProjector.write_entries_sync(ctx, 0, dir, [projected_entry], 301)
+    assert HistoryProjector.durable?(ctx, 0, dir, 301)
+
+    unprojected_event_id = "3004-2"
+
+    unprojected_key =
+      Ferricstore.Flow.Keys.stream_entry_key("flow-behind-recover", unprojected_event_id, nil)
+
+    history_path = HistoryProjector.history_file_path(dir, 0)
+
+    assert {:ok, [_location]} =
+             NIF.v2_append_batch_nosync(history_path, [
+               {unprojected_key, "history-needs-recovery", 0}
+             ])
+
+    lmdb_key = Ferricstore.Flow.LMDB.history_index_key(history_key, unprojected_event_id, 3_004)
+    assert :not_found == Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(dir), lmdb_key)
+
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
+    :ets.delete_all_objects(keydir)
+    :atomics.put(ctx.flow_history_projected_index, 1, 0)
+
+    assert :ok = HistoryProjector.recover(ctx, 0, dir, keydir)
+
+    assert {:ok, lmdb_value} =
+             Ferricstore.Flow.LMDB.get(Ferricstore.Flow.LMDB.path(dir), lmdb_key)
+
+    assert {:ok,
+            {^unprojected_event_id, 3_004, _expire, _compound, {:flow_history, 0}, _offset, _size}} =
              Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
   end
 
@@ -549,8 +874,8 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     assert {:ok, records} = NIF.v2_scan_file(history_path)
     keys = Enum.map(records, fn {key, _offset, _value_size, _expire_at_ms, _deleted?} -> key end)
 
-    refute value_key_a in keys
-    refute value_key_b in keys
+    assert value_key_a in keys
+    assert value_key_b in keys
     assert [] = :ets.lookup(keydir, value_key_a)
     assert [] = :ets.lookup(keydir, value_key_b)
 
@@ -558,30 +883,24 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     assert {:ok, lmdb_value_a} = Ferricstore.Flow.LMDB.get(lmdb_path, value_key_a)
     assert {:ok, lmdb_value_b} = Ferricstore.Flow.LMDB.get(lmdb_path, value_key_b)
 
-    assert {:ok, {{:waraft_apply_projection, ^projection_index}, 0, value_size_a}} =
+    assert {:ok, {{:flow_history, file_id_a}, offset_a, value_size_a}} =
              Ferricstore.Flow.LMDB.decode_value_locator(lmdb_value_a, 1_000)
 
-    assert {:ok, {{:waraft_apply_projection, ^projection_index}, 0, value_size_b}} =
+    assert {:ok, {{:flow_history, file_id_b}, offset_b, value_size_b}} =
              Ferricstore.Flow.LMDB.decode_value_locator(lmdb_value_b, 1_001)
 
     assert value_size_a == byte_size(source_value_a)
     assert value_size_b == byte_size(source_value_b)
+    assert file_id_a == 0
+    assert file_id_b == 0
+    assert is_integer(offset_a) and offset_a >= 0
+    assert is_integer(offset_b) and offset_b >= 0
 
     assert {:ok, ^source_value_a} =
-             Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
-               ctx,
-               0,
-               {:waraft_apply_projection, projection_index},
-               value_key_a
-             )
+             HistoryProjector.read_value(dir, {:flow_history, file_id_a}, offset_a)
 
     assert {:ok, ^source_value_b} =
-             Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
-               ctx,
-               0,
-               {:waraft_apply_projection, projection_index},
-               value_key_b
-             )
+             HistoryProjector.read_value(dir, {:flow_history, file_id_b}, offset_b)
 
     assert {:ok, pins} =
              Ferricstore.Flow.LMDB.segment_value_pin_entries_before(
@@ -590,16 +909,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
                100
              )
 
-    assert Enum.sort(
-             Enum.map(pins, fn pin ->
-               {pin.key, pin.file_id, pin.offset, pin.value_size}
-             end)
-           ) == [
-             {value_key_a, {:waraft_apply_projection, projection_index}, 0,
-              byte_size(source_value_a)},
-             {value_key_b, {:waraft_apply_projection, projection_index}, 0,
-              byte_size(source_value_b)}
-           ]
+    assert pins == []
   end
 
   test "apply projection cache spill clears only the spilled shard root" do
@@ -817,7 +1127,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
            "Flow value projection must not block behind the async LMDB writer; it writes value locators itself before deleting keydir refs"
   end
 
-  test "value projection publishes WARaft apply-projection locators without reading payload bytes" do
+  test "value projection copies WARaft apply-projection values into the history log" do
     unique = System.unique_integer([:positive])
     instance_name = :"history_projector_direct_projection_#{unique}"
 
@@ -846,14 +1156,22 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     }
 
     projection_index = 4242
-    id = "flow-direct-projection"
-    value_key = "f:{flow-direct-projection}:v:p:#{id}:1"
-    encoded_size = 1024
+    id = "flow-copy-projection"
+    value_key = "f:{flow-copy-projection}:v:p:#{id}:1"
+    source_value = Ferricstore.Flow.encode_value("payload-copy")
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               data_dir,
+               0,
+               projection_index,
+               [{value_key, source_value, 0}]
+             )
 
     :ets.insert(
       keydir,
       {value_key, nil, 0, Ferricstore.Store.LFU.initial(),
-       {:waraft_apply_projection, projection_index}, 128, encoded_size}
+       {:waraft_apply_projection, projection_index}, 0, byte_size(source_value)}
     )
 
     record = %{
@@ -889,8 +1207,92 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
     lmdb_path = Ferricstore.Flow.LMDB.path(dir)
     assert {:ok, lmdb_value} = Ferricstore.Flow.LMDB.get(lmdb_path, value_key)
 
-    assert {:ok, {{:waraft_apply_projection, ^projection_index}, 128, ^encoded_size}} =
+    assert {:ok, {{:flow_history, file_id}, offset, value_size}} =
              Ferricstore.Flow.LMDB.decode_value_locator(lmdb_value, 1_000)
+
+    assert file_id == 0
+    assert is_integer(offset) and offset >= 0
+    assert value_size == byte_size(source_value)
+
+    assert {:ok, ^source_value} =
+             HistoryProjector.read_value(dir, {:flow_history, file_id}, offset)
+  end
+
+  test "value projection overwrites stale LMDB locator from newer direct segment keydir row" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_stale_value_locator_#{unique}"
+
+    data_dir =
+      Path.join(System.tmp_dir!(), "ferricstore_history_projector_stale_value_locator_#{unique}")
+
+    dir = Path.join([data_dir, "data", "shard_0"])
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_stale_value_locator_keydir_#{unique}", [:set, :public])
+
+    on_exit(fn ->
+      File.rm_rf(data_dir)
+    end)
+
+    ctx = %{
+      name: instance_name,
+      data_dir: data_dir,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    id = "flow-stale-locator"
+    value_key = "f:{flow-stale-locator}:v:p:#{id}:2"
+    lmdb_path = Ferricstore.Flow.LMDB.path(dir)
+
+    stale_locator =
+      Ferricstore.Flow.LMDB.encode_value_locator(0, {:flow_history, 0}, 11, 22)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, value_key, stale_locator}])
+
+    :ets.insert(
+      keydir,
+      {value_key, nil, 0, Ferricstore.Store.LFU.initial(), {:waraft_segment, 44}, 123, 456}
+    )
+
+    record = %{
+      id: id,
+      type: "audit",
+      state: "running",
+      version: 2,
+      partition_key: nil,
+      priority: 0,
+      attempts: 0,
+      next_run_at_ms: 1_000,
+      created_at_ms: 1_000,
+      updated_at_ms: 2_000,
+      lease_owner: nil,
+      lease_deadline_ms: 0,
+      payload_ref: value_key
+    }
+
+    entry = %{
+      key: Ferricstore.Flow.Keys.stream_entry_key(id, "2000-2", nil),
+      expire_at_ms: 0,
+      history_key: Ferricstore.Flow.Keys.history_key(id),
+      event_id: "2000-2",
+      event_ms: 2_000,
+      version: 2,
+      value: Ferricstore.Flow.encode_history_fields(record, "transitioned", 2_000, %{}),
+      ra_index: 44
+    }
+
+    assert :ok = HistoryProjector.write_entries_sync(ctx, 0, dir, [entry], 44)
+    assert [] = :ets.lookup(keydir, value_key)
+    assert {:ok, lmdb_value} = Ferricstore.Flow.LMDB.get(lmdb_path, value_key)
+
+    assert {:ok, {{:waraft_segment, 44}, 123, 456}} =
+             Ferricstore.Flow.LMDB.decode_value_locator(lmdb_value, 2_000)
   end
 
   test "sync projection directly evicts hot history rows when previous event is known" do
@@ -1216,8 +1618,8 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
         }
       end
 
-      assert :ok = HistoryProjector.enqueue(ctx, 0, [entry.(1)], 1)
-      assert {:error, :queue_full} = HistoryProjector.enqueue(ctx, 0, [entry.(2)], 2)
+      assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry.(1)], 1)
+      assert {:error, :queue_full} = HistoryProjector.enqueue_async(ctx, 0, [entry.(2)], 2)
 
       assert Process.alive?(pid)
     after
@@ -1283,6 +1685,79 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
       :ok = :sys.resume(pid)
       assert :ok = HistoryProjector.flush(ctx, 0)
+    after
+      if Process.whereis(HistoryProjector.name(ctx, 0)),
+        do: GenServer.stop(HistoryProjector.name(ctx, 0))
+
+      File.rm_rf(dir)
+    end
+  end
+
+  test "requested replay index is not published after async enqueue is lost before projector handles it" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_lost_async_enqueue_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_lost_async_#{unique}")
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_lost_async_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    try do
+      {:ok, pid} =
+        HistoryProjector.start_link(
+          shard_index: 0,
+          shard_data_path: dir,
+          instance_ctx: ctx,
+          recover_on_init: false
+        )
+
+      :ok = :sys.suspend(pid)
+
+      event_id = "1001-1"
+      key = Ferricstore.Flow.Keys.stream_entry_key("flow-lost-async", event_id, nil)
+
+      entry = %{
+        key: key,
+        expire_at_ms: 0,
+        history_key: Ferricstore.Flow.Keys.history_key("flow-lost-async"),
+        event_id: event_id,
+        event_ms: 1001,
+        version: 1,
+        value: "history-lost-before-handle",
+        ra_index: 42
+      }
+
+      assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry], 42)
+
+      ref = Process.monitor(pid)
+      Process.unlink(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+
+      {:ok, _pid} =
+        HistoryProjector.start_link(
+          shard_index: 0,
+          shard_data_path: dir,
+          instance_ctx: ctx,
+          recover_on_init: false
+        )
+
+      assert :requested = HistoryProjector.request(ctx, 0, dir, 42)
+      assert {:error, :flush_failed} = HistoryProjector.flush(ctx, 0)
+      refute HistoryProjector.durable?(ctx, 0, dir, 42)
+      assert HistoryProjector.scan_event_value(dir, key) == :miss
     after
       if Process.whereis(HistoryProjector.name(ctx, 0)),
         do: GenServer.stop(HistoryProjector.name(ctx, 0))
@@ -1432,18 +1907,149 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
   test "projected Flow value refs use apply-stamped refs without decoding history payload" do
     generated_ref = "f:{flow-fast-ref}:v:p:flow-fast-ref:2"
+    generated_shared_ref = "f:{flow-fast-ref}:v:s:flow-fast-ref:doc:1"
     external_ref = "external-payload-ref"
 
     refs =
       HistoryProjector.__projected_flow_value_refs_for_test__([
         %{
           value: "not-a-decodable-history-record",
-          value_refs: [generated_ref, external_ref, nil, ""]
+          value_refs: [generated_ref, generated_shared_ref, external_ref, nil, ""]
         }
       ])
 
     assert MapSet.member?(refs, generated_ref)
+    assert MapSet.member?(refs, generated_shared_ref)
     refute MapSet.member?(refs, external_ref)
+  end
+
+  test "projected watermark stays behind when marker persist fails" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_marker_fail_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_marker_fail_#{unique}")
+    File.mkdir_p!(dir)
+    File.mkdir_p!(Ferricstore.Flow.HistoryProjectedIndex.path(dir))
+
+    keydir = :ets.new(:"history_projector_marker_fail_keydir_#{unique}", [:set, :public])
+    {flow_index, flow_lookup} = OrderedIndex.table_names(instance_name, 0)
+    NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    entry = %{
+      key: Ferricstore.Flow.Keys.stream_entry_key("flow-marker-fail", "9000-1", nil),
+      expire_at_ms: 0,
+      history_key: Ferricstore.Flow.Keys.history_key("flow-marker-fail"),
+      event_id: "9000-1",
+      event_ms: 9_000,
+      version: 1,
+      value: "history-marker-fail",
+      ra_index: 900
+    }
+
+    assert {:error, _reason} = HistoryProjector.write_entries_sync(ctx, 0, dir, [entry], 900)
+    refute HistoryProjector.durable?(ctx, 0, dir, 900)
+    assert :atomics.get(ctx.flow_history_projected_index, 1) == 0
+  end
+
+  test "projected index marker persists concurrently without tmp collisions or regression" do
+    unique = System.unique_integer([:positive])
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projected_index_concurrent_#{unique}")
+    File.mkdir_p!(dir)
+
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    results =
+      1..100
+      |> Task.async_stream(
+        fn index -> Ferricstore.Flow.HistoryProjectedIndex.persist(dir, index) end,
+        max_concurrency: 32,
+        timeout: 10_000
+      )
+      |> Enum.to_list()
+
+    assert Enum.all?(results, &match?({:ok, :ok}, &1))
+    assert Ferricstore.Flow.HistoryProjectedIndex.read(dir) == 100
+  end
+
+  test "projected index marker persistence fsyncs tmp file and parent directory" do
+    source = File.read!("lib/ferricstore/flow/history_projected_index.ex")
+
+    assert source =~ "NIF.v2_fsync(tmp_path)",
+           "projected marker must fsync tmp contents before rename"
+
+    assert source =~ "NIF.v2_fsync_dir(shard_data_path)",
+           "projected marker must fsync the directory after rename"
+  end
+
+  test "pending_count fails closed when projector is not started" do
+    unique = System.unique_integer([:positive])
+    ctx = %{name: :"history_projector_missing_pending_#{unique}"}
+
+    assert {:error, :not_started} = HistoryProjector.pending_count(ctx, 0)
+  end
+
+  test "async enqueue uses existing pending registry without waiting on table owner" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"history_projector_enqueue_fast_registry_#{unique}"
+    dir = Path.join(System.tmp_dir!(), "ferricstore_history_projector_enqueue_fast_#{unique}")
+    File.mkdir_p!(dir)
+
+    keydir = :ets.new(:"history_projector_enqueue_fast_keydir_#{unique}", [:set, :public])
+
+    ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      checkpoint_flags: :atomics.new(1, signed: false),
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency]),
+      keydir_binary_bytes: :atomics.new(1, signed: true),
+      flow_history_projected_index: :atomics.new(1, signed: false),
+      flow_history_projector_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    {:ok, pid} =
+      HistoryProjector.start_link(
+        shard_index: 0,
+        shard_data_path: dir,
+        instance_ctx: ctx,
+        recover_on_init: false
+      )
+
+    owner = Process.whereis(Ferricstore.Flow.HistoryProjector.TableOwner)
+    assert is_pid(owner)
+    :sys.suspend(owner)
+
+    on_exit(fn ->
+      if Process.alive?(owner), do: :sys.resume(owner)
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(dir)
+    end)
+
+    entry = %{
+      key: Ferricstore.Flow.Keys.stream_entry_key("flow-fast-enqueue", "1000-1", nil),
+      expire_at_ms: 0,
+      history_key: Ferricstore.Flow.Keys.history_key("flow-fast-enqueue"),
+      event_id: "1000-1",
+      event_ms: 1_000,
+      version: 1,
+      value: "encoded-history",
+      ra_index: 1
+    }
+
+    task = Task.async(fn -> HistoryProjector.enqueue_async(ctx, 0, [entry], 1) end)
+    assert :ok = Task.await(task, 100)
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

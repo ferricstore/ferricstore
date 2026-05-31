@@ -41,6 +41,7 @@ defmodule Ferricstore.Commands.CatalogTest do
       for cmd <- Catalog.all() do
         assert is_binary(cmd.summary),
                "Expected binary summary for #{cmd.name}, got: #{inspect(cmd.summary)}"
+
         assert byte_size(cmd.summary) > 0,
                "Summary for #{cmd.name} must not be empty"
       end
@@ -50,6 +51,7 @@ defmodule Ferricstore.Commands.CatalogTest do
       for cmd <- Catalog.all() do
         assert is_list(cmd.flags),
                "Expected list of flags for #{cmd.name}, got: #{inspect(cmd.flags)}"
+
         for flag <- cmd.flags do
           assert is_binary(flag),
                  "Expected string flag for #{cmd.name}, got: #{inspect(flag)}"
@@ -61,8 +63,10 @@ defmodule Ferricstore.Commands.CatalogTest do
       for cmd <- Catalog.all() do
         assert is_integer(cmd.first_key),
                "Expected integer first_key for #{cmd.name}"
+
         assert is_integer(cmd.last_key),
                "Expected integer last_key for #{cmd.name}"
+
         assert is_integer(cmd.step),
                "Expected integer step for #{cmd.name}"
       end
@@ -72,6 +76,7 @@ defmodule Ferricstore.Commands.CatalogTest do
       for cmd <- Catalog.all(), cmd.first_key == 0 do
         assert cmd.last_key == 0,
                "#{cmd.name} has first_key=0 but last_key=#{cmd.last_key}"
+
         assert cmd.step == 0,
                "#{cmd.name} has first_key=0 but step=#{cmd.step}"
       end
@@ -86,6 +91,7 @@ defmodule Ferricstore.Commands.CatalogTest do
 
     test "no duplicate names" do
       names = Enum.map(Catalog.all(), & &1.name)
+
       assert length(names) == length(Enum.uniq(names)),
              "Duplicate command names detected"
     end
@@ -124,10 +130,30 @@ defmodule Ferricstore.Commands.CatalogTest do
 
     test "includes major commands" do
       names = Catalog.names()
-      expected = ["get", "set", "del", "exists", "mget", "mset",
-                  "ping", "echo", "info", "keys", "dbsize",
-                  "expire", "ttl", "persist", "command", "client",
-                  "hello", "quit", "reset", "flushdb", "flushall"]
+
+      expected = [
+        "get",
+        "set",
+        "del",
+        "exists",
+        "mget",
+        "mset",
+        "ping",
+        "echo",
+        "info",
+        "keys",
+        "dbsize",
+        "expire",
+        "ttl",
+        "persist",
+        "command",
+        "client",
+        "hello",
+        "quit",
+        "reset",
+        "flushdb",
+        "flushall"
+      ]
 
       for cmd <- expected do
         assert cmd in names,
@@ -178,6 +204,16 @@ defmodule Ferricstore.Commands.CatalogTest do
       assert cmd.last_key == 1
       assert cmd.step == 1
       assert "write" in cmd.flags
+    end
+
+    test "includes executable Flow value and signal commands" do
+      assert {:ok, value_put} = Catalog.lookup("FLOW.VALUE.PUT")
+      assert value_put.name == "flow.value.put"
+      assert "write" in value_put.flags
+
+      assert {:ok, signal} = Catalog.lookup("FLOW.SIGNAL")
+      assert signal.name == "flow.signal"
+      assert "write" in signal.flags
     end
 
     test "returns correct metadata for PING" do
@@ -233,6 +269,7 @@ defmodule Ferricstore.Commands.CatalogTest do
     test "works for every registered command" do
       for cmd <- Catalog.all() do
         tuple = Catalog.info_tuple(cmd)
+
         assert length(tuple) == 6,
                "info_tuple for #{cmd.name} should have 6 elements"
       end
@@ -275,6 +312,22 @@ defmodule Ferricstore.Commands.CatalogTest do
 
     test "returns keys for MGET (variadic, all args are keys)" do
       assert {:ok, ["k1", "k2", "k3"]} = Catalog.get_keys("MGET", ["k1", "k2", "k3"])
+    end
+
+    test "returns keys for Flow value and signal commands" do
+      assert {:ok, ["tenant-a"]} =
+               Catalog.get_keys("FLOW.VALUE.PUT", ["payload", "PARTITION", "tenant-a"])
+
+      assert {:ok, ["tenant-a"]} =
+               Catalog.get_keys("FLOW.SIGNAL", [
+                 "flow-1",
+                 "PARTITION",
+                 "tenant-a",
+                 "SIGNAL",
+                 "paid"
+               ])
+
+      assert {:ok, ["flow-1"]} = Catalog.get_keys("FLOW.SIGNAL", ["flow-1", "SIGNAL", "paid"])
     end
 
     test "returns empty list for PING (no key command)" do

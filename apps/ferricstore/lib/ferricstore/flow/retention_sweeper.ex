@@ -10,8 +10,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
   require Logger
 
-  @default_initial_delay_ms 60_000
-  @default_interval_ms 60_000
+  @default_initial_delay_ms 600_000
+  @default_interval_ms 600_000
   @default_catchup_delay_ms 100
   @default_limit 100
 
@@ -117,7 +117,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
     duration_us = duration_us(started)
     {status, counts, reason} = normalize_result(result)
-    limit_hit? = status == :ok and Map.get(counts, :flows, 0) >= state.limit
+    limit_hit? = status == :ok and cleanup_limit_hit?(counts, state.limit)
     emit_sweep(status, counts, reason, limit_hit?, duration_us, state)
     maybe_emit_backlog(limit_hit?, counts, state)
     maybe_emit_error(status, reason, state)
@@ -186,6 +186,12 @@ defmodule Ferricstore.Flow.RetentionSweeper do
   defp normalize_result({:ok, counts}) when is_map(counts), do: {:ok, counts, :none}
   defp normalize_result({:error, reason}), do: {:error, %{}, reason}
   defp normalize_result(other), do: {:error, %{}, other}
+
+  defp cleanup_limit_hit?(counts, limit) do
+    Enum.any?([:flows, :history, :values], fn key ->
+      Map.get(counts, key, 0) >= limit
+    end)
+  end
 
   defp emit_sweep(status, counts, reason, limit_hit?, duration_us, state) do
     :telemetry.execute(

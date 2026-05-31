@@ -429,7 +429,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   defp merge_retention(policy, override) when is_map(override) do
     Enum.reduce(override, policy, fn
-      {key, value}, acc when key in [:ttl_ms, :history_max_events] ->
+      {key, value}, acc when key in [:ttl_ms, :history_hot_max_events, :history_max_events] ->
         Map.put(acc, key, value)
 
       _entry, acc ->

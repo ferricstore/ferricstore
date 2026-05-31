@@ -26,12 +26,19 @@ defmodule Ferricstore.Transaction.Coordinator do
 
   def execute(queue, watched_keys, sandbox_namespace) do
     if watches_clean?(watched_keys) do
+      maybe_run_after_watch_preflight_hook()
+
       case classify_shards(queue, sandbox_namespace) do
         {:single_shard, shard_idx} ->
-          execute_single_shard_raft(queue, shard_idx, sandbox_namespace)
+          execute_single_shard_raft(queue, shard_idx, sandbox_namespace, watched_keys)
 
-        {:multi_shard, shard_groups, index_map} ->
-          execute_cross_shard(shard_groups, index_map, length(queue), sandbox_namespace)
+        {:multi_shard, shard_groups} ->
+          execute_cross_shard(
+            shard_groups,
+            length(queue),
+            sandbox_namespace,
+            watched_keys
+          )
       end
     else
       nil
@@ -42,7 +49,7 @@ defmodule Ferricstore.Transaction.Coordinator do
   # Single-shard path
   # ---------------------------------------------------------------------------
 
-  defp execute_single_shard_raft(queue, shard_idx, sandbox_namespace) do
+  defp execute_single_shard_raft(queue, shard_idx, sandbox_namespace, watched_keys) do
     shard_groups = %{
       shard_idx =>
         queue
@@ -52,9 +59,9 @@ defmodule Ferricstore.Transaction.Coordinator do
 
     execute_cross_shard(
       shard_groups,
-      build_index_map(shard_groups),
       length(queue),
-      sandbox_namespace
+      sandbox_namespace,
+      watched_keys
     )
   end
 
@@ -62,7 +69,7 @@ defmodule Ferricstore.Transaction.Coordinator do
   # Cross-shard path: anchor shard Raft entry or sequential GenServer fallback
   # ---------------------------------------------------------------------------
 
-  defp execute_cross_shard(shard_groups, index_map, total, sandbox_namespace) do
+  defp execute_cross_shard(shard_groups, total, sandbox_namespace, watched_keys) do
     anchor_idx = shard_groups |> Map.keys() |> Enum.min()
 
     shard_batches =
@@ -70,14 +77,13 @@ defmodule Ferricstore.Transaction.Coordinator do
         {shard_idx, cmds_with_indices, sandbox_namespace}
       end)
 
-    command = {:cross_shard_tx, shard_batches}
+    command = {:cross_shard_tx, shard_batches, watched_keys}
 
     try do
       case Backend.write(anchor_idx, command) do
         {:error, :noproc} ->
           maybe_execute_cross_shard_sequential(
             shard_groups,
-            index_map,
             total,
             sandbox_namespace,
             :noproc
@@ -86,24 +92,25 @@ defmodule Ferricstore.Transaction.Coordinator do
         {:error, _reason} ->
           maybe_execute_cross_shard_sequential(
             shard_groups,
-            index_map,
             total,
             sandbox_namespace,
             :pipeline_rejected
           )
+
+        nil ->
+          nil
 
         shard_results ->
           Enum.each(Map.keys(shard_groups), fn idx ->
             Ferricstore.Store.WriteVersion.increment(idx)
           end)
 
-          reassemble_results(shard_results, index_map, total)
+          reassemble_results(shard_results, shard_groups, total)
       end
     catch
       :exit, {:noproc, _} ->
         maybe_execute_cross_shard_sequential(
           shard_groups,
-          index_map,
           total,
           sandbox_namespace,
           :noproc
@@ -115,22 +122,31 @@ defmodule Ferricstore.Transaction.Coordinator do
   # must fail closed instead of acknowledging local-only writes.
   defp maybe_execute_cross_shard_sequential(
          shard_groups,
-         index_map,
          total,
          sandbox_namespace,
          reason
        ) do
-    _ = {shard_groups, index_map, total, sandbox_namespace}
+    _ = {shard_groups, total, sandbox_namespace}
     {:error, "ERR transaction raft unavailable: #{inspect(reason)}"}
   end
 
   # Reassembles per-shard results back into the original command order.
-  defp reassemble_results(shard_results, index_map, total) do
-    Enum.map(0..(total - 1), fn orig_idx ->
-      {shard_idx, pos} = Map.fetch!(index_map, orig_idx)
-      results_for_shard = Map.fetch!(shard_results, shard_idx)
-      Enum.at(results_for_shard, pos)
-    end)
+  defp reassemble_results(shard_results, shard_groups, total) do
+    indexed_results =
+      Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds_with_indices}, acc ->
+        shard_results
+        |> Map.fetch!(shard_idx)
+        |> then(fn results_for_shard ->
+          cmds_with_indices
+          |> Enum.map(fn {orig_idx, _entry} -> orig_idx end)
+          |> Enum.zip(results_for_shard)
+        end)
+        |> Enum.reduce(acc, fn {orig_idx, result}, inner ->
+          Map.put(inner, orig_idx, result)
+        end)
+      end)
+
+    Enum.map(0..(total - 1)//1, &Map.fetch!(indexed_results, &1))
   end
 
   # ---------------------------------------------------------------------------
@@ -143,7 +159,7 @@ defmodule Ferricstore.Transaction.Coordinator do
 
   @spec classify_shards([TxAst.queue_entry()], binary() | nil) ::
           {:single_shard, non_neg_integer()}
-          | {:multi_shard, %{non_neg_integer() => list()}, %{non_neg_integer() => tuple()}}
+          | {:multi_shard, %{non_neg_integer() => list()}}
   defp classify_shards(queue, sandbox_namespace) do
     indexed =
       queue
@@ -191,20 +207,8 @@ defmodule Ferricstore.Transaction.Coordinator do
             fn {idx, entry, _shard_idx} -> {idx, entry} end
           )
 
-        index_map = build_index_map(shard_groups)
-
-        {:multi_shard, shard_groups, index_map}
+        {:multi_shard, shard_groups}
     end
-  end
-
-  defp build_index_map(shard_groups) do
-    Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds}, acc ->
-      cmds
-      |> Enum.with_index()
-      |> Enum.reduce(acc, fn {{orig_idx, _entry}, pos}, inner ->
-        Map.put(inner, orig_idx, {shard_idx, pos})
-      end)
-    end)
   end
 
   defp command_shard(args, sandbox_namespace) do
@@ -240,5 +244,12 @@ defmodule Ferricstore.Transaction.Coordinator do
         :exit, _ -> false
       end
     end)
+  end
+
+  defp maybe_run_after_watch_preflight_hook do
+    case Process.get(:ferricstore_tx_after_watch_preflight_hook) do
+      hook when is_function(hook, 0) -> hook.()
+      _ -> :ok
+    end
   end
 end

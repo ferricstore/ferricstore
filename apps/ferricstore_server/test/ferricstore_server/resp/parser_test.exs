@@ -401,6 +401,26 @@ defmodule FerricstoreServer.Resp.ParserTest do
                Parser.parse_commands(input)
     end
 
+    test "copies partial command tail after a large parsed pipeline" do
+      complete = String.duplicate("*1\r\n$4\r\nPING\r\n", 8_192)
+      partial = "*2\r\n$3\r\nGET\r\n$"
+
+      assert {:ok, commands, rest} = Parser.parse_commands(complete <> partial)
+      assert rest == partial
+      assert length(commands) == 8_192
+      assert :binary.referenced_byte_size(rest) <= byte_size(rest) + 64
+    end
+
+    test "copies partial RESP tail after a large parsed buffer" do
+      complete = String.duplicate("+OK\r\n", 16_384)
+      partial = "$5\r\nhe"
+
+      assert {:ok, values, rest} = Parser.parse(complete <> partial)
+      assert rest == partial
+      assert length(values) == 16_384
+      assert :binary.referenced_byte_size(rest) <= byte_size(rest) + 64
+    end
+
     test "rejects non bulk-string array arguments for server command mode" do
       assert {:error, :invalid_command_argument} =
                Parser.parse_commands("*2\r\n$3\r\nGET\r\n:1\r\n")
@@ -423,12 +443,16 @@ defmodule FerricstoreServer.Resp.ParserTest do
                Parser.parse_commands("*1\r\n$0\r\n\r\n")
     end
 
-    test "skips true empty commands without poisoning the connection buffer" do
+    test "skips blank inline commands without poisoning the connection buffer" do
       assert {:ok, [], ""} = Parser.parse_commands("\r\n")
-      assert {:ok, [], ""} = Parser.parse_commands("*0\r\n")
 
       assert {:ok, [{:command, "PING", [], :ping, []}], ""} =
                Parser.parse_commands("\r\nPING\r\n")
+    end
+
+    test "rejects empty RESP command arrays" do
+      assert {:error, error} = Parser.parse_commands("*0\r\n")
+      assert error in [:empty_command_array, "ERR protocol error: empty command array"]
     end
 
     test "preserves embedded NUL bytes in command args, AST, and key extraction" do
@@ -684,6 +708,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                 {:command, "MEMORY", ["usage", "k"], {:memory, ["USAGE", "k"]}, ["k"]},
                 {:command, "FERRICSTORE.CONFIG", ["set", "p", "ttl", "1"],
                  {:ferricstore_config, ["SET", "p", "ttl", "1"]}, []},
+                {:command, "FERRICSTORE.DOCTOR", ["CHECK", "SCOPE", "FLOW_LMDB"],
+                 {:ferricstore_doctor, ["CHECK", "SCOPE", "FLOW_LMDB"]}, []},
                 {:command, "PUBSUB", ["channels"], {:pubsub, ["CHANNELS"]}, []}
               ], ""} =
                Parser.parse_commands(
@@ -692,6 +718,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "config get *\r\n" <>
                    "memory usage k\r\n" <>
                    "ferricstore.config set p ttl 1\r\n" <>
+                   "ferricstore.doctor CHECK SCOPE FLOW_LMDB\r\n" <>
                    "pubsub channels\r\n"
                )
     end
@@ -2002,12 +2029,12 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  "flow.create_many tenant-a ITEMS flow-min payload-min\r\n" <>
                    "flow.complete_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
                    "flow.retry_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
-                  "flow.fail_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
-                  "flow.cancel_many tenant-a INDEPENDENT true ITEMS flow-1 1\r\n" <>
-                  "flow.create_many MIXED TYPE iot RUN_AT 1000 IDEMPOTENT true INDEPENDENT true ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
-                  "flow.create_many AUTO TYPE iot INDEPENDENT true ITEMS flow-auto-1 payload-1 flow-auto-2 payload-2\r\n" <>
-                  "flow.transition_many MIXED queued ready RUN_AT 2000 INDEPENDENT true ITEMS flow-1 device-a 1 - flow-2 device-b 2 lease-2\r\n"
-              )
+                   "flow.fail_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
+                   "flow.cancel_many tenant-a INDEPENDENT true ITEMS flow-1 1\r\n" <>
+                   "flow.create_many MIXED TYPE iot RUN_AT 1000 IDEMPOTENT true INDEPENDENT true ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
+                   "flow.create_many AUTO TYPE iot INDEPENDENT true ITEMS flow-auto-1 payload-1 flow-auto-2 payload-2\r\n" <>
+                   "flow.transition_many MIXED queued ready RUN_AT 2000 INDEPENDENT true ITEMS flow-1 device-a 1 - flow-2 device-b 2 lease-2\r\n"
+               )
     end
 
     test "parses mixed-partition Flow spawn_children into typed Rust AST" do

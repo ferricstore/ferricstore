@@ -23,12 +23,14 @@
     location_for_index/2,
     read_disk/2,
     read_disk_at/4,
+    reset_disk_to_position/2,
     memory_status/1,
     ensure_segment_config/1,
     write_projection/3,
     write_projection_batch/3,
     write_projection_batches/2,
-    write_projection_batches_sync/2
+    write_projection_batches_sync/2,
+    close_process_writers/1
 ]).
 
 -export([
@@ -51,6 +53,7 @@
 -define(DEFAULT_SEGMENT_RECORDS, 65536).
 -define(SEGMENT_EXT, ".seg").
 -define(SEGMENT_CONFIG_FILE, "segment_config.term").
+-define(TRIM_FLOOR_FILE, "trim_floor.term").
 -define(RECORD_HEADER_SIZE, 8).
 -define(MAX_RECORD_BYTES, 1073741824).
 -define(MAX_SEGMENT_METADATA_BYTES, 1048576).
@@ -73,9 +76,16 @@ first_index(#raft_log{name = Name} = Log) ->
     first_index_for_name(Name, log_dir(Log)).
 
 first_index_for_name(Name, Dir) ->
-    case memory_boundaries(Name, Dir) of
-        {undefined, _Last} -> undefined;
-        {First, _Last} -> First
+    case {logical_trim_floor_result(Dir), memory_boundaries(Name, Dir)} of
+        {{ok, Floor}, {undefined, _Last}} ->
+            case Floor > 0 of
+                true -> Floor;
+                false -> undefined
+            end;
+        {{ok, Floor}, {First, _Last}} ->
+            max(First, Floor);
+        {{error, Reason}, _Bounds} ->
+            {error, Reason}
     end.
 
 last_index(#raft_log{name = Name} = Log) ->
@@ -97,9 +107,17 @@ fold_terms(Log, Start, End, Func, Acc) ->
     fold_terms_impl(Log, Start, End, Func, Acc).
 
 get(#raft_log{name = Name} = Log, Index) ->
-    case ets:lookup(Name, Index) of
-        [{Index, Entry}] -> {ok, Entry};
-        [] -> read_log_disk_record(Log, Index)
+    Dir = log_dir(Log),
+    case index_below_trim_floor(Dir, Index) of
+        true ->
+            not_found;
+        false ->
+            case ets:lookup(Name, Index) of
+                [{Index, Entry}] -> {ok, Entry};
+                [] -> read_log_disk_record(Log, Index)
+            end;
+        {error, _Reason} = Error ->
+            Error
     end.
 
 term(Log, Index) ->
@@ -314,7 +332,11 @@ read_disk(RootDir, Index) when is_integer(Index), Index >= 0 ->
         apply_projection ->
             read_disk_apply_projection_merged(Dir, Index);
         _Other ->
-            read_disk_scan(Dir, Index)
+            case index_below_trim_floor(Dir, Index) of
+                true -> not_found;
+                false -> read_disk_scan(Dir, Index);
+                {error, _Reason} = Error -> Error
+            end
     end;
 read_disk(_RootDir, _Index) ->
     {error, bad_index}.
@@ -390,11 +412,18 @@ fold_disk_stream(Dir, Tid, Fun, Acc) ->
 
 location_for_index(RootDir, Index) when is_integer(Index), Index >= 0 ->
     Dir = fold_disk_segment_dir(RootDir),
-    case lookup_offset(Dir, Index) of
-        {ok, Location} ->
-            {ok, Location};
-        not_found ->
-            locate_offset_on_disk(Dir, Index);
+    case index_below_trim_floor(Dir, Index) of
+        true ->
+            not_found;
+        false ->
+            case lookup_offset(Dir, Index) of
+                {ok, Location} ->
+                    {ok, Location};
+                not_found ->
+                    locate_offset_on_disk(Dir, Index);
+                {error, _Reason} = Error ->
+                    Error
+            end;
         {error, _Reason} = Error ->
             Error
     end;
@@ -406,6 +435,18 @@ read_disk_at(RootDir, Index, Offset, EncodedSize)
        is_integer(Offset), Offset >= 0,
        is_integer(EncodedSize), EncodedSize >= ?RECORD_HEADER_SIZE ->
     Dir = fold_disk_segment_dir(RootDir),
+    case index_below_trim_floor(Dir, Index) of
+        true ->
+            not_found;
+        false ->
+            read_disk_at_untrimmed(Dir, Index, Offset, EncodedSize);
+        {error, _Reason} = Error ->
+            Error
+    end;
+read_disk_at(_RootDir, _Index, _Offset, _EncodedSize) ->
+    {error, bad_location}.
+
+read_disk_at_untrimmed(Dir, Index, Offset, EncodedSize) ->
     case validate_segment_log_dir(Dir) of
         ok ->
             case recover_rewrite(Dir) of
@@ -432,9 +473,37 @@ read_disk_at(RootDir, Index, Offset, EncodedSize)
             not_found;
         {error, _Reason} = Error ->
             Error
+    end.
+
+reset_disk_to_position(RootDir, {raft_log_pos, Index, Term})
+        when is_integer(Index), Index >= 0, is_integer(Term), Term >= 0 ->
+    Dir = fold_disk_segment_dir(RootDir),
+    Record = {Index, {Term, undefined}},
+    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+        ok ->
+            case validate_segment_log_dir(Dir) of
+                ok ->
+                    case check_append_failure_marker(Dir) of
+                        ok ->
+                            case close_writers_for_dir(Dir) of
+                                ok ->
+                                    case rewrite_records(Dir, [Record]) of
+                                        ok -> set_logical_trim_floor(Dir, Index);
+                                        {error, _Reason} = Error -> Error
+                                    end;
+                                {error, _Reason} = Error -> Error
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, Reason} ->
+            {error, {ensure_segment_log_dir, Reason}}
     end;
-read_disk_at(_RootDir, _Index, _Offset, _EncodedSize) ->
-    {error, bad_location}.
+reset_disk_to_position(_RootDir, Position) ->
+    {error, {bad_reset_position, Position}}.
 
 fold_disk_segment_dir(RootDir) ->
     Path = unicode:characters_to_list(RootDir),
@@ -449,8 +518,10 @@ ensure_segment_config(RootDir) ->
         ok ->
             case validate_segment_log_dir(Dir) of
                 ok ->
-                    case records_per_segment(Dir) of
-                        {ok, _RecordsPerSegment} -> ok;
+                    case load_or_create_segment_config(Dir) of
+                        {ok, RecordsPerSegment} ->
+                            persistent_term:put(segment_config_cache_key(Dir), RecordsPerSegment),
+                            ok;
                         {error, _Reason} = Error -> Error
                     end;
                 {error, _Reason} = Error ->
@@ -785,19 +856,24 @@ open(#raft_log{name = Name} = Log) ->
                                                 ok ->
                                                     case profile_startup_phase(Dir, preload_segment_config, fun() -> preload_segment_config(Dir) end) of
                                                         ok ->
-                                                            true = ets:delete_all_objects(Name),
-                                                            _ = ensure_offset_registry(),
-                                                            _ = ensure_memory_registry(),
-                                                            _ = profile_startup_phase(Dir, clear_offset_registry, fun() -> clear_offset_registry_for_dir(Dir) end),
-                                                            clear_latest_config_cache(Dir),
-                                                            case profile_startup_phase(Dir, load_segments, fun() -> load_segments_bounded(Dir, Name) end) of
+                                                            case profile_startup_phase(Dir, preload_trim_floor, fun() -> preload_logical_trim_floor(Dir) end) of
                                                                 ok ->
-                                                                    profile_startup_phase(Dir, refresh_memory_stats, fun() -> refresh_memory_stats(Name, Dir) end),
-                                                                    profile_startup_phase(Dir, enforce_ets_memory_limit, fun() -> enforce_ets_memory_limit(Name, Dir) end),
-                                                                    {ok, #{dir => Dir}};
-                                                                {error, _Reason} = Error ->
                                                                     true = ets:delete_all_objects(Name),
-                                                                    clear_memory_stats(Name),
+                                                                    _ = ensure_offset_registry(),
+                                                                    _ = ensure_memory_registry(),
+                                                                    _ = profile_startup_phase(Dir, clear_offset_registry, fun() -> clear_offset_registry_for_dir(Dir) end),
+                                                                    clear_latest_config_cache(Dir),
+                                                                    case profile_startup_phase(Dir, load_segments, fun() -> load_segments_bounded(Dir, Name) end) of
+                                                                        ok ->
+                                                                            profile_startup_phase(Dir, refresh_memory_stats, fun() -> refresh_memory_stats(Name, Dir) end),
+                                                                            profile_startup_phase(Dir, enforce_ets_memory_limit, fun() -> enforce_ets_memory_limit(Name, Dir) end),
+                                                                            {ok, #{dir => Dir}};
+                                                                        {error, _Reason} = Error ->
+                                                                            true = ets:delete_all_objects(Name),
+                                                                            clear_memory_stats(Name),
+                                                                            Error
+                                                                    end;
+                                                                {error, _Reason} = Error ->
                                                                     Error
                                                             end;
                                                         {error, _Reason} = Error ->
@@ -826,7 +902,11 @@ close(Log, _State) ->
     _ = close_writers_for_dir(log_dir(Log)),
     _ = persistent_term:erase(segment_config_cache_key(log_dir(Log))),
     _ = clear_latest_config_cache(log_dir(Log)),
+    _ = clear_logical_trim_floor_cache(log_dir(Log)),
     ok.
+
+close_process_writers(#raft_log{} = Log) ->
+    close_writers_for_dir_owner(log_dir(Log), self()).
 
 reset(#raft_log{name = Name} = Log, #raft_log_pos{index = Index, term = Term}, State) ->
     Record = {Index, {Term, undefined}},
@@ -839,6 +919,7 @@ reset(#raft_log{name = Name} = Log, #raft_log_pos{index = Index, term = Term}, S
                     case rewrite_records(Dir, [Record]) of
                         ok ->
                             true = ets:insert(Name, Record),
+                            ok = set_logical_trim_floor(Dir, Index),
                             clear_latest_config_cache(Dir),
                             set_memory_stats(Name, Dir, 1, record_memory_bytes(Record), Index, Index),
                             {ok, State};
@@ -861,7 +942,7 @@ truncate(#raft_log{name = Name} = Log, Index, State) ->
         ok ->
             case close_writers_for_dir(Dir) of
                 ok ->
-                    case rewrite_ets_records_before(Dir, Name, Index) of
+                    case truncate_disk_tail_from(Dir, Index) of
                         ok ->
                             delete_from(Name, Index),
                             set_memory_boundaries_and_refresh(Name, Dir, FirstBefore, Index - 1),
@@ -877,10 +958,121 @@ truncate(#raft_log{name = Name} = Log, Index, State) ->
             Error
     end.
 
+truncate_disk_tail_from(_Dir, Index) when not is_integer(Index); Index < 0 ->
+    {error, {bad_truncate_index, Index}};
+truncate_disk_tail_from(Dir, Index) ->
+    case existing_records_per_segment(Dir) of
+        {ok, RecordsPerSegment} ->
+            case lookup_or_locate_offset(Dir, Index) of
+                {ok, {Ordinal, Offset, _EncodedSize}} ->
+                    case truncate_segment_files_from(Dir, Ordinal, Offset) of
+                        ok -> rebuild_offset_registry(Dir);
+                        {error, _Reason} = Error -> Error
+                    end;
+                not_found ->
+                    case disk_tail_before_index(Dir, Index, RecordsPerSegment) of
+                        true -> ok;
+                        false -> {error, {truncate_index_not_found, Index}};
+                        {error, _Reason} = Error -> Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        not_found ->
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+disk_tail_before_index(Dir, Index, RecordsPerSegment) ->
+    case lookup_offset_dir_last_index(Dir) of
+        {ok, LastIndex} ->
+            LastIndex < Index;
+        not_found ->
+            case segment_paths(Dir) of
+                {ok, Paths} ->
+                    case scan_segment_paths(Paths, undefined, RecordsPerSegment, undefined, undefined, 0) of
+                        {ok, _First, LastIndex, _Count} when is_integer(LastIndex) ->
+                            LastIndex < Index;
+                        {ok, undefined, undefined, 0} ->
+                            true;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, enoent} ->
+                    true;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+truncate_segment_files_from(Dir, TargetOrdinal, TargetOffset) ->
+    case segment_paths(Dir) of
+        {ok, Paths} ->
+            truncate_segment_paths_from(Paths, TargetOrdinal, TargetOffset);
+        {error, enoent} ->
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+truncate_segment_paths_from([], _TargetOrdinal, _TargetOffset) ->
+    ok;
+truncate_segment_paths_from([{Ordinal, _Path} | Rest], TargetOrdinal, TargetOffset)
+  when Ordinal < TargetOrdinal ->
+    truncate_segment_paths_from(Rest, TargetOrdinal, TargetOffset);
+truncate_segment_paths_from([{TargetOrdinal, Path} | Rest], TargetOrdinal, TargetOffset) ->
+    case truncate_segment_path_to(Path, TargetOffset) of
+        ok -> truncate_later_segment_paths(Rest);
+        {error, _Reason} = Error -> Error
+    end;
+truncate_segment_paths_from([{Ordinal, Path} | Rest], TargetOrdinal, _TargetOffset)
+  when Ordinal > TargetOrdinal ->
+    case truncate_segment_path_to(Path, 0) of
+        ok -> truncate_later_segment_paths(Rest);
+        {error, _Reason} = Error -> Error
+    end.
+
+truncate_later_segment_paths([]) ->
+    ok;
+truncate_later_segment_paths([{_Ordinal, Path} | Rest]) ->
+    case truncate_segment_path_to(Path, 0) of
+        ok -> truncate_later_segment_paths(Rest);
+        {error, _Reason} = Error -> Error
+    end.
+
+truncate_segment_path_to(Path, Size) ->
+    case close_writer_for_path(Path) of
+        ok ->
+            case validate_existing_segment_file(Path) of
+                ok ->
+                    case file:open(Path, [read, write, raw, binary]) of
+                        {ok, Fd} ->
+                            Result = rollback_append_fd(Path, Fd, Size),
+                            CloseResult = file:close(Fd),
+                            case {Result, CloseResult} of
+                                {ok, ok} -> ok;
+                                {{error, Reason}, _} -> {error, {truncate_tail, Reason}};
+                                {_, {error, Reason}} -> {error, {truncate_tail, {close, Reason}}}
+                            end;
+                        {error, Reason} ->
+                            {error, {truncate_tail, {open, Reason}}}
+                    end;
+                {error, Reason} ->
+                    {error, {truncate_tail, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {truncate_tail, Reason}}
+    end.
+
 trim(#raft_log{name = Name} = Log, Index, State) ->
-    %% WARaft advances the in-memory log view after this asynchronous callback.
-    %% The provider must trim persisted records too, otherwise restart reloads
-    %% compacted entries and the segment log grows without bound.
+    %% WARaft advances the in-memory log view only when this returns ok. Keep
+    %% that correctness boundary cheap: persist a logical trim floor, drop the
+    %% in-memory/offset view below it, and let physical segment cleanup happen
+    %% out of the commit path. Recovery honors the floor, so old bytes left on
+    %% disk are storage debt, not replayable Raft entries.
     %% The Raft segment is the Bitcask payload location. Before trimming those
     %% records, the storage layer must persist a projection checkpoint so cold
     %% keydir rows can still be rebuilt/read.
@@ -890,17 +1082,13 @@ trim(#raft_log{name = Name} = Log, Index, State) ->
         ok ->
             case check_append_failure_marker(Dir) of
                 ok ->
-                    case close_writers_for_dir(Dir) of
+                    case write_logical_trim_floor(Dir, Index) of
                         ok ->
-                            case rewrite_ets_records_at_or_after(Dir, Name, Index) of
-                                ok ->
-                                    delete_before(Name, Index),
-                                    set_memory_boundaries_and_refresh(Name, Dir, Index, LastBefore),
-                                    rebuild_latest_config_cache(Log, Name, Dir),
-                                    {ok, State};
-                                {error, _Reason} = Error ->
-                                    Error
-                            end;
+                            delete_before(Name, Index),
+                            clear_offset_registry_before(Dir, Index),
+                            set_memory_boundaries_and_refresh(Name, Dir, Index, LastBefore),
+                            rebuild_latest_config_cache(Log, Name, Dir),
+                            {ok, State};
                         {error, _Reason} = Error ->
                             Error
                     end;
@@ -1017,6 +1205,129 @@ delete_before(Name, Index) ->
         _Key ->
             ok
     end.
+
+clear_offset_registry_before(Dir, Index) ->
+    case ensure_offset_registry() of
+        ok ->
+            clear_offset_registry_before(Dir, Index, ets:first(?OFFSET_REGISTRY));
+        {error, _Reason} ->
+            ok
+    end.
+
+clear_offset_registry_before(_Dir, _Index, '$end_of_table') ->
+    ok;
+clear_offset_registry_before(Dir, Index, Key) ->
+    Next = ets:next(?OFFSET_REGISTRY, Key),
+    DirKey = offset_dir_key(Dir),
+    case Key of
+        {{DirKey, StoredIndex}, _Ordinal, _Offset, _EncodedSize}
+          when is_integer(StoredIndex), StoredIndex < Index ->
+            true = ets:delete(?OFFSET_REGISTRY, Key);
+        _Other ->
+            ok
+    end,
+    clear_offset_registry_before(Dir, Index, Next).
+
+index_below_trim_floor(Dir, Index) when is_integer(Index), Index >= 0 ->
+    case logical_trim_floor_result(Dir) of
+        {ok, Floor} when Index < Floor -> true;
+        {ok, _Floor} -> false;
+        {error, _Reason} = Error -> Error
+    end;
+index_below_trim_floor(_Dir, _Index) ->
+    false.
+
+logical_trim_floor_result(Dir) ->
+    CacheKey = trim_floor_cache_key(Dir),
+    case persistent_term:get(CacheKey, undefined) of
+        Floor when is_integer(Floor), Floor >= 0 ->
+            {ok, Floor};
+        undefined ->
+            case read_logical_trim_floor(Dir) of
+                {ok, Floor} ->
+                    persistent_term:put(CacheKey, Floor),
+                    {ok, Floor};
+                {error, _Reason} = Error ->
+                    Error
+            end
+    end.
+
+preload_logical_trim_floor(Dir) ->
+    case read_logical_trim_floor(Dir) of
+        {ok, Floor} ->
+            persistent_term:put(trim_floor_cache_key(Dir), Floor),
+            ok;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+read_logical_trim_floor(Dir) ->
+    Path = trim_floor_path(Dir),
+    case read_segment_metadata_file(Path, trim_floor_file_too_large) of
+        {ok, Binary} ->
+            decode_trim_floor(Binary);
+        {error, enoent} ->
+            {ok, 0};
+        {error, Reason} ->
+            {error, {read_trim_floor, Reason}}
+    end.
+
+decode_trim_floor(Binary) ->
+    try binary_to_term(Binary, [safe]) of
+        #{version := 1, index := Index} when is_integer(Index), Index >= 0 ->
+            {ok, Index};
+        Other ->
+            {error, {bad_trim_floor, Other}}
+    catch
+        _:Reason ->
+            {error, {bad_trim_floor, Reason}}
+    end.
+
+write_logical_trim_floor(Dir, Index) when is_integer(Index), Index >= 0 ->
+    case logical_trim_floor_result(Dir) of
+        {ok, Current} when Index =< Current ->
+            ok;
+        {ok, _Current} ->
+            set_logical_trim_floor(Dir, Index);
+        {error, _Reason} = Error ->
+            Error
+    end;
+write_logical_trim_floor(_Dir, Index) ->
+    {error, {bad_trim_floor_index, Index}}.
+
+set_logical_trim_floor(Dir, Index) when is_integer(Index), Index >= 0 ->
+    Path = trim_floor_path(Dir),
+    TmpPath = Path ++ ".tmp." ++ unique_suffix(),
+    Metadata = #{version => 1, index => Index},
+    case filelib:ensure_dir(Path) of
+        ok ->
+            case write_file_sync(TmpPath, term_to_binary(Metadata)) of
+                ok ->
+                    case rename_path(TmpPath, Path) of
+                        ok ->
+                            case sync_dir(Dir) of
+                                ok ->
+                                    persistent_term:put(trim_floor_cache_key(Dir), Index),
+                                    ok;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    _ = delete_file_if_exists(TmpPath),
+                    Error
+            end;
+        {error, Reason} ->
+            {error, {ensure_trim_floor_dir, Reason}}
+    end;
+set_logical_trim_floor(_Dir, Index) ->
+    {error, {bad_trim_floor_index, Index}}.
+
+clear_logical_trim_floor_cache(Dir) ->
+    _ = persistent_term:erase(trim_floor_cache_key(Dir)),
+    ok.
 
 write_records(_Dir, []) ->
     ok;
@@ -1182,9 +1493,10 @@ open_record_group_once_file_direct(Dir, Path, RecordsRev) ->
 
 acquire_record_group_file_direct(Dir, Path) ->
     Registry = ensure_writer_registry(),
+    maybe_run_writer_registry_hook(after_acquire_ensure, Registry),
     Key = writer_key(Path),
     WriterDir = writer_dir_from_dir(Dir),
-    case ets:lookup(Registry, Key) of
+    case writer_registry_lookup(Registry, Key) of
         [{Key, WriterDir, file_fd, Fd, Position}] when is_integer(Position), Position >= 0 ->
             {ok, Fd, Position, false};
         [{Key, _Dir, Kind, Handle, _Position}] ->
@@ -1199,6 +1511,19 @@ acquire_record_group_file_direct(Dir, Path) ->
             end;
         [] ->
             open_record_group_file_fd(Registry, Key, WriterDir, Path)
+    end.
+
+writer_registry_lookup(Registry, Key) ->
+    try ets:lookup(Registry, Key) of
+        Entries -> Entries
+    catch
+        error:badarg ->
+            RetryRegistry = ensure_writer_registry(),
+            try ets:lookup(RetryRegistry, Key) of
+                RetryEntries -> RetryEntries
+            catch
+                error:badarg -> []
+            end
     end.
 
 open_record_group_file_fd(Registry, Key, WriterDir, Path) ->
@@ -1219,7 +1544,7 @@ open_record_group_file_fd_after_inactive_close(Registry, Key, WriterDir, Path) -
                                     BinaryPath = unicode:characters_to_binary(Path),
                                     case maybe_run_file_open_hook(BinaryPath) of
                                         ok ->
-                                            case put_writer_entry(Registry, {Key, WriterDir, file_fd, Fd, OldSize}) of
+                                            case put_writer_entry(Registry, {Key, WriterDir, file_fd_writing, Fd, OldSize}) of
                                                 ok ->
                                                     {ok, Fd, OldSize, OldSize =:= 0};
                                                 {error, _Reason} = Error ->
@@ -1250,6 +1575,31 @@ close_inactive_writers_for_dir(Registry, WriterDir, ActiveKey) ->
     %% useful, but retaining every old segment fd makes long runs accumulate
     %% thousands of stale writer entries and descriptors.
     cleanup_writer_entries(writer_registry_entries(Registry), Registry, WriterDir, ActiveKey).
+
+close_writers_for_dir_owner(Dir, Owner) ->
+    Registry = ensure_writer_registry(),
+    WriterDir = writer_dir_from_dir(Dir),
+    close_writer_entries_for_owner(writer_registry_entries(Registry), Registry, WriterDir, Owner).
+
+close_writer_entries_for_owner([], _Registry, _WriterDir, _Owner) ->
+    ok;
+close_writer_entries_for_owner([Entry | Rest], Registry, WriterDir, Owner) ->
+    case writer_close_spec_for_owner(Entry, WriterDir, Owner) of
+        {close, Key, Kind, Handle} ->
+            case close_writer_entry(Key, Kind, Handle) of
+                ok -> close_writer_entries_for_owner(Rest, Registry, WriterDir, Owner);
+                {error, _Reason} = Error -> Error
+            end;
+        skip ->
+            close_writer_entries_for_owner(Rest, Registry, WriterDir, Owner)
+    end.
+
+writer_close_spec_for_owner({{Owner, _Path} = Key, WriterDir, Kind, Handle, _Position}, WriterDir, Owner) ->
+    {close, Key, Kind, Handle};
+writer_close_spec_for_owner({{Owner, _Path} = Key, WriterDir, Handle, _Position}, WriterDir, Owner) ->
+    {close, Key, wal_nif, Handle};
+writer_close_spec_for_owner(_Entry, _WriterDir, _Owner) ->
+    skip.
 
 open_record_group_once_file_direct_nosync(Dir, Path, RecordsRev) ->
     case acquire_record_group_file_direct(Dir, Path) of
@@ -1532,68 +1882,11 @@ rewrite_records(Dir, Records) ->
         {error, _Reason} = Error -> Error
     end.
 
-rewrite_ets_records_before(Dir, _Name, Index) ->
-    rewrite_disk_records(Dir, fun(Key) -> Key < Index end).
-
-rewrite_ets_records_at_or_after(Dir, _Name, Index) ->
-    rewrite_disk_records(Dir, fun(Key) -> Key >= Index end).
-
-rewrite_disk_records(Dir, KeepFun) ->
-    case validate_segment_log_dir(Dir) of
-        ok ->
-            case recover_rewrite(Dir) of
-                ok ->
-                    case validate_segment_log_dir(Dir) of
-                        ok ->
-                            case records_per_segment(Dir) of
-                                {ok, RecordsPerSegment} ->
-                                    rewrite_disk_records_atomic(Dir, KeepFun, RecordsPerSegment);
-                                {error, _Reason} = Error ->
-                                    Error
-                            end;
-                        {error, _Reason} = Error ->
-                            Error
-                    end;
-                {error, _Reason} = Error -> Error
-            end;
-        {error, _Reason} = Error -> Error
-    end.
-
 rewrite_records_atomic(Dir, Records, RecordsPerSegment) ->
     Paths = rewrite_paths(Dir),
     Staging = maps:get(staging, Paths),
     Backup = maps:get(backup, Paths),
     case prepare_rewrite_stage(Staging, Records, RecordsPerSegment) of
-        ok ->
-            case write_rewrite_marker(Dir, Paths) of
-                ok ->
-                    case swap_rewrite_dirs(Dir, Staging, Backup) of
-                        ok ->
-                            case finish_rewrite(Dir, Backup) of
-                                ok ->
-                                    rebuild_offset_registry(Dir);
-                                {error, _Reason} = Error ->
-                                    _ = rollback_rewrite(Dir, Paths),
-                                    Error
-                            end;
-                        {error, _Reason} = Error ->
-                            _ = rollback_rewrite(Dir, Paths),
-                            Error
-                    end;
-                {error, _Reason} = Error ->
-                    _ = remove_tree(Staging),
-                    Error
-            end;
-        {error, _Reason} = Error ->
-            _ = remove_tree(Staging),
-            Error
-    end.
-
-rewrite_disk_records_atomic(Dir, KeepFun, RecordsPerSegment) ->
-    Paths = rewrite_paths(Dir),
-    Staging = maps:get(staging, Paths),
-    Backup = maps:get(backup, Paths),
-    case prepare_rewrite_stage_from_disk(Staging, Dir, KeepFun, RecordsPerSegment) of
         ok ->
             case write_rewrite_marker(Dir, Paths) of
                 ok ->
@@ -1684,35 +1977,6 @@ prepare_rewrite_stage(Staging, Records, RecordsPerSegment) ->
                     case write_segment_config(Staging, RecordsPerSegment) of
                         ok ->
                             case write_records_with_segment_size(Staging, Records, RecordsPerSegment) of
-                                ok ->
-                                    case close_writers_for_dir(Staging) of
-                                        ok -> sync_dir(Staging);
-                                        {error, _Reason} = Error -> Error
-                                    end;
-                                {error, _Reason} = Error -> Error
-                            end;
-                        {error, _Reason} = Error -> Error
-                    end;
-                {error, Reason} ->
-                    {error, {ensure_staging_dir, Reason}}
-            end;
-        {error, _Reason} = Error ->
-            Error
-    end.
-
-prepare_rewrite_stage_from_disk(Staging, SourceDir, KeepFun, RecordsPerSegment) ->
-    case remove_tree(Staging) of
-        ok ->
-            case filelib:ensure_dir(filename:join(Staging, "dummy")) of
-                ok ->
-                    case write_segment_config(Staging, RecordsPerSegment) of
-                        ok ->
-                            case write_disk_records_with_segment_size(
-                                SourceDir,
-                                Staging,
-                                KeepFun,
-                                RecordsPerSegment
-                            ) of
                                 ok ->
                                     case close_writers_for_dir(Staging) of
                                         ok -> sync_dir(Staging);
@@ -1841,13 +2105,13 @@ stream_disk_segment_fd(Fd, Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdi
         {ok, Header} when byte_size(Header) < ?RECORD_HEADER_SIZE ->
             {ok, Ordinal, RecordsRev, Rollbacks};
         {ok, <<Len:32/unsigned-big, Crc:32/unsigned-big>>} ->
-            case Len > ?MAX_RECORD_BYTES of
-                true ->
-                    {error, {record_too_large, Offset, Len}};
+            case record_fits_file(Offset, Len, FileBytes) of
                 false ->
-                    case Offset + ?RECORD_HEADER_SIZE + Len > FileBytes of
+                    {ok, Ordinal, RecordsRev, Rollbacks};
+                true ->
+                    case Len > ?MAX_RECORD_BYTES of
                         true ->
-                            {ok, Ordinal, RecordsRev, Rollbacks};
+                            {error, {record_too_large, Offset, Len}};
                         false ->
                             case file:read(Fd, Len) of
                                 {ok, Payload} when byte_size(Payload) =:= Len ->
@@ -2201,17 +2465,30 @@ load_raft_segments_bounded(Dir, Name, RecordsPerSegment, Paths) ->
     Limits = ets_memory_limits(),
     TailLimit = maps:get(min_entries, Limits),
     Result =
-        case scan_raft_segment_paths(Paths, undefined, RecordsPerSegment, undefined, 0, TailLimit, {queue:new(), 0}, 0) of
-            {ok, ScanFirst, ScanLast, ScanCount, TailLocations0, ScanPayloadBytes} ->
-                TailFirst = load_tail_first_index(ScanLast, Limits),
-                TailLocations = filter_tail_locations(TailLocations0, TailFirst),
-                begin_load_context(Name, Dir, StartedAt, TailFirst, ScanFirst, ScanLast),
-                set_load_context_scan_summary(Name, Dir, ScanCount, ScanFirst, ScanLast, ScanPayloadBytes),
-                case load_raft_tail_locations(Dir, Name, RecordsPerSegment, TailLocations) of
-                    ok ->
-                        maybe_cache_latest_config_after_bounded_load(Dir, ScanLast),
-                        ok;
+        case logical_trim_floor_result(Dir) of
+            {ok, TrimFloor} ->
+                LoadFloor =
+                    case TrimFloor > 0 of
+                        true -> TrimFloor;
+                        false -> undefined
+                    end,
+                case scan_raft_segment_paths(Paths, undefined, RecordsPerSegment, undefined, 0, TailLimit, {queue:new(), 0}, 0) of
+                    {ok, ScanFirst, ScanLast, ScanCount, TailLocations0, ScanPayloadBytes} ->
+                        TailFirst0 = load_tail_first_index(ScanLast, Limits),
+                        TailFirst = max_defined(TailFirst0, LoadFloor),
+                        DiskFirst = max_defined(ScanFirst, LoadFloor),
+                        TailLocations = filter_tail_locations(TailLocations0, TailFirst),
+                        begin_load_context(Name, Dir, StartedAt, TailFirst, DiskFirst, ScanLast),
+                        set_load_context_scan_summary(Name, Dir, ScanCount, DiskFirst, ScanLast, ScanPayloadBytes),
+                        case load_raft_tail_locations(Dir, Name, RecordsPerSegment, TailLocations) of
+                            ok ->
+                                maybe_cache_latest_config_after_bounded_load(Dir, ScanLast),
+                                ok;
+                            {error, _Reason} = Error ->
+                                Error
+                        end;
                     {error, _Reason} = Error ->
+                        begin_load_context(Name, Dir, StartedAt, undefined, undefined, undefined),
                         Error
                 end;
             {error, _Reason} = Error ->
@@ -2543,10 +2820,10 @@ read_disk_record_fd(Fd, Path, WantedIndex, Offset, FileBytes, Ordinal, RecordsPe
                 true ->
                     {error, {record_too_large, Offset, Len}};
                 false ->
-                    case Offset + ?RECORD_HEADER_SIZE + Len > FileBytes of
-                        true ->
-                            not_found;
+                    case record_fits_file(Offset, Len, FileBytes) of
                         false ->
+                            not_found;
+                        true ->
                             case file:read(Fd, Len) of
                                 {ok, Payload} when byte_size(Payload) =:= Len ->
                                     read_disk_record_payload(
@@ -2661,13 +2938,13 @@ scan_segment_fd(Fd, Path, PreviousIndex, Offset, FileBytes, Ordinal, RecordsPerS
         {ok, Header} when byte_size(Header) < ?RECORD_HEADER_SIZE ->
             {ok, FirstIndex, LastIndex, Count};
         {ok, <<Len:32/unsigned-big, Crc:32/unsigned-big>>} ->
-            case Len > ?MAX_RECORD_BYTES andalso PreviousIndex =:= undefined of
-                true ->
-                    {error, {record_too_large, Offset, Len}};
+            case record_fits_file(Offset, Len, FileBytes) of
                 false ->
-                    case Offset + ?RECORD_HEADER_SIZE + Len > FileBytes of
+                    {ok, FirstIndex, LastIndex, Count};
+                true ->
+                    case Len > ?MAX_RECORD_BYTES of
                         true ->
-                            {ok, FirstIndex, LastIndex, Count};
+                            {error, {record_too_large, Offset, Len}};
                         false ->
                             case file:read(Fd, Len) of
                                 {ok, Payload} when byte_size(Payload) =:= Len ->
@@ -2737,8 +3014,13 @@ scan_raft_segment_paths([], PreviousIndex, _RecordsPerSegment, FirstIndex, Count
     {ok, FirstIndex, PreviousIndex, Count, tail_queue_to_list(TailQueue), ScanPayloadBytes};
 scan_raft_segment_paths([{Ordinal, Path} | Rest], PreviousIndex, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes) ->
     case scan_raft_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes) of
-        {ok, NextFirst, NextLast, NextCount, NextTailQueue, NextScanPayloadBytes} ->
-            scan_raft_segment_paths(Rest, NextLast, RecordsPerSegment, NextFirst, NextCount, TailLimit, NextTailQueue, NextScanPayloadBytes);
+        {ok, NextFirst, NextLast, NextCount, NextTailQueue, NextScanPayloadBytes, ValidBytes, FileBytes} ->
+            case maybe_truncate(Path, ValidBytes, FileBytes) of
+                ok ->
+                    scan_raft_segment_paths(Rest, NextLast, RecordsPerSegment, NextFirst, NextCount, TailLimit, NextTailQueue, NextScanPayloadBytes);
+                {error, _Reason} = Error ->
+                    Error
+            end;
         {error, _Reason} = Error ->
             Error
     end.
@@ -2786,18 +3068,18 @@ scan_raft_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, C
 scan_raft_segment_fd(Fd, Path, PreviousIndex, Offset, FileBytes, Ordinal, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes) ->
     case file:read(Fd, ?RECORD_HEADER_SIZE) of
         eof ->
-            {ok, FirstIndex, PreviousIndex, Count, TailQueue, ScanPayloadBytes};
+            {ok, FirstIndex, PreviousIndex, Count, TailQueue, ScanPayloadBytes, Offset, FileBytes};
         {ok, Header} when byte_size(Header) < ?RECORD_HEADER_SIZE ->
-            {ok, FirstIndex, PreviousIndex, Count, TailQueue, ScanPayloadBytes};
+            {ok, FirstIndex, PreviousIndex, Count, TailQueue, ScanPayloadBytes, Offset, FileBytes};
         {ok, <<Len:32/unsigned-big, Crc:32/unsigned-big>>} ->
-            case Len > ?MAX_RECORD_BYTES andalso PreviousIndex =:= undefined of
+            case Len > ?MAX_RECORD_BYTES of
                 true ->
                     {error, {record_too_large, Offset, Len}};
                 false ->
-                    case Offset + ?RECORD_HEADER_SIZE + Len > FileBytes of
-                        true ->
-                            {ok, FirstIndex, PreviousIndex, Count, TailQueue, ScanPayloadBytes};
+                    case record_fits_file(Offset, Len, FileBytes) of
                         false ->
+                            {ok, FirstIndex, PreviousIndex, Count, TailQueue, ScanPayloadBytes, Offset, FileBytes};
+                        true ->
                             scan_raft_segment_record(
                                 Fd,
                                 Path,
@@ -2831,6 +3113,7 @@ scan_raft_segment_record(Fd, Path, undefined, Offset, FileBytes, Ordinal, Record
                             scan_raft_segment_known_index(
                                 Fd,
                                 Path,
+                                undefined,
                                 Index,
                                 Offset,
                                 FileBytes,
@@ -2852,37 +3135,52 @@ scan_raft_segment_record(Fd, Path, undefined, Offset, FileBytes, Ordinal, Record
         {ok, Payload} ->
             {error, {short_record_read, Offset, Len, byte_size(Payload)}};
         eof ->
-            {ok, FirstIndex, undefined, Count, TailQueue, ScanPayloadBytes};
+            {ok, FirstIndex, undefined, Count, TailQueue, ScanPayloadBytes, Offset, FileBytes};
         {error, Reason} ->
             {error, {read_record_payload, Offset, Reason}}
     end;
-scan_raft_segment_record(Fd, Path, PreviousIndex, Offset, FileBytes, Ordinal, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes, Len, _Crc) ->
-    Index = PreviousIndex + 1,
-    case file:position(Fd, {cur, Len}) of
-        {ok, _Position} ->
-            scan_raft_segment_known_index(
-                Fd,
-                Path,
-                Index,
-                Offset,
-                FileBytes,
-                Ordinal,
-                RecordsPerSegment,
-                FirstIndex,
-                Count,
-                TailLimit,
-                TailQueue,
-                ScanPayloadBytes,
-                Len
-            );
+scan_raft_segment_record(Fd, Path, PreviousIndex, Offset, FileBytes, Ordinal, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes, Len, Crc) ->
+    case file:read(Fd, Len) of
+        {ok, Payload} when byte_size(Payload) =:= Len ->
+            case erlang:crc32(Payload) of
+                Crc ->
+                    case peek_record_index(Payload) of
+                        {ok, Index} ->
+                            maybe_update_latest_config_from_payload(filename:dirname(Path), Index, Payload),
+                            scan_raft_segment_known_index(
+                                Fd,
+                                Path,
+                                PreviousIndex,
+                                Index,
+                                Offset,
+                                FileBytes,
+                                Ordinal,
+                                RecordsPerSegment,
+                                FirstIndex,
+                                Count,
+                                TailLimit,
+                                TailQueue,
+                                ScanPayloadBytes + Len,
+                                Len
+                            );
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                _Mismatch ->
+                    {error, {crc_mismatch, Offset}}
+            end;
+        {ok, Payload} ->
+            {error, {short_record_read, Offset, Len, byte_size(Payload)}};
+        eof ->
+            {ok, FirstIndex, PreviousIndex, Count, TailQueue, ScanPayloadBytes, Offset, FileBytes};
         {error, Reason} ->
-            {error, {skip_record_payload, Offset, Len, Reason}}
+            {error, {read_record_payload, Offset, Reason}}
     end.
 
-scan_raft_segment_known_index(Fd, Path, Index, Offset, FileBytes, Ordinal, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes, Len) ->
+scan_raft_segment_known_index(Fd, Path, PreviousIndex, Index, Offset, FileBytes, Ordinal, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes, Len) ->
     case validate_record_segment_ordinal(Path, Index, Ordinal, RecordsPerSegment) of
         ok ->
-            case recovered_index_allowed(Path, choose_last(undefined, Index - 1), Index) of
+            case recovered_index_allowed(Path, PreviousIndex, Index) of
                 ok ->
                     Location = {Index, Ordinal, Path, Offset, ?RECORD_HEADER_SIZE + Len},
                     scan_raft_segment_fd(
@@ -2999,13 +3297,13 @@ load_segment_fd(Fd, Path, Name, PreviousIndex, Offset, FileBytes, Ordinal, Recor
         {ok, Header} when byte_size(Header) < ?RECORD_HEADER_SIZE ->
             {ok, PreviousIndex, Offset};
         {ok, <<Len:32/unsigned-big, Crc:32/unsigned-big>>} ->
-            case Len > ?MAX_RECORD_BYTES andalso PreviousIndex =:= undefined of
-                true ->
-                    {error, {record_too_large, Offset, Len}};
+            case record_fits_file(Offset, Len, FileBytes) of
                 false ->
-                    case Offset + ?RECORD_HEADER_SIZE + Len > FileBytes of
+                    {ok, PreviousIndex, Offset};
+                true ->
+                    case Len > ?MAX_RECORD_BYTES of
                         true ->
-                            {ok, PreviousIndex, Offset};
+                            {error, {record_too_large, Offset, Len}};
                         false ->
                             case file:read(Fd, Len) of
                                 {ok, Payload} when byte_size(Payload) =:= Len ->
@@ -3205,6 +3503,8 @@ recovered_index_contiguous(undefined, _Index) ->
     ok;
 recovered_index_contiguous(PreviousIndex, Index) when Index =:= PreviousIndex + 1 ->
     ok;
+recovered_index_contiguous(PreviousIndex, Index) when Index =:= PreviousIndex ->
+    {error, {duplicate_record_index, Index}};
 recovered_index_contiguous(PreviousIndex, Index) ->
     {error, {non_contiguous_record_index, PreviousIndex, Index}}.
 
@@ -3292,6 +3592,9 @@ maybe_truncate(Path, ValidBytes, FileBytes) when ValidBytes < FileBytes ->
     end;
 maybe_truncate(_Path, _ValidBytes, _FileBytes) ->
     ok.
+
+record_fits_file(Offset, Len, FileBytes) ->
+    Offset + ?RECORD_HEADER_SIZE + Len =< FileBytes.
 
 validate_existing_segment_file(Path) ->
     case file:read_link_info(Path) of
@@ -3549,13 +3852,13 @@ locate_disk_record_offset_fd(
         {ok, Header} when byte_size(Header) < ?RECORD_HEADER_SIZE ->
             Latest;
         {ok, <<Len:32/unsigned-big, Crc:32/unsigned-big>>} ->
-            case Len > ?MAX_RECORD_BYTES of
-                true ->
-                    {error, {record_too_large, Offset, Len}};
+            case record_fits_file(Offset, Len, FileBytes) of
                 false ->
-                    case Offset + ?RECORD_HEADER_SIZE + Len > FileBytes of
+                    Latest;
+                true ->
+                    case Len > ?MAX_RECORD_BYTES of
                         true ->
-                            Latest;
+                            {error, {record_too_large, Offset, Len}};
                         false ->
                             case file:read(Fd, Len) of
                                 {ok, Payload} when byte_size(Payload) =:= Len ->
@@ -3918,6 +4221,11 @@ choose_last(Value, undefined) -> Value;
 choose_last(A, B) when A >= B -> A;
 choose_last(_A, B) -> B.
 
+max_defined(undefined, Value) -> Value;
+max_defined(Value, undefined) -> Value;
+max_defined(A, B) when A >= B -> A;
+max_defined(_A, B) -> B.
+
 ets_memory_limits() ->
     MaxEntries = memory_limit_env(waraft_segment_log_max_ets_entries, ?DEFAULT_MAX_ETS_ENTRIES),
     MaxBytes = memory_limit_env(waraft_segment_log_max_ets_bytes, ?DEFAULT_MAX_ETS_BYTES),
@@ -4231,6 +4539,12 @@ segment_config_path(Dir) ->
 segment_config_cache_key(Dir) ->
     {?MODULE, records_per_segment, cache_dir_key(Dir)}.
 
+trim_floor_path(Dir) ->
+    filename:join(Dir, ?TRIM_FLOOR_FILE).
+
+trim_floor_cache_key(Dir) ->
+    {?MODULE, trim_floor, cache_dir_key(Dir)}.
+
 latest_config_cache_key(Dir) ->
     {?MODULE, latest_config, cache_dir_key(Dir)}.
 
@@ -4330,7 +4644,7 @@ close_writers_for_dir(Dir) ->
     Registry = ensure_writer_registry(),
     WriterDir = writer_dir_from_dir(Dir),
     maybe_run_writer_registry_hook(before_tab2list, Registry),
-    close_writer_entries(entries_to_close(writer_registry_entries(Registry), WriterDir, undefined)).
+    close_destructive_writer_entries(writer_registry_entries(Registry), Registry, WriterDir).
 
 close_writer_for_path(Path) ->
     Registry = ensure_writer_registry(),
@@ -4340,19 +4654,6 @@ close_writer_for_path(Path) ->
         [{Key, _Dir, Handle, _Position}] -> close_writer_entry(Key, wal_nif, Handle);
         [] -> ok
     end.
-
-entries_to_close(Entries, WriterDir, ActiveKey) ->
-    [Spec || Entry <- Entries,
-             {ok, Spec} <- [entry_to_close_spec(Entry, WriterDir, ActiveKey)]].
-
-entry_to_close_spec({{Owner, _Path} = Key, WriterDir, Kind, Handle, _Position}, WriterDir, ActiveKey)
-  when Owner =:= self(), Key =/= ActiveKey ->
-    {ok, {Key, Kind, Handle}};
-entry_to_close_spec({{Owner, _Path} = Key, WriterDir, Handle, _Position}, WriterDir, ActiveKey)
-  when Owner =:= self(), Key =/= ActiveKey ->
-    {ok, {Key, wal_nif, Handle}};
-entry_to_close_spec(_Entry, _WriterDir, _ActiveKey) ->
-    skip.
 
 cleanup_writer_entries([], _Registry, _WriterDir, _ActiveKey) ->
     ok;
@@ -4389,12 +4690,111 @@ writer_cleanup_spec_for_owner(Owner, Key, _Kind, _Handle) when is_pid(Owner) ->
 writer_cleanup_spec_for_owner(_Owner, _Key, _Kind, _Handle) ->
     skip.
 
-close_writer_entries([]) ->
+close_destructive_writer_entries([], _Registry, _WriterDir) ->
     ok;
-close_writer_entries([{Key, Kind, Handle} | Rest]) ->
-    case close_writer_entry(Key, Kind, Handle) of
-        ok -> close_writer_entries(Rest);
-        {error, _Reason} = Error -> Error
+close_destructive_writer_entries([Entry | Rest], Registry, WriterDir) ->
+    case destructive_writer_action(Entry, WriterDir) of
+        {close, Key, Kind, Handle} ->
+            case close_writer_entry(Key, Kind, Handle) of
+                ok -> close_destructive_writer_entries(Rest, Registry, WriterDir);
+                {error, _Reason} = Error -> Error
+            end;
+        {wait_idle_or_owner, Key, Owner} ->
+            case wait_for_writer_idle_or_owner_exit(Registry, Key, Owner) of
+                ok -> close_destructive_writer_entries(Rest, Registry, WriterDir);
+                {error, _Reason} = Error -> Error
+            end;
+        {wait_owner, Key, Owner} ->
+            case wait_for_writer_owner_exit(Registry, Key, Owner) of
+                ok -> close_destructive_writer_entries(Rest, Registry, WriterDir);
+                {error, _Reason} = Error -> Error
+            end;
+        {delete, Key} ->
+            ok = delete_writer_entry(Registry, Key),
+            close_destructive_writer_entries(Rest, Registry, WriterDir);
+        skip ->
+            close_destructive_writer_entries(Rest, Registry, WriterDir)
+    end.
+
+destructive_writer_action({{Owner, _Path} = Key, WriterDir, Kind, Handle, _Position}, WriterDir) ->
+    destructive_writer_action_for_owner(Owner, Key, Kind, Handle);
+destructive_writer_action({{Owner, _Path} = Key, WriterDir, Handle, _Position}, WriterDir) ->
+    destructive_writer_action_for_owner(Owner, Key, wal_nif, Handle);
+destructive_writer_action(_Entry, _WriterDir) ->
+    skip.
+
+destructive_writer_action_for_owner(Owner, Key, Kind, Handle) when Owner =:= self() ->
+    {close, Key, Kind, Handle};
+destructive_writer_action_for_owner(Owner, Key, file_fd, _Handle) when is_pid(Owner) ->
+    %% file_fd means the append finished and the fd is only cached for reuse.
+    %% Raw file descriptors cannot be closed from a different controlling
+    %% process, but deleting the registry entry prevents the owner from reusing
+    %% a stale fd after the directory rewrite. Active appends are marked
+    %% file_fd_writing below and are never invalidated mid-write.
+    {delete, Key};
+destructive_writer_action_for_owner(Owner, Key, file_fd_writing, _Handle) when is_pid(Owner) ->
+    {wait_idle_or_owner, Key, Owner};
+destructive_writer_action_for_owner(Owner, Key, _Kind, _Handle) when is_pid(Owner) ->
+    case is_process_alive(Owner) of
+        true -> {wait_owner, Key, Owner};
+        false -> {delete, Key}
+    end;
+destructive_writer_action_for_owner(_Owner, _Key, _Kind, _Handle) ->
+    skip.
+
+wait_for_writer_owner_exit(Registry, Key, Owner) ->
+    Deadline = erlang:monotonic_time(millisecond) + file_writer_call_timeout_ms(),
+    wait_for_writer_owner_exit(Registry, Key, Owner, Deadline).
+
+wait_for_writer_idle_or_owner_exit(Registry, Key, Owner) ->
+    Deadline = erlang:monotonic_time(millisecond) + file_writer_call_timeout_ms(),
+    wait_for_writer_idle_or_owner_exit(Registry, Key, Owner, Deadline).
+
+wait_for_writer_idle_or_owner_exit(Registry, Key, Owner, Deadline) ->
+    case ets:lookup(Registry, Key) of
+        [] ->
+            ok;
+        [{Key, _Dir, file_fd, _Fd, _Position}] ->
+            ok = delete_writer_entry(Registry, Key),
+            ok;
+        [{Key, _Dir, file_fd_writing, _Fd, _Position}] ->
+            wait_for_writer_idle_or_owner_exit_or_retry(Registry, Key, Owner, Deadline);
+        [{Key, _Dir, _Kind, _Handle, _Position}] ->
+            wait_for_writer_owner_exit(Registry, Key, Owner, Deadline);
+        [{Key, _Dir, _Handle, _Position}] ->
+            wait_for_writer_owner_exit(Registry, Key, Owner, Deadline)
+    end.
+
+wait_for_writer_idle_or_owner_exit_or_retry(Registry, Key, Owner, Deadline) ->
+    case is_process_alive(Owner) of
+        false ->
+            ok = delete_writer_entry(Registry, Key),
+            ok;
+        true ->
+            Now = erlang:monotonic_time(millisecond),
+            case Now >= Deadline of
+                true ->
+                    {error, {writer_owner_alive, Key, Owner, file_writer_call_timeout_ms()}};
+                false ->
+                    timer:sleep(min(10, Deadline - Now)),
+                    wait_for_writer_idle_or_owner_exit(Registry, Key, Owner, Deadline)
+            end
+    end.
+
+wait_for_writer_owner_exit(Registry, Key, Owner, Deadline) ->
+    case is_process_alive(Owner) of
+        false ->
+            ok = delete_writer_entry(Registry, Key),
+            ok;
+        true ->
+            Now = erlang:monotonic_time(millisecond),
+            case Now >= Deadline of
+                true ->
+                    {error, {writer_owner_alive, Key, Owner, file_writer_call_timeout_ms()}};
+                false ->
+                    timer:sleep(min(10, Deadline - Now)),
+                    wait_for_writer_owner_exit(Registry, Key, Owner, Deadline)
+            end
     end.
 
 close_writer_entry(Key, file_writer, Pid) when is_pid(Pid) ->
@@ -4420,6 +4820,8 @@ close_writer_entry(Key, file_writer, Pid) when is_pid(Pid) ->
         {error, _Reason} = Error ->
             Error
     end;
+close_writer_entry(Key, file_fd_writing, Fd) ->
+    close_writer_entry(Key, file_fd, Fd);
 close_writer_entry(Key, file_fd, Fd) ->
     Registry = ensure_writer_registry(),
     Result =
@@ -4775,10 +5177,9 @@ decode_segment_record(Path, Payload) ->
         Decoded =
             case segment_append_kind(Path) of
                 raft_log ->
-                    %% Raft records are trusted local WAL data and may contain
-                    %% VM-local correlation references. Projection records stay
-                    %% on safe decoding because they never need those terms.
-                    binary_to_term(Payload);
+                    %% Safe decoding still supports VM references used as local
+                    %% correlation ids, but rejects new atoms from corrupt WAL.
+                    binary_to_term(Payload, [safe]);
                 _Projection ->
                     binary_to_term(Payload, [safe])
             end,

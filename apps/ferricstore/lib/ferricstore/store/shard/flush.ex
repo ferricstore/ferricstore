@@ -330,17 +330,26 @@ defmodule Ferricstore.Store.Shard.Flush do
       [] ->
         fs
 
-      [{^key, _old_value, _old_exp, _lfu, old_fid, _old_off, old_vsize}]
+      [{^key, ^expected_value, ^exp, _lfu, old_fid, old_off, old_vsize}]
       when old_fid != :pending and is_integer(old_fid) and old_fid >= 0 and
+             is_integer(old_off) and old_off >= 0 and
              is_integer(old_vsize) and old_vsize >= 0 ->
         vsize = persisted_value_size(persisted_value)
 
-        :ets.insert(
-          keydir,
-          {key, expected_value, exp, Ferricstore.Store.LFU.initial(), fid, offset, vsize}
-        )
+        replaced =
+          :ets.select_replace(keydir, [
+            {
+              {key, expected_value, exp, :"$1", old_fid, old_off, old_vsize},
+              [],
+              [{{key, expected_value, exp, :"$1", fid, offset, vsize}}]
+            }
+          ])
 
-        track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
+        if replaced == 1 do
+          track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
+        else
+          fs
+        end
 
       _ ->
         fs

@@ -38,7 +38,8 @@ defmodule FerricstoreServer.Commands.TransactionTrackingTest do
       multi_queue: [{"SET", [key, "v2"], {:set, key, "v2"}}],
       multi_queue_count: 1,
       watched_keys: %{},
-      tracking: tracking
+      tracking: tracking,
+      acl_cache: :full_access
     }
 
     assert {:continue, encoded, new_state} = Transaction.dispatch_exec([], state)

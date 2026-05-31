@@ -24,7 +24,8 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @spec write_async_quorum(non_neg_integer(), command(), GenServer.from()) :: :ok
-  def write_async_quorum(shard_index, command, reply_to), do: write_async(shard_index, command, reply_to)
+  def write_async_quorum(shard_index, command, reply_to),
+    do: write_async(shard_index, command, reply_to)
 
   @spec write_async_quorum_forwarded(non_neg_integer(), command(), GenServer.from(), node()) ::
           :ok
@@ -89,7 +90,8 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @spec origin_enqueue_ordered(non_neg_integer(), command()) :: :ok | {:error, term()}
-  def origin_enqueue_ordered(shard_index, command), do: origin_submit_ordered(shard_index, command)
+  def origin_enqueue_ordered(shard_index, command),
+    do: origin_submit_ordered(shard_index, command)
 
   @spec origin_submit_batch_ordered(non_neg_integer(), [command()]) :: :ok | {:error, term()}
   def origin_submit_batch_ordered(_shard_index, []), do: :ok
@@ -114,11 +116,13 @@ defmodule Ferricstore.Raft.Batcher do
   @spec origin_accepting?(non_neg_integer()) :: boolean()
   def origin_accepting?(_shard_index), do: true
 
-  @spec pause_writes_for_sync(non_neg_integer(), timeout()) :: :ok
-  def pause_writes_for_sync(_shard_index, _timeout \\ 30_000), do: :ok
+  @spec pause_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def pause_writes_for_sync(shard_index, timeout \\ 30_000),
+    do: WARaftBackend.pause_writes_for_sync(shard_index, timeout)
 
-  @spec resume_writes_for_sync(non_neg_integer(), timeout()) :: :ok
-  def resume_writes_for_sync(_shard_index, _timeout \\ 5_000), do: :ok
+  @spec resume_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def resume_writes_for_sync(shard_index, timeout \\ 5_000),
+    do: WARaftBackend.resume_writes_for_sync(shard_index, timeout)
 
   @spec await_local_applied(non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
           :ok | {:error, :timeout}

@@ -133,6 +133,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # records. The key delete path above removes the durable records; reset the
     # native projection too so test setup cannot leak in-memory index state.
     Ferricstore.Flow.NativeOrderedIndex.reset_all(ctx.name, shard_count)
+    clear_flow_projection_storage(ctx, shard_count)
 
     # Safety net: clear any remaining compound key entries from ETS.
     # After the per-shard deletes and drain above this should be a no-op,
@@ -165,6 +166,24 @@ defmodule Ferricstore.Test.ShardHelpers do
     # command tests fail with KEYDIR_FULL despite empty ETS tables.
     reset_keydir_binary_counters(ctx, shard_count)
     reset_memory_guard_pressure()
+  end
+
+  defp clear_flow_projection_storage(ctx, shard_count) do
+    Enum.each(0..max(shard_count - 1, -1)//1, fn shard_index ->
+      :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index)
+    end)
+
+    :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, shard_count)
+    :ok = Ferricstore.Flow.LMDB.clear_all(ctx.data_dir, shard_count)
+
+    Enum.each(0..max(shard_count - 1, -1)//1, fn shard_index ->
+      history_dir =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.HistoryProjector.history_dir()
+
+      :ok = Ferricstore.FS.rm_rf(history_dir)
+    end)
   end
 
   defp delete_keys_on_shard(_shard_index, []), do: :ok

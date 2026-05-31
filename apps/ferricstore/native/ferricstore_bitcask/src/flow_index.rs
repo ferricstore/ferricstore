@@ -1,6 +1,7 @@
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +32,30 @@ struct OrderedEntry {
     key: Vec<u8>,
     score: Score,
     member: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DueCandidate {
+    key_index: usize,
+    entry: OrderedEntry,
+}
+
+impl Ord for DueCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .entry
+            .score
+            .cmp(&self.entry.score)
+            .then_with(|| other.entry.member.cmp(&self.entry.member))
+            .then_with(|| other.entry.key.cmp(&self.entry.key))
+            .then_with(|| other.key_index.cmp(&self.key_index))
+    }
+}
+
+impl PartialOrd for DueCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Default)]
@@ -359,7 +384,7 @@ pub fn flow_index_claim_due_candidates<'a>(
     let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
     let rows = index.claim_due_candidates(&key_refs, max_score, limit, max_scan);
 
-    encode_owned_key_member_scores(env, rows)
+    encode_owned_key_member_score_runs(env, ordered_due_candidate_runs(rows))
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -1735,35 +1760,125 @@ impl FlowOrderedIndex {
             return Vec::new();
         }
 
+        if keys.len() == 1 {
+            return self.claim_due_candidates_single_key(keys[0], max_score, limit, max_scan);
+        }
+
         let mut rows = Vec::with_capacity(limit.min(max_scan));
         let mut scanned = 0usize;
+        let mut heap = BinaryHeap::with_capacity(keys.len());
 
-        for key in keys {
-            let lower = OrderedEntry {
-                key: key.to_vec(),
-                score: Score(f64::NEG_INFINITY),
-                member: Vec::new(),
+        for (key_index, key) in keys.iter().enumerate() {
+            if let Some(entry) = self.first_due_entry_for_key(key, max_score) {
+                heap.push(DueCandidate { key_index, entry });
+            }
+        }
+
+        while rows.len() < limit && scanned < max_scan {
+            let Some(candidate) = heap.pop() else {
+                break;
             };
 
-            for entry in self.ordered.range(lower..) {
-                if entry.key.as_slice() != *key {
-                    break;
-                }
+            scanned += 1;
+            rows.push((
+                candidate.entry.key.clone(),
+                candidate.entry.member.clone(),
+                candidate.entry.score.0,
+            ));
 
-                if entry.score.0 > max_score {
-                    break;
-                }
-
-                scanned += 1;
-                rows.push((entry.key.clone(), entry.member.clone(), entry.score.0));
-
-                if rows.len() >= limit || scanned >= max_scan {
-                    return rows;
-                }
+            if let Some(next) =
+                self.next_due_entry_for_key(keys[candidate.key_index], max_score, &candidate.entry)
+            {
+                heap.push(DueCandidate {
+                    key_index: candidate.key_index,
+                    entry: next,
+                });
             }
         }
 
         rows
+    }
+
+    fn claim_due_candidates_single_key(
+        &self,
+        key: &[u8],
+        max_score: f64,
+        limit: usize,
+        max_scan: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
+        let mut rows = Vec::with_capacity(limit.min(max_scan));
+        let mut scanned = 0usize;
+        let lower = OrderedEntry {
+            key: key.to_vec(),
+            score: Score(f64::NEG_INFINITY),
+            member: Vec::new(),
+        };
+
+        for entry in self.ordered.range(lower..) {
+            if entry.key.as_slice() != key {
+                break;
+            }
+
+            if entry.score.0 > max_score {
+                break;
+            }
+
+            scanned += 1;
+            rows.push((entry.key.clone(), entry.member.clone(), entry.score.0));
+
+            if rows.len() >= limit || scanned >= max_scan {
+                return rows;
+            }
+        }
+
+        rows
+    }
+
+    fn first_due_entry_for_key(&self, key: &[u8], max_score: f64) -> Option<OrderedEntry> {
+        let lower = OrderedEntry {
+            key: key.to_vec(),
+            score: Score(f64::NEG_INFINITY),
+            member: Vec::new(),
+        };
+
+        self.next_due_entry_from_range(key, max_score, lower, false)
+    }
+
+    fn next_due_entry_for_key(
+        &self,
+        key: &[u8],
+        max_score: f64,
+        previous: &OrderedEntry,
+    ) -> Option<OrderedEntry> {
+        self.next_due_entry_from_range(key, max_score, previous.clone(), true)
+    }
+
+    fn next_due_entry_from_range(
+        &self,
+        key: &[u8],
+        max_score: f64,
+        lower: OrderedEntry,
+        exclude_lower: bool,
+    ) -> Option<OrderedEntry> {
+        if exclude_lower {
+            for entry in self.ordered.range((Excluded(lower), Unbounded)) {
+                match due_entry_match(entry, key, max_score) {
+                    DueEntryMatch::Match => return Some(entry.clone()),
+                    DueEntryMatch::Stop => return None,
+                    DueEntryMatch::Continue => continue,
+                }
+            }
+        } else {
+            for entry in self.ordered.range(lower..) {
+                match due_entry_match(entry, key, max_score) {
+                    DueEntryMatch::Match => return Some(entry.clone()),
+                    DueEntryMatch::Stop => return None,
+                    DueEntryMatch::Continue => continue,
+                }
+            }
+        }
+
+        None
     }
 
     fn due_keys_present(&self, keys: &[&[u8]], max_score: f64) -> Vec<Vec<u8>> {
@@ -1788,6 +1903,21 @@ impl FlowOrderedIndex {
         }
 
         rows
+    }
+}
+
+enum DueEntryMatch {
+    Match,
+    Continue,
+    Stop,
+}
+
+fn due_entry_match(entry: &OrderedEntry, key: &[u8], max_score: f64) -> DueEntryMatch {
+    match entry.key.as_slice().cmp(key) {
+        Ordering::Less => DueEntryMatch::Continue,
+        Ordering::Greater => DueEntryMatch::Stop,
+        Ordering::Equal if entry.score.0 <= max_score => DueEntryMatch::Match,
+        Ordering::Equal => DueEntryMatch::Stop,
     }
 }
 
@@ -2422,14 +2552,37 @@ fn encode_owned_member_scores<'a>(env: Env<'a>, rows: Vec<(Vec<u8>, f64)>) -> Ni
     Ok(terms.encode(env))
 }
 
-fn encode_owned_key_member_scores<'a>(
-    env: Env<'a>,
+fn ordered_due_candidate_runs(
     rows: Vec<(Vec<u8>, Vec<u8>, f64)>,
-) -> NifResult<Term<'a>> {
-    let mut terms = Vec::with_capacity(rows.len());
+) -> Vec<(Vec<u8>, Vec<(Vec<u8>, f64)>)> {
+    let mut runs: Vec<(Vec<u8>, Vec<(Vec<u8>, f64)>)> = Vec::new();
 
     for (key, member, score) in rows {
-        terms.push((binary_term(env, &key)?, binary_term(env, &member)?, score).encode(env));
+        match runs.last_mut() {
+            Some((last_key, members)) if last_key.as_slice() == key.as_slice() => {
+                members.push((member, score));
+            }
+            _other => runs.push((key, vec![(member, score)])),
+        }
+    }
+
+    runs
+}
+
+fn encode_owned_key_member_score_runs<'a>(
+    env: Env<'a>,
+    runs: Vec<(Vec<u8>, Vec<(Vec<u8>, f64)>)>,
+) -> NifResult<Term<'a>> {
+    let mut terms = Vec::with_capacity(runs.len());
+
+    for (key, members) in runs {
+        let mut member_terms = Vec::with_capacity(members.len());
+
+        for (member, score) in members {
+            member_terms.push((binary_term(env, &member)?, score).encode(env));
+        }
+
+        terms.push((binary_term(env, &key)?, member_terms).encode(env));
     }
 
     Ok(terms.encode(env))
@@ -2507,4 +2660,67 @@ fn owned_binary<'a>(env: Env<'a>, value: &[u8]) -> NifResult<Binary<'a>> {
         .ok_or_else(|| rustler::Error::Term(Box::new("flow index binary allocation failed")))?;
     binary.as_mut_slice().copy_from_slice(value);
     Ok(Binary::from_owned(binary, env))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_due_candidates_merge_by_due_time_across_keys() {
+        let mut index = FlowOrderedIndex::default();
+        index.put(b"due:queued", b"queued-job", 100.0, false);
+        index.put(b"due:retry", b"retry-job", 10.0, false);
+
+        let rows = index.claim_due_candidates(
+            &[b"due:queued".as_slice(), b"due:retry".as_slice()],
+            200.0,
+            1,
+            16,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, b"due:retry");
+        assert_eq!(rows[0].1, b"retry-job");
+        assert_eq!(rows[0].2, 10.0);
+    }
+
+    #[test]
+    fn ordered_due_candidate_runs_preserve_global_order() {
+        let rows = vec![
+            (b"due:retry".to_vec(), b"retry-1".to_vec(), 10.0),
+            (b"due:queued".to_vec(), b"queued-1".to_vec(), 100.0),
+            (b"due:queued".to_vec(), b"queued-2".to_vec(), 101.0),
+            (b"due:retry".to_vec(), b"retry-2".to_vec(), 102.0),
+        ];
+
+        assert_eq!(
+            ordered_due_candidate_runs(rows),
+            vec![
+                (b"due:retry".to_vec(), vec![(b"retry-1".to_vec(), 10.0)]),
+                (
+                    b"due:queued".to_vec(),
+                    vec![(b"queued-1".to_vec(), 100.0), (b"queued-2".to_vec(), 101.0)]
+                ),
+                (b"due:retry".to_vec(), vec![(b"retry-2".to_vec(), 102.0)])
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_due_candidates_keep_single_key_order() {
+        let mut index = FlowOrderedIndex::default();
+        index.put(b"due:queued", b"second", 20.0, false);
+        index.put(b"due:queued", b"first", 10.0, false);
+
+        let rows = index.claim_due_candidates(&[b"due:queued".as_slice()], 100.0, 2, 16);
+
+        assert_eq!(
+            rows,
+            vec![
+                (b"due:queued".to_vec(), b"first".to_vec(), 10.0),
+                (b"due:queued".to_vec(), b"second".to_vec(), 20.0)
+            ]
+        );
+    }
 }

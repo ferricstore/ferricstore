@@ -955,7 +955,8 @@ defmodule Ferricstore.Commands.Set do
       CompoundKey.list_prefix(destination),
       CompoundKey.set_prefix(destination),
       CompoundKey.zset_prefix(destination),
-      CompoundKey.stream_prefix(destination)
+      CompoundKey.stream_prefix(destination),
+      CompoundKey.stream_group_prefix(destination)
     ]
     |> Enum.reduce_while(:ok, fn prefix, :ok ->
       case Ops.compound_delete_prefix(store, destination, prefix) do
@@ -963,6 +964,10 @@ defmodule Ferricstore.Commands.Set do
         {:error, _} = error -> {:halt, error}
       end
     end)
+    |> case do
+      :ok -> Ops.compound_delete(store, destination, CompoundKey.stream_meta_key(destination))
+      {:error, _} = error -> error
+    end
   end
 
   defp destination_backup(destination, store) do
@@ -1023,21 +1028,35 @@ defmodule Ferricstore.Commands.Set do
         []
       end
 
-    type_entries ++ list_meta_entries
+    stream_meta_entries =
+      if type == "stream" do
+        stream_meta_key = CompoundKey.stream_meta_key(destination)
+
+        case Ops.compound_get_meta(store, destination, stream_meta_key) do
+          nil -> []
+          {value, expire_at_ms} -> [{stream_meta_key, value, expire_at_ms}]
+        end
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries ++ stream_meta_entries
   end
 
   defp compound_backup_member_entries(destination, type, store) do
-    prefix = destination_prefix(destination, type)
+    prefixes = destination_prefixes(destination, type)
 
     compound_keys =
-      store
-      |> Ops.compound_scan(destination, prefix)
-      |> Enum.map(fn {member_or_key, _value} ->
-        if String.starts_with?(member_or_key, prefix) do
-          member_or_key
-        else
-          prefix <> member_or_key
-        end
+      Enum.flat_map(prefixes, fn prefix ->
+        store
+        |> Ops.compound_scan(destination, prefix)
+        |> Enum.map(fn {member_or_key, _value} ->
+          if String.starts_with?(member_or_key, prefix) do
+            member_or_key
+          else
+            prefix <> member_or_key
+          end
+        end)
       end)
 
     store
@@ -1054,6 +1073,11 @@ defmodule Ferricstore.Commands.Set do
   defp destination_prefix(destination, "set"), do: CompoundKey.set_prefix(destination)
   defp destination_prefix(destination, "zset"), do: CompoundKey.zset_prefix(destination)
   defp destination_prefix(destination, "stream"), do: CompoundKey.stream_prefix(destination)
+
+  defp destination_prefixes(destination, "stream"),
+    do: [CompoundKey.stream_prefix(destination), CompoundKey.stream_group_prefix(destination)]
+
+  defp destination_prefixes(destination, type), do: [destination_prefix(destination, type)]
 
   defp put_set_members(store, key, members) do
     entries =

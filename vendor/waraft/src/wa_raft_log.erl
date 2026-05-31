@@ -756,15 +756,21 @@ truncate(#log_view{log = Log} = View, Index) ->
 %% Trim the log by removing log entries before the provided log index.
 %% This operation is not required to remove all data before the
 %% provided log index immediately and can defer this work to future
-%% trimming operations. This operation is asynchronous.
--spec trim(View :: view(), Index :: log_index()) -> {ok, NewView :: view()}.
+%% trimming operations. The public API is synchronous so providers that
+%% must rewrite durable segments can keep the in-memory view aligned with
+%% what is actually persisted.
+-spec trim(View :: view(), Index :: log_index()) -> {ok, NewView :: view()} | {error, term()}.
 trim(#log_view{log = Log, first = First} = View, Index) ->
-    gen_server:cast(log_name(Log), {trim, Index}),
-    {ok, View#log_view{first = max(Index, First)}}.
+    case gen_server:call(log_name(Log), {trim, Index}, infinity) of
+        ok ->
+            {ok, View#log_view{first = max(Index, First)}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 %% Perform a batched trimming (rotate) of the underlying log according
 %% to application environment configuration values.
--spec rotate(View :: view(), Index :: log_index()) -> {ok, NewView :: view()}.
+-spec rotate(View :: view(), Index :: log_index()) -> {ok, NewView :: view()} | {error, term()}.
 rotate(#log_view{log = #raft_log{application = App, table = Table}} = View, Index) ->
     % Current rotation configuration is based on two configuration values,
     % 'raft_max_log_records_per_file' which indicates after how many outstanding extra
@@ -778,7 +784,8 @@ rotate(#log_view{log = #raft_log{application = App, table = Table}} = View, Inde
 %% Perform a batched trimming (rotate) of the underlying log where
 %% we keep some number of log entries and only trigger trimming operations
 %% every so often.
--spec rotate(View :: view(), Index :: log_index(), Interval :: pos_integer(), Keep :: non_neg_integer()) -> {ok, NewView :: view()}.
+-spec rotate(View :: view(), Index :: log_index(), Interval :: pos_integer(), Keep :: non_neg_integer()) ->
+    {ok, NewView :: view()} | {error, term()}.
 rotate(#log_view{log = #raft_log{table = Table}, first = First} = View, Index, Interval, Keep) when Index - Keep - First >= Interval ->
     ?RAFT_COUNT(Table, 'log.rotate'),
     trim(View, Index - Keep);
@@ -874,7 +881,8 @@ init(#raft_options{application = Application, table = Table, partition = Partiti
     when Request ::
         {open, Position :: log_pos()} |
         {reset, Position :: log_pos(), View :: view()} |
-        {truncate, Index :: log_index(), View :: view()}.
+        {truncate, Index :: log_index(), View :: view()} |
+        {trim, Index :: log_index()}.
 handle_call({open, Position}, _From, State) ->
     {Reply, NewState} = handle_open(Position, State),
     {reply, Reply, NewState};
@@ -890,6 +898,14 @@ handle_call({truncate, Index, View}, _From, State) ->
         {ok, NewView, NewState} ->
             {reply, {ok, NewView}, NewState};
         {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+handle_call({trim, Index}, _From, #log_state{log = Log} = State) ->
+    case handle_trim(Index, State) of
+        {ok, NewState} ->
+            {reply, ok, NewState};
+        {error, Reason} ->
+            ?RAFT_LOG_WARNING("[~p] failed to trim log due to ~p", [log_name(Log), Reason]),
             {reply, {error, Reason}, State}
     end;
 handle_call(Request, From, #log_state{log = Log} = State) ->
@@ -1053,9 +1069,9 @@ handle_truncate(Index, #log_view{last = Last} = View0, #log_state{log = #raft_lo
             {error, Reason}
     end.
 
-%% Trim is an asynchronous operation so we do not use the view here.
-%% Rather, the wa_raft_log:trim/2 API will assume that the trim succeeded and
-%% optimistically update the view to advance the start of the log to the provided index.
+%% The public wa_raft_log:trim/2 call advances the view only after this provider
+%% operation succeeds. Returning an error here keeps the old view and lets the
+%% server retry rotation after the storage fault clears.
 -spec handle_trim(Index :: log_index(), State :: #log_state{}) ->
     {ok, NewState :: #log_state{}} | {error, Reason :: term()}.
 handle_trim(_Index, #log_state{state = ?PROVIDER_NOT_OPENED}) ->

@@ -11,11 +11,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
   alias Ferricstore.Store.{BlobRef, DiskPressure, LFU, WriteVersion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
-  @default_batch_size 4_096
-  @default_flush_interval_ms 250
+  @default_batch_size 25_000
+  @default_flush_interval_ms 1_000
   @default_chunk_interval_ms 1
   @default_max_pending_entries 100_000
   @retry_interval_ms 50
+  @pending_registry :ferricstore_flow_history_projector_pending_registry
+  @replay_reservation_registry :ferricstore_flow_history_projector_replay_reservations
 
   @type entry :: %{
           required(:key) => binary(),
@@ -114,10 +116,29 @@ defmodule Ferricstore.Flow.HistoryProjector do
         {:error, :not_started}
 
       pid when is_pid(pid) ->
-        # This is used from Raft apply. It must never wait behind cold history
-        # projection or LMDB work; release-cursor gating handles durability.
-        GenServer.cast(pid, {:enqueue, stamp_ra_index(entries, ra_index)})
-        :ok
+        entries = stamp_ra_index(entries, ra_index)
+
+        case reserve_pending(projector, length(entries)) do
+          :ok ->
+            reserve_replay_range(projector, entries)
+            # This is used from Raft apply. It must never wait behind cold history
+            # projection or LMDB work; release-cursor gating handles durability.
+            GenServer.cast(pid, {:enqueue_reserved, entries})
+            :ok
+
+          {:error, :queue_full, pending_entries, max_pending_entries} ->
+            mark_queue_full(instance_ctx, shard_index)
+
+            emit_queue_full(
+              instance_ctx,
+              shard_index,
+              pending_entries,
+              length(entries),
+              max_pending_entries
+            )
+
+            {:error, :queue_full}
+        end
     end
   catch
     :exit, _reason -> {:error, :not_started}
@@ -135,9 +156,24 @@ defmodule Ferricstore.Flow.HistoryProjector do
     :exit, reason -> {:error, {:flush_exit, reason}}
   end
 
+  @spec pending_count(map() | nil, non_neg_integer(), timeout()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def pending_count(instance_ctx, shard_index, timeout \\ 1_000) do
+    projector = name(instance_ctx, shard_index)
+
+    case Process.whereis(projector) do
+      nil -> {:error, :not_started}
+      _pid -> GenServer.call(projector, :pending_count, timeout)
+    end
+  catch
+    :exit, reason -> {:error, {:pending_count_exit, reason}}
+  end
+
   @spec request(map() | nil, non_neg_integer(), binary(), non_neg_integer()) ::
           :durable | :requested
   def request(instance_ctx, shard_index, shard_data_path, index) do
+    publish_requested_index(instance_ctx, shard_index, index)
+
     if durable?(instance_ctx, shard_index, shard_data_path, index) do
       :durable
     else
@@ -217,6 +253,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
     shard_index = Keyword.fetch!(opts, :shard_index)
     shard_data_path = Keyword.fetch!(opts, :shard_data_path)
     instance_ctx = Keyword.get(opts, :instance_ctx)
+    projector_name = name(instance_ctx, shard_index)
 
     :ok =
       if Keyword.get(opts, :recover_on_init, true) do
@@ -225,21 +262,32 @@ defmodule Ferricstore.Flow.HistoryProjector do
         prepare_recovered_history_projector(instance_ctx, shard_index, shard_data_path)
       end
 
+    max_pending_entries =
+      Ferricstore.MemoryBudget.limit(
+        :flow_history_projector_max_pending_entries,
+        @default_max_pending_entries
+      )
+
+    pending_counter = :atomics.new(1, signed: true)
+    register_pending_counter(projector_name, pending_counter, max_pending_entries)
+    projected_index = projected_index(instance_ctx, shard_index, shard_data_path)
+    flushed_index = max(projected_index, replay_reservation_flushed_index(projector_name))
+
     {:ok,
      %{
+       projector_name: projector_name,
        shard_index: shard_index,
        shard_data_path: shard_data_path,
        instance_ctx: instance_ctx,
+       pending_counter: pending_counter,
        pending: [],
        pending_count: 0,
+       first_pending_at: nil,
        flush_timer: nil,
        requested_index: nil,
+       flushed_index: flushed_index,
        batch_size: app_env(:flow_history_projector_batch_size, @default_batch_size),
-       max_pending_entries:
-         Ferricstore.MemoryBudget.limit(
-           :flow_history_projector_max_pending_entries,
-           @default_max_pending_entries
-         ),
+       max_pending_entries: max_pending_entries,
        flush_interval_ms:
          app_env(:flow_history_projector_flush_interval_ms, @default_flush_interval_ms),
        chunk_interval_ms:
@@ -248,8 +296,28 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   @impl true
-  def handle_cast({:enqueue, entries}, state) do
+  def handle_cast({:enqueue_reserved, entries}, state) do
     {:noreply, enqueue_entries(state, entries)}
+  end
+
+  def handle_cast({:enqueue, entries}, state) do
+    case reserve_pending(state, length(entries)) do
+      :ok ->
+        {:noreply, enqueue_entries(state, entries)}
+
+      {:error, :queue_full, pending_entries, max_pending_entries} ->
+        mark_queue_full(state.instance_ctx, state.shard_index)
+
+        emit_queue_full(
+          state.instance_ctx,
+          state.shard_index,
+          pending_entries,
+          length(entries),
+          max_pending_entries
+        )
+
+        {:noreply, state}
+    end
   end
 
   def handle_cast({:project_to, index}, state) do
@@ -260,19 +328,43 @@ defmodule Ferricstore.Flow.HistoryProjector do
   @impl true
   def handle_call(:flush, _from, state) do
     state = flush_pending(state)
-    result = if state.pending_count == 0, do: :ok, else: {:error, :flush_failed}
+
+    result =
+      if state.pending_count == 0 and state.requested_index == nil,
+        do: :ok,
+        else: {:error, :flush_failed}
+
     {:reply, result, state}
   end
 
+  def handle_call(:pending_count, _from, state) do
+    {:reply, {:ok, state.pending_count}, state}
+  end
+
   def handle_call({:enqueue, entries}, _from, state) do
-    case pending_capacity(state, length(entries)) do
+    case reserve_pending(state, length(entries)) do
       :ok ->
         {:reply, :ok, enqueue_entries(state, entries)}
 
-      {:error, :queue_full} = error ->
-        emit_queue_full(state, length(entries))
-        {:reply, error, state}
+      {:error, :queue_full, pending_entries, max_pending_entries} ->
+        mark_queue_full(state.instance_ctx, state.shard_index)
+
+        emit_queue_full(
+          state.instance_ctx,
+          state.shard_index,
+          pending_entries,
+          length(entries),
+          max_pending_entries
+        )
+
+        {:reply, {:error, :queue_full}, state}
     end
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    unregister_pending_counter(Map.get(state, :projector_name))
+    :ok
   end
 
   @impl true
@@ -285,7 +377,11 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defp enqueue_entries(state, entries) do
     pending = Enum.reverse(entries, state.pending)
     count = state.pending_count + length(entries)
-    state = %{state | pending: pending, pending_count: count}
+    first_pending_at = state.first_pending_at || System.monotonic_time(:microsecond)
+
+    state =
+      %{state | pending: pending, pending_count: count, first_pending_at: first_pending_at}
+      |> publish_backlog_state()
 
     if count >= state.batch_size do
       schedule_flush_soon(state)
@@ -294,11 +390,224 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-  defp pending_capacity(%{max_pending_entries: :infinity}, _new_count), do: :ok
+  defp reserve_pending(%{pending_counter: counter, max_pending_entries: max_pending}, count),
+    do: reserve_pending_counter(counter, count, max_pending)
 
-  defp pending_capacity(%{pending_count: count, max_pending_entries: max_pending}, new_count)
-       when is_integer(max_pending) do
-    if count + new_count <= max_pending, do: :ok, else: {:error, :queue_full}
+  defp reserve_pending(projector, count) when is_atom(projector) do
+    case lookup_pending_counter(projector) do
+      {:ok, counter, max_pending} -> reserve_pending_counter(counter, count, max_pending)
+      :error -> :ok
+    end
+  end
+
+  defp reserve_pending_counter(_counter, count, _max_pending) when count <= 0, do: :ok
+
+  defp reserve_pending_counter(counter, count, :infinity) do
+    :atomics.add(counter, 1, count)
+    :ok
+  end
+
+  defp reserve_pending_counter(counter, count, max_pending)
+       when is_integer(max_pending) and max_pending >= 0 do
+    pending_entries = :atomics.add_get(counter, 1, count)
+
+    if pending_entries <= max_pending do
+      :ok
+    else
+      _ = :atomics.add_get(counter, 1, -count)
+      {:error, :queue_full, max(pending_entries - count, 0), max_pending}
+    end
+  end
+
+  defp release_pending(_state, count) when count <= 0, do: :ok
+
+  defp release_pending(%{pending_counter: counter}, count) do
+    pending_entries = :atomics.add_get(counter, 1, -count)
+
+    if pending_entries < 0 do
+      :atomics.put(counter, 1, 0)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp register_pending_counter(projector, counter, max_pending) when is_atom(projector) do
+    @pending_registry
+    |> ensure_pending_registry()
+    |> :ets.insert({projector, counter, max_pending})
+
+    :ok
+  end
+
+  defp unregister_pending_counter(nil), do: :ok
+
+  defp unregister_pending_counter(projector) when is_atom(projector) do
+    case :ets.whereis(@pending_registry) do
+      :undefined -> :ok
+      table -> :ets.delete(table, projector)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp lookup_pending_counter(projector) when is_atom(projector) do
+    table = ensure_pending_registry(@pending_registry)
+
+    case :ets.lookup(table, projector) do
+      [{^projector, counter, max_pending}] -> {:ok, counter, max_pending}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp ensure_pending_registry(name) do
+    ensure_registry(
+      name,
+      [:named_table, :public, :set, read_concurrency: true],
+      :pending_registry_unavailable
+    )
+  end
+
+  defp ensure_replay_reservation_registry do
+    ensure_registry(
+      @replay_reservation_registry,
+      [
+        :named_table,
+        :public,
+        :set,
+        read_concurrency: true,
+        write_concurrency: true
+      ],
+      :replay_reservation_registry_unavailable
+    )
+  end
+
+  defp ensure_registry(name, opts, unavailable_reason) do
+    case :ets.whereis(name) do
+      :undefined ->
+        ensure_registry_slow(name, opts, unavailable_reason)
+
+      table ->
+        table
+    end
+  end
+
+  defp ensure_registry_slow(name, opts, unavailable_reason) do
+    Ferricstore.Flow.HistoryProjector.TableOwner.ensure_tables()
+
+    case :ets.whereis(name) do
+      :undefined ->
+        try do
+          :ets.new(name, opts)
+        rescue
+          ArgumentError ->
+            case :ets.whereis(name) do
+              :undefined -> :erlang.error(unavailable_reason)
+              table -> table
+            end
+        end
+
+      table ->
+        table
+    end
+  end
+
+  defp reserve_replay_range(projector, entries) do
+    case entry_index_range(entries) do
+      nil ->
+        :ok
+
+      {min_index, max_index} ->
+        table = ensure_replay_reservation_registry()
+
+        case :ets.lookup(table, projector) do
+          [{^projector, old_min, old_max, flushed_index}] ->
+            :ets.insert(
+              table,
+              {projector, min(old_min, min_index), max(old_max, max_index), flushed_index}
+            )
+
+          _missing ->
+            :ets.insert(table, {projector, min_index, max_index, 0})
+        end
+
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp mark_replay_range_flushed(_projector, nil), do: :ok
+
+  defp mark_replay_range_flushed(projector, index) when is_integer(index) and index >= 0 do
+    table = ensure_replay_reservation_registry()
+
+    case :ets.lookup(table, projector) do
+      [{^projector, min_index, max_index, flushed_index}] ->
+        :ets.insert(table, {projector, min_index, max_index, max(flushed_index, index)})
+
+      _missing ->
+        :ok
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp trim_replay_reservation(_projector, nil), do: :ok
+
+  defp trim_replay_reservation(projector, index) when is_integer(index) and index >= 0 do
+    table = ensure_replay_reservation_registry()
+
+    case :ets.lookup(table, projector) do
+      [{^projector, _min_index, max_index, _flushed_index}] when index >= max_index ->
+        :ets.delete(table, projector)
+
+      [{^projector, min_index, max_index, flushed_index}] when index >= min_index ->
+        :ets.insert(table, {projector, index + 1, max_index, flushed_index})
+
+      _other ->
+        :ok
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp replay_reservation_flushed_index(projector) do
+    table = ensure_replay_reservation_registry()
+
+    case :ets.lookup(table, projector) do
+      [{^projector, _min_index, _max_index, flushed_index}] when is_integer(flushed_index) ->
+        flushed_index
+
+      _missing ->
+        0
+    end
+  rescue
+    _ -> 0
+  end
+
+  defp entry_index_range(entries) do
+    Enum.reduce(entries, nil, fn entry, acc ->
+      case Map.get(entry, :ra_index) do
+        index when is_integer(index) and index >= 0 ->
+          case acc do
+            nil -> {index, index}
+            {min_index, max_index} -> {min(min_index, index), max(max_index, index)}
+          end
+
+        _other ->
+          acc
+      end
+    end)
   end
 
   defp flush_pending(state, mode \\ :all)
@@ -320,9 +629,23 @@ defmodule Ferricstore.Flow.HistoryProjector do
            nil
          ) do
       :ok ->
-        state
-        |> Map.merge(%{pending: Enum.reverse(rest), pending_count: length(rest)})
-        |> maybe_schedule_next_chunk()
+        release_pending(state, length(chunk))
+        flushed_index = max_index(state.flushed_index, max_projected_index(chunk, nil))
+        mark_replay_range_flushed(state.projector_name, flushed_index)
+
+        first_pending_at = if rest == [], do: nil, else: state.first_pending_at
+
+        next_state =
+          state
+          |> Map.merge(%{
+          pending: Enum.reverse(rest),
+          pending_count: length(rest),
+          first_pending_at: first_pending_at,
+          flushed_index: flushed_index
+          })
+          |> publish_backlog_state()
+
+        maybe_schedule_next_chunk(next_state)
 
       {:error, reason} ->
         mark_flush_failure(state.instance_ctx, state.shard_index)
@@ -336,9 +659,41 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
+  defp flush_pending(%{pending_count: 0, requested_index: requested_index} = state, _mode)
+       when is_integer(requested_index) and requested_index >= 0 do
+    state = cancel_flush(state)
+
+    if state.flushed_index >= requested_index do
+      case publish_projected_index(
+             state.instance_ctx,
+             state.shard_index,
+             state.shard_data_path,
+             requested_index
+           ) do
+        :ok ->
+          trim_replay_reservation(state.projector_name, requested_index)
+
+          %{state | requested_index: nil, flushed_index: max(state.flushed_index, requested_index)}
+          |> publish_backlog_state()
+
+        {:error, reason} ->
+          mark_flush_failure(state.instance_ctx, state.shard_index)
+
+          Logger.error(
+            "Flow history projector shard_#{state.shard_index}: projected index publish failed: #{inspect(reason)}"
+          )
+
+          state
+      end
+    else
+      state
+    end
+  end
+
   defp flush_pending(state, _mode) do
     state = cancel_flush(state)
     entries = Enum.reverse(state.pending)
+    projected_index = max_projected_index(entries, state.requested_index)
 
     case do_project(
            state.instance_ctx,
@@ -349,7 +704,19 @@ defmodule Ferricstore.Flow.HistoryProjector do
            nil
          ) do
       :ok ->
-        %{state | pending: [], pending_count: 0, requested_index: nil}
+        release_pending(state, length(entries))
+        mark_replay_range_flushed(state.projector_name, projected_index)
+        trim_replay_reservation(state.projector_name, projected_index)
+
+        %{
+          state
+          | pending: [],
+            pending_count: 0,
+            first_pending_at: nil,
+            requested_index: nil,
+            flushed_index: max_index(state.flushed_index, projected_index)
+        }
+        |> publish_backlog_state()
 
       {:error, reason} ->
         mark_flush_failure(state.instance_ctx, state.shard_index)
@@ -396,21 +763,22 @@ defmodule Ferricstore.Flow.HistoryProjector do
          encoded_entries <- Enum.map(entries, &encode_entry/1),
          batch <- Enum.map(encoded_entries, &{&1.key, &1.value, &1.expire_at_ms}),
          {:ok, locations} <- append_batch(file_path, batch),
-         :ok <- validate_locations(encoded_entries, locations) do
+         :ok <- validate_locations(encoded_entries, locations),
+         :ok <- sync_history_log_before_publish(file_path) do
       clear_disk_pressure(instance_ctx, shard_index)
 
-      publish_keydir_entries(
-        instance_ctx,
-        shard_index,
-        keydir,
-        file_id,
-        encoded_entries,
-        locations
-      )
-
-      with :ok <- publish_history_index(instance_ctx, shard_index, encoded_entries),
-           :ok <-
+      with :ok <-
              publish_lmdb_history_locations(shard_data_path, file_id, encoded_entries, locations),
+           :ok <-
+             publish_keydir_entries(
+               instance_ctx,
+               shard_index,
+               keydir,
+               file_id,
+               encoded_entries,
+               locations
+             ),
+           :ok <- publish_history_index(instance_ctx, shard_index, encoded_entries),
            :ok <-
              compact_projected_flow_values(
                instance_ctx,
@@ -525,6 +893,23 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp append_batch(file_path, batch), do: NIF.v2_append_batch_nosync(file_path, batch)
 
+  defp sync_history_log_before_publish(file_path) do
+    with :ok <- NIF.v2_fsync(file_path),
+         :ok <-
+           Ferricstore.FaultInjection.maybe_pause(:after_flow_history_fsync, %{
+             file_path: file_path
+           }) do
+      maybe_history_projector_fsync_hook(file_path)
+    end
+  end
+
+  defp maybe_history_projector_fsync_hook(file_path) do
+    case Application.get_env(:ferricstore, :flow_history_projector_fsync_hook) do
+      fun when is_function(fun, 1) -> fun.(file_path)
+      _other -> :ok
+    end
+  end
+
   defp maybe_persist_projected_index(
          _instance_ctx,
          _shard_index,
@@ -539,14 +924,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
          instance_ctx,
          shard_index,
          shard_data_path,
-         file_path,
+         _file_path,
          index,
          requested_index
        )
        when is_integer(index) and is_integer(requested_index) do
-    with :ok <- NIF.v2_fsync(file_path) do
-      publish_projected_index(instance_ctx, shard_index, shard_data_path, index)
-    end
+    publish_projected_index(instance_ctx, shard_index, shard_data_path, index)
   end
 
   defp encode_entry(%{value: value} = entry) when is_binary(value), do: entry
@@ -622,7 +1005,16 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp publish_lmdb_history_locations(shard_data_path, file_id, entries, locations) do
-    write_lmdb_ops(shard_data_path, lmdb_history_location_ops(file_id, entries, locations))
+    with :ok <- maybe_history_projector_lmdb_publish_hook(shard_data_path, file_id, entries) do
+      write_lmdb_ops(shard_data_path, lmdb_history_location_ops(file_id, entries, locations))
+    end
+  end
+
+  defp maybe_history_projector_lmdb_publish_hook(shard_data_path, file_id, entries) do
+    case Application.get_env(:ferricstore, :flow_history_projector_lmdb_publish_hook) do
+      fun when is_function(fun, 3) -> fun.(shard_data_path, file_id, entries)
+      _other -> :ok
+    end
   end
 
   defp lmdb_history_location_ops(file_id, entries, locations) do
@@ -710,13 +1102,23 @@ defmodule Ferricstore.Flow.HistoryProjector do
        ) do
     refs = projected_flow_value_refs(entries)
 
-    keydir_refs = projected_flow_value_keydir_refs(keydir, refs)
+    keydir_items = projected_flow_value_keydir_items(keydir, refs)
+
+    {direct_segment_items, lmdb_checked_items} =
+      Enum.split_with(keydir_items, fn {_ref, file_id} ->
+        direct_segment_value_file_id?(file_id)
+      end)
+
+    direct_segment_refs = Enum.map(direct_segment_items, &elem(&1, 0))
+    lmdb_checked_refs = Enum.map(lmdb_checked_items, &elem(&1, 0))
 
     # Do not flush the async LMDB writer here. The projector writes value
     # locators itself before removing keydir refs, so waiting behind unrelated
     # state/history LMDB work would turn cold projection into an apply-adjacent
     # latency source.
-    {projected_refs, pending_refs} = split_projected_flow_value_refs(shard_data_path, keydir_refs)
+    {projected_refs, pending_refs} =
+      split_projected_flow_value_refs(shard_data_path, lmdb_checked_refs)
+
     delete_projected_flow_value_keydir_refs(instance_ctx, shard_index, keydir, projected_refs)
 
     case collect_projected_flow_values(
@@ -724,7 +1126,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
            shard_index,
            shard_data_path,
            keydir,
-           pending_refs
+           direct_segment_refs ++ pending_refs
          ) do
       [] ->
         :ok
@@ -774,11 +1176,19 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp projected_flow_value_keydir_refs(keydir, refs) do
+    keydir
+    |> projected_flow_value_keydir_items(refs)
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp projected_flow_value_keydir_items(keydir, refs) do
     refs
     |> Enum.reduce([], fn ref, acc ->
       case safe_ets_lookup(keydir, ref) do
         [{^ref, _value, _expire_at_ms, _lfu, file_id, offset, value_size}] ->
-          if readable_value_locator?(file_id, offset, value_size), do: [ref | acc], else: acc
+          if readable_value_locator?(file_id, offset, value_size),
+            do: [{ref, file_id} | acc],
+            else: acc
 
         _missing_or_unreadable ->
           acc
@@ -786,6 +1196,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end)
     |> Enum.reverse()
   end
+
+  defp direct_segment_value_file_id?({:waraft_segment, index})
+       when is_integer(index) and index > 0,
+       do: true
+
+  defp direct_segment_value_file_id?(_file_id), do: false
 
   defp split_projected_flow_value_refs(shard_data_path, refs) do
     refs = Enum.to_list(refs)
@@ -822,6 +1238,9 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp projected_flow_value_lmdb_live?({:ok, blob}, now_ms) when is_binary(blob) do
     case Ferricstore.Flow.LMDB.decode_value_locator(blob, now_ms) do
+      {:ok, {{:waraft_apply_projection, _index}, _offset, _value_size}} ->
+        false
+
       {:ok, _locator} ->
         true
 
@@ -848,7 +1267,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
       [{^key, value, expire_at_ms, lfu, file_id, offset, value_size} = row] ->
         if readable_value_locator?(file_id, offset, value_size) do
           case {value, file_id, value_size} do
-            {nil, {:waraft_apply_projection, _index}, 0} ->
+            {nil, {tag, _index}, 0} when tag in [:waraft_segment, :waraft_apply_projection] ->
               {:entry,
                projected_flow_value_entry_from_row(
                  key,
@@ -861,7 +1280,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
                  row
                )}
 
-            {nil, {:waraft_apply_projection, _index}, _value_size} ->
+            {nil, {:waraft_segment, _index}, _value_size} ->
               {:entry,
                direct_projected_flow_value_entry_from_row(
                  key,
@@ -1051,12 +1470,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defp valid_projected_value_location?(_location), do: false
 
   defp direct_segment_value_entry?(%{
-         source_file_id: {:waraft_apply_projection, index},
+         source_file_id: {tag, index},
          source_offset: offset,
          source_value_size: value_size
        })
-       when is_integer(index) and index > 0 and is_integer(offset) and offset >= 0 and
-              is_integer(value_size) and value_size > 0,
+       when tag == :waraft_segment and is_integer(index) and index > 0 and
+              is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size > 0,
        do: true
 
   defp direct_segment_value_entry?(_entry), do: false
@@ -1115,6 +1534,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
     with {:ok, locations} <- append_batch(file_path, batch),
          :ok <- validate_projected_value_locations(value_entries, locations),
+         :ok <- sync_history_log_before_publish(file_path),
          :ok <-
            publish_lmdb_value_locations(
              shard_data_path,
@@ -1308,7 +1728,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defp generated_flow_value_ref?("f:" <> _rest = ref) do
     case :binary.split(ref, ":v:") do
       ["f:" <> tag, <<kind, ?:, rest::binary>>]
-      when byte_size(tag) > 0 and kind in [?p, ?r, ?e] and byte_size(rest) > 0 ->
+      when byte_size(tag) > 0 and kind in [?p, ?r, ?e, ?s] and byte_size(rest) > 0 ->
         true
 
       _other ->
@@ -1704,9 +2124,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defp append_tombstones(file_path, keys) do
     ops = Enum.map(keys, &{:delete, &1})
 
-    case NIF.v2_append_ops_batch_nosync(file_path, ops) do
-      {:ok, locations} -> validate_tombstone_locations(locations, length(keys))
-      {:error, _reason} = error -> error
+    with {:ok, locations} <- NIF.v2_append_ops_batch_nosync(file_path, ops),
+         :ok <- validate_tombstone_locations(locations, length(keys)),
+         :ok <- sync_history_log_before_publish(file_path) do
+      :ok
     end
   end
 
@@ -1763,10 +2184,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
         live_records = live_history_records(records)
         {entries, locations} = recovered_history_entries(live_records, keydir, shard_data_path)
 
-        publish_keydir_entries(instance_ctx, shard_index, keydir, 0, entries, locations)
-
-        with :ok <- publish_history_index(instance_ctx, shard_index, entries),
-             :ok <- publish_lmdb_history_locations(shard_data_path, 0, entries, locations),
+        with :ok <- publish_lmdb_history_locations(shard_data_path, 0, entries, locations),
+             :ok <-
+               publish_keydir_entries(instance_ctx, shard_index, keydir, 0, entries, locations),
+             :ok <- publish_history_index(instance_ctx, shard_index, entries),
              :ok <- trim_history_hot_cache(instance_ctx, shard_index, keydir, entries) do
           :ok
         end
@@ -1913,10 +2334,23 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp skip_history_log_recover?(shard_data_path, projected)
        when is_integer(projected) and projected >= 0 do
-    default_history_hot_max_events() == 0 and lmdb_projection_present?(shard_data_path)
+    default_history_hot_max_events() == 0 and lmdb_projection_present?(shard_data_path) and
+      history_log_safe_to_skip?(shard_data_path)
   end
 
   defp skip_history_log_recover?(_shard_data_path, _projected), do: false
+
+  defp history_log_safe_to_skip?(shard_data_path) do
+    shard_data_path
+    |> history_file_path(0)
+    |> File.stat()
+    |> case do
+      {:ok, %{type: :regular, size: 0}} -> true
+      {:ok, %{type: :directory}} -> true
+      {:error, :enoent} -> true
+      _ -> false
+    end
+  end
 
   defp lmdb_projection_present?(shard_data_path) do
     shard_data_path
@@ -1952,20 +2386,117 @@ defmodule Ferricstore.Flow.HistoryProjector do
     _ -> :ok
   end
 
-  defp emit_queue_full(state, incoming_entries) do
+  defp emit_queue_full(
+         instance_ctx,
+         shard_index,
+         pending_entries,
+         incoming_entries,
+         max_pending_entries
+       ) do
     :telemetry.execute(
       [:ferricstore, :flow, :history_projector, :queue_full],
       %{
         count: 1,
-        pending_entries: state.pending_count,
+        pending_entries: pending_entries,
         incoming_entries: incoming_entries,
-        max_pending_entries: state.max_pending_entries
+        max_pending_entries: max_pending_entries
       },
       %{
-        instance: instance_name(state.instance_ctx),
-        shard_index: state.shard_index
+        instance: instance_name(instance_ctx),
+        shard_index: shard_index
       }
     )
+  rescue
+    _ -> :ok
+  end
+
+  defp publish_requested_index(instance_ctx, shard_index, index)
+       when is_integer(index) and index >= 0 do
+    put_atomic_max(instance_ctx, :flow_history_requested_index, shard_index, index)
+  end
+
+  defp publish_requested_index(_instance_ctx, _shard_index, _index), do: :ok
+
+  defp publish_backlog_state(%{pending_count: pending_count} = state) do
+    publish_atomic(
+      state.instance_ctx,
+      :flow_history_projector_pending_entries,
+      state.shard_index,
+      max(pending_count, 0)
+    )
+
+    publish_atomic(
+      state.instance_ctx,
+      :flow_history_projector_oldest_pending_age_us,
+      state.shard_index,
+      history_pending_age_us(state)
+    )
+
+    state
+  end
+
+  defp history_pending_age_us(%{pending_count: count}) when count <= 0, do: 0
+
+  defp history_pending_age_us(%{first_pending_at: first_pending_at})
+       when is_integer(first_pending_at) do
+    max(System.monotonic_time(:microsecond) - first_pending_at, 0)
+  end
+
+  defp history_pending_age_us(_state), do: 0
+
+  defp mark_queue_full(instance_ctx, shard_index) do
+    add_atomic(instance_ctx, :flow_history_projector_queue_full, shard_index, 1)
+  end
+
+  defp publish_atomic(instance_ctx, field, shard_index, value)
+       when is_integer(shard_index) and shard_index >= 0 and is_integer(value) and value >= 0 do
+    case Map.get(instance_ctx || %{}, field) do
+      ref when is_reference(ref) ->
+        size = :atomics.info(ref).size
+        if shard_index < size, do: :atomics.put(ref, shard_index + 1, value)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp put_atomic_max(instance_ctx, field, shard_index, value)
+       when is_integer(shard_index) and shard_index >= 0 and is_integer(value) and value >= 0 do
+    case Map.get(instance_ctx || %{}, field) do
+      ref when is_reference(ref) ->
+        size = :atomics.info(ref).size
+
+        if shard_index < size do
+          index = shard_index + 1
+          current = :atomics.get(ref, index)
+          if value > current, do: :atomics.put(ref, index, value)
+        end
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp add_atomic(instance_ctx, field, shard_index, increment)
+       when is_integer(shard_index) and shard_index >= 0 and is_integer(increment) do
+    case Map.get(instance_ctx || %{}, field) do
+      ref when is_reference(ref) ->
+        size = :atomics.info(ref).size
+        if shard_index < size, do: :atomics.add(ref, shard_index + 1, increment)
+
+      _ ->
+        :ok
+    end
+
+    :ok
   rescue
     _ -> :ok
   end
@@ -2031,16 +2562,16 @@ defmodule Ferricstore.Flow.HistoryProjector do
        when is_integer(index) and index >= 0 do
     index = max(index, projected_index(instance_ctx, shard_index, shard_data_path))
 
-    case instance_ctx do
-      %{flow_history_projected_index: ref} when is_reference(ref) ->
-        size = :atomics.info(ref).size
-        if shard_index < size, do: :atomics.put(ref, shard_index + 1, index)
+    with :ok <- HistoryProjectedIndex.persist(shard_data_path, index) do
+      case instance_ctx do
+        %{flow_history_projected_index: ref} when is_reference(ref) ->
+          size = :atomics.info(ref).size
+          if shard_index < size, do: :atomics.put(ref, shard_index + 1, index)
 
-      _ ->
-        :ok
+        _ ->
+          :ok
+      end
     end
-
-    HistoryProjectedIndex.persist(shard_data_path, index)
   end
 
   defp max_projected_index(entries, requested_index) do

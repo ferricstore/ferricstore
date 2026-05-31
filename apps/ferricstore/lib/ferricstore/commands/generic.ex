@@ -759,20 +759,50 @@ defmodule Ferricstore.Commands.Generic do
         []
       end
 
-    type_entries ++ list_meta_entries
+    stream_meta_entries =
+      if type == "stream" do
+        copy_compound_key_entries(
+          source,
+          CompoundKey.stream_meta_key(source),
+          CompoundKey.stream_meta_key(destination),
+          store
+        )
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries ++ stream_meta_entries
+  end
+
+  defp compound_member_copy_entries(source, destination, "stream", store) do
+    compound_member_copy_entries_from_prefixes(
+      source,
+      store,
+      [
+        {CompoundKey.stream_prefix(source), CompoundKey.stream_prefix(destination)},
+        {CompoundKey.stream_group_prefix(source), CompoundKey.stream_group_prefix(destination)}
+      ]
+    )
   end
 
   defp compound_member_copy_entries(source, destination, type, store) do
-    source_prefix = compound_prefix(type, source)
-    destination_prefix = compound_prefix(type, destination)
+    compound_member_copy_entries_from_prefixes(
+      source,
+      store,
+      [{compound_prefix(type, source), compound_prefix(type, destination)}]
+    )
+  end
 
+  defp compound_member_copy_entries_from_prefixes(source, store, prefix_pairs) do
     pairs =
-      store
-      |> Ops.compound_scan(source, source_prefix)
-      |> Enum.map(fn {sub_key, _value} ->
-        source_key = scanned_compound_key(source_prefix, sub_key)
-        destination_key = scanned_compound_key(destination_prefix, sub_key)
-        {source_key, destination_key}
+      Enum.flat_map(prefix_pairs, fn {source_prefix, destination_prefix} ->
+        store
+        |> Ops.compound_scan(source, source_prefix)
+        |> Enum.map(fn {sub_key, _value} ->
+          source_key = scanned_compound_key(source_prefix, sub_key)
+          destination_key = scanned_compound_key(destination_prefix, sub_key)
+          {source_key, destination_key}
+        end)
       end)
 
     source_keys = Enum.map(pairs, fn {source_key, _destination_key} -> source_key end)

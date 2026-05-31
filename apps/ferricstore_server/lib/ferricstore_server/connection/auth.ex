@@ -9,6 +9,9 @@ defmodule FerricstoreServer.Connection.Auth do
   alias FerricstoreServer.Acl.CommandCategories
   alias FerricstoreServer.Resp.Encoder
 
+  @global_keyspace_enumeration_commands ~w(KEYS SCAN RANDOMKEY DBSIZE)
+  @acl_subcommands ~w(CAT DELUSER GETUSER LIST LOAD LOG SAVE SETUSER WHOAMI)
+
   # ── AUTH dispatch ──────────────────────────────────────────────────────
 
   @spec dispatch_auth([binary()], map()) ::
@@ -61,6 +64,46 @@ defmodule FerricstoreServer.Connection.Auth do
     {:continue, Encoder.encode(FerricstoreServer.Acl.list_users()), state}
   end
 
+  def dispatch_acl("SAVE", [], state) do
+    case FerricstoreServer.Acl.save() do
+      :ok ->
+        {:continue, Encoder.encode(:ok), state}
+
+      {:error, reason} ->
+        {:continue, Encoder.encode({:error, reason}), state}
+    end
+  end
+
+  def dispatch_acl("SAVE", _args, state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|save' command"}),
+     state}
+  end
+
+  def dispatch_acl("LOAD", [], state) do
+    with {:ok, contents} <- FerricstoreServer.Acl.load_file_contents(),
+         {:ok, ctx} <- default_instance_ctx() do
+      case Ferricstore.Store.Router.server_command(ctx, {:acl_load, contents}) do
+        :ok ->
+          broadcast_acl_invalidation(:all)
+          {:continue, Encoder.encode(:ok), maybe_refresh_acl_cache(state, :all)}
+
+        {:error, reason} ->
+          {:continue, Encoder.encode({:error, reason}), state}
+      end
+    else
+      :error ->
+        loading(state)
+
+      {:error, reason} ->
+        {:continue, Encoder.encode({:error, reason}), state}
+    end
+  end
+
+  def dispatch_acl("LOAD", _args, state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|load' command"}),
+     state}
+  end
+
   def dispatch_acl("SETUSER", [], state) do
     {:continue,
      Encoder.encode({:error, "ERR wrong number of arguments for 'acl|setuser' command"}), state}
@@ -77,7 +120,7 @@ defmodule FerricstoreServer.Connection.Auth do
 
           new_state =
             if username == state.username do
-              %{state | acl_cache: build_acl_cache(username)}
+              refresh_acl_session(state)
             else
               state
             end
@@ -99,13 +142,8 @@ defmodule FerricstoreServer.Connection.Auth do
 
   def dispatch_acl("DELUSER", usernames, state) do
     with {:ok, ctx} <- default_instance_ctx() do
-      results =
-        Enum.map(usernames, fn username ->
-          Ferricstore.Store.Router.server_command(ctx, {:acl_deluser, username})
-        end)
-
-      case Enum.find(results, fn r -> match?({:error, _}, r) end) do
-        nil ->
+      case Ferricstore.Store.Router.server_command(ctx, {:acl_delusers, usernames}) do
+        :ok ->
           Enum.each(usernames, &broadcast_acl_invalidation/1)
           state = Enum.reduce(usernames, state, &maybe_refresh_acl_cache(&2, &1))
           {:continue, Encoder.encode(:ok), state}
@@ -193,6 +231,14 @@ defmodule FerricstoreServer.Connection.Auth do
 
   # ── ACL cache ──────────────────────────────────────────────────────────
 
+  @spec user_requires_auth?(binary()) :: boolean()
+  def user_requires_auth?(username) do
+    case FerricstoreServer.Acl.get_user(username) do
+      %{password: password} when is_binary(password) -> true
+      _ -> false
+    end
+  end
+
   @spec build_acl_cache(binary()) :: map() | :full_access | :denied
   def build_acl_cache(username) do
     case FerricstoreServer.Acl.get_user(username) do
@@ -201,15 +247,17 @@ defmodule FerricstoreServer.Connection.Auth do
 
       user ->
         denied = Map.get(user, :denied_commands, MapSet.new())
+        channels = Map.get(user, :channels, :all)
 
         if user.enabled and user.commands == :all and
-             MapSet.size(denied) == 0 and user.keys == :all do
+             MapSet.size(denied) == 0 and user.keys == :all and channels == :all do
           :full_access
         else
           %{
             commands: user.commands,
             denied_commands: denied,
             keys: user.keys,
+            channels: channels,
             enabled: user.enabled
           }
         end
@@ -220,6 +268,11 @@ defmodule FerricstoreServer.Connection.Auth do
 
   @spec check_command_cached(map() | :full_access | :denied | nil, binary()) ::
           :ok | {:error, binary()}
+
+  # ACL WHOAMI only returns the authenticated username, but disabled/deleted
+  # users must still fail closed after ACL invalidation refreshes the cache.
+  def check_command_cached(:full_access, "ACL.WHOAMI"), do: :ok
+  def check_command_cached(%{enabled: true}, "ACL.WHOAMI"), do: :ok
 
   # Deleted user, unknown user, or missing cache -- deny all commands.
   def check_command_cached(:denied, _cmd),
@@ -246,15 +299,15 @@ defmodule FerricstoreServer.Connection.Auth do
         {:error,
          "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
-      cache.commands == :all and not MapSet.member?(cache.denied_commands, cmd) ->
+      cache.commands == :all and not cached_command_denied?(cache.denied_commands, cmd) ->
         :ok
 
       cache.commands == :all ->
         {:error,
          "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
-      MapSet.member?(cache.commands, cmd) and
-          not MapSet.member?(cache.denied_commands, cmd) ->
+      cached_command_allowed?(cache.commands, cmd) and
+          not cached_command_denied?(cache.denied_commands, cmd) ->
         :ok
 
       true ->
@@ -276,15 +329,48 @@ defmodule FerricstoreServer.Connection.Auth do
   def check_keys_cached(:full_access, _cmd, _keys), do: :ok
   def check_keys_cached(%{keys: :all}, _cmd, _keys), do: :ok
 
+  def check_keys_cached(%{keys: patterns}, cmd, []) when is_list(patterns) do
+    if global_keyspace_enumeration_command?(cmd) and
+         not unrestricted_read_key_patterns?(patterns) do
+      {:error,
+       "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+    else
+      :ok
+    end
+  end
+
   def check_keys_cached(%{keys: patterns}, cmd, keys) when is_list(keys) do
     case keys do
       [] ->
         :ok
 
       keys ->
-        cmd
-        |> command_access_type()
-        |> then(&check_all_keys(keys, &1, patterns))
+        case key_access_plan(cmd, keys) do
+          {:mixed, plan} -> check_key_access_plan(plan, patterns)
+          {:uniform, access_type} -> check_all_keys(keys, access_type, patterns)
+        end
+    end
+  end
+
+  @spec check_channels_cached(map() | :full_access | :denied | nil, [binary()]) ::
+          :ok | {:error, binary()}
+  def check_channels_cached(:denied, _channels),
+    do: {:error, "NOPERM user session expired or user was deleted"}
+
+  def check_channels_cached(nil, _channels),
+    do: {:error, "NOPERM user session expired or user was deleted"}
+
+  def check_channels_cached(:full_access, _channels), do: :ok
+  def check_channels_cached(%{channels: :all}, _channels), do: :ok
+  def check_channels_cached(%{channels: patterns}, []) when is_list(patterns), do: :ok
+
+  def check_channels_cached(%{channels: patterns}, channels)
+      when is_list(patterns) and is_list(channels) do
+    if Enum.all?(channels, &FerricstoreServer.Acl.channel_matches_any?(&1, patterns)) do
+      :ok
+    else
+      {:error,
+       "NOPERM this user has no permissions to access one of the channels mentioned in the command"}
     end
   end
 
@@ -317,11 +403,114 @@ defmodule FerricstoreServer.Connection.Auth do
   @spec command_access_type(binary()) :: :read | :write | :rw
   def command_access_type(cmd), do: CommandCategories.command_access_type(cmd)
 
+  defp key_access_plan(cmd, keys) when is_binary(cmd) do
+    case String.upcase(cmd) do
+      # Source/destination commands must not treat every key as a write key:
+      # the command reads source data and writes only the destination.
+      "COPY" ->
+        source_destination_plan(keys, :read)
+
+      # BITOP reads every source key and writes only the destination key.
+      # Keeping this as a per-command plan avoids forcing source keys to have
+      # write access while also preventing write-only source patterns from
+      # leaking read access.
+      cmd when cmd in ~w(BITOP PFMERGE SDIFFSTORE SINTERSTORE SUNIONSTORE GEOSEARCHSTORE
+                         CMS.MERGE TDIGEST.MERGE ZINTERSTORE ZUNIONSTORE) ->
+        destination_sources_plan(keys)
+
+      cmd when cmd in ~w(RENAME RENAMENX LMOVE BLMOVE RPOPLPUSH SMOVE) ->
+        source_destination_plan(keys, :read_write)
+
+      _ ->
+        {:uniform, command_access_type(cmd)}
+    end
+  end
+
+  defp key_access_plan(cmd, _keys), do: {:uniform, command_access_type(cmd)}
+
+  defp destination_sources_plan([dest | sources]),
+    do: {:mixed, [{dest, :write} | Enum.map(sources, &{&1, :read})]}
+
+  defp destination_sources_plan(_keys), do: {:mixed, []}
+
+  defp source_destination_plan([source, destination | _rest], :read),
+    do: {:mixed, [{source, :read}, {destination, :write}]}
+
+  defp source_destination_plan([source, destination | _rest], :read_write),
+    do: {:mixed, [{source, :read}, {source, :write}, {destination, :write}]}
+
+  defp source_destination_plan(_keys, _source_access), do: {:mixed, []}
+
+  defp check_key_access_plan([], _patterns), do: :ok
+
+  defp check_key_access_plan([{key, access_type} | rest], patterns) do
+    if FerricstoreServer.Acl.key_matches_any?(key, access_type, patterns) do
+      check_key_access_plan(rest, patterns)
+    else
+      {:error,
+       "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+    end
+  end
+
+  defp global_keyspace_enumeration_command?(cmd),
+    do: String.upcase(cmd) in @global_keyspace_enumeration_commands
+
+  defp unrestricted_read_key_patterns?(patterns) do
+    Enum.any?(patterns, fn
+      {"*", mode, _regex} when mode in [:rw, :read] -> true
+      _other -> false
+    end)
+  end
+
+  @doc false
+  @spec acl_command_name(binary(), [binary()], term()) :: binary()
+  def acl_command_name("CLIENT", ["HELLO" | _rest], _ast), do: "HELLO"
+
+  def acl_command_name("CLIENT", [subcmd | _rest], _ast) when is_binary(subcmd) do
+    "CLIENT." <> String.upcase(subcmd)
+  end
+
+  def acl_command_name("ACL", [subcmd | _rest], _ast) when is_binary(subcmd) do
+    subcmd = String.upcase(subcmd)
+
+    if subcmd in @acl_subcommands do
+      "ACL." <> subcmd
+    else
+      "ACL"
+    end
+  end
+
+  def acl_command_name(cmd, _args, _ast), do: cmd
+
+  defp cached_command_denied?(commands, cmd) do
+    MapSet.member?(commands, cmd) or
+      (cached_parent_supported?(cmd) and MapSet.member?(commands, cached_command_parent(cmd)))
+  end
+
+  defp cached_command_allowed?(commands, cmd) do
+    MapSet.member?(commands, cmd) or
+      (cached_parent_supported?(cmd) and MapSet.member?(commands, cached_command_parent(cmd)))
+  end
+
+  defp cached_parent_supported?(cmd) do
+    case cached_command_parent(cmd) do
+      nil -> false
+      parent -> MapSet.member?(CommandCategories.acl_supported_commands(), parent)
+    end
+  end
+
+  defp cached_command_parent(cmd) do
+    case String.split(cmd, ".", parts: 2) do
+      [parent, _subcommand] -> parent
+      _ -> nil
+    end
+  end
+
   # ── ACL invalidation broadcasting ──────────────────────────────────────
 
   @acl_pg_group :ferricstore_acl_connections
 
-  @spec broadcast_acl_invalidation(binary()) :: :ok
+  @spec broadcast_acl_invalidation(binary() | :all) :: :ok
   def broadcast_acl_invalidation(username) do
     members =
       try do
@@ -337,13 +526,25 @@ defmodule FerricstoreServer.Connection.Auth do
     :ok
   end
 
-  @spec maybe_refresh_acl_cache(map(), binary()) :: map()
+  @spec maybe_refresh_acl_cache(map(), binary() | :all) :: map()
+  def maybe_refresh_acl_cache(state, :all),
+    do: refresh_acl_session(state)
+
   def maybe_refresh_acl_cache(state, invalidated_username) do
     if invalidated_username == state.username do
-      %{state | acl_cache: build_acl_cache(state.username)}
+      refresh_acl_session(state)
     else
       state
     end
+  end
+
+  @spec refresh_acl_session(map()) :: map()
+  def refresh_acl_session(state) do
+    %{
+      state
+      | acl_cache: build_acl_cache(state.username),
+        require_auth: user_requires_auth?(state.username)
+    }
   end
 
   # ── Internal helpers ───────────────────────────────────────────────────
@@ -363,7 +564,13 @@ defmodule FerricstoreServer.Connection.Auth do
         new_cache = build_acl_cache(username)
 
         {:continue, Encoder.encode(:ok),
-         %{state | authenticated: true, username: username, acl_cache: new_cache}}
+         %{
+           state
+           | authenticated: true,
+             username: username,
+             acl_cache: new_cache,
+             require_auth: user_requires_auth?(username)
+         }}
 
       {:error, reason} ->
         AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
@@ -391,7 +598,13 @@ defmodule FerricstoreServer.Connection.Auth do
       new_cache = build_acl_cache("default")
 
       {:continue, Encoder.encode(:ok),
-       %{state | authenticated: true, username: "default", acl_cache: new_cache}}
+       %{
+         state
+         | authenticated: true,
+           username: "default",
+           acl_cache: new_cache,
+           require_auth: user_requires_auth?("default")
+       }}
     else
       AuditLog.log(:auth_failure, %{username: "default", client_ip: client_ip})
 

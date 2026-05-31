@@ -7,7 +7,7 @@
 # a synthetic command floor before the public Flow API existed.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/flow_api_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/flow_api_bench.exs
 #
 # Options:
 #   FLOW_API_BACKLOGS=1000,10000

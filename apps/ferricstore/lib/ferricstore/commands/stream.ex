@@ -48,6 +48,7 @@ defmodule Ferricstore.Commands.Stream do
 
   @meta_table Ferricstore.Stream.Meta
   @groups_table Ferricstore.Stream.Groups
+  @group_locks_table Ferricstore.Stream.GroupLocks
   @index_table Ferricstore.Stream.Index
   @stream_waiters_table :ferricstore_stream_waiters
 
@@ -408,17 +409,69 @@ defmodule Ferricstore.Commands.Stream do
 
       case ids do
         [] ->
-          []
+          case durable_stream_meta_entry(key, store) do
+            nil ->
+              if stream_type_marker?(key, store) do
+                put_local_stream_meta(key, 0, "0-0", "0-0", 0, 0)
+                :ets.lookup(@meta_table, key)
+              else
+                []
+              end
+
+            {len, first, last, ms, seq} ->
+              put_local_stream_meta(key, len, first, last, ms, seq)
+              :ets.lookup(@meta_table, key)
+          end
 
         _ ->
           first = List.first(ids)
           last = List.last(ids)
           {last_ms, last_seq} = parse_id!(last)
-          :ets.insert(@meta_table, {key, length(ids), first, last, last_ms, last_seq})
+          put_stream_meta(key, length(ids), first, last, last_ms, last_seq, store)
           :ets.lookup(@meta_table, key)
       end
     else
       []
+    end
+  end
+
+  defp durable_stream_meta_entry(key, store) do
+    store
+    |> Ops.compound_get(key, CompoundKey.stream_meta_key(key))
+    |> decode_stream_meta()
+  end
+
+  defp decode_stream_meta(nil), do: nil
+
+  defp decode_stream_meta(raw) when is_binary(raw) do
+    case :erlang.binary_to_term(raw, [:safe]) do
+      {:stream_meta, len, first, last, ms, seq}
+      when is_integer(len) and len >= 0 and is_binary(first) and is_binary(last) and
+             is_integer(ms) and ms >= 0 and is_integer(seq) and seq >= 0 ->
+        {len, first, last, ms, seq}
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp put_local_stream_meta(key, len, first, last, ms, seq) do
+    :ets.insert(@meta_table, {key, len, first, last, ms, seq})
+  end
+
+  defp put_stream_meta(key, len, first, last, ms, seq, store) do
+    put_local_stream_meta(key, len, first, last, ms, seq)
+    persist_stream_meta(key, len, first, last, ms, seq, store)
+  end
+
+  defp persist_stream_meta(key, len, first, last, ms, seq, store) do
+    if Ops.has_compound?(store) do
+      encoded = :erlang.term_to_binary({:stream_meta, len, first, last, ms, seq})
+      Ops.compound_put(store, key, CompoundKey.stream_meta_key(key), encoded, 0)
+    else
+      :ok
     end
   end
 
@@ -484,6 +537,18 @@ defmodule Ferricstore.Commands.Stream do
         :ok
     end
 
+    case :ets.whereis(@group_locks_table) do
+      :undefined ->
+        try do
+          :ets.new(@group_locks_table, [:set, :public, :named_table])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      _ref ->
+        :ok
+    end
+
     case :ets.whereis(@stream_waiters_table) do
       :undefined ->
         try do
@@ -536,6 +601,7 @@ defmodule Ferricstore.Commands.Stream do
   @spec register_stream_waiter(binary(), pid(), binary()) :: :ok
   def register_stream_waiter(stream_key, pid, last_seen_id) do
     ensure_meta_table()
+    Ferricstore.Waiters.Monitor.track(pid)
     registered_at = System.monotonic_time(:microsecond)
     :ets.insert(@stream_waiters_table, {stream_key, pid, last_seen_id, registered_at})
     :ok
@@ -639,7 +705,7 @@ defmodule Ferricstore.Commands.Stream do
                     {1, id_str}
                 end
 
-              :ets.insert(@meta_table, {key, new_len, new_first, id_str, ms, seq})
+              put_stream_meta(key, new_len, new_first, id_str, ms, seq, store)
 
               # Apply trim if requested.
               maybe_trim(key, trim_opts, store)
@@ -836,14 +902,14 @@ defmodule Ferricstore.Commands.Stream do
         {:ok, deleted_count} ->
           # Update metadata.
           remaining = Enum.drop(all_ids, deleted_count)
-          update_meta_after_trim(key, remaining)
+          update_meta_after_trim(key, remaining, store)
 
           deleted_count
 
         {:error, reason, deleted_count} ->
           if deleted_count > 0 do
             remaining = Enum.drop(all_ids, deleted_count)
-            update_meta_after_trim(key, remaining)
+            update_meta_after_trim(key, remaining, store)
           end
 
           {:error, reason}
@@ -876,7 +942,7 @@ defmodule Ferricstore.Commands.Stream do
       {:ok, deleted_count} ->
         if deleted_count > 0 do
           remaining = all_ids -- to_remove
-          update_meta_after_trim(key, remaining)
+          update_meta_after_trim(key, remaining, store)
         end
 
         deleted_count
@@ -885,7 +951,7 @@ defmodule Ferricstore.Commands.Stream do
         if deleted_count > 0 do
           deleted_ids = Enum.take(to_remove, deleted_count)
           remaining = all_ids -- deleted_ids
-          update_meta_after_trim(key, remaining)
+          update_meta_after_trim(key, remaining, store)
         end
 
         {:error, reason}
@@ -965,23 +1031,26 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp update_meta_after_trim(key, []) do
+  defp update_meta_after_trim(key, [], store) do
     # Preserve metadata with length=0 instead of deleting, so that
     # the stream's last_id is kept for future XADD ordering.
     case :ets.lookup(@meta_table, key) do
       [{^key, _len, _first, last, ms, seq}] ->
-        :ets.insert(@meta_table, {key, 0, "0-0", last, ms, seq})
+        put_stream_meta(key, 0, "0-0", last, ms, seq, store)
 
       [] ->
-        :ok
+        case durable_stream_meta_entry(key, store) do
+          {_, _, last, ms, seq} -> put_stream_meta(key, 0, "0-0", last, ms, seq, store)
+          nil -> :ok
+        end
     end
   end
 
-  defp update_meta_after_trim(key, remaining_ids) do
+  defp update_meta_after_trim(key, remaining_ids, store) do
     first_str = List.first(remaining_ids)
     last_str = List.last(remaining_ids)
     {last_ms, last_seq} = parse_id!(last_str)
-    :ets.insert(@meta_table, {key, length(remaining_ids), first_str, last_str, last_ms, last_seq})
+    put_stream_meta(key, length(remaining_ids), first_str, last_str, last_ms, last_seq, store)
   end
 
   # ---------------------------------------------------------------------------
@@ -1084,6 +1153,12 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xgroup_create(key, group, id_str, mkstream, store) do
     ensure_meta_table()
 
+    with_group_lock(key, group, fn ->
+      do_xgroup_create_locked(key, group, id_str, mkstream, store)
+    end)
+  end
+
+  defp do_xgroup_create_locked(key, group, id_str, mkstream, store) do
     stream_exists? = stream_exists_for_group_create?(key, store)
     group_exists? = lookup_group(store, key, group) != :missing
 
@@ -1101,7 +1176,7 @@ defmodule Ferricstore.Commands.Stream do
           type_status when type_status in [:ok, {:ok, :created}, :no_marker] ->
             case create_group(key, group, id_str, store) do
               :ok ->
-                :ets.insert(@meta_table, {key, 0, "0-0", "0-0", 0, 0})
+                put_stream_meta(key, 0, "0-0", "0-0", 0, 0, store)
                 :ok
 
               {:error, _} = error ->
@@ -1237,23 +1312,25 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp xreadgroup_stream_result(group, consumer, key, id_str, count, store) do
-    case lookup_group(store, key, group) do
-      :missing ->
-        {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
+    with_group_lock(key, group, fn ->
+      case lookup_group(store, key, group) do
+        :missing ->
+          {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
 
-      {:ok, last_delivered, consumers, pending} ->
-        xreadgroup_known_group_result(
-          group,
-          consumer,
-          key,
-          id_str,
-          count,
-          store,
-          last_delivered,
-          consumers,
-          pending
-        )
-    end
+        {:ok, last_delivered, consumers, pending} ->
+          xreadgroup_known_group_result(
+            group,
+            consumer,
+            key,
+            id_str,
+            count,
+            store,
+            last_delivered,
+            consumers,
+            pending
+          )
+      end
+    end)
   end
 
   defp xreadgroup_known_group_result(
@@ -1374,6 +1451,12 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xack(key, group, ids, store) do
     ensure_meta_table()
 
+    with_group_lock(key, group, fn ->
+      do_xack_locked(key, group, ids, store)
+    end)
+  end
+
+  defp do_xack_locked(key, group, ids, store) do
     case lookup_group(store, key, group) do
       :missing ->
         0
@@ -1392,6 +1475,68 @@ defmodule Ferricstore.Commands.Stream do
           :ok -> acked
           {:error, _reason} = error -> error
         end
+    end
+  end
+
+  defp with_group_lock(key, group, fun) when is_function(fun, 0) do
+    lock = {key, group}
+    acquire_group_lock(lock)
+
+    try do
+      fun.()
+    after
+      release_group_lock(lock)
+    end
+  end
+
+  defp acquire_group_lock(lock) do
+    ensure_group_lock_table()
+
+    case :ets.insert_new(@group_locks_table, {lock, self()}) do
+      true ->
+        :ok
+
+      false ->
+        wait_for_group_lock(lock)
+    end
+  end
+
+  defp wait_for_group_lock(lock) do
+    case :ets.lookup(@group_locks_table, lock) do
+      [{^lock, holder}] when is_pid(holder) ->
+        if Process.alive?(holder) do
+          receive do
+          after
+            1 -> :ok
+          end
+        else
+          :ets.select_delete(@group_locks_table, [{{lock, holder}, [], [true]}])
+        end
+
+      _other ->
+        :ok
+    end
+
+    acquire_group_lock(lock)
+  end
+
+  defp release_group_lock(lock) do
+    ensure_group_lock_table()
+    :ets.select_delete(@group_locks_table, [{{lock, self()}, [], [true]}])
+    :ok
+  end
+
+  defp ensure_group_lock_table do
+    case :ets.whereis(@group_locks_table) do
+      :undefined ->
+        try do
+          :ets.new(@group_locks_table, [:set, :public, :named_table])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      _ref ->
+        :ok
     end
   end
 
@@ -1780,9 +1925,9 @@ defmodule Ferricstore.Commands.Stream do
   defp update_meta_after_index_mutation(key, remaining_len, old_last, old_ms, old_seq, store)
        when remaining_len <= 0 do
     if Ops.has_compound?(store) do
-      :ets.insert(@meta_table, {key, 0, "0-0", old_last, old_ms, old_seq})
+      put_stream_meta(key, 0, "0-0", old_last, old_ms, old_seq, store)
     else
-      update_meta_after_trim(key, [])
+      update_meta_after_trim(key, [], store)
     end
   end
 
@@ -1791,7 +1936,7 @@ defmodule Ferricstore.Commands.Stream do
       case stream_index_first_last(key) do
         {first_str, last_str} ->
           {last_ms, last_seq} = parse_id!(last_str)
-          :ets.insert(@meta_table, {key, remaining_len, first_str, last_str, last_ms, last_seq})
+          put_stream_meta(key, remaining_len, first_str, last_str, last_ms, last_seq, store)
 
         nil ->
           remaining_ids =
@@ -1799,7 +1944,7 @@ defmodule Ferricstore.Commands.Stream do
             |> stream_ids_for(key)
             |> Enum.sort_by(&parse_id!/1)
 
-          update_meta_after_trim(key, remaining_ids)
+          update_meta_after_trim(key, remaining_ids, store)
       end
     else
       remaining_ids =
@@ -1807,7 +1952,7 @@ defmodule Ferricstore.Commands.Stream do
         |> stream_ids_for(key)
         |> Enum.sort_by(&parse_id!/1)
 
-      update_meta_after_trim(key, remaining_ids)
+      update_meta_after_trim(key, remaining_ids, store)
     end
   end
 
@@ -1822,7 +1967,7 @@ defmodule Ferricstore.Commands.Stream do
           |> stream_ids_for(key)
           |> Enum.sort_by(&parse_id!/1)
 
-        update_meta_after_trim(key, remaining_ids)
+        update_meta_after_trim(key, remaining_ids, store)
     end
   end
 

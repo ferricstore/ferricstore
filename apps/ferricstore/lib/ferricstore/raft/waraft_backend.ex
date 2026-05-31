@@ -10,6 +10,8 @@ defmodule Ferricstore.Raft.WARaftBackend do
   alias Ferricstore.Raft.BlobCommand
   alias Ferricstore.Raft.CommandStamp
   alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
+  alias Ferricstore.Raft.WARaftBackend.BatcherSupervisor, as: NamespaceBatcherSupervisor
+  alias Ferricstore.Raft.WARaftBackend.SyncGate
 
   @app :ferricstore_waraft_backend
   @table :ferricstore_waraft_backend
@@ -183,9 +185,11 @@ defmodule Ferricstore.Raft.WARaftBackend do
     _ = Supervisor.delete_child(:kernel_sup, @sup_id)
     _ = stop_orphaned_waraft_sup()
     wait_down(registered_names(shard_count), 100)
+    erase_waraft_option_cache(shard_count)
     :persistent_term.erase({@context_key, @table})
     :persistent_term.erase(@inflight_bytes_key)
     :persistent_term.erase(@max_inflight_bytes_key)
+    SyncGate.clear_shards(shard_count)
     erase_cached_voter_nodes(shard_count)
     :persistent_term.erase(@shard_count_key)
     :ok
@@ -236,10 +240,12 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   @spec write(non_neg_integer(), tuple()) :: term()
   def write(shard_index, command) when valid_shard_index_shape(shard_index) do
-    case maybe_namespace_window_write(shard_index, command) do
-      :direct -> commit_or_redirect(shard_index, command, 2)
-      result -> result
-    end
+    with_sync_write(shard_index, fn ->
+      case maybe_namespace_window_write(shard_index, command) do
+        :direct -> commit_or_redirect(shard_index, command, 2)
+        result -> result
+      end
+    end)
   end
 
   def write(shard_index, _command), do: invalid_shard_index_error(shard_index)
@@ -249,7 +255,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   def write_many(shard_commands) when is_list(shard_commands) do
     shard_commands
-    |> Enum.map(&submit_write_many_entry/1)
+    |> Enum.map(&submit_write_many_entry_after_pause/1)
     |> Enum.map(&await_write_many_entry/1)
   end
 
@@ -267,7 +273,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   def write_redirected(shard_index, command, redirects_left)
       when is_integer(redirects_left) and redirects_left >= 0 do
-    commit_or_redirect(shard_index, command, redirects_left)
+    with_sync_write(shard_index, fn ->
+      commit_or_redirect(shard_index, command, redirects_left)
+    end)
   end
 
   @spec write_batch(non_neg_integer(), [tuple()]) :: term()
@@ -277,7 +285,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
   def write_batch(_shard_index, []), do: {:ok, []}
 
   def write_batch(shard_index, commands) when is_list(commands) do
-    NamespaceBatcher.write_batch(shard_index, commands)
+    with_sync_write(shard_index, fn ->
+      NamespaceBatcher.write_batch(shard_index, commands)
+    end)
   end
 
   def write_batch(_shard_index, commands),
@@ -296,7 +306,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
   def write_put_batch(_shard_index, []), do: {:ok, []}
 
   def write_put_batch(shard_index, entries) when is_list(entries) do
-    NamespaceBatcher.write_put_batch(shard_index, entries)
+    with_sync_write(shard_index, fn ->
+      NamespaceBatcher.write_put_batch(shard_index, entries)
+    end)
   end
 
   def write_put_batch(_shard_index, entries),
@@ -319,7 +331,27 @@ defmodule Ferricstore.Raft.WARaftBackend do
   end
 
   def write_put_batch_async(shard_index, entries, from) when is_list(entries) do
-    NamespaceBatcher.write_put_batch_async(shard_index, entries, from)
+    case SyncGate.enter(shard_index) do
+      {:ok, token} ->
+        try do
+          case NamespaceBatcher.write_put_batch_async(shard_index, entries, from, token) do
+            :ok ->
+              :ok
+
+            {:direct, result} ->
+              SyncGate.leave(token)
+              {:direct, result}
+          end
+        catch
+          kind, reason ->
+            SyncGate.leave(token)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      {:error, _reason} = error ->
+        GenServer.reply(from, error)
+        :ok
+    end
   end
 
   def write_put_batch_async(_shard_index, entries, from) do
@@ -334,7 +366,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
   def write_delete_batch(_shard_index, []), do: {:ok, []}
 
   def write_delete_batch(shard_index, keys) when is_list(keys) do
-    NamespaceBatcher.write_delete_batch(shard_index, keys)
+    with_sync_write(shard_index, fn ->
+      NamespaceBatcher.write_delete_batch(shard_index, keys)
+    end)
   end
 
   def write_delete_batch(_shard_index, keys),
@@ -354,13 +388,62 @@ defmodule Ferricstore.Raft.WARaftBackend do
   end
 
   def write_delete_batch_async(shard_index, keys, from) when is_list(keys) do
-    NamespaceBatcher.write_delete_batch_async(shard_index, keys, from)
+    case SyncGate.enter(shard_index) do
+      {:ok, token} ->
+        try do
+          case NamespaceBatcher.write_delete_batch_async(shard_index, keys, from, token) do
+            :ok ->
+              :ok
+
+            {:direct, result} ->
+              SyncGate.leave(token)
+              {:direct, result}
+          end
+        catch
+          kind, reason ->
+            SyncGate.leave(token)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      {:error, _reason} = error ->
+        GenServer.reply(from, error)
+        :ok
+    end
   end
 
   def write_delete_batch_async(_shard_index, keys, from) do
     GenServer.reply(from, {:error, {:invalid_delete_batch, keys}})
     :ok
   end
+
+  @spec pause_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def pause_writes_for_sync(shard_index, timeout \\ 30_000)
+
+  def pause_writes_for_sync(shard_index, timeout) when valid_shard_index_shape(shard_index) do
+    with {:ok, gate_pid} <- SyncGate.pause(shard_index),
+         :ok <- NamespaceBatcher.flush(shard_index, timeout),
+         :ok <- SyncGate.await_drained(gate_pid, timeout),
+         :ok <- NamespaceBatcher.flush(shard_index, timeout),
+         :ok <- sync_pause_barrier(shard_index) do
+      :ok
+    else
+      {:error, reason} = error ->
+        _ = resume_writes_for_sync(shard_index, 5_000)
+        emit_sync_pause_failed(shard_index, reason)
+        error
+    end
+  end
+
+  def pause_writes_for_sync(shard_index, _timeout), do: invalid_shard_index_error(shard_index)
+
+  @spec resume_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def resume_writes_for_sync(shard_index, timeout \\ 5_000)
+
+  def resume_writes_for_sync(shard_index, timeout) when valid_shard_index_shape(shard_index) do
+    SyncGate.resume(shard_index, timeout)
+  end
+
+  def resume_writes_for_sync(shard_index, _timeout), do: invalid_shard_index_error(shard_index)
 
   @doc false
   @spec __commit_put_batch_direct__(
@@ -778,6 +861,32 @@ defmodule Ferricstore.Raft.WARaftBackend do
     backend_call(fn -> :wa_raft_server.is_peer_ready(server, {server, node_name}) end)
   end
 
+  defp submit_write_many_entry_after_pause({shard_index, command} = entry)
+       when valid_shard_index_shape(shard_index) do
+    case SyncGate.enter(shard_index) do
+      {:ok, token} ->
+        try do
+          case submit_write_many_entry(entry) do
+            {^shard_index, ^command, submission} ->
+              {shard_index, command, submission, token}
+
+            other ->
+              SyncGate.leave(token)
+              other
+          end
+        catch
+          kind, reason ->
+            SyncGate.leave(token)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      {:error, _reason} = error ->
+        {shard_index, command, {:immediate, error}}
+    end
+  end
+
+  defp submit_write_many_entry_after_pause(entry), do: submit_write_many_entry(entry)
+
   defp submit_write_many_entry({shard_index, command}) do
     {shard_index, command, submit_commit_async(shard_index, command)}
   end
@@ -786,6 +895,14 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp await_write_many_entry({:invalid, entry}),
     do: {:error, {:invalid_write_many_entry, entry}}
+
+  defp await_write_many_entry({shard_index, command, submission, sync_token}) do
+    try do
+      await_write_many_entry({shard_index, command, submission})
+    after
+      SyncGate.leave(sync_token)
+    end
+  end
 
   defp await_write_many_entry({shard_index, command, submission}) do
     submission
@@ -841,7 +958,8 @@ defmodule Ferricstore.Raft.WARaftBackend do
     with :ok <- ensure_local_leader_connected_quorum(shard_index),
          {:ok, acquired_bytes} <- acquire_commit_bytes(shard_index, command) do
       try do
-        with {:ok, prepared_command} <- prepare_commit_command(shard_index, command) do
+        with {:ok, prepared_command, blob_protection} <-
+               prepare_commit_command(shard_index, command) do
           acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
           acceptor_pid = Process.whereis(acceptor)
           stamped = CommandStamp.to_ttb(prepared_command)
@@ -852,6 +970,12 @@ defmodule Ferricstore.Raft.WARaftBackend do
             |> commit_safely(acceptor_pid, {make_ref(), stamped})
             |> normalize_commit_transport_result(acceptor_pid)
 
+          :ok =
+            Ferricstore.FaultInjection.maybe_pause(:after_waraft_commit, %{
+              shard_index: shard_index,
+              result: result
+            })
+
           emit_commit_timeout_if_needed(
             shard_index,
             command,
@@ -861,6 +985,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
             :sync
           )
 
+          release_blob_protection_after_result(blob_protection, result)
           result
         end
       after
@@ -945,8 +1070,13 @@ defmodule Ferricstore.Raft.WARaftBackend do
   end
 
   defp config_voter_nodes(%{} = config) do
-    config
-    |> Map.get(:membership, [])
+    voters =
+      case Map.get(config, :membership, []) do
+        [_ | _] = membership -> membership
+        _empty_or_missing -> Map.get(config, :participants, [])
+      end
+
+    voters
     |> Enum.map(&peer_node/1)
     |> Enum.filter(&valid_node_name?/1)
     |> Enum.uniq()
@@ -956,7 +1086,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp submit_acquired_commit_async(shard_index, command, acquired_bytes) do
     case prepare_commit_command(shard_index, command) do
-      {:ok, prepared_command} ->
+      {:ok, prepared_command, blob_protection} ->
         acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
 
         case Process.whereis(acceptor) do
@@ -975,16 +1105,19 @@ defmodule Ferricstore.Raft.WARaftBackend do
                  ) do
               :ok ->
                 {:submitted, shard_index, reply_alias, reply_ref, pid, acquired_bytes,
-                 command_shape, started_mono}
+                 command_shape, started_mono, blob_protection}
 
               {:error, _reason} = error ->
                 flush_reply_alias(reply_alias, reply_ref)
                 release_commit_bytes(shard_index, acquired_bytes)
-                {:immediate, normalize_commit_transport_result(error, pid)}
+                result = normalize_commit_transport_result(error, pid)
+                release_blob_protection_after_result(blob_protection, result)
+                {:immediate, result}
             end
 
           nil ->
             release_commit_bytes(shard_index, acquired_bytes)
+            release_blob_protection_after_result(blob_protection, {:error, :unreachable})
             {:immediate, {:error, :unreachable}}
         end
 
@@ -1009,6 +1142,34 @@ defmodule Ferricstore.Raft.WARaftBackend do
   end
 
   defp await_commit_async({:immediate, result}), do: result
+
+  defp await_commit_async(
+         {:submitted, shard_index, reply_alias, reply_ref, acceptor_pid, acquired_bytes,
+          command_shape, started_mono, blob_protection}
+       ) do
+    result =
+      try do
+        receive do
+          {^reply_ref, result} -> normalize_commit_transport_result(result, acceptor_pid)
+        after
+          @timeout ->
+            emit_commit_timeout(shard_index, command_shape, acquired_bytes, started_mono, :async)
+            {:error, :timeout}
+        end
+      after
+        flush_reply_alias(reply_alias, reply_ref)
+        release_commit_bytes(shard_index, acquired_bytes)
+      end
+
+    :ok =
+      Ferricstore.FaultInjection.maybe_pause(:after_waraft_commit, %{
+        shard_index: shard_index,
+        result: result
+      })
+
+    release_blob_protection_after_result(blob_protection, result)
+    result
+  end
 
   defp await_commit_async(
          {:submitted, shard_index, reply_alias, reply_ref, acceptor_pid, acquired_bytes,
@@ -1055,11 +1216,11 @@ defmodule Ferricstore.Raft.WARaftBackend do
         result =
           try do
             if BlobCommand.side_channel_candidate?(ctx, command) do
-              BlobCommand.prepare(ctx, shard_index, command,
+              BlobCommand.prepare_protected(ctx, shard_index, command,
                 single_member?: single_member_waraft_group?(shard_index)
               )
             else
-              {:ok, command}
+              {:ok, command, nil}
             end
           rescue
             error ->
@@ -1090,6 +1251,27 @@ defmodule Ferricstore.Raft.WARaftBackend do
   catch
     _kind, _reason -> :error
   end
+
+  defp release_blob_protection_after_result(nil, _result), do: :ok
+
+  defp release_blob_protection_after_result(blob_protection, result) do
+    if keep_blob_protection_after_result?(result) do
+      Ferricstore.Store.BlobStore.harden_protection(blob_protection, result: result)
+    else
+      Ferricstore.Store.BlobStore.unprotect(blob_protection)
+    end
+
+    :ok
+  end
+
+  defp keep_blob_protection_after_result?({:error, :timeout}), do: true
+  defp keep_blob_protection_after_result?({:error, :commit_unreachable_after_submit}), do: true
+  defp keep_blob_protection_after_result?({:error, :not_leader_after_submit}), do: true
+
+  defp keep_blob_protection_after_result?({:error, {:commit_call_failed_after_submit, _reason}}),
+    do: true
+
+  defp keep_blob_protection_after_result?(_result), do: false
 
   defp single_member_waraft_group?(shard_index) do
     case status(shard_index) do
@@ -1138,11 +1320,12 @@ defmodule Ferricstore.Raft.WARaftBackend do
   defp redirectable_write_error?(_error), do: false
 
   defp maybe_redirect_write_to_leader(
-         {:error, :not_leader} = error,
+         {:error, reason} = error,
          shard_index,
          command,
          redirects_left
-       ) do
+       )
+       when reason == :not_leader do
     case local_leader_node(shard_index) do
       node_name when is_atom(node_name) and not is_nil(node_name) and node_name != node() ->
         redirect_commit(node_name, shard_index, command, redirects_left)
@@ -1169,15 +1352,65 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp redirect_commit(node_name, shard_index, command, redirects_left) do
     try do
-      :erpc.call(
-        node_name,
-        __MODULE__,
-        :write_redirected,
-        [shard_index, command, redirects_left - 1],
-        @timeout
-      )
+      result =
+        :erpc.call(
+          node_name,
+          __MODULE__,
+          :write_redirected,
+          [shard_index, command, redirects_left - 1],
+          @timeout
+        )
+
+      barrier_redirected_commit(node_name, shard_index, result)
     catch
       kind, reason -> redirect_write_failure(kind, reason)
+    end
+  end
+
+  defp barrier_redirected_commit(_node_name, _shard_index, {:error, _reason} = error), do: error
+
+  defp barrier_redirected_commit(node_name, shard_index, result) do
+    case remote_storage_position(node_name, shard_index) do
+      {:ok, {:raft_log_pos, applied_index, _term}}
+      when is_integer(applied_index) and applied_index > 0 ->
+        case await_local_storage_applied(shard_index, applied_index, @timeout) do
+          :ok -> result
+          {:error, :timeout} -> ErrorReasons.write_timeout_unknown()
+        end
+
+      _other ->
+        result
+    end
+  end
+
+  defp remote_storage_position(node_name, shard_index) do
+    :erpc.call(node_name, __MODULE__, :storage_position, [shard_index], 5_000)
+  catch
+    _kind, _reason -> {:error, :leader_unavailable}
+  end
+
+  defp await_local_storage_applied(_shard_index, target_index, _timeout_ms)
+       when not is_integer(target_index) or target_index <= 0,
+       do: :ok
+
+  defp await_local_storage_applied(shard_index, target_index, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + max(timeout_ms, 0)
+    do_await_local_storage_applied(shard_index, target_index, deadline)
+  end
+
+  defp do_await_local_storage_applied(shard_index, target_index, deadline) do
+    case storage_position(shard_index) do
+      {:ok, {:raft_log_pos, applied_index, _term}}
+      when is_integer(applied_index) and applied_index >= target_index ->
+        :ok
+
+      _other ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(1)
+          do_await_local_storage_applied(shard_index, target_index, deadline)
+        end
     end
   end
 
@@ -1489,47 +1722,119 @@ defmodule Ferricstore.Raft.WARaftBackend do
     wait_attempts = startup_wait_attempts()
 
     with {:ok, status} <- wait_status(server, wait_attempts),
-         :ok <- finish_start_status(server, status, bootstrap?, wait_attempts),
+         :ok <- finish_start_status(shard_index, server, status, bootstrap?, wait_attempts),
          :ok <- wait_log_replayed(server, replay_target, wait_attempts),
          :ok <- wait_storage_replayed(shard_index, replay_target, wait_attempts) do
       maybe_cache_current_config(shard_index)
     end
   end
 
-  defp finish_start_status(_server, _status, false, _wait_attempts), do: :ok
+  defp finish_start_status(_shard_index, _server, _status, false, _wait_attempts), do: :ok
 
-  defp finish_start_status(server, status, true, wait_attempts) do
+  defp finish_start_status(shard_index, server, status, true, wait_attempts) do
     case Keyword.get(status, :state) do
       :stalled ->
-        with :ok <- bootstrap(server) do
-          wait_leader(server, wait_attempts)
+        with {:ok, config} <- bootstrap(shard_index, server) do
+          wait_initial_leader(shard_index, server, config, wait_attempts)
         end
 
       :leader ->
         :ok
 
       _other ->
-        case backend_call(fn -> :wa_raft_server.promote(server, :next, true) end) do
-          :ok -> wait_leader(server, wait_attempts)
-          {:error, _reason} = error -> error
-          other -> {:error, other}
+        config = Keyword.get(status, :config, %{})
+
+        if cluster_config?(config) do
+          wait_known_leader(shard_index, server, wait_attempts)
+        else
+          case backend_call(fn -> :wa_raft_server.promote(server, :next, true) end) do
+            :ok -> wait_leader(server, wait_attempts)
+            {:error, _reason} = error -> error
+            other -> {:error, other}
+          end
         end
     end
   end
 
-  defp bootstrap(server) do
-    config =
-      :wa_raft_server.make_config([
-        {:raft_identity, server, node()}
-      ])
+  defp bootstrap(shard_index, server) do
+    config = initial_bootstrap_config(shard_index, server)
 
     case backend_call(fn ->
            :wa_raft_server.bootstrap(server, {:raft_log_pos, 1, 1}, config, %{})
          end) do
-      :ok -> :ok
-      {:error, :already_bootstrapped} -> :ok
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        :ok = cache_config(shard_index, config)
+        {:ok, config}
+
+      {:error, :already_bootstrapped} ->
+        handle_already_bootstrapped_initial_partition(shard_index, config)
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp initial_bootstrap_config(shard_index, server) do
+    nodes = initial_bootstrap_nodes()
+
+    nodes
+    |> Enum.map(fn node_name -> {:raft_identity, server, node_name} end)
+    |> :wa_raft_server.make_config()
+    |> tap(fn config ->
+      maybe_emit_cluster_bootstrap_config_mismatch(shard_index, config)
+    end)
+  end
+
+  defp initial_bootstrap_nodes do
+    cluster_nodes =
+      :ferricstore
+      |> Application.get_env(:cluster_nodes, [])
+      |> normalize_initial_cluster_nodes()
+
+    if node() in cluster_nodes do
+      cluster_nodes
+    else
+      [node()]
+    end
+  end
+
+  defp normalize_initial_cluster_nodes(nodes) when is_list(nodes) do
+    nodes
+    |> Enum.filter(&valid_node_name?/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_initial_cluster_nodes(_nodes), do: []
+
+  defp handle_already_bootstrapped_initial_partition(shard_index, requested_config) do
+    requested_nodes = config_voter_nodes(requested_config)
+
+    case requested_nodes do
+      [local_node] when local_node == node() ->
+        config = current_partition_config(shard_index)
+        effective_config = if map_size(config) > 0, do: config, else: requested_config
+        :ok = cache_config(shard_index, effective_config)
+        {:ok, effective_config}
+
+      _cluster_nodes ->
+        with :ok <- handle_already_bootstrapped_cluster_partition(shard_index, requested_nodes) do
+          {:ok, current_partition_config(shard_index)}
+        end
+    end
+  end
+
+  defp maybe_emit_cluster_bootstrap_config_mismatch(shard_index, config) do
+    requested_nodes = config_voter_nodes(config)
+
+    if length(requested_nodes) > 1 and node() not in requested_nodes do
+      :telemetry.execute(
+        [:ferricstore, :waraft, :bootstrap, :invalid_cluster_nodes],
+        %{count: 1},
+        %{shard_index: shard_index, node: node(), requested_nodes: requested_nodes}
+      )
+    end
+  rescue
+    _ -> :ok
   end
 
   defp bootstrap_cluster_partition(shard_index, nodes) do
@@ -1589,6 +1894,89 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
   defp backend_unavailable_error, do: {:error, :backend_unavailable}
 
+  defp with_sync_write(shard_index, fun) when is_function(fun, 0) do
+    case SyncGate.enter(shard_index) do
+      {:ok, token} ->
+        try do
+          fun.()
+        after
+          SyncGate.leave(token)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @doc false
+  @spec blob_protection_barrier(non_neg_integer()) :: :ok | {:error, term()}
+  @spec blob_protection_barrier(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def blob_protection_barrier(shard_index, _timeout \\ 30_000)
+      when valid_shard_index_shape(shard_index) do
+    case context(@table) do
+      {:ok, _ctx} ->
+        case commit_unstamped_control(shard_index, :noop) do
+          :ok -> :ok
+          {:error, :backend_unavailable} -> :ok
+          {:error, reason} -> {:error, {:blob_protection_barrier_failed, reason}}
+          _other -> :ok
+        end
+
+      {:error, :backend_unavailable} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:blob_protection_barrier_failed, reason}}
+    end
+  end
+
+  defp sync_pause_barrier(shard_index) do
+    case context(@table) do
+      {:ok, _ctx} ->
+        case commit_unstamped_control(shard_index, :noop) do
+          :ok -> :ok
+          {:error, :backend_unavailable} -> :ok
+          {:error, reason} -> {:error, {:sync_pause_barrier_failed, reason}}
+          _other -> :ok
+        end
+
+      {:error, :backend_unavailable} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:sync_pause_barrier_failed, reason}}
+    end
+  end
+
+  defp commit_unstamped_control(shard_index, command) do
+    with :ok <- ensure_local_leader_connected_quorum(shard_index),
+         {:ok, acquired_bytes} <- acquire_commit_bytes(shard_index, command) do
+      try do
+        acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
+        acceptor_pid = Process.whereis(acceptor)
+
+        acceptor
+        |> commit_safely(acceptor_pid, {make_ref(), command})
+        |> normalize_commit_transport_result(acceptor_pid)
+        |> normalize_commit_result()
+      after
+        release_commit_bytes(shard_index, acquired_bytes)
+      end
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp emit_sync_pause_failed(shard_index, reason) do
+    :telemetry.execute(
+      [:ferricstore, :waraft, :sync_pause, :failed],
+      %{count: 1},
+      %{shard_index: shard_index, reason: reason}
+    )
+  rescue
+    _ -> :ok
+  end
+
   defp backend_call(fun) when is_function(fun, 0) do
     fun.()
   catch
@@ -1643,7 +2031,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
   end
 
   defp valid_node_name?(node_name)
-       when is_atom(node_name) and node_name not in [nil, true, false],
+       when is_atom(node_name) and node_name not in [nil, true, false, :undefined],
        do: true
 
   defp valid_node_name?(_node_name), do: false
@@ -2042,6 +2430,56 @@ defmodule Ferricstore.Raft.WARaftBackend do
     end
   end
 
+  defp wait_initial_leader(shard_index, server, config, attempts) do
+    if cluster_config?(config) do
+      wait_known_leader(shard_index, server, attempts)
+    else
+      wait_leader(server, attempts)
+    end
+  end
+
+  defp cluster_config?(config) do
+    config
+    |> config_voter_nodes()
+    |> length()
+    |> Kernel.>(1)
+  end
+
+  defp wait_known_leader(shard_index, server, attempts),
+    do: wait_known_leader(shard_index, server, attempts, nil)
+
+  defp wait_known_leader(_shard_index, _server, 0, status),
+    do: {:error, {:leader_timeout, status}}
+
+  defp wait_known_leader(shard_index, server, attempts, _status) do
+    case wait_status(server, 1) do
+      {:ok, status} ->
+        if known_leader?(shard_index, status) do
+          :ok
+        else
+          Process.sleep(10)
+          wait_known_leader(shard_index, server, attempts - 1, status)
+        end
+
+      {:error, reason} ->
+        Process.sleep(10)
+        wait_known_leader(shard_index, server, attempts - 1, {:status_error, reason})
+    end
+  end
+
+  defp known_leader?(shard_index, status) when is_list(status) do
+    leader_node = peer_node(Keyword.get(status, :leader_id))
+
+    if valid_node_name?(leader_node) do
+      true
+    else
+      leader_node = :wa_raft_info.get_leader(@table, partition(shard_index))
+      valid_node_name?(leader_node)
+    end
+  end
+
+  defp known_leader?(_shard_index, _status), do: false
+
   defp wait_leader(server, attempts), do: wait_leader(server, attempts, nil)
 
   defp wait_leader(_server, 0, status), do: {:error, {:leader_timeout, status}}
@@ -2221,10 +2659,19 @@ defmodule Ferricstore.Raft.WARaftBackend do
   defp start_namespace_batchers(shard_count, opts)
        when is_integer(shard_count) and shard_count > 0 do
     Enum.reduce_while(0..(shard_count - 1), :ok, fn shard_index, :ok ->
-      case NamespaceBatcher.start_link(shard_index, opts) do
-        {:ok, _pid} -> {:cont, :ok}
-        {:error, {:already_started, _pid}} -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
+      case NamespaceBatcherSupervisor.ensure_started(shard_index, opts) do
+        :ok ->
+          {:cont, :ok}
+
+        {:error, :supervisor_not_started} ->
+          case NamespaceBatcher.start_link(shard_index, opts) do
+            {:ok, _pid} -> {:cont, :ok}
+            {:error, {:already_started, _pid}} -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        {:error, _reason} = error ->
+          {:halt, error}
       end
     end)
   end
@@ -2232,7 +2679,13 @@ defmodule Ferricstore.Raft.WARaftBackend do
   defp start_namespace_batchers(_shard_count, _opts), do: :ok
 
   defp stop_namespace_batchers(shard_count) when is_integer(shard_count) and shard_count > 0 do
-    Enum.each(0..(shard_count - 1), &NamespaceBatcher.stop/1)
+    NamespaceBatcherSupervisor.stop_all(shard_count)
+
+    Enum.each(0..(shard_count - 1), fn shard_index ->
+      if Process.whereis(NamespaceBatcher.name(shard_index)) do
+        NamespaceBatcher.stop(shard_index)
+      end
+    end)
   end
 
   defp stop_namespace_batchers(_shard_count), do: :ok
@@ -2252,6 +2705,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
     :persistent_term.put(@shard_count_key, ctx.shard_count)
     :persistent_term.put(@inflight_bytes_key, :atomics.new(ctx.shard_count, signed: false))
     :persistent_term.put(@max_inflight_bytes_key, config.max_inflight_commit_bytes)
+    SyncGate.init_shards(ctx.shard_count)
 
     :ok =
       Application.put_env(
@@ -2470,7 +2924,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
           16 * 1024 * 1024
         ),
       apply_log_batch_size:
-        throughput_option(opts, :apply_log_batch_size, :waraft_apply_log_batch_size, 1024),
+        throughput_option(opts, :apply_log_batch_size, :waraft_apply_log_batch_size, 4096),
       apply_batch_max_bytes:
         throughput_option(
           opts,
@@ -2613,6 +3067,21 @@ defmodule Ferricstore.Raft.WARaftBackend do
         64
     end
   end
+
+  defp erase_waraft_option_cache(shard_count) when is_integer(shard_count) and shard_count > 0 do
+    # WAraft stores normalized partition options in persistent_term. They
+    # include absolute database paths, so embedded/test restarts with a new
+    # data_dir must clear them after the old partition supervisors are down.
+    :persistent_term.erase({:wa_raft_sup, @app})
+
+    Enum.each(1..shard_count, fn partition ->
+      :persistent_term.erase({:wa_raft_part_sup, @table, partition})
+    end)
+
+    :ok
+  end
+
+  defp erase_waraft_option_cache(_shard_count), do: :ok
 
   defp registered_names(shard_count) do
     [

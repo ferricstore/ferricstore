@@ -14,6 +14,14 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
     end
   end
 
+  test "test config suppresses debug/info log noise by default" do
+    config = Config.Reader.read!(Path.join(@repo_root, "config/config.exs"), env: :test)
+    level = get_in(config, [:logger, :level])
+
+    assert level in [:warning, :error],
+           "test logger level must keep suite output and scheduler work bounded, got #{inspect(level)}"
+  end
+
   test "prod runtime log level defaults to info unless explicitly overridden" do
     with_env("FERRICSTORE_LOG_LEVEL", nil, fn ->
       assert runtime_logger_level() == :info

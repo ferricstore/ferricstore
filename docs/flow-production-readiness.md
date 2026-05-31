@@ -16,6 +16,8 @@ Telemetry:
 - `[:ferricstore, :flow, :lmdb_writer, :unavailable]`
 - `[:ferricstore, :flow, :lmdb_replay_safe_index, :persist]`
 - `[:ferricstore, :flow, :lmdb_mirror, :degraded]`
+- `[:ferricstore, :flow, :history_projector, :queue_full]`
+- `[:ferricstore, :flow, :history_projector, :recover]`
 
 Prometheus / `FERRICSTORE.METRICS`:
 
@@ -25,10 +27,40 @@ Prometheus / `FERRICSTORE.METRICS`:
 - `ferricstore_flow_lmdb_replay_safe_persist_failures_total`
 - `ferricstore_flow_lmdb_mirror_enqueue_failures_total`
 - `ferricstore_flow_lmdb_mirror_degraded`
+- `ferricstore_flow_history_projected_index`
+- `ferricstore_flow_history_requested_index`
+- `ferricstore_flow_history_projection_lag`
+- `ferricstore_flow_history_projector_pending_entries`
+- `ferricstore_flow_history_projector_oldest_pending_age_us`
+- `ferricstore_flow_history_projector_flush_failures_total`
+- `ferricstore_flow_history_projector_queue_full_total`
 
-`INFO bitcask` exposes the same shard fields with `shard_N_flow_lmdb_*` names.
-Alert on non-zero degraded flags, increasing enqueue/persist failures, or a
-replay-safe lag that grows instead of draining.
+`INFO bitcask` exposes the same shard fields with `shard_N_flow_lmdb_*` and
+`shard_N_flow_history_*` names. Alert on non-zero degraded flags, increasing
+enqueue/persist/flush failures, or a replay-safe/projection lag that grows
+instead of draining.
+
+Durability boundary:
+
+- Flow command success waits for Ra commit/apply and Bitcask truth writes.
+- LMDB terminal/lineage projection is async.
+- History projection is async, but every requested replay-safe marker is
+  monotonic and never moves backward.
+- `CONSISTENT_PROJECTION`/projection requests may wait for the async projectors;
+  normal hot commands must not.
+
+Failure mode:
+
+- If LMDB/history projection fails, the command remains durable because state and
+  history truth are in Bitcask.
+- Projection lag metrics rise until the projector catches up or an operator
+  fixes the underlying disk/LMDB issue.
+- On restart, projectors replay from durable Flow state/history records and the
+  persisted projected-index markers.
+- The optional LMDB release-cursor poke is disabled by default through
+  `:flow_lmdb_release_cursor_poke_enabled`. Enable it only after validating that
+  the deployment benefits from faster cursor nudges without adding noisy Ra
+  traffic.
 
 Important tuning note: the hot-path throughput cliff during large terminal Flow
 bursts is usually not fixed by making LMDB flush more aggressively. The critical
@@ -58,6 +90,51 @@ LMDB terminal and history projections have explicit expire indexes:
 Cold query paths run bounded sweeps before reading projection rows. This keeps
 expired terminal/history projection rows from growing forever even if no exact
 record is read.
+
+## Blob Protection Cleanup
+
+Blob writes prepared before Ra commit are protected from GC until the command
+outcome is known. If the caller loses the commit outcome after submit, the blob
+protection is intentionally hardened instead of deleted. This is safe: GC keeps
+the blob until the system can prove all older Ra/apply state is replay-safe.
+
+The cleanup path is background-only:
+
+- Hardened protections are tracked in ETS with creation time and metadata.
+- Blob GC snapshots a bounded set of hardened protection IDs per shard.
+- Blob GC commits a no-op Ra barrier for that shard.
+- Blob GC waits until apply/release metrics prove the shard is replay-safe.
+- Under the blob GC shard lock, it releases only the snapshotted hardened IDs and
+  sweeps normally against the current live-ref set.
+
+Telemetry:
+
+- `[:ferricstore, :blob, :protection, :hardened]`
+- `[:ferricstore, :blob, :protection, :reconcile]`
+- `[:ferricstore, :blob, :protection, :reconcile, :failed]`
+
+Prometheus / `FERRICSTORE.METRICS`:
+
+- `ferricstore_blob_hardened_protections`
+- `ferricstore_blob_hardened_oldest_age_ms`
+
+`FERRICSTORE.BLOBGC` also returns:
+
+- `hardened_protections_seen`
+- `hardened_protections_released`
+- `hardened_protections_blocked`
+
+Runbook:
+
+- If `ferricstore_blob_hardened_protections` rises briefly and drains, no action
+  is needed.
+- If `ferricstore_blob_hardened_oldest_age_ms` keeps rising, check Ra health,
+  replay-safe cursor lag, disk pressure, and blob GC errors.
+- `:blob_protection_reconcile_enabled` can disable automatic release if an
+  operator needs manual inspection.
+- `:blob_protection_reconcile_max_records` bounds one GC pass, default `1000`.
+- `:blob_protection_reconcile_barrier_timeout_ms` bounds the Ra/replay wait,
+  default `30000`.
 
 ## Lease Reclaim
 
@@ -138,7 +215,7 @@ LMDB projection is mandatory for Flow and always runs as a lagged cold
 projection. There is no synchronous/write-through mode in production.
 
 ```sh
-MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LINEAGE_BACKLOG=1000000 \
+MIX_ENV=bench FLOW_LINEAGE_BACKLOG=1000000 \
 FLOW_LINEAGE_TERMINAL=1000000 FLOW_LINEAGE_ITER=200 FLOW_LINEAGE_QUERY_COUNT=100 \
   mix run --no-start bench/flow_lineage_bench.exs
 ```

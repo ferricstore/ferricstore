@@ -775,17 +775,10 @@ These environment variables are read from `config/runtime.exs` in production (`M
 |----------|---------|-------------|
 | `FERRICSTORE_RELEASE_CURSOR_INTERVAL` | `200000` | Applied-entry interval for emitting release-cursor effects. |
 | `FERRICSTORE_WAL_COMMIT_DELAY_US` | `6000` | Max adaptive WARaft segment group-commit delay in microseconds. |
-| `FERRICSTORE_RAFT_BATCHER_MAX_PENDING` | `256` | Max pending calls per shard Batcher before backpressure. |
-| `FERRICSTORE_RAFT_BATCHER_MAX_BATCH_BYTES` | `4194304` (4 MiB) | Max estimated payload bytes per Batcher slot before an early WARaft submit. Keeps large SET pipelines from forming very large log terms while preserving high small-value batching. |
-| `FERRICSTORE_RAFT_BATCHER_MAX_PENDING_BYTES` | `0` (disabled) | Max serialized payload bytes in flight per shard Batcher before overload backpressure. Set a positive value, for example `268435456` for 256 MiB, to bound large-payload bursts while allowing one oversized write through on an empty queue. |
 | `FERRICSTORE_WARAFT_LOG_ROTATION_INTERVAL` | `50000` | WARaft segment rotation interval in entries. |
 | `FERRICSTORE_WARAFT_LOG_ROTATION_KEEP` | `100000` | Entries to keep around rotation/compaction boundaries. |
 | `FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES` | `100000` | Max retained entries after release-cursor trimming. |
 | `FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES` | adaptive | Per-shard cap for WARaft-applied Flow rows waiting for lagged LMDB/history projection. Too low can force synchronous spill/compaction during terminal Flow bursts; validate changes with the DBOS-style 1M Flow benchmark. |
-| `FERRICSTORE_RAFT_DIRECT_BATCH_COMMANDS` | `true` | Submit homogeneous SET/DEL pipeline runs as final compact Ra terms instead of generic per-command batches. |
-| `FERRICSTORE_RAFT_COMPACT_HOT_BATCHES` | `true` | Compact homogeneous generic Ra batches into `put_batch` / `delete_batch` terms inside the batcher. |
-| `FERRICSTORE_RAFT_PUT_BATCH_APPLY_FAST_PATH` | `true` | Use the state-machine SET batch fast path that stages Bitcask records and publishes ETS after append success. |
-| `FERRICSTORE_RAFT_DELETE_BATCH_APPLY_FAST_PATH` | `true` | Use the state-machine DEL batch fast path that stages tombstones and deletes ETS after append success. |
 | `FERRICSTORE_MAX_ACTIVE_FILE_SIZE` | `8589934592` (8 GiB) | Max active Bitcask file size before rollover. Larger values reduce active-file rotation tail spikes on high-throughput write workloads. |
 | `FERRICSTORE_PROMOTION_THRESHOLD` | `100` | Field count to promote collection to dedicated Bitcask |
 
