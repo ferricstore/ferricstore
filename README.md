@@ -5,66 +5,35 @@
 [![CI](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml/badge.svg)](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-**FerricFlow durable execution, built on a Redis-compatible durable store.**
+**FerricStore is a Redis-compatible durable server with FerricFlow durable execution built in.**
 
-FerricStore is the server behind FerricFlow: durable queues, explicit state
-machines, workflow history, value refs, fanout, retries, leases, and terminal
-retention. It speaks the Redis wire protocol, so applications can use normal
-Redis clients while getting a purpose-built durable workflow layer.
+FerricStore gives applications a durable key-value/data-structure store and a workflow layer for queues, explicit state machines, retries, leases, history, value refs, signals, and fanout.
 
-The core model is intentionally explicit:
+FerricFlow is the durable execution layer inside FerricStore. It stores workflow state as server-owned records instead of asking application code to rebuild leases, due indexes, retry state, history, and terminal records around a generic queue.
+
+## What Is A Flow?
+
+A Flow is one durable execution record:
+
+| Field | Meaning |
+| --- | --- |
+| `type` | Workflow or queue type, such as `email` or `order`. |
+| `id` | Application-defined Flow id. |
+| `state` | Current durable state, such as `queued`, `created`, or `charged`. |
+| `payload` / value refs | Small routing payload plus optional named values stored separately. |
+| lease | Worker claim ownership with fencing. |
+| history | State changes, signals, retries, and terminal events. |
+| terminal status | Completed, failed, cancelled, or still active. |
+
+The core loop is explicit:
 
 ```text
 FLOW.CREATE -> FLOW.CLAIM_DUE -> handler -> FLOW.TRANSITION / COMPLETE / FAIL / RETRY
 ```
 
-FerricFlow uses explicit durable states and worker outcomes. State, leases,
-history, payload refs, and transitions are stored as durable server state.
+Queue workers usually process one state and complete/fail/retry. Workflow workers process multiple named states and return explicit transitions.
 
-## Why FerricFlow?
-
-Most durable execution systems make you choose between two extremes:
-
-- a workflow runtime when your application wants code-driven orchestration
-- a queue plus app code, where you rebuild leases, retries, state, history, and fanout yourself
-
-FerricFlow sits in the middle: server-side durable workflow primitives that are
-simple enough to use through Redis protocol, but strong enough for production
-work queues and state machines.
-
-| Capability | What FerricFlow provides |
-| --- | --- |
-| Durable create | Flow state is written through Raft and disk-backed storage before success. |
-| Claim leases | Workers claim due work with leases and fencing. |
-| Explicit state machine | Transitions move a flow from one state to the next. |
-| Terminal commands | Complete, fail, cancel, retry, rewind, and reclaim are first-class. |
-| History | State changes are recorded for audit/debugging. |
-| Value refs | Large or optional values can be stored separately and hydrated only when needed. |
-| Fanout | Parent flows can spawn many child flows without making users build routing logic. |
-| Backpressure | Server overload returns clean rejections instead of silently eating memory. |
-
-## What makes it different?
-
-FerricFlow stores Flow state, due indexes, leases, history, value refs, and
-retention as part of the server contract.
-
-That gives you:
-
-- **one durable truth** — Raft log plus Bitcask Flow records
-- **fast hot indexes** — native ordered indexes for due/running/state lookups
-- **payload-safe workflows** — payload/value bytes are separate from hot Flow metadata
-- **Redis-compatible access** — use RESP clients, pipelines, ACLs, and familiar deployment patterns
-- **explicit workflow state** — handlers return durable outcomes such as transition, retry, complete, or fail
-
-## Quick start with Python SDK
-
-Install the Python SDK:
-
-```bash
-pip install ferricstore
-```
-
-Run FerricStore locally:
+## Run Locally
 
 ```bash
 docker run -p 6379:6379 \
@@ -73,7 +42,41 @@ docker run -p 6379:6379 \
   ferricstore/ferricstore
 ```
 
-Create a durable queue item and process it:
+`FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
+
+## First Flow Over RESP
+
+FerricFlow commands are available over the Redis-compatible protocol, so normal RESP clients can use pipelines, ACLs, TLS, and existing connection pools.
+
+Durable queue item:
+
+```text
+FLOW.CREATE email email-1 STATE queued PAYLOAD "welcome:user-1"
+FLOW.CLAIM_DUE email STATE queued WORKER worker-1 LIMIT 100
+FLOW.COMPLETE email-1 WORKER worker-1 LEASE <lease-token> RESULT "sent"
+```
+
+Explicit state transition:
+
+```text
+FLOW.CREATE order order-1 STATE created PAYLOAD "order payload"
+FLOW.CLAIM_DUE order STATE created WORKER worker-1 LIMIT 1
+FLOW.TRANSITION order-1 WORKER worker-1 LEASE <lease-token> TO charged
+FLOW.CLAIM_DUE order STATE charged WORKER worker-1 LIMIT 1
+FLOW.COMPLETE order-1 WORKER worker-1 LEASE <lease-token> RESULT "ok"
+```
+
+Because this is RESP, Flow commands and normal Redis-compatible commands can be pipelined on the same connection.
+
+## Python SDK
+
+Install:
+
+```bash
+pip install ferricstore
+```
+
+Durable queue:
 
 ```python
 from ferricstore import QueueClient
@@ -92,7 +95,7 @@ def send_email(job):
 emails.worker(concurrency=10, batch_size=100).run(send_email)
 ```
 
-Create an explicit workflow/state machine:
+Explicit state-machine workflow:
 
 ```python
 from ferricstore import WorkflowClient, complete, transition
@@ -117,28 +120,93 @@ order.start("order-1", payload=b"order payload", idempotent=True)
 order.worker(states=["created", "charged"]).run()
 ```
 
-Python SDK:
+The SDK handles claim leases and fencing. Handlers return durable outcomes such as `transition(...)`, `complete(...)`, `retry(...)`, or `fail(...)`.
+
+Python SDK links:
 
 - Package: <https://pypi.org/project/ferricstore/>
 - Repository: <https://github.com/ferricstore/ferricstore-python>
 
-## Quick start with RESP commands
+## Core FerricFlow Primitives
 
-FerricFlow commands are available over the Redis-compatible protocol.
+### Signals
 
-```text
-FLOW.CREATE email email-1 STATE queued PAYLOAD "welcome:user-1"
-FLOW.CLAIM_DUE email STATE queued WORKER worker-1 LIMIT 100
-FLOW.COMPLETE email-1 WORKER worker-1 LEASE <lease-token> RESULT "sent"
+Signals record external events durably and can optionally move a Flow to another state.
+
+```python
+from ferricstore import WorkflowClient
+
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+approval = client.workflow(type="approval", initial_state="waiting")
+approval.start("approval-1", payload=b"invoice:123", idempotent=True)
+
+approval.signal(
+    "approval-1",
+    signal="approved",
+    if_state="waiting",
+    transition_to="approved",
+    idempotency_key="approve-approval-1",
+)
 ```
 
-Because this is RESP, clients can pipeline normal Redis commands and Flow
-commands on the same connection.
+### Value Refs
 
-## Durable store underneath
+Named values let a Flow store large or optional bytes separately from hot state. Workers hydrate only the values they ask for.
 
-FerricStore still includes a Redis-compatible durable key-value/data-structure
-store. Normal commands are durable by default:
+```python
+from ferricstore import QueueClient
+
+client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+orders = client.queue(type="order")
+
+orders.enqueue(
+    "order-1",
+    payload=b"small routing bytes",
+    values={"invoice": invoice_pdf_bytes, "customer": customer_snapshot_bytes},
+)
+
+orders.worker(claim_values=["customer"]).run(handle_customer_step)
+```
+
+### Fanout
+
+A parent Flow can spawn child Flows. Children run independently with their own state, retries, leases, history, and terminal status; parent/child links are queryable later.
+
+```python
+from ferricstore import ChildSpec, WorkflowClient, transition
+
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+campaign = client.workflow(type="campaign", initial_state="dispatch")
+
+
+@campaign.state("dispatch")
+def dispatch(job):
+    job.flow.spawn_children(
+        [
+            ChildSpec(
+                id=f"device:{device_id}:cmd:{job.id}",
+                type="device-command",
+                payload=device_id.encode(),
+            )
+            for device_id in device_ids
+        ],
+        wait_state="done",
+    )
+    return transition("waiting_for_children")
+```
+
+## Failure Model
+
+- Flow state is durable before `FLOW.CREATE`, transition, retry, complete, fail, or cancel returns success.
+- `FLOW.CLAIM_DUE` grants a lease and lease token to a worker.
+- Terminal or transition commands must present the current lease token, so stale workers cannot overwrite newer claims.
+- If a worker crashes after claiming, the Flow becomes claimable again after the lease expires or is reclaimed.
+- Handlers are normal application code. FerricFlow does not replay handler code to recover state.
+- History and cold query projections may lag briefly, but current Flow state is the source of truth.
+
+## Durable Store Underneath
+
+FerricStore also exposes a Redis-compatible durable key-value/data-structure store:
 
 ```text
 SET user:42:name alice
@@ -147,12 +215,11 @@ HSET order:1 status paid
 ZADD due 1700000000000 flow-1
 ```
 
-Every write goes through Raft consensus and disk-backed storage before success is
-reported. There is no separate “turn persistence on” mode.
+Writes go through Raft consensus and disk-backed storage before success is reported. There is no separate mode to turn persistence on.
 
 | Property | How |
 | --- | --- |
-| Atomic | Each command is a single Raft log entry, applied or not. |
+| Atomic | Each command is one Raft log entry, applied or not. |
 | Consistent | Raft linearizability for committed writes. |
 | Isolated | Single-threaded state machine per shard. |
 | Durable | WAL, disk-backed storage, and Raft quorum before ack. |
@@ -171,42 +238,61 @@ FerricStore can also run inside an Elixir application.
 {:ok, "alice"} = FerricStore.get("user:42:name")
 ```
 
-## Use cases
+FerricFlow is also available through embedded `FerricStore.flow_*` functions and the high-level Elixir Flow SDK.
 
-- durable work queues
-- explicit state-machine workflows
-- queued workflow execution
-- AI orchestration and tool execution
-- IoT fanout and command tracking
-- saga steps with retry/fail/compensation state
-- human approval workflows
-- durable cache/data-structure storage
+## Documentation
 
-## Flow docs
+Start here:
 
-- [Flow production readiness](docs/flow-production-readiness.md) — operational model, lagged projections, retention, reclaim, and production tuning.
-- [Flow retry policy](docs/flow-retry-policy.md) — type/state retry policies and retry exhaustion behavior.
-- [Elixir Flow SDK](guides/flow-elixir-sdk.md) — high-level embedded workflow/state-machine API over core Flow commands.
-- [Workflow usage examples](docs/flow-vs-temporal-usage.md) — code-shape examples for queues, workflows, retries, fanout, signals, and value refs.
-- [Flow command reference](guides/commands.md) — `FLOW.*` command syntax alongside Redis-compatible commands.
+- [Getting Started](guides/getting-started.md) — installation, configuration, first commands.
+- [Workflow usage examples](docs/flow-vs-temporal-usage.md) — queues, workflows, retries, fanout, signals, and value refs.
 - [Benchmarks](docs/benchmarks.md) — latest Azure FerricFlow and KV SET/GET results.
 
-## Guides
+FerricFlow:
 
-- [Getting Started](guides/getting-started.md) — installation, configuration, first commands
-- [Architecture](guides/architecture.md) — write path, read path, storage, Raft consensus
-- [Commands Reference](guides/commands.md) — Redis-compatible and FerricFlow command syntax
-- [Configuration](guides/configuration.md) — server config and production defaults
-- [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering
-- [Security](guides/security.md) — ACL, TLS, protected mode
-- [Best Practices](guides/best-practices.md) — pipelining, key design, partitioning
-- [Benchmarks](docs/benchmarks.md) — latest Azure FerricFlow and KV SET/GET results
+- [Flow command reference](guides/commands.md) — `FLOW.*` command syntax alongside Redis-compatible commands.
+- [Flow retry policy](docs/flow-retry-policy.md) — type/state retry policies and retry exhaustion behavior.
+- [Flow production readiness](docs/flow-production-readiness.md) — operational model, lagged projections, retention, reclaim, and production tuning.
+- [Elixir Flow SDK](guides/flow-elixir-sdk.md) — high-level embedded workflow/state-machine API over core Flow commands.
 
-## Requirements
+Operations and reference:
+
+- [Architecture](guides/architecture.md) — write path, read path, storage, Raft consensus.
+- [Commands Reference](guides/commands.md) — Redis-compatible and FerricFlow command syntax.
+- [Configuration](guides/configuration.md) — server config and production defaults.
+- [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering.
+- [Security](guides/security.md) — ACL, TLS, protected mode.
+- [Best Practices](guides/best-practices.md) — pipelining, key design, partitioning.
+
+## Development
+
+Source builds require:
 
 - Elixir >= 1.19
 - Erlang/OTP 28+
-- Rust toolchain for NIF compilation, or precompiled binaries when available
+- Rust stable toolchain
+
+```bash
+mix deps.get
+mix compile
+mix test
+```
+
+Run from source:
+
+```bash
+MIX_ENV=prod FERRICSTORE_DATA_DIR=/tmp/ferricstore mix run --no-halt
+```
+
+Build a release:
+
+```bash
+MIX_ENV=prod mix release ferricstore
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see [SECURITY.md](SECURITY.md).
 
 ## License
 
