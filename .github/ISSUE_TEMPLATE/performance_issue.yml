@@ -1,0 +1,35 @@
+name: Performance issue
+description: Report throughput, latency, memory, disk, or recovery performance issues
+title: "perf: "
+labels: [performance]
+body:
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: Commands, Flow pattern, payload size, concurrency, shard count, client settings.
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Observed numbers
+      description: Throughput, latency percentiles, RSS, disk growth, projection lag, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected numbers or baseline
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, VM/instance type, storage type, Elixir/OTP, Rust, FerricStore commit.
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Profiles or logs
+      render: text

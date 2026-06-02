@@ -1,0 +1,39 @@
+name: Bug report
+description: Report incorrect behavior in FerricStore or FerricFlow
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal steps, commands, or code to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Elixir/OTP, Rust, deployment mode, hardware if relevant.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: text

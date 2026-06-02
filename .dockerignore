@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+.github
+
+# Build outputs
+_build
+deps
+cover
+test-results
+
+# Native build outputs
+**/target
+**/.cargo
+
+# Local/runtime data
+data
+tmp
+*.log
+*.dump
+
+# Bench outputs
+bench/results
+bench/output
+
+# Terraform/local cloud state
+**/.terraform
+**/*.tfstate
+**/*.tfstate.backup
+**/*.tfplan
+**/terraform.tfvars
+
+# Local tooling
+.mcp.json
+.DS_Store
+
+# Docs/editor noise
+*.swp
+*.swo
