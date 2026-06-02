@@ -1,6 +1,8 @@
 # Embedded Mode
 
-Embedded mode lets you use FerricStore as an in-process key-value store inside your Elixir application. No TCP listener, no RESP3 protocol, no network overhead. You interact with FerricStore through the `FerricStore` module, which calls directly into the same shard routing and group-commit pipeline that standalone mode uses.
+Embedded mode runs FerricStore inside your Elixir application. There is no TCP listener and no RESP serialization; your code calls the public `FerricStore` module directly.
+
+Use this guide after [Getting Started](getting-started.md). It covers setup, first commands, behavior differences from TCP/RESP mode, and the embedded API reference.
 
 ## When to Use Embedded Mode
 
@@ -43,11 +45,47 @@ In embedded mode, these options are **not used** and can be omitted:
 
 ### 3. Start Using It
 
-FerricStore starts automatically with your application (it is an OTP application with `mod: {Ferricstore.Application, []}`). Once started, call functions on the `FerricStore` module:
+FerricStore starts automatically with your application. The public API module is `FerricStore`; internal supervision modules use the internal `Ferricstore.*` namespace. Once started, call functions on `FerricStore`:
 
 ```elixir
 :ok = FerricStore.set("session:abc", session_data, ttl: :timer.minutes(30))
 {:ok, data} = FerricStore.get("session:abc")
+```
+
+
+## Quick Examples
+
+Store a short-lived cache value:
+
+```elixir
+:ok = FerricStore.set("cache:user:42", :erlang.term_to_binary(user), ttl: :timer.minutes(10))
+{:ok, encoded} = FerricStore.get("cache:user:42")
+user = :erlang.binary_to_term(encoded)
+```
+
+Use an atomic counter:
+
+```elixir
+{:ok, 1} = FerricStore.incr("rate:user:42")
+:ok = FerricStore.expire("rate:user:42", 60_000)
+```
+
+Use a hash for structured fields:
+
+```elixir
+:ok = FerricStore.hset("profile:42", %{"name" => "alice", "plan" => "pro"})
+{:ok, "pro"} = FerricStore.hget("profile:42", "plan")
+```
+
+Use FerricFlow directly from embedded mode:
+
+```elixir
+:ok = FerricStore.flow_create("email-1", type: "email", state: "queued", payload: "welcome:user-1")
+{:ok, [job]} = FerricStore.flow_claim_due("email", state: "queued", worker: "worker-1", limit: 1)
+{:ok, _} = FerricStore.flow_complete(job.id, job.lease_token,
+  fencing_token: job.fencing_token,
+  result: "sent"
+)
 ```
 
 ## Behavior Differences from RESP3 Mode
@@ -63,7 +101,7 @@ The embedded API (`FerricStore` module) and the RESP3/TCP mode execute the same 
 | **ACL** | Per-connection ACL enforcement | No ACL checks |
 | **Client tracking** | `CLIENT TRACKING` with invalidation messages | Not applicable |
 
-## Elixir API -- Complete Reference
+## API Reference
 
 ### Strings
 
@@ -242,8 +280,7 @@ false = FerricStore.hexists("user:42", "email")
 > **Blocking list commands (`BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`) are not
 > available in embedded mode.** These commands require a persistent TCP
 > connection to block on. In embedded mode, use `lpop`/`rpop` with a polling
-> loop, or subscribe to list-push events via Phoenix PubSub for a
-> reactive pattern.
+> loop or your application's own notification mechanism.
 
 ### Sets
 

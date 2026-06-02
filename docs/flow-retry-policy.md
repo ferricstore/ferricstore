@@ -1,129 +1,144 @@
 # Flow Retry Policy
 
-Flow retry policy controls what `FLOW.RETRY` and `FLOW.RETRY_MANY` do after a leased
-worker returns work to the scheduler.
+Retry policy controls what happens when a leased Flow should be tried again.
 
-Policy precedence is:
+A retry can:
 
-1. Built-in default.
-2. Type policy from `FLOW.POLICY.SET`.
-3. State policy from `FLOW.POLICY.SET ... STATE <state> ...`.
-4. Command-local retry policy on `FLOW.RETRY` or `FLOW.RETRY_MANY`.
+- put the Flow back into a due state later;
+- apply fixed or exponential backoff;
+- stop retrying after a maximum retry count;
+- move the Flow to a terminal or manual state when exhausted.
 
-The effective policy is evaluated inside the Flow apply path. The durable source
-of truth is Ra/Bitcask Flow state plus the stored policy key. LMDB receives the
-policy asynchronously as a cold projection only; Flow command correctness does not
-wait for LMDB.
+Retry is per Flow. Child Flows, fanout Flows, and ordinary queue items each track their own retry state.
 
-## Defaults And Guards
-
-Default retry policy:
+## Mental Model
 
 ```text
-MAX_RETRIES 3
-BACKOFF EXPONENTIAL
-BASE_MS 1000
-MAX_MS 30000
-JITTER_PCT 20
-EXHAUSTED_TO failed
+claim due work
+-> handler fails or returns retry(...)
+-> FerricFlow validates the lease token
+-> retry count increases
+-> next due time is scheduled
+-> worker can claim again when due
 ```
 
-Guards:
+If retry budget is exhausted, FerricFlow applies the exhaustion rule from the effective policy.
 
-- `MAX_RETRIES` must be `0..1000`.
-- `MAX_RETRIES` counts scheduled retries after the first failed run. `0` means
-  the first `FLOW.RETRY` exhausts immediately.
-- `BASE_MS` and `MAX_MS` must be `0..2592000000` (30 days).
-- `JITTER_PCT` must be `0..100`.
-- `BACKOFF` must be `NONE`, `FIXED`, `LINEAR`, or `EXPONENTIAL`.
-- `EXHAUSTED_TO` can be any non-empty state except `running`.
-- Terminal states are fixed: `completed`, `failed`, `cancelled`.
+## Attempts vs Retries
 
-## Redis Commands
-
-Set a type default:
+`MAX_RETRIES` is the number of retry operations after the initial attempt.
 
 ```text
-FLOW.POLICY.SET checkout MAX_RETRIES 5 BACKOFF EXPONENTIAL BASE_MS 1000 MAX_MS 60000 JITTER_PCT 10 EXHAUSTED_TO failed
+MAX_RETRIES 0  -> one attempt only, no retries
+MAX_RETRIES 1  -> initial attempt + one retry
+MAX_RETRIES 5  -> initial attempt + five retries
 ```
 
-Set per-state overrides in the same command:
+This keeps the policy aligned with normal application language: retries are extra attempts after the first failure.
+
+## Policy Precedence
+
+FerricFlow resolves retry policy in this order:
+
+| Level | Meaning |
+| --- | --- |
+| State policy | Most specific. Applies to one Flow type and state. |
+| Type policy | Applies to every state of the Flow type. |
+| Command outcome | `retry(...)` can provide per-attempt error/result data. |
+| Default | Safe default behavior if no policy is installed. |
+
+## Python SDK
+
+```python
+from ferricstore import ExceptionPolicy, RetryPolicy, retry, transition
+
+order = client.workflow(
+    type="order",
+    initial_state="charge",
+    retry_policy=RetryPolicy(max_retries=5, backoff="exponential"),
+)
+
+
+@order.state("charge", exception_policy=ExceptionPolicy.RETRY)
+def charge(job):
+    result = charge_card(job.payload)
+    if result.rate_limited:
+        return retry(error=b"rate limited")
+    return transition("ship")
+```
+
+Unhandled handler exceptions follow `exception_policy`. Explicit `retry(...)` is for application-known retry decisions.
+
+## RESP Commands
+
+Install or update policy for a Flow type:
 
 ```text
-FLOW.POLICY.SET checkout \
-  MAX_RETRIES 5 EXHAUSTED_TO failed \
-  STATE charge_card MAX_RETRIES 2 BACKOFF FIXED BASE_MS 10000 MAX_MS 10000 JITTER_PCT 0 EXHAUSTED_TO payment_failed
+FLOW.POLICY.SET order MAX_RETRIES 5 BACKOFF exponential BASE_MS 1000 MAX_MS 60000
 ```
 
-Read effective policy:
+Install state-specific policy:
 
 ```text
-FLOW.POLICY.GET checkout
-FLOW.POLICY.GET checkout STATE charge_card
+FLOW.POLICY.SET order STATE charge MAX_RETRIES 5 BACKOFF exponential BASE_MS 1000 MAX_MS 60000
 ```
 
-Command-local override:
+Retry a leased Flow:
 
 ```text
-FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 1 EXHAUSTED_TO payment_failed
+FLOW.RETRY order-1 <lease-token> FENCING <fencing-token> ERROR "rate limited"
 ```
 
-Exhaust immediately on the first failed run and move to the terminal `failed`
-state:
+The `lease_token` and `FENCING` token come from `FLOW.CLAIM_DUE`. Stale workers cannot retry or complete a Flow after another worker has claimed it.
 
-```text
-FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 0 EXHAUSTED_TO failed
-```
-
-Exhaust immediately into an active/manual state that can be claimed again:
-
-```text
-FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 0 EXHAUSTED_TO payment_failed
-```
-
-Terminal exhaustion clears `next_run_at_ms`; active-state exhaustion sets
-`next_run_at_ms` to the retry command time so workers can claim it immediately.
-Terminal exhaustion also runs normal terminal Flow hooks: parent child-group
-summaries, cross-shard parent updates, retention stamping, and child-close
-policy handling.
-
-## Embedded API
+## Embedded Elixir
 
 ```elixir
-FerricStore.flow_policy_set("checkout",
+FerricStore.flow_policy_set("order",
   retry: [
     max_retries: 5,
-    backoff: [kind: :exponential, base_ms: 1_000, max_ms: 60_000, jitter_pct: 10],
+    backoff: [kind: :exponential, base_ms: 1_000, max_ms: 60_000],
     exhausted_to: "failed"
   ],
   states: %{
-    "charge_card" => [
-      retry: [max_retries: 2, exhausted_to: "payment_failed"]
+    "charge" => [
+      retry: [
+        max_retries: 5,
+        backoff: [kind: :exponential, base_ms: 1_000, max_ms: 60_000],
+        exhausted_to: "failed"
+      ]
     ]
   }
 )
+```
 
-FerricStore.flow_policy_get("checkout", state: "charge_card")
+Retry from a leased claim:
 
-FerricStore.flow_retry(flow_id, lease_token,
-  fencing_token: fencing_token,
-  retry: [max_retries: 0, exhausted_to: "failed"]
+```elixir
+FerricStore.flow_retry(claim.id, claim.lease_token,
+  fencing_token: claim.fencing_token,
+  error: "rate limited"
 )
 ```
 
-## History Metadata
+## Exhaustion Behavior
 
-Retry history events include the effective retry decision and policy values used:
+When retry budget is exhausted, the effective policy decides the next state:
 
-- `retry_decision`: `scheduled` or `exhausted`.
-- `retry_run_state`: state to return to after retry.
-- `retry_next_run_at_ms`: computed or explicit next run time.
-- `retry_max_retries`.
-- `retry_backoff_kind`.
-- `retry_backoff_base_ms`.
-- `retry_backoff_max_ms`.
-- `retry_jitter_pct`.
-- `retry_exhausted_to`.
+| Exhaustion target | Behavior |
+| --- | --- |
+| `failed` | Flow becomes terminal failed. |
+| `cancelled` | Flow becomes terminal cancelled. |
+| `completed` | Flow becomes terminal completed. |
+| active/manual state | Flow moves to that state and is no longer retried by this policy. |
 
-This keeps debugging self-contained in `FLOW.HISTORY` without requiring the
-caller to reconstruct which policy was active at the time.
+Terminal exhaustion runs normal terminal hooks: history is recorded, terminal indexes/projections are updated asynchronously, and parent/child group hooks can observe child terminal status.
+
+## History And Debugging
+
+Retry events are visible in Flow history with retry count, error/result metadata, and due time. Use history to answer:
+
+- why the Flow retried;
+- how many retries were used;
+- when the next attempt was scheduled;
+- whether retry exhausted into a terminal or manual state.

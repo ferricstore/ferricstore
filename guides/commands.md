@@ -1,6 +1,10 @@
 # Commands Reference
 
-FerricStore implements 250+ commands covering standard Redis data types, probabilistic structures, and FerricStore-native operations. This guide documents each command with its exact syntax, return values, embedded API equivalent, and Redis compatibility notes.
+This is the command reference for the Redis-compatible server and FerricFlow.
+
+Start here if you need exact RESP syntax, return values, embedded API equivalents, or compatibility notes. For a first walkthrough, use [Getting Started](getting-started.md).
+
+FerricFlow commands use the `FLOW.*` prefix and model durable execution: create, claim due work, transition, retry, complete, fail, cancel, signal, value refs, and fanout.
 
 ## Redis Compatibility Summary
 
@@ -34,14 +38,15 @@ CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELL
 Flow commands are FerricStore-native workflow primitives, not Redis
 compatibility commands. They are exposed through RESP3 and the embedded API:
 
-`FLOW.CREATE`, `FLOW.CREATE_MANY`, `FLOW.SPAWN_CHILDREN`, `FLOW.GET`,
-`FLOW.CLAIM_DUE`, `FLOW.RECLAIM`, `FLOW.EXTEND_LEASE`, `FLOW.COMPLETE`,
-`FLOW.COMPLETE_MANY`, `FLOW.RETRY`, `FLOW.RETRY_MANY`, `FLOW.FAIL`,
-`FLOW.FAIL_MANY`, `FLOW.CANCEL`, `FLOW.CANCEL_MANY`, `FLOW.TRANSITION`,
-`FLOW.TRANSITION_MANY`, `FLOW.REWIND`, `FLOW.LIST`, `FLOW.BY_PARENT`,
-`FLOW.BY_ROOT`, `FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`,
-`FLOW.HISTORY`, `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.POLICY.SET`,
-`FLOW.POLICY.GET`, and `FLOW.RETENTION_CLEANUP`.
+`FLOW.CREATE`, `FLOW.CREATE_MANY`, `FLOW.VALUE.PUT`, `FLOW.SIGNAL`,
+`FLOW.SPAWN_CHILDREN`, `FLOW.GET`, `FLOW.CLAIM_DUE`, `FLOW.RECLAIM`,
+`FLOW.EXTEND_LEASE`, `FLOW.COMPLETE`, `FLOW.COMPLETE_MANY`, `FLOW.RETRY`,
+`FLOW.RETRY_MANY`, `FLOW.FAIL`, `FLOW.FAIL_MANY`, `FLOW.CANCEL`,
+`FLOW.CANCEL_MANY`, `FLOW.TRANSITION`, `FLOW.TRANSITION_MANY`,
+`FLOW.REWIND`, `FLOW.LIST`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`,
+`FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`, `FLOW.HISTORY`,
+`FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.POLICY.SET`, `FLOW.POLICY.GET`,
+and `FLOW.RETENTION_CLEANUP`.
 
 Production semantics, retry policy, history caps, LMDB cold projection, and
 operator metrics are documented in `docs/flow-production-readiness.md` and
@@ -70,8 +75,9 @@ documented in `guides/flow-elixir-sdk.md`.
 
 These are FerricStore-native commands:
 
-`CAS`, `LOCK`, `UNLOCK`, `EXTEND`, `RATELIMIT.ADD`, `FETCH_OR_COMPUTE`, `FETCH_OR_COMPUTE_RESULT`, `FETCH_OR_COMPUTE_ERROR`, `KEY_INFO`,
-`FERRICSTORE.CONFIG`, `FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`, `FERRICSTORE.DOCTOR`,
+`CAS`, `LOCK`, `UNLOCK`, `EXTEND`, `RATELIMIT.ADD`, `FETCH_OR_COMPUTE`,
+`FETCH_OR_COMPUTE_RESULT`, `FETCH_OR_COMPUTE_ERROR`, `FERRICSTORE.CONFIG`,
+`FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`, `FERRICSTORE.DOCTOR`,
 `CLUSTER.HEALTH`, `CLUSTER.STATS`, `CLUSTER.KEYSLOT`, `CLUSTER.SLOTS`
 
 ### Redis Commands Not Yet Supported
@@ -1104,13 +1110,13 @@ Cache-aside with stampede protection. The first caller to a missing key is desig
 | `FETCH_OR_COMPUTE_RESULT` | `FETCH_OR_COMPUTE_RESULT key value ttl_ms` | `+OK` |
 | `FETCH_OR_COMPUTE_ERROR` | `FETCH_OR_COMPUTE_ERROR key message` | `+OK` |
 
-### KEY_INFO
+### FERRICSTORE.KEY_INFO
 
 Returns diagnostic metadata about a key.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `KEY_INFO key` (or `FERRICSTORE.KEY_INFO key`) |
+| **RESP3 syntax** | `FERRICSTORE.KEY_INFO key` |
 | **Return** | Array: `[type, T, value_size, N, ttl_ms, N, hot_cache_status, hot\|cold, last_write_shard, N]` |
 
 ### FERRICSTORE.DOCTOR

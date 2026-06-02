@@ -1,40 +1,35 @@
-# Workflow Usage Examples
+# Workflow Runtime Shapes And FerricFlow Examples
 
-This is not a feature checklist. It shows code-shape examples for common
-workflow patterns.
+This document shows common workflow patterns in two shapes:
 
-The short version:
+| Shape | Description |
+| --- | --- |
+| Workflow-code runtime | Application code models workflow control flow and activities. Examples are conceptual. |
+| FerricFlow | FerricStore stores durable Flow records; workers claim states and return explicit outcomes. |
+
+FerricFlow’s model is the same across the examples:
 
 ```text
-Workflow-code examples: workflow code schedules activities
-FerricFlow examples: durable states, workers, signals, and explicit outcomes
+Flow record: type + id + state + payload/value refs + lease + history + terminal status
+Worker:      claim due state -> run handler -> transition/complete/fail/retry
 ```
 
-## 1. Durable queue item
+Handlers are normal application code. FerricFlow does not replay handler code to recover state.
 
-### Workflow-code shape
+## Durable Queue Item
 
-A queue-like workload can be modeled as a workflow or activity task:
+Workflow-code shape:
 
 ```python
-# conceptual Temporal shape
+# conceptual shape
 @workflow.defn
 class EmailWorkflow:
     @workflow.run
     async def run(self, user_id: str) -> None:
-        await workflow.execute_activity(
-            send_email,
-            user_id,
-            start_to_close_timeout=timedelta(seconds=30),
-        )
+        await workflow.execute_activity(send_email, user_id)
 ```
 
-The worker runs SDK workflow code, and workflow history is used to resume the
-workflow model correctly.
-
-### FerricFlow shape
-
-FerricFlow models it as durable work in a state:
+FerricFlow shape:
 
 ```python
 from ferricstore import QueueClient
@@ -53,31 +48,24 @@ def send_email(job):
 emails.worker(state="queued", concurrency=100, batch_size=500).run(send_email)
 ```
 
-The server owns the due index, lease, state mutation, and history. The handler is
-normal application code; it does not replay.
+Queue workers usually process one state and complete, fail, or retry.
 
-## 2. Multi-step workflow
+## State-Machine Workflow
 
-### Workflow-code shape
-
-A code-driven workflow runtime often expresses steps as workflow code:
+Workflow-code shape:
 
 ```python
-# conceptual Temporal shape
+# conceptual shape
 @workflow.defn
 class OrderWorkflow:
     @workflow.run
     async def run(self, order_id: str) -> str:
-        charge_id = await workflow.execute_activity(charge_card, order_id, ...)
-        await workflow.execute_activity(send_receipt, charge_id, ...)
+        charge_id = await workflow.execute_activity(charge_card, order_id)
+        await workflow.execute_activity(send_receipt, charge_id)
         return "ok"
 ```
 
-The workflow code represents the orchestration model.
-
-### FerricFlow shape
-
-FerricFlow expresses steps as durable states:
+FerricFlow shape:
 
 ```python
 from ferricstore import WorkflowClient, complete, transition
@@ -102,29 +90,50 @@ order.start("order-1", payload=b"order payload", idempotent=True)
 order.worker(states=["created", "charged"]).run()
 ```
 
-The state record is the orchestration source of truth. Returning
-`transition(...)`, `complete(...)`, `retry(...)`, or `fail(...)` from the handler
-asks FerricFlow to mutate state atomically with lease/fencing validation.
+Workflow workers process multiple named states and return explicit transitions.
 
-## 3. Retry after failure
+## Signals And External Events
 
-### Workflow-code shape
-
-A workflow runtime commonly configures retry policy on activities or workflows:
+Workflow-code shape:
 
 ```python
-# conceptual Temporal shape
+# conceptual shape
+@workflow.signal
+async def approve(self, user_id: str) -> None:
+    self.approved = True
+```
+
+FerricFlow shape:
+
+```python
+approval = client.workflow(type="approval", initial_state="waiting")
+approval.start("approval-1", payload=b"invoice:123", idempotent=True)
+
+approval.signal(
+    "approval-1",
+    signal="approved",
+    if_state="waiting",
+    transition_to="approved",
+    idempotency_key="approve-approval-1",
+)
+```
+
+Signals are durable history events. They can be idempotent, state-guarded, and can optionally move the Flow to another state.
+
+## Retry After Failure
+
+Workflow-code shape:
+
+```python
+# conceptual shape
 await workflow.execute_activity(
     charge_card,
     order_id,
     retry_policy=RetryPolicy(maximum_attempts=5),
-    start_to_close_timeout=timedelta(seconds=30),
 )
 ```
 
-### FerricFlow shape
-
-FerricFlow retry can be a worker default, state policy, or explicit outcome:
+FerricFlow shape:
 
 ```python
 from ferricstore import ExceptionPolicy, RetryPolicy, retry, transition
@@ -144,39 +153,27 @@ def charge(job):
     return transition("ship")
 ```
 
-`RetryPolicy` controls the durable retry schedule. `ExceptionPolicy.RETRY`
-handles unhandled handler exceptions. Explicit `retry(...)` is used when
-application code knows the current attempt should be retried. The retry decision
-becomes durable Flow state and history, and workers later claim the flow again
-when it is due.
+Retry state is durable. Workers claim the Flow again when its next due time arrives.
 
-## 4. Fanout
+## Fanout
 
-### Workflow-code shape
-
-A workflow runtime can fan out by starting many activities or child workflows from
-workflow code:
+Workflow-code shape:
 
 ```python
-# conceptual Temporal shape
+# conceptual shape
 children = [
     workflow.start_child_workflow(DeviceWorkflow.run, device_id)
     for device_id in device_ids
 ]
 ```
 
-The parent workflow code owns the fanout model in this shape.
-
-### FerricFlow shape
-
-FerricFlow fanout uses first-class child flows. The parent state handler creates
-children through the Flow context, so parent/child links are stored by the
-server:
+FerricFlow shape:
 
 ```python
 from ferricstore import ChildSpec, transition
 
 campaign = client.workflow(type="campaign", initial_state="dispatch")
+
 
 @campaign.state("dispatch")
 def dispatch(job):
@@ -194,286 +191,48 @@ def dispatch(job):
     return transition("waiting_for_children")
 ```
 
-The parent/child links are queryable later. Child flows are normal Flow records
-with their own state, lease, retry, terminal status, and history.
+Child Flows have their own state, retry, lease, history, and terminal status. Parent/child links are queryable later.
 
-If many children need the same large bytes, store those bytes as a Flow value and
-attach value refs instead of duplicating payload bytes in every child.
+## Value Refs For Large Optional Data
 
-## 5. Large optional payloads
-
-### Workflow-code shape
-
-Workflow applications often keep large data outside workflow history and pass
-references, or use payload codecs/converters carefully.
+Workflow-code shape:
 
 ```python
-# conceptual Temporal shape
-await workflow.execute_activity(process_invoice, invoice_blob_ref, ...)
+# conceptual shape
+await workflow.execute_activity(process_invoice, invoice_blob_ref)
 ```
 
-### FerricFlow shape
-
-FerricFlow has first-class value refs tied to a flow:
+FerricFlow shape:
 
 ```python
+orders = client.queue(type="order")
+
 orders.enqueue(
     "order-1",
     payload=b"small routing bytes",
-    values={
-        "invoice": invoice_pdf_bytes,
-        "customer": customer_snapshot_bytes,
-    },
+    values={"invoice": invoice_pdf_bytes, "customer": customer_snapshot_bytes},
 )
 
 orders.worker(claim_values=["customer"]).run(handle_customer_step)
 ```
 
-Only requested values are hydrated for the worker. Other values stay stored as
-Flow value refs and follow Flow retention policy.
+Only requested values are hydrated for the worker. Other values stay stored as Flow value refs and follow Flow retention policy.
 
-## 6. Investigating what happened
+## Failure Model
 
-### Workflow-code shape
+- Claiming work grants a lease and lease token.
+- Transition, retry, complete, fail, and cancel validate the current lease token.
+- If a worker crashes, the Flow becomes claimable again after lease expiry or reclaim.
+- Handlers can run more than once after crashes or retries; side effects should be idempotent or guarded by application keys.
+- Current Flow state is authoritative. History and cold projections may lag briefly.
 
-Workflow-runtime visibility is usually workflow-history centered: events,
-activity attempts, timers, signals, and search attributes.
-
-### FerricFlow shape
-
-FerricFlow history is state-transition and signal centered:
+## Inspecting History And State
 
 ```python
-record = orders.get("order-1")
-history = orders.history("order-1")
-children = orders.children("order-1")
+record = order.get("order-1")
+history = order.history("order-1")
+children = order.children("order-1")
+failed = order.terminals(state="failed", count=100)
 ```
 
-You inspect the current state, terminal result/error, retry attempts, parent/root
-links, value refs, and history events.
-
-
-## 7. Signals / external events
-
-### Workflow-code shape
-
-In a workflow-code shape, signals are methods on workflow code. A running
-workflow receives the signal and updates workflow state.
-
-```python
-# conceptual Temporal shape
-@workflow.defn
-class ApprovalWorkflow:
-    def __init__(self) -> None:
-        self.approved = False
-
-    @workflow.signal
-    async def approve(self, user_id: str) -> None:
-        self.approved = True
-
-    @workflow.run
-    async def run(self, request_id: str) -> str:
-        await workflow.wait_condition(lambda: self.approved)
-        return "approved"
-```
-
-### FerricFlow shape
-
-FerricFlow has an explicit signal command. A signal records the external event
-durably, can be idempotent, can be guarded by current state, and can optionally
-move the flow to another state.
-
-```python
-approval = client.workflow(type="approval", initial_state="waiting")
-
-approval.start("request-1", payload=b"approval request", idempotent=True)
-
-# Later, from an API handler or webhook:
-approval.signal(
-    "request-1",
-    signal="approved",
-    if_state="waiting",
-    transition_to="approved",
-    values={"approval": b"approved by user-42"},
-    idempotency_key="approval-request-1-user-42",
-)
-```
-
-The signal is visible in Flow history. If `transition_to` is provided, it also
-advances the durable state. No workflow code needs to be kept suspended in
-memory.
-
-## 8. Query current workflow state
-
-### Workflow-code shape
-
-In a workflow-code shape, queries are methods that read workflow state.
-
-```python
-# conceptual Temporal shape
-@workflow.query
-async def status(self) -> str:
-    return self.current_status
-```
-
-### FerricFlow shape
-
-FerricFlow queries read durable server state and indexes.
-
-```python
-record = approval.get("request-1")
-history = approval.history("request-1")
-children = approval.children("request-1")
-```
-
-For operational queries, use Flow list/index APIs through the SDK:
-
-```python
-waiting = approval.list(state="waiting", count=100)
-failed = approval.terminals(state="failed", count=100)
-```
-
-## 9. Timers / delayed work
-
-### Workflow-code shape
-
-In a workflow-code shape, timers are expressed inside workflow code:
-
-```python
-# conceptual Temporal shape
-await workflow.sleep(timedelta(hours=1))
-await workflow.execute_activity(send_reminder, request_id, ...)
-```
-
-### FerricFlow shape
-
-FerricFlow stores the next due time in the Flow record/index. Workers claim the
-flow only when it becomes due.
-
-```python
-from ferricstore import retry, transition
-
-
-@approval.state("waiting")
-def waiting(job):
-    if not is_approved(job.id):
-        return retry(error=b"still waiting", run_at_ms=one_hour_from_now_ms())
-    return transition("approved")
-```
-
-You can also create work directly for a future due time:
-
-```python
-reminders.enqueue(
-    "reminder-1",
-    payload=b"request-1",
-    run_at_ms=one_hour_from_now_ms(),
-    idempotent=True,
-)
-```
-
-## 10. Cancellation
-
-### Workflow-code shape
-
-In a workflow-code shape, cancellation is delivered to workflow/activity
-execution and handled by the SDK runtime.
-
-```python
-# conceptual Temporal shape
-await client.get_workflow_handle("request-1").cancel()
-```
-
-### FerricFlow shape
-
-FerricFlow cancellation is a terminal state mutation.
-
-```python
-approval.cancel("request-1", error=b"cancelled by user")
-```
-
-After cancellation, the flow is terminal and no longer claimable as normal due
-work. The cancellation appears in history and terminal queries.
-
-## 11. Human approval
-
-### Workflow-code shape
-
-A workflow-code shape often models human approval as workflow code waiting for a
-signal.
-
-```python
-# conceptual Temporal shape
-await workflow.wait_condition(lambda: self.approved or self.rejected)
-```
-
-### FerricFlow shape
-
-FerricFlow keeps the request in a durable state. The web/API layer sends a
-signal when the human acts.
-
-```python
-approval.start("approval-1", payload=b"invoice:123", idempotent=True)
-
-# User clicks approve:
-approval.signal(
-    "approval-1",
-    signal="approved",
-    if_state="waiting",
-    transition_to="approved",
-    idempotency_key="approve-approval-1",
-)
-
-# User clicks reject:
-approval.signal(
-    "approval-1",
-    signal="rejected",
-    if_state="waiting",
-    transition_to="rejected",
-    idempotency_key="reject-approval-1",
-)
-```
-
-Workers can process the next state normally:
-
-```python
-@approval.state("approved")
-def approved(job):
-    release_payment(job.payload)
-    return complete(result=b"released")
-```
-
-## 12. Continue-as-new / long histories
-
-### Workflow-code shape
-
-Workflow-code runtimes often use continue-as-new to keep workflow histories
-bounded.
-
-```python
-# conceptual Temporal shape
-return workflow.continue_as_new(next_input)
-```
-
-### FerricFlow shape
-
-FerricFlow stores current state separately from history and uses retention/cold
-projection for older history. Long-running processes normally stay as the same
-flow id unless the application wants to create a new generation explicitly.
-
-```python
-record = workflow.get("flow-1")
-history = workflow.history("flow-1")
-```
-
-If the application wants a new generation, create a new flow and link it through
-correlation/root metadata:
-
-```python
-workflow.start(
-    "flow-1:generation-2",
-    payload=record.payload,
-    correlation_id="flow-1",
-    idempotent=True,
-)
-```
+Use current state for decisions. Use history for debugging and audit.

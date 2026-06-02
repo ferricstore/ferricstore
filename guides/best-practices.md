@@ -1,8 +1,18 @@
 # Best Practices
 
+Use this after FerricStore is running. It covers key naming, batching, pipelining, value sizing, and performance-sensitive command choices.
+
 ## Use Hash Tags for Related Keys
 
 FerricStore shards data across multiple independent Raft groups. Each shard has its own WAL, its own fsync, and its own ETS table. When related keys land on the same shard, writes are batched into a single Raft command and a single fsync. When they land on different shards, each shard does its own fsync independently.
+
+### Good vs Bad Key Shapes
+
+| Goal | Prefer | Avoid |
+| --- | --- | --- |
+| Keep related user keys on one shard | `{user:42}:profile` and `{user:42}:cart` | `user:42:profile` and `user:42:cart` if cross-key commands need same shard |
+| Keep unrelated tenants spread out | `{tenant:a}:order:1`, `{tenant:b}:order:1` | one global tag for all tenants |
+| Preserve write parallelism | specific tags per user/tenant/device | forcing all keys into one tag |
 
 ### How hash tags work
 
@@ -93,7 +103,7 @@ All standalone-server writes use the Raft durability path. Namespace prefixes ca
 
 ```redis
 # Latency-sensitive state: short commit window
-FERRICSTORE.CONFIG SET "session:" window_ms 1
+FERRICSTORE.CONFIG SET "auth:" window_ms 1
 FERRICSTORE.CONFIG SET "order:" window_ms 1
 
 # Write-heavy data: larger batches
@@ -106,6 +116,18 @@ Design your key naming scheme around this:
 session:{user:42}:token     → namespace "session"
 cache:{product:99}:details  → namespace "cache"
 ```
+
+## FerricStore-Native Commands
+
+These commands are FerricStore-specific and are useful when they match your workload:
+
+| Command | Use case |
+| --- | --- |
+| `CAS` | Atomic compare-and-swap for optimistic updates. |
+| `FETCH_OR_COMPUTE` | Cache stampede protection. |
+| `LOCK` / `UNLOCK` / `EXTEND` | Explicit distributed lock operations. |
+| `RATELIMIT.ADD` | Namespace-aware rate limiting. |
+| `FLOW.*` | Durable execution: queues, workflows, signals, retries, leases, value refs. |
 
 ## Prefer Compound Operations Over Multiple Round-Trips
 
@@ -123,22 +145,29 @@ Each round-trip is a Raft commit. Fewer round-trips = fewer fsyncs = higher thro
 
 ## Pipeline Commands
 
-When sending multiple independent commands, pipeline them. Pipelines allow the group-commit batcher to collect more writes per batch, reducing the number of fsyncs:
+Pipelining is a client behavior, not a Redis command. The client sends multiple commands before waiting for replies, reducing round trips and helping FerricStore batch writes.
 
-```redis
-# Without pipelining: 3 separate Raft batches, 3 fsyncs
-SET key1 val1
-SET key2 val2
-SET key3 val3
+Elixir example with Redix:
 
-# With pipelining: potentially 1 Raft batch, 1 fsync
-PIPELINE
-SET key1 val1
-SET key2 val2
-SET key3 val3
+```elixir
+Redix.pipeline(conn, [
+  ["SET", "a", "1"],
+  ["SET", "b", "2"],
+  ["GET", "a"]
+])
 ```
 
-Most Redis client libraries support pipelining natively (e.g., `Redix.pipeline/2` in Elixir).
+Python redis-py example:
+
+```python
+pipe = redis.pipeline(transaction=False)
+pipe.set("a", "1")
+pipe.set("b", "2")
+pipe.get("a")
+pipe.execute()
+```
+
+FerricFlow SDKs use batching/pipelining internally where safe. Use explicit batch APIs when you need batch semantics; use client pipelining when you want independent commands with fewer network round trips.
 
 ## Size Your Values for the Hot Cache
 

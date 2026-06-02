@@ -1,5 +1,15 @@
 # Architecture
 
+This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the RESP server.
+
+Quick model:
+
+```text
+client command -> shard router -> Raft log -> state machine -> Bitcask/Flow records -> hot indexes/projections
+```
+
+FerricFlow current state is durable truth. Hot indexes are rebuildable serving structures. LMDB/history projections are query surfaces that can lag briefly.
+
 FerricStore is built around three core design principles: (1) all mutable state lives in Elixir where it is observable and debuggable, (2) Rust NIFs are pure stateless functions for I/O and CPU-intensive work, and (3) data is stored in the tier best suited to its access pattern.
 
 ## Overview
@@ -463,6 +473,16 @@ Lists are not promoted to dedicated Bitcask instances because the position-based
 Bitcask files are append-only and accumulate dead entries (overwritten or deleted keys). The merge subsystem compacts data files in the background.
 
 ### Architecture
+
+This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the RESP server.
+
+Quick model:
+
+```text
+client command -> shard router -> Raft log -> state machine -> Bitcask/Flow records -> hot indexes/projections
+```
+
+FerricFlow current state is durable truth. Hot indexes are rebuildable serving structures. LMDB/history projections are query surfaces that can lag briefly.
 
 ```
 Ferricstore.Merge.Supervisor (:one_for_one)

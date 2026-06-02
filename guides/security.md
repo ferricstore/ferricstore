@@ -1,5 +1,9 @@
 # Security
 
+This guide covers FerricStore server security: protected mode, ACL users, passwords, TLS, Erlang distribution, audit logs, and production limits.
+
+Local examples may disable protected mode for convenience. Production deployments should use protected mode, ACL, TLS where appropriate, private network binding, and a strong Erlang cookie for clustered nodes.
+
 FerricStore provides multiple layers of security: ACL user accounts with fine-grained permissions, TLS encryption, protected mode, password hashing, and audit logging.
 
 ## Access Control Lists (ACL)

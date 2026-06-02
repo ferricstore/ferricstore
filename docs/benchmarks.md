@@ -1,6 +1,8 @@
 # Benchmarks
 
-These numbers are intended as reproducible engineering reference points, not universal hardware claims. They use one FerricStore server VM and one client VM on Azure, with local NVMe where noted.
+This page keeps only the latest public benchmark summaries. Raw benchmark logs and one-off profiling runs are intentionally not committed.
+
+Use these numbers as reproducible reference points, not universal hardware claims. Throughput and latency depend on VM type, local NVMe availability, shard count, client concurrency, pipeline depth, payload size, and resource guards.
 
 ## FerricFlow: latest Azure runs
 

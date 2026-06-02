@@ -9,7 +9,49 @@ state-machine workflows. It builds on `FerricStore.flow_*` commands. It does not
 add a replay engine, does not use RESP, and does not change Flow durability or
 atomicity.
 
-## Architecture
+
+## First Workflow
+
+Start with one state that completes or retries:
+
+```elixir
+defmodule EmailFlow do
+  use FerricStore.Flow.Workflow,
+    type: "email",
+    initial_state: :queued
+
+  state :queued do
+    lease_ms 30_000
+    on_ok complete()
+    on_error retry_or: :failed
+  end
+
+  state :failed do
+    on_ok complete()
+  end
+end
+```
+
+Create and run one unit of work:
+
+```elixir
+{:ok, _flow} =
+  EmailFlow.create(%{
+    id: "email-1",
+    payload: "welcome:user-1"
+  })
+
+EmailFlow.run_once(:queued, worker: "worker-1", handler: fn job ->
+  send_email(job.payload)
+  {:ok, "sent"}
+end)
+
+{:ok, history} = EmailFlow.history("email-1")
+```
+
+The SDK handles command construction. Flow core still handles leases, fencing, durable state, and history.
+
+## How It Works Internally
 
 ```text
 Workflow SDK
@@ -73,7 +115,7 @@ use FerricStore.Flow.Workflow, type: "billing"
 
 Every generated command uses this Flow type.
 
-`store` selects the embedded API module. Default is `FerricStore`.
+`store` selects the embedded API module. Default is `FerricStore`. Most applications should omit this option.
 
 ```elixir
 use FerricStore.Flow.Workflow,

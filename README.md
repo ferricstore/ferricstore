@@ -51,19 +51,19 @@ FerricFlow commands are available over the Redis-compatible protocol, so normal 
 Durable queue item:
 
 ```text
-FLOW.CREATE email email-1 STATE queued PAYLOAD "welcome:user-1"
+FLOW.CREATE email-1 TYPE email STATE queued PAYLOAD "welcome:user-1"
 FLOW.CLAIM_DUE email STATE queued WORKER worker-1 LIMIT 100
-FLOW.COMPLETE email-1 WORKER worker-1 LEASE <lease-token> RESULT "sent"
+FLOW.COMPLETE email-1 <lease-token> FENCING <fencing-token> RESULT "sent"
 ```
 
 Explicit state transition:
 
 ```text
-FLOW.CREATE order order-1 STATE created PAYLOAD "order payload"
+FLOW.CREATE order-1 TYPE order STATE created PAYLOAD "order payload"
 FLOW.CLAIM_DUE order STATE created WORKER worker-1 LIMIT 1
-FLOW.TRANSITION order-1 WORKER worker-1 LEASE <lease-token> TO charged
+FLOW.TRANSITION order-1 running charged LEASE_TOKEN <lease-token> FENCING <fencing-token>
 FLOW.CLAIM_DUE order STATE charged WORKER worker-1 LIMIT 1
-FLOW.COMPLETE order-1 WORKER worker-1 LEASE <lease-token> RESULT "ok"
+FLOW.COMPLETE order-1 <lease-token> FENCING <fencing-token> RESULT "ok"
 ```
 
 Because this is RESP, Flow commands and normal Redis-compatible commands can be pipelined on the same connection.
@@ -198,8 +198,8 @@ def dispatch(job):
 ## Failure Model
 
 - Flow state is durable before `FLOW.CREATE`, transition, retry, complete, fail, or cancel returns success.
-- `FLOW.CLAIM_DUE` grants a lease and lease token to a worker.
-- Terminal or transition commands must present the current lease token, so stale workers cannot overwrite newer claims.
+- `FLOW.CLAIM_DUE` grants a lease token and fencing token to a worker.
+- Terminal or transition commands must present the current lease/fencing data, so stale workers cannot overwrite newer claims.
 - If a worker crashes after claiming, the Flow becomes claimable again after the lease expires or is reclaimed.
 - Handlers are normal application code. FerricFlow does not replay handler code to recover state.
 - History and cold query projections may lag briefly, but current Flow state is the source of truth.

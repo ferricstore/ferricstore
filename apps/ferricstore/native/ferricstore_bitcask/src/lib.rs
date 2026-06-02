@@ -35,6 +35,27 @@
 #![allow(clippy::map_flatten)]
 // format!("{}", x) vs format!("{x}") — both fine, don't force inline:
 #![allow(clippy::uninlined_format_args)]
+// Rustler NIF exported functions often have BEAM-shaped signatures and large
+// encode/decode bodies. These lints do not signal correctness issues here.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::elidable_lifetime_names)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::unnecessary_debug_formatting)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::implicit_clone)]
+#![allow(clippy::float_cmp)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::used_underscore_binding)]
+#![allow(clippy::unnecessary_literal_unwrap)]
+#![allow(clippy::needless_continue)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::large_stack_arrays)]
+#![allow(clippy::match_bool)]
+#![allow(clippy::single_match)]
+#![allow(clippy::option_option)]
 
 pub mod async_io;
 pub mod bloom;

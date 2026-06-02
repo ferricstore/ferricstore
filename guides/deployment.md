@@ -1,5 +1,14 @@
 # Deployment Guide
 
+This guide covers running FerricStore as a server: native release, Docker, Kubernetes, and cluster layouts. For local development, start with [Getting Started](getting-started.md). For production security, pair this guide with [Security](security.md).
+
+Recommended path:
+
+1. Use Docker for local smoke tests.
+2. Use a native release or container image for production.
+3. Put data on durable fast storage; use local NVMe for benchmarks.
+4. Enable protected mode, ACL, and TLS before exposing the server.
+
 ## Native Release (Recommended for Benchmarks)
 
 Build and run directly on the host for maximum performance:

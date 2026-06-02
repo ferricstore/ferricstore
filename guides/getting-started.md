@@ -1,303 +1,160 @@
 # Getting Started
 
-This guide walks you through installing FerricStore, configuring it for your use case, and running your first commands. By the end, you will have a working key-value store -- either embedded inside your Elixir application or running as a standalone Redis-compatible server.
+This guide gets you to a first successful FerricStore command quickly, then points you to the deeper guides.
 
-## Choosing a Deployment Mode
+FerricStore has two common ways to run:
 
-FerricStore supports two operational modes:
+| Mode | Use when |
+| --- | --- |
+| Docker/server | You want a Redis-compatible TCP server for Python, Go, Node, Java, Elixir, or redis-cli clients. |
+| Embedded Elixir | You want FerricStore inside an Elixir application with direct `FerricStore.*` calls. |
 
-- **Embedded** -- the store runs inside your Elixir application as an OTP supervised process tree. No TCP listener, no RESP3 parsing, no network overhead. You interact with it through the `FerricStore` Elixir module. This is the recommended mode when FerricStore and your application live in the same BEAM node.
+FerricFlow is available in both modes. It is the durable execution layer for queues, state-machine workflows, retries, leases, signals, value refs, and fanout.
 
-- **Standalone** -- FerricStore runs as a full Redis-compatible server with a TCP listener, RESP3 protocol handling, ACL authentication, TLS, health endpoints, and Prometheus metrics. Connect with `redis-cli`, Redix, or any Redis client library in any language.
+## 1. Run The Server With Docker
 
-You can always start with embedded mode and add standalone later -- the core engine is the same.
+```bash
+docker run -p 6379:6379 \
+  -e FERRICSTORE_PROTECTED_MODE=false \
+  -v ferricstore_data:/data \
+  ferricstore/ferricstore
+```
 
-## Installation
+`FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
 
-### Embedded Mode
+Smoke test with `redis-cli`:
 
-Add `ferricstore` to your dependencies:
+```bash
+redis-cli -p 6379 PING
+redis-cli -p 6379 SET hello world
+redis-cli -p 6379 GET hello
+```
+
+## 2. Create Your First Flow
+
+A Flow is one durable execution record with a `type`, `id`, `state`, payload/value refs, lease, history, and terminal status.
+
+```text
+FLOW.CREATE email-1 TYPE email STATE queued PAYLOAD "welcome:user-1"
+FLOW.CLAIM_DUE email STATE queued WORKER worker-1 LIMIT 1
+FLOW.COMPLETE email-1 <lease-token> FENCING <fencing-token> RESULT "sent"
+```
+
+For a state machine, return a transition instead of completing immediately:
+
+```text
+FLOW.CREATE order-1 TYPE order STATE created PAYLOAD "order payload"
+FLOW.CLAIM_DUE order STATE created WORKER worker-1 LIMIT 1
+FLOW.TRANSITION order-1 running charged LEASE_TOKEN <lease-token> FENCING <fencing-token>
+```
+
+## 3. Use The Python SDK
+
+```bash
+pip install ferricstore
+```
+
+Queue worker:
+
+```python
+from ferricstore import QueueClient
+
+client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+emails = client.queue(type="email")
+
+emails.enqueue("email-1", payload=b"welcome:user-1", idempotent=True)
+
+
+def send_email(job):
+    print(job.id, job.payload)
+    return b"sent"
+
+
+emails.worker(concurrency=10, batch_size=100).run(send_email)
+```
+
+Workflow worker:
+
+```python
+from ferricstore import WorkflowClient, complete, transition
+
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+order = client.workflow(type="order", initial_state="created")
+
+
+@order.state("created")
+def created(job):
+    charge_card(job.payload)
+    return transition("charged")
+
+
+@order.state("charged")
+def charged(job):
+    send_receipt(job.id)
+    return complete(result=b"ok")
+
+
+order.start("order-1", payload=b"order payload", idempotent=True)
+order.worker(states=["created", "charged"]).run()
+```
+
+The SDK handles claim leases and fencing. Your handler returns a durable outcome such as `transition(...)`, `complete(...)`, `retry(...)`, or `fail(...)`.
+
+## 4. Use Embedded Elixir
+
+Add the dependency:
 
 ```elixir
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.3.5"}
+    {:ferricstore, "~> 0.3.7"}
   ]
 end
 ```
 
-Then fetch dependencies:
+Start an IEx shell and verify the embedded API:
 
 ```bash
-mix deps.get
+iex -S mix
 ```
-
-### Standalone Mode
-
-For standalone mode, you also need `ferricstore_server` which includes the TCP/TLS listener:
 
 ```elixir
-# mix.exs
-def deps do
-  [
-    {:ferricstore, "~> 0.3.5"},
-    {:ferricstore_server, "~> 0.3.5"}
-  ]
-end
+:ok = FerricStore.set("hello", "world")
+{:ok, "world"} = FerricStore.get("hello")
 ```
 
-Or clone the repository and run directly:
+FerricStore starts with the OTP application. If your application uses a custom embedded instance, see [Embedded Mode](embedded-mode.md).
+
+## 5. Build From Source
+
+Source builds require Elixir, Erlang/OTP, and Rust.
 
 ```bash
-git clone https://github.com/ferricstore/ferricstore.git
-cd ferricstore
 mix deps.get
-mix run --no-halt
+mix compile
+mix test
 ```
 
-### Docker
+Run from source:
 
 ```bash
-docker build -t ferricstore .
-docker run -p 6379:6379 -v ferricstore_data:/data ferricstore
+MIX_ENV=prod FERRICSTORE_DATA_DIR=/tmp/ferricstore mix run --no-halt
 ```
 
-Environment variables (set via `docker run -e` or in `docker-compose.yml`):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FERRICSTORE_PORT` | `6379` | TCP port for RESP3 listener |
-| `FERRICSTORE_HEALTH_PORT` | `6380` | HTTP health/metrics port |
-| `FERRICSTORE_DATA_DIR` | `/data` | Data directory inside the container |
-| `FERRICSTORE_SHARD_COUNT` | `0` (auto = scheduler count) | Number of shards |
-| `FERRICSTORE_NODE_NAME` | unset | Erlang node name (enables clustering) |
-| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
-| `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated list of peer node names |
-
-For a 3-node cluster with HAProxy: `docker compose up -d`
-
-### Release Build
+Build a release:
 
 ```bash
 MIX_ENV=prod mix release ferricstore
-```
-
-Output at `_build/prod/rel/ferricstore/`. Start with:
-
-```bash
 _build/prod/rel/ferricstore/bin/ferricstore start
 ```
 
-### Benchmarking
+## 6. Next Steps
 
-Requires [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark):
-
-```bash
-# macOS
-brew install memtier_benchmark
-
-# Run the full suite
-./bench/run.sh
-```
-
-Tests: write-only (SET), read-only (GET), mixed 1:10, pipelined GET (pipeline=10), large values (4KB).
-
-## Configuration
-
-### Minimal Configuration (Embedded)
-
-```elixir
-# config/config.exs
-config :ferricstore, :mode, :embedded
-config :ferricstore, :data_dir, "priv/ferricstore_data"
-```
-
-### Minimal Configuration (Standalone)
-
-```elixir
-# config/config.exs
-config :ferricstore, :port, 6379
-config :ferricstore, :data_dir, "data"
-```
-
-For a complete configuration reference, see the [Configuration Guide](configuration.md).
-
-## Basic Usage (Embedded)
-
-Once FerricStore starts with your application, use the `FerricStore` module directly:
-
-### Strings
-
-```elixir
-# SET with optional TTL
-:ok = FerricStore.set("user:42:name", "alice", ttl: :timer.hours(1))
-
-# GET
-{:ok, "alice"} = FerricStore.get("user:42:name")
-{:ok, nil} = FerricStore.get("nonexistent")
-
-# DEL
-:ok = FerricStore.del("user:42:name")
-
-# EXISTS
-true = FerricStore.exists("mykey")
-false = FerricStore.exists("nonexistent")
-
-# INCR / INCRBY
-{:ok, 1} = FerricStore.incr("counter")
-{:ok, 11} = FerricStore.incr_by("counter", 10)
-```
-
-### Hash
-
-```elixir
-# HSET
-:ok = FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
-
-# HGET
-{:ok, "alice"} = FerricStore.hget("user:42", "name")
-{:ok, nil} = FerricStore.hget("user:42", "nonexistent_field")
-
-# HGETALL
-{:ok, %{"name" => "alice", "age" => "30"}} = FerricStore.hgetall("user:42")
-```
-
-### Lists
-
-```elixir
-# LPUSH / RPUSH
-{:ok, 3} = FerricStore.lpush("queue", ["a", "b", "c"])
-{:ok, 4} = FerricStore.rpush("queue", ["d"])
-
-# LPOP / RPOP
-{:ok, "c"} = FerricStore.lpop("queue")
-{:ok, "d"} = FerricStore.rpop("queue")
-
-# LRANGE (all elements)
-{:ok, elements} = FerricStore.lrange("queue", 0, -1)
-
-# LLEN
-{:ok, 2} = FerricStore.llen("queue")
-```
-
-### Sets
-
-```elixir
-# SADD
-{:ok, 3} = FerricStore.sadd("tags", ["elixir", "rust", "redis"])
-
-# SMEMBERS
-{:ok, members} = FerricStore.smembers("tags")
-
-# SISMEMBER
-true = FerricStore.sismember("tags", "elixir")
-false = FerricStore.sismember("tags", "python")
-
-# SCARD
-{:ok, 3} = FerricStore.scard("tags")
-```
-
-### Sorted Sets
-
-```elixir
-# ZADD
-{:ok, 2} = FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}])
-
-# ZRANGE
-{:ok, ["alice", "bob"]} = FerricStore.zrange("leaderboard", 0, -1)
-
-# ZRANGE with scores
-{:ok, [{"alice", 100.0}, {"bob", 200.0}]} =
-  FerricStore.zrange("leaderboard", 0, -1, withscores: true)
-
-# ZSCORE
-{:ok, 100.0} = FerricStore.zscore("leaderboard", "alice")
-
-# ZCARD
-{:ok, 2} = FerricStore.zcard("leaderboard")
-```
-
-### TTL and Expiration
-
-```elixir
-# Set with TTL
-:ok = FerricStore.set("session:abc", "data", ttl: :timer.minutes(30))
-
-# Set TTL on existing key
-{:ok, true} = FerricStore.expire("user:42", :timer.hours(1))
-
-# Check remaining TTL
-{:ok, ms_remaining} = FerricStore.ttl("session:abc")
-
-# Keys without TTL
-{:ok, nil} = FerricStore.ttl("permanent_key")
-```
-
-### Pipelines
-
-Batch multiple commands into a single group-commit entry:
-
-```elixir
-{:ok, results} = FerricStore.pipeline(fn pipe ->
-  pipe
-  |> FerricStore.Pipe.set("key1", "val1")
-  |> FerricStore.Pipe.set("key2", "val2")
-  |> FerricStore.Pipe.get("key1")
-  |> FerricStore.Pipe.incr("counter")
-end)
-```
-
-## Basic Usage (Standalone)
-
-Start the server and connect with any Redis client:
-
-```bash
-# Start FerricStore
-mix run --no-halt
-
-# In another terminal
-redis-cli -p 6379
-```
-
-All standard Redis commands work:
-
-```
-127.0.0.1:6379> SET user:42:name alice EX 3600
-OK
-127.0.0.1:6379> GET user:42:name
-"alice"
-127.0.0.1:6379> HSET user:42 name alice age 30
-(integer) 2
-127.0.0.1:6379> HGETALL user:42
-1) "age"
-2) "30"
-3) "name"
-4) "alice"
-127.0.0.1:6379> ZADD leaderboard 100 alice 200 bob
-(integer) 2
-127.0.0.1:6379> ZRANGE leaderboard 0 -1 WITHSCORES
-1) "alice"
-2) "100"
-3) "bob"
-4) "200"
-127.0.0.1:6379> PING
-PONG
-```
-
-### Connecting with Redix (from another Elixir app)
-
-```elixir
-{:ok, conn} = Redix.start_link(host: "localhost", port: 6379)
-{:ok, "OK"} = Redix.command(conn, ["SET", "key", "value"])
-{:ok, "value"} = Redix.command(conn, ["GET", "key"])
-```
-
-## Next Steps
-
-- [Best Practices](best-practices.md) -- hash tags, durability choices, pipelining, key design
-- [Configuration Reference](configuration.md) -- tune memory limits, eviction, Raft, merge, and more
-- [Architecture](architecture.md) -- understand the three-tier storage, write/read paths, and NIF design
-- [Embedded Mode](embedded-mode.md) -- detailed guide for in-process usage
-- [Commands Reference](commands.md) -- complete list of supported commands
-- [Security](security.md) -- ACL, TLS, protected mode
+- [Workflow usage examples](../docs/flow-vs-temporal-usage.md) -- queues, state machines, signals, retries, fanout, and value refs.
+- [Commands Reference](commands.md) -- RESP command syntax.
+- [Embedded Mode](embedded-mode.md) -- direct Elixir API.
+- [Configuration](configuration.md) -- production defaults and runtime configuration.
+- [Deployment](deployment.md) -- Docker, releases, Kubernetes, and clustering.
+- [Security](security.md) -- ACL, TLS, protected mode.
+- [Benchmarks](../docs/benchmarks.md) -- latest Azure Flow and KV benchmark results.

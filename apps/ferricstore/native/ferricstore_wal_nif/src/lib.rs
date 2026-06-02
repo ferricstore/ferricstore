@@ -10,6 +10,7 @@
 //   Background thread: adaptive commit_delay → write() → fdatasync() → notify caller
 
 #![allow(clippy::needless_pass_by_value)] // Rustler NIF convention
+#![allow(clippy::io_other_error)] // Keep compatibility with older Rust toolchains.
 
 mod aligned_buffer;
 mod background_thread;

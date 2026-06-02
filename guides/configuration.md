@@ -1,6 +1,13 @@
 # Configuration Reference
 
-FerricStore is configured through Elixir's standard `config/config.exs` (compile-time) and `config/runtime.exs` (runtime). Some parameters can also be changed at runtime via the `CONFIG SET` Redis command.
+FerricStore can be configured through Elixir config files, environment variables, and selected runtime `CONFIG SET` commands.
+
+Use this guide to answer:
+
+- how to choose server vs embedded mode;
+- how to set data directories, shards, memory, TLS, and clustering;
+- which settings are safe production defaults;
+- which runtime settings can be changed without restart.
 
 > **Mode applicability.** Each option is tagged with its scope:
 >
@@ -351,8 +358,8 @@ are committed as soon as they're fsynced locally. No network round-trips.
 Configure per-namespace at runtime:
 
 ```bash
-# Session data: 1ms batch window (default)
-redis-cli FERRICSTORE.CONFIG SET session window_ms 1
+# Latency-sensitive keys: 1ms batch window (default)
+redis-cli FERRICSTORE.CONFIG SET latency window_ms 1
 
 # Analytics counters: 5ms batch window
 redis-cli FERRICSTORE.CONFIG SET analytics window_ms 5
@@ -365,7 +372,7 @@ Or in Elixir config:
 
 ```elixir
 config :ferricstore, :namespace_config, %{
-  "session" => %{window_ms: 1},
+  "latency" => %{window_ms: 1},
   "analytics" => %{window_ms: 5}
 }
 ```
@@ -870,8 +877,8 @@ namespace is derived from the key prefix (everything before the first `:`).
 **Standalone mode:**
 
 ```bash
-# Session keys: 1ms batch window
-redis-cli FERRICSTORE.CONFIG SET session window_ms 1
+# Latency-sensitive keys: 1ms batch window
+redis-cli FERRICSTORE.CONFIG SET latency window_ms 1
 
 # Analytics counters: 5ms batch window
 redis-cli FERRICSTORE.CONFIG SET analytics window_ms 5
@@ -887,7 +894,7 @@ redis-cli FERRICSTORE.CONFIG RESET analytics
 alias Ferricstore.Commands.Server
 
 # Set namespace config (builds a store map for the handler)
-Server.handle("FERRICSTORE.CONFIG", ["SET", "session", "window_ms", "1"], %{})
+Server.handle("FERRICSTORE.CONFIG", ["SET", "latency", "window_ms", "1"], %{})
 Server.handle("FERRICSTORE.CONFIG", ["SET", "analytics", "window_ms", "5"], %{})
 
 # Reset

@@ -1,3 +1,6 @@
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::explicit_auto_deref)]
+
 use rustler::{Atom, BigInt, Binary, Encoder, Env, NewBinary, NifResult, Term};
 use std::str::FromStr;
 
