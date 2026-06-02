@@ -2430,7 +2430,7 @@ defmodule FlowStateLMDBSoak do
   defp keep_tail(binary, max), do: binary_part(binary, byte_size(binary) - max, max)
 
   defp stop_started_apps do
-    for app <- [:ferricstore_server, :ferricstore_ecto, :ferricstore_session, :ferricstore] do
+    for app <- [:ferricstore_server, :ferricstore] do
       _ = Application.stop(app)
     end
   end

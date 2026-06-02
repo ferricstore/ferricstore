@@ -36,21 +36,19 @@ defmodule Ferricstore.MixProject do
       extras: [
         "../../guides/getting-started.md",
         "../../guides/embedded-mode.md",
-        "../../guides/standalone-mode.md",
+        "../../guides/flow-elixir-sdk.md",
         "../../guides/commands.md",
         "../../guides/configuration.md",
         "../../guides/architecture.md",
         "../../guides/deployment.md",
         "../../guides/security.md",
-        "../../guides/extensions.md",
-        "../../guides/best-practices.md",
-        "../../guides/comparison.md"
+        "../../guides/best-practices.md"
       ],
       groups_for_extras: [
         Guides: Path.wildcard("../../guides/*.md")
       ],
-      source_url: "https://github.com/yoavgeva/ferricstore",
-      homepage_url: "https://github.com/yoavgeva/ferricstore"
+      source_url: "https://github.com/ferricstore/ferricstore",
+      homepage_url: "https://github.com/ferricstore/ferricstore"
     ]
   end
 
@@ -72,9 +70,9 @@ defmodule Ferricstore.MixProject do
         "checksum-*.exs",
         "mix.exs"
       ],
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       links: %{
-        "GitHub" => "https://github.com/yoavgeva/ferricstore"
+        "GitHub" => "https://github.com/ferricstore/ferricstore"
       }
     ]
   end

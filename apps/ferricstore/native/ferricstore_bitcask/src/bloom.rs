@@ -265,7 +265,7 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
     // after the write but before the background pagecache flush would lose
     // the bit. Ra replay is safe for bloom (bit-set is idempotent) but the
     // header `count` field can desync with the actual bits set, breaking
-    // BF.CARD. See docs/bitcask-background-fsync.md.
+    // BF.CARD. See background fsync design notes.
     if let Err(e) = crate::prob_fsync(&file) {
         return Ok((atoms::error(), e).encode(env));
     }

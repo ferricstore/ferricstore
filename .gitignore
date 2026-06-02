@@ -72,3 +72,6 @@ apps/ferricstore_server/native/resp_parser_nif/target/
 
 # Runtime Bitcask files accidentally created from app cwd during local spikes.
 apps/ferricstore/*.log
+
+# Local MCP/tooling config
+.mcp.json

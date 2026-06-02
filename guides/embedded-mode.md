@@ -609,7 +609,7 @@ Geo is implemented on top of Sorted Sets with geohash-encoded scores.
 
 ### Compare-and-Swap
 
-Atomic compare-and-swap without Lua scripting. Routed directly through `Router.cas/4`.
+Atomic compare-and-swap routed directly through `Router.cas/4`.
 
 ```elixir
 FerricStore.set("version", "1")
@@ -855,7 +855,7 @@ and sufficient when you don't need separate eviction pools or data directories.
 
 ## Integration with Phoenix
 
-A common pattern is to use FerricStore as a session store or cache in a Phoenix application:
+A common pattern is to use FerricStore as an application cache in a Phoenix application:
 
 ```elixir
 # lib/my_app/cache.ex

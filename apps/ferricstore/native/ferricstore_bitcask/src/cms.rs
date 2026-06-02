@@ -353,7 +353,7 @@ pub fn cms_file_incrby<'a>(
     // Durability: fsync before returning the computed counts. CMS is a
     // read-modify-write on counters; replay after a partial-write crash
     // double-counts and produces cross-replica divergence. See
-    // docs/bitcask-background-fsync.md.
+    // background fsync design notes.
     if let Err(e) = crate::prob_fsync(&file) {
         return Ok((atoms::error(), e).encode(env));
     }

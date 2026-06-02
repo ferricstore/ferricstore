@@ -71,15 +71,6 @@ jobs:
           mix run bench/router_write_bench.exs 2>&1 | tee bench/output/router_write_results.txt
           echo "::endgroup::"
 
-      - name: Run write backend benchmark (sync fsync vs async io_uring)
-        env:
-          BENCH_WARMUP: ${{ github.event.inputs.warmup || '3' }}
-          BENCH_TIME: ${{ github.event.inputs.time || '10' }}
-        run: |
-          echo "::group::Write Backend Benchmark Output"
-          mix run bench/write_backend_bench.exs 2>&1 | tee bench/output/write_backend_results.txt
-          echo "::endgroup::"
-
       - name: Run TCP benchmark
         env:
           BENCH_WARMUP: ${{ github.event.inputs.warmup || '3' }}
@@ -87,15 +78,6 @@ jobs:
         run: |
           echo "::group::TCP Benchmark Output"
           mix run bench/tcp_bench.exs 2>&1 | tee bench/output/tcp_results.txt
-          echo "::endgroup::"
-
-      - name: Run store benchmark
-        env:
-          BENCH_WARMUP: ${{ github.event.inputs.warmup || '3' }}
-          BENCH_TIME: ${{ github.event.inputs.time || '10' }}
-        run: |
-          echo "::group::Store Benchmark Output"
-          mix run bench/store_bench.exs 2>&1 | tee bench/output/store_results.txt
           echo "::endgroup::"
 
       - name: Run commands benchmark

@@ -17,7 +17,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: yoavgeva/ferricstore
+          images: ferricstore/ferricstore
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

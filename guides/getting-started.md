@@ -50,7 +50,7 @@ end
 Or clone the repository and run directly:
 
 ```bash
-git clone https://github.com/yoavgeva/ferricstore.git
+git clone https://github.com/ferricstore/ferricstore.git
 cd ferricstore
 mix deps.get
 mix run --no-halt
@@ -299,6 +299,5 @@ PONG
 - [Configuration Reference](configuration.md) -- tune memory limits, eviction, Raft, merge, and more
 - [Architecture](architecture.md) -- understand the three-tier storage, write/read paths, and NIF design
 - [Embedded Mode](embedded-mode.md) -- detailed guide for in-process usage
-- [Standalone Mode](standalone-mode.md) -- TLS, health endpoints, Prometheus metrics
 - [Commands Reference](commands.md) -- complete list of supported commands
 - [Security](security.md) -- ACL, TLS, protected mode

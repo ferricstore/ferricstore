@@ -1,0 +1,15 @@
+# Azure benchmark lab example variables.
+# Copy to terraform.tfvars for local use. Do not commit terraform.tfvars.
+
+location = "northcentralus"
+node_count = 1
+
+# Server/client sizes are benchmark-lab defaults. Adjust based on quota.
+server_vm_size = "Standard_L4as_v4"
+client_vm_size = "Standard_D2as_v4"
+
+# Use local NVMe for benchmark data. cloud-init fails fast if no local data disk is found.
+data_filesystem = "ext4"
+
+# SSH public key used for the ferric user.
+ssh_public_key = "ssh-ed25519 REPLACE_ME"

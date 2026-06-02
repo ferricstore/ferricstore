@@ -66,11 +66,3 @@ config :junit_formatter,
   include_filename?: true,
   use_project_subdirectory?: true
 
-# FerricstoreEcto test repo (SQLite3 in-memory with shared cache)
-# pool_size: 5 to allow concurrent test access; journal_mode: wal for
-# concurrent reads during writes.
-config :ferricstore_ecto, FerricstoreEcto.TestRepo,
-  database: "file:ferricstore_ecto_test?mode=memory&cache=shared",
-  pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: 5,
-  log: false

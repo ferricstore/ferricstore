@@ -471,7 +471,7 @@ defmodule FlowLMDBSoak do
   defp dir_bytes(_), do: 0
 
   defp stop_started_apps do
-    for app <- [:ferricstore_server, :ferricstore_ecto, :ferricstore_session, :ferricstore] do
+    for app <- [:ferricstore_server, :ferricstore] do
       _ = Application.stop(app)
     end
   end

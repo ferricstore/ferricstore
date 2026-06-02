@@ -511,7 +511,7 @@ pub fn topk_file_add_v2<'a>(
     // Durability: fsync before returning. TopK is NOT idempotent under
     // Raft replay (heap state + decay + counter RMW), so relying on
     // pagecache flush + replay corrupts state on kernel panic. See
-    // docs/bitcask-background-fsync.md.
+    // background fsync design notes.
     if let Err(e) = crate::prob_fsync(&file) {
         return Ok((atoms::error(), e).encode(env));
     }

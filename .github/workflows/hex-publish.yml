@@ -111,28 +111,10 @@ jobs:
             "resp_parser_nif-v${VERSION}-*.tar.gz" \
             "libresp_parser_nif-v${VERSION}-*.tar.gz"
 
-      # Publish in dependency order: core first, then packages that depend on it
+      # Publish core package
       - name: Publish ferricstore (core)
         run: |
           cd apps/ferricstore
           mix hex.publish --replace --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-
-      - name: Publish ferricstore_ecto
-        run: |
-          cd apps/ferricstore_ecto
-          mix deps.get
-          mix hex.publish package --replace --yes
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-          HEX_PUBLISH: "1"
-
-      - name: Publish ferricstore_session
-        run: |
-          cd apps/ferricstore_session
-          mix deps.get
-          mix hex.publish package --replace --yes
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-          HEX_PUBLISH: "1"

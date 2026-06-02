@@ -224,7 +224,7 @@ defmodule Ferricstore.Store.Promotion do
     mk = marker_key(redis_key)
 
     # --------------------------------------------------------------------
-    # Crash-safe promotion order (docs/bitcask-background-fsync.md §D2):
+    # Crash-safe promotion order (the crash-safe promotion ordering):
     #
     #   1. Write the marker FIRST. If we crash here, recover_promoted
     #      sees the marker and falls back to compound keys still in the
@@ -436,7 +436,7 @@ defmodule Ferricstore.Store.Promotion do
           end
         end)
 
-      # Crash-safety fallback (docs/bitcask-background-fsync.md §D2):
+      # Crash-safety fallback (the crash-safe promotion ordering):
       #
       # If the marker exists but the dedicated dir has no records at all,
       # we crashed between step 1 (marker write) and step 2 (dedicated

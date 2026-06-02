@@ -6,7 +6,7 @@ defmodule Ferricstore.Bitcask.NIF do
   use RustlerPrecompiled,
     otp_app: :ferricstore,
     crate: "ferricstore_bitcask",
-    base_url: "https://github.com/yoavgeva/ferricstore/releases/download/v#{version}",
+    base_url: "https://github.com/ferricstore/ferricstore/releases/download/v#{version}",
     version: version,
     nif_versions: ["2.16"],
     targets: ~w(

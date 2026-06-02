@@ -56,7 +56,7 @@ Operational telemetry:
 The event includes RSS bytes, memory limit bytes, disk used/total bytes, memory
 level, disk level, ratios, data directory, and shard count.
 
-Recommended starting points for DBOS/Temporal-style Flow workloads:
+Recommended starting points for queued workflow workloads:
 
 - shards: one per CPU up to the workload-tested limit, then benchmark
 - queue/workflow batch size: `500`
@@ -138,7 +138,7 @@ budget is `:waraft_apply_projection_cache_max_entries` /
 `FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES`, which buffers applied
 Flow state/value rows until lagged LMDB/history projection consumes them. If it
 is too small, WARaft has to spill/compact that cache synchronously and the
-DBOS-style 1M Flow benchmark can fall from the ~58K/s range to the ~35K/s range.
+the 1M Flow benchmark can fall from the ~58K/s range to the ~35K/s range.
 Treat LMDB flush interval/batch knobs as lag controls; treat the apply-projection
 cache as the burst-throughput guardrail.
 

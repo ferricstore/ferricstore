@@ -556,7 +556,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   def maybe_rotate_file(state) do
     if state.active_file_size >= state.max_active_file_size do
       # Rotation durability handoff
-      # (docs/bitcask-background-fsync.md § Active-file rotation):
+      # (the active-file rotation design):
       #
       # 1. Synchronously fsync the outgoing active file so any bytes
       #    written since the last checkpoint land on disk BEFORE we

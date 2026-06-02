@@ -46,7 +46,7 @@ compatibility commands. They are exposed through RESP3 and the embedded API:
 Production semantics, retry policy, history caps, LMDB cold projection, and
 operator metrics are documented in `docs/flow-production-readiness.md` and
 `docs/flow-retry-policy.md`. The Elixir workflow SDK for the embedded API is
-documented in `docs/flow-elixir-sdk.md`.
+documented in `guides/flow-elixir-sdk.md`.
 
 ### Commands with Minor Differences
 
@@ -68,13 +68,13 @@ documented in `docs/flow-elixir-sdk.md`.
 
 ### FerricStore-Only Commands
 
-These have no Redis equivalent:
+These are FerricStore-native commands:
 
 `CAS`, `LOCK`, `UNLOCK`, `EXTEND`, `RATELIMIT.ADD`, `FETCH_OR_COMPUTE`, `FETCH_OR_COMPUTE_RESULT`, `FETCH_OR_COMPUTE_ERROR`, `KEY_INFO`,
 `FERRICSTORE.CONFIG`, `FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`, `FERRICSTORE.DOCTOR`,
 `CLUSTER.HEALTH`, `CLUSTER.STATS`, `CLUSTER.KEYSLOT`, `CLUSTER.SLOTS`
 
-### Redis Commands NOT Yet Supported
+### Redis Commands Not Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
 `LMPOP`, `ZMPOP`, `BZMPOP` (multi-key pop),
@@ -695,7 +695,7 @@ Range query by index with optional WITHSCORES.
 | **RESP3 syntax** | `ZRANGE key start stop [WITHSCORES]`, `ZREVRANGE key start stop [WITHSCORES]` |
 | **Embedded API** | `FerricStore.zrange(key, start, stop, withscores: bool)` |
 | **RESP3 return** | Array of members, or interleaved `[member, score, ...]` with WITHSCORES |
-| **Redis compat** | The legacy index-based syntax is fully compatible. The Redis 6.2+ unified `ZRANGE` syntax (BYSCORE/BYLEX/REV/LIMIT) is NOT yet supported -- use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` instead. |
+| **Redis compat** | The legacy index-based syntax is fully compatible. The Redis 6.2+ unified `ZRANGE` syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) is not yet supported. Use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` for score ranges. |
 
 ### ZRANGEBYSCORE / ZREVRANGEBYSCORE
 
@@ -1299,18 +1299,18 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 
 ---
 
-## Differences from Redis -- Summary
+## Redis Compatibility Notes
 
 1. **Single database** -- `SELECT` returns an error. FerricStore is single-database.
 2. **RESP3 only** -- `HELLO 3` is required. RESP2 is not supported.
 3. **No Lua scripting** -- `EVAL`/`EVALSHA` are not implemented. Use CAS, LOCK, and FETCH_OR_COMPUTE for atomic operations.
 4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` require a TCP connection.
-5. **Probabilistic structures are built-in** -- no separate Redis Stack module needed. BF, CF, CMS, TopK, TDigest are all native.
-6. **CAS is a native command** -- no need for Lua scripts for compare-and-swap. WATCH/MULTI/EXEC is also supported.
-8. **FETCH_OR_COMPUTE** -- built-in cache stampede protection that Redis lacks.
+5. **Probabilistic structures are built-in** -- available without an external module. BF, CF, CMS, TopK, TDigest are all native.
+6. **CAS is a native command** -- available as a direct compare-and-swap command. WATCH/MULTI/EXEC is also supported.
+8. **FETCH_OR_COMPUTE** -- built-in cache stampede protection.
 9. **Group commit** -- writes are batched for higher throughput. Individual write latency includes the batch window (default 1ms). Use hash tags `{tag}` to colocate related keys on the same shard for maximum batching -- see [Best Practices](best-practices.md).
 10. **HLC timestamps** -- expiry uses Hybrid Logical Clock timestamps instead of wall-clock time. Monotonic even during clock skew.
 11. **Compound key storage** -- hash fields, set members, and zset members are stored as individual Bitcask entries with structured key prefixes, enabling O(1) field-level access without deserializing the entire data structure.
-12. **SCAN cursor** -- uses alphabetic key position, not Redis's opaque hash-table cursor. Functionally equivalent but cursor values differ.
-13. **OBJECT ENCODING** -- returns type-specific encodings (`"embstr"`, `"raw"`, `"hashtable"`, `"quicklist"`, `"skiplist"`, `"stream"`) but does not use Redis's memory-optimized internal encodings like `ziplist`, `listpack`, `intset`, or `skiplist` (Redis's native C implementation).
+12. **SCAN cursor** -- uses alphabetic key position, a key-position cursor rather than an opaque hash-table cursor. Functionally equivalent but cursor values differ.
+13. **OBJECT ENCODING** -- returns type-specific encodings (`"embstr"`, `"raw"`, `"hashtable"`, `"quicklist"`, `"skiplist"`, `"stream"`) and does not expose implementation-specific internal encodings such as `ziplist`, `listpack`, or `intset`.
 14. **INFO sections** -- includes FerricStore-specific sections: `raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`.

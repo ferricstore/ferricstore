@@ -10,7 +10,7 @@ defmodule Ferricstore.Resp.ParserNif do
   use RustlerPrecompiled,
     otp_app: :ferricstore,
     crate: "resp_parser_nif",
-    base_url: "https://github.com/yoavgeva/ferricstore/releases/download/v#{version}",
+    base_url: "https://github.com/ferricstore/ferricstore/releases/download/v#{version}",
     version: version,
     nif_versions: ["2.16"],
     targets: ~w(

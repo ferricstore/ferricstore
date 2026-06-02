@@ -778,7 +778,7 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_WARAFT_LOG_ROTATION_INTERVAL` | `50000` | WARaft segment rotation interval in entries. |
 | `FERRICSTORE_WARAFT_LOG_ROTATION_KEEP` | `100000` | Entries to keep around rotation/compaction boundaries. |
 | `FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES` | `100000` | Max retained entries after release-cursor trimming. |
-| `FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES` | adaptive | Per-shard cap for WARaft-applied Flow rows waiting for lagged LMDB/history projection. Too low can force synchronous spill/compaction during terminal Flow bursts; validate changes with the DBOS-style 1M Flow benchmark. |
+| `FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES` | adaptive | Per-shard cap for WARaft-applied Flow rows waiting for lagged LMDB/history projection. Too low can force synchronous spill/compaction during terminal Flow bursts; validate changes with the 1M Flow benchmark. |
 | `FERRICSTORE_MAX_ACTIVE_FILE_SIZE` | `8589934592` (8 GiB) | Max active Bitcask file size before rollover. Larger values reduce active-file rotation tail spikes on high-throughput write workloads. |
 | `FERRICSTORE_PROMOTION_THRESHOLD` | `100` | Field count to promote collection to dedicated Bitcask |
 

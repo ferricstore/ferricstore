@@ -13,7 +13,6 @@ defmodule Ferricstore.Umbrella.MixProject do
           applications: [
             ferricstore: :permanent,
             ferricstore_server: :permanent
-            # NO ferricstore_ecto — it's a library for Phoenix apps
           ],
           include_executables_for: [:unix],
           rel_templates_path: "rel",
@@ -35,10 +34,9 @@ defmodule Ferricstore.Umbrella.MixProject do
   defp aliases do
     [
       "bench.resp": "run bench/resp_bench.exs",
-      "bench.store": "run bench/store_bench.exs",
       "bench.commands": "run bench/commands_bench.exs",
       "bench.tcp": "run bench/tcp_bench.exs",
-      "bench.waraft_resp": "run --no-start bench/waraft_resp_router_bench.exs"
+      "bench.flow": "run bench/flow_workflow_bench.exs"
     ]
   end
 end
