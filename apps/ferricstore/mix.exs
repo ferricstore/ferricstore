@@ -83,7 +83,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.37", optional: true},
-      {:wa_raft, path: "../../vendor/waraft", manager: :rebar3},
+      {:wa_raft, github: "ferricstore/waraft", tag: "v0.1.0", manager: :rebar3},
       {:libcluster, "3.3.3"},
       {:libcluster_consul, "1.3.0", optional: true},
       {:libcluster_etcd, "1.1.2", optional: true},
