@@ -230,7 +230,7 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     [function_source] =
       Regex.run(
-        ~r/defp flow_transition_move_due_indexes\(state, plans\).*?^  end/ms,
+        ~r/defp flow_transition_move_due_indexes_nonempty\(state, plans\).*?^  end/ms,
         source
       )
 
@@ -367,6 +367,33 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     refute function_source =~ "flow_claim_plan_pair(plan)",
            "claim_due fast index apply is on the WARaft apply hot path; it should dispatch plan tuple shapes directly instead of calling the generic plan-pair helper for every item"
+  end
+
+  test "flow terminal transition skips empty due and metadata index passes" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    assert source =~ "flow_transition_plans_due_index_empty?(plans)"
+    assert source =~ "flow_transition_move_due_indexes_nonempty(state, plans)"
+    assert source =~ "flow_transition_plans_metadata_index_empty?(plans)"
+    assert source =~ "flow_transition_move_metadata_indexes_nonempty(state, plans)"
+  end
+
+  test "flow terminal transition caches repeated lifecycle index keys" do
+    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    [state_index_source] =
+      Regex.run(~r/defp flow_transition_move_state_indexes\(state, plans\).*?^  end/ms, source)
+
+    assert state_index_source =~ "flow_claim_cached_state_index_key"
+
+    [delete_source] =
+      Regex.run(
+        ~r/defp flow_transition_delete_old_secondary_indexes\(state, plans\).*?^  defp flow_transition_put_new_running_indexes/ms,
+        source
+      )
+
+    assert delete_source =~ "flow_claim_cached_inflight_index_key"
+    assert delete_source =~ "flow_claim_cached_worker_index_key"
   end
 
   test "flow non-idempotent create fast path does not synchronously query LMDB for existence" do

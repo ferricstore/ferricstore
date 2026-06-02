@@ -25,6 +25,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.Keys, as: FlowKeys
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
 
@@ -119,10 +120,10 @@ defmodule Ferricstore.Store.Router do
              idx,
              hardened_ids,
              fn ->
-             with {:ok, live_refs} <- blob_gc_live_refs(ctx, idx, state),
-                  :ok <- blob_gc_after_live_refs_hook(ctx, idx, live_refs) do
-               {:ok, live_refs}
-             end
+               with {:ok, live_refs} <- blob_gc_live_refs(ctx, idx, state),
+                    :ok <- blob_gc_after_live_refs_hook(ctx, idx, live_refs) do
+                 {:ok, live_refs}
+               end
              end
            ) do
       {:ok, blob_gc_merge_stats(Map.merge(blob_gc_empty_stats(), hardened_stats), stats)}
@@ -154,13 +155,19 @@ defmodule Ferricstore.Store.Router do
               emit_blob_protection_reconcile_failed(ctx, idx, length(ids), reason)
 
               {:ok, [],
-               %{hardened_protections_seen: length(ids), hardened_protections_blocked: length(ids)}}
+               %{
+                 hardened_protections_seen: length(ids),
+                 hardened_protections_blocked: length(ids)
+               }}
 
             {:error, reason} ->
               emit_blob_protection_reconcile_failed(ctx, idx, length(ids), reason)
 
               {:ok, [],
-               %{hardened_protections_seen: length(ids), hardened_protections_blocked: length(ids)}}
+               %{
+                 hardened_protections_seen: length(ids),
+                 hardened_protections_blocked: length(ids)
+               }}
           end
       end
     end
@@ -4828,7 +4835,7 @@ defmodule Ferricstore.Store.Router do
       |> Enum.group_by(fn {key, _index} -> flow_lmdb_path(ctx, key) end)
       |> Enum.reduce(%{}, fn {path, indexed_keys}, acc ->
         group_keys = Enum.map(indexed_keys, fn {key, _index} -> key end)
-        values = flow_lmdb_get_many(path, group_keys, now_ms, mode)
+        values = flow_lmdb_get_many(ctx, path, group_keys, now_ms, mode)
 
         indexed_keys
         |> Enum.zip(values)
@@ -4843,9 +4850,12 @@ defmodule Ferricstore.Store.Router do
   defp flow_get_lmdb(ctx, key, mode) do
     path = flow_lmdb_path(ctx, key)
 
-    path
-    |> Ferricstore.Flow.LMDB.get(key)
-    |> flow_decode_lmdb_get_result(path, key, CommandTime.now_ms(), mode)
+    value =
+      path
+      |> Ferricstore.Flow.LMDB.get(key)
+      |> flow_decode_lmdb_get_result(path, key, CommandTime.now_ms(), mode)
+
+    value || flow_get_lmdb_cold_park(ctx, key, mode)
   end
 
   defp flow_lmdb_path(ctx, key) do
@@ -4853,26 +4863,113 @@ defmodule Ferricstore.Store.Router do
     ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
   end
 
-  defp flow_lmdb_get_many(_path, [], _now_ms, _mode), do: []
+  defp flow_lmdb_get_many(_ctx, _path, [], _now_ms, _mode), do: []
 
-  defp flow_lmdb_get_many(path, keys, now_ms, mode) do
+  defp flow_lmdb_get_many(ctx, path, keys, now_ms, mode) do
     case Ferricstore.Flow.LMDB.get_many(path, keys) do
       {:ok, results} ->
         keys
         |> Enum.zip(results)
         |> Enum.map(fn {key, result} ->
-          flow_decode_lmdb_get_result(result, path, key, now_ms, mode)
+          flow_decode_lmdb_get_result(result, path, key, now_ms, mode) ||
+            flow_get_lmdb_cold_park(ctx, key, mode)
         end)
 
       {:error, reason} ->
         flow_observe_lmdb_read_error(mode, reason)
 
         Enum.map(keys, fn key ->
-          path
-          |> Ferricstore.Flow.LMDB.get(key)
-          |> flow_decode_lmdb_get_result(path, key, now_ms, mode)
+          value =
+            path
+            |> Ferricstore.Flow.LMDB.get(key)
+            |> flow_decode_lmdb_get_result(path, key, now_ms, mode)
+
+          value || flow_get_lmdb_cold_park(ctx, key, mode)
         end)
     end
+  end
+
+  defp flow_get_lmdb_cold_park(ctx, key, mode) do
+    path = flow_lmdb_path(ctx, key)
+    park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(key)
+
+    with {:ok, park_blob} <- Ferricstore.Flow.LMDB.get(path, park_key),
+         {:ok, %{locator: %Locator{kind: :state} = locator} = park} <-
+           Ferricstore.Flow.LMDB.decode_cold_park(park_blob),
+         {:ok, value} <- flow_read_cold_park_state_value(ctx, key, locator, park),
+         {:ok, record} <- flow_decode_cold_park_state(value),
+         true <- flow_locator_matches_record?(locator, record) do
+      value
+    else
+      {:error, reason} ->
+        flow_lmdb_read_error_result(mode, reason)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp flow_read_state_locator_value(
+         ctx,
+         key,
+         %Locator{file_id: fid, offset: offset, value_size: value_size}
+       )
+       when valid_cold_location(fid, offset, value_size) do
+    idx = shard_for(ctx, key)
+
+    case Ferricstore.Store.ColdRead.pread_at(
+           cold_file_path(ctx, idx, fid),
+           offset,
+           key,
+           @cold_batch_read_timeout_ms
+         ) do
+      {:ok, value} when is_binary(value) -> {:ok, value}
+      {:error, reason} -> {:error, reason}
+      _ -> :not_found
+    end
+  end
+
+  defp flow_read_state_locator_value(
+         ctx,
+         key,
+         %Locator{file_id: fid, offset: offset, value_size: value_size}
+       )
+       when valid_waraft_segment_location(fid, offset, value_size) do
+    idx = shard_for(ctx, key)
+
+    case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, fid, key) do
+      {:ok, value} when is_binary(value) -> {:ok, value}
+      :not_found -> :not_found
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp flow_read_state_locator_value(_ctx, _key, _locator), do: :not_found
+
+  defp flow_read_cold_park_state_value(ctx, key, %Locator{} = locator, park)
+       when is_map(park) do
+    case flow_read_state_locator_value(ctx, key, locator) do
+      {:ok, value} ->
+        {:ok, value}
+
+      _ ->
+        case Map.get(park, :state_value) do
+          value when is_binary(value) -> {:ok, value}
+          _ -> :not_found
+        end
+    end
+  end
+
+  defp flow_decode_cold_park_state(value) when is_binary(value) do
+    try do
+      {:ok, Ferricstore.Flow.decode_record(value)}
+    rescue
+      _ -> {:error, :decode_error}
+    end
+  end
+
+  defp flow_locator_matches_record?(%Locator{} = locator, record) do
+    Map.get(record, :id) == locator.flow_id and Map.get(record, :version) == locator.version
   end
 
   defp flow_decode_lmdb_get_result({:ok, blob}, path, key, now_ms, mode) when is_binary(blob) do
@@ -4914,11 +5011,16 @@ defmodule Ferricstore.Store.Router do
   def flow_create(ctx, %{id: id} = attrs) when is_binary(id) do
     key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 
-    if byte_size(key) > @max_key_size do
-      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
-    else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_create, key, attrs})
+    cond do
+      byte_size(key) > @max_key_size ->
+        {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+
+      flow_create_admission_rejected?(ctx, key) ->
+        flow_create_overloaded_error()
+
+      true ->
+        idx = shard_for(ctx, key)
+        raft_write(ctx, idx, key, {:flow_create, key, attrs})
     end
   end
 
@@ -4958,15 +5060,20 @@ defmodule Ferricstore.Store.Router do
           {%{id: id} = attrs, idx}, {valid_acc, result_acc} when is_binary(id) ->
             key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 
-            if byte_size(key) > @max_key_size do
-              {valid_acc,
-               Map.put(
-                 result_acc,
-                 idx,
-                 {:error, "ERR key too large (max #{@max_key_size} bytes)"}
-               )}
-            else
-              {[{idx, key, {:flow_create, key, attrs}} | valid_acc], result_acc}
+            cond do
+              byte_size(key) > @max_key_size ->
+                {valid_acc,
+                 Map.put(
+                   result_acc,
+                   idx,
+                   {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+                 )}
+
+              flow_create_admission_rejected?(ctx, key) ->
+                {valid_acc, Map.put(result_acc, idx, flow_create_overloaded_error())}
+
+              true ->
+                {[{idx, key, {:flow_create, key, attrs}} | valid_acc], result_acc}
             end
 
           {_attrs, idx}, {valid_acc, result_acc} ->
@@ -4995,29 +5102,42 @@ defmodule Ferricstore.Store.Router do
       when is_binary(partition_key) and is_list(attrs_list) do
     key = Ferricstore.Flow.Keys.state_key("__batch__", partition_key)
 
-    if byte_size(key) > @max_key_size do
-      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
-    else
-      idx = shard_for(ctx, key)
+    cond do
+      byte_size(key) > @max_key_size ->
+        {:error, "ERR key too large (max #{@max_key_size} bytes)"}
 
-      raft_write(
-        ctx,
-        idx,
-        key,
-        {:flow_create_many, key, %{records: attrs_list}}
-      )
+      flow_create_many_admission_rejected?(ctx, attrs_list, partition_key) ->
+        flow_create_overloaded_error(length(attrs_list))
+
+      true ->
+        idx = shard_for(ctx, key)
+
+        raft_write(
+          ctx,
+          idx,
+          key,
+          {:flow_create_many, key, %{records: attrs_list}}
+        )
     end
   end
 
   def flow_create_many(ctx, nil, attrs_list) when is_list(attrs_list) do
-    flow_many_by_shard(ctx, attrs_list, :flow_create_many, "__batch__")
+    if flow_create_many_admission_rejected?(ctx, attrs_list, nil) do
+      flow_create_overloaded_error(length(attrs_list))
+    else
+      flow_many_by_shard(ctx, attrs_list, :flow_create_many, "__batch__")
+    end
   end
 
   @doc false
   def flow_create_many_independent(_ctx, []), do: []
 
   def flow_create_many_independent(ctx, attrs_list) when is_list(attrs_list) do
-    flow_create_pipeline_batch(ctx, attrs_list)
+    if flow_create_many_admission_rejected?(ctx, attrs_list, nil) do
+      flow_create_overloaded_error(length(attrs_list))
+    else
+      flow_create_pipeline_batch(ctx, attrs_list)
+    end
   end
 
   @doc false
@@ -5274,7 +5394,10 @@ defmodule Ferricstore.Store.Router do
         :empty ->
           {:ok, []}
 
-        _unknown_or_non_empty ->
+        {:non_empty, cold_due_mode} ->
+          raft_write(ctx, idx, key, {:flow_claim_due, key, Map.put(attrs, :cold_due_mode, cold_due_mode)})
+
+        _unknown ->
           raft_write(ctx, idx, key, {:flow_claim_due, key, attrs})
       end
     end
@@ -5364,9 +5487,9 @@ defmodule Ferricstore.Store.Router do
     groups =
       groups
       |> Enum.flat_map(fn {idx, partition_keys} ->
-        filtered =
-          Enum.reject(partition_keys, fn partition_key ->
-            flow_claim_due_empty_precheck(
+        {filtered, modes} =
+          Enum.reduce(partition_keys, {[], []}, fn partition_key, {keys_acc, modes_acc} ->
+            case flow_claim_due_empty_precheck(
               ctx,
               idx,
               type,
@@ -5374,11 +5497,23 @@ defmodule Ferricstore.Store.Router do
               priority,
               partition_key,
               attrs
-            ) ==
-              :empty
+            ) do
+              :empty ->
+                {keys_acc, modes_acc}
+
+              {:non_empty, mode} ->
+                {[partition_key | keys_acc], [mode | modes_acc]}
+
+              _unknown ->
+                {[partition_key | keys_acc], [Map.get(attrs, :cold_due_mode, :skip) | modes_acc]}
+            end
           end)
 
-        if filtered == [], do: [], else: [{idx, filtered}]
+        if filtered == [] do
+          []
+        else
+          [{idx, Enum.reverse(filtered), flow_claim_due_group_cold_mode(modes, attrs)}]
+        end
       end)
 
     group_count = length(groups)
@@ -5391,7 +5526,7 @@ defmodule Ferricstore.Store.Router do
 
       groups
       |> Enum.with_index()
-      |> Enum.flat_map(fn {{_idx, partition_keys}, group_idx} ->
+      |> Enum.flat_map(fn {{_idx, partition_keys, cold_due_mode}, group_idx} ->
         quota = base + if(group_idx < extra, do: 1, else: 0)
 
         if quota <= 0 do
@@ -5404,10 +5539,19 @@ defmodule Ferricstore.Store.Router do
             |> Map.put(:limit, quota)
             |> Map.put(:partition_key, hd(partition_keys))
             |> Map.put(:partition_keys, partition_keys)
+            |> Map.put(:cold_due_mode, cold_due_mode)
 
           [{key, {:flow_claim_due, key, shard_attrs}}]
         end
       end)
+    end
+  end
+
+  defp flow_claim_due_group_cold_mode(modes, attrs) do
+    cond do
+      Enum.any?(modes, &(&1 == :skip)) -> :skip
+      Enum.any?(modes, &(&1 == :allow)) -> :allow
+      true -> Map.get(attrs, :cold_due_mode, :skip)
     end
   end
 
@@ -5419,8 +5563,23 @@ defmodule Ferricstore.Store.Router do
       now_ms = flow_claim_due_precheck_now_ms(attrs)
 
       case NativeFlowIndex.due_keys_present(native, due_keys, now_ms) do
-        [] -> :empty
-        [_ | _] -> :non_empty
+        [] ->
+          if flow_claim_due_cold_precheck_present?(
+               ctx,
+               idx,
+               type,
+               state,
+               priority,
+               partition_key,
+               now_ms,
+               Map.get(attrs, :cold_due_mode)
+             ) do
+            {:non_empty, :allow}
+          else
+            :empty
+          end
+
+        [_ | _] -> {:non_empty, :skip}
       end
     else
       _other -> :unknown
@@ -5435,6 +5594,80 @@ defmodule Ferricstore.Store.Router do
 
   defp flow_claim_due_precheck_now_ms(_attrs),
     do: CommandTime.now_ms() + @flow_claim_due_precheck_slack_ms
+
+  defp flow_claim_due_cold_precheck_present?(
+         ctx,
+         idx,
+         type,
+         state,
+         priority,
+         partition_key,
+         now_ms,
+         cold_due_mode
+       ) do
+    with true <- cold_due_mode in [:allow, :block],
+         true <- Ferricstore.Flow.Hibernation.enabled?(),
+         {:ok, states} <- flow_claim_due_precheck_states(state),
+         priorities <- flow_claim_any_priorities(priority),
+         true <- Enum.all?(priorities, &is_integer/1),
+         path when is_binary(path) <- flow_claim_due_cold_precheck_path(ctx, idx),
+         [_ | _] = buckets <- flow_claim_due_cold_precheck_buckets(now_ms) do
+      Enum.any?(states, fn claim_state ->
+        Enum.any?(priorities, fn claim_priority ->
+          Enum.any?(buckets, fn bucket_ms ->
+            prefix =
+              Ferricstore.Flow.LMDB.cold_due_claim_prefix(
+                bucket_ms: bucket_ms,
+                type: type,
+                state: claim_state,
+                partition_key: partition_key,
+                priority: claim_priority
+              )
+
+            case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+              {:ok, [_ | _]} -> true
+              _ -> false
+            end
+          end)
+        end)
+      end)
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp flow_claim_due_cold_precheck_path(%{data_dir: data_dir}, idx)
+       when is_binary(data_dir) and is_integer(idx) and idx >= 0 do
+    data_dir
+    |> Ferricstore.DataDir.shard_data_path(idx)
+    |> Ferricstore.Flow.LMDB.path()
+  end
+
+  defp flow_claim_due_cold_precheck_path(_ctx, _idx), do: nil
+
+  defp flow_claim_due_cold_precheck_buckets(now_ms) when is_integer(now_ms) and now_ms >= 0 do
+    first =
+      now_ms
+      |> Kernel.-(Ferricstore.Flow.Hibernation.late_promote_window_ms())
+      |> max(0)
+      |> Ferricstore.Flow.LMDB.cold_due_bucket_ms()
+
+    last =
+      now_ms
+      |> Kernel.+(Ferricstore.Flow.Hibernation.promote_window_ms())
+      |> Ferricstore.Flow.LMDB.cold_due_bucket_ms()
+
+    first
+    |> Stream.iterate(&(&1 + 60_000))
+    |> Stream.take_while(&(&1 <= last))
+    |> Enum.to_list()
+  end
+
+  defp flow_claim_due_cold_precheck_buckets(_now_ms), do: []
 
   defp flow_claim_due_empty_precheck_allowed?(ctx, idx) do
     selected_waraft_ctx?(ctx) and flow_claim_due_single_local_member?(idx)
@@ -6344,13 +6577,17 @@ defmodule Ferricstore.Store.Router do
   def flow_create_pipeline_batch(_ctx, []), do: []
 
   def flow_create_pipeline_batch(ctx, attrs_list) when is_list(attrs_list) do
-    {buckets, count} =
-      Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
-        %{id: id} = attrs, {buckets, index} ->
+    {buckets, count, rejected} =
+      Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0, %{}}, fn
+        %{id: id} = attrs, {buckets, index, rejected} ->
           key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
-          shard_idx = shard_for(ctx, key)
 
-          {flow_put_shard_bucket(buckets, shard_idx, {index, key, attrs}), index + 1}
+          if flow_create_admission_rejected?(ctx, key) do
+            {buckets, index + 1, Map.put(rejected, index, flow_create_overloaded_error())}
+          else
+            shard_idx = shard_for(ctx, key)
+            {flow_put_shard_bucket(buckets, shard_idx, {index, key, attrs}), index + 1, rejected}
+          end
       end)
 
     groups =
@@ -6369,9 +6606,9 @@ defmodule Ferricstore.Store.Router do
     results =
       groups
       |> Enum.zip(group_results)
-      |> Enum.reduce(flow_result_tuple(count), fn {{_shard_idx, _route_key, indices, _cmd},
-                                                   result},
-                                                  results ->
+      |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key, indices,
+                                                              _cmd}, result},
+                                                            results ->
         group_results =
           case result do
             result when is_list(result) and length(result) == length(indices) -> result
@@ -6414,8 +6651,12 @@ defmodule Ferricstore.Store.Router do
     |> Enum.reverse()
   end
 
-  defp flow_result_tuple(count) when is_integer(count) and count >= 0 do
-    :erlang.make_tuple(count, ErrorReasons.write_timeout_unknown())
+  defp flow_result_tuple(count, rejected \\ %{}) when is_integer(count) and count >= 0 do
+    base = :erlang.make_tuple(count, ErrorReasons.write_timeout_unknown())
+
+    Enum.reduce(rejected, base, fn {index, result}, acc ->
+      put_elem(acc, index, result)
+    end)
   end
 
   @doc false
@@ -6894,6 +7135,48 @@ defmodule Ferricstore.Store.Router do
       :ok
     end
   end
+
+  defp flow_create_many_admission_rejected?(ctx, attrs_list, partition_key) do
+    flow_create_admission_pressure?(ctx) and
+      Enum.any?(attrs_list, fn
+        %{id: id} = attrs when is_binary(id) ->
+          key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key, partition_key))
+          not exists_fast?(ctx, key)
+
+        _ ->
+          false
+      end)
+  end
+
+  defp flow_create_admission_rejected?(ctx, key) do
+    flow_create_admission_pressure?(ctx) and not exists_fast?(ctx, key)
+  end
+
+  defp flow_create_admission_pressure?(ctx) do
+    Ferricstore.Flow.Admission.reject_new_creates?() or
+      :atomics.get(ctx.pressure_flags, 1) == 1 or :atomics.get(ctx.pressure_flags, 2) == 1 or
+      Ferricstore.OperationalGuard.reject_flow_creates?()
+  rescue
+    _ ->
+      Ferricstore.Flow.Admission.reject_new_creates?() or Ferricstore.MemoryGuard.reject_writes?() or
+        Ferricstore.OperationalGuard.reject_flow_creates?()
+  end
+
+  defp flow_create_overloaded_error(count \\ 1) do
+    Ferricstore.MemoryGuard.nudge()
+    status = Ferricstore.Flow.Admission.status()
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :create, :rejected],
+      %{count: flow_create_rejected_count(count)},
+      %{reason: status.reason, retry_after_ms: status.retry_after_ms}
+    )
+
+    Ferricstore.Flow.Admission.overload_error(:memory_guard, 1_000)
+  end
+
+  defp flow_create_rejected_count(count) when is_integer(count) and count > 0, do: count
+  defp flow_create_rejected_count(_count), do: 0
 
   @doc "Deletes `key`. Returns `:ok` whether or not the key existed."
   @spec delete(FerricStore.Instance.t(), binary()) :: :ok

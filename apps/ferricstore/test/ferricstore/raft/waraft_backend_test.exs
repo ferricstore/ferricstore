@@ -16091,8 +16091,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   defp delayed_parallel_batch_record?(_other), do: false
 
   defp start_peer_runtime_apps!(node_name) do
+    quiet_peer_logger!(node_name)
     assert {:ok, _} = :rpc.call(node_name, Application, :ensure_all_started, [:telemetry])
     assert {:ok, _} = :rpc.call(node_name, Application, :ensure_all_started, [:os_mon])
+  end
+
+  defp quiet_peer_logger!(node_name) do
+    assert :ok = :rpc.call(node_name, Application, :put_env, [:logger, :level, :warning])
+    assert :ok = :rpc.call(node_name, Logger, :configure, [[level: :warning]])
   end
 
   defp wait_for_waraft_backend_leader(names, shard_index),

@@ -14,8 +14,9 @@ defmodule Ferricstore.MemoryGuard do
       counter in `tracking_alloc.rs`. Returns -1 when tracking is not installed
       (production cdylib), 0+ when active (tests).
     * **Process RSS** -- `process_rss_bytes()` reads `/proc/self/status` (Linux)
-      or `:memsup` data. Includes ETS, NIF allocations, BEAM heaps, and page
-      cache residency. Only used in standalone mode (not embedded).
+      or `ps rss` (macOS/Unix fallback). Includes ETS, NIF allocations, BEAM
+      heaps, LMDB/native mappings, and page cache residency. Only used in
+      standalone mode (not embedded).
     * **Cgroup limits** -- detects container memory limits via `/sys/fs/cgroup/`
       and uses that as the effective memory ceiling instead of host RAM.
 
@@ -886,10 +887,12 @@ defmodule Ferricstore.MemoryGuard do
   # Returns the current process RSS (Resident Set Size) in bytes.
   # This is the actual physical memory used by the BEAM process,
   # including ETS, NIF allocations, mmap'd file pages, and BEAM heaps.
-  # Falls back to :erlang.memory(:total) which only covers BEAM-managed memory.
+  # Falls back to `ps rss` on macOS/Unix, then :erlang.memory(:total) which only
+  # covers BEAM-managed memory.
   @doc false
   def process_rss_bytes do
     read_proc_self_rss() ||
+      read_ps_rss() ||
       erlang_total_memory()
   end
 
@@ -910,6 +913,36 @@ defmodule Ferricstore.MemoryGuard do
 
       _ ->
         nil
+    end
+  end
+
+  defp read_ps_rss do
+    pid = :os.getpid() |> List.to_string()
+
+    case System.cmd("ps", ["-o", "rss=", "-p", pid], stderr_to_stdout: true) do
+      {output, 0} -> parse_ps_rss_kb(output)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  @doc false
+  def parse_ps_rss_kb(output) when is_binary(output) do
+    output
+    |> String.split()
+    |> List.first()
+    |> case do
+      nil ->
+        nil
+
+      value ->
+        case Integer.parse(value) do
+          {kb, ""} when kb > 0 -> kb * 1024
+          _ -> nil
+        end
     end
   end
 

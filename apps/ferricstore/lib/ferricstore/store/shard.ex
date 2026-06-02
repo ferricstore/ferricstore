@@ -47,6 +47,9 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.Hibernation
+  alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Raft.Backend, as: RaftBackend
   alias Ferricstore.Store.CompoundKey
@@ -1293,7 +1296,7 @@ defmodule Ferricstore.Store.Shard do
               {written, dropped, reclaimed, compacted, skipped, failures}
 
             live_entries != [] ->
-              offsets = Enum.map(live_entries, fn {_key, off} -> off end)
+              offsets = Enum.map(live_entries, &compaction_entry_offset/1)
 
               old_size =
                 case File.stat(source) do
@@ -1330,15 +1333,30 @@ defmodule Ferricstore.Store.Shard do
                       Ferricstore.FS.rename!(dest, source)
                       update_compacted_ets_locations(state.keydir, fid, live_entries, results)
 
-                      new_size =
-                        case File.stat(source) do
-                          {:ok, %{size: s}} -> s
-                          _ -> 0
-                        end
+                      cold_update =
+                        update_compacted_flow_cold_locations(state, live_entries, results)
 
-                      {written + length(live_entries), dropped,
-                       reclaimed + max(old_size - new_size, 0), [fid | compacted], skipped,
-                       failures}
+                      case cold_update do
+                        :ok ->
+                          new_size =
+                            case File.stat(source) do
+                              {:ok, %{size: s}} -> s
+                              _ -> 0
+                            end
+
+                          {written + length(live_entries), dropped,
+                           reclaimed + max(old_size - new_size, 0), [fid | compacted], skipped,
+                           failures}
+
+                        {:error, reason} ->
+                          failure = {fid, :cold_flow_locator_update_failed, reason}
+
+                          Logger.error(
+                            "Shard #{state.index}: compaction cold Flow locator update failed for #{source}: #{inspect(reason)}"
+                          )
+
+                          {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
+                      end
 
                     {:error, reason} ->
                       remove_compaction_temp(state, dest)
@@ -2653,24 +2671,94 @@ defmodule Ferricstore.Store.Shard do
     target_fids = MapSet.new(file_ids)
     now_ms = Ferricstore.HLC.now_ms()
 
-    :ets.foldl(
-      fn
-        {key, _value, expire_at_ms, _lfu, fid, off, _vsize}, acc
-        when expire_at_ms == 0 or expire_at_ms > now_ms ->
-          if MapSet.member?(target_fids, fid) and fid != state.active_file_id and
-               shared_compaction_entry?(state, key, fid, fid) do
-            Map.update(acc, fid, [{key, off}], &[{key, off} | &1])
-          else
-            acc
-          end
+    hot_groups =
+      :ets.foldl(
+        fn
+          {key, _value, expire_at_ms, _lfu, fid, off, _vsize}, acc
+          when expire_at_ms == 0 or expire_at_ms > now_ms ->
+            if MapSet.member?(target_fids, fid) and fid != state.active_file_id and
+                 shared_compaction_entry?(state, key, fid, fid) do
+              Map.update(acc, fid, [{key, off}], &[{key, off} | &1])
+            else
+              acc
+            end
 
-        {_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, acc ->
+          {_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, acc ->
+            acc
+        end,
+        %{},
+        state.keydir
+      )
+
+    merge_compaction_entry_groups(hot_groups, group_compaction_cold_flow_entries(state, file_ids))
+  end
+
+  defp group_compaction_cold_flow_entries(state, file_ids) do
+    if Hibernation.enabled?() do
+      hot_keys = compaction_hot_key_set(state)
+      path = LMDB.path(state.shard_data_path)
+
+      Enum.reduce(file_ids, %{}, fn fid, acc ->
+        if fid == state.active_file_id do
           acc
+        else
+          prefix = LMDB.cold_by_segment_prefix(fid)
+
+          case LMDB.prefix_entries(path, prefix, 100_000) do
+            {:ok, entries} ->
+              entries
+              |> Enum.reduce(acc, fn {_reverse_key, park_key}, inner ->
+                case compaction_cold_flow_entry(state, path, fid, park_key, hot_keys) do
+                  {:ok, entry} -> Map.update(inner, fid, [entry], &[entry | &1])
+                  :skip -> inner
+                end
+              end)
+
+            _ ->
+              acc
+          end
+        end
+      end)
+    else
+      %{}
+    end
+  end
+
+  defp compaction_hot_key_set(state) do
+    :ets.foldl(
+      fn {key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, acc ->
+        MapSet.put(acc, key)
       end,
-      %{},
+      MapSet.new(),
       state.keydir
     )
   end
+
+  defp compaction_cold_flow_entry(_state, _path, _fid, park_key, _hot_keys)
+       when not is_binary(park_key),
+       do: :skip
+
+  defp compaction_cold_flow_entry(_state, path, fid, park_key, hot_keys) do
+    with {:ok, park_blob} <- LMDB.get(path, park_key),
+         {:ok,
+          %{locator: %Locator{kind: :state, file_id: ^fid} = locator, state_key: state_key} = park} <-
+           LMDB.decode_cold_park(park_blob),
+         true <- is_binary(state_key),
+         false <- MapSet.member?(hot_keys, state_key) do
+      {:ok, {state_key, locator.offset, {:cold_flow, park_key, park}}}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp merge_compaction_entry_groups(left, right) do
+    Map.merge(left, right, fn _fid, left_entries, right_entries ->
+      right_entries ++ left_entries
+    end)
+  end
+
+  defp compaction_entry_offset({_key, offset}) when is_integer(offset), do: offset
+  defp compaction_entry_offset({_key, offset, _meta}) when is_integer(offset), do: offset
 
   defp tombstone_dependency_state(true, _expire_at_ms, _now_ms), do: :tombstone
   defp tombstone_dependency_state(false, 0, _now_ms), do: :live
@@ -2705,15 +2793,61 @@ defmodule Ferricstore.Store.Shard do
 
   defp update_compacted_ets_locations(keydir, fid, live_entries, results) do
     Enum.zip(live_entries, results)
-    |> Enum.each(fn {{key, old_offset}, {new_offset, _new_size}} ->
-      case :ets.lookup(keydir, key) do
-        [{^key, _value, _exp, _lfu, ^fid, ^old_offset, _vsize}] ->
-          :ets.update_element(keydir, key, {6, new_offset})
+    |> Enum.each(fn
+      {{key, old_offset}, {new_offset, _new_size}} ->
+        update_compacted_ets_location(keydir, fid, key, old_offset, new_offset)
 
-        _ ->
-          :ok
-      end
+      {{key, old_offset, _meta}, {new_offset, _new_size}} ->
+        update_compacted_ets_location(keydir, fid, key, old_offset, new_offset)
     end)
+  end
+
+  defp update_compacted_ets_location(keydir, fid, key, old_offset, new_offset) do
+    case :ets.lookup(keydir, key) do
+      [{^key, _value, _exp, _lfu, ^fid, ^old_offset, _vsize}] ->
+        :ets.update_element(keydir, key, {6, new_offset})
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp update_compacted_flow_cold_locations(state, live_entries, results) do
+    {ops, errors} =
+      live_entries
+      |> Enum.zip(results)
+      |> Enum.reduce({[], []}, fn
+        {{_state_key, _old_offset,
+          {:cold_flow, park_key, %{locator: %Locator{} = locator} = park}},
+         {new_offset, new_size}},
+        {ops_acc, errors_acc} ->
+          old_row = %{locator: locator, park: park, park_key: park_key}
+
+          with {:ok, new_row} <-
+                 Hibernation.relocate_cold_row(old_row,
+                   offset: new_offset,
+                   value_size: new_size
+                 ),
+               {:ok, row_ops} <- Hibernation.cold_compaction_ops(old_row, new_row) do
+            {row_ops ++ ops_acc, errors_acc}
+          else
+            error -> {ops_acc, [{park_key, error} | errors_acc]}
+          end
+
+        _other, acc ->
+          acc
+      end)
+
+    case {ops, errors} do
+      {_ops, [_ | _]} ->
+        {:error, {:cold_flow_compaction_relocation_failed, Enum.reverse(errors)}}
+
+      {[], []} ->
+        :ok
+
+      {[_ | _], []} ->
+        LMDB.write_batch(LMDB.path(state.shard_data_path), Enum.reverse(ops))
+    end
   end
 
   # -------------------------------------------------------------------

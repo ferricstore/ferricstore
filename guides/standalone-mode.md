@@ -225,6 +225,7 @@ The dashboard has sidebar navigation with the following pages:
 - **Storage** (`/dashboard/storage`) -- per-shard on-disk storage details.
 - **Raft Consensus** (`/dashboard/raft`) -- per-shard Raft health, leader, term, applied/commit index. Refreshes 5s.
 - **Config** (`/dashboard/config`) -- namespace config overrides.
+- **Doctor** (`/dashboard/doctor`) -- bounded storage/projection diagnostics and safe background repair jobs.
 - **Clients** (`/dashboard/clients`) -- active client connections with IP, age, idle time. Refreshes 5s.
 - **Key Prefixes** (`/dashboard/prefixes`) -- key prefix distribution.
 
@@ -388,6 +389,22 @@ redis-cli FERRICSTORE.CONFIG SET session window_ms 5
 # Reset a namespace to defaults
 redis-cli FERRICSTORE.CONFIG RESET session
 ```
+
+### Doctor Diagnostics
+
+```bash
+redis-cli FERRICSTORE.DOCTOR CHECK
+redis-cli FERRICSTORE.DOCTOR CHECK SCOPE FLOW_LMDB
+redis-cli FERRICSTORE.DOCTOR START CHECK SCOPE BITCASK
+redis-cli FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB
+redis-cli FERRICSTORE.DOCTOR LIST
+```
+
+`FERRICSTORE.DOCTOR` is the Redis command behind the dashboard Doctor page. It
+checks Bitcask/keydir metadata, large-value blob refs, and the Flow LMDB cold
+projection. Inline `CHECK` is bounded; repair runs as a background job and is
+currently limited to rebuilding the Flow LMDB projection from durable Flow
+records.
 
 ### Key Diagnostics
 

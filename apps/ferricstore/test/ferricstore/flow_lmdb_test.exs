@@ -49,6 +49,35 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :not_found = Ferricstore.Flow.LMDB.get(path, "missing")
   end
 
+  test "release_all drops cached envs without losing persisted data" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_release_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn ->
+      Ferricstore.Flow.LMDB.release_all()
+      File.rm_rf!(path)
+    end)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "key", "value"}])
+    assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "key")
+
+    assert {:ok, released} = Ferricstore.Flow.LMDB.release_all()
+    assert released >= 1
+
+    assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "key")
+  end
+
+  test "mode parser supports explicit off lagged and legacy boolean values" do
+    assert Ferricstore.Flow.LMDB.normalize_mode("off") == :off
+    assert Ferricstore.Flow.LMDB.normalize_mode("false") == :off
+    assert Ferricstore.Flow.LMDB.normalize_mode("mirror") == :lagged
+    assert Ferricstore.Flow.LMDB.normalize_mode("lagged") == :lagged
+    assert Ferricstore.Flow.LMDB.normalize_mode("true") == :lagged
+  end
+
   test "read-only operations do not open a missing LMDB env" do
     path =
       Path.join(
@@ -500,10 +529,10 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert Ferricstore.Flow.LMDB.mode() == :lagged
     assert Ferricstore.Flow.LMDB.mirror?()
-    assert writer_state.flush_interval_ms == 1_000
+    assert writer_state.flush_interval_ms == 500
     assert writer_state.flush_jitter_ms == 250
     assert writer_state.max_ops == 25_000
-    assert writer_state.flush_chunk_ops == 10_000
+    assert writer_state.flush_chunk_ops == 5_000
     assert writer_state.flush_chunk_pause_ms == 1
 
     path =
@@ -1091,6 +1120,107 @@ defmodule Ferricstore.Flow.LMDBTest do
                fixture.lmdb_path,
                Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
              )
+  end
+
+  test "LMDB writer drains terminal Flow projection outbox from durable source" do
+    fixture = start_active_lmdb_projection_fixture!("terminal-outbox")
+
+    completed =
+      active_lmdb_record("flow-terminal-outbox", "terminal-outbox", "completed",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 30,
+        next_run_at_ms: nil,
+        version: 7
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+    encoded = Ferricstore.Flow.encode_record(completed)
+
+    :ets.insert(
+      fixture.source_keydir,
+      {state_key, encoded, 0, {:flow_state_version, completed.version, 0}, :hot, 0,
+       byte_size(encoded)}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue_projection_outbox(
+               fixture.instance_name,
+               fixture.shard_index,
+               [{state_key, completed.version}]
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+    assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+
+  end
+
+  test "lagged LMDB projector reconciles dirty shard from durable Flow state" do
+    fixture = start_active_lmdb_projection_fixture!("lagged-dirty")
+
+    completed =
+      active_lmdb_record("flow-lagged-dirty", "lagged-dirty", "completed",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 40,
+        next_run_at_ms: nil,
+        version: 9
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+    encoded = Ferricstore.Flow.encode_record(completed)
+
+    :ets.insert(
+      fixture.source_keydir,
+      {state_key, encoded, 0, {:flow_state_version, completed.version, 0}, :hot, 0,
+       byte_size(encoded)}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.mark_projection_dirty(
+               fixture.instance_name,
+               fixture.shard_index
+             )
+
+    writer = Process.whereis(Ferricstore.Flow.LMDBWriter.name(fixture.instance_name, 0))
+
+    assert wait_until_true(fn ->
+             %{projection_dirty?: dirty?} = :sys.get_state(writer)
+             dirty?
+           end, 20)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+    assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+
+    assert wait_until_true(fn -> :ets.lookup(fixture.source_keydir, state_key) == [] end, 20)
   end
 
   test "empty rebuild does not open LMDB" do
@@ -8388,7 +8518,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     instance_name = :"flow_lmdb_#{label}_#{System.unique_integer([:positive])}"
     shard_index = 0
-    source_keydir = :ets.new(:"flow_lmdb_#{label}_source", [:set])
+    source_keydir = :ets.new(:"flow_lmdb_#{label}_source", [:set, :public])
 
     on_exit(fn ->
       if :ets.info(source_keydir) != :undefined, do: :ets.delete(source_keydir)

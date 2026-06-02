@@ -501,6 +501,10 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec lmdb_clear(binary(), non_neg_integer()) :: :ok | {:error, term()}
   def lmdb_clear(_path, _map_size), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_release_all() ::
+          {:ok, non_neg_integer()} | {:busy, non_neg_integer()} | {:error, term()}
+  def lmdb_release_all, do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_prefix_entries(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),

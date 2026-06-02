@@ -1,9 +1,74 @@
 # Flow Production Readiness Notes
 
-Flow command correctness is based on Ra + Bitcask Flow state/history records and
+Flow command correctness is based on Raft + Bitcask Flow state/history records and
 the hot ETS Flow indexes. LMDB is a cold projection for terminal, lineage, and
 deep-history queries. Hot commands must not wait for LMDB projection flush unless
 the caller explicitly asks for a consistent projection read.
+
+## Operational Limits And Overload
+
+FerricStore derives default guardrails from the actual node/container capacity:
+
+- memory budget: detected cgroup/host memory, or `:operational_memory_limit_bytes`
+- disk budget: filesystem capacity for `:data_dir`, or
+  `:operational_disk_total_bytes` / `:operational_disk_available_bytes`
+- CPU/shards: `System.schedulers_online()` unless `:shard_count` is configured
+
+Default memory ratios:
+
+- warn: `70%`
+- pressure: `80%`
+- reject: `88%`
+- panic: `94%`
+
+Default disk ratios:
+
+- warn: `70%`
+- pressure: `80%`
+- reject: `90%`
+- panic: `95%`
+
+Behavior:
+
+- `pressure`: retention runs with the pressure cadence and merge checks are
+  triggered more aggressively.
+- `disk reject`: all shard disk-pressure flags are set, so new writes fail
+  cleanly instead of queuing work that cannot be persisted.
+- `rss pressure`: cold-read promotion is skipped to avoid hot-cache thrashing.
+- `rss reject`: write rejection follows the same backpressure path as memory
+  exhaustion.
+
+Important operational rule: terminal retention is logical deletion, not instant
+disk reclaim. Bitcask and Raft logs are append-oriented, so disk usage falls only
+after retention commands, merge/compaction, and release cursors catch up. The
+guard therefore starts cleanup at pressure level and rejects new writes before
+the filesystem reaches ENOSPC.
+
+For a larger VM, do not copy small-instance constants. Example: on a 16 CPU,
+64 GiB RAM, 1 TiB NVMe node, the default reject points are derived as roughly
+`56 GiB RSS` and `921 GiB disk used`. If you move the data directory to a larger
+disk, the disk thresholds automatically move with that filesystem.
+
+Operational telemetry:
+
+- `[:ferricstore, :operational, :guard]`
+
+The event includes RSS bytes, memory limit bytes, disk used/total bytes, memory
+level, disk level, ratios, data directory, and shard count.
+
+Recommended starting points for DBOS/Temporal-style Flow workloads:
+
+- shards: one per CPU up to the workload-tested limit, then benchmark
+- queue/workflow batch size: `500`
+- pipeline depth: `50`
+- client connections: at least `cpu_count * 16` for high-throughput benchmarks
+- inline value comfort zone: `64 KiB`
+- blob side-channel threshold: default `256 KiB`
+
+Under overload the Python SDK should treat write rejection/backpressure as a
+signal to slow producers, retry with jitter, or shed load. The server protects
+durability first; it will reject new work before allowing memory or disk
+pressure to corrupt the runtime.
 
 ## LMDB Projection Visibility
 
@@ -57,6 +122,11 @@ Failure mode:
   fixes the underlying disk/LMDB issue.
 - On restart, projectors replay from durable Flow state/history records and the
   persisted projected-index markers.
+- Operators can inspect projection state with
+  `FERRICSTORE.DOCTOR CHECK SCOPE FLOW_LMDB`. If the projection remains degraded
+  after fixing the underlying issue, run
+  `FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB` to reconcile the
+  cold/query projection from durable Flow records.
 - The optional LMDB release-cursor poke is disabled by default through
   `:flow_lmdb_release_cursor_poke_enabled`. Enable it only after validating that
   the deployment benefits from faster cursor nudges without adding noisy Ra

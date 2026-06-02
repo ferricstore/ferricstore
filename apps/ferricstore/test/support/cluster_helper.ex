@@ -852,6 +852,8 @@ defmodule Ferricstore.Test.ClusterHelper do
   end
 
   defp configure_remote_node(node_name, data_dir, shards) do
+    quiet_remote_logger(node_name)
+
     env_settings = [
       {:data_dir, data_dir},
       {:port, 0},
@@ -867,6 +869,12 @@ defmodule Ferricstore.Test.ClusterHelper do
     Enum.each(env_settings, fn {key, value} ->
       :ok = :rpc.call(node_name, Application, :put_env, [:ferricstore, key, value])
     end)
+  end
+
+  defp quiet_remote_logger(node_name) do
+    _ = :rpc.call(node_name, Application, :put_env, [:logger, :level, :warning])
+    _ = :rpc.call(node_name, Logger, :configure, [[level: :warning]])
+    :ok
   end
 
   # ---------------------------------------------------------------------------

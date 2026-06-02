@@ -71,7 +71,7 @@ documented in `docs/flow-elixir-sdk.md`.
 These have no Redis equivalent:
 
 `CAS`, `LOCK`, `UNLOCK`, `EXTEND`, `RATELIMIT.ADD`, `FETCH_OR_COMPUTE`, `FETCH_OR_COMPUTE_RESULT`, `FETCH_OR_COMPUTE_ERROR`, `KEY_INFO`,
-`FERRICSTORE.CONFIG`, `FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`,
+`FERRICSTORE.CONFIG`, `FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`, `FERRICSTORE.DOCTOR`,
 `CLUSTER.HEALTH`, `CLUSTER.STATS`, `CLUSTER.KEYSLOT`, `CLUSTER.SLOTS`
 
 ### Redis Commands NOT Yet Supported
@@ -1112,6 +1112,62 @@ Returns diagnostic metadata about a key.
 |---|---|
 | **RESP3 syntax** | `KEY_INFO key` (or `FERRICSTORE.KEY_INFO key`) |
 | **Return** | Array: `[type, T, value_size, N, ttl_ms, N, hot_cache_status, hot\|cold, last_write_shard, N]` |
+
+### FERRICSTORE.DOCTOR
+
+Runs bounded operator diagnostics and safe background repair jobs. This is an
+admin command intended for production debugging and dashboard actions. Inline
+`CHECK` reads bounded metadata only; expensive checks or repairs should be run
+with `START` so the client connection is not held.
+
+| | |
+|---|---|
+| **RESP3 syntax** | `FERRICSTORE.DOCTOR <subcommand> [args...]` |
+| **Embedded API** | Internal command surface only |
+| **RESP3 return** | Map with `status`, `checks`, `job_id`, or `jobs` depending on subcommand |
+| **ACL** | `@admin`; repair jobs are also `@dangerous` |
+| **Dashboard** | `/dashboard/doctor` |
+
+Supported scopes:
+
+| Scope | What It Checks |
+|-------|----------------|
+| `BITCASK` | Keydir availability, keydir binary bytes, data file count, and data bytes per shard |
+| `BLOB_REFS` | Large-value blob segment metadata and protected blob refs |
+| `FLOW_LMDB` | Flow LMDB projection health, pending ops, oldest pending age, replay-safe lag, and degraded shards |
+| `ALL` | All supported scopes |
+
+Subcommands:
+
+| Command | Purpose |
+|---------|---------|
+| `FERRICSTORE.DOCTOR CHECK [SCOPE scope]` | Run a bounded inline check. Omitting `SCOPE` checks all scopes. |
+| `FERRICSTORE.DOCTOR CHECK SCOPES n scope...` | Run a bounded inline check for specific scopes. |
+| `FERRICSTORE.DOCTOR START CHECK [SCOPE scope]` | Start the same check as a background job and return `job_id`. |
+| `FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB` | Flush and reconcile the Flow LMDB cold projection from durable Flow records. |
+| `FERRICSTORE.DOCTOR STATUS job_id` | Return one background job. |
+| `FERRICSTORE.DOCTOR LIST` | Return known doctor jobs, newest first. |
+| `FERRICSTORE.DOCTOR CANCEL job_id` | Cancel a running background job. |
+
+Examples:
+
+```bash
+redis-cli FERRICSTORE.DOCTOR CHECK
+redis-cli FERRICSTORE.DOCTOR CHECK SCOPE FLOW_LMDB
+redis-cli FERRICSTORE.DOCTOR START CHECK SCOPE BITCASK
+redis-cli FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB
+redis-cli FERRICSTORE.DOCTOR STATUS doctor-1-123
+redis-cli FERRICSTORE.DOCTOR LIST
+```
+
+Repair notes:
+
+- `START REPAIR PROJECTIONS SCOPE FLOW_LMDB` repairs the cold/query projection
+  only. It does not mutate hot Flow indexes or rewrite user state.
+- Flow command durability does not depend on LMDB projection being current; the
+  durable source of truth remains the WARaft/Bitcask Flow records.
+- Use this repair when `FLOW_LMDB` reports degraded shards or projection lag that
+  does not drain after the underlying disk/LMDB issue is fixed.
 
 ---
 

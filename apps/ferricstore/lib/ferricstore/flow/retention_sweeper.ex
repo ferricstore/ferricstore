@@ -10,10 +10,15 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
   require Logger
 
+  alias Ferricstore.Store.DiskPressure
+
   @default_initial_delay_ms 600_000
   @default_interval_ms 600_000
   @default_catchup_delay_ms 100
   @default_limit 100
+  @default_pressure_interval_ms 1_000
+  @default_pressure_limit 10_000
+  @default_pressure_compaction_interval_ms 60_000
 
   def start_link(opts \\ []) do
     if enabled?() do
@@ -37,6 +42,19 @@ defmodule Ferricstore.Flow.RetentionSweeper do
               @default_catchup_delay_ms
             ),
           limit: config_pos_int(:flow_retention_sweeper_limit, @default_limit),
+          pressure_interval_ms:
+            config_pos_int(
+              :flow_retention_sweeper_pressure_interval_ms,
+              @default_pressure_interval_ms
+            ),
+          pressure_limit:
+            config_pos_int(:flow_retention_sweeper_pressure_limit, @default_pressure_limit),
+          pressure_compaction_interval_ms:
+            config_non_neg_int(
+              :flow_retention_sweeper_pressure_compaction_interval_ms,
+              @default_pressure_compaction_interval_ms
+            ),
+          compaction_running?: false,
           consecutive_limit_hits: 0,
           last_sweep: nil
         }
@@ -53,6 +71,19 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         catchup_delay_ms:
           config_non_neg_int(:flow_retention_sweeper_catchup_delay_ms, @default_catchup_delay_ms),
         limit: config_pos_int(:flow_retention_sweeper_limit, @default_limit),
+        pressure_interval_ms:
+          config_pos_int(
+            :flow_retention_sweeper_pressure_interval_ms,
+            @default_pressure_interval_ms
+          ),
+        pressure_limit:
+          config_pos_int(:flow_retention_sweeper_pressure_limit, @default_pressure_limit),
+        pressure_compaction_interval_ms:
+          config_non_neg_int(
+            :flow_retention_sweeper_pressure_compaction_interval_ms,
+            @default_pressure_compaction_interval_ms
+          ),
+        compaction_running?: false,
         consecutive_limit_hits: 0,
         last_sweep: nil
       }
@@ -71,7 +102,32 @@ defmodule Ferricstore.Flow.RetentionSweeper do
           @default_catchup_delay_ms
         ),
       limit: opt_pos_int(opts, :limit, :flow_retention_sweeper_limit, @default_limit),
+      pressure_interval_ms:
+        opt_pos_int(
+          opts,
+          :pressure_interval_ms,
+          :flow_retention_sweeper_pressure_interval_ms,
+          @default_pressure_interval_ms
+        ),
+      pressure_limit:
+        opt_pos_int(
+          opts,
+          :pressure_limit,
+          :flow_retention_sweeper_pressure_limit,
+          @default_pressure_limit
+        ),
+      pressure_compaction_interval_ms:
+        opt_non_neg_int(
+          opts,
+          :pressure_compaction_interval_ms,
+          :flow_retention_sweeper_pressure_compaction_interval_ms,
+          @default_pressure_compaction_interval_ms
+        ),
+      pressure_detector_fun: Keyword.get(opts, :pressure_detector_fun, &pressure?/0),
       cleanup_fun: Keyword.get(opts, :cleanup_fun, &FerricStore.flow_retention_cleanup/1),
+      compaction_fun: Keyword.get(opts, :compaction_fun, &trigger_merge_checks/0),
+      compaction_ref: nil,
+      last_compaction_mono_ms: nil,
       consecutive_limit_hits: 0,
       last_sweep: nil
     }
@@ -97,6 +153,10 @@ defmodule Ferricstore.Flow.RetentionSweeper do
        interval_ms: state.interval_ms,
        catchup_delay_ms: state.catchup_delay_ms,
        limit: state.limit,
+       pressure_interval_ms: state.pressure_interval_ms,
+       pressure_limit: state.pressure_limit,
+       pressure_compaction_interval_ms: state.pressure_compaction_interval_ms,
+       compaction_running?: state.compaction_ref != nil,
        consecutive_limit_hits: state.consecutive_limit_hits,
        last_sweep: state.last_sweep
      }, state}
@@ -105,10 +165,12 @@ defmodule Ferricstore.Flow.RetentionSweeper do
   @impl true
   def handle_info(:sweep, state) do
     started = System.monotonic_time()
+    pressure? = pressure?(state)
+    limit = effective_limit(state, pressure?)
 
     result =
       try do
-        state.cleanup_fun.(limit: state.limit)
+        state.cleanup_fun.(limit: limit)
       rescue
         error ->
           Logger.warning("Flow retention sweeper failed: #{Exception.message(error)}")
@@ -117,8 +179,23 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
     duration_us = duration_us(started)
     {status, counts, reason} = normalize_result(result)
-    limit_hit? = status == :ok and cleanup_limit_hit?(counts, state.limit)
-    emit_sweep(status, counts, reason, limit_hit?, duration_us, state)
+    limit_hit? = status == :ok and cleanup_limit_hit?(counts, limit)
+
+    {state, compaction_triggered?} =
+      maybe_trigger_compaction(status, counts, pressure?, limit_hit?, state)
+
+    emit_sweep(
+      status,
+      counts,
+      reason,
+      limit_hit?,
+      pressure?,
+      compaction_triggered?,
+      duration_us,
+      limit,
+      state
+    )
+
     maybe_emit_backlog(limit_hit?, counts, state)
     maybe_emit_error(status, reason, state)
 
@@ -132,16 +209,24 @@ defmodule Ferricstore.Flow.RetentionSweeper do
             flows: Map.get(counts, :flows, 0),
             history: Map.get(counts, :history, 0),
             values: Map.get(counts, :values, 0),
+            pressure?: pressure?,
             duration_us: duration_us,
-            limit: state.limit,
+            limit: limit,
             limit_hit?: limit_hit?,
+            compaction_triggered?: compaction_triggered?,
             finished_at_ms: System.system_time(:millisecond)
           }
       }
 
-    schedule(if(limit_hit?, do: state.catchup_delay_ms, else: state.interval_ms))
+    schedule(next_delay_ms(limit_hit?, pressure?, state))
     {:noreply, next_state}
   end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{compaction_ref: ref} = state) do
+    {:noreply, %{state | compaction_ref: nil}}
+  end
+
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state), do: {:noreply, state}
 
   defp schedule(delay_ms) do
     Process.send_after(self(), :sweep, delay_ms)
@@ -183,6 +268,9 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     end
   end
 
+  defp effective_limit(state, true), do: max(state.limit, state.pressure_limit)
+  defp effective_limit(state, false), do: state.limit
+
   defp normalize_result({:ok, counts}) when is_map(counts), do: {:ok, counts, :none}
   defp normalize_result({:error, reason}), do: {:error, %{}, reason}
   defp normalize_result(other), do: {:error, %{}, other}
@@ -193,7 +281,17 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     end)
   end
 
-  defp emit_sweep(status, counts, reason, limit_hit?, duration_us, state) do
+  defp emit_sweep(
+         status,
+         counts,
+         reason,
+         limit_hit?,
+         pressure?,
+         compaction_triggered?,
+         duration_us,
+         limit,
+         state
+       ) do
     :telemetry.execute(
       [:ferricstore, :flow, :retention_sweeper, :sweep],
       %{
@@ -201,11 +299,13 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         flows: Map.get(counts, :flows, 0),
         history: Map.get(counts, :history, 0),
         values: Map.get(counts, :values, 0),
-        limit: state.limit
+        limit: limit
       },
       %{
         status: status,
         reason: reason,
+        pressure?: pressure?,
+        compaction_triggered?: compaction_triggered?,
         limit_hit?: limit_hit?,
         consecutive_limit_hits: if(limit_hit?, do: state.consecutive_limit_hits + 1, else: 0)
       }
@@ -239,6 +339,119 @@ defmodule Ferricstore.Flow.RetentionSweeper do
       },
       %{consecutive_limit_hits: state.consecutive_limit_hits + 1}
     )
+  end
+
+  defp next_delay_ms(true, true, state),
+    do: min(state.catchup_delay_ms, state.pressure_interval_ms)
+
+  defp next_delay_ms(true, false, state), do: state.catchup_delay_ms
+  defp next_delay_ms(false, true, state), do: state.pressure_interval_ms
+  defp next_delay_ms(false, false, state), do: state.interval_ms
+
+  defp pressure?(state) do
+    state.pressure_detector_fun.()
+  rescue
+    _ -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp pressure? do
+    operational_pressure?() or memory_pressure?() or disk_pressure?()
+  end
+
+  defp operational_pressure? do
+    Ferricstore.OperationalGuard.pressure?()
+  rescue
+    _ -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp memory_pressure? do
+    Ferricstore.MemoryGuard.reject_writes?() or Ferricstore.MemoryGuard.skip_promotion?()
+  rescue
+    _ -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp disk_pressure? do
+    ctx = FerricStore.Instance.get(:default)
+
+    Enum.any?(0..(ctx.shard_count - 1), fn shard_index ->
+      DiskPressure.under_pressure?(ctx, shard_index)
+    end)
+  rescue
+    _ -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp maybe_trigger_compaction(:ok, counts, pressure?, limit_hit?, state) do
+    if should_trigger_compaction?(counts, pressure?, limit_hit?, state) do
+      case Task.start(fn -> state.compaction_fun.() end) do
+        {:ok, pid} ->
+          ref = Process.monitor(pid)
+
+          {%{
+             state
+             | compaction_ref: ref,
+               last_compaction_mono_ms: System.monotonic_time(:millisecond)
+           }, true}
+
+        _other ->
+          {state, false}
+      end
+    else
+      {state, false}
+    end
+  end
+
+  defp maybe_trigger_compaction(_status, _counts, _pressure?, _limit_hit?, state),
+    do: {state, false}
+
+  defp should_trigger_compaction?(counts, pressure?, limit_hit?, state) do
+    state.pressure_compaction_interval_ms > 0 and
+      state.compaction_ref == nil and
+      (pressure? or limit_hit?) and
+      cleanup_count(counts) > 0 and
+      compaction_due?(state)
+  end
+
+  defp cleanup_count(counts) do
+    Map.get(counts, :flows, 0) + Map.get(counts, :history, 0) + Map.get(counts, :values, 0)
+  end
+
+  defp compaction_due?(%{last_compaction_mono_ms: nil}), do: true
+
+  defp compaction_due?(state) do
+    System.monotonic_time(:millisecond) - state.last_compaction_mono_ms >=
+      state.pressure_compaction_interval_ms
+  end
+
+  defp trigger_merge_checks do
+    ctx = FerricStore.Instance.get(:default)
+
+    if is_integer(ctx.shard_count) and ctx.shard_count > 0 do
+      Enum.each(0..(ctx.shard_count - 1), fn shard_index ->
+        scheduler = Ferricstore.Merge.Scheduler.scheduler_name(ctx, shard_index)
+
+        if Process.whereis(scheduler) do
+          Ferricstore.Merge.Scheduler.trigger_check(scheduler)
+        end
+      end)
+    end
+
+    :ok
+  rescue
+    error ->
+      Logger.warning("Flow retention pressure compaction failed: #{Exception.message(error)}")
+      :ok
+  catch
+    kind, reason ->
+      Logger.warning("Flow retention pressure compaction failed: #{inspect({kind, reason})}")
+      :ok
   end
 
   defp duration_us(started) do

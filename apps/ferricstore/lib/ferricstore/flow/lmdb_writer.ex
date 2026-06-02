@@ -4,18 +4,20 @@ defmodule Ferricstore.Flow.LMDBWriter do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.Hibernation
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Raft.WARaftSegmentReader
 
   require Logger
 
-  @default_lagged_flush_interval_ms 1_000
+  @default_lagged_flush_interval_ms 500
   @default_lagged_flush_jitter_ms 250
-  @default_lagged_flush_quiet_ms 1_000
-  @default_lagged_flush_max_lag_ms 5_000
+  @default_lagged_flush_quiet_ms 250
+  @default_lagged_flush_max_lag_ms 30_000
   @default_lagged_max_ops 25_000
-  @default_flush_chunk_ops 10_000
+  @default_flush_chunk_ops 5_000
   @default_lagged_flush_chunk_pause_ms 1
   @default_source_pending_retries 100
   @default_source_pending_sleep_ms 1
@@ -102,7 +104,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       instance_suspended?(instance_name) ->
         writer_unavailable(:enqueue, instance_name, shard_index, :writer_suspended, op_count)
 
-      pid = Process.whereis(name(instance_name, shard_index)) ->
+      is_pid(pid = Process.whereis(name(instance_name, shard_index))) ->
         case enqueue_async_guard(instance_name, shard_index, op_count) do
           :ok ->
             seq = reserve_enqueue_seq(instance_name, shard_index)
@@ -115,6 +117,94 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
       true ->
         writer_unavailable(:enqueue, instance_name, shard_index, :writer_not_started, op_count)
+    end
+  end
+
+  def enqueue_projection_outbox(instance_name, shard_index, entries)
+      when is_atom(instance_name) and is_integer(shard_index) and is_list(entries) do
+    entries = normalize_projection_outbox_entries(entries)
+    entry_count = length(entries)
+
+    cond do
+      entries == [] ->
+        :ok
+
+      instance_suspended?(instance_name) ->
+        writer_unavailable(
+          :projection_outbox_enqueue,
+          instance_name,
+          shard_index,
+          :writer_suspended,
+          entry_count
+        )
+
+      pid = Process.whereis(name(instance_name, shard_index)) ->
+        case :ets.whereis(projection_outbox_name(instance_name, shard_index)) do
+          :undefined ->
+            writer_unavailable(
+              :projection_outbox_enqueue,
+              instance_name,
+              shard_index,
+              :projection_outbox_not_started,
+              entry_count
+            )
+
+          tid ->
+            :ets.insert(tid, projection_outbox_rows(entries))
+            GenServer.cast(pid, :projection_outbox_available)
+            :ok
+        end
+
+      true ->
+        writer_unavailable(
+          :projection_outbox_enqueue,
+          instance_name,
+          shard_index,
+          :writer_not_started,
+          entry_count
+        )
+    end
+  end
+
+  def mark_projection_dirty(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) do
+    cond do
+      instance_suspended?(instance_name) ->
+        writer_unavailable(
+          :projection_dirty,
+          instance_name,
+          shard_index,
+          :writer_suspended,
+          1
+        )
+
+      pid = Process.whereis(name(instance_name, shard_index)) ->
+        case :ets.whereis(projection_outbox_name(instance_name, shard_index)) do
+          :undefined ->
+            writer_unavailable(
+              :projection_dirty,
+              instance_name,
+              shard_index,
+              :projection_outbox_not_started,
+              1
+            )
+
+          tid ->
+            if :ets.insert_new(tid, {:dirty, true}) do
+              GenServer.cast(pid, :projection_dirty)
+            end
+
+            :ok
+        end
+
+      true ->
+        writer_unavailable(
+          :projection_dirty,
+          instance_name,
+          shard_index,
+          :writer_not_started,
+          1
+        )
     end
   end
 
@@ -324,6 +414,41 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :"Ferricstore.Flow.LMDBWriter.#{instance_name}.#{shard_index}"
   end
 
+  defp projection_outbox_name(instance_name, shard_index) do
+    :"Ferricstore.Flow.LMDBWriter.ProjectionOutbox.#{instance_name}.#{shard_index}"
+  end
+
+  defp ensure_projection_outbox!(instance_name, shard_index) do
+    table = projection_outbox_name(instance_name, shard_index)
+
+    case :ets.whereis(table) do
+      :undefined ->
+        :ets.new(table, [
+          :ordered_set,
+          :public,
+          :named_table,
+          {:read_concurrency, true},
+          {:write_concurrency, true}
+        ])
+
+      tid ->
+        tid
+    end
+  end
+
+  defp normalize_projection_outbox_entries(entries) do
+    Enum.flat_map(entries, fn
+      {state_key, version} when is_binary(state_key) and is_integer(version) -> [{state_key, version}]
+      _other -> []
+    end)
+  end
+
+  defp projection_outbox_rows(entries) do
+    Enum.map(entries, fn {state_key, version} ->
+      {System.unique_integer([:monotonic, :positive]), state_key, version}
+    end)
+  end
+
   defp mark_instance_suspended(instance_name) when is_atom(instance_name) do
     :persistent_term.put(suspend_key(instance_name), true)
     :ok
@@ -362,6 +487,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     shard_index = Keyword.fetch!(opts, :shard_index)
     data_dir = Keyword.fetch!(opts, :data_dir)
     instance_name = instance_name_from_opts(opts)
+    _outbox = ensure_projection_outbox!(instance_name, shard_index)
 
     if shard_index == 0 do
       clear_instance_suspended(instance_name)
@@ -375,6 +501,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       instance_name: instance_name,
       mode: Ferricstore.Flow.LMDB.mode(),
       shard_index: shard_index,
+      data_dir: data_dir,
       shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, shard_index),
       path:
         data_dir
@@ -392,6 +519,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       terminal_count_inits: MapSet.new(),
       lmdb_ready: false,
       suspended?: false,
+      projection_dirty?: false,
       enqueue_seq: enqueue_seq,
       processed_enqueue_seq: 0,
       processed_enqueue_gaps: MapSet.new(),
@@ -421,6 +549,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
           @default_lagged_flush_max_lag_ms
         ),
       max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, default_max_ops()),
+      flush_on_max_ops?:
+        Application.get_env(
+          :ferricstore,
+          :flow_lmdb_flush_on_max_ops,
+          default_flush_on_max_ops(Ferricstore.Flow.LMDB.mode())
+        ),
       flush_chunk_ops:
         Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops, @default_flush_chunk_ops),
       flush_chunk_pause_ms:
@@ -486,6 +620,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp default_max_ops do
     @default_lagged_max_ops
   end
+
+  defp default_flush_on_max_ops(_mode), do: false
 
   defp default_flush_jitter_ms do
     @default_lagged_flush_jitter_ms
@@ -590,6 +726,24 @@ defmodule Ferricstore.Flow.LMDBWriter do
       {:noreply, state}
     else
       handle_enqueue(ops, after_flush, state)
+    end
+  end
+
+  def handle_cast(:projection_outbox_available, state) do
+    cond do
+      writer_suspended?(state) ->
+        {:noreply, state}
+
+      true ->
+        {:noreply, ensure_projection_outbox_timer(state)}
+    end
+  end
+
+  def handle_cast(:projection_dirty, state) do
+    if writer_suspended?(state) do
+      {:noreply, state}
+    else
+      {:noreply, ensure_projection_outbox_timer(%{state | projection_dirty?: true})}
     end
   end
 
@@ -714,13 +868,25 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp ensure_timer(state), do: state
 
+  defp ensure_projection_outbox_timer(%{timer_ref: nil} = state) do
+    delay =
+      state
+      |> Map.get(:flush_max_lag_ms, @default_lagged_flush_max_lag_ms)
+      |> max(1)
+
+    %{state | timer_ref: Process.send_after(self(), :flush, delay)}
+  end
+
+  defp ensure_projection_outbox_timer(state), do: state
+
   defp ensure_enqueue_timer(state), do: ensure_timer(state)
 
-  defp flush_on_max_ops?(state), do: state.count >= state.max_ops
+  defp flush_on_max_ops?(%{flush_on_max_ops?: true} = state), do: state.count >= state.max_ops
+  defp flush_on_max_ops?(_state), do: false
 
   defp maybe_defer_timer_flush(%{pending: [], pending_after_flush: []}), do: :flush
 
-  defp maybe_defer_timer_flush(%{count: count, max_ops: max_ops})
+  defp maybe_defer_timer_flush(%{flush_on_max_ops?: true, count: count, max_ops: max_ops})
        when is_integer(count) and is_integer(max_ops) and count >= max_ops,
        do: :flush
 
@@ -749,7 +915,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp timer_flush_decision(%{pending: [], pending_after_flush: []}), do: :flush
 
-  defp timer_flush_decision(%{count: count, max_ops: max_ops})
+  defp timer_flush_decision(%{flush_on_max_ops?: true, count: count, max_ops: max_ops})
        when is_integer(count) and is_integer(max_ops) and count >= max_ops,
        do: :flush
 
@@ -874,7 +1040,13 @@ defmodule Ferricstore.Flow.LMDBWriter do
     state
   end
 
-  defp flush_pending_with_reply(
+  defp flush_pending_with_reply(state) do
+    state = drain_projection_outbox(state, :no_flush)
+    {state, reply} = do_flush_pending_with_reply(state)
+    maybe_reconcile_dirty_projection_with_reply(state, reply)
+  end
+
+  defp do_flush_pending_with_reply(
          %{
            pending: [],
            pending_after_flush: [],
@@ -893,7 +1065,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
      }, :ok}
   end
 
-  defp flush_pending_with_reply(state) do
+  defp do_flush_pending_with_reply(state) do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
 
     ops = Enum.reverse(state.pending)
@@ -1020,6 +1192,146 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp terminal_count_cache_empty?(_cache), do: true
+
+  defp drain_projection_outbox(state, mode) when mode in [:maybe_flush, :no_flush] do
+    case take_projection_outbox_entries(state) do
+      [] ->
+        state
+
+      entries ->
+        {ops, after_flush} = projection_outbox_items(state, entries)
+
+        cond do
+          ops == [] and after_flush == [] ->
+            state
+
+          mode == :maybe_flush ->
+            enqueue_and_maybe_flush(ops, after_flush, state)
+
+          true ->
+            now = System.monotonic_time()
+            state = enqueue_ops(ops, after_flush, state, now)
+
+            emit_backlog(state, now)
+            state
+        end
+    end
+  end
+
+  defp take_projection_outbox_entries(state) do
+    table = projection_outbox_name(state.instance_name, state.shard_index)
+
+    case :ets.whereis(table) do
+      :undefined ->
+        []
+
+      tid ->
+        tid
+        |> :ets.tab2list()
+        |> Enum.flat_map(fn
+          {seq, _state_key, _version} ->
+          case :ets.take(tid, seq) do
+            [entry] -> [entry]
+            _ -> []
+          end
+
+          _marker ->
+            []
+        end)
+        |> Enum.sort_by(fn {seq, _state_key, _version} -> seq end)
+    end
+  rescue
+    ArgumentError -> []
+  end
+
+  defp projection_outbox_items(state, entries) do
+    entries
+    |> Enum.reduce({[], []}, fn {_seq, state_key, version}, {ops, after_flush} ->
+      action = projection_outbox_after_flush(state, state_key, version)
+
+      after_flush =
+        case action do
+          nil -> after_flush
+          action -> [action | after_flush]
+        end
+
+      {[{:project_flow_state_from_source, state_key} | ops], after_flush}
+    end)
+    |> then(fn {ops, after_flush} -> {Enum.reverse(ops), Enum.reverse(after_flush)} end)
+  end
+
+  defp projection_outbox_after_flush(state, state_key, version) do
+    case source_keydir(state) do
+      nil ->
+        nil
+
+      ets ->
+        {zset_index, zset_lookup} =
+          Ferricstore.Store.Shard.ZSetIndex.table_names(state.instance_name, state.shard_index)
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(state.instance_name, state.shard_index)
+
+        {:defer_after_flush, terminal_hot_ttl_ms(),
+         {:prune_terminal_flow_from_source_v1, state.data_dir, state.shard_index, ets, zset_index,
+          zset_lookup, flow_index, flow_lookup, state_key, version}}
+    end
+  end
+
+  defp maybe_reconcile_dirty_projection_with_reply(state, :ok) do
+    case reconcile_dirty_projection(state) do
+      :ok ->
+        clear_projection_dirty_marker(state)
+        {%{state | projection_dirty?: false}, :ok}
+
+      {:error, reason} ->
+        record_flush_failure(state.instance_ctx, state.shard_index)
+        mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
+        {%{state | projection_dirty?: true}, {:error, reason}}
+    end
+  end
+
+  defp maybe_reconcile_dirty_projection_with_reply(state, reply), do: {state, reply}
+
+  defp reconcile_dirty_projection(%{projection_dirty?: true, mode: :lagged} = state) do
+    case source_keydir(state) do
+      nil ->
+        {:error, :source_keydir_unavailable}
+
+      keydir ->
+        {zset_index, zset_lookup} =
+          Ferricstore.Store.Shard.ZSetIndex.table_names(state.instance_name, state.shard_index)
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(state.instance_name, state.shard_index)
+
+        Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+          state.shard_data_path,
+          keydir,
+          state.shard_index,
+          state.instance_ctx,
+          zset_index,
+          zset_lookup,
+          flow_index,
+          flow_lookup
+        )
+    end
+  rescue
+    error -> {:error, {:lagged_projection_reconcile_failed, error}}
+  catch
+    kind, reason -> {:error, {:lagged_projection_reconcile_failed, {kind, reason}}}
+  end
+
+  defp reconcile_dirty_projection(_state), do: :ok
+
+  defp clear_projection_dirty_marker(state) do
+    case :ets.whereis(projection_outbox_name(state.instance_name, state.shard_index)) do
+      :undefined -> :ok
+      tid -> :ets.delete(tid, :dirty)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
 
   defp write_op_chunks(state, ops, chunk_ops) do
     ops
@@ -2125,6 +2437,80 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
+  defp apply_after_flush(
+         {:prune_terminal_flow_from_source_v1, data_dir, shard_index, ets, zset_index,
+          zset_lookup, flow_index, flow_lookup, state_key, version}
+       ) do
+    with {:ok, record} <- hot_flow_record_from_ets(ets, state_key),
+         ^version <- Map.get(record, :version),
+         terminal_state when is_binary(terminal_state) <- Map.get(record, :state),
+         true <- Ferricstore.Flow.LMDB.terminal_state?(terminal_state),
+         type when is_binary(type) <- Map.get(record, :type),
+         id when is_binary(id) <- Map.get(record, :id) do
+      partition_key = Map.get(record, :partition_key)
+      state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
+
+      metadata_index_keys =
+        terminal_project_metadata_index_keys(
+          id,
+          partition_key,
+          Map.get(record, :parent_flow_id),
+          Map.get(record, :root_flow_id),
+          Map.get(record, :correlation_id)
+        )
+
+      prune_terminal_state_key(data_dir, shard_index, ets, state_key, version)
+
+      safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+      safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
+
+      Enum.each(metadata_index_keys, fn index_key ->
+        safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
+      end)
+    end
+
+    :ok
+  end
+
+  defp apply_after_flush(
+         {:hibernate_flow_evict_hot_v1,
+          %{
+            data_dir: data_dir,
+            shard_index: shard_index,
+            ets: ets,
+            flow_index: flow_index,
+            flow_lookup: flow_lookup,
+            state_key: state_key,
+            record: record,
+            locator: %Locator{} = locator
+          } = attrs}
+       ) do
+    evicted? = hibernate_delete_hot_state_key(data_dir, shard_index, ets, state_key, locator)
+
+    if evicted? do
+      zset_index = Map.get(attrs, :zset_index)
+      zset_lookup = Map.get(attrs, :zset_lookup)
+      id = Map.fetch!(record, :id)
+
+      record
+      |> Hibernation.hot_index_keys(due_any?: true)
+      |> Enum.each(fn index_key ->
+        safe_zset_delete_member(zset_index, zset_lookup, index_key, id)
+        safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
+      end)
+
+      Hibernation.maybe_schedule_claim_waiter(record)
+    end
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :hibernation, :evict_hot],
+      %{count: 1},
+      %{result: if(evicted?, do: :evicted, else: :stale), shard_index: shard_index}
+    )
+
+    :ok
+  end
+
   defp apply_after_flush({:defer_after_flush, delay_ms, action}) do
     delay_ms = normalize_delay_ms(delay_ms)
 
@@ -2146,6 +2532,44 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp apply_after_flush(_action), do: :ok
+
+  defp hot_flow_record_from_ets(ets, state_key) do
+    case :ets.lookup(ets, state_key) do
+      [{^state_key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}]
+      when is_binary(value) ->
+        decode_raw_flow_record(value)
+
+      _ ->
+        :not_found
+    end
+  rescue
+    ArgumentError -> :not_found
+  end
+
+  defp decode_raw_flow_record(value) when is_binary(value) do
+    {:ok, flow_call(:decode_record, [value])}
+  rescue
+    _ -> :error
+  end
+
+  defp hibernate_delete_hot_state_key(data_dir, shard_index, ets, state_key, %Locator{} = locator) do
+    case :ets.lookup(ets, state_key) do
+      [{^state_key, _value, _expire_at_ms, _lfu, file_id, offset, value_size} = row] ->
+        if file_id == locator.file_id and offset == locator.offset and
+             value_size == locator.value_size do
+          delete_apply_projection_cache_for_row(data_dir, shard_index, row)
+          :ets.delete(ets, state_key)
+          true
+        else
+          false
+        end
+
+      _ ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
 
   defp normalize_delay_ms(delay_ms) when is_integer(delay_ms) and delay_ms >= 0, do: delay_ms
   defp normalize_delay_ms(_delay_ms), do: 0
@@ -2194,6 +2618,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp normalize_non_negative_integer(_value, default), do: default
 
+  defp terminal_hot_ttl_ms do
+    :ferricstore
+    |> Application.get_env(:flow_terminal_hot_ttl_ms, 0)
+    |> normalize_non_negative_integer(0)
+  end
+
   defp safe_zset_delete_member(nil, _zset_lookup, _state_index_key, _id), do: :ok
   defp safe_zset_delete_member(_zset_index, nil, _state_index_key, _id), do: :ok
 
@@ -2223,7 +2653,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp prune_terminal_state_key(ets, state_key, version) do
     case :ets.lookup(ets, state_key) do
       [
-        {^state_key, nil, _expire_at_ms, {:flow_state_version, ^version, _lfu}, _fid, _off,
+        {^state_key, _value, _expire_at_ms, {:flow_state_version, ^version, _lfu}, _fid, _off,
          _vsize}
       ] ->
         :ets.delete(ets, state_key)
@@ -2238,7 +2668,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp prune_terminal_state_key(data_dir, shard_index, ets, state_key, version) do
     case :ets.lookup(ets, state_key) do
       [
-        {^state_key, nil, _expire_at_ms, {:flow_state_version, ^version, _lfu}, _fid, _off,
+        {^state_key, _value, _expire_at_ms, {:flow_state_version, ^version, _lfu}, _fid, _off,
          _vsize} = row
       ] ->
         delete_apply_projection_cache_for_row(data_dir, shard_index, row)

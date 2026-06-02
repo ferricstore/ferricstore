@@ -70,12 +70,107 @@ if config_env() == :prod do
         if count == 0, do: System.schedulers_online(), else: count
       )
 
+  parse_positive_integer = fn value ->
+    case Integer.parse(String.trim(to_string(value))) do
+      {n, ""} when n > 0 -> n
+      _ -> nil
+    end
+  end
+
+  read_positive_integer_file = fn path ->
+    case File.read(path) do
+      {:ok, value} -> parse_positive_integer.(value)
+      _ -> nil
+    end
+  end
+
+  detect_memory_bytes = fn ->
+    cgroup_v2 = read_positive_integer_file.("/sys/fs/cgroup/memory.max")
+    cgroup_v1 = read_positive_integer_file.("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+    system_memory =
+      case :os.type() do
+        {:unix, :darwin} ->
+          case System.cmd("sysctl", ["-n", "hw.memsize"], stderr_to_stdout: true) do
+            {value, 0} -> parse_positive_integer.(value)
+            _ -> nil
+          end
+
+        {:unix, _} ->
+          case File.read("/proc/meminfo") do
+            {:ok, contents} ->
+              case Regex.run(~r/^MemTotal:\s+(\d+)\s+kB/m, contents) do
+                [_, kb] ->
+                  case parse_positive_integer.(kb) do
+                    n when is_integer(n) -> n * 1024
+                    _ -> nil
+                  end
+
+                _ ->
+                  nil
+              end
+
+            _ ->
+              nil
+          end
+
+        _ ->
+          nil
+      end
+
+    [cgroup_v2, cgroup_v1, system_memory]
+    |> Enum.filter(fn
+      n when is_integer(n) and n > 0 -> true
+      _ -> false
+    end)
+    |> case do
+      [] -> 0
+      values -> Enum.min(values)
+    end
+  end
+
+  auto_memory_budget = fn ->
+    case detect_memory_bytes.() do
+      detected when detected > 0 -> div(detected * 80, 100)
+      _ -> 0
+    end
+  end
+
+  max_memory_env =
+    System.get_env("FERRICSTORE_MAX_MEMORY")
+    |> case do
+      nil -> "auto"
+      value -> String.trim(value)
+    end
+
+  max_memory_bytes =
+    case String.downcase(max_memory_env) do
+      "" -> auto_memory_budget.()
+      "auto" -> auto_memory_budget.()
+      value -> String.to_integer(value)
+    end
+
+  keydir_max_ram =
+    case System.get_env("FERRICSTORE_KEYDIR_MAX_RAM") do
+      nil ->
+        cond do
+          max_memory_bytes <= 0 ->
+            268_435_456
+
+          true ->
+            max(268_435_456, min(div(max_memory_bytes, 10), 8_589_934_592))
+        end
+
+      value ->
+        String.to_integer(value)
+    end
+
   # ---------------------------------------------------------------------------
   # Memory & Eviction
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    max_memory_bytes: String.to_integer(System.get_env("FERRICSTORE_MAX_MEMORY", "0")),
-    keydir_max_ram: String.to_integer(System.get_env("FERRICSTORE_KEYDIR_MAX_RAM", "268435456")),
+    max_memory_bytes: max_memory_bytes,
+    keydir_max_ram: keydir_max_ram,
     eviction_policy: System.get_env("FERRICSTORE_EVICTION_POLICY", "volatile_lru"),
     max_value_size: String.to_integer(System.get_env("FERRICSTORE_MAX_VALUE_SIZE", "1048576")),
     hot_cache_max_value_size:
@@ -91,6 +186,11 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS", "600000")),
     max_active_file_size:
       String.to_integer(System.get_env("FERRICSTORE_MAX_ACTIVE_FILE_SIZE", "8589934592")),
+    flow_lmdb_mode:
+      System.get_env(
+        "FERRICSTORE_FLOW_LMDB_MODE",
+        if(boolean_env.("FERRICSTORE_FLOW_LMDB_ENABLED", true), do: "lagged", else: "off")
+      ),
     flow_lmdb_map_size:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
     flow_lmdb_flush_interval_ms:
@@ -103,8 +203,11 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS", "1")),
     flow_lmdb_flush_jitter_ms:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS", "250")),
+    flow_lmdb_flush_on_max_ops:
+      boolean_env.("FERRICSTORE_FLOW_LMDB_FLUSH_ON_MAX_OPS", false),
     flow_lmdb_max_concurrent_flushes:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
+    flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
     flow_async_history: true,
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))

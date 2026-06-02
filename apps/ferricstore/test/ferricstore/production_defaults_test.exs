@@ -17,8 +17,14 @@ defmodule Ferricstore.ProductionDefaultsTest do
     assert bench_exs =~ "waraft_commit_batch_max: 10_000"
     assert config_exs =~ "flow_retention_sweeper_initial_delay_ms: 600_000"
     assert config_exs =~ "flow_retention_sweeper_interval_ms: 600_000"
+    assert config_exs =~ "flow_retention_sweeper_pressure_interval_ms: 1_000"
+    assert config_exs =~ "flow_retention_sweeper_pressure_limit: 10_000"
+    assert config_exs =~ "flow_retention_sweeper_pressure_compaction_interval_ms: 60_000"
     assert bench_exs =~ "flow_retention_sweeper_initial_delay_ms: 600_000"
     assert bench_exs =~ "flow_retention_sweeper_interval_ms: 600_000"
+    assert bench_exs =~ "flow_retention_sweeper_pressure_interval_ms: 1_000"
+    assert bench_exs =~ "flow_retention_sweeper_pressure_limit: 10_000"
+    assert bench_exs =~ "flow_retention_sweeper_pressure_compaction_interval_ms: 60_000"
     assert runtime_exs =~ "flow_async_history: true"
     assert runtime_exs =~ "\"6000\""
     assert runtime_exs =~ "\"10000\""
@@ -308,8 +314,12 @@ defmodule Ferricstore.ProductionDefaultsTest do
     # avoid the older cursor/polling workload shape.
     assert source =~ ~S|defp normal_claim_states_mode, do: env("NORMAL_CLAIM_STATES_MODE", "any")|
     assert source =~ ~S|defp long_claim_states_mode, do: env("LONG_CLAIM_STATES_MODE", "any")|
-    assert source =~ ~S|defp normal_worker_mode, do: env("NORMAL_WORKER_MODE", env("WORKER_MODE", "blocking"))|
-    assert source =~ ~S|defp long_worker_mode, do: env("LONG_WORKER_MODE", env("WORKER_MODE", "blocking"))|
+
+    assert source =~
+             ~S|defp normal_worker_mode, do: env("NORMAL_WORKER_MODE", env("WORKER_MODE", "blocking"))|
+
+    assert source =~
+             ~S|defp long_worker_mode, do: env("LONG_WORKER_MODE", env("WORKER_MODE", "blocking"))|
   end
 
   test "segment log production code has no alternate I/O mode selectors" do

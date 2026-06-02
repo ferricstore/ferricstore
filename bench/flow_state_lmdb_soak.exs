@@ -34,11 +34,16 @@ defmodule FlowStateLMDBSoak do
 
   @events [
     [:ferricstore, :flow, :create, :stop],
+    [:ferricstore, :flow, :create, :attempt],
+    [:ferricstore, :flow, :create, :success],
+    [:ferricstore, :flow, :create, :rejected],
     [:ferricstore, :flow, :transition, :stop],
     [:ferricstore, :flow, :complete, :stop],
     [:ferricstore, :flow, :fail, :stop],
     [:ferricstore, :flow, :pipeline_write, :stop],
     [:ferricstore, :flow, :claim_due, :stop],
+    [:ferricstore, :flow, :hibernation, :evict_hot],
+    [:ferricstore, :flow, :hibernation, :promote],
     [:ferricstore, :flow, :lmdb_writer, :flush],
     [:ferricstore, :flow, :lmdb_writer, :backlog],
     [:ferricstore, :waraft, :batcher, :slot_flush],
@@ -89,8 +94,11 @@ defmodule FlowStateLMDBSoak do
     shards = int_env("SHARDS", 16)
     sample_interval_s = int_env("SAMPLE_INTERVAL_SECONDS", 30)
     min_free_mb = int_env("MIN_FREE_DISK_MB", 100_000)
-    max_total_mem_mb = int_env("MAX_TOTAL_MEM_MB", 64_000)
+    max_rss_mb = int_env("MAX_RSS_MB", int_env("MAX_TOTAL_MEM_MB", 64_000))
+    server_max_rss_mb = int_env("SERVER_MAX_RSS_MB", max_rss_mb)
     flow_latency_sample_rate = max(int_env("FLOW_LATENCY_SAMPLE_RATE", 10), 1)
+    terminal_retention_ttl_ms = int_env("TERMINAL_RETENTION_TTL_MS", 0)
+    run_at_delay_ms = int_env("RUN_AT_DELAY_MS", 0)
 
     normal_flows =
       case System.get_env("NORMAL_FLOWS") do
@@ -118,12 +126,15 @@ defmodule FlowStateLMDBSoak do
         "long_worker_mode=#{long_worker_mode()} " <>
         "flow_async_history=true " <>
         "flow_latency_sample_rate=#{flow_latency_sample_rate} " <>
+        "terminal_retention_ttl_ms=#{terminal_retention_ttl_ms} " <>
+        "run_at_delay_ms=#{run_at_delay_ms} " <>
+        "server_max_rss_mb=#{server_max_rss_mb} max_rss_mb=#{max_rss_mb} " <>
         "estimated_raw_payload_gb=#{Float.round(estimate_bytes / 1_073_741_824, 2)} " <>
         "free_mb=#{free_mb_before} min_free_mb=#{min_free_mb}"
     )
 
     stop_started_apps()
-    configure_app(data_dir, shards, max_total_mem_mb)
+    configure_app(data_dir, shards, server_max_rss_mb)
     print_effective_config()
 
     table = telemetry_table()
@@ -172,7 +183,8 @@ defmodule FlowStateLMDBSoak do
         table: table,
         data_dir: data_dir,
         min_free_mb: min_free_mb,
-        max_total_mem_mb: max_total_mem_mb,
+        max_rss_mb: max_rss_mb,
+        server_max_rss_mb: server_max_rss_mb,
         last_disk_mb: dir_mb(data_dir),
         last_disk_at: started_native,
         max_pending_ops: 0,
@@ -193,6 +205,7 @@ defmodule FlowStateLMDBSoak do
         max_waraft_log_entries: 0,
         max_waraft_log_ets_mb: 0.0,
         max_total_mem_mb_seen: 0.0,
+        max_rss_mb_seen: 0.0,
         max_binary_mem_mb: 0.0,
         max_keydir_binary_mb: 0.0,
         max_flow_index_entries: 0,
@@ -253,6 +266,8 @@ defmodule FlowStateLMDBSoak do
       env("CLAIM_BATCH_SIZE", "1000"),
       "--claim-partition-batch-size",
       env("CLAIM_PARTITION_BATCH_SIZE", "32"),
+      "--claim-block-ms",
+      env("CLAIM_BLOCK_MS", "5000"),
       "--apply-inflight",
       env("APPLY_INFLIGHT", "8"),
       "--worker-mode",
@@ -271,11 +286,19 @@ defmodule FlowStateLMDBSoak do
       Integer.to_string(payload_bytes),
       "--terminal-payload-bytes",
       Integer.to_string(payload_bytes),
+      "--retention-ttl-ms",
+      env("TERMINAL_RETENTION_TTL_MS", "0"),
+      "--run-at-delay-ms",
+      env("RUN_AT_DELAY_MS", "0"),
+      "--progress-interval-s",
+      env("PROGRESS_INTERVAL_SECONDS", "0"),
       "--terminal-mode",
       Keyword.fetch!(opts, :terminal_mode),
       "--result-bytes",
       "0"
     ]
+    |> optional_cli_arg("CREATE_NOW_MS", "--create-now-ms")
+    |> optional_cli_arg("CLAIM_NOW_MS", "--claim-now-ms")
 
     port_ref =
       Port.open({:spawn_executable, python()}, [
@@ -291,6 +314,14 @@ defmodule FlowStateLMDBSoak do
 
   defp default_create_rate_per_sec(opts) do
     max(div(int_env("TARGET_OPS_PER_SEC", 50_000), Keyword.fetch!(opts, :steps) + 1), 1)
+  end
+
+  defp optional_cli_arg(args, env_name, flag) do
+    case System.get_env(env_name) do
+      nil -> args
+      "" -> args
+      value -> args ++ [flag, value]
+    end
   end
 
   # Product workers use server-side BLOCK claims against any ready state. Keep
@@ -360,7 +391,9 @@ defmodule FlowStateLMDBSoak do
   end
 
   defp guard_resources(state) do
-    total_mem_mb = bytes_to_mb(:erlang.memory(:total))
+    memory = memory_status()
+    total_mem_mb = memory.total_mb
+    rss_mb = rss_guard_mb(memory)
     free_mb = disk_free_mb(state.data_dir)
 
     cond do
@@ -369,10 +402,14 @@ defmodule FlowStateLMDBSoak do
         kill_running_ports(state)
         %{state | ports: mark_running_stopped(state.ports, :low_disk)}
 
-      total_mem_mb >= state.max_total_mem_mb ->
-        IO.puts("guard_stop reason=high_beam_memory total_mem_mb=#{Float.round(total_mem_mb, 1)}")
+      rss_mb >= state.max_rss_mb ->
+        IO.puts(
+          "guard_stop reason=high_rss rss_mb=#{Float.round(rss_mb, 1)} " <>
+            "max_rss_mb=#{state.max_rss_mb} beam_total_mb=#{Float.round(total_mem_mb, 1)}"
+        )
+
         kill_running_ports(state)
-        %{state | ports: mark_running_stopped(state.ports, :high_beam_memory)}
+        %{state | ports: mark_running_stopped(state.ports, :high_rss)}
 
       true ->
         state
@@ -392,6 +429,7 @@ defmodule FlowStateLMDBSoak do
     keydir = keydir_status()
     flow_index = flow_index_status()
     waraft_log = waraft_log_status()
+    admission = flow_admission_status()
     telemetry = telemetry_snapshot(state.table)
     sample_count = Map.get(state, :sample_count, 0) + 1
 
@@ -399,8 +437,15 @@ defmodule FlowStateLMDBSoak do
       "sample elapsed_s=#{Float.round(elapsed_s, 1)} " <>
         "flow_ops=#{telemetry.flow_ops} flow_ops_s=#{Float.round(telemetry.flow_ops / max(elapsed_s, 0.001), 1)} " <>
         "write_ops=#{telemetry.write_ops} write_ops_s=#{Float.round(telemetry.write_ops / max(elapsed_s, 0.001), 1)} " <>
-        "create=#{telemetry.create} transition=#{telemetry.transition} complete=#{telemetry.complete} " <>
+        "create=#{telemetry.create} create_attempt=#{telemetry.create_attempt} " <>
+        "create_success=#{telemetry.create_success} create_rejected=#{telemetry.create_rejected} " <>
+        "transition=#{telemetry.transition} complete=#{telemetry.complete} " <>
         "fail=#{telemetry.fail} pipeline_write=#{telemetry.pipeline_write} claim_due=#{telemetry.claim_due} " <>
+        "cold_due_evicted=#{telemetry.cold_due_evicted} " <>
+        "cold_due_evict_stale=#{telemetry.cold_due_evict_stale} " <>
+        "cold_due_promoted=#{telemetry.cold_due_promoted} " <>
+        "flow_create_paused=#{admission.paused} flow_create_pause_reason=#{admission.reason} " <>
+        "flow_create_retry_after_ms=#{admission.retry_after_ms} " <>
         "lmdb_pending=#{lmdb.pending_ops} lmdb_oldest_lag_ms=#{Float.round(lmdb.max_oldest_lag_ms, 2)} " <>
         "lmdb_replay_lag=#{lmdb.max_replay_safe_lag} lmdb_flush_failures=#{lmdb.flush_failures} " <>
         "history_pending=#{production_health.history_pending_entries} " <>
@@ -491,7 +536,8 @@ defmodule FlowStateLMDBSoak do
         max_blob_hardened: max(state.max_blob_hardened, production_health.blob_hardened_count),
         max_blob_hardened_oldest_ms:
           max(state.max_blob_hardened_oldest_ms, production_health.blob_hardened_oldest_ms),
-        max_release_cursor_gap: max(state.max_release_cursor_gap, production_health.release_cursor_gap),
+        max_release_cursor_gap:
+          max(state.max_release_cursor_gap, production_health.release_cursor_gap),
         max_disk_mb: max(state.max_disk_mb, disk_mb),
         max_blob_mb: max(state.max_blob_mb, storage.blob_mb),
         max_lmdb_mb: max(state.max_lmdb_mb, storage.lmdb_mb),
@@ -499,6 +545,7 @@ defmodule FlowStateLMDBSoak do
         max_waraft_log_entries: max(state.max_waraft_log_entries, waraft_log.entries),
         max_waraft_log_ets_mb: max(state.max_waraft_log_ets_mb, waraft_log.ets_mb),
         max_total_mem_mb_seen: max(state.max_total_mem_mb_seen, memory.total_mb),
+        max_rss_mb_seen: max(state.max_rss_mb_seen, rss_guard_mb(memory)),
         max_binary_mem_mb: max(state.max_binary_mem_mb, memory.binary_mb),
         max_keydir_binary_mb: max(state.max_keydir_binary_mb, keydir.binary_mb),
         max_flow_index_entries: max(state.max_flow_index_entries, flow_index.index_entries),
@@ -514,9 +561,14 @@ defmodule FlowStateLMDBSoak do
     IO.puts(
       "summary ports=#{inspect(Enum.map(state.ports, &{&1.name, &1.status}))} " <>
         "flow_ops=#{telemetry.flow_ops} write_ops=#{telemetry.write_ops} " <>
-        "create=#{telemetry.create} transition=#{telemetry.transition} " <>
+        "create=#{telemetry.create} create_attempt=#{telemetry.create_attempt} " <>
+        "create_success=#{telemetry.create_success} create_rejected=#{telemetry.create_rejected} " <>
+        "transition=#{telemetry.transition} " <>
         "complete=#{telemetry.complete} fail=#{telemetry.fail} pipeline_write=#{telemetry.pipeline_write} " <>
         "claim_due=#{telemetry.claim_due} " <>
+        "cold_due_evicted=#{telemetry.cold_due_evicted} " <>
+        "cold_due_evict_stale=#{telemetry.cold_due_evict_stale} " <>
+        "cold_due_promoted=#{telemetry.cold_due_promoted} " <>
         "max_lmdb_pending=#{state.max_pending_ops} max_lmdb_oldest_lag_ms=#{Float.round(state.max_oldest_lag_ms, 2)} " <>
         "max_lmdb_replay_lag=#{state.max_replay_lag} max_disk_mb=#{Float.round(state.max_disk_mb, 1)} " <>
         "max_history_pending=#{state.max_history_pending_entries} " <>
@@ -532,6 +584,7 @@ defmodule FlowStateLMDBSoak do
         "max_waraft_log_entries=#{state.max_waraft_log_entries} " <>
         "max_waraft_log_ets_mb=#{Float.round(state.max_waraft_log_ets_mb, 1)} " <>
         "max_total_mem_mb=#{Float.round(state.max_total_mem_mb_seen, 1)} " <>
+        "max_rss_mb=#{Float.round(state.max_rss_mb_seen, 1)} " <>
         "max_binary_mem_mb=#{Float.round(state.max_binary_mem_mb, 1)} " <>
         "max_keydir_binary_mb=#{Float.round(state.max_keydir_binary_mb, 1)} " <>
         "max_flow_index_entries=#{state.max_flow_index_entries} " <>
@@ -673,8 +726,16 @@ defmodule FlowStateLMDBSoak do
 
   defp event_key([:ferricstore, :flow, command, :stop], _metadata), do: {:flow, command}
 
+  defp event_key([:ferricstore, :flow, :create, kind], _metadata)
+       when kind in [:attempt, :success, :rejected],
+       do: {:flow_create, kind}
+
   defp event_key([:ferricstore, :flow, :lmdb_writer, :flush], metadata),
     do: {:lmdb_flush, Map.get(metadata, :status, :unknown)}
+
+  defp event_key([:ferricstore, :flow, :hibernation, action], metadata)
+       when action in [:evict_hot, :promote],
+       do: {:flow_hibernation, action, Map.get(metadata, :result, :unknown)}
 
   defp event_key([:ferricstore, :waraft, :batcher, :slot_flush], metadata),
     do: {:waraft_flush, Map.get(metadata, :result, :unknown)}
@@ -712,12 +773,18 @@ defmodule FlowStateLMDBSoak do
   defp event_key(event, _metadata), do: {:event, event}
 
   defp telemetry_snapshot(table) do
-    create = event_items(table, {:flow, :create})
+    create_attempt = event_items(table, {:flow_create, :attempt})
+    create_success = event_items(table, {:flow_create, :success})
+    create_rejected = event_items(table, {:flow_create, :rejected})
+    create = create_success
     transition = event_items(table, {:flow, :transition})
     complete = event_items(table, {:flow, :complete})
     fail = event_items(table, {:flow, :fail})
     pipeline_write = event_items(table, {:flow, :pipeline_write})
     claim_due = event_items(table, {:flow, :claim_due})
+    cold_due_evicted = event_items(table, {:flow_hibernation, :evict_hot, :evicted})
+    cold_due_evict_stale = event_items(table, {:flow_hibernation, :evict_hot, :stale})
+    cold_due_promoted = event_items(table, {:flow_hibernation, :promote, :promoted})
     {lmdb_flushes, lmdb_flush_us} = event_count_duration_prefix(table, :lmdb_flush)
     {waraft_flushes, _waraft_total_event_us} = event_count_duration_prefix(table, :waraft_flush)
     {waraft_queue_samples, waraft_queue_wait_us} = timing_count_duration(table, :queue_age)
@@ -751,11 +818,17 @@ defmodule FlowStateLMDBSoak do
 
     %{
       create: create,
+      create_attempt: create_attempt,
+      create_success: create_success,
+      create_rejected: create_rejected,
       transition: transition,
       complete: complete,
       fail: fail,
       pipeline_write: pipeline_write,
       claim_due: claim_due,
+      cold_due_evicted: cold_due_evicted,
+      cold_due_evict_stale: cold_due_evict_stale,
+      cold_due_promoted: cold_due_promoted,
       flow_ops: create + transition + complete + fail + pipeline_write,
       write_ops: create + transition + complete + fail + pipeline_write + claim_due,
       lmdb_flushes: lmdb_flushes,
@@ -1313,6 +1386,18 @@ defmodule FlowStateLMDBSoak do
     end
   end
 
+  defp flow_admission_status do
+    status = Ferricstore.Flow.Admission.status()
+
+    %{
+      paused: status.reject_new_creates?,
+      reason: status.reason,
+      retry_after_ms: status.retry_after_ms
+    }
+  rescue
+    _ -> %{paused: false, reason: :unknown, retry_after_ms: 0}
+  end
+
   defp production_health_status do
     case safe_instance() do
       nil ->
@@ -1555,6 +1640,9 @@ defmodule FlowStateLMDBSoak do
       run_queue: :erlang.statistics(:run_queue)
     }
   end
+
+  defp rss_guard_mb(%{rss_mb: rss_mb}) when rss_mb > 0, do: rss_mb
+  defp rss_guard_mb(%{total_mb: total_mb}), do: total_mb
 
   defp maybe_print_top_binary_holders(sample_count) do
     if diagnostic_due?("TOP_BINARY_HOLDERS", "TOP_BINARY_HOLDERS_EVERY_N", sample_count) do
@@ -1880,7 +1968,7 @@ defmodule FlowStateLMDBSoak do
     _ -> %{cpu_pct: 0.0, rss_mb: 0.0}
   end
 
-  defp configure_app(data_dir, shards, max_total_mem_mb) do
+  defp configure_app(data_dir, shards, max_rss_mb) do
     remove_data_dir(data_dir)
     File.mkdir_p!(data_dir)
 
@@ -1891,11 +1979,10 @@ defmodule FlowStateLMDBSoak do
     Application.put_env(:ferricstore, :shard_count, shards)
     Application.put_env(:ferricstore, :protected_mode, false)
 
-    Application.put_env(
-      :ferricstore,
-      :max_memory_bytes,
-      app_memory_budget_bytes(max_total_mem_mb)
-    )
+    max_memory_bytes = app_memory_budget_bytes(max_rss_mb)
+
+    Application.put_env(:ferricstore, :max_memory_bytes, max_memory_bytes)
+    Application.put_env(:ferricstore, :keydir_max_ram, app_keydir_max_ram_bytes(max_memory_bytes))
 
     Application.put_env(:ferricstore, :memory_guard_interval_ms, 60 * 60 * 1000)
     Application.put_env(:ferricstore, :flow_async_history, true)
@@ -1921,19 +2008,19 @@ defmodule FlowStateLMDBSoak do
     Application.put_env(
       :ferricstore,
       :flow_lmdb_flush_interval_ms,
-      int_env("FLOW_LMDB_FLUSH_INTERVAL_MS", 1_000)
+      int_env("FLOW_LMDB_FLUSH_INTERVAL_MS", 500)
     )
 
     Application.put_env(
       :ferricstore,
       :flow_lmdb_max_batch_ops,
-      int_env("FLOW_LMDB_MAX_BATCH_OPS", 25_000)
+      int_env("FLOW_LMDB_MAX_BATCH_OPS", 10_000)
     )
 
     Application.put_env(
       :ferricstore,
       :flow_lmdb_flush_chunk_ops,
-      int_env("FLOW_LMDB_FLUSH_CHUNK_OPS", 10_000)
+      int_env("FLOW_LMDB_FLUSH_CHUNK_OPS", 5_000)
     )
 
     Application.put_env(
@@ -1954,6 +2041,42 @@ defmodule FlowStateLMDBSoak do
       int_env("FLOW_LMDB_MAX_CONCURRENT_FLUSHES", 1)
     )
 
+    put_optional_int_env(
+      ["FLOW_LMDB_MAP_SIZE", "FERRICSTORE_FLOW_LMDB_MAP_SIZE"],
+      :flow_lmdb_map_size
+    )
+
+    if any_env?(["FLOW_LMDB_MMAP_RECLAIM_ENABLED", "FERRICSTORE_FLOW_LMDB_MMAP_RECLAIM_ENABLED"]) do
+      Application.put_env(
+        :ferricstore,
+        :flow_lmdb_mmap_reclaim_enabled,
+        bool_env(
+          ["FLOW_LMDB_MMAP_RECLAIM_ENABLED", "FERRICSTORE_FLOW_LMDB_MMAP_RECLAIM_ENABLED"],
+          true
+        )
+      )
+    end
+
+    put_optional_int_env(
+      ["FLOW_LMDB_MMAP_RECLAIM_INTERVAL_MS", "FERRICSTORE_FLOW_LMDB_MMAP_RECLAIM_INTERVAL_MS"],
+      :flow_lmdb_mmap_reclaim_interval_ms
+    )
+
+    put_optional_float_env(
+      ["FLOW_LMDB_MMAP_RECLAIM_RSS_RATIO", "FERRICSTORE_FLOW_LMDB_MMAP_RECLAIM_RSS_RATIO"],
+      :flow_lmdb_mmap_reclaim_rss_ratio
+    )
+
+    put_optional_float_env(
+      ["FLOW_CREATE_PAUSE_RSS_RATIO", "FERRICSTORE_FLOW_CREATE_PAUSE_RSS_RATIO"],
+      :flow_create_pause_rss_ratio
+    )
+
+    put_optional_float_env(
+      ["FLOW_CREATE_RESUME_RSS_RATIO", "FERRICSTORE_FLOW_CREATE_RESUME_RSS_RATIO"],
+      :flow_create_resume_rss_ratio
+    )
+
     put_optional_limit_env(
       [
         "FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES",
@@ -1967,9 +2090,10 @@ defmodule FlowStateLMDBSoak do
       :flow_history_projector_batch_size
     )
 
-    put_optional_int_env(
-      "FERRICSTORE_FLOW_HISTORY_PROJECTOR_FLUSH_INTERVAL_MS",
-      :flow_history_projector_flush_interval_ms
+    Application.put_env(
+      :ferricstore,
+      :flow_history_projector_flush_interval_ms,
+      int_env("FERRICSTORE_FLOW_HISTORY_PROJECTOR_FLUSH_INTERVAL_MS", 500)
     )
 
     put_optional_int_env(
@@ -1988,6 +2112,59 @@ defmodule FlowStateLMDBSoak do
     put_optional_limit_env(
       ["FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS", "FERRICSTORE_FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS"],
       :flow_lmdb_writer_max_enqueue_ops
+    )
+
+    if any_env?(["FLOW_RETENTION_SWEEPER_ENABLED", "FERRICSTORE_FLOW_RETENTION_SWEEPER_ENABLED"]) do
+      Application.put_env(
+        :ferricstore,
+        :flow_retention_sweeper_enabled,
+        bool_env(
+          ["FLOW_RETENTION_SWEEPER_ENABLED", "FERRICSTORE_FLOW_RETENTION_SWEEPER_ENABLED"],
+          true
+        )
+      )
+    end
+
+    put_optional_int_env(
+      [
+        "FLOW_RETENTION_SWEEPER_INITIAL_DELAY_MS",
+        "FERRICSTORE_FLOW_RETENTION_SWEEPER_INITIAL_DELAY_MS"
+      ],
+      :flow_retention_sweeper_initial_delay_ms
+    )
+
+    put_optional_int_env(
+      ["FLOW_RETENTION_SWEEPER_INTERVAL_MS", "FERRICSTORE_FLOW_RETENTION_SWEEPER_INTERVAL_MS"],
+      :flow_retention_sweeper_interval_ms
+    )
+
+    put_optional_int_env(
+      ["FLOW_RETENTION_SWEEPER_LIMIT", "FERRICSTORE_FLOW_RETENTION_SWEEPER_LIMIT"],
+      :flow_retention_sweeper_limit
+    )
+
+    put_optional_int_env(
+      [
+        "FLOW_RETENTION_SWEEPER_PRESSURE_INTERVAL_MS",
+        "FERRICSTORE_FLOW_RETENTION_SWEEPER_PRESSURE_INTERVAL_MS"
+      ],
+      :flow_retention_sweeper_pressure_interval_ms
+    )
+
+    put_optional_int_env(
+      [
+        "FLOW_RETENTION_SWEEPER_PRESSURE_LIMIT",
+        "FERRICSTORE_FLOW_RETENTION_SWEEPER_PRESSURE_LIMIT"
+      ],
+      :flow_retention_sweeper_pressure_limit
+    )
+
+    put_optional_int_env(
+      [
+        "FLOW_RETENTION_SWEEPER_PRESSURE_COMPACTION_INTERVAL_MS",
+        "FERRICSTORE_FLOW_RETENTION_SWEEPER_PRESSURE_COMPACTION_INTERVAL_MS"
+      ],
+      :flow_retention_sweeper_pressure_compaction_interval_ms
     )
 
     Application.delete_env(:ferricstore, :waraft_log_module)
@@ -2089,17 +2266,30 @@ defmodule FlowStateLMDBSoak do
         "waraft_apply_batch_max_bytes=#{inspect(Application.get_env(:ferricstore, :waraft_apply_batch_max_bytes, :default))} " <>
         "flow_history_projector_batch_size=#{Application.get_env(:ferricstore, :flow_history_projector_batch_size, 25_000)} " <>
         "flow_history_projector_flush_interval_ms=#{Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms, 1_000)} " <>
+        "max_memory_bytes=#{Application.get_env(:ferricstore, :max_memory_bytes)} " <>
+        "keydir_max_ram=#{Application.get_env(:ferricstore, :keydir_max_ram)} " <>
         "flow_lmdb_flush_interval_ms=#{Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)} " <>
         "flow_lmdb_max_batch_ops=#{Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)} " <>
         "flow_lmdb_flush_chunk_ops=#{Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops)} " <>
+        "flow_lmdb_map_size=#{Application.get_env(:ferricstore, :flow_lmdb_map_size, :default)} " <>
+        "flow_lmdb_mmap_reclaim_enabled=#{Application.get_env(:ferricstore, :flow_lmdb_mmap_reclaim_enabled, true)} " <>
+        "flow_lmdb_mmap_reclaim_interval_ms=#{Application.get_env(:ferricstore, :flow_lmdb_mmap_reclaim_interval_ms, :default)} " <>
+        "flow_lmdb_mmap_reclaim_rss_ratio=#{Application.get_env(:ferricstore, :flow_lmdb_mmap_reclaim_rss_ratio, :default)} " <>
+        "flow_create_pause_rss_ratio=#{Application.get_env(:ferricstore, :flow_create_pause_rss_ratio, :default)} " <>
+        "flow_create_resume_rss_ratio=#{Application.get_env(:ferricstore, :flow_create_resume_rss_ratio, :default)} " <>
         "flow_retention_sweeper_initial_delay_ms=#{Application.get_env(:ferricstore, :flow_retention_sweeper_initial_delay_ms)} " <>
-        "flow_retention_sweeper_interval_ms=#{Application.get_env(:ferricstore, :flow_retention_sweeper_interval_ms)}"
+        "flow_retention_sweeper_interval_ms=#{Application.get_env(:ferricstore, :flow_retention_sweeper_interval_ms)} " <>
+        "flow_retention_sweeper_limit=#{inspect(Application.get_env(:ferricstore, :flow_retention_sweeper_limit, :default))} " <>
+        "flow_retention_sweeper_pressure_interval_ms=#{Application.get_env(:ferricstore, :flow_retention_sweeper_pressure_interval_ms)} " <>
+        "flow_retention_sweeper_pressure_limit=#{Application.get_env(:ferricstore, :flow_retention_sweeper_pressure_limit)} " <>
+        "flow_retention_sweeper_pressure_compaction_interval_ms=#{Application.get_env(:ferricstore, :flow_retention_sweeper_pressure_compaction_interval_ms)}"
     )
   end
 
   defp print_header do
     IO.puts(
-      "sample elapsed_s flow_ops flow_ops_s write_ops write_ops_s create transition complete fail pipeline_write claim_due " <>
+      "sample elapsed_s flow_ops flow_ops_s write_ops write_ops_s create create_attempt create_success create_rejected transition complete fail pipeline_write claim_due cold_due_evicted cold_due_evict_stale cold_due_promoted " <>
+        "flow_create_paused flow_create_pause_reason flow_create_retry_after_ms " <>
         "lmdb_pending lmdb_oldest_lag_ms lmdb_replay_lag lmdb_flush_failures lmdb_flushes " <>
         "lmdb_flush_avg_us waraft_flush_errors waraft_apply_full waraft_commit_bytes_rejected " <>
         "waraft_commit_timeouts waraft_commit_timeout_max_us " <>
@@ -2285,7 +2475,21 @@ defmodule FlowStateLMDBSoak do
   defp app_memory_budget_bytes(max_total_mem_mb) do
     case System.get_env("FERRICSTORE_MAX_MEMORY") do
       nil -> max_total_mem_mb * 1024 * 1024
+      "auto" -> max_total_mem_mb * 1024 * 1024
       value -> String.to_integer(value)
+    end
+  end
+
+  defp app_keydir_max_ram_bytes(max_memory_bytes) do
+    case System.get_env("FERRICSTORE_KEYDIR_MAX_RAM") do
+      nil when max_memory_bytes <= 0 ->
+        256 * 1024 * 1024
+
+      nil ->
+        max(256 * 1024 * 1024, min(div(max_memory_bytes, 10), 8 * 1024 * 1024 * 1024))
+
+      value ->
+        String.to_integer(value)
     end
   end
 
@@ -2330,6 +2534,13 @@ defmodule FlowStateLMDBSoak do
     case System.get_env(env_name) do
       nil -> :ok
       value -> Application.put_env(:ferricstore, app_key, String.to_integer(value))
+    end
+  end
+
+  defp put_optional_float_env(env_names, app_key) when is_list(env_names) do
+    case first_env_value(env_names) do
+      nil -> :ok
+      {_env_name, value} -> Application.put_env(:ferricstore, app_key, parse_float(value))
     end
   end
 

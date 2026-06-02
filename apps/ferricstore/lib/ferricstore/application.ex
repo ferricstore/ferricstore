@@ -160,7 +160,12 @@ defmodule Ferricstore.Application do
         FerricStore.Instance.build(:default,
           data_dir: data_dir,
           shard_count: shard_count,
-          max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
+          max_memory_bytes:
+            Application.get_env(
+              :ferricstore,
+              :max_memory_bytes,
+              Ferricstore.OperationalLimits.memory_limit_bytes()
+            ),
           keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024),
           eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
           hot_cache_max_value_size:
@@ -237,6 +242,7 @@ defmodule Ferricstore.Application do
             {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
             Ferricstore.PubSub,
             Ferricstore.FetchOrCompute,
+            {Ferricstore.OperationalGuard, instance_ctx: default_ctx},
             Ferricstore.Flow.RetentionSweeper,
             {Ferricstore.Store.BlobGCSweeper, instance_ctx: default_ctx},
             {Ferricstore.MemoryGuard, memory_guard_opts()},

@@ -143,6 +143,8 @@ defmodule Ferricstore.FlowCrashMatrixTest do
 
     create_and_complete(type, partition, id, result: "lmdb-result")
     fault = install_blocking_fault(:before_flow_lmdb_flush_write)
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition)
+    assert :ok = LMDBWriter.enqueue(:default, shard, [{:project_flow_state_from_source, state_key}])
 
     op =
       start_unlinked(fn ->

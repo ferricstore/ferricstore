@@ -928,15 +928,40 @@ defmodule Ferricstore.Raft.WARaftBackend do
        do: invalid_shard_index_error(shard_index)
 
   defp commit_or_redirect(shard_index, command, redirects_left) do
-    case commit(shard_index, command) do
-      {:error, _reason} = error ->
-        error
-        |> maybe_redirect_commit(shard_index, command, redirects_left)
+    case cached_pre_submit_redirect_node(shard_index, redirects_left) do
+      leader_node when is_atom(leader_node) and leader_node not in [nil, node()] ->
+        leader_node
+        |> redirect_commit(shard_index, command, redirects_left)
         |> normalize_commit_result()
 
-      result ->
-        result
+      _other ->
+        case commit(shard_index, command) do
+          {:error, _reason} = error ->
+            error
+            |> maybe_redirect_commit(shard_index, command, redirects_left)
+            |> normalize_commit_result()
+
+          result ->
+            result
+        end
     end
+  end
+
+  defp cached_pre_submit_redirect_node(_shard_index, redirects_left) when redirects_left <= 0,
+    do: nil
+
+  defp cached_pre_submit_redirect_node(shard_index, _redirects_left) do
+    case cached_voter_nodes(shard_index) do
+      {:ok, voters} when length(voters) > 1 ->
+        @table
+        |> :wa_raft_info.get_leader(partition(shard_index))
+        |> peer_node()
+
+      _other ->
+        nil
+    end
+  catch
+    _kind, _reason -> nil
   end
 
   defp maybe_namespace_window_write(shard_index, command) do

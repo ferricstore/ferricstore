@@ -86,6 +86,7 @@ mod atoms {
         miss,
         not_found,
         missing,
+        busy,
         value,
         fallback,
     }
@@ -2564,6 +2565,32 @@ fn lmdb_prefix_count<'a>(
         }
         Err(e) => Ok((atoms::error(), e).encode(env)),
     }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn lmdb_release_all<'a>(env: Env<'a>) -> NifResult<Term<'a>> {
+    let stores = match LMDB_STORES.get() {
+        Some(stores) => stores,
+        None => return Ok((atoms::ok(), 0usize).encode(env)),
+    };
+
+    let mut guard = match stores.lock() {
+        Ok(guard) => guard,
+        Err(_) => return Ok((atoms::error(), "lmdb cache poisoned").encode(env)),
+    };
+
+    let busy = guard
+        .values()
+        .filter(|store| Arc::strong_count(store) > 1)
+        .count();
+
+    if busy > 0 {
+        return Ok((atoms::busy(), busy).encode(env));
+    }
+
+    let released = guard.len();
+    guard.clear();
+    Ok((atoms::ok(), released).encode(env))
 }
 
 fn lmdb_write_batch_impl<'a>(

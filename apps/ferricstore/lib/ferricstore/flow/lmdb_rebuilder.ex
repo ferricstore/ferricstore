@@ -444,9 +444,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           rebuild_active_flow_indexes(flow_index, flow_lookup, record)
         end)
 
-        Enum.each(Enum.reverse(terminal_prunes), fn {key, _record} ->
-          track_binary_remove(keydir, shard_index, key, instance_ctx)
-          :ets.delete(keydir, key)
+        Enum.each(Enum.reverse(terminal_prunes), fn {key, record} ->
+          safe_prune_terminal_keydir_entry(keydir, shard_index, key, record, instance_ctx)
         end)
 
         %{
@@ -1512,32 +1511,43 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   defp score_string(_value), do: "0.0"
 
   defp select_state_entries(keydir) do
-    Stream.resource(
-      fn -> :start end,
-      fn
-        :done ->
-          {:halt, :done}
+    :ets.safe_fixtable(keydir, true)
 
-        :start ->
-          select_next(:ets.select(keydir, keydir_match_spec(), @batch_size))
-
-        continuation ->
-          select_next(:ets.select(continuation))
-      end,
-      fn _ -> :ok end
-    )
+    try do
+      keydir
+      |> select_state_entry_chunks(:ets.select(keydir, keydir_match_spec(), @batch_size), [])
+      |> Enum.reverse()
+    after
+      :ets.safe_fixtable(keydir, false)
+    end
+  rescue
+    ArgumentError -> []
   end
 
-  defp select_next(:"$end_of_table"), do: {:halt, :done}
+  defp select_state_entry_chunks(_keydir, :"$end_of_table", acc), do: acc
 
-  defp select_next({entries, continuation}) do
+  defp select_state_entry_chunks(keydir, {entries, continuation}, acc) do
     state_entries = Enum.filter(entries, &flow_state_entry?/1)
+    acc = if state_entries == [], do: acc, else: [state_entries | acc]
+    select_state_entry_chunks(keydir, :ets.select(continuation), acc)
+  end
 
-    if state_entries == [] do
-      {[], continuation}
-    else
-      {[state_entries], continuation}
+  defp safe_prune_terminal_keydir_entry(keydir, shard_index, key, record, instance_ctx) do
+    version = Map.get(record, :version)
+
+    with [{^key, value, expire_at_ms, _lfu, _fid, _off, _vsize}] <- :ets.lookup(keydir, key),
+         true <- is_binary(value),
+         [{^key, _materialized, _expire_at_ms, current}] <-
+           decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx),
+         ^version <- Map.get(current, :version),
+         true <- LMDB.terminal_state?(Map.get(current, :state)) do
+      track_binary_remove(keydir, shard_index, key, instance_ctx)
+      :ets.delete(keydir, key)
     end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   defp keydir_match_spec do

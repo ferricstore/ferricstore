@@ -26,6 +26,22 @@ defmodule Ferricstore.Flow do
   @max_ref_size 4_096
   @default_max_count 10_000
   @default_lmdb_query_scan_limit 10_000
+  @claim_due_cold_schedule_horizon_ms Application.compile_env(
+                                        :ferricstore,
+                                        :flow_claim_due_cold_schedule_horizon_ms,
+                                        24 * 60 * 60 * 1_000
+                                      )
+  @claim_due_cold_schedule_scan_limit Application.compile_env(
+                                        :ferricstore,
+                                        :flow_claim_due_cold_schedule_scan_limit,
+                                        1_000
+                                      )
+  @claim_due_cold_schedule_min_horizon_ms Application.compile_env(
+                                            :ferricstore,
+                                            :flow_claim_due_cold_schedule_min_horizon_ms,
+                                            60_000
+                                          )
+  @claim_due_cold_schedule_bucket_ms 60_000
   @terminal_states ["completed", "failed", "cancelled"]
   @u64_decimal_zero_pad "00000000000000000000"
   @history_tag :flow_history_v1
@@ -630,7 +646,9 @@ defmodule Ferricstore.Flow do
     observe_flow(:reclaim, started, result, %{flow_type: type})
   end
 
-  defp claim_due_result(ctx, type, opts) do
+  defp claim_due_result(ctx, type, opts), do: claim_due_result(ctx, type, opts, :allow)
+
+  defp claim_due_result(ctx, type, opts, cold_due_mode) do
     with :ok <- validate_opts(opts, return: true),
          :ok <- validate_type(type),
          {:ok, state} <- optional_claim_states(opts),
@@ -658,6 +676,7 @@ defmodule Ferricstore.Flow do
         }
         |> maybe_put_attr(:partition_keys, partition_keys)
         |> maybe_put_attr(:now_ms, now)
+        |> maybe_put_attr(:cold_due_mode, cold_due_mode)
 
       case claim_due_router_result(ctx, attrs, reclaim_expired?, reclaim_ratio) do
         {:ok, records} when is_list(records) ->
@@ -670,7 +689,7 @@ defmodule Ferricstore.Flow do
   end
 
   defp claim_due_blocking_result(ctx, type, opts, block_ms) do
-    case claim_due_result(ctx, type, opts) do
+    case claim_due_result(ctx, type, opts, :block) do
       {:ok, [_ | _]} = claimed ->
         claimed
 
@@ -683,12 +702,17 @@ defmodule Ferricstore.Flow do
                    limit: limit
                  ) do
             try do
-              case claim_due_result(ctx, type, opts) do
+              case claim_due_result(ctx, type, opts, :block) do
                 {:ok, [_ | _]} = claimed ->
                   claimed
 
                 {:ok, []} ->
-                  schedule_claim_due_waiter_next_due(ctx, type, opts)
+                  schedule_claim_due_waiter_next_due(
+                    ctx,
+                    type,
+                    claim_due_wait_opts_with_horizon(opts, deadline)
+                  )
+
                   claim_due_wait_loop(ctx, type, opts, deadline, keys, limit)
 
                 other ->
@@ -711,13 +735,18 @@ defmodule Ferricstore.Flow do
 
     receive do
       {^waiter_message, _key} ->
-        case claim_due_result(ctx, type, opts) do
+        case claim_due_result(ctx, type, opts, :block) do
           {:ok, []} ->
             if claim_due_block_expired?(deadline) do
               {:ok, []}
             else
               with :ok <- reregister_claim_waiters(keys, deadline, limit) do
-                schedule_claim_due_waiter_next_due(ctx, type, opts)
+                schedule_claim_due_waiter_next_due(
+                  ctx,
+                  type,
+                  claim_due_wait_opts_with_horizon(opts, deadline)
+                )
+
                 claim_due_wait_loop(ctx, type, opts, deadline, keys, limit)
               end
             end
@@ -734,6 +763,19 @@ defmodule Ferricstore.Flow do
   defp reregister_claim_waiters(keys, deadline, limit) do
     ClaimWaiters.unregister(keys, self())
     ClaimWaiters.register(keys, self(), claim_due_waiter_deadline(deadline), limit: limit)
+  end
+
+  defp claim_due_wait_opts_with_horizon(opts, @claim_due_block_forever) do
+    Keyword.put(opts, :wait_horizon_ms, @claim_due_cold_schedule_horizon_ms)
+  end
+
+  defp claim_due_wait_opts_with_horizon(opts, deadline) when is_integer(deadline) do
+    horizon_ms =
+      deadline
+      |> Kernel.-(System.monotonic_time(:millisecond))
+      |> max(0)
+
+    Keyword.put(opts, :wait_horizon_ms, horizon_ms)
   end
 
   defp claim_due_block_deadline(0), do: @claim_due_block_forever
@@ -857,13 +899,15 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key, partition_keys} <- optional_claim_partitions(opts),
          {:ok, priority} <- optional_priority_or_nil(opts) do
       partition_filter = partition_keys || partition_key
+      cold_horizon_ms = claim_due_wait_cold_horizon_ms(Keyword.get(opts, :wait_horizon_ms))
 
       schedule_claim_due_waiter_next_due_filter(
         ctx,
         type,
         state_filter,
         priority,
-        partition_filter
+        partition_filter,
+        cold_horizon_ms
       )
     else
       _unsupported -> :ok
@@ -877,7 +921,8 @@ defmodule Ferricstore.Flow do
          type,
          state_filter,
          priority,
-         partition_filter
+         partition_filter,
+         cold_horizon_ms
        ) do
     case {claim_due_wait_schedule_states(state_filter),
           claim_due_wait_schedule_partitions(partition_filter)} do
@@ -890,6 +935,15 @@ defmodule Ferricstore.Flow do
           schedule_claim_due_waiter_next_due_key(ctx, type, state, priority, partition_key)
         end
 
+        schedule_claim_due_waiter_next_cold_due(
+          ctx,
+          type,
+          state_filter,
+          priority,
+          partition_filter,
+          cold_horizon_ms
+        )
+
         :ok
 
       _broad_filter ->
@@ -899,6 +953,15 @@ defmodule Ferricstore.Flow do
           state_filter,
           priority,
           partition_filter
+        )
+
+        schedule_claim_due_waiter_next_cold_due(
+          ctx,
+          type,
+          state_filter,
+          priority,
+          partition_filter,
+          cold_horizon_ms
         )
     end
   end
@@ -973,6 +1036,257 @@ defmodule Ferricstore.Flow do
     _kind, _reason -> :ok
   end
 
+  defp schedule_claim_due_waiter_next_cold_due(
+         ctx,
+         type,
+         state_filter,
+         priority_filter,
+         partition_filter,
+         cold_horizon_ms
+       ) do
+    with true <- Ferricstore.Flow.Hibernation.enabled?(),
+         true <- cold_horizon_ms >= @claim_due_cold_schedule_min_horizon_ms,
+         due_at when is_integer(due_at) <-
+           earliest_claim_due_wait_cold_score(
+             ctx,
+             type,
+             state_filter,
+             priority_filter,
+             partition_filter,
+             cold_horizon_ms
+           ) do
+      for state <- claim_due_wait_notify_states(state_filter),
+          partition_key <- claim_due_wait_notify_partitions(partition_filter) do
+        ClaimWaiters.schedule_ready(type, state, priority_filter, partition_key, due_at, 1)
+      end
+
+      :ok
+    else
+      _other -> :ok
+    end
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp earliest_claim_due_wait_cold_score(
+         ctx,
+         type,
+         state_filter,
+         priority_filter,
+         partition_filter,
+         cold_horizon_ms
+       )
+       when is_binary(type) do
+    now_ms = CommandTime.now_ms()
+
+    ctx
+    |> claim_due_wait_cold_lmdb_paths()
+    |> Enum.reduce(nil, fn path, earliest ->
+      path
+      |> claim_due_wait_cold_bucket_prefixes(
+        type,
+        state_filter,
+        priority_filter,
+        partition_filter,
+        now_ms,
+        cold_horizon_ms
+      )
+      |> Enum.reduce_while(earliest, fn prefix, current ->
+        case Ferricstore.Flow.LMDB.prefix_entries(
+               path,
+               prefix,
+               @claim_due_cold_schedule_scan_limit
+             ) do
+          {:ok, entries} ->
+            next =
+              entries
+              |> Enum.reduce(current, fn {_due_key, park_key}, acc ->
+                case claim_due_wait_cold_due_at(
+                       path,
+                       park_key,
+                       type,
+                       state_filter,
+                       priority_filter,
+                       partition_filter
+                     ) do
+                  due_at when is_integer(due_at) ->
+                    if is_integer(acc), do: min(acc, due_at), else: due_at
+
+                  _ ->
+                    acc
+                end
+              end)
+
+            if is_integer(next) and next <= now_ms do
+              {:halt, next}
+            else
+              {:cont, next}
+            end
+
+          _other ->
+            {:cont, current}
+        end
+      end)
+    end)
+  end
+
+  defp earliest_claim_due_wait_cold_score(_ctx, _type, _state, _priority, _partition, _horizon),
+    do: nil
+
+  defp claim_due_wait_cold_lmdb_paths(%{data_dir: data_dir, shard_count: shard_count})
+       when is_binary(data_dir) and is_integer(shard_count) and shard_count > 0 do
+    for shard_index <- 0..(shard_count - 1) do
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+    end
+  end
+
+  defp claim_due_wait_cold_lmdb_paths(_ctx), do: []
+
+  defp claim_due_wait_cold_bucket_prefixes(
+         path,
+         type,
+         state_filter,
+         priority_filter,
+         partition_filter,
+         now_ms,
+         cold_horizon_ms
+       ) do
+    buckets = claim_due_wait_cold_schedule_buckets(now_ms, cold_horizon_ms)
+
+    case {claim_due_wait_schedule_states(state_filter),
+          claim_due_wait_schedule_partitions(partition_filter)} do
+      {{:ok, states}, {:ok, partitions}} ->
+        priorities = claim_due_wait_schedule_priorities(priority_filter)
+
+        if priorities == [] do
+          claim_due_wait_cold_type_prefixes(buckets, type)
+        else
+          for bucket_ms <- buckets,
+              state <- states,
+              partition_key <- partitions,
+              priority <- priorities do
+            Ferricstore.Flow.LMDB.cold_due_claim_prefix(
+              bucket_ms: bucket_ms,
+              type: type,
+              state: state,
+              partition_key: partition_key,
+              priority: priority
+            )
+          end
+        end
+
+      _broad_filter ->
+        claim_due_wait_cold_type_prefixes(buckets, type)
+    end
+    |> Enum.filter(&claim_due_wait_cold_prefix_present?(path, &1))
+  end
+
+  defp claim_due_wait_cold_type_prefixes(buckets, type) do
+    Enum.map(buckets, &Ferricstore.Flow.LMDB.cold_due_type_bucket_prefix(&1, type))
+  end
+
+  defp claim_due_wait_cold_prefix_present?(path, prefix) do
+    case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+      {:ok, [_ | _]} -> true
+      _ -> false
+    end
+  end
+
+  defp claim_due_wait_cold_horizon_ms(value) when is_integer(value) and value >= 0 do
+    min(value, @claim_due_cold_schedule_horizon_ms)
+  end
+
+  defp claim_due_wait_cold_horizon_ms(_value), do: @claim_due_cold_schedule_horizon_ms
+
+  defp claim_due_wait_cold_schedule_buckets(now_ms, horizon_ms) do
+    first = Ferricstore.Flow.LMDB.cold_due_bucket_ms(now_ms, @claim_due_cold_schedule_bucket_ms)
+    horizon = now_ms + claim_due_wait_cold_horizon_ms(horizon_ms)
+    last = Ferricstore.Flow.LMDB.cold_due_bucket_ms(horizon, @claim_due_cold_schedule_bucket_ms)
+
+    first
+    |> Stream.iterate(&(&1 + @claim_due_cold_schedule_bucket_ms))
+    |> Stream.take_while(&(&1 <= last))
+    |> Enum.to_list()
+  end
+
+  defp claim_due_wait_cold_due_at(
+         path,
+         park_key,
+         type,
+         state_filter,
+         priority_filter,
+         partition_filter
+       )
+       when is_binary(park_key) do
+    with {:ok, park_blob} <- Ferricstore.Flow.LMDB.get(path, park_key),
+         {:ok, park} <- Ferricstore.Flow.LMDB.decode_cold_park(park_blob),
+         true <-
+           claim_due_wait_cold_park_matches?(
+             park,
+             type,
+             state_filter,
+             priority_filter,
+             partition_filter
+           ),
+         due_at when is_integer(due_at) <- Map.get(park, :due_at_ms) do
+      due_at
+    else
+      _other -> nil
+    end
+  end
+
+  defp claim_due_wait_cold_due_at(_path, _park_key, _type, _state, _priority, _partition),
+    do: nil
+
+  defp claim_due_wait_cold_park_matches?(
+         park,
+         type,
+         state_filter,
+         priority_filter,
+         partition_filter
+       )
+       when is_map(park) do
+    Map.get(park, :type) == type and
+      claim_due_wait_cold_state_match?(Map.get(park, :state), state_filter) and
+      claim_due_wait_cold_priority_match?(Map.get(park, :priority, 0), priority_filter) and
+      claim_due_wait_cold_partition_match?(Map.get(park, :partition_key), partition_filter)
+  end
+
+  defp claim_due_wait_cold_park_matches?(_park, _type, _state, _priority, _partition),
+    do: false
+
+  defp claim_due_wait_cold_state_match?(state, state_filter)
+       when is_binary(state) and state_filter in [nil, :any],
+       do: true
+
+  defp claim_due_wait_cold_state_match?(state, states) when is_binary(state) and is_list(states),
+    do: state in states
+
+  defp claim_due_wait_cold_state_match?(state, state), do: true
+  defp claim_due_wait_cold_state_match?(_state, _filter), do: false
+
+  defp claim_due_wait_cold_priority_match?(_priority, nil), do: true
+  defp claim_due_wait_cold_priority_match?(priority, priority), do: true
+  defp claim_due_wait_cold_priority_match?(_priority, _filter), do: false
+
+  defp claim_due_wait_cold_partition_match?(partition, partition_filter)
+       when is_binary(partition) and partition_filter in [nil, :any],
+       do: true
+
+  defp claim_due_wait_cold_partition_match?(partition, :auto) when is_binary(partition),
+    do: String.starts_with?(partition, "__flow_auto__:")
+
+  defp claim_due_wait_cold_partition_match?(partition, partitions)
+       when is_binary(partition) and is_list(partitions),
+       do: partition in partitions
+
+  defp claim_due_wait_cold_partition_match?(partition, partition), do: true
+  defp claim_due_wait_cold_partition_match?(_partition, _filter), do: false
+
   defp earliest_claim_due_wait_score(results) when is_list(results) do
     results
     |> Enum.reduce(nil, fn
@@ -1029,6 +1343,7 @@ defmodule Ferricstore.Flow do
       (:binary.match(key, "}:d:") != :nomatch or :binary.match(key, "}:da:") != :nomatch)
   end
 
+  defp claim_due_wait_partition_match?(_key, nil), do: true
   defp claim_due_wait_partition_match?(_key, :any), do: true
 
   defp claim_due_wait_partition_match?(key, :auto),
@@ -1044,7 +1359,7 @@ defmodule Ferricstore.Flow do
       String.starts_with?(key, "f:" <> tag <> ":da:")
   end
 
-  defp claim_due_wait_state_match?(key, type, :any) do
+  defp claim_due_wait_state_match?(key, type, state_filter) when state_filter in [nil, :any] do
     String.contains?(key, "}:d:" <> type <> ":") or
       String.contains?(key, "}:da:" <> type <> ":p")
   end
@@ -5173,10 +5488,12 @@ defmodule Ferricstore.Flow do
   defp flow_start_time, do: System.monotonic_time()
 
   defp observe_flow(command, started, result, fallback_metadata) do
-    {success_count, fallback_metadata} = Map.pop(fallback_metadata, :_count)
-    measurements = flow_measurements(started, command, result, success_count)
+    {attempt_count, fallback_metadata} = Map.pop(fallback_metadata, :_count)
+    measurements = flow_measurements(started, command, result, attempt_count)
     metadata = flow_metadata(result, fallback_metadata)
 
+    observe_flow_create_attempt(command, measurements, metadata, attempt_count)
+    observe_flow_create_success(command, measurements, metadata)
     :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
 
     result
@@ -5184,15 +5501,38 @@ defmodule Ferricstore.Flow do
 
   defp observe_flow_batch(command, started, results) do
     {success_count, first_record} = flow_batch_success_count_and_first_record(results)
+    attempt_count = length(results)
 
     measurements =
       flow_measurements(started, command, {:ok, first_record}, success_count)
 
     metadata = flow_metadata({:ok, first_record}, %{flow_id: nil})
 
+    observe_flow_create_attempt(command, measurements, metadata, attempt_count)
+    observe_flow_create_success(command, measurements, metadata)
     :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
     :ok
   end
+
+  defp observe_flow_create_attempt(:create, measurements, metadata, count) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :create, :attempt],
+      %{measurements | count: positive_count(count)},
+      metadata
+    )
+  end
+
+  defp observe_flow_create_attempt(_command, _measurements, _metadata, _count), do: :ok
+
+  defp observe_flow_create_success(:create, %{count: count} = measurements, metadata)
+       when is_integer(count) and count > 0 do
+    :telemetry.execute([:ferricstore, :flow, :create, :success], measurements, metadata)
+  end
+
+  defp observe_flow_create_success(_command, _measurements, _metadata), do: :ok
+
+  defp positive_count(count) when is_integer(count) and count > 0, do: count
+  defp positive_count(_count), do: 0
 
   defp flow_batch_success_count_and_first_record(results) do
     Enum.reduce(results, {0, nil}, fn
@@ -5239,6 +5579,7 @@ defmodule Ferricstore.Flow do
   end
 
   defp result_count(:ok, count) when is_integer(count) and count >= 0, do: count
+  defp result_count({:ok, {:error, _reason}}, _count), do: 0
   defp result_count({:ok, _value}, count) when is_integer(count) and count >= 0, do: count
   defp result_count(result, _count), do: result_count(result)
 
@@ -5264,6 +5605,10 @@ defmodule Ferricstore.Flow do
       record_value || fallback_value
     end)
     |> Map.merge(%{result: :ok, reason: nil})
+  end
+
+  defp flow_metadata({:ok, {:error, reason}}, fallback) when is_binary(reason) do
+    Map.merge(fallback, %{result: :error, reason: flow_error_reason(reason)})
   end
 
   defp flow_metadata({:ok, _value}, fallback),

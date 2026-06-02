@@ -35,7 +35,26 @@ config :ferricstore,
 # hot claim/transition workloads are not interrupted every minute.
 config :ferricstore,
   flow_retention_sweeper_initial_delay_ms: 600_000,
-  flow_retention_sweeper_interval_ms: 600_000
+  flow_retention_sweeper_interval_ms: 600_000,
+  flow_retention_sweeper_pressure_interval_ms: 1_000,
+  flow_retention_sweeper_pressure_limit: 10_000,
+  flow_retention_sweeper_pressure_compaction_interval_ms: 60_000
+
+# Operational guardrails are derived from the actual node/container memory and
+# the filesystem backing `:data_dir`. These ratios control when cleanup becomes
+# aggressive and when new writes are rejected cleanly instead of allowing RSS or
+# disk growth to collapse the node.
+config :ferricstore,
+  operational_guard_enabled: true,
+  operational_guard_interval_ms: 1_000,
+  operational_rss_warn_ratio: 0.70,
+  operational_rss_pressure_ratio: 0.80,
+  operational_rss_reject_ratio: 0.88,
+  operational_rss_panic_ratio: 0.94,
+  operational_disk_warn_ratio: 0.70,
+  operational_disk_pressure_ratio: 0.80,
+  operational_disk_reject_ratio: 0.90,
+  operational_disk_panic_ratio: 0.95
 
 # LFU decay: minutes per decay step (0 = no decay). Matches Redis lfu-decay-time.
 config :ferricstore, :lfu_decay_time, 1

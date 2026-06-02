@@ -860,6 +860,68 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches cold auto-bucket create_many claim_due through Rust AST" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("flow-command-cold-auto-bulk") <> ":bench"
+    id_a = uid("flow-command-cold-auto-a")
+    id_b = uid("flow-command-cold-auto-b")
+    partition = Ferricstore.Flow.Keys.auto_partition_key(id_a)
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE_MANY",
+               [
+                 partition,
+                 "TYPE",
+                 type,
+                 "STATE",
+                 "queued",
+                 "RUN_AT",
+                 "302000",
+                 "NOW",
+                 "1000",
+                 "PRIORITY",
+                 "0",
+                 "INDEPENDENT",
+                 "true",
+                 "RETENTION_TTL_MS",
+                 "300000",
+                 "ITEMS",
+                 id_a,
+                 "payload:" <> id_a,
+                 id_b,
+                 "payload:" <> id_b
+               ],
+               MockStore.make()
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    assert [job_a | _] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 type,
+                 "WORKER",
+                 "worker-cold-auto",
+                 "LIMIT",
+                 "10",
+                 "NOW",
+                 "302000",
+                 "PARTITIONS",
+                 "1",
+                 partition,
+                 "RETURN",
+                 "JOBS_COMPACT_STATE"
+               ],
+               MockStore.make()
+             )
+
+    assert [^id_a, ^partition, lease_token, fencing_token, "queued"] = job_a
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
+  end
+
   test "dispatches idempotent Flow create_many retry through Rust AST" do
     partition = uid("tenant")
     type = uid("flow-command-bulk-idempotent")

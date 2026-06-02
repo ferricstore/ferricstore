@@ -56,6 +56,62 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
     end)
   end
 
+  test "prod runtime derives keydir RAM from maxmemory unless explicitly overridden" do
+    with_env("FERRICSTORE_KEYDIR_MAX_RAM", nil, fn ->
+      with_env("FERRICSTORE_MAX_MEMORY", nil, fn ->
+        assert runtime_ferricstore_config(:max_memory_bytes) > 0
+        assert runtime_ferricstore_config(:keydir_max_ram) >= 268_435_456
+        assert runtime_ferricstore_config(:keydir_max_ram) <= 8_589_934_592
+      end)
+
+      with_env("FERRICSTORE_MAX_MEMORY", "auto", fn ->
+        assert runtime_ferricstore_config(:max_memory_bytes) > 0
+        assert runtime_ferricstore_config(:keydir_max_ram) >= 268_435_456
+        assert runtime_ferricstore_config(:keydir_max_ram) <= 8_589_934_592
+      end)
+
+      with_env("FERRICSTORE_MAX_MEMORY", "0", fn ->
+        assert runtime_ferricstore_config(:keydir_max_ram) == 268_435_456
+      end)
+
+      with_env("FERRICSTORE_MAX_MEMORY", "100000000000", fn ->
+        assert runtime_ferricstore_config(:keydir_max_ram) == 8_589_934_592
+      end)
+
+      with_env("FERRICSTORE_MAX_MEMORY", "1073741824", fn ->
+        assert runtime_ferricstore_config(:keydir_max_ram) == 268_435_456
+      end)
+    end)
+
+    with_env("FERRICSTORE_MAX_MEMORY", "100000000000", fn ->
+      with_env("FERRICSTORE_KEYDIR_MAX_RAM", "123456789", fn ->
+        assert runtime_ferricstore_config(:keydir_max_ram) == 123_456_789
+      end)
+    end)
+  end
+
+  test "flow soak harness exposes and applies derived memory budgets" do
+    source = File.read!(Path.join(@repo_root, "bench/flow_state_lmdb_soak.exs"))
+    lmdb_writer_source = File.read!(Path.join(@lib_root, "ferricstore/flow/lmdb_writer.ex"))
+    state_machine_source = File.read!(Path.join(@lib_root, "ferricstore/raft/state_machine.ex"))
+
+    assert source =~ "Application.put_env(:ferricstore, :max_memory_bytes, max_memory_bytes)"
+    assert source =~ "Application.put_env(:ferricstore, :keydir_max_ram, app_keydir_max_ram_bytes(max_memory_bytes))"
+    assert source =~
+             ~S|max_memory_bytes=#{Application.get_env(:ferricstore, :max_memory_bytes)}|
+
+    assert source =~ ~S|keydir_max_ram=#{Application.get_env(:ferricstore, :keydir_max_ram)}|
+    assert source =~ ~s("auto" -> max_total_mem_mb * 1024 * 1024)
+    assert source =~ ~S|optional_cli_arg("CREATE_NOW_MS", "--create-now-ms")|
+    assert source =~ ~S|optional_cli_arg("CLAIM_NOW_MS", "--claim-now-ms")|
+    assert source =~ ~S|[:ferricstore, :flow, :hibernation, :evict_hot]|
+    assert source =~ ~S|[:ferricstore, :flow, :hibernation, :promote]|
+    assert source =~ "cold_due_evicted="
+    assert source =~ "cold_due_promoted="
+    assert lmdb_writer_source =~ ~S|[:ferricstore, :flow, :hibernation, :evict_hot]|
+    assert state_machine_source =~ ~S|[:ferricstore, :flow, :hibernation, :promote]|
+  end
+
   test "prod runtime WARaft ETS byte cap treats empty as unset and validates overrides" do
     with_env("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES", nil, fn ->
       refute Keyword.has_key?(

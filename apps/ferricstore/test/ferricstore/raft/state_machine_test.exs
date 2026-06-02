@@ -1793,8 +1793,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       completed = flow_record!(state, state_key)
       assert completed.state == "completed"
-      assert_receive {:flow_lmdb_backlog, measurements, %{shard_index: ^shard_index}}, 500
-      assert measurements.pending_ops > 0
+      refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
     end
 
     test "Flow hot path does not depend on LMDB writer availability", %{
