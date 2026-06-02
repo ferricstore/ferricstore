@@ -48,6 +48,17 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     end
   end
 
+  describe "performance guards" do
+    test "result reassembly does not scan shard result lists by position" do
+      source =
+        Path.expand("../../../lib/ferricstore/transaction/coordinator.ex", __DIR__)
+        |> File.read!()
+
+      refute source =~ "Enum.at(results_for_shard",
+             "EXEC result reassembly must stay linear; zip shard results to original indices instead"
+    end
+  end
+
   describe "single-shard transactions" do
     test "executes when all commands target the same shard", %{same1: s1, same2: s2} do
       queue = [{"SET", [s1, "100"]}, {"SET", [s2, "200"]}, {"GET", [s1]}]
@@ -59,12 +70,11 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
     test "single-shard write transaction applies through Raft", %{same1: s1} do
       idx = Router.shard_for(FerricStore.Instance.get(:default), s1)
-      shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
-      before_count = raft_applied_count(shard_id)
+      before_count = raft_applied_count(idx)
 
       assert [:ok] == Coordinator.execute([{"SET", [s1, "via_raft"]}], %{}, nil)
 
-      assert raft_applied_count(shard_id) == before_count + 1
+      assert raft_applied_count(idx) == before_count + 1
     end
 
     test "returns results in original command order", %{same1: s1, same2: s2} do
@@ -328,6 +338,26 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert Router.get(FerricStore.Instance.get(:default), s1) == "updated"
     end
 
+    test "aborts when a watched key changes after preflight before apply", %{same1: s1, same2: s2} do
+      Router.put(FerricStore.Instance.get(:default), s1, "original", 0)
+
+      watched = %{s1 => Router.watch_token(FerricStore.Instance.get(:default), s1)}
+
+      Process.put(:ferricstore_tx_after_watch_preflight_hook, fn ->
+        Router.put(FerricStore.Instance.get(:default), s1, "raced", 0)
+      end)
+
+      try do
+        result = Coordinator.execute([{"SET", [s2, "should_not_commit"]}], watched, nil)
+
+        assert result == nil
+        assert Router.get(FerricStore.Instance.get(:default), s1) == "raced"
+        assert Router.get(FerricStore.Instance.get(:default), s2) == nil
+      after
+        Process.delete(:ferricstore_tx_after_watch_preflight_hook)
+      end
+    end
+
     test "cross-shard WATCH succeeds when watches pass", %{k0: k0, k1: k1} do
       Router.put(FerricStore.Instance.get(:default), k0, "orig_k0", 0)
 
@@ -424,8 +454,10 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     end
   end
 
-  defp raft_applied_count(shard_id) do
-    {:ok, %{machine: %{applied_count: count}}, _leader} = :ra.member_overview(shard_id)
-    count
+  defp raft_applied_count(shard_index) do
+    {:ok, {:raft_log_pos, index, _term}} =
+      Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+
+    index
   end
 end

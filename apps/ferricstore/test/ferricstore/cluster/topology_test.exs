@@ -31,6 +31,7 @@ defmodule Ferricstore.Cluster.TopologyTest do
   # Uses two MFA-form :erpc calls to avoid sending anonymous functions
   # (which would fail with :undef on peer nodes that lack test module code).
   defp remote_router(node_name, fun, args) do
+    :ok = ClusterHelper.ensure_node_reachable(node_name, timeout: 2_000)
     ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
     :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
   end
@@ -54,8 +55,7 @@ defmodule Ferricstore.Cluster.TopologyTest do
 
     Enum.each(nodes, fn node ->
       for shard <- 0..(shard_count - 1) do
-        server_id = {:"ferricstore_shard_#{shard}", node.name}
-        result = :rpc.call(node.name, :ra, :members, [server_id])
+        result = :rpc.call(node.name, Ferricstore.Raft.Cluster, :members, [shard, 2_000])
 
         assert match?({:ok, _, _}, result),
                "shard #{shard} on #{node.name} should have a leader, got #{inspect(result)}"
@@ -172,6 +172,7 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
 
   # Helper: execute a Router function on a remote peer node with ctx.
   defp remote_router(node_name, fun, args) do
+    :ok = ClusterHelper.ensure_node_reachable(node_name, timeout: 2_000)
     ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
     :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
   end
@@ -239,6 +240,7 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
 
     for shard <- 0..3 do
       leader = ClusterHelper.find_leader(alive_nodes, shard)
+
       assert leader in alive_names,
              "shard #{shard} leader #{inspect(leader)} should be an alive node"
     end
@@ -288,6 +290,7 @@ defmodule Ferricstore.Cluster.FailoverTest do
 
   # Helper: execute a Router function on a remote peer node with ctx.
   defp remote_router(node_name, fun, args) do
+    :ok = ClusterHelper.ensure_node_reachable(node_name, timeout: 2_000)
     ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
     :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
   end
@@ -340,10 +343,10 @@ defmodule Ferricstore.Cluster.FailoverTest do
     assert result_pre == :ok, "CT-005: pre-kill write on n1 should succeed"
 
     # Kill n3
-    {_killed, _remaining} = ClusterHelper.kill_node(nodes, n3)
+    {_killed, remaining} = ClusterHelper.kill_node(nodes, n3)
 
-    # Allow distribution to settle
-    Process.sleep(500)
+    # Wait for failover to complete before asserting post-failover writes.
+    :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 15_000)
 
     # n1 and n2 should still serve writes
     result1 =
@@ -457,6 +460,7 @@ defmodule Ferricstore.Cluster.PartitionTest do
   end
 
   defp remote_router(node_name, fun, args) do
+    :ok = ClusterHelper.ensure_node_reachable(node_name, timeout: 2_000)
     ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
     :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
   end
@@ -472,17 +476,16 @@ defmodule Ferricstore.Cluster.PartitionTest do
 
   @tag :cluster
   test "partitioned node loses Raft membership", %{nodes: nodes} do
-    [n1, _n2, n3] = nodes
+    [n1, n2, n3] = nodes
     shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
-    # Stop ra on n3 — simulates network partition from Raft's perspective
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
-    end
+    # Stop consensus on n3 to simulate local consensus unavailability.
+    :ok = ClusterHelper.stop_consensus(n3.name)
 
-    Process.sleep(500)
+    # A stopped consensus node may have been leader for some shards. Wait until
+    # the remaining majority has elected replacement leaders before asserting
+    # write availability; Raft failover is not instantaneous.
+    :ok = ClusterHelper.wait_for_leaders([n1, n2], shards, timeout: 15_000)
 
     # Majority side (n1+n2) can still write (2-of-3 quorum)
     result =
@@ -494,11 +497,8 @@ defmodule Ferricstore.Cluster.PartitionTest do
 
     assert result == :ok, "majority side should still accept writes"
 
-    # Restart ra on n3 — simulates partition heal
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
-    end
+    # Restart consensus on n3 to simulate heal.
+    :ok = ClusterHelper.start_consensus(n3.name)
 
     ClusterHelper.wait_for_leaders(nodes, shards, timeout: 10_000)
 
@@ -511,29 +511,24 @@ defmodule Ferricstore.Cluster.PartitionTest do
 
   @tag :cluster
   test "heal partition: node catches up on writes made during its absence", %{nodes: nodes} do
-    [n1, _n2, n3] = nodes
+    [n1, n2, n3] = nodes
     shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
     # Write before partition
     remote_router(n1.name, :put, ["topo:heal:pre", "before", 0])
 
-    # Stop ra on n3
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
-    end
+    # Stop consensus on n3
+    :ok = ClusterHelper.stop_consensus(n3.name)
 
-    Process.sleep(500)
+    # The write below is only guaranteed after the surviving majority has
+    # replacement leaders for shards that were led by n3.
+    :ok = ClusterHelper.wait_for_leaders([n1, n2], shards, timeout: 15_000)
 
     # Write on n1 during n3's absence
-    remote_router(n1.name, :put, ["topo:heal:during", "during", 0])
+    :ok = remote_router(n1.name, :put, ["topo:heal:during", "during", 0])
 
-    # Restart ra on n3
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
-    end
+    # Restart consensus on n3
+    :ok = ClusterHelper.start_consensus(n3.name)
 
     ClusterHelper.wait_for_leaders(nodes, shards, timeout: 10_000)
 
@@ -560,15 +555,13 @@ defmodule Ferricstore.Cluster.PartitionTest do
   } do
     [n1, n2, n3] = nodes
     shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
-    # Stop ra on n3 — simulates partition
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
-    end
+    # Stop consensus on n3 — simulates partition
+    :ok = ClusterHelper.stop_consensus(n3.name)
 
-    Process.sleep(500)
+    # Wait for majority-side leaders before writing. If the stopped node was a
+    # leader, writes can correctly fail until the new election completes.
+    :ok = ClusterHelper.wait_for_leaders([n1, n2], shards, timeout: 15_000)
 
     # Write 50 keys on n1 during n3's absence (majority still has quorum)
     for i <- 1..50 do
@@ -580,11 +573,8 @@ defmodule Ferricstore.Cluster.PartitionTest do
         ])
     end
 
-    # Restart ra on n3 — heals the partition
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
-    end
+    # Restart consensus on n3 — heals the partition
+    :ok = ClusterHelper.start_consensus(n3.name)
 
     ClusterHelper.wait_for_leaders(nodes, shards, timeout: 15_000)
 
@@ -595,12 +585,18 @@ defmodule Ferricstore.Cluster.PartitionTest do
     end
 
     # n3 catches up via Raft log replay — eventually sees all 50 keys
-    eventually(fn ->
-      missing = Enum.count(1..50, fn i ->
-        remote_router(n3.name, :get, ["ct009:majority:#{i}"]) == nil
-      end)
-      assert missing == 0, "n3 still missing #{missing}/50 keys"
-    end, 60, 200)
+    eventually(
+      fn ->
+        missing =
+          Enum.count(1..50, fn i ->
+            remote_router(n3.name, :get, ["ct009:majority:#{i}"]) == nil
+          end)
+
+        assert missing == 0, "n3 still missing #{missing}/50 keys"
+      end,
+      60,
+      200
+    )
 
     # All nodes can write after rejoin
     :ok = remote_router(n1.name, :put, ["ct009:post:n1", "ok", 0])

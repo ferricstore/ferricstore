@@ -10,6 +10,8 @@ defmodule FerricstoreServer.PubSubTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.PubSub
+  alias FerricstoreServer.Acl
+  alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
@@ -19,6 +21,15 @@ defmodule FerricstoreServer.PubSubTest do
 
   defp send_cmd(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))
+    :ok = :gen_tcp.send(sock, data)
+  end
+
+  defp send_pipeline(sock, commands) do
+    data =
+      commands
+      |> Enum.map(&Encoder.encode/1)
+      |> IO.iodata_to_binary()
+
     :ok = :gen_tcp.send(sock, data)
   end
 
@@ -97,16 +108,55 @@ defmodule FerricstoreServer.PubSubTest do
 
   setup do
     # Clean ETS tables between tests to avoid cross-test interference
-    :ets.delete_all_objects(:ferricstore_pubsub)
-    :ets.delete_all_objects(:ferricstore_pubsub_patterns)
+    clear_table(:ferricstore_pubsub)
+    clear_table(:ferricstore_pubsub_patterns)
+    clear_table(:ferricstore_pubsub_channel_cache)
     :ok
+  end
+
+  defp clear_table(table) do
+    case :ets.whereis(table) do
+      :undefined -> :ok
+      _tid -> :ets.delete_all_objects(table)
+    end
   end
 
   # ---------------------------------------------------------------------------
   # Unit tests — PubSub module directly
   # ---------------------------------------------------------------------------
 
+  test "connection Pub/Sub dispatch uses bulk registry APIs" do
+    source = File.read!(Path.expand("../../lib/ferricstore_server/connection/pubsub.ex", __DIR__))
+
+    assert source =~ "PS.subscribe_many(self())"
+    assert source =~ "PS.psubscribe_many(self())"
+    assert source =~ "PS.unsubscribe_many(channels, self())"
+    assert source =~ "PS.punsubscribe_many(patterns, self())"
+    refute source =~ "PS.subscribe(ch, self())"
+    refute source =~ "PS.psubscribe(pat, self())"
+  end
+
+  test "exact publish uses the channel pid cache" do
+    source = File.read!(Path.expand("../../../ferricstore/lib/ferricstore/pubsub.ex", __DIR__))
+    [publish_source] = Regex.run(~r/def publish\(channel, message\).*?^  end/ms, source)
+
+    assert source =~ "@channel_cache_table :ferricstore_pubsub_channel_cache"
+    assert publish_source =~ ":ets.lookup(@channel_cache_table, channel)"
+    refute publish_source =~ ":ets.lookup(@channels_table, channel)"
+  end
+
   describe "subscribe and receive message" do
+    test "bulk exact subscribe and unsubscribe update registry idempotently" do
+      assert :ok = PubSub.subscribe_many(["bulk", "bulk", "other"], self())
+
+      assert PubSub.numsub(["bulk", "other"]) == ["bulk", 1, "other", 1]
+      assert PubSub.publish("bulk", "hello") == 1
+      assert_receive {:pubsub_message, "bulk", "hello"}, 1000
+
+      assert :ok = PubSub.unsubscribe_many(["bulk", "bulk"], self())
+      assert PubSub.numsub(["bulk", "other"]) == ["bulk", 0, "other", 1]
+    end
+
     test "subscriber receives message on exact channel" do
       PubSub.subscribe("news", self())
       PubSub.publish("news", "hello world")
@@ -125,6 +175,16 @@ defmodule FerricstoreServer.PubSubTest do
       refute_receive {:pubsub_message, "news", "hello world"}, 100
     end
 
+    test "bulk duplicate exact subscriptions keep publish count and delivery idempotent" do
+      PubSub.subscribe_many(["news", "news", "news"], self())
+
+      assert PubSub.numsub(["news"]) == ["news", 1]
+      assert PubSub.publish("news", "cached") == 1
+
+      assert_receive {:pubsub_message, "news", "cached"}, 1000
+      refute_receive {:pubsub_message, "news", "cached"}, 100
+    end
+
     test "subscriber does not receive message on different channel" do
       PubSub.subscribe("news", self())
       PubSub.publish("sports", "goal!")
@@ -134,6 +194,18 @@ defmodule FerricstoreServer.PubSubTest do
   end
 
   describe "pattern subscribe and receive message" do
+    test "bulk pattern subscribe and unsubscribe update registry idempotently" do
+      assert :ok = PubSub.psubscribe_many(["bulk.*", "bulk.*", "other.*"], self())
+
+      assert PubSub.numpat() == 2
+      assert PubSub.publish("bulk.1", "hello") == 1
+      assert_receive {:pubsub_pmessage, "bulk.*", "bulk.1", "hello"}, 1000
+
+      assert :ok = PubSub.punsubscribe_many(["bulk.*", "bulk.*"], self())
+      assert PubSub.numpat() == 1
+      assert PubSub.publish("bulk.1", "miss") == 0
+    end
+
     test "pattern subscriber receives message matching pattern" do
       PubSub.psubscribe("news.*", self())
       PubSub.publish("news.tech", "AI breakthrough")
@@ -482,6 +554,15 @@ defmodule FerricstoreServer.PubSubTest do
       :gen_tcp.close(sock)
     end
 
+    test "unsubscribe with no subscriptions returns null channel count zero", %{port: port} do
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["UNSUBSCRIBE"])
+      assert {:push, ["unsubscribe", nil, 0]} = recv_response(sock)
+
+      :gen_tcp.close(sock)
+    end
+
     test "connection exits pub/sub mode after unsubscribing all", %{port: port} do
       sock = connect_and_hello(port)
 
@@ -512,6 +593,15 @@ defmodule FerricstoreServer.PubSubTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "punsubscribe with no subscriptions returns null pattern count zero", %{port: port} do
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["PUNSUBSCRIBE"])
+      assert {:push, ["punsubscribe", nil, 0]} = recv_response(sock)
+
+      :gen_tcp.close(sock)
+    end
   end
 
   describe "pub/sub mode restrictions" do
@@ -524,6 +614,24 @@ defmodule FerricstoreServer.PubSubTest do
       send_cmd(sock, ["GET", "somekey"])
       response = recv_response(sock)
       assert {:error, "ERR Can't execute 'get'" <> _} = response
+
+      :gen_tcp.close(sock)
+    end
+
+    test "commands after SUBSCRIBE in the same pipeline stay restricted", %{port: port} do
+      sock = connect_and_hello(port)
+      key = "pubsub:pipeline:restricted:#{System.unique_integer([:positive])}"
+
+      send_pipeline(sock, [
+        ["SUBSCRIBE", "locked-pipe"],
+        ["SET", key, "must-not-write"]
+      ])
+
+      [subscribe_response, set_response] = recv_n(sock, 2)
+
+      assert {:push, ["subscribe", "locked-pipe", 1]} = subscribe_response
+      assert {:error, "ERR Can't execute 'set'" <> _} = set_response
+      assert nil == Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), key)
 
       :gen_tcp.close(sock)
     end
@@ -651,6 +759,125 @@ defmodule FerricstoreServer.PubSubTest do
       assert recv_response(query) == ["cleanup_test", 0]
 
       :gen_tcp.close(query)
+    end
+  end
+
+  describe "ACL invalidation while subscribed" do
+    setup do
+      Acl.reset!()
+
+      on_exit(fn ->
+        Acl.reset!()
+      end)
+
+      :ok
+    end
+
+    test "deleting a subscribed user removes live subscriptions", %{port: port} do
+      channel = "acl-events-#{System.unique_integer([:positive])}"
+
+      assert :ok =
+               Acl.set_user("temporary_subscriber", [
+                 "on",
+                 ">secret",
+                 "-@all",
+                 "+@pubsub",
+                 "&acl-events-*"
+               ])
+
+      sub = connect_and_hello(port)
+      send_cmd(sub, ["AUTH", "temporary_subscriber", "secret"])
+      assert {:simple, "OK"} = recv_response(sub)
+
+      send_cmd(sub, ["SUBSCRIBE", channel])
+      assert {:push, ["subscribe", ^channel, 1]} = recv_response(sub)
+      assert PubSub.numsub([channel]) == [channel, 1]
+
+      assert :ok = Acl.del_user("temporary_subscriber")
+      ConnAuth.broadcast_acl_invalidation("temporary_subscriber")
+
+      eventually(fn ->
+        assert PubSub.numsub([channel]) == [channel, 0]
+      end)
+
+      assert PubSub.publish(channel, "should-not-deliver") == 0
+
+      :gen_tcp.close(sub)
+    end
+  end
+
+  describe "Pub/Sub ACL channel patterns" do
+    setup do
+      Acl.reset!()
+
+      on_exit(fn ->
+        Acl.reset!()
+      end)
+
+      :ok
+    end
+
+    test "SUBSCRIBE is governed by channel ACL patterns, not key ACL patterns", %{port: port} do
+      assert :ok =
+               Acl.set_user("news_subscriber", [
+                 "on",
+                 ">secret",
+                 "-@all",
+                 "+subscribe",
+                 "resetkeys",
+                 "&news:*"
+               ])
+
+      sub = connect_and_hello(port)
+      send_cmd(sub, ["AUTH", "news_subscriber", "secret"])
+      assert {:simple, "OK"} = recv_response(sub)
+
+      send_cmd(sub, ["SUBSCRIBE", "news:1"])
+      assert {:push, ["subscribe", "news:1", 1]} = recv_response(sub)
+
+      denied = connect_and_hello(port)
+      send_cmd(denied, ["AUTH", "news_subscriber", "secret"])
+      assert {:simple, "OK"} = recv_response(denied)
+
+      send_cmd(denied, ["SUBSCRIBE", "private:1"])
+      assert {:error, reason} = recv_response(denied)
+      assert reason =~ "NOPERM"
+
+      :gen_tcp.close(sub)
+      :gen_tcp.close(denied)
+    end
+
+    test "PUBLISH is governed by channel ACL patterns, not key ACL patterns", %{port: port} do
+      channel = "news:publish-acl"
+
+      assert :ok =
+               Acl.set_user("news_publisher", [
+                 "on",
+                 ">secret",
+                 "-@all",
+                 "+publish",
+                 "resetkeys",
+                 "&news:*"
+               ])
+
+      sub = connect_and_hello(port)
+      send_cmd(sub, ["SUBSCRIBE", channel])
+      assert {:push, ["subscribe", ^channel, 1]} = recv_response(sub)
+
+      pub = connect_and_hello(port)
+      send_cmd(pub, ["AUTH", "news_publisher", "secret"])
+      assert {:simple, "OK"} = recv_response(pub)
+
+      send_cmd(pub, ["PUBLISH", channel, "ok"])
+      assert 1 = recv_response(pub)
+      assert {:push, ["message", ^channel, "ok"]} = recv_response(sub)
+
+      send_cmd(pub, ["PUBLISH", "private:publish-acl", "nope"])
+      assert {:error, reason} = recv_response(pub)
+      assert reason =~ "NOPERM"
+
+      :gen_tcp.close(pub)
+      :gen_tcp.close(sub)
     end
   end
 end

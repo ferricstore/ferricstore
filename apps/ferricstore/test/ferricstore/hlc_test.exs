@@ -151,6 +151,16 @@ defmodule Ferricstore.HLCTest do
   # ---------------------------------------------------------------------------
 
   describe "update/1" do
+    test "does not call the HLC GenServer on the hot update path" do
+      source = File.read!("lib/ferricstore/hlc.ex")
+
+      [update_source] =
+        Regex.run(~r/@spec update\(timestamp\(\)\).*?^  end/ms, source)
+
+      assert update_source =~ "hlc_update_packed(remote_ts)"
+      refute update_source =~ "GenServer.call"
+    end
+
     test "with a future remote timestamp advances the local clock" do
       # Get current time.
       {local_phys, _} = HLC.now()

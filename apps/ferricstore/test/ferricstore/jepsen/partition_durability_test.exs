@@ -94,12 +94,10 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
                  "got=#{inspect(read)} on n1"
       end)
 
-      IO.puts(
-        "  #{length(n1_entries)} partition writes verified on majority node after heal"
-      )
+      IO.puts("  #{length(n1_entries)} partition writes verified on majority node after heal")
     end
 
-    test "minority node retains its own writes after heal (single-node mode)", %{
+    test "minority node writes are rejected during partition", %{
       nodes: nodes
     } do
       [n1, _n2, n3] = nodes
@@ -108,35 +106,31 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
       ClusterHelper.partition_node(n3, nodes)
       Process.sleep(300)
 
-      # In single-node mode, n3 can still write (self-quorum).
-      # These writes succeed on n3 independently.
-      n3_writes =
+      # FerricStore is quorum-only. A minority-side node must not acknowledge
+      # writes while it cannot reach a Raft majority.
+      n3_results =
         for i <- 1..20 do
           key = "minority:#{i}"
           value = "iso_v#{i}"
-          result = :rpc.call(n3.name, FerricStore, :set, [key, value])
-          if result == :ok, do: {key, value}, else: nil
+          {key, value, :rpc.call(n3.name, FerricStore, :set, [key, value])}
         end
-        |> Enum.reject(&is_nil/1)
 
-      assert n3_writes != [], "n3 should be able to write in single-node mode"
+      assert Enum.all?(n3_results, fn {_key, _value, result} -> result != :ok end),
+             "minority node must not ACK writes without quorum"
 
       # Heal partition
       ClusterHelper.heal_partition(n3, nodes)
       Process.sleep(300)
 
-      # n3 retains its own writes after heal
-      Enum.each(n3_writes, fn {key, value} ->
+      # Rejected writes must not appear after heal on either side.
+      Enum.each(n3_results, fn {key, _value, _result} ->
         {:ok, read} = :rpc.call(n3.name, FerricStore, :get, [key])
-        assert read == value, "n3 lost its own write after heal: #{key}"
+        assert read == nil, "n3 should not retain a rejected write after heal: #{key}"
       end)
 
-      # n1 does NOT have n3's writes (single-node mode: no replication)
-      Enum.each(n3_writes, fn {key, _value} ->
+      Enum.each(n3_results, fn {key, _value, _result} ->
         {:ok, read} = :rpc.call(n1.name, FerricStore, :get, [key])
-
-        assert read == nil,
-               "n1 should not see n3's write in single-node mode: #{key}"
+        assert read == nil, "n1 should not see a rejected minority write: #{key}"
       end)
     end
 

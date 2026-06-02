@@ -1,4 +1,4 @@
-// ferricstore_wal_nif — Rust NIF WAL I/O layer for ra_log_wal
+// ferricstore_wal_nif -- Rust NIF append-log I/O layer for WARaft segments
 //
 // Hot write/sync NIF functions run on normal BEAM schedulers (<1μs each).
 // Blocking I/O (write + fdatasync) runs on a dedicated background thread.
@@ -60,6 +60,20 @@ fn open(
     }
 }
 
+/// Open a generic append log file from byte 0.
+#[rustler::nif(schedule = "Normal")]
+fn open_raw_append(
+    path: String,
+    commit_delay_us: u64,
+    max_buffer_bytes: u64,
+    start_offset: u64,
+) -> NifResult<(Atom, ResourceArc<WalHandle>)> {
+    match WalHandle::open_raw_append(path, commit_delay_us, max_buffer_bytes, start_offset) {
+        Ok(handle) => Ok((atoms::ok(), ResourceArc::new(handle))),
+        Err(e) => Err(rustler::Error::Term(Box::new(format!("{e}")))),
+    }
+}
+
 /// Write pre-formatted iodata to the WAL buffer.
 /// Copies bytes into the shared aligned buffer. Does NOT write to disk.
 /// Returns :ok | {:error, :wal_thread_dead} | {:error, :backpressure}
@@ -67,13 +81,7 @@ fn open(
 fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
     handle.check_alive()?;
 
-    let bytes = iodata_to_binary(iodata)?;
-    let incoming = bytes.as_slice().len() as u64;
-
-    if incoming > handle.max_buffer_bytes() {
-        return Err(rustler::Error::Term(Box::new("backpressure")));
-    }
-
+    let bytes = iodata.decode_as_binary()?;
     handle.buffer_write(bytes.as_slice())?;
     Ok(atoms::ok())
 }
@@ -153,20 +161,18 @@ fn pread<'a>(
     Ok((atoms::ok(), binary.release(env)))
 }
 
+/// Reserve disk space for an external segmented log without changing file size.
+#[rustler::nif(schedule = "Normal")]
+fn preallocate_keep_size<'a>(env: Env<'a>, path: String, bytes: u64) -> NifResult<Term<'a>> {
+    match background_thread::preallocate_keep_size_path(&path, bytes) {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Convert Erlang iodata (binary or iolist) to bytes.
-///
-/// Uses rustler's `decode_as_binary`, which calls `enif_inspect_iolist_as_binary`
-/// under the hood. That function correctly handles every shape of valid iodata —
-/// flat binaries, deeply nested lists, improper lists like `[H | <<tail>>]`, and
-/// integer bytes. Our previous hand-rolled flattener returned `:badarg` on
-/// improper lists, which crashed the ra WAL on every flush of a real batch.
-fn iodata_to_binary<'a>(term: Term<'a>) -> NifResult<Binary<'a>> {
-    term.decode_as_binary()
-}
 
 // ---------------------------------------------------------------------------
 // NIF Registration

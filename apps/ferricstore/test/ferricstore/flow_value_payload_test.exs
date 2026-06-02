@@ -353,7 +353,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_history(id,
                partition_key: "tenant-retention",
                include_cold: true,
-               consistent_projection: false,
+               consistent_projection: true,
                count: 10
              )
 

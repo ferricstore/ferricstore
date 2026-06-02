@@ -1,0 +1,22 @@
+<% data = assigns.data %>
+<%= page_head("Flow Detail - FerricStore", 2, chartjs: true) %>
+<body data-dashboard-live-page="flow-detail" data-dashboard-live-url="<%= flow_detail_live_url(data.id, Map.get(data, :partition_key), Map.get(data, :history_page)) %>" data-dashboard-live-interval-ms="2000">
+<div class="layout">
+<%= render_sidebar_static("flow") %>
+<main class="main-content">
+<%= render_subpage_header("Flow Detail") %>
+<div class="content">
+<%= render_page_intro("Flow Detail", "Inspect one workflow's current state, loaded history page, value refs, signals, and guarded rewind action.") %>
+<%= render_flow_subnav("detail") %>
+<%= render_flow_detail_flash(data) %>
+<%= render_live_component("flow_detail", render_flow_detail(data)) %>
+<%= render_live_component("flow_debug", render_flow_debug(data)) %>
+<%= render_live_component("flow_history", render_flow_history_timeline(data.history, Map.get(data, :history_status, :ok), Map.get(data, :history_page))) %>
+<%= render_live_component("flow_timeline_chart", render_flow_timeline_chart(data.history)) %>
+<%= render_live_component("flow_value_store", render_flow_value_store(data)) %>
+</div>
+</main>
+</div>
+<%= render_flow_value_modal() %>
+</body>
+</html>

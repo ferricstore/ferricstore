@@ -59,7 +59,9 @@ defmodule Ferricstore.V2ArchitectureTest do
       :ets.delete(keydir)
     end
 
-    test "3. GET cold (value=nil, has file_id/offset) -- pread_at returns correct value", %{dir: dir} do
+    test "3. GET cold (value=nil, has file_id/offset) -- pread_at returns correct value", %{
+      dir: dir
+    } do
       path = data_file(dir, 1)
       {:ok, {offset, _size}} = NIF.v2_append_record(path, "cold_key", "cold_value", 0)
 
@@ -73,7 +75,8 @@ defmodule Ferricstore.V2ArchitectureTest do
       {:ok, {_offset, _size}} = NIF.v2_append_record(path, "to_delete", "val", 0)
       {:ok, {tomb_offset, tomb_size}} = NIF.v2_append_tombstone(path, "to_delete")
       assert tomb_offset > 0
-      assert tomb_size == @header_size + 9  # key "to_delete" is 9 bytes
+      # key "to_delete" is 9 bytes
+      assert tomb_size == @header_size + 9
 
       # Reading the tombstone offset should return nil (tombstone)
       assert {:ok, nil} = NIF.v2_pread_at(path, tomb_offset)
@@ -203,6 +206,24 @@ defmodule Ferricstore.V2ArchitectureTest do
       assert tomb3 == true
     end
 
+    test "11b. scan_file_page returns bounded metadata pages with a resume offset", %{dir: dir} do
+      path = data_file(dir, 1)
+      {:ok, {_off1, _}} = NIF.v2_append_record(path, "k1", "v1", 0)
+      {:ok, {_off2, _}} = NIF.v2_append_record(path, "k2", "v22", 5000)
+      {:ok, {_off3, _}} = NIF.v2_append_tombstone(path, "k3")
+
+      assert {:ok, [{"k1", 0, 2, 0, false}, {"k2", off2, 3, 5000, false}], next, false} =
+               NIF.v2_scan_file_page(path, 0, 2)
+
+      assert next > off2
+
+      assert {:ok, [{"k3", _off3, 0, _exp3, true}], next2, true} =
+               NIF.v2_scan_file_page(path, next, 2)
+
+      assert next2 > next
+      assert {:ok, [], ^next2, true} = NIF.v2_scan_file_page(path, next2, 2)
+    end
+
     test "12. copy_records copies only specified offsets", %{dir: dir} do
       source_path = data_file(dir, 1)
       {:ok, {off1, _}} = NIF.v2_append_record(source_path, "keep1", "val1", 0)
@@ -301,7 +322,9 @@ defmodule Ferricstore.V2ArchitectureTest do
   # =========================================================================
 
   describe "concurrent operations" do
-    test "19. 100 concurrent cold reads -- no Mutex, all parallel, all return correct data", %{dir: dir} do
+    test "19. 100 concurrent cold reads -- no Mutex, all parallel, all return correct data", %{
+      dir: dir
+    } do
       path = data_file(dir, 1)
 
       # Write 100 distinct keys
@@ -332,12 +355,14 @@ defmodule Ferricstore.V2ArchitectureTest do
       {:ok, {offset, _}} = NIF.v2_append_record(path, "read_me", "stable_value", 0)
 
       # Start a writer task that writes 50 records
-      writer_task = Task.async(fn ->
-        for i <- 0..49 do
-          NIF.v2_append_record(path, "writer_#{i}", "w_val_#{i}", 0)
-        end
-        :done
-      end)
+      writer_task =
+        Task.async(fn ->
+          for i <- 0..49 do
+            NIF.v2_append_record(path, "writer_#{i}", "w_val_#{i}", 0)
+          end
+
+          :done
+        end)
 
       # Concurrently read the original record 50 times
       reader_tasks =
@@ -428,6 +453,7 @@ defmodule Ferricstore.V2ArchitectureTest do
   describe "v2_append_batch" do
     test "batch append writes multiple records with single fsync", %{dir: dir} do
       path = data_file(dir, 1)
+
       records = [
         {"batch_k1", "batch_v1", 0},
         {"batch_k2", "batch_v2", 1_000_000},
@@ -580,10 +606,12 @@ defmodule Ferricstore.V2ArchitectureTest do
 
       # Write a hint file
       hint_path = hint_file(dir, 1)
+
       entries = [
         {"hint_k1", 1, off1, 2, 0},
         {"hint_k2", 1, off2, 2, 99_000}
       ]
+
       :ok = NIF.v2_write_hint_file(hint_path, entries)
 
       # Rebuild keydir from hint
@@ -623,11 +651,12 @@ defmodule Ferricstore.V2ArchitectureTest do
       end
 
       # Time 10000 ETS lookups
-      {elapsed_us, _} = :timer.tc(fn ->
-        for _ <- 0..9999 do
-          :ets.lookup(keydir, "key_500")
-        end
-      end)
+      {elapsed_us, _} =
+        :timer.tc(fn ->
+          for _ <- 0..9999 do
+            :ets.lookup(keydir, "key_500")
+          end
+        end)
 
       avg_ns = elapsed_us * 1000 / 10_000
       assert avg_ns < 1000, "Hot read avg #{avg_ns}ns exceeds 1000ns"
@@ -642,24 +671,30 @@ defmodule Ferricstore.V2ArchitectureTest do
       # Write 100 records
       offsets =
         for i <- 0..99 do
-          {:ok, {offset, _}} = NIF.v2_append_record(path, "perf_#{i}", String.duplicate("x", 100), 0)
+          {:ok, {offset, _}} =
+            NIF.v2_append_record(path, "perf_#{i}", String.duplicate("x", 100), 0)
+
           offset
         end
 
       # Serialized
-      {serial_us, _} = :timer.tc(fn ->
-        for offset <- offsets do
-          NIF.v2_pread_at(path, offset)
-        end
-      end)
+      {serial_us, _} =
+        :timer.tc(fn ->
+          for offset <- offsets do
+            NIF.v2_pread_at(path, offset)
+          end
+        end)
 
       # Concurrent
-      {concurrent_us, _} = :timer.tc(fn ->
-        tasks = for offset <- offsets do
-          Task.async(fn -> NIF.v2_pread_at(path, offset) end)
-        end
-        Task.await_many(tasks, 10_000)
-      end)
+      {concurrent_us, _} =
+        :timer.tc(fn ->
+          tasks =
+            for offset <- offsets do
+              Task.async(fn -> NIF.v2_pread_at(path, offset) end)
+            end
+
+          Task.await_many(tasks, 10_000)
+        end)
 
       # Concurrent should be at least somewhat faster on multicore
       # (But we mainly care it doesn't deadlock or error)

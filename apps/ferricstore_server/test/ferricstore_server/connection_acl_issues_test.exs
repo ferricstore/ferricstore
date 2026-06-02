@@ -54,6 +54,19 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
       assert :ok = Acl.check_command("readonly", "GET")
       assert {:error, "NOPERM" <> _} = Acl.check_command("readonly", "SET")
     end
+
+    test "explicit denies override allowlist entries" do
+      user = %{
+        Acl.get_user("default")
+        | commands: MapSet.new(["GET", "MGET"]),
+          denied_commands: MapSet.new(["GET"])
+      }
+
+      :ets.insert(:ferricstore_acl, {"reader", user})
+
+      assert {:error, "NOPERM" <> _} = Acl.check_command("reader", "GET")
+      assert :ok = Acl.check_command("reader", "MGET")
+    end
   end
 
   # ---------------------------------------------------------------------------

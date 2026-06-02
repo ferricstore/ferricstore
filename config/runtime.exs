@@ -1,6 +1,25 @@
 import Config
 
 if config_env() == :prod do
+  boolean_env = fn name, default ->
+    case System.get_env(name) do
+      nil ->
+        default
+
+      value ->
+        case String.downcase(String.trim(value)) do
+          value when value in ["1", "true", "yes", "y", "on"] ->
+            true
+
+          value when value in ["0", "false", "no", "n", "off"] ->
+            false
+
+          _other ->
+            raise "#{name} must be a boolean: true/false, 1/0, yes/no, or on/off"
+        end
+    end
+  end
+
   log_level =
     case String.downcase(System.get_env("FERRICSTORE_LOG_LEVEL", "info")) do
       "debug" -> :debug
@@ -12,6 +31,28 @@ if config_env() == :prod do
       _other -> :info
     end
 
+  limit_env = fn name ->
+    case System.get_env(name) do
+      nil ->
+        nil
+
+      value ->
+        case String.downcase(String.trim(value)) do
+          "" ->
+            nil
+
+          value when value in ["false", "off", "infinity", "inf", "unlimited"] ->
+            :infinity
+
+          value ->
+            case Integer.parse(value) do
+              {parsed, ""} when parsed >= 0 -> parsed
+              _other -> raise "#{name} must be a non-negative integer or infinity/off/false"
+            end
+        end
+    end
+  end
+
   config :logger, level: log_level
 
   # ---------------------------------------------------------------------------
@@ -22,10 +63,6 @@ if config_env() == :prod do
     port: String.to_integer(System.get_env("FERRICSTORE_PORT", "6379")),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
-    flow_max_claim_limit:
-      String.to_integer(System.get_env("FERRICSTORE_FLOW_MAX_CLAIM_LIMIT", "1000")),
-    flow_max_compact_claim_limit:
-      String.to_integer(System.get_env("FERRICSTORE_FLOW_MAX_COMPACT_CLAIM_LIMIT", "5000")),
     shard_count:
       (
         count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")
@@ -33,12 +70,107 @@ if config_env() == :prod do
         if count == 0, do: System.schedulers_online(), else: count
       )
 
+  parse_positive_integer = fn value ->
+    case Integer.parse(String.trim(to_string(value))) do
+      {n, ""} when n > 0 -> n
+      _ -> nil
+    end
+  end
+
+  read_positive_integer_file = fn path ->
+    case File.read(path) do
+      {:ok, value} -> parse_positive_integer.(value)
+      _ -> nil
+    end
+  end
+
+  detect_memory_bytes = fn ->
+    cgroup_v2 = read_positive_integer_file.("/sys/fs/cgroup/memory.max")
+    cgroup_v1 = read_positive_integer_file.("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+    system_memory =
+      case :os.type() do
+        {:unix, :darwin} ->
+          case System.cmd("sysctl", ["-n", "hw.memsize"], stderr_to_stdout: true) do
+            {value, 0} -> parse_positive_integer.(value)
+            _ -> nil
+          end
+
+        {:unix, _} ->
+          case File.read("/proc/meminfo") do
+            {:ok, contents} ->
+              case Regex.run(~r/^MemTotal:\s+(\d+)\s+kB/m, contents) do
+                [_, kb] ->
+                  case parse_positive_integer.(kb) do
+                    n when is_integer(n) -> n * 1024
+                    _ -> nil
+                  end
+
+                _ ->
+                  nil
+              end
+
+            _ ->
+              nil
+          end
+
+        _ ->
+          nil
+      end
+
+    [cgroup_v2, cgroup_v1, system_memory]
+    |> Enum.filter(fn
+      n when is_integer(n) and n > 0 -> true
+      _ -> false
+    end)
+    |> case do
+      [] -> 0
+      values -> Enum.min(values)
+    end
+  end
+
+  auto_memory_budget = fn ->
+    case detect_memory_bytes.() do
+      detected when detected > 0 -> div(detected * 80, 100)
+      _ -> 0
+    end
+  end
+
+  max_memory_env =
+    System.get_env("FERRICSTORE_MAX_MEMORY")
+    |> case do
+      nil -> "auto"
+      value -> String.trim(value)
+    end
+
+  max_memory_bytes =
+    case String.downcase(max_memory_env) do
+      "" -> auto_memory_budget.()
+      "auto" -> auto_memory_budget.()
+      value -> String.to_integer(value)
+    end
+
+  keydir_max_ram =
+    case System.get_env("FERRICSTORE_KEYDIR_MAX_RAM") do
+      nil ->
+        cond do
+          max_memory_bytes <= 0 ->
+            268_435_456
+
+          true ->
+            max(268_435_456, min(div(max_memory_bytes, 10), 8_589_934_592))
+        end
+
+      value ->
+        String.to_integer(value)
+    end
+
   # ---------------------------------------------------------------------------
   # Memory & Eviction
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    max_memory_bytes: String.to_integer(System.get_env("FERRICSTORE_MAX_MEMORY", "0")),
-    keydir_max_ram: String.to_integer(System.get_env("FERRICSTORE_KEYDIR_MAX_RAM", "268435456")),
+    max_memory_bytes: max_memory_bytes,
+    keydir_max_ram: keydir_max_ram,
     eviction_policy: System.get_env("FERRICSTORE_EVICTION_POLICY", "volatile_lru"),
     max_value_size: String.to_integer(System.get_env("FERRICSTORE_MAX_VALUE_SIZE", "1048576")),
     hot_cache_max_value_size:
@@ -47,99 +179,67 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES", "262144")),
     blob_segment_max_bytes:
       String.to_integer(System.get_env("FERRICSTORE_BLOB_SEGMENT_MAX_BYTES", "268435456")),
-    blob_gc_sweeper_enabled:
-      System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_ENABLED", "true") in ["1", "true", "TRUE"],
+    blob_gc_sweeper_enabled: boolean_env.("FERRICSTORE_BLOB_GC_SWEEPER_ENABLED", true),
     blob_gc_sweeper_initial_delay_ms:
       String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INITIAL_DELAY_MS", "60000")),
     blob_gc_sweeper_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS", "600000")),
     max_active_file_size:
       String.to_integer(System.get_env("FERRICSTORE_MAX_ACTIVE_FILE_SIZE", "8589934592")),
-    flow_lmdb_enabled: System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
     flow_lmdb_mode:
       System.get_env(
         "FERRICSTORE_FLOW_LMDB_MODE",
-        if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-          do: "lagged",
-          else: "off"
-        )
+        if(boolean_env.("FERRICSTORE_FLOW_LMDB_ENABLED", true), do: "lagged", else: "off")
       ),
     flow_lmdb_map_size:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
     flow_lmdb_flush_interval_ms:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "30000",
-            else: "100"
-          )
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS", "1000")),
     flow_lmdb_max_batch_ops:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "100000",
-            else: "10000"
-          )
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS", "25000")),
     flow_lmdb_flush_chunk_ops:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_OPS", "10000")),
     flow_lmdb_flush_chunk_pause_ms:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "1",
-            else: "0"
-          )
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS", "1")),
     flow_lmdb_flush_jitter_ms:
-      String.to_integer(
-        System.get_env(
-          "FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS",
-          if(
-            System.get_env(
-              "FERRICSTORE_FLOW_LMDB_MODE",
-              if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
-                do: "lagged",
-                else: "off"
-              )
-            ) in ["lagged", "async", "batched"],
-            do: "5000",
-            else: "0"
-          )
-        )
-      ),
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS", "250")),
+    flow_lmdb_flush_on_max_ops:
+      boolean_env.("FERRICSTORE_FLOW_LMDB_FLUSH_ON_MAX_OPS", false),
     flow_lmdb_max_concurrent_flushes:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
+    flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
+    flow_async_history: true,
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
+
+  # These override adaptive memory-budget caps. The apply-projection cache is
+  # the important Flow/LMDB-adjacent one: it buffers WARaft-applied Flow
+  # state/value rows until lagged LMDB/history projection can consume them.
+  # Too low a value forces synchronous spill/compaction during terminal-flow
+  # bursts; tune it with the DBOS-style 1M Flow benchmark, not by lowering it
+  # to reduce steady-state LMDB lag.
+  memory_budget_overrides =
+    [
+      flow_history_projector_max_pending_entries:
+        limit_env.("FERRICSTORE_FLOW_HISTORY_PROJECTOR_MAX_PENDING_ENTRIES"),
+      flow_lmdb_writer_max_mailbox_messages:
+        limit_env.("FERRICSTORE_FLOW_LMDB_WRITER_MAX_MAILBOX_MESSAGES"),
+      flow_lmdb_writer_max_enqueue_ops:
+        limit_env.("FERRICSTORE_FLOW_LMDB_WRITER_MAX_ENQUEUE_OPS"),
+      waraft_segment_log_max_ets_bytes:
+        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_BYTES"),
+      waraft_segment_log_max_ets_entries:
+        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES"),
+      waraft_segment_log_min_ets_entries:
+        limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES"),
+      waraft_apply_projection_cache_max_entries:
+        limit_env.("FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES")
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+  if memory_budget_overrides != [] do
+    config :ferricstore, memory_budget_overrides
+  end
 
   # ---------------------------------------------------------------------------
   # LFU Scoring
@@ -170,10 +270,10 @@ if config_env() == :prod do
   # Security
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    protected_mode: System.get_env("FERRICSTORE_PROTECTED_MODE", "true") == "true",
+    protected_mode: boolean_env.("FERRICSTORE_PROTECTED_MODE", true),
     maxclients: String.to_integer(System.get_env("FERRICSTORE_MAXCLIENTS", "10000")),
-    audit_log_enabled: System.get_env("FERRICSTORE_AUDIT_LOG", "false") == "true",
-    acl_auto_save: System.get_env("FERRICSTORE_ACL_AUTO_SAVE", "false") == "true"
+    audit_log_enabled: boolean_env.("FERRICSTORE_AUDIT_LOG", false),
+    acl_auto_save: boolean_env.("FERRICSTORE_ACL_AUTO_SAVE", false)
 
   # ---------------------------------------------------------------------------
   # TLS (optional)
@@ -186,7 +286,7 @@ if config_env() == :prod do
       tls_cert_file: tls_cert,
       tls_key_file: System.get_env("FERRICSTORE_TLS_KEY_FILE"),
       tls_ca_cert_file: System.get_env("FERRICSTORE_TLS_CA_CERT_FILE"),
-      require_tls: System.get_env("FERRICSTORE_REQUIRE_TLS", "false") == "true"
+      require_tls: boolean_env.("FERRICSTORE_REQUIRE_TLS", false)
   end
 
   # ---------------------------------------------------------------------------
@@ -201,41 +301,26 @@ if config_env() == :prod do
          "once" -> :once
          n -> String.to_integer(n)
        end),
-    tcp_nodelay: System.get_env("FERRICSTORE_TCP_NODELAY", "true") == "true",
+    tcp_nodelay: boolean_env.("FERRICSTORE_TCP_NODELAY", true),
     tcp_recbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_RECBUF", "131072")),
     tcp_sndbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_SNDBUF", "131072"))
 
   # ---------------------------------------------------------------------------
-  # Raft / Internals
+  # Replication / Internals
   # ---------------------------------------------------------------------------
   config :ferricstore,
     release_cursor_interval:
       String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")),
-    ra_segment_max_entries:
-      String.to_integer(System.get_env("FERRICSTORE_RA_SEGMENT_MAX_ENTRIES", "1048576")),
-    ra_segment_max_size_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RA_SEGMENT_MAX_SIZE_BYTES", "256000000")),
-    ra_wal_max_size_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RA_WAL_MAX_SIZE_BYTES", "8589934592")),
-    ra_wal_compute_checksums:
-      System.get_env("FERRICSTORE_RA_WAL_COMPUTE_CHECKSUMS", "true") in ["1", "true", "TRUE"],
-    raft_batcher_max_pending:
-      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_PENDING", "256")),
-    raft_batcher_max_pending_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_PENDING_BYTES", "0")),
-    raft_batcher_max_batch_bytes:
-      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_BATCH_BYTES", "4194304")),
-    raft_pipeline_priority: System.get_env("FERRICSTORE_RAFT_PIPELINE_PRIORITY", "low"),
-    raft_direct_batch_commands: System.get_env("FERRICSTORE_RAFT_DIRECT_BATCH_COMMANDS", "true"),
-    raft_compact_hot_batches: System.get_env("FERRICSTORE_RAFT_COMPACT_HOT_BATCHES", "true"),
-    raft_put_batch_apply_fast_path:
-      System.get_env("FERRICSTORE_RAFT_PUT_BATCH_APPLY_FAST_PATH", "true"),
-    raft_delete_batch_apply_fast_path:
-      System.get_env("FERRICSTORE_RAFT_DELETE_BATCH_APPLY_FAST_PATH", "true"),
-    ra_min_snapshot_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "10000000")),
-    ra_min_checkpoint_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_CHECKPOINT_INTERVAL", "1000000")),
+    waraft_log_rotation_interval:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_INTERVAL", "50000")),
+    waraft_log_rotation_keep:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_LOG_ROTATION_KEEP", "100000")),
+    waraft_max_retained_entries:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES", "100000")),
+    waraft_commit_batch_max:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_COMMIT_BATCH_MAX", "10000")),
+    waraft_apply_log_batch_size:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_APPLY_LOG_BATCH_SIZE", "4096")),
     promotion_threshold:
       String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100")),
     wal_commit_delay_us:
@@ -248,8 +333,7 @@ if config_env() == :prod do
     supervisor_max_restarts: {
       String.to_integer(System.get_env("FERRICSTORE_MAX_RESTARTS", "20")),
       String.to_integer(System.get_env("FERRICSTORE_MAX_RESTARTS_SECONDS", "10"))
-    },
-    observability_token: System.get_env("FERRICSTORE_OBSERVABILITY_TOKEN")
+    }
 
   # ---------------------------------------------------------------------------
   # Clustering
@@ -263,7 +347,7 @@ if config_env() == :prod do
       node_name: String.to_atom(node_name),
       cookie: String.to_atom(cookie),
       cluster_role: String.to_atom(System.get_env("FERRICSTORE_CLUSTER_ROLE", "voter")),
-      cluster_auto_join: System.get_env("FERRICSTORE_CLUSTER_AUTO_JOIN", "false") == "true",
+      cluster_auto_join: boolean_env.("FERRICSTORE_CLUSTER_AUTO_JOIN", false),
       cluster_remove_delay_ms:
         String.to_integer(System.get_env("FERRICSTORE_CLUSTER_REMOVE_DELAY_MS", "60000"))
 

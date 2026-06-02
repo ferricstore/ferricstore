@@ -27,6 +27,7 @@ defmodule FerricstoreServer.AclSecurityTest do
       Application.put_env(:ferricstore, :audit_log_enabled, false)
       Application.delete_env(:ferricstore, :max_acl_users)
       Application.delete_env(:ferricstore, :protected_mode)
+      Ferricstore.Config.set("requirepass", "")
     end)
 
     :ok
@@ -222,6 +223,27 @@ defmodule FerricstoreServer.AclSecurityTest do
       assert user.denied_commands == MapSet.new()
     end
 
+    test "new user with password starts with no command or key permissions" do
+      assert :ok = Acl.set_user("alice", ["on", ">s3cret"])
+
+      assert {:ok, "alice"} = Acl.authenticate("alice", "s3cret")
+      assert {:error, _} = Acl.check_command("alice", "GET")
+      assert {:error, _} = Acl.check_key_access("alice", "any:key", :read)
+
+      user = Acl.get_user("alice")
+      assert user.commands == MapSet.new()
+      assert user.keys == []
+    end
+
+    test "new user requires explicit command and key grants" do
+      assert :ok = Acl.set_user("alice", ["on", ">s3cret", "+GET", "~cache:*"])
+
+      assert :ok = Acl.check_command("alice", "GET")
+      assert {:error, _} = Acl.check_command("alice", "SET")
+      assert :ok = Acl.check_key_access("alice", "cache:item", :read)
+      assert {:error, _} = Acl.check_key_access("alice", "other:item", :read)
+    end
+
     test "multiple denied commands accumulate" do
       assert :ok = Acl.set_user("alice", ["on", "+@all", "-FLUSHDB", "-FLUSHALL", "-DEBUG"])
 
@@ -274,6 +296,16 @@ defmodule FerricstoreServer.AclSecurityTest do
       refute Acl.has_configured_users?()
     end
 
+    test "has_configured_users? returns true when default user has a password" do
+      assert :ok = Acl.set_user("default", ["on", ">s3cret"])
+      assert Acl.has_configured_users?()
+    end
+
+    test "has_configured_users? returns true when requirepass is configured" do
+      assert :ok = Ferricstore.Config.set("requirepass", "s3cret")
+      assert Acl.has_configured_users?()
+    end
+
     test "has_configured_users? returns true when non-default user with password exists" do
       assert :ok = Acl.set_user("admin", ["on", ">s3cret"])
       assert Acl.has_configured_users?()
@@ -324,6 +356,20 @@ defmodule FerricstoreServer.AclSecurityTest do
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert :ok = Acl.set_user("admin", ["on", ">s3cret"])
+      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
+    end
+
+    test "check_protected_mode allows non-localhost when default user is passworded" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      assert :ok = Acl.set_user("default", ["on", ">s3cret"])
+      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
+    end
+
+    test "check_protected_mode allows non-localhost when requirepass is configured" do
+      Application.put_env(:ferricstore, :protected_mode, true)
+
+      assert :ok = Ferricstore.Config.set("requirepass", "s3cret")
       assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
     end
 

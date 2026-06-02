@@ -25,6 +25,7 @@ defmodule Ferricstore.NamespaceConfig do
 
   @table :ferricstore_ns_config
   @default_window_ms 1
+  @has_overrides_key {__MODULE__, :has_overrides}
 
   @typedoc "A namespace configuration entry."
   @type ns_entry :: %{
@@ -105,6 +106,7 @@ defmodule Ferricstore.NamespaceConfig do
   def reset(prefix) when is_binary(prefix) do
     try do
       :ets.delete(@table, prefix)
+      refresh_override_flag()
     rescue
       ArgumentError -> :ok
     end
@@ -121,6 +123,7 @@ defmodule Ferricstore.NamespaceConfig do
   def reset_all do
     try do
       :ets.delete_all_objects(@table)
+      :persistent_term.put(@has_overrides_key, false)
     rescue
       ArgumentError -> :ok
     end
@@ -147,6 +150,10 @@ defmodule Ferricstore.NamespaceConfig do
   @spec default_window_ms() :: pos_integer()
   def default_window_ms, do: @default_window_ms
 
+  @doc false
+  @spec has_overrides?() :: boolean()
+  def has_overrides?, do: :persistent_term.get(@has_overrides_key, false)
+
   @impl true
   def init(_opts) do
     case :ets.whereis(@table) do
@@ -163,6 +170,8 @@ defmodule Ferricstore.NamespaceConfig do
         :ets.delete_all_objects(@table)
     end
 
+    :persistent_term.put(@has_overrides_key, false)
+
     {:ok, %{}}
   end
 
@@ -171,12 +180,23 @@ defmodule Ferricstore.NamespaceConfig do
 
     try do
       :ets.insert(@table, {prefix, value, now, changed_by})
+      :persistent_term.put(@has_overrides_key, true)
       broadcast_ns_config_changed()
       :ok
     rescue
       ArgumentError ->
         {:error, "ERR namespace config table not available"}
     end
+  end
+
+  defp refresh_override_flag do
+    has_overrides? =
+      case :ets.info(@table, :size) do
+        size when is_integer(size) and size > 0 -> true
+        _other -> false
+      end
+
+    :persistent_term.put(@has_overrides_key, has_overrides?)
   end
 
   defp lookup(prefix) do
@@ -230,8 +250,8 @@ defmodule Ferricstore.NamespaceConfig do
     {:error, "ERR unknown namespace config field '#{field}'"}
   end
 
-  # Sends :ns_config_changed to all live batcher processes so they clear their
-  # in-process namespace window caches.
+  # Sends :ns_config_changed to live namespace batchers so they clear their
+  # in-process window caches.
   @spec broadcast_ns_config_changed() :: :ok
   defp broadcast_ns_config_changed do
     notify_batchers()

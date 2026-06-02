@@ -213,6 +213,13 @@ defmodule Ferricstore.Store.CompoundKeyTest do
       assert CompoundKey.internal_key?(<<"Z:foo", 0, "bar">>)
     end
 
+    test "identifies stream consumer group metadata keys" do
+      group_key = CompoundKey.stream_group("events", "workers")
+
+      assert CompoundKey.internal_key?(group_key)
+      assert ["events"] == CompoundKey.user_visible_keys(["events", group_key])
+    end
+
     test "identifies type metadata keys" do
       assert CompoundKey.internal_key?("T:mykey")
     end

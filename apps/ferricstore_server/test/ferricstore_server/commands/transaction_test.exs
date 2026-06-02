@@ -108,7 +108,7 @@ defmodule FerricstoreServer.Commands.TransactionTest do
       send_cmd(sock, ["SET", k, "hello"])
       assert recv_response(sock) == {:simple, "QUEUED"}
 
-      send_cmd(sock, ["GET", k])
+      send_cmd(sock, ["PING"])
       assert recv_response(sock) == {:simple, "QUEUED"}
 
       send_cmd(sock, ["DISCARD"])
@@ -157,6 +157,26 @@ defmodule FerricstoreServer.Commands.TransactionTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "compound write commands queue without executing validation handlers", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("hset_queue")
+
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["HSET", k, "field", "value"])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      send_cmd(sock, ["EXEC"])
+      result = recv_response(sock)
+      assert [1] = result
+
+      send_cmd(sock, ["HGET", k, "field"])
+      assert recv_response(sock) == "value"
+
+      :gen_tcp.close(sock)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -184,6 +204,31 @@ defmodule FerricstoreServer.Commands.TransactionTest do
       assert length(result) == 2
       assert Enum.at(result, 0) == {:simple, "OK"}
       assert Enum.at(result, 1) == "hello"
+
+      :gen_tcp.close(sock)
+    end
+
+    test "EXEC aborts after queue-time syntax error and skips queued writes", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("execabort")
+
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      send_cmd(sock, ["SET", k, "should_not_write"])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      send_cmd(sock, ["GET"])
+      assert {:error, "ERR wrong number of arguments" <> _} = recv_response(sock)
+
+      send_cmd(sock, ["GET", k])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      send_cmd(sock, ["EXEC"])
+      assert {:error, "EXECABORT" <> _} = recv_response(sock)
+
+      send_cmd(sock, ["GET", k])
+      assert recv_response(sock) == nil
 
       :gen_tcp.close(sock)
     end
@@ -802,11 +847,16 @@ defmodule FerricstoreServer.Commands.TransactionTest do
       assert length(result) == 5
 
       # Results should reflect sequential execution
-      assert Enum.at(result, 0) == {:simple, "OK"}   # SET first
-      assert Enum.at(result, 1) == {:simple, "OK"}   # SET second
-      assert Enum.at(result, 2) == "second"           # GET -> "second"
-      assert Enum.at(result, 3) == {:simple, "OK"}   # SET third
-      assert Enum.at(result, 4) == "third"            # GET -> "third"
+      # SET first
+      assert Enum.at(result, 0) == {:simple, "OK"}
+      # SET second
+      assert Enum.at(result, 1) == {:simple, "OK"}
+      # GET -> "second"
+      assert Enum.at(result, 2) == "second"
+      # SET third
+      assert Enum.at(result, 3) == {:simple, "OK"}
+      # GET -> "third"
+      assert Enum.at(result, 4) == "third"
 
       :gen_tcp.close(sock)
     end

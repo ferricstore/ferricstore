@@ -21,16 +21,15 @@ defmodule Ferricstore.Commands.KeydirFullTest do
   setup do
     ShardHelpers.flush_all_keys()
 
-    # Save the original MemoryGuard state so we can restore it after each test.
-    original_state = :sys.get_state(MemoryGuard)
-    orig_reject = MemoryGuard.reject_writes?()
-    orig_keydir = MemoryGuard.keydir_full?()
+    # This module intentionally mutates the global MemoryGuard. Start every test
+    # from a writable baseline so leaked pressure from earlier suites cannot make
+    # the seed writes fail before the scenario under test begins.
+    force_ok_mode()
 
     on_exit(fn ->
-      # Restore MemoryGuard to its original state (both GenServer and persistent_term).
-      :sys.replace_state(MemoryGuard, fn _current -> original_state end)
-      MemoryGuard.set_reject_writes(orig_reject)
-      MemoryGuard.set_keydir_full(orig_keydir)
+      # Leave the shared application MemoryGuard writable for later synchronous
+      # command suites; pressure scenarios are local to this module.
+      force_ok_mode()
       ShardHelpers.flush_all_keys()
     end)
 
@@ -54,7 +53,7 @@ defmodule Ferricstore.Commands.KeydirFullTest do
   # Forces MemoryGuard into ok pressure (no rejection).
   defp force_ok_mode do
     :sys.replace_state(MemoryGuard, fn state ->
-      %{state | last_pressure_level: :ok, eviction_policy: :noeviction}
+      %{state | last_pressure_level: :ok, keydir_pressure_level: :ok, eviction_policy: :noeviction}
     end)
     MemoryGuard.set_reject_writes(false)
     MemoryGuard.set_keydir_full(false)

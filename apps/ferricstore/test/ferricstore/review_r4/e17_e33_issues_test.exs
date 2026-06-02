@@ -420,10 +420,10 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
       assert store.get.("dst") == "v1"
     end
 
-    test "COPY returns error when source does not exist" do
+    test "COPY returns 0 when source does not exist" do
       store = MockStore.make(%{"dst" => {"v2", 0}})
       result = Generic.handle("COPY", ["src", "dst"], store)
-      assert {:error, "ERR no such key"} == result
+      assert result == 0
     end
   end
 

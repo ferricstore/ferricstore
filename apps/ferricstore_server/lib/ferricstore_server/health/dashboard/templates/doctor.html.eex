@@ -1,0 +1,20 @@
+<% data = assigns.data %>
+<%= page_head("Doctor - FerricStore", nil) %>
+<body>
+<div class="layout">
+<%= render_sidebar_static("doctor") %>
+<main class="main-content">
+<%= render_subpage_header("Doctor") %>
+<div class="content">
+<%= render_page_intro("Doctor", "Run operator diagnostics and safe repair jobs through the same FERRICSTORE.DOCTOR command available over Redis.") %>
+<%= render_doctor_flash(Map.get(data, :flash, %{})) %>
+<%= render_doctor_summary(Map.get(data, :check, %{})) %>
+<%= render_doctor_checks(Map.get(data, :check, %{})) %>
+<%= render_doctor_actions() %>
+<%= render_doctor_jobs(Map.get(data, :jobs, [])) %>
+<%= render_doctor_command_reference(Map.get(data, :command_reference, [])) %>
+</div>
+</main>
+</div>
+</body>
+</html>

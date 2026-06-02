@@ -1,0 +1,18 @@
+<% data = assigns.data %>
+<%= page_head("FerricFlow Policies - FerricStore", nil) %>
+<body>
+<div class="layout">
+<%= render_sidebar_static("flow") %>
+<main class="main-content">
+<%= render_subpage_header("FerricFlow Policies") %>
+<div class="content">
+<%= render_page_intro("FerricFlow Policies", "Review and edit retry, exhausted-state, and retention policy defaults for Flow types and states.") %>
+<%= render_flow_subnav("policies") %>
+<%= render_flow_policy_editor(data) %>
+<%= render_flow_policy_commands() %>
+<%= render_flow_policies_table(data.policies, Map.get(data, :policy_scan, %{})) %>
+</div>
+</main>
+</div>
+</body>
+</html>

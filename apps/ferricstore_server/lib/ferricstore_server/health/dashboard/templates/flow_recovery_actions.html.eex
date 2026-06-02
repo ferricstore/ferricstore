@@ -1,0 +1,38 @@
+<% data = assigns.data %>
+<% filters = flow_failures_page_filters(data) %>
+<div class="flow-policy-panel">
+  <div class="section-title">Recovery Actions <%= info_icon("Reclaim only takes expired running leases through FLOW.RECLAIM. Failed terminal flows are listed for triage; retry/rewind stays on the Flow detail page.") %></div>
+  <form class="flow-policy-form" action="/dashboard/flow/failures" method="post">
+    <input type="hidden" name="action" value="reclaim">
+    <div class="flow-policy-grid">
+      <label class="flow-policy-field">
+        <span>Type</span>
+        <input class="flow-search-input mono" name="type" value="<%= escape_attr(filters.type || "") %>" placeholder="required" title="Workflow type to reclaim expired running leases from">
+      </label>
+      <label class="flow-policy-field">
+        <span>Partition</span>
+        <input class="flow-search-input mono" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="optional" title="Optional partition scope">
+      </label>
+      <label class="flow-policy-field">
+        <span>Worker</span>
+        <input class="flow-search-input mono" name="worker" value="dashboard-recovery" title="Lease owner for reclaimed work">
+      </label>
+      <label class="flow-policy-field">
+        <span>Limit</span>
+        <input class="flow-search-input mono" type="number" min="1" max="200" name="limit" value="25" title="Maximum expired leases to reclaim">
+      </label>
+      <label class="flow-policy-field">
+        <span>Lease ms</span>
+        <input class="flow-search-input mono" type="number" min="1" name="lease_ms" value="30000" title="New lease duration for reclaimed work">
+      </label>
+    </div>
+    <div class="flow-policy-actions">
+      <label class="flow-check-label" title="Required before the dashboard sends FLOW.RECLAIM.">
+        <input type="checkbox" name="confirm_reclaim" value="true">
+        I reviewed the expired leases and understand this changes lease ownership.
+      </label>
+      <button class="flow-search-button flow-danger-button" type="submit">Reclaim expired leases</button>
+    </div>
+    <div class="flow-filter-note">Requires +FLOW.RECLAIM. This only reclaims expired running leases; terminal failed flows are retried or rewound from the detail page.</div>
+  </form>
+</div>

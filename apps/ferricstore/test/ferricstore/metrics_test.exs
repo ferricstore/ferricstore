@@ -404,11 +404,21 @@ defmodule Ferricstore.MetricsTest do
         "ferricstore_flow_lmdb_writer_pending_ops",
         "ferricstore_flow_lmdb_writer_oldest_pending_age_us",
         "ferricstore_flow_lmdb_writer_flush_failures_total",
+        "ferricstore_flow_history_projected_index",
+        "ferricstore_flow_history_requested_index",
+        "ferricstore_flow_history_projection_lag",
+        "ferricstore_flow_history_projector_pending_entries",
+        "ferricstore_flow_history_projector_oldest_pending_age_us",
+        "ferricstore_flow_history_projector_flush_failures_total",
+        "ferricstore_flow_history_projector_queue_full_total",
+        "ferricstore_blob_hardened_protections",
+        "ferricstore_blob_hardened_oldest_age_ms",
         "ferricstore_bitcask_release_cursor_gap",
         "ferricstore_bitcask_pending_release_cursor_checkpoint_count",
         "ferricstore_bitcask_release_cursor_blocked_apply_count",
         "ferricstore_bitcask_checkpoint_dirty",
-        "ferricstore_bitcask_checkpoint_in_flight"
+        "ferricstore_bitcask_checkpoint_in_flight",
+        "ferricstore_waraft_inflight_commit_bytes"
       ]
 
       for metric <- expected_metrics do
@@ -458,18 +468,6 @@ defmodule Ferricstore.MetricsTest do
              )
     end
 
-    test "prefix metrics cache ignores stale ra_event messages without error logging" do
-      pid = Process.whereis(PrefixMetricsCache)
-      assert is_pid(pid)
-
-      log =
-        capture_log(fn ->
-          send(pid, {:ra_event, {:stale_shard, :nonode@nohost}, {:applied, []}})
-          Process.sleep(20)
-        end)
-
-      refute log =~ "received unexpected message"
-    end
   end
 
   # ---------------------------------------------------------------------------

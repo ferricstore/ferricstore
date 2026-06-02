@@ -73,7 +73,8 @@ defmodule Ferricstore.FlowNamedValuesTest do
     assert replay.created == false
     assert replay.stored == false
 
-    assert {:error, "ERR flow value order already exists with different digest; use OVERRIDE true"} =
+    assert {:error,
+            "ERR flow value order already exists with different digest; use OVERRIDE true"} =
              FerricStore.flow_value_put("order-v2",
                partition_key: "tenant-a",
                owner_flow_id: id,
@@ -97,6 +98,46 @@ defmodule Ferricstore.FlowNamedValuesTest do
              FerricStore.flow_get(id, partition_key: "tenant-a", values: ["order"])
 
     assert fetched.values == %{"order" => "order-v2"}
+  end
+
+  test "WARaft blob side-channel named value put returns original large value" do
+    id = uid("named-put-blob")
+    partition_key = "tenant-a"
+    payload = :binary.copy("large-named-value", 64)
+
+    original_ctx = FerricStore.Instance.get(:default)
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+    try do
+      :persistent_term.put(
+        {FerricStore.Instance, :default},
+        %{original_ctx | blob_side_channel_threshold_bytes: 128}
+      )
+
+      assert byte_size(payload) >
+               FerricStore.Instance.get(:default).blob_side_channel_threshold_bytes
+
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: "named-values",
+                 partition_key: partition_key,
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, %{ref: value_ref}} =
+               FerricStore.flow_value_put(payload,
+                 partition_key: partition_key,
+                 owner_flow_id: id,
+                 name: "doc",
+                 now_ms: 1_010
+               )
+
+      assert {:ok, [^payload]} = FerricStore.flow_value_mget([value_ref])
+    after
+      :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+    end
   end
 
   test "claim_due hydrates selected named values with one logical request" do
@@ -441,7 +482,8 @@ defmodule Ferricstore.FlowNamedValuesTest do
              )
 
     assert :ok =
-             FerricStore.flow_create_many("tenant-named-many",
+             FerricStore.flow_create_many(
+               "tenant-named-many",
                [
                  %{
                    id: created,
@@ -473,7 +515,8 @@ defmodule Ferricstore.FlowNamedValuesTest do
              )
 
     assert :ok =
-             FerricStore.flow_spawn_children(parent,
+             FerricStore.flow_spawn_children(
+               parent,
                [
                  %{
                    id: child,

@@ -144,11 +144,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
     end
   end
 
-  defp poke_release_cursor(state, index) do
-    Ferricstore.Raft.Batcher.origin_submit(state.shard_index, {:release_cursor_poke, index})
-  catch
-    :exit, _reason -> :ok
-  end
+  defp poke_release_cursor(_state, _index), do: :ok
 
   defp publish_durable(%{replay_safe_index: replay_safe_index}, shard_index, index)
        when is_reference(replay_safe_index) do

@@ -13,11 +13,20 @@
 # Temporary files, for example, from tests.
 /tmp/
 
-# OS/editor local metadata.
-.DS_Store
+# Local benchmark run logs; summaries belong in docs/ or curated result dirs.
+/bench/results/*.log
+
+# Node-based browser/devtools helpers.
+/node_modules/
+/playwright-report/
+/test-results/dashboard-inspect*.png
+/test-results/dashboard-inspect*.json
 
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
+
+# Local OS/editor metadata.
+.DS_Store
 
 # Also ignore archive artifacts (built via "mix archive.build").
 *.ez
@@ -38,7 +47,6 @@ ferricstore-*.tar
 
 .claude/worktrees/
 apps/ferricstore/data/
-apps/ferricstore/*.log
 apps/ferricstore/priv/native/*.so
 apps/ferricstore/priv/native/*.dll
 apps/ferricstore/priv/native/*.dylib
@@ -53,13 +61,14 @@ test-results/
 .terraform/
 *.tfstate
 *.tfstate.backup
-*.tfstate.*.backup
 *.tfplan
-*.tfvars
-*.tfvars.json
+terraform.tfvars
 .terraform.lock.hcl
 apps/ferricstore/native/ferricstore_wal_nif/target/
 apps/ferricstore/native/ferricstore_bitcask/target/
 apps/ferricstore/native/resp_parser_nif/target/
 apps/ferricstore_server/native/resp_parser_nif/target/
 *.tfstate.backup
+
+# Runtime Bitcask files accidentally created from app cwd during local spikes.
+apps/ferricstore/*.log

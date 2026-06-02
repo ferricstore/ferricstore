@@ -41,6 +41,8 @@ defmodule Ferricstore.Waiters do
       {:decentralized_counters, true}
     ])
 
+    Ferricstore.Waiters.Monitor.ensure_table()
+
     :ok
   end
 
@@ -59,6 +61,7 @@ defmodule Ferricstore.Waiters do
   """
   @spec register(binary(), pid(), non_neg_integer()) :: :ok
   def register(key, pid, deadline_ms) do
+    Ferricstore.Waiters.Monitor.track(pid)
     registered_at = System.monotonic_time(:microsecond)
     :ets.insert(@table, {key, pid, deadline_ms, registered_at})
     :ok
@@ -100,6 +103,29 @@ defmodule Ferricstore.Waiters do
         entries
         |> Enum.sort_by(fn {_k, _p, _d, reg_at} -> reg_at end)
         |> notify_oldest_live(key)
+    end
+  end
+
+  @doc """
+  Notifies up to `count` oldest waiters for `key`.
+
+  Multi-element pushes can make more than one blocked list command runnable.
+  Waking at most the pushed element count avoids a thundering herd while still
+  allowing each woken client to re-run the real pop atomically.
+  """
+  @spec notify_push(binary(), non_neg_integer()) :: [pid()]
+  def notify_push(_key, count) when not is_integer(count) or count <= 0, do: []
+
+  def notify_push(key, count) do
+    case :ets.lookup(@table, key) do
+      [] ->
+        []
+
+      entries ->
+        entries
+        |> Enum.sort_by(fn {_k, _p, _d, reg_at} -> reg_at end)
+        |> notify_oldest_live_many(key, count, [])
+        |> Enum.reverse()
     end
   end
 
@@ -149,6 +175,20 @@ defmodule Ferricstore.Waiters do
     else
       cleanup(pid)
       notify_oldest_live(rest, key)
+    end
+  end
+
+  defp notify_oldest_live_many(_entries, _key, 0, acc), do: acc
+  defp notify_oldest_live_many([], _key, _remaining, acc), do: acc
+
+  defp notify_oldest_live_many([{key, pid, _deadline, _reg_at} | rest], key, remaining, acc) do
+    if Process.alive?(pid) do
+      :ets.match_delete(@table, {key, pid, :_, :_})
+      send(pid, {:waiter_notify, key})
+      notify_oldest_live_many(rest, key, remaining - 1, [pid | acc])
+    else
+      cleanup(pid)
+      notify_oldest_live_many(rest, key, remaining, acc)
     end
   end
 end

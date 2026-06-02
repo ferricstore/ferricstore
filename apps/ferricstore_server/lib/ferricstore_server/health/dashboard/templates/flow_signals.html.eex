@@ -1,0 +1,17 @@
+<% data = assigns.data %>
+<%= page_head("Flow Signals - FerricStore", 2) %>
+<body data-dashboard-live-page="flow-signals" data-dashboard-live-url="<%= flow_signals_live_url(flow_signals_page_filters(data)) %>" data-dashboard-live-interval-ms="2000">
+<div class="layout">
+<%= render_sidebar_static("flow") %>
+<main class="main-content">
+<%= render_subpage_header("Flow Signals") %>
+<div class="content">
+<%= render_page_intro("Flow Signals", "Inspect recent FLOW.SIGNAL events and jump from a signal to its target workflow history.") %>
+<%= render_flow_subnav("signals") %>
+<%= render_flow_signals_filter(data) %>
+<%= render_live_component("flow_signals_table", render_flow_signals_table(data.signals, data.total_sampled, data.filtered_sampled, data.sample_limit, flow_signals_page_filters(data))) %>
+</div>
+</main>
+</div>
+</body>
+</html>

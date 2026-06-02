@@ -6,7 +6,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
   - Rate limit counter works correctly per-node (Raft-durable)
   - Concurrent requests on a single node: at most `limit` succeed
-  - Rate limit state survives (persisted through Raft WAL)
+  - Rate limit state survives (persisted through WARaft segments)
 
   ## Return Value Format
 
@@ -289,16 +289,14 @@ defmodule Ferricstore.Cluster.RateLimitTest do
   #
   # Test plan: increment on different nodes, counter stays consistent.
   #
-  # In single-node Raft mode, each node has independent rate limit state.
-  # A counter incremented on node1 is NOT reflected on node2. This test
-  # verifies per-node independence and documents expected behavior when
-  # multi-node Raft is added (at which point all nodes should share the
-  # counter via Raft log replication).
+  # ClusterHelper.start_cluster/2 forms real multi-node Raft groups. A rate
+  # limit key must therefore have one replicated counter, regardless of which
+  # node receives the client request.
   # ---------------------------------------------------------------------------
 
   describe "rate limit counter consistency across nodes" do
     @tag :cluster
-    test "increments on different nodes are independent in single-node mode", %{nodes: nodes} do
+    test "increments through different nodes share one replicated counter", %{nodes: nodes} do
       [n1, n2, n3] = nodes
       key = "rl:cross:counter"
       window = 60_000
@@ -318,28 +316,26 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       assert n1_count == 4, "n1 should have count of 4 after 4 requests"
 
-      # In single-node mode, n2's counter for the same key starts at 0
-      # (no replication). When multi-node Raft is added, n2 should see
-      # the aggregate count from n1's requests.
+      # The same key is owned by one replicated Raft shard, even when the
+      # client request enters through a different node.
       [status2, n2_count, _remaining2, _ttl2] =
         remote_router(n2.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status2 == "allowed"
 
-      # In single-node mode, n2's count starts fresh at 1
-      assert n2_count == 1,
-             "in single-node mode, n2 counter should be independent (got #{n2_count})"
+      assert n2_count == 5,
+             "n2 should observe n1's replicated counter and advance it to 5 (got #{n2_count})"
 
       # Same for n3
       [status3, n3_count, _remaining3, _ttl3] =
         remote_router(n3.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status3 == "allowed"
-      assert n3_count == 1, "n3 counter should also be independent"
+      assert n3_count == 6, "n3 should observe the replicated counter at 6"
     end
 
     @tag :cluster
-    test "rate limit per-node isolation: exhausting on one node does not affect others", %{
+    test "exhausting through one node denies requests through other nodes", %{
       nodes: nodes
     } do
       [n1, n2, _n3] = nodes
@@ -361,23 +357,22 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       assert denied_status == "denied", "n1 should be rate-limited"
 
-      # n2 is NOT exhausted (independent state in single-node mode)
-      # When multi-node Raft is added, n2 should also return "denied".
       [n2_status | _] =
         remote_router(n2.name, :ratelimit_add, [key, window, limit, 1])
 
-      assert n2_status == "allowed",
-             "in single-node mode, n2 should not be affected by n1's exhausted counter"
+      assert n2_status == "denied",
+             "n2 should observe the replicated exhausted counter"
     end
 
     @tag :cluster
-    test "concurrent increments on different nodes stay within per-node limits", %{
+    test "concurrent increments on different nodes stay within the global replicated limit", %{
       nodes: nodes
     } do
       window = 60_000
       limit = 15
 
-      # Each node gets 30 concurrent requests on the same key, independently
+      # Each node sends 30 concurrent requests for the same key. The global
+      # Raft state machine should still allow only `limit` total.
       tasks =
         Enum.flat_map(nodes, fn node ->
           for _i <- 1..30 do
@@ -392,25 +387,25 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       results = Task.await_many(tasks, 30_000)
 
-      # Group by node and verify per-node limits
-      by_node = Enum.group_by(results, &elem(&1, 0), &elem(&1, 1))
+      replies = Enum.map(results, &elem(&1, 1))
 
-      Enum.each(by_node, fn {node_idx, node_results} ->
-        valid =
-          Enum.filter(node_results, fn
-            [_status | _] -> true
-            _ -> false
-          end)
+      valid =
+        Enum.filter(replies, fn
+          [_status | _] -> true
+          _ -> false
+        end)
 
-        allowed = Enum.count(valid, fn [status | _] -> status == "allowed" end)
-        denied = Enum.count(valid, fn [status | _] -> status == "denied" end)
+      allowed = Enum.count(valid, fn [status | _] -> status == "allowed" end)
+      denied = Enum.count(valid, fn [status | _] -> status == "denied" end)
 
-        assert allowed <= limit,
-               "node #{node_idx}: allowed (#{allowed}) should not exceed limit (#{limit})"
+      assert length(valid) == length(replies),
+             "all cluster responses should be rate-limit replies, got #{inspect(replies -- valid)}"
 
-        assert allowed + denied == length(valid),
-               "node #{node_idx}: all responses should be either allowed or denied"
-      end)
+      assert allowed == limit,
+             "globally allowed requests (#{allowed}) should equal limit (#{limit})"
+
+      assert denied == length(replies) - limit,
+             "all requests above the global limit should be denied"
     end
   end
 end

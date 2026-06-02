@@ -211,6 +211,18 @@ defmodule Ferricstore.Commands.BlockingExtendedTest do
 
       assert List.handle("LRANGE", ["mylist", "0", "-1"], store) == ["c", "d"]
     end
+
+    test "returns WRONGTYPE instead of skipping a non-list key" do
+      store = MockStore.make()
+      :ok = store.put.("string_key", "not-a-list", 0)
+      List.handle("RPUSH", ["list_key", "value"], store)
+
+      assert {:error, msg} =
+               Blocking.handle("BLMPOP", ["0", "2", "string_key", "list_key", "LEFT"], store)
+
+      assert msg =~ "WRONGTYPE"
+      assert List.handle("LRANGE", ["list_key", "0", "-1"], store) == ["value"]
+    end
   end
 
   # ===========================================================================

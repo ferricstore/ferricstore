@@ -247,6 +247,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
       :atomics.put(instance_ctx.replay_safe_index, 1, 3)
       :atomics.put(instance_ctx.flow_lmdb_replay_safe_index, 1, 3)
+      :atomics.put(instance_ctx.flow_history_projected_index, 1, 3)
 
       on_exit({:hlc_release_cursor_instance, instance_name}, fn ->
         FerricStore.Instance.cleanup(instance_name)

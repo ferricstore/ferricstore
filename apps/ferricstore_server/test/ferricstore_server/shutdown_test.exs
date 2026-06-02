@@ -214,7 +214,7 @@ defmodule FerricstoreServer.ShutdownTest do
   describe "isolated shard stop flushes data" do
     @tag :capture_log
     test "starting and stopping an isolated shard preserves written data" do
-      # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+      # Isolated shard tests bypass WARaft consensus for ad-hoc indices.
 
       # Start a shard outside the application supervisor tree with a
       # unique index and temporary directory to avoid conflicts.
@@ -260,7 +260,7 @@ defmodule FerricstoreServer.ShutdownTest do
   describe "terminate/2 flushes pending writes" do
     @tag :capture_log
     test "after shutdown signal, pending writes are flushed" do
-      # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+      # Isolated shard tests bypass WARaft consensus for ad-hoc indices.
 
       # Start an isolated shard so we can stop it without affecting the
       # application supervisor tree.
@@ -300,7 +300,7 @@ defmodule FerricstoreServer.ShutdownTest do
   describe "terminate/2 writes hint files" do
     @tag :capture_log
     test "after shutdown, hint files exist on disk" do
-      # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+      # Isolated shard tests bypass WARaft consensus for ad-hoc indices.
 
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_hint_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)
@@ -333,7 +333,7 @@ defmodule FerricstoreServer.ShutdownTest do
   describe "terminate/2 emits shutdown telemetry" do
     @tag :capture_log
     test "shard terminate/2 emits [:ferricstore, :shard, :shutdown] telemetry" do
-      # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+      # Isolated shard tests bypass WARaft consensus for ad-hoc indices.
 
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_telem_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)

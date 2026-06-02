@@ -119,7 +119,7 @@ defmodule Ferricstore.Commands.Hash do
       pairs = Ops.compound_scan(store, key, prefix)
 
       # Return flat list [field1, value1, field2, value2, ...]
-      Enum.flat_map(pairs, fn {field, value} -> [field, value] end)
+      hash_pairs_to_flat_list(pairs)
     end
   end
 
@@ -329,15 +329,7 @@ defmodule Ferricstore.Commands.Hash do
         {unique_fields, compound_keys, metas_by_field} =
           batch_hash_field_metas(fields, key, store)
 
-        entries =
-          unique_fields
-          |> Enum.zip(compound_keys)
-          |> Enum.flat_map(fn {field, compound_key} ->
-            case Map.fetch!(metas_by_field, field) do
-              {value, expire_at_ms} when expire_at_ms != 0 -> [{compound_key, value, 0}]
-              _nil_or_persistent -> []
-            end
-          end)
+        entries = persistent_hash_field_entries(unique_fields, compound_keys, metas_by_field, [])
 
         case Ops.compound_batch_put(store, key, entries) do
           :ok ->
@@ -592,7 +584,7 @@ defmodule Ferricstore.Commands.Hash do
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
-      elements = Enum.flat_map(batch, fn {field, value} -> [field, value] end)
+      elements = hash_pairs_to_flat_list(batch)
       [next_cursor, elements]
     end
   end
@@ -817,20 +809,8 @@ defmodule Ferricstore.Commands.Hash do
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.hash_field(key, &1))
 
-      metas_by_key =
-        store
-        |> Ops.compound_batch_get_meta(key, compound_keys)
-        |> Enum.zip(compound_keys)
-        |> Map.new(fn {meta, compound_key} -> {compound_key, meta} end)
-
-      deleted_entries =
-        compound_keys
-        |> Enum.flat_map(fn compound_key ->
-          case Map.fetch!(metas_by_key, compound_key) do
-            nil -> []
-            {value, expire_at_ms} -> [{compound_key, value, expire_at_ms}]
-          end
-        end)
+      metas = Ops.compound_batch_get_meta(store, key, compound_keys)
+      deleted_entries = hash_deleted_entries(compound_keys, metas, [])
 
       deleted = length(deleted_entries)
 
@@ -841,6 +821,20 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp hdel_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'hdel' command"}
+
+  defp hash_deleted_entries([_compound_key | compound_keys], [nil | metas], acc) do
+    hash_deleted_entries(compound_keys, metas, acc)
+  end
+
+  defp hash_deleted_entries([compound_key | compound_keys], [{value, expire_at_ms} | metas], acc) do
+    hash_deleted_entries(compound_keys, metas, [{compound_key, value, expire_at_ms} | acc])
+  end
+
+  defp hash_deleted_entries([compound_key | _compound_keys], [], _acc) do
+    raise KeyError, key: compound_key, term: %{}
+  end
+
+  defp hash_deleted_entries(_compound_keys, _metas, acc), do: Enum.reverse(acc)
 
   defp hmget_args([key | fields], store) when fields != [] do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
@@ -856,7 +850,7 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
       pairs = Ops.compound_scan(store, key, prefix)
-      Enum.flat_map(pairs, fn {field, value} -> [field, value] end)
+      hash_pairs_to_flat_list(pairs)
     end
   end
 
@@ -948,7 +942,7 @@ defmodule Ferricstore.Commands.Hash do
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
-      elements = Enum.flat_map(batch, fn {field, value} -> [field, value] end)
+      elements = hash_pairs_to_flat_list(batch)
       [next_cursor, elements]
     end
   end
@@ -1106,15 +1100,7 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
-      entries =
-        unique_fields
-        |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn {field, compound_key} ->
-          case Map.fetch!(metas_by_field, field) do
-            {value, expire_at_ms} when expire_at_ms != 0 -> [{compound_key, value, 0}]
-            _nil_or_persistent -> []
-          end
-        end)
+      entries = persistent_hash_field_entries(unique_fields, compound_keys, metas_by_field, [])
 
       case Ops.compound_batch_put(store, key, entries) do
         :ok ->
@@ -1154,41 +1140,49 @@ defmodule Ferricstore.Commands.Hash do
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.hash_field(key, &1))
 
-      metas_by_key =
-        store
-        |> Ops.compound_batch_get_meta(key, compound_keys)
-        |> then(&Enum.zip(compound_keys, &1))
-        |> Map.new(fn {compound_key, meta} -> {compound_key, meta} end)
-
-      {results, deleted_entries_by_key} =
-        Enum.reduce(fields, {[], %{}}, fn field, {acc, deleted} ->
-          compound_key = CompoundKey.hash_field(key, field)
-
-          cond do
-            Map.has_key?(deleted, compound_key) ->
-              {[nil | acc], deleted}
-
-            is_nil(Map.get(metas_by_key, compound_key)) ->
-              {[nil | acc], deleted}
-
-            true ->
-              {value, expire_at_ms} = Map.fetch!(metas_by_key, compound_key)
-              {[value | acc], Map.put(deleted, compound_key, {value, expire_at_ms})}
-          end
-        end)
-
-      results = Enum.reverse(results)
-
-      deleted_entries =
-        Enum.map(deleted_entries_by_key, fn {compound_key, {value, expire_at_ms}} ->
-          {compound_key, value, expire_at_ms}
-        end)
+      metas = Ops.compound_batch_get_meta(store, key, compound_keys)
+      metas_by_key = hash_metas_by_key(compound_keys, metas, %{})
+      {results, deleted_entries} = hgetdel_results(fields, key, metas_by_key, [], %{}, [])
 
       deleted_count = length(deleted_entries)
 
       with :ok <- delete_hash_fields_and_cleanup(key, deleted_entries, deleted_count, store) do
         results
       end
+    end
+  end
+
+  defp hash_metas_by_key([compound_key | compound_keys], [meta | metas], acc) do
+    hash_metas_by_key(compound_keys, metas, Map.put(acc, compound_key, meta))
+  end
+
+  defp hash_metas_by_key(_compound_keys, _metas, acc), do: acc
+
+  defp hgetdel_results([], _key, _metas_by_key, results, _deleted, deleted_entries) do
+    {Enum.reverse(results), Enum.reverse(deleted_entries)}
+  end
+
+  defp hgetdel_results([field | fields], key, metas_by_key, results, deleted, deleted_entries) do
+    compound_key = CompoundKey.hash_field(key, field)
+
+    cond do
+      Map.has_key?(deleted, compound_key) ->
+        hgetdel_results(fields, key, metas_by_key, [nil | results], deleted, deleted_entries)
+
+      is_nil(Map.get(metas_by_key, compound_key)) ->
+        hgetdel_results(fields, key, metas_by_key, [nil | results], deleted, deleted_entries)
+
+      true ->
+        {value, expire_at_ms} = Map.fetch!(metas_by_key, compound_key)
+
+        hgetdel_results(
+          fields,
+          key,
+          metas_by_key,
+          [value | results],
+          Map.put(deleted, compound_key, true),
+          [{compound_key, value, expire_at_ms} | deleted_entries]
+        )
     end
   end
 
@@ -1241,18 +1235,10 @@ defmodule Ferricstore.Commands.Hash do
   defp hset_pairs(field_value_pairs, key, store, type_status) do
     {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
     compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
+    existing_values = Ops.compound_batch_get(store, key, compound_keys)
 
-    added =
-      store
-      |> Ops.compound_batch_get(key, compound_keys)
-      |> Enum.count(&is_nil/1)
-
-    entries =
-      fields
-      |> Enum.zip(compound_keys)
-      |> Enum.map(fn {field, compound_key} ->
-        {compound_key, Map.fetch!(values_by_field, field), 0}
-      end)
+    {added, entries} =
+      hash_put_entries(fields, compound_keys, existing_values, values_by_field, 0)
 
     case Ops.compound_batch_put(store, key, entries) do
       :ok -> added
@@ -1311,31 +1297,44 @@ defmodule Ferricstore.Commands.Hash do
     unique_fields = Enum.uniq(fields)
     compound_keys = Enum.map(unique_fields, &CompoundKey.hash_field(key, &1))
 
-    metas_by_field =
-      store
-      |> Ops.compound_batch_get_meta(key, compound_keys)
-      |> then(&Enum.zip(unique_fields, &1))
-      |> Map.new()
+    metas = Ops.compound_batch_get_meta(store, key, compound_keys)
+    metas_by_field = hash_field_metas_by_field(unique_fields, metas, %{})
 
     {unique_fields, compound_keys, metas_by_field}
   end
+
+  defp hash_field_metas_by_field([field | fields], [meta | metas], acc) do
+    hash_field_metas_by_field(fields, metas, Map.put(acc, field, meta))
+  end
+
+  defp hash_field_metas_by_field(_fields, _metas, acc), do: acc
+
+  defp persistent_hash_field_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         metas_by_field,
+         acc
+       ) do
+    next_acc =
+      case Map.fetch!(metas_by_field, field) do
+        {value, expire_at_ms} when expire_at_ms != 0 -> [{compound_key, value, 0} | acc]
+        _nil_or_persistent -> acc
+      end
+
+    persistent_hash_field_entries(fields, compound_keys, metas_by_field, next_acc)
+  end
+
+  defp persistent_hash_field_entries(_fields, _compound_keys, _metas_by_field, acc),
+    do: Enum.reverse(acc)
 
   # Same as hset_pairs but with per-field TTL.
   defp hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, type_status) do
     {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
     compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
+    existing_values = Ops.compound_batch_get(store, key, compound_keys)
 
-    added =
-      store
-      |> Ops.compound_batch_get(key, compound_keys)
-      |> Enum.count(&is_nil/1)
-
-    entries =
-      fields
-      |> Enum.zip(compound_keys)
-      |> Enum.map(fn {field, compound_key} ->
-        {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
-      end)
+    {added, entries} =
+      hash_put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms)
 
     case Ops.compound_batch_put(store, key, entries) do
       :ok -> added
@@ -1344,14 +1343,94 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp existing_hash_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms) do
-    unique_fields
-    |> Enum.zip(compound_keys)
-    |> Enum.flat_map(fn {field, compound_key} ->
+    existing_hash_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms, [])
+  end
+
+  defp existing_hash_field_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         metas_by_field,
+         expire_at_ms,
+         acc
+       ) do
+    next_acc =
       case Map.fetch!(metas_by_field, field) do
-        {value, _old_expire} -> [{compound_key, value, expire_at_ms}]
-        nil -> []
+        {value, _old_expire} -> [{compound_key, value, expire_at_ms} | acc]
+        nil -> acc
       end
-    end)
+
+    existing_hash_field_entries(fields, compound_keys, metas_by_field, expire_at_ms, next_acc)
+  end
+
+  defp existing_hash_field_entries(_fields, _compound_keys, _metas_by_field, _expire_at_ms, acc),
+    do: Enum.reverse(acc)
+
+  defp hash_put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms) do
+    hash_put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms, 0, [])
+  end
+
+  defp hash_put_entries([], [], _existing_values, _values_by_field, _expire_at_ms, added, entries) do
+    {added, Enum.reverse(entries)}
+  end
+
+  defp hash_put_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         [nil | existing_values],
+         values_by_field,
+         expire_at_ms,
+         added,
+         entries
+       ) do
+    entry = {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
+
+    hash_put_entries(
+      fields,
+      compound_keys,
+      existing_values,
+      values_by_field,
+      expire_at_ms,
+      added + 1,
+      [entry | entries]
+    )
+  end
+
+  defp hash_put_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         [_existing | existing_values],
+         values_by_field,
+         expire_at_ms,
+         added,
+         entries
+       ) do
+    entry = {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
+
+    hash_put_entries(
+      fields,
+      compound_keys,
+      existing_values,
+      values_by_field,
+      expire_at_ms,
+      added,
+      [entry | entries]
+    )
+  end
+
+  defp hash_put_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         [],
+         values_by_field,
+         expire_at_ms,
+         added,
+         entries
+       ) do
+    entry = {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
+
+    hash_put_entries(fields, compound_keys, [], values_by_field, expire_at_ms, added, [
+      entry | entries
+    ])
   end
 
   # O(n/2) parity check without computing full length.
@@ -1503,6 +1582,14 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
+  defp hash_pairs_to_flat_list(pairs), do: hash_pairs_to_flat_list(pairs, [])
+
+  defp hash_pairs_to_flat_list([{field, value} | pairs], acc) do
+    hash_pairs_to_flat_list(pairs, [value, field | acc])
+  end
+
+  defp hash_pairs_to_flat_list([], acc), do: Enum.reverse(acc)
+
   defp select_random_fields(pairs, count, with_values) do
     cond do
       count == 0 ->
@@ -1512,7 +1599,7 @@ defmodule Ferricstore.Commands.Hash do
         selected = Enum.take_random(pairs, count)
 
         if with_values do
-          Enum.flat_map(selected, fn {field, value} -> [field, value] end)
+          hash_pairs_to_flat_list(selected)
         else
           Enum.map(selected, fn {field, _value} -> field end)
         end
@@ -1529,7 +1616,7 @@ defmodule Ferricstore.Commands.Hash do
           selected = for _ <- 1..abs_count, do: elem(tuple, :rand.uniform(size) - 1)
 
           if with_values do
-            Enum.flat_map(selected, fn {field, value} -> [field, value] end)
+            hash_pairs_to_flat_list(selected)
           else
             Enum.map(selected, fn {field, _value} -> field end)
           end

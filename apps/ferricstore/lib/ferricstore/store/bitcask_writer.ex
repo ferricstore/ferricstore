@@ -10,9 +10,10 @@ defmodule Ferricstore.Store.BitcaskWriter do
   in batches, then updates each ETS entry's file_id and offset via
   `:ets.update_element/3`.
 
-  This decouples the ~50us synchronous NIF write from the ra_server process,
-  allowing it to process the next Raft command immediately. The ETS entry is
-  tagged with `file_id = :pending` until the background write completes.
+  This decouples the ~50us synchronous NIF write from replicated apply,
+  allowing the apply process to move to the next command immediately. The ETS
+  entry is tagged with `file_id = :pending` until the background write
+  completes.
 
   ## Batching strategy
 
@@ -72,7 +73,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
   Queues a deferred Bitcask write for background processing.
 
   Called from `StateMachine.apply/3` for small values. The write is
-  non-blocking (cast) so the ra_server process is not delayed.
+  non-blocking (cast) so replicated apply is not delayed.
 
   ## Parameters
 

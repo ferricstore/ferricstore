@@ -1,6 +1,6 @@
 defmodule :ferricstore_wal_nif do
   @moduledoc """
-  Rust NIF WAL I/O module for ra_log_wal.
+  Rust NIF append-log I/O module.
 
   Replaces file:write and file:datasync with a Rust background thread
   that handles O_DIRECT, commit_delay batching, and fdatasync.
@@ -9,7 +9,7 @@ defmodule :ferricstore_wal_nif do
   The blocking I/O runs on a dedicated Rust OS thread.
 
   This module is registered as an Erlang atom `:ferricstore_wal_nif`
-  so ra_log_wal can call it as IoMod:write(Handle, Data).
+  so the WARaft segment log can call it from Erlang.
   """
 
   version = Mix.Project.config()[:version]
@@ -27,11 +27,14 @@ defmodule :ferricstore_wal_nif do
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-musl
       x86_64-unknown-linux-musl
-    ),
-    force_build: System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
+    )
 
   @doc "Open a WAL file. Spawns background I/O thread."
   def open(_path, _commit_delay_us, _pre_allocate_bytes, _max_buffer_bytes),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Open a raw append file with no header offset. Used by WARaft segment logs."
+  def open_raw_append(_path, _commit_delay_us, _max_buffer_bytes, _start_offset),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Write pre-formatted iodata to the WAL buffer. Does NOT write to disk."
@@ -41,7 +44,8 @@ defmodule :ferricstore_wal_nif do
   def sync(_handle, _caller_pid, _ref), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Request async fdatasync with a per-sync adaptive delay."
-  def sync_with_delay(_handle, _caller_pid, _ref, _delay_us), do: :erlang.nif_error(:nif_not_loaded)
+  def sync_with_delay(_handle, _caller_pid, _ref, _delay_us),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Close the WAL file. Blocks until drain + sync + close."
   def close(_handle), do: :erlang.nif_error(:nif_not_loaded)
@@ -51,4 +55,7 @@ defmodule :ferricstore_wal_nif do
 
   @doc "Read bytes from WAL at offset. Used during recovery."
   def pread(_handle, _offset, _len), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Reserve file space without extending logical length. Used by WARaft segment logs."
+  def preallocate_keep_size(_path, _bytes), do: :erlang.nif_error(:nif_not_loaded)
 end

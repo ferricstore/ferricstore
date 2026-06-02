@@ -212,7 +212,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.kill_shard_safely(0)
       ShardHelpers.wait_shards_alive(30_000)
 
-      # Data may or may not survive (the Raft WAL has the command, so
+      # Data may or may not survive (the WARaft segment log has the command, so
       # replay during init should recover it). The critical requirement
       # is that the shard recovers without crashing.
       eventually(fn ->

@@ -519,6 +519,34 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
 
+    test "shard flush completion does not republish stale value over newer cold row" do
+      keydir =
+        :ets.new(:"shard_flush_stale_cold_#{System.unique_integer([:positive])}", [
+          :set,
+          :public
+        ])
+
+      key = "flush:stale-cold-location"
+
+      state = %{
+        keydir: keydir,
+        active_file_id: 7,
+        file_stats: %{8 => {100, 0}},
+        instance_ctx: %{hot_cache_max_value_size: 64}
+      }
+
+      try do
+        :ets.insert(keydir, {key, "new", 456, LFU.initial(), 8, 99, 3})
+
+        state = ShardFlush.update_ets_locations(state, [{key, "old", 123, "old"}], [{42, 3}])
+
+        assert [{^key, "new", 456, _lfu, 8, 99, 3}] = :ets.lookup(keydir, key)
+        assert state.file_stats == %{8 => {100, 0}}
+      after
+        :ets.delete(keydir)
+      end
+    end
+
     test "shard flush completion handles numeric pending values" do
       keydir =
         :ets.new(:"shard_flush_numeric_#{System.unique_integer([:positive])}", [
@@ -1540,6 +1568,42 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
 
+    test "manual compaction truncates leftover temp log before copying live records" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+      try do
+        shard_path = Path.join([dir, "data", "shard_0"])
+        compact_path = Path.join(shard_path, "compact_0.log")
+        live_key = "compact_live_#{System.unique_integer([:positive])}"
+        stale_key = "compact_stale_#{System.unique_integer([:positive])}"
+
+        assert :ok = GenServer.call(pid, {:put, live_key, "live", 0})
+        assert :ok = GenServer.call(pid, :flush)
+        force_rotate_active_file(pid)
+
+        assert {:ok, [_stale_location]} =
+                 NIF.v2_append_batch(compact_path, [{stale_key, "stale", 0}])
+
+        assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid, {:run_compaction, [0]})
+        refute File.exists?(compact_path)
+
+        GenServer.stop(pid, :normal, 5000)
+        restarted = restart_shard(dir, ctx, 5000)
+
+        assert "live" == GenServer.call(restarted, {:get, live_key})
+        assert nil == GenServer.call(restarted, {:get, stale_key})
+      after
+        case Process.whereis(elem(ctx.shard_names, 0)) do
+          nil ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+
+          live_pid ->
+            cleanup_shard(live_pid, ctx, dir)
+        end
+      end
+    end
+
     test "manual compaction skips the registry active log after external rotation" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
 
@@ -1839,6 +1903,10 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
       hint_path = Path.join([dir, "data", "shard_0", "00000.hint"])
       assert File.exists?(hint_path)
+      alternate_hint_path = Path.join([dir, "data", "shard_0", "00000000000000000000.hint"])
+      File.cp!(hint_path, alternate_hint_path)
+      File.rm!(hint_path)
+      assert File.exists?(alternate_hint_path)
 
       :ok = GenServer.call(pid1, {:delete, a})
       :ok = GenServer.call(pid1, :flush)

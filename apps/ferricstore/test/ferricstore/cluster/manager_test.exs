@@ -45,6 +45,15 @@ defmodule Ferricstore.Cluster.ManagerTest do
       end
     end
 
+    test "node_status/1 supports bounded shard membership probes" do
+      status = Manager.node_status(1_000)
+
+      assert is_map(status)
+      assert status.mode == :standalone
+      assert status.node == node()
+      assert is_map(status.shards)
+    end
+
     test "node_status/0 shard entries contain members and leader" do
       status = Manager.node_status()
 
@@ -106,6 +115,141 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
+    test "WARaft remote join uses the WARaft add/barrier/marker path" do
+      target = :"waraft_join_target@127.0.0.1"
+      parent = self()
+
+      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
+        {:ok, false}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
+        {:ok, %{0 => false}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
+        send(parent, :legacy_direct_sync_called)
+        {:error, :legacy_direct_sync_called}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
+        send(parent, :legacy_stop_raft_called)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target, 1, _idx ->
+        send(parent, :legacy_start_raft_called)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
+        send(parent, :backend_add_called)
+        {:ok, %{0 => :ok}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 1 ->
+        send(parent, :backend_barrier_called)
+        {:ok, %{0 => 42}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target,
+                                                                            _ctx,
+                                                                            %{0 => 42} ->
+        send(parent, :marker_written)
+        :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_target_membership_hook)
+        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
+        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
+        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
+        Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
+        Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 1
+      }
+
+      assert {:reply, :ok, new_state} =
+               Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
+
+      assert_receive :backend_add_called
+      assert_receive :backend_barrier_called
+      assert_receive :marker_written
+      refute_received :legacy_direct_sync_called
+      refute_received :legacy_stop_raft_called
+      refute_received :legacy_start_raft_called
+      assert MapSet.member?(new_state.known_nodes, target)
+    end
+
+    test "WARaft partial add rolls back shards that were newly added" do
+      target = :"waraft_partial_add_target@127.0.0.1"
+      parent = self()
+
+      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 2 ->
+        {:ok, false}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
+        {:ok, %{0 => false, 1 => false}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
+        {{:error, {:partial_add, %{0 => :ok, 1 => {:error, :boom}}}},
+         %{0 => :ok, 1 => {:error, :boom}}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_remove_added_member_hook, fn ^target, shard_idx ->
+        send(parent, {:remove_added_member, shard_idx})
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 2 ->
+        send(parent, :target_cleanup)
+        :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_target_membership_hook)
+        Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_remove_added_member_hook)
+        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 2
+      }
+
+      assert {:reply, {:error, {:partial_add, %{0 => :ok, 1 => {:error, :boom}}}}, new_state} =
+               Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
+
+      assert_receive {:remove_added_member, 0}
+      assert_receive {:remove_added_member, 1}
+      assert_receive :target_cleanup
+      refute MapSet.member?(new_state.known_nodes, target)
+    end
+
     test "direct sync index extraction fails closed for wal-bridgeable unreadable target" do
       target = :"missing_index_target@127.0.0.1"
 
@@ -152,7 +296,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
       assert {:ok, true} = Manager.__target_shard_has_data_for_test__(node(), root, 0)
     end
 
-    test "target cleanup removes blob side-channel data" do
+    test "target cleanup removes shard-owned side stores" do
       root =
         Path.join(
           System.tmp_dir!(),
@@ -164,15 +308,32 @@ defmodule Ferricstore.Cluster.ManagerTest do
       File.mkdir_p!(Ferricstore.DataDir.shard_data_path(root, 0))
       File.mkdir_p!(Path.join([root, "dedicated", "shard_0", "hash:abc"]))
       File.mkdir_p!(Path.join([root, "blob", "shard_0", "aa"]))
+      File.mkdir_p!(Path.join([root, "prob", "shard_0", "filter:abc"]))
+      File.mkdir_p!(Path.join([root, "ra", "server"]))
+      File.mkdir_p!(Path.join([root, "waraft", "ferricstore_waraft_backend.1"]))
       File.write!(Path.join([root, "data", "shard_0", "00000.log"]), "data")
       File.write!(Path.join([root, "dedicated", "shard_0", "hash:abc", "00000.log"]), "dedicated")
       File.write!(Path.join([root, "blob", "shard_0", "aa", "payload.blob"]), "blob")
+      File.write!(Path.join([root, "prob", "shard_0", "filter:abc", "00000.log"]), "prob")
+      File.write!(Path.join([root, "ra", "server", "state"]), "legacy-ra")
+      File.write!(Path.join([root, "waraft", "ferricstore_waraft_backend.1", "state"]), "waraft")
+      File.write!(Ferricstore.ReplicationMode.marker_path(root), "cluster-marker")
+
+      File.write!(
+        Ferricstore.ReplicationMode.marker_path(root) <> ".tmp",
+        "partial-cluster-marker"
+      )
 
       assert :ok = Manager.__cleanup_target_data_dir_for_test__(node(), root, 1)
 
       refute File.exists?(Path.join([root, "data", "shard_0"]))
       refute File.exists?(Path.join(root, "dedicated"))
       refute File.exists?(Path.join(root, "blob"))
+      refute File.exists?(Path.join(root, "prob"))
+      refute File.exists?(Path.join(root, "ra"))
+      refute File.exists?(Path.join(root, "waraft"))
+      refute File.exists?(Ferricstore.ReplicationMode.marker_path(root))
+      refute File.exists?(Ferricstore.ReplicationMode.marker_path(root) <> ".tmp")
     end
 
     test "unknown target data state aborts join before identity bypass or sync" do
@@ -1087,6 +1248,129 @@ defmodule Ferricstore.Cluster.ManagerTest do
 
       refute source =~ "flush_flow_lmdb_writers"
       refute source =~ "Flow.LMDBWriter.flush_all(name, shard_count"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Remove/leave failure handling
+  # ---------------------------------------------------------------------------
+
+  describe "remove/leave failure handling" do
+    test "remove_node fails closed when any shard removal fails" do
+      target = :"remove_failure_target@127.0.0.1"
+
+      Process.put(:ferricstore_cluster_manager_members_hook, fn _shard_idx ->
+        {:ok, [], nil}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_remove_member_hook, fn
+        0, ^target -> :ok
+        1, ^target -> {:error, :storage_blocked}
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_members_hook)
+        Process.delete(:ferricstore_cluster_manager_remove_member_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new([target]),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 2
+      }
+
+      assert {:reply, {:error, {:partial_remove, %{0 => :ok, 1 => {:error, :storage_blocked}}}},
+              new_state} =
+               Manager.handle_call({:remove_node, target}, {self(), make_ref()}, state)
+
+      assert MapSet.member?(new_state.known_nodes, target)
+    end
+
+    test "leave does not switch to standalone when self removal fails" do
+      local = node()
+
+      Process.put(:ferricstore_cluster_manager_members_hook, fn _shard_idx ->
+        {:ok, [], nil}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_remove_member_hook, fn
+        0, ^local -> :ok
+        1, ^local -> {:error, :storage_blocked}
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_members_hook)
+        Process.delete(:ferricstore_cluster_manager_remove_member_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new([local]),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 2
+      }
+
+      assert {:reply, {:error, {:partial_leave, %{0 => :ok, 1 => {:error, :storage_blocked}}}},
+              new_state} =
+               Manager.handle_call(:leave, {self(), make_ref()}, state)
+
+      assert new_state.mode == :cluster
+    end
+
+    test "remove_node transfers leadership to another shard member before removing leader" do
+      target = :"remove_leader_target@127.0.0.1"
+      replacement = :"remove_leader_replacement@127.0.0.1"
+      parent = self()
+
+      Process.put(:ferricstore_cluster_manager_members_hook, fn 0 ->
+        {:ok, [:unknown_member_shape, {:shard_0, target}, {:shard_0, replacement}],
+         {:shard_0, target}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_transfer_leadership_hook, fn
+        0, ^replacement ->
+          send(parent, {:transferred_to, replacement})
+          :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_remove_member_hook, fn
+        0, ^target -> :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_members_hook)
+        Process.delete(:ferricstore_cluster_manager_transfer_leadership_hook)
+        Process.delete(:ferricstore_cluster_manager_remove_member_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new([target]),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 1
+      }
+
+      assert {:reply, :ok, new_state} =
+               Manager.handle_call({:remove_node, target}, {self(), make_ref()}, state)
+
+      assert_receive {:transferred_to, ^replacement}
+      refute MapSet.member?(new_state.known_nodes, target)
     end
   end
 

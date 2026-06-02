@@ -1,8 +1,8 @@
 defmodule Ferricstore.Raft.ReplaySafeIndexTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
   import ExUnit.CaptureLog
 
-  alias Ferricstore.Raft.{Batcher, ReplaySafeIndex, ReplaySafeIndexWriter}
+  alias Ferricstore.Raft.{ReplaySafeIndex, ReplaySafeIndexWriter}
 
   test "persists and reads replay-safe index" do
     dir = tmp_dir()
@@ -66,17 +66,12 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
                    1_000
   end
 
-  test "writer pokes raft apply path after marker becomes durable" do
+  test "writer persists latest replay-safe index without legacy pokes" do
     shard_index = 100_000 + System.unique_integer([:positive])
-    batcher_name = Batcher.batcher_name(shard_index)
     writer_name = ReplaySafeIndexWriter.process_name(shard_index, nil)
     dir = tmp_dir()
-    parent = self()
-
-    Process.register(parent, batcher_name)
 
     on_exit(fn ->
-      if Process.whereis(batcher_name) == parent, do: Process.unregister(batcher_name)
       File.rm_rf(dir)
     end)
 
@@ -88,21 +83,18 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
       )
 
     assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 321)
-    assert_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 321}}}, 1_000
-    assert ReplaySafeIndex.read(dir) == 321
+    assert wait_until(fn -> ReplaySafeIndex.read(dir) == 321 end)
+    refute_receive {:"$gen_cast", {:origin_submit, _command}}, 100
 
     GenServer.stop(writer)
   end
 
   test "writer coalesces many marker requests to latest index" do
     shard_index = 110_000 + System.unique_integer([:positive])
-    batcher_name = Batcher.batcher_name(shard_index)
     writer_name = ReplaySafeIndexWriter.process_name(shard_index, nil)
     dir = tmp_dir()
     parent = self()
     handler_id = {:replay_safe_index_coalesce, parent, make_ref()}
-
-    Process.register(parent, batcher_name)
 
     :telemetry.attach(
       handler_id,
@@ -115,7 +107,6 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
 
     on_exit(fn ->
       :telemetry.detach(handler_id)
-      if Process.whereis(batcher_name) == parent, do: Process.unregister(batcher_name)
       File.rm_rf(dir)
     end)
 
@@ -131,15 +122,12 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 101)
     assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 150)
 
-    assert_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 150}}}, 1_000
-
     assert_receive {:persist_event, [:ferricstore, :raft, :replay_safe_index, :persist],
                     %{index: 150, requested_index: 150, durable_index: 150, lag: 0},
                     %{status: :ok, shard_index: ^shard_index}},
                    1_000
 
-    refute_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 100}}}, 50
-    refute_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 101}}}, 50
+    refute_receive {:"$gen_cast", {:origin_submit, _command}}, 50
     assert ReplaySafeIndex.read(dir) == 150
 
     GenServer.stop(writer)

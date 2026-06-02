@@ -1,6 +1,9 @@
 defmodule Ferricstore.Store.OpsTest do
   @moduledoc false
-  use ExUnit.Case, async: true
+  # Some LocalTxStore cold-read tests assert ETS warming. Warming is suppressed
+  # by the application-wide MemoryGuard skip-promotion flag, which pressure
+  # tests mutate globally, so this module cannot run concurrently with them.
+  use ExUnit.Case, async: false
 
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.LocalTxStore

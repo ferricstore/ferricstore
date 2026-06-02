@@ -3,7 +3,7 @@
 # Baseline public Flow command latency before disk-backed FlowMetaStore/LMDB.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start bench/flow_commands_baseline_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/flow_commands_baseline_bench.exs
 #
 # Options:
 #   FLOW_BASELINE_ITER=300

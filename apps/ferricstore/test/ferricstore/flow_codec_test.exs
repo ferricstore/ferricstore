@@ -32,6 +32,38 @@ defmodule Ferricstore.FlowCodecTest do
     assert decoded == record
   end
 
+  test "record codec omits redundant immutable defaults from every state version" do
+    record =
+      base_record()
+      |> Map.merge(%{
+        id: "flow-compact-state",
+        type: "iot-fanout-worker",
+        state: "queued",
+        version: 1,
+        attempts: 0,
+        fencing_token: 0,
+        next_run_at_ms: nil,
+        priority: 0,
+        ttl_ms: nil,
+        root_flow_id: "flow-compact-state",
+        lease_owner: nil,
+        lease_token: nil,
+        lease_deadline_ms: 0,
+        run_state: nil,
+        payload_ref: "shared-payload-ref",
+        result_ref: nil,
+        error_ref: nil,
+        child_groups: %{}
+      })
+
+    encoded = Flow.encode_record(record)
+
+    assert Flow.decode_record(encoded) == record
+    assert byte_size(encoded) <= 150
+    assert length(:binary.matches(encoded, "flow-compact-state")) == 1
+    refute String.contains?(encoded, "J{}")
+  end
+
   test "terminal after noop batch NIF detects records without terminal side effects" do
     parented = %{base_record() | parent_flow_id: "parent-1"}
 
@@ -59,11 +91,13 @@ defmodule Ferricstore.FlowCodecTest do
     elixir_encoded = Flow.encode_history_fields_elixir(record, "123-1", 123, %{reason: "ok"})
 
     assert encoded == elixir_encoded
-    assert Flow.decode_history_fields(encoded) == Flow.decode_history_fields_elixir(elixir_encoded)
+
+    assert Flow.decode_history_fields(encoded, record) ==
+             Flow.decode_history_fields_elixir(elixir_encoded, record)
 
     fields =
       encoded
-      |> Flow.decode_history_fields()
+      |> Flow.decode_history_fields(record)
       |> Enum.chunk_every(2)
       |> Map.new(fn [key, value] -> {key, value} end)
 
@@ -72,6 +106,50 @@ defmodule Ferricstore.FlowCodecTest do
     assert fields["state"] == "completed"
     assert fields["result_ref"] == "flow/value/a/result/2"
     assert fields["reason"] == "ok"
+  end
+
+  test "history codec stores per-event data without repeated immutable flow metadata" do
+    record =
+      base_record()
+      |> Map.merge(%{
+        id: "flow-compact-history",
+        type: "iot-fanout-worker",
+        state: "running",
+        version: 12,
+        attempts: 2,
+        fencing_token: 9,
+        created_at_ms: 1_000,
+        updated_at_ms: 2_000,
+        next_run_at_ms: nil,
+        priority: 0,
+        lease_owner: nil,
+        lease_token: nil,
+        lease_deadline_ms: 0,
+        root_flow_id: "flow-compact-history",
+        correlation_id: "device-batch-2026-05-23",
+        payload_ref: "shared-payload-ref",
+        result_ref: nil,
+        error_ref: nil
+      })
+
+    encoded = Flow.encode_history_fields(record, "transition", 2_000, %{})
+
+    assert byte_size(encoded) <= 95
+    refute String.contains?(encoded, "flow-compact-history")
+    refute String.contains?(encoded, "iot-fanout-worker")
+    refute String.contains?(encoded, "device-batch-2026-05-23")
+
+    fields =
+      encoded
+      |> Flow.decode_history_fields(record)
+      |> Enum.chunk_every(2)
+      |> Map.new(fn [key, value] -> {key, value} end)
+
+    assert fields["id"] == "flow-compact-history"
+    assert fields["type"] == "iot-fanout-worker"
+    assert fields["correlation_id"] == "device-batch-2026-05-23"
+    assert fields["payload_ref"] == "shared-payload-ref"
+    assert fields["state"] == "running"
   end
 
   test "history codec round trips fields that require multibyte length headers" do
@@ -87,12 +165,18 @@ defmodule Ferricstore.FlowCodecTest do
     elixir_encoded = Flow.encode_history_fields_elixir(record, "123456789-1", 123_456_789, meta)
 
     assert encoded == elixir_encoded
-    assert Flow.decode_history_fields(encoded) == Flow.decode_history_fields_elixir(elixir_encoded)
+
+    assert Flow.decode_history_fields(encoded, record) ==
+             Flow.decode_history_fields_elixir(elixir_encoded, record)
   end
 
   test "value codec stores normal binaries raw and escapes magic-prefixed binaries" do
     assert Flow.encode_value("payload-bytes") == "payload-bytes"
     assert Flow.decode_value("payload-bytes") == "payload-bytes"
+
+    old_magic_prefixed = "FSV1" <> :erlang.term_to_binary(%{old: true})
+    assert Flow.encode_value(old_magic_prefixed) == old_magic_prefixed
+    assert Flow.decode_value(old_magic_prefixed) == old_magic_prefixed
 
     magic_prefixed = "FSV2" <> <<2>> <> "not-a-term"
     encoded_magic = Flow.encode_value(magic_prefixed)

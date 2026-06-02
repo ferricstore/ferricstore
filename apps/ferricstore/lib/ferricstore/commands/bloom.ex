@@ -25,10 +25,6 @@ defmodule Ferricstore.Commands.Bloom do
   @prob_read_timeout_ms 5_000
   @default_error_rate 0.01
   @default_capacity 100
-  @default_max_capacity 10_000_000
-  @default_max_num_bits 1_073_741_824
-  @default_max_batch_items 65_536
-  @max_num_hashes 1024
 
   # -------------------------------------------------------------------
   # Public command handler
@@ -39,9 +35,8 @@ defmodule Ferricstore.Commands.Bloom do
   def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
 
   def handle_ast({:bf_reserve, key, error_rate, capacity}, store) do
-    with :ok <- validate_capacity(capacity),
-         :ok <- validate_error_rate(error_rate),
-         :ok <- validate_computed_params(capacity, error_rate),
+    with :ok <- validate_error_rate(error_rate),
+         :ok <- validate_bloom_capacity(capacity),
          :ok <- check_bloom_not_exists(key, store) do
       do_bloom_reserve(key, capacity, error_rate, store)
     end
@@ -64,9 +59,8 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.RESERVE", [key, error_rate_str, capacity_str], store) do
     with {:ok, error_rate} <- parse_float(error_rate_str, "error_rate"),
          {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity"),
-         :ok <- validate_capacity(capacity),
          :ok <- validate_error_rate(error_rate),
-         :ok <- validate_computed_params(capacity, error_rate),
+         :ok <- validate_bloom_capacity(capacity),
          :ok <- check_bloom_not_exists(key, store) do
       do_bloom_reserve(key, capacity, error_rate, store)
     end
@@ -125,7 +119,7 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp bf_madd_args([key | elements], store) when elements != [] do
-    with :ok <- validate_batch_count("bf.madd", elements),
+    with :ok <- validate_bloom_batch_size(elements),
          :ok <- ProbType.check_expected(key, :bloom, store) do
       auto_params = default_auto_create_params()
       result = do_prob_write(store, {:bloom_madd, key, elements, auto_params})
@@ -162,7 +156,7 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp bf_mexists_args([key | elements], store) when elements != [] do
-    with :ok <- validate_batch_count("bf.mexists", elements) do
+    with :ok <- validate_bloom_batch_size(elements) do
       path = prob_path(store, key, "bloom")
 
       case await_nif(fn proxy, corr_id ->
@@ -312,22 +306,24 @@ defmodule Ferricstore.Commands.Bloom do
   defp do_bloom_reserve(key, capacity, error_rate, store) do
     {num_bits, num_hashes} = compute_params(capacity, error_rate)
 
-    meta =
-      {:bloom_meta,
-       %{
-         path: prob_path(store, key, "bloom"),
-         num_bits: num_bits,
-         num_hashes: num_hashes,
-         capacity: capacity,
-         error_rate: error_rate
-       }}
+    with :ok <- validate_bloom_num_bits(num_bits) do
+      meta =
+        {:bloom_meta,
+         %{
+           path: prob_path(store, key, "bloom"),
+           num_bits: num_bits,
+           num_hashes: num_hashes,
+           capacity: capacity,
+           error_rate: error_rate
+         }}
 
-    result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
+      result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
 
-    case result do
-      {:ok, _} -> :ok
-      :ok -> :ok
-      other -> other
+      case result do
+        {:ok, _} -> :ok
+        :ok -> :ok
+        other -> other
+      end
     end
   end
 
@@ -335,6 +331,37 @@ defmodule Ferricstore.Commands.Bloom do
     num_bits = optimal_num_bits(capacity, error_rate)
     num_hashes = optimal_num_hashes(num_bits, capacity)
     {num_bits, num_hashes}
+  end
+
+  defp validate_bloom_capacity(capacity) do
+    case Application.get_env(:ferricstore, :bloom_max_capacity) do
+      max_capacity
+      when is_integer(max_capacity) and max_capacity > 0 and capacity > max_capacity ->
+        {:error, "ERR bloom capacity exceeds configured maximum capacity"}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp validate_bloom_num_bits(num_bits) do
+    case Application.get_env(:ferricstore, :bloom_max_num_bits) do
+      max_bits when is_integer(max_bits) and max_bits > 0 and num_bits > max_bits ->
+        {:error, "ERR bloom computed bits exceed configured maximum bits"}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp validate_bloom_batch_size(elements) do
+    case Application.get_env(:ferricstore, :bloom_max_batch_items) do
+      max_items when is_integer(max_items) and max_items > 0 and length(elements) > max_items ->
+        {:error, "ERR bloom batch exceeds configured maximum batch size"}
+
+      _ ->
+        :ok
+    end
   end
 
   defp default_auto_create_params do
@@ -565,50 +592,4 @@ defmodule Ferricstore.Commands.Bloom do
   @spec validate_error_rate(float()) :: :ok | {:error, binary()}
   defp validate_error_rate(rate) when rate > 0.0 and rate < 1.0, do: :ok
   defp validate_error_rate(_), do: {:error, "ERR (0 < error rate range < 1)"}
-
-  defp validate_capacity(capacity) when is_integer(capacity) and capacity > 0 do
-    max_capacity = configured_pos_integer(:bloom_max_capacity, @default_max_capacity)
-
-    if capacity <= max_capacity do
-      :ok
-    else
-      {:error, "ERR bloom capacity exceeds max capacity #{max_capacity}"}
-    end
-  end
-
-  defp validate_capacity(_capacity), do: {:error, "ERR bad capacity value"}
-
-  defp validate_computed_params(capacity, error_rate) do
-    {num_bits, num_hashes} = compute_params(capacity, error_rate)
-    max_num_bits = configured_pos_integer(:bloom_max_num_bits, @default_max_num_bits)
-
-    cond do
-      num_bits > max_num_bits ->
-        {:error, "ERR bloom filter size exceeds max bits #{max_num_bits}"}
-
-      num_hashes > @max_num_hashes ->
-        {:error, "ERR bloom hash count exceeds max #{@max_num_hashes}"}
-
-      true ->
-        :ok
-    end
-  end
-
-  defp validate_batch_count(command, elements) do
-    max_batch_items = configured_pos_integer(:bloom_max_batch_items, @default_max_batch_items)
-    count = length(elements)
-
-    if count <= max_batch_items do
-      :ok
-    else
-      {:error, "ERR #{command} batch too large (#{count} items, max #{max_batch_items})"}
-    end
-  end
-
-  defp configured_pos_integer(key, default) do
-    case Application.get_env(:ferricstore, key, default) do
-      value when is_integer(value) and value > 0 -> value
-      _ -> default
-    end
-  end
 end

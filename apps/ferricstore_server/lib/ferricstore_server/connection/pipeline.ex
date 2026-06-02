@@ -13,11 +13,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
   alias FerricstoreServer.Connection.TcpOpts
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
+  require Logger
+
   @stateful_cmds MapSet.new(~w(
-    HELLO CLIENT QUIT AUTH ACL RESET SANDBOX
+    HELLO CLIENT QUIT AUTH ACL RESET CONFIG SANDBOX
     MULTI EXEC DISCARD WATCH UNWATCH
     SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
     BLPOP BRPOP BLMOVE BLMPOP
+    FETCH_OR_COMPUTE
   ))
 
   @prefetch_read_only_keyed_cmds MapSet.new(~w(
@@ -67,17 +70,16 @@ defmodule FerricstoreServer.Connection.Pipeline do
           commands :: [term()],
           state :: struct(),
           handle_command_fn :: (term(), struct() -> {atom(), iodata(), struct()}),
-          send_response_fn :: (term(), term(), iodata() -> :ok)
+          send_response_fn :: (term(), term(), iodata() -> :ok | {:error, term()})
         ) :: {:quit, struct()} | {:continue, struct()}
   def pipeline_dispatch([single_cmd], state, handle_command_fn, send_response_fn) do
     case handle_command_fn.(single_cmd, state) do
       {:quit, response, quit_state} ->
-        send_response_fn.(state.socket, state.transport, response)
+        _ = send_response_result(quit_state, send_response_fn, response)
         {:quit, quit_state}
 
       {:continue, response, new_state} ->
-        send_response_fn.(state.socket, state.transport, response)
-        {:continue, new_state}
+        send_or_quit(new_state, send_response_fn, response)
     end
   end
 
@@ -108,7 +110,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # ---------------------------------------------------------------------------
 
   defp try_batch_get_fast_path(commands, state, send_response_fn) do
-    if requires_auth?(state) or state.multi_state == :queuing do
+    if requires_sequential_dispatch?(state) do
       :fallback
     else
       case extract_plain_gets(commands) do
@@ -166,45 +168,43 @@ defmodule FerricstoreServer.Connection.Pipeline do
         if has_file_ref? do
           stream_get_results(keys, lookup_keys, results, state, send_response_fn)
         else
-          send_response_fn.(
-            state.socket,
-            state.transport,
-            Encoder.encode_bulk_strings_or_nulls(results)
-          )
+          next_state = ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)
 
-          {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
+          send_or_quit(
+            state,
+            send_response_fn,
+            Encoder.encode_bulk_strings_or_nulls(results),
+            next_state
+          )
         end
 
       {:error, err} ->
-        send_response_fn.(
-          state.socket,
-          state.transport,
+        send_or_quit(
+          state,
+          send_response_fn,
           List.duplicate(Encoder.encode(err), length(keys))
         )
-
-        {:continue, state}
     end
   end
 
   defp dispatch_batch_get_results(keys, lookup_keys, state, send_response_fn) do
     case safe_dispatch(fn -> Router.batch_get(state.instance_ctx, lookup_keys) end) do
       {:ok, values} ->
-        send_response_fn.(
-          state.socket,
-          state.transport,
-          Encoder.encode_bulk_strings_or_nulls(values)
-        )
+        next_state = ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)
 
-        {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
+        send_or_quit(
+          state,
+          send_response_fn,
+          Encoder.encode_bulk_strings_or_nulls(values),
+          next_state
+        )
 
       {:error, err} ->
-        send_response_fn.(
-          state.socket,
-          state.transport,
+        send_or_quit(
+          state,
+          send_response_fn,
           List.duplicate(Encoder.encode(err), length(lookup_keys))
         )
-
-        {:continue, state}
     end
   end
 
@@ -226,45 +226,43 @@ defmodule FerricstoreServer.Connection.Pipeline do
         if has_file_ref? do
           stream_get_results(planned_keys, results, state, send_response_fn)
         else
-          send_response_fn.(
-            state.socket,
-            state.transport,
-            Encoder.encode_bulk_strings_or_nulls(results)
-          )
+          next_state = ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)
 
-          {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
+          send_or_quit(
+            state,
+            send_response_fn,
+            Encoder.encode_bulk_strings_or_nulls(results),
+            next_state
+          )
         end
 
       {:error, err} ->
-        send_response_fn.(
-          state.socket,
-          state.transport,
+        send_or_quit(
+          state,
+          send_response_fn,
           List.duplicate(Encoder.encode(err), length(planned_keys))
         )
-
-        {:continue, state}
     end
   end
 
   defp dispatch_planned_batch_get_results(planned_keys, keys, state, send_response_fn) do
     case safe_dispatch(fn -> Router.batch_get_planned(state.instance_ctx, planned_keys) end) do
       {:ok, values} ->
-        send_response_fn.(
-          state.socket,
-          state.transport,
-          Encoder.encode_bulk_strings_or_nulls(values)
-        )
+        next_state = ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)
 
-        {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
+        send_or_quit(
+          state,
+          send_response_fn,
+          Encoder.encode_bulk_strings_or_nulls(values),
+          next_state
+        )
 
       {:error, err} ->
-        send_response_fn.(
-          state.socket,
-          state.transport,
+        send_or_quit(
+          state,
+          send_response_fn,
           List.duplicate(Encoder.encode(err), length(planned_keys))
         )
-
-        {:continue, state}
     end
   end
 
@@ -297,24 +295,28 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   namespace_key(acc_state.sandbox_namespace, key)
                 )
 
-              send_response_fn.(
-                acc_state.socket,
-                acc_state.transport,
-                Encoder.encode(value)
-              )
+              case send_response_result(acc_state, send_response_fn, Encoder.encode(value)) do
+                :ok ->
+                  tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+                  {:cont, {{:continue, tracked_state}, new_cache}}
 
-              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
-              {:cont, {{:continue, tracked_state}, new_cache}}
+                {:error, _reason} ->
+                  {:halt, {{:quit, acc_state}, new_cache}}
+              end
 
             {:error_after_header, _reason, new_cache} ->
               {:halt, {{:quit, acc_state}, new_cache}}
           end
 
         {{key, _lookup_key}, value}, {{:continue, acc_state}, file_cache} ->
-          send_response_fn.(acc_state.socket, acc_state.transport, Encoder.encode(value))
+          case send_response_result(acc_state, send_response_fn, Encoder.encode(value)) do
+            :ok ->
+              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+              {:cont, {{:continue, tracked_state}, file_cache}}
 
-          tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
-          {:cont, {{:continue, tracked_state}, file_cache}}
+            {:error, _reason} ->
+              {:halt, {{:quit, acc_state}, file_cache}}
+          end
       end)
 
     ConnSendfile.close_file_cache(file_cache)
@@ -347,14 +349,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
             {:fallback, new_cache} ->
               value = Router.get(acc_state.instance_ctx, lookup_key)
 
-              send_response_fn.(
-                acc_state.socket,
-                acc_state.transport,
-                Encoder.encode(value)
-              )
+              case send_response_result(acc_state, send_response_fn, Encoder.encode(value)) do
+                :ok ->
+                  tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+                  {:cont, {{:continue, tracked_state}, new_cache}}
 
-              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
-              {:cont, {{:continue, tracked_state}, new_cache}}
+                {:error, _reason} ->
+                  {:halt, {{:quit, acc_state}, new_cache}}
+              end
 
             {:error_after_header, _reason, new_cache} ->
               {:halt, {{:quit, acc_state}, new_cache}}
@@ -362,10 +364,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
         {{key, _lookup_key, _shard_index, _keydir}, value},
         {{:continue, acc_state}, file_cache} ->
-          send_response_fn.(acc_state.socket, acc_state.transport, Encoder.encode(value))
+          case send_response_result(acc_state, send_response_fn, Encoder.encode(value)) do
+            :ok ->
+              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+              {:cont, {{:continue, tracked_state}, file_cache}}
 
-          tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
-          {:cont, {{:continue, tracked_state}, file_cache}}
+            {:error, _reason} ->
+              {:halt, {{:quit, acc_state}, file_cache}}
+          end
       end)
 
     ConnSendfile.close_file_cache(file_cache)
@@ -385,7 +391,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # fdatasync instead of serializing through it.
 
   defp try_batch_set_fast_path(commands, state, send_response_fn) do
-    if requires_auth?(state) or state.multi_state == :queuing do
+    if requires_sequential_dispatch?(state) do
       :fallback
     else
       case extract_plain_sets(commands) do
@@ -452,8 +458,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
           List.duplicate(Encoder.encode(err), length(kv_pairs))
       end
 
-    send_response_fn.(state.socket, state.transport, response)
-    {:continue, state}
+    send_or_quit(state, send_response_fn, response)
   end
 
   # ---------------------------------------------------------------------------
@@ -463,7 +468,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # split into two groups, batch each, then reassemble responses in order.
 
   defp try_mixed_fast_path(commands, state, handle_command_fn, send_response_fn) do
-    if requires_auth?(state) or state.multi_state == :queuing do
+    if requires_sequential_dispatch?(state) do
       general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
     else
       # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
@@ -603,8 +608,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
       stream_mixed_results(response_slots, state, send_response_fn)
     else
       response = Enum.map(response_slots, &response_iodata/1)
-      send_response_fn.(state.socket, state.transport, response)
-      {:continue, track_mixed_get_results(response_slots, state)}
+
+      send_or_quit(
+        state,
+        send_response_fn,
+        response,
+        track_mixed_get_results(response_slots, state)
+      )
     end
   end
 
@@ -691,30 +701,40 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 {:cont, {{:continue, new_state}, new_cache}}
 
               {:fallback, new_cache} ->
-                send_response_fn.(
-                  acc_state.socket,
-                  acc_state.transport,
-                  Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
-                )
+                case send_response_result(
+                       acc_state,
+                       send_response_fn,
+                       Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                     ) do
+                  :ok ->
+                    {:cont,
+                     {{:continue,
+                       ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)},
+                      new_cache}}
 
-                {:cont,
-                 {{:continue,
-                   ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)},
-                  new_cache}}
+                  {:error, _reason} ->
+                    {:halt, {{:quit, acc_state}, new_cache}}
+                end
 
               {:error_after_header, _reason, new_cache} ->
                 {:halt, {{:quit, acc_state}, new_cache}}
             end
 
           {:get_encoded, key, encoded, value}, {{:continue, acc_state}, file_cache} ->
-            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+            case send_response_result(acc_state, send_response_fn, encoded) do
+              :ok ->
+                tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+                {:cont, {{:continue, tracked_state}, file_cache}}
 
-            tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
-            {:cont, {{:continue, tracked_state}, file_cache}}
+              {:error, _reason} ->
+                {:halt, {{:quit, acc_state}, file_cache}}
+            end
 
           encoded, {{:continue, acc_state}, file_cache} ->
-            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
-            {:cont, {{:continue, acc_state}, file_cache}}
+            case send_response_result(acc_state, send_response_fn, encoded) do
+              :ok -> {:cont, {{:continue, acc_state}, file_cache}}
+              {:error, _reason} -> {:halt, {{:quit, acc_state}, file_cache}}
+            end
         end
       )
 
@@ -746,8 +766,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # terminal state.
 
   defp try_batch_flow_write_fast_path(commands, state, send_response_fn) do
-    if requires_auth?(state) or state.multi_state == :queuing or
-         not flow_pipeline_fast_paths_enabled?(state) do
+    if requires_sequential_dispatch?(state) do
       :fallback
     else
       if full_acl_fast_path?(state.acl_cache) do
@@ -766,8 +785,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   List.duplicate(Encoder.encode(err), length(writes))
               end
 
-            send_response_fn.(state.socket, state.transport, response)
-            {:ok, {:continue, state}}
+            {:ok, send_or_quit(state, send_response_fn, response)}
 
           :fallback ->
             :fallback
@@ -782,212 +800,108 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp extract_flow_writes([], acc), do: {:ok, Enum.reverse(acc)}
 
-  defp extract_flow_writes(
-         [{:command, "FLOW.CREATE", _args, {:flow_create, id, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_list(opts),
-       do: extract_flow_writes(rest, [{:create, id, opts} | acc])
-
-  defp extract_flow_writes(
-         [
-           {:command, "FLOW.TRANSITION", _args,
-            {:flow_transition, id, from_state, to_state, opts}, _keys}
-           | rest
-         ],
-         acc
-       )
-       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
-       do: extract_flow_writes(rest, [{:transition, id, from_state, to_state, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.SIGNAL", _args, {:flow_signal, id, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_list(opts),
-       do: extract_flow_writes(rest, [{:signal, id, opts} | acc])
-
-  defp extract_flow_writes(
-         [
-           {:command, "FLOW.EXTEND_LEASE", _args, {:flow_extend_lease, id, lease_token, opts},
-            _keys}
-           | rest
-         ],
-         acc
-       )
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: extract_flow_writes(rest, [{:extend_lease, id, lease_token, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.VALUE.PUT", _args, {:flow_value_put, value, opts}, _keys} | rest],
-         acc
-       )
-       when is_list(opts) do
-    if owned_flow_value_put_opts?(opts) do
-      extract_flow_writes(rest, [{:value_put, value, opts} | acc])
-    else
-      :fallback
+  defp extract_flow_writes([command | rest], acc) do
+    case flow_write_op(command) do
+      {:ok, op} -> extract_flow_writes(rest, [op | acc])
+      :fallback -> :fallback
     end
   end
 
-  defp extract_flow_writes(
-         [
-           {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
-           | rest
-         ],
-         acc
-       )
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: extract_flow_writes(rest, [{:complete, id, lease_token, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: extract_flow_writes(rest, [{:retry, id, lease_token, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: extract_flow_writes(rest, [{:fail, id, lease_token, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys} | rest],
-         acc
-       )
+  defp flow_write_op({:command, "FLOW.CREATE", _args, {:flow_create, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: extract_flow_writes(rest, [{:cancel, id, opts} | acc])
-
-  defp extract_flow_writes(
-         [{:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys} | rest],
-         acc
-       )
-       when is_binary(id) and is_list(opts),
-       do: extract_flow_writes(rest, [{:rewind, id, opts} | acc])
-
-  defp extract_flow_writes(_commands, _acc), do: :fallback
-
-  defp flow_write_op({:command, "FLOW.CREATE", _args, {:flow_create, id, opts}, _keys})
-       when is_binary(id) and is_list(opts),
-       do: {:ok, {:create, id, opts}}
+       do: {:ok, ast}
 
   defp flow_write_op(
-         {:command, "FLOW.TRANSITION", _args, {:flow_transition, id, from_state, to_state, opts},
-          _keys}
+         {:command, "FLOW.TRANSITION", _args,
+          {:flow_transition, id, from_state, to_state, opts} = ast, _keys}
        )
        when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
-       do: {:ok, {:transition, id, from_state, to_state, opts}}
-
-  defp flow_write_op({:command, "FLOW.SIGNAL", _args, {:flow_signal, id, opts}, _keys})
-       when is_binary(id) and is_list(opts),
-       do: {:ok, {:signal, id, opts}}
+       do: {:ok, ast}
 
   defp flow_write_op(
-         {:command, "FLOW.EXTEND_LEASE", _args, {:flow_extend_lease, id, lease_token, opts},
-          _keys}
+         {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts} = ast, _keys}
        )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: {:ok, {:extend_lease, id, lease_token, opts}}
-
-  defp flow_write_op({:command, "FLOW.VALUE.PUT", _args, {:flow_value_put, value, opts}, _keys})
-       when is_list(opts) do
-    if owned_flow_value_put_opts?(opts) do
-      {:ok, {:value_put, value, opts}}
-    else
-      :fallback
-    end
-  end
+       do: {:ok, ast}
 
   defp flow_write_op(
-         {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
+         {:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts} = ast, _keys}
        )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: {:ok, {:complete, id, lease_token, opts}}
+       do: {:ok, ast}
 
-  defp flow_write_op({:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys})
+  defp flow_write_op(
+         {:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts} = ast, _keys}
+       )
        when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: {:ok, {:retry, id, lease_token, opts}}
+       do: {:ok, ast}
 
-  defp flow_write_op({:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys})
-       when is_binary(id) and is_binary(lease_token) and is_list(opts),
-       do: {:ok, {:fail, id, lease_token, opts}}
-
-  defp flow_write_op({:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys})
+  defp flow_write_op({:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:cancel, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_write_op({:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys})
+  defp flow_write_op({:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:rewind, id, opts}}
+       do: {:ok, ast}
 
   defp flow_write_op(_command), do: :fallback
-
-  defp owned_flow_value_put_opts?(opts) when is_list(opts) do
-    is_binary(Keyword.get(opts, :owner_flow_id)) and is_binary(Keyword.get(opts, :name))
-  end
-
-  defp owned_flow_value_put_opts?(_opts), do: false
 
   defp flow_claim_due_op(
          {:command, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, type, opts}, _keys}
        )
-       when is_binary(type) and is_list(opts),
-       do: {:ok, {:claim_due, type, opts}}
+       when is_binary(type) and is_list(opts) do
+    if Keyword.has_key?(opts, :block_ms) do
+      :fallback
+    else
+      {:ok, {:claim_due, type, opts}}
+    end
+  end
 
   defp flow_claim_due_op(_command), do: :fallback
 
-  defp flow_read_op({:command, "FLOW.GET", _args, {:flow_get, id, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.GET", _args, {:flow_get, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:get, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.HISTORY", _args, {:flow_history, id, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.HISTORY", _args, {:flow_history, id, opts} = ast, _keys})
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:history, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.VALUE.MGET", _args, {:flow_value_mget, refs}, _keys})
-       when is_list(refs),
-       do: {:ok, {:value_mget, refs, []}}
-
-  defp flow_read_op({:command, "FLOW.VALUE.MGET", _args, {:flow_value_mget, refs, opts}, _keys})
-       when is_list(refs) and is_list(opts),
-       do: {:ok, {:value_mget, refs, opts}}
-
-  defp flow_read_op({:command, "FLOW.LIST", _args, {:flow_list, type, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.LIST", _args, {:flow_list, type, opts} = ast, _keys})
        when is_binary(type) and is_list(opts),
-       do: {:ok, {:list, type, opts}}
-
-  defp flow_read_op({:command, "FLOW.TERMINALS", _args, {:flow_terminals, type, opts}, _keys})
-       when is_binary(type) and is_list(opts),
-       do: {:ok, {:terminals, type, opts}}
-
-  defp flow_read_op({:command, "FLOW.FAILURES", _args, {:flow_failures, type, opts}, _keys})
-       when is_binary(type) and is_list(opts),
-       do: {:ok, {:failures, type, opts}}
-
-  defp flow_read_op({:command, "FLOW.BY_PARENT", _args, {:flow_by_parent, id, opts}, _keys})
-       when is_binary(id) and is_list(opts),
-       do: {:ok, {:by_parent, id, opts}}
-
-  defp flow_read_op({:command, "FLOW.BY_ROOT", _args, {:flow_by_root, id, opts}, _keys})
-       when is_binary(id) and is_list(opts),
-       do: {:ok, {:by_root, id, opts}}
+       do: {:ok, ast}
 
   defp flow_read_op(
-         {:command, "FLOW.BY_CORRELATION", _args, {:flow_by_correlation, id, opts}, _keys}
+         {:command, "FLOW.TERMINALS", _args, {:flow_terminals, type, opts} = ast, _keys}
+       )
+       when is_binary(type) and is_list(opts),
+       do: {:ok, ast}
+
+  defp flow_read_op({:command, "FLOW.FAILURES", _args, {:flow_failures, type, opts} = ast, _keys})
+       when is_binary(type) and is_list(opts),
+       do: {:ok, ast}
+
+  defp flow_read_op({:command, "FLOW.BY_PARENT", _args, {:flow_by_parent, id, opts} = ast, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, ast}
+
+  defp flow_read_op({:command, "FLOW.BY_ROOT", _args, {:flow_by_root, id, opts} = ast, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, ast}
+
+  defp flow_read_op(
+         {:command, "FLOW.BY_CORRELATION", _args, {:flow_by_correlation, id, opts} = ast, _keys}
        )
        when is_binary(id) and is_list(opts),
-       do: {:ok, {:by_correlation, id, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.INFO", _args, {:flow_info, type, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.INFO", _args, {:flow_info, type, opts} = ast, _keys})
        when is_binary(type) and is_list(opts),
-       do: {:ok, {:info, type, opts}}
+       do: {:ok, ast}
 
-  defp flow_read_op({:command, "FLOW.STUCK", _args, {:flow_stuck, type, opts}, _keys})
+  defp flow_read_op({:command, "FLOW.STUCK", _args, {:flow_stuck, type, opts} = ast, _keys})
        when is_binary(type) and is_list(opts),
-       do: {:ok, {:stuck, type, opts}}
+       do: {:ok, ast}
 
   defp flow_read_op(_command), do: :fallback
 
@@ -1005,8 +919,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # (MULTI, AUTH, SUBSCRIBE, etc.) force a flush-and-sequential boundary.
 
   defp general_batch_dispatch(commands, state, handle_command_fn, send_response_fn) do
-    if requires_auth?(state) or state.multi_state == :queuing or
-         not full_acl_fast_path?(state.acl_cache) do
+    if requires_sequential_dispatch?(state) or not full_acl_fast_path?(state.acl_cache) do
       sequential_dispatch(commands, state, handle_command_fn, send_response_fn)
     else
       case split_at_stateful(commands, state) do
@@ -1021,16 +934,25 @@ defmodule FerricstoreServer.Connection.Pipeline do
             {:continue, new_state} ->
               case handle_command_fn.(stateful_cmd, new_state) do
                 {:quit, response, quit_state} ->
-                  send_response_fn.(quit_state.socket, quit_state.transport, response)
+                  _ = send_response_result(quit_state, send_response_fn, response)
                   {:quit, quit_state}
 
                 {:continue, response, new_state2} ->
-                  send_response_fn.(new_state2.socket, new_state2.transport, response)
+                  case send_response_result(new_state2, send_response_fn, response) do
+                    :ok ->
+                      if rest == [] do
+                        {:continue, new_state2}
+                      else
+                        general_batch_dispatch(
+                          rest,
+                          new_state2,
+                          handle_command_fn,
+                          send_response_fn
+                        )
+                      end
 
-                  if rest == [] do
-                    {:continue, new_state2}
-                  else
-                    general_batch_dispatch(rest, new_state2, handle_command_fn, send_response_fn)
+                    {:error, _reason} ->
+                      {:quit, new_state2}
                   end
               end
           end
@@ -1047,13 +969,34 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp split_at_stateful([cmd | rest], state, acc) do
     name = extract_command_name(cmd)
 
-    if MapSet.member?(@stateful_cmds, name) or
+    if stateful_pipeline_command?(cmd) or MapSet.member?(@stateful_cmds, name) or
          (is_binary(name) and String.starts_with?(name, "CLIENT")) do
       {:split, Enum.reverse(acc), cmd, rest}
     else
       split_at_stateful(rest, state, [cmd | acc])
     end
   end
+
+  defp stateful_pipeline_command?(
+         {:command, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, _type, opts}, _keys}
+       )
+       when is_list(opts),
+       do: Keyword.has_key?(opts, :block_ms)
+
+  defp stateful_pipeline_command?(
+         {:command, "XREAD", _args, {:xread, _count, {:block, _timeout_ms}, _stream_ids}, _keys}
+       ),
+       do: true
+
+  defp stateful_pipeline_command?(
+         {:command, "XREADGROUP", _args,
+          {:xreadgroup, _group, _consumer, {_count, {:block, _timeout_ms}, _stream_ids}}, _keys}
+       ),
+       do: true
+
+  defp stateful_pipeline_command?({:command, "FETCH_OR_COMPUTE", _args, _ast, _keys}), do: true
+
+  defp stateful_pipeline_command?(_command), do: false
 
   defp do_batch_pure([], state, _send_response_fn), do: {:continue, state}
 
@@ -1080,13 +1023,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
       if Enum.any?(responses, &streaming_response?/1) do
         stream_response_entries(responses, final_state, send_response_fn)
       else
-        send_response_fn.(
-          state.socket,
-          state.transport,
-          Enum.map(responses, fn {:encoded, encoded} -> encoded end)
-        )
+        response = Enum.map(responses, fn {:encoded, encoded} -> encoded end)
 
-        {action, final_state}
+        case send_response_result(final_state, send_response_fn, response) do
+          :ok -> {action, final_state}
+          {:error, _reason} -> {:quit, final_state}
+        end
       end
 
     if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, false)
@@ -1098,16 +1040,21 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp dispatch_pure_segments([{cmd, idx} | rest], state, store, prefetched_reads, acc) do
-    flow_fast_paths? = flow_pipeline_fast_paths_enabled?(state)
-
-    case maybe_flow_write_op(cmd, flow_fast_paths?) do
+    case flow_write_op(cmd) do
       {:ok, op} ->
         {ops, rest} = take_flow_write_segment(rest, [op])
         entries = dispatch_flow_write_segment(Enum.reverse(ops), state)
-        dispatch_pure_segments(rest, state, store, prefetched_reads, Enum.reverse(entries) ++ acc)
+
+        dispatch_pure_segments(
+          rest,
+          state,
+          store,
+          prefetched_reads,
+          prepend_pipeline_entries(entries, acc)
+        )
 
       :fallback ->
-        case maybe_flow_claim_due_op(cmd, flow_fast_paths?) do
+        case flow_claim_due_op(cmd) do
           {:ok, op} ->
             {ops, rest} = take_flow_claim_due_segment(rest, [op])
             entries = dispatch_flow_claim_due_segment(Enum.reverse(ops), state)
@@ -1117,11 +1064,11 @@ defmodule FerricstoreServer.Connection.Pipeline do
               state,
               store,
               prefetched_reads,
-              Enum.reverse(entries) ++ acc
+              prepend_pipeline_entries(entries, acc)
             )
 
           :fallback ->
-            case maybe_flow_read_op(cmd, flow_fast_paths?) do
+            case flow_read_op(cmd) do
               {:ok, op} ->
                 {ops, rest} = take_flow_read_segment(rest, [op])
                 entries = dispatch_flow_read_segment(Enum.reverse(ops), state)
@@ -1131,7 +1078,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   state,
                   store,
                   prefetched_reads,
-                  Enum.reverse(entries) ++ acc
+                  prepend_pipeline_entries(entries, acc)
                 )
 
               :fallback ->
@@ -1152,7 +1099,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
                       new_state,
                       store,
                       prefetched_reads,
-                      Enum.reverse(entries) ++ acc
+                      prepend_pipeline_entries(entries, acc)
                     )
 
                   :fallback ->
@@ -1170,17 +1117,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
     end
   end
 
-  defp flow_pipeline_fast_paths_enabled?(%{sandbox_namespace: nil}), do: true
-  defp flow_pipeline_fast_paths_enabled?(_state), do: false
-
-  defp maybe_flow_write_op(cmd, true), do: flow_write_op(cmd)
-  defp maybe_flow_write_op(_cmd, false), do: :fallback
-
-  defp maybe_flow_claim_due_op(cmd, true), do: flow_claim_due_op(cmd)
-  defp maybe_flow_claim_due_op(_cmd, false), do: :fallback
-
-  defp maybe_flow_read_op(cmd, true), do: flow_read_op(cmd)
-  defp maybe_flow_read_op(_cmd, false), do: :fallback
+  defp prepend_pipeline_entries(entries, acc) do
+    Enum.reduce(entries, acc, fn entry, next_acc -> [entry | next_acc] end)
+  end
 
   defp take_flow_write_segment([{cmd, idx} | rest], acc) do
     case flow_write_op(cmd) do
@@ -1470,12 +1409,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads) do
     {_name, _args, ast, keys} = command_parts(cmd)
+    acl_name = ConnAuth.acl_command_name(name, args, ast)
     Stats.incr_commands(state.stats_counter)
 
     result =
-      case ConnAuth.check_command_cached(state.acl_cache, name) do
+      case ConnAuth.check_command_cached(state.acl_cache, acl_name) do
         :ok ->
-          case ConnAuth.check_keys_cached(state.acl_cache, name, keys) do
+          case ConnAuth.check_keys_cached(state.acl_cache, acl_name, keys) do
             :ok ->
               try do
                 dispatch_pure_command(idx, name, args, ast, store, state, prefetched_reads)
@@ -1484,19 +1424,19 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   {:error, "ERR server not ready, shard process unavailable"}
 
                 :exit, {reason, _} ->
-                  {:error, "ERR internal error: #{inspect(reason)}"}
+                  internal_error(:exit, reason)
 
                 kind, reason ->
                   internal_error(kind, reason)
               end
 
             {:error, _} = err ->
-              log_acl_denied(state, name)
+              log_acl_denied(state, acl_name)
               err
           end
 
         {:error, _} = err ->
-          log_acl_denied(state, name)
+          log_acl_denied(state, acl_name)
           err
       end
 
@@ -1753,18 +1693,22 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 {:cont, {{:continue, new_state}, new_cache}}
 
               {:fallback, new_cache} ->
-                send_response_fn.(
-                  acc_state.socket,
-                  acc_state.transport,
-                  Encoder.encode(
-                    ConnSendfile.materialize_getrange(key, start_idx, end_idx, acc_state)
-                  )
-                )
+                case send_response_result(
+                       acc_state,
+                       send_response_fn,
+                       Encoder.encode(
+                         ConnSendfile.materialize_getrange(key, start_idx, end_idx, acc_state)
+                       )
+                     ) do
+                  :ok ->
+                    tracked_state =
+                      ConnTracking.maybe_track_read("GETRANGE", args, :fallback_ok, acc_state)
 
-                tracked_state =
-                  ConnTracking.maybe_track_read("GETRANGE", args, :fallback_ok, acc_state)
+                    {:cont, {{:continue, tracked_state}, new_cache}}
 
-                {:cont, {{:continue, tracked_state}, new_cache}}
+                  {:error, _reason} ->
+                    {:halt, {{:quit, acc_state}, new_cache}}
+                end
 
               {:error_after_header, _reason, new_cache} ->
                 {:halt, {{:quit, acc_state}, new_cache}}
@@ -1785,24 +1729,30 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 {:cont, {{:continue, new_state}, new_cache}}
 
               {:fallback, new_cache} ->
-                send_response_fn.(
-                  acc_state.socket,
-                  acc_state.transport,
-                  Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
-                )
+                case send_response_result(
+                       acc_state,
+                       send_response_fn,
+                       Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                     ) do
+                  :ok ->
+                    tracked_state =
+                      ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)
 
-                tracked_state =
-                  ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)
+                    {:cont, {{:continue, tracked_state}, new_cache}}
 
-                {:cont, {{:continue, tracked_state}, new_cache}}
+                  {:error, _reason} ->
+                    {:halt, {{:quit, acc_state}, new_cache}}
+                end
 
               {:error_after_header, _reason, new_cache} ->
                 {:halt, {{:quit, acc_state}, new_cache}}
             end
 
           {:encoded, encoded}, {{:continue, acc_state}, file_cache} ->
-            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
-            {:cont, {{:continue, acc_state}, file_cache}}
+            case send_response_result(acc_state, send_response_fn, encoded) do
+              :ok -> {:cont, {{:continue, acc_state}, file_cache}}
+              {:error, _reason} -> {:halt, {{:quit, acc_state}, file_cache}}
+            end
         end
       )
 
@@ -1811,44 +1761,51 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp stream_array_response(keys, elements, state, send_response_fn, file_cache) do
-    send_response_fn.(state.socket, state.transport, [
-      "*",
-      Integer.to_string(length(elements)),
-      "\r\n"
-    ])
-
     {result, file_cache} =
-      Enum.reduce_while(elements, {{:sent, state}, file_cache}, fn
-        {:file_ref, key, lookup_key, path, offset, size}, {{:sent, acc_state}, file_cache} ->
-          case ConnSendfile.send_file_ref_element_response_cached(
-                 key,
-                 lookup_key,
-                 path,
-                 offset,
-                 size,
-                 acc_state,
-                 file_cache
-               ) do
-            {:sent, new_state, new_cache} ->
-              {:cont, {{:sent, new_state}, new_cache}}
+      case send_response_result(state, send_response_fn, [
+             "*",
+             Integer.to_string(length(elements)),
+             "\r\n"
+           ]) do
+        :ok ->
+          Enum.reduce_while(elements, {{:sent, state}, file_cache}, fn
+            {:file_ref, key, lookup_key, path, offset, size}, {{:sent, acc_state}, file_cache} ->
+              case ConnSendfile.send_file_ref_element_response_cached(
+                     key,
+                     lookup_key,
+                     path,
+                     offset,
+                     size,
+                     acc_state,
+                     file_cache
+                   ) do
+                {:sent, new_state, new_cache} ->
+                  {:cont, {{:sent, new_state}, new_cache}}
 
-            {:fallback, new_cache} ->
-              send_response_fn.(
-                acc_state.socket,
-                acc_state.transport,
-                Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
-              )
+                {:fallback, new_cache} ->
+                  case send_response_result(
+                         acc_state,
+                         send_response_fn,
+                         Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                       ) do
+                    :ok -> {:cont, {{:sent, acc_state}, new_cache}}
+                    {:error, reason} -> {:halt, {{:error_after_header, reason}, new_cache}}
+                  end
 
-              {:cont, {{:sent, acc_state}, new_cache}}
+                {:error_after_header, reason, new_cache} ->
+                  {:halt, {{:error_after_header, reason}, new_cache}}
+              end
 
-            {:error_after_header, reason, new_cache} ->
-              {:halt, {{:error_after_header, reason}, new_cache}}
-          end
+            {:encoded, encoded}, {{:sent, acc_state}, file_cache} ->
+              case send_response_result(acc_state, send_response_fn, encoded) do
+                :ok -> {:cont, {{:sent, acc_state}, file_cache}}
+                {:error, reason} -> {:halt, {{:error_after_header, reason}, file_cache}}
+              end
+          end)
 
-        {:encoded, encoded}, {{:sent, acc_state}, file_cache} ->
-          send_response_fn.(acc_state.socket, acc_state.transport, encoded)
-          {:cont, {{:sent, acc_state}, file_cache}}
-      end)
+        {:error, reason} ->
+          {{:error_after_header, reason}, file_cache}
+      end
 
     result =
       case result do
@@ -1873,7 +1830,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   # Pure sequential fallback for auth-required or queuing states
   defp sequential_dispatch(commands, state, handle_command_fn, send_response_fn) do
-    if state.transport == :ranch_tcp do
+    if state.transport == :ranch_tcp and sequential_cork_safe?(commands) do
       TcpOpts.set_cork(state.socket, true)
       result = do_sequential(commands, state, handle_command_fn, send_response_fn)
       TcpOpts.set_cork(state.socket, false)
@@ -1888,18 +1845,46 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp do_sequential([cmd | rest], state, handle_command_fn, send_response_fn) do
     case handle_command_fn.(cmd, state) do
       {:quit, response, quit_state} ->
-        send_response_fn.(quit_state.socket, quit_state.transport, response)
+        _ = send_response_result(quit_state, send_response_fn, response)
         {:quit, quit_state}
 
       {:continue, response, new_state} ->
-        send_response_fn.(new_state.socket, new_state.transport, response)
-        do_sequential(rest, new_state, handle_command_fn, send_response_fn)
+        case send_response_result(new_state, send_response_fn, response) do
+          :ok -> do_sequential(rest, new_state, handle_command_fn, send_response_fn)
+          {:error, _reason} -> {:quit, new_state}
+        end
     end
+  end
+
+  defp sequential_cork_safe?(commands), do: not pipeline_contains_blocking_command?(commands)
+
+  defp pipeline_contains_blocking_command?(commands) do
+    Enum.any?(commands, fn command ->
+      name = extract_command_name(command)
+
+      stateful_pipeline_command?(command) or
+        name in ~w(BLPOP BRPOP BLMOVE BLMPOP)
+    end)
   end
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp send_response_result(state, send_response_fn, iodata) do
+    send_response_fn.(state.socket, state.transport, iodata)
+  end
+
+  defp send_or_quit(state, send_response_fn, iodata) do
+    send_or_quit(state, send_response_fn, iodata, state)
+  end
+
+  defp send_or_quit(send_state, send_response_fn, iodata, continue_state) do
+    case send_response_result(send_state, send_response_fn, iodata) do
+      :ok -> {:continue, continue_state}
+      {:error, _reason} -> {:quit, continue_state}
+    end
+  end
 
   defp command_parts({:command, name, args, ast, keys})
        when is_binary(name) and is_list(args) and is_list(keys),
@@ -1979,7 +1964,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp dispatch_store_command(name, args, ast, store, _ctx, _namespace)
-       when is_tuple(ast) and tuple_size(ast) in 2..6 do
+       when is_tuple(ast) and tuple_size(ast) in 2..5 do
     case Dispatcher.dispatch_ast(ast, store) do
       {:error, "ERR unsupported command AST"} ->
         {:error,
@@ -2018,16 +2003,22 @@ defmodule FerricstoreServer.Connection.Pipeline do
       {:error, {:error, "ERR server not ready, shard process unavailable"}}
 
     :exit, {reason, _} ->
-      {:error, {:error, "ERR internal error: #{inspect(reason)}"}}
+      {:error, internal_error(:exit, reason)}
 
     kind, reason ->
       {:error, internal_error(kind, reason)}
   end
 
-  defp internal_error(kind, reason),
-    do: {:error, "ERR internal error: #{inspect({kind, reason})}"}
+  defp internal_error(kind, reason) do
+    Logger.error(fn ->
+      "FerricStore pipeline internal error: #{inspect({kind, reason}, limit: 20)}"
+    end)
+
+    {:error, "ERR internal error"}
+  end
 
   defp extract_command_name({:command, name, _args, _ast, _keys}) when is_binary(name), do: name
+
   defp extract_command_name(_), do: "UNKNOWN"
 
   defp full_acl_fast_path?(:full_access), do: true
@@ -2035,6 +2026,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp full_acl_fast_path?(%{
          commands: :all,
          keys: :all,
+         channels: :all,
          enabled: true,
          denied_commands: %MapSet{map: denied}
        })
@@ -2043,8 +2035,28 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp full_acl_fast_path?(_cache), do: false
 
+  defp requires_sequential_dispatch?(state) do
+    requires_auth?(state) or state.multi_state == :queuing or pubsub_mode?(state)
+  end
+
   defp requires_auth?(state) do
-    not state.authenticated and state.require_auth
+    not state.authenticated and
+      (Map.get(state, :require_auth, false) or live_requirepass_enabled?())
+  end
+
+  defp pubsub_mode?(%{pubsub_channels: nil, pubsub_patterns: nil}), do: false
+
+  defp pubsub_mode?(state) do
+    pubsub_count(Map.get(state, :pubsub_channels)) +
+      pubsub_count(Map.get(state, :pubsub_patterns)) >
+      0
+  end
+
+  defp pubsub_count(nil), do: 0
+  defp pubsub_count(%MapSet{} = set), do: MapSet.size(set)
+
+  defp live_requirepass_enabled? do
+    Ferricstore.Config.get_value("requirepass") not in [nil, ""]
   end
 
   defp format_peer(nil), do: "unknown"

@@ -131,9 +131,8 @@ Before the supervision tree starts, `Application.start/2` performs critical init
 2. `LFU.init_config_cache()` -- caches `lfu_decay_time` and `lfu_log_factor` in `persistent_term` (~5ns reads)
 3. `persistent_term` initialization -- `hot_cache_max_value_size`, `keydir_full`, `reject_writes`, `shard_count`, `promotion_threshold`
 4. `Waiters.init()`, `ClientTracking.init_tables()`, `Stream.init_tables()` -- ETS tables for blocking commands, client tracking, and streams
-5. `install_patched_wal()` -- loads the patched `ra_log_wal` module with async fdatasync (pre-compiled `.beam` in release mode, runtime-compiled in dev)
-6. `Raft.Cluster.start_system(data_dir)` -- starts the ra system (WAL directory under `data_dir/ra`)
-7. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> HLC -> Batchers -> BitcaskWriters -> Flow LMDB writers -> ShardSupervisor -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
+5. `WARaftBackend.start(default_ctx)` -- starts WARaft partitions with the segment log under `data_dir/waraft`
+6. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> HLC -> WARaft namespace batchers -> BitcaskWriters -> Flow LMDB writers -> ShardSupervisor -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
 
 Stats starts first so counters are available before any connection. The ShardSupervisor must start before the Ranch listener (in the server app) so the key-value store is ready before any client arrives. MemoryGuard starts last because it reads from shard ETS tables.
 
@@ -144,7 +143,7 @@ Every key is mapped to a shard via a 1,024-slot indirection layer: `phash2(key) 
 Each shard has:
 - An ETS table (`keydir_N`) for hot data
 - A Bitcask data directory (`data_dir/shard_N/`) for persistent storage
-- A Raft group (ra server `ferricstore_shard_N`) for consensus
+- A WARaft partition (`raft_server_ferricstore_waraft_backend_N`) for consensus
 - A group-commit batcher for write batching
 - A prefix index ETS table for efficient SCAN/KEYS by prefix
 - A merge scheduler for background compaction
@@ -217,7 +216,7 @@ Client                Router              Shard GenServer         Raft Batcher
   |                     |                      |                       |
   |                     |                      |   (timer fires)       |
   |                     |                      |                       |
-  |                     |                      |                       |-- :ra.process_command
+  |                     |                      |                       |-- WARaftBackend.write
   |                     |                      |                       |   (blocks until quorum)
   |                     |                      |                       |
   |                     |                      |  StateMachine.apply:  |
@@ -236,7 +235,7 @@ Client                Router              Shard GenServer         Raft Batcher
 2. `Shard.handle_call({:put, key, value, expire_at_ms})` calls `Batcher.write(shard_index, {:put, key, value, expire_at_ms})`.
 3. The Batcher extracts the namespace prefix from the key (text before the first `:`; keys without `:` go to `"_root"`). It looks up the namespace config for `window_ms` (commit window).
 4. The command and caller are appended to the namespace's slot buffer. On the first write to an empty slot, a timer is started with `window_ms` (default: 1ms). If the slot reaches `max_batch_size` (default: 1000), it flushes immediately.
-5. When the timer fires or the slot is full, the batch is submitted through Raft via `:ra.pipeline_command/4`. `StateMachine.apply/3` runs after the Raft entry is committed: it calls `NIF.v2_append_batch(active_file_path, records)` to write to Bitcask with fsync, then `:ets.insert(keydir, 7-tuple)` to update the keydir. Each caller receives their individual result after the applied notification arrives.
+5. When the timer fires or the slot is full, the batch is submitted through `WARaftBackend`. `StateMachine.apply/3` runs after the WARaft entry is committed: it stages Bitcask/segment records, fsyncs through the segment log path, then publishes keydir updates. Each caller receives its individual result after the applied notification arrives.
 
 **Direct write path (embedded custom instances and sandbox test shards)**:
 
@@ -305,34 +304,34 @@ Client                Router              ETS keydir          Shard GenServer
 
 For cold keys over plain TCP (not TLS), `Router.get_file_ref/1` returns `{file_path, value_offset, value_size}` when the value exceeds the sendfile threshold (default: 64KB). The connection handler uses `:file.sendfile/5` to transfer data directly from disk to the TCP socket without copying through BEAM memory. The value offset is computed as `record_offset + 26 (header) + key_length`.
 
-## Raft Consensus
+## WARaft Consensus
 
-FerricStore uses the [ra](https://hex.pm/packages/ra) library for Raft consensus. Each shard has its own independent Raft group with its own leader.
+FerricStore uses WARaft for Raft consensus. Each shard has its own independent WARaft partition with its own leader.
 
 ### Cluster Topology
 
-- **Single-node mode** (development, testing): Each shard's Raft group has one member -- self quorum. Writes are durable after local WAL append + fsync. No network round trip.
-- **Three-node cluster**: Each shard's Raft group has three members. Writes require quorum (2 of 3) acknowledgement before commit.
+- **Single-node mode** (development, testing): Each shard's WARaft partition has one member -- self quorum. Writes are durable after local segment append + fsync. No network round trip.
+- **Three-node cluster**: Each shard's WARaft partition has three members. Writes require quorum (2 of 3) acknowledgement before commit.
 
-The ra system is named `:ferricstore_raft` and stores its WAL and segment files under `data_dir/ra`. Each shard's ra server is identified as `{:"ferricstore_shard_N", node()}`.
+The WARaft system is named `:ferricstore_waraft_backend` and stores segment files under `data_dir/waraft`. Each shard's server is identified as `{:"raft_server_ferricstore_waraft_backend_N", node()}`.
 
 ### Group Commit Batcher
 
-`Ferricstore.Raft.Batcher` is a per-shard GenServer that accumulates write commands into per-namespace buffers:
+`Ferricstore.Raft.WARaftBackend.Batcher` is a per-shard GenServer that accumulates write commands into per-namespace buffers:
 
 1. Client calls `Batcher.write(shard_index, command)` -- synchronous `GenServer.call`.
 2. The key's namespace prefix is extracted: `"session"` from `"session:abc123"`, `"_root"` for keys without a colon.
 3. Namespace config is looked up from the `ns_cache` process-state map (populated lazily from the `:ferricstore_ns_config` ETS table managed by `NamespaceConfig`). Returns `window_ms`.
 4. Commands are buffered in a slot keyed by prefix. A timer is started on the first write to each slot.
 5. When the timer fires (or `max_batch_size` of 1000 is reached):
-   - Single command -> `:ra.pipeline_command(shard_id, command, corr, :low)`.
-   - Homogeneous hot batch -> `:ra.pipeline_command(shard_id, {:put_batch, entries}, corr, :low)` or `{:delete_batch, keys}` when the router can build the final shape directly.
-   - Mixed batch -> `:ra.pipeline_command(shard_id, {:batch, commands}, corr, :low)`.
+   - Single command -> `WARaftBackend.write(shard_index, command)`.
+   - Homogeneous hot batch -> `WARaftBackend.write_put_batch/2` or `write_delete_batch/2` when the router can build the final shape directly.
+   - Mixed batch -> `WARaftBackend.write_batch(shard_index, commands)`.
 6. When `NamespaceConfig` changes (via `FERRICSTORE.CONFIG SET`), it broadcasts `:ns_config_changed` to all Batchers, which clear their `ns_cache`.
 
-### Specialized Ra Command Terms
+### Specialized WARaft Command Terms
 
-FerricStore uses compact Ra command terms for hot homogeneous write paths. The current examples are `{:put_batch, entries}` and `{:delete_batch, keys}`. They reduce allocation, Ra term size, serialization work, and per-command pattern matching compared with sending `{:batch, [{:put, ...}, ...]}` for the same request.
+FerricStore uses compact WARaft command terms for hot homogeneous write paths. The current examples are `{:put_batch, entries}` and `{:delete_batch, keys}`. They reduce allocation, log term size, serialization work, and per-command pattern matching compared with sending `{:batch, [{:put, ...}, ...]}` for the same request.
 
 The rule for adding the next specialized term is strict:
 
@@ -344,18 +343,18 @@ The rule for adding the next specialized term is strict:
 6. On append failure, no new public ETS state should remain visible. Tests must cover rollback of overwritten keys and absence of new keys.
 7. Keep a runtime perf toggle while proving a new term, and benchmark it against the generic `{:batch, commands}` path plus any dedicated fast apply path disabled.
 
-The `put_batch` profiling lesson was that the compact wire term was good, but the first apply implementation did too much extra pending-state work. The matching `delete_batch` fast path follows the same rule for tombstones: stage the Bitcask delete records first, then remove ETS rows only after append success. Future terms need both halves: compact Ra shape and compact state-machine apply.
+The `put_batch` profiling lesson was that the compact wire term was good, but the first apply implementation did too much extra pending-state work. The matching `delete_batch` fast path follows the same rule for tombstones: stage the Bitcask delete records first, then remove ETS rows only after append success. Future terms need both halves: compact log shape and compact state-machine apply.
 
 ### State Machine
 
-`Ferricstore.Raft.StateMachine` implements the `:ra_machine` behaviour. Key callbacks:
+`Ferricstore.Raft.StateMachine` is the deterministic WARaft apply module. Key callbacks:
 
 - **`init/1`**: Receives shard config (paths, ETS table name, active file info). Stores `release_cursor_interval` (default: 1000) in machine state for deterministic cursor emission.
 - **`apply/3`**: Deterministic command application. Supports `:put`, `:put_batch`, `:delete`, `:delete_batch`, `:batch`, `:list_op`, `:compound_put`, `:compound_delete`, `:compound_delete_prefix`, `:incr_float`, `:append`, `:getset`, `:getdel`, `:getex`, `:setrange`, `:cas`, `:lock`, `:unlock`, `:extend`, `:ratelimit_add`. Writes are appended to Bitcask before public ETS state is updated. Values exceeding `hot_cache_max_value_size` are stored as `nil` in ETS.
 - **`state_enter/2`**: On becoming leader, calls `HLC.now()` to advance the local clock.
 - **`overview/1`**: Returns debugging info: shard index, keydir size, applied count, cursor interval.
 
-**Log Compaction**: Every `release_cursor_interval` applied commands, `apply/3` emits a `{:release_cursor, ra_index, state}` effect. This tells ra that all log entries up to that index are reflected in the snapshot and can be truncated.
+**Log Compaction**: Every `release_cursor_interval` applied commands, `apply/3` emits a `{:release_cursor, ra_index, state}` effect. This tells WARaft that all log entries up to that index are reflected in the snapshot and can be truncated.
 
 **HLC Piggybacking**: Commands can be wrapped as `{inner_command, %{hlc_ts: {physical_ms, logical}}}`. When `apply/3` processes a wrapped command, it calls `HLC.update/1` to merge the leader's clock into the local node's HLC, keeping followers causally synchronized.
 
@@ -500,7 +499,7 @@ On shard startup, `Shard.init/1` rebuilds the in-memory keydir:
    - Entries recovered from hints/logs are inserted as cold: `{key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size}`.
 5. **Recover promoted collections**: Scans ETS for `PM:` marker keys, re-opens dedicated Bitcask directories, scans their logs to recover entries.
 6. **Migrate prob files**: Scans prob directory for existing `.bloom`/`.cms`/`.cuckoo`/`.topk` files, writes metadata markers to ETS for any files without corresponding keydir entries.
-7. **Start Raft server**: `Raft.Cluster.start_shard_server/5` starts the ra server for this shard. On supervisor restart after a shard crash, the existing Raft server is stopped and restarted with the same UID, preserving all committed WAL data (previous versions used `force_delete_server` which destroyed the WAL).
+7. **Start quorum runtime**: application startup owns WARaft partition startup. A shard GenServer restart reuses the same keydir and active-file state while WARaft keeps the committed segment log durable.
 9. **Schedule flush timer and expiry sweep**.
 
 ## Rust NIF Design

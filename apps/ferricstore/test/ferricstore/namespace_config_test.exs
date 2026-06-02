@@ -31,6 +31,22 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert entry.window_ms == 10
     end
 
+    test "tracks whether namespace overrides exist for hot-path routing" do
+      refute NamespaceConfig.has_overrides?()
+
+      assert :ok = NamespaceConfig.set("rate", "window_ms", "10")
+      assert NamespaceConfig.has_overrides?()
+
+      assert :ok = NamespaceConfig.reset("rate")
+      refute NamespaceConfig.has_overrides?()
+    end
+
+    test "sets window_ms under WARaft native namespace windows" do
+      assert :ok = NamespaceConfig.set("rate", "window_ms", "10")
+      {:ok, entry} = NamespaceConfig.get("rate")
+      assert entry.window_ms == 10
+    end
+
     test "rejects removed durability field for a prefix" do
       assert {:error, msg} = NamespaceConfig.set("ts", "durability", "async")
       assert msg =~ "unknown namespace config field 'durability'"

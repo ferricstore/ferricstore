@@ -187,15 +187,16 @@ defmodule Ferricstore.Store.Shard.Flush do
   # -------------------------------------------------------------------
 
   defp build_flush_batch(state, raw_batch) do
+    threshold = blob_threshold(state)
     hot_cache_threshold = ShardETS.hot_cache_threshold(state)
-    threshold = blob_threshold(state, hot_cache_threshold)
 
     {prepared_reversed, disk_values_reversed} =
       Enum.reduce(raw_batch, {[], []}, fn {key, value, exp}, {prepared_acc, disk_acc} ->
         disk_value = ShardETS.to_disk_binary(value)
+        staged_value = ShardETS.value_for_ets(disk_value, hot_cache_threshold)
 
         {
-          [{key, exp, disk_value} | prepared_acc],
+          [{key, disk_value, exp, staged_value} | prepared_acc],
           [disk_value | disk_acc]
         }
       end)
@@ -203,56 +204,33 @@ defmodule Ferricstore.Store.Shard.Flush do
     with {:ok, persisted_values} <-
            externalize_flush_values(state, threshold, Enum.reverse(disk_values_reversed)),
          {:ok, batch} <-
-           attach_persisted_flush_values(
-             Enum.reverse(prepared_reversed),
-             persisted_values,
-             hot_cache_threshold
-           ) do
+           attach_persisted_flush_values(Enum.reverse(prepared_reversed), persisted_values) do
       {:ok, batch}
     else
       {:error, reason} -> {:error, {:blob_externalize_failed, reason}}
     end
   end
 
-  defp attach_persisted_flush_values(prepared, persisted_values, hot_cache_threshold),
-    do: attach_persisted_flush_values(prepared, persisted_values, hot_cache_threshold, [])
+  defp attach_persisted_flush_values(prepared, persisted_values),
+    do: attach_persisted_flush_values(prepared, persisted_values, [])
 
   defp attach_persisted_flush_values(
-         [{key, exp, original_value} | prepared],
+         [{key, _disk_value, exp, staged_value} | prepared],
          [persisted_value | persisted_values],
-         hot_cache_threshold,
          acc
        ) do
-    staged_value = ShardETS.value_for_ets(original_value, hot_cache_threshold)
-
-    attach_persisted_flush_values(prepared, persisted_values, hot_cache_threshold, [
+    attach_persisted_flush_values(prepared, persisted_values, [
       {key, persisted_value, exp, staged_value} | acc
     ])
   end
 
-  defp attach_persisted_flush_values([], [], _hot_cache_threshold, acc),
-    do: {:ok, Enum.reverse(acc)}
+  defp attach_persisted_flush_values([], [], acc), do: {:ok, Enum.reverse(acc)}
 
-  defp attach_persisted_flush_values(_prepared, _persisted_values, _hot_cache_threshold, _acc),
+  defp attach_persisted_flush_values(_prepared, _persisted_values, _acc),
     do: {:error, :blob_externalize_result_mismatch}
 
-  defp blob_threshold(%{instance_ctx: ctx}, hot_cache_threshold) do
-    effective_blob_threshold(BlobValue.threshold(ctx), hot_cache_threshold)
-  end
-
-  defp blob_threshold(_state, _hot_cache_threshold), do: 0
-
-  defp effective_blob_threshold(blob_threshold, hot_cache_threshold)
-       when is_integer(blob_threshold) and blob_threshold > 0 and is_integer(hot_cache_threshold) and
-              hot_cache_threshold > 0 do
-    min(blob_threshold, hot_cache_threshold)
-  end
-
-  defp effective_blob_threshold(blob_threshold, _hot_cache_threshold)
-       when is_integer(blob_threshold) and blob_threshold > 0,
-       do: blob_threshold
-
-  defp effective_blob_threshold(_blob_threshold, _hot_cache_threshold), do: 0
+  defp blob_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_threshold(_state), do: 0
 
   defp externalize_flush_values(_state, threshold, disk_values) when threshold <= 0,
     do: BlobValue.maybe_externalize_many(nil, 0, 0, disk_values)
@@ -279,6 +257,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   @doc false
   def update_ets_locations(state, batch, locations) do
     fid = state.active_file_id
+    batch = normalize_flush_location_batch(batch)
 
     last_index_by_key =
       batch
@@ -307,6 +286,13 @@ defmodule Ferricstore.Store.Shard.Flush do
       end)
 
     %{state | file_stats: new_file_stats}
+  end
+
+  defp normalize_flush_location_batch(batch) do
+    Enum.map(batch, fn
+      {key, persisted_value, exp, staged_value} -> {key, persisted_value, exp, staged_value}
+      {key, value, exp} -> {key, value, exp, value}
+    end)
   end
 
   defp update_single_ets_location(
@@ -344,17 +330,26 @@ defmodule Ferricstore.Store.Shard.Flush do
       [] ->
         fs
 
-      [{^key, _old_value, _old_exp, _lfu, old_fid, _old_off, old_vsize}]
+      [{^key, ^expected_value, ^exp, _lfu, old_fid, old_off, old_vsize}]
       when old_fid != :pending and is_integer(old_fid) and old_fid >= 0 and
+             is_integer(old_off) and old_off >= 0 and
              is_integer(old_vsize) and old_vsize >= 0 ->
         vsize = persisted_value_size(persisted_value)
 
-        :ets.insert(
-          keydir,
-          {key, expected_value, exp, Ferricstore.Store.LFU.initial(), fid, offset, vsize}
-        )
+        replaced =
+          :ets.select_replace(keydir, [
+            {
+              {key, expected_value, exp, :"$1", old_fid, old_off, old_vsize},
+              [],
+              [{{key, expected_value, exp, :"$1", fid, offset, vsize}}]
+            }
+          ])
 
-        track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
+        if replaced == 1 do
+          track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
+        else
+          fs
+        end
 
       _ ->
         fs

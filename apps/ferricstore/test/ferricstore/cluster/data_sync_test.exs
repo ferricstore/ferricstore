@@ -1,5 +1,5 @@
 defmodule Ferricstore.Cluster.DataSyncTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Ferricstore.Cluster.DataSync
 
@@ -148,6 +148,18 @@ defmodule Ferricstore.Cluster.DataSyncTest do
                :wal_bridgeable,
                {:error, {:ls_failed, :eacces}}
              )
+  end
+
+  test "WARaft resync decisions use one production path" do
+    source = File.read!("lib/ferricstore/cluster/data_sync.ex")
+
+    refute source =~ "RaftBackend.waraft?()"
+    refute source =~ "unsupported_waraft_data_sync"
+    assert source =~ "do_needs_resync?"
+  end
+
+  test "WARaft data sync pauses the production write facade" do
+    assert :ok = DataSync.__pause_batcher_for_test__(node(), 0)
   end
 
   test "remote batcher pause failures return error tuples instead of exiting" do

@@ -4,12 +4,12 @@ defmodule Ferricstore.Test.ClusterHelper do
 
   Uses `:peer` (OTP 25+) for in-process BEAM nodes. Each node gets its own
   temporary directory for Bitcask data and runs the full FerricStore
-  application including Raft state machines, ETS tables, and the Bitcask NIF.
+  application including WARaft state machines, ETS tables, and the Bitcask NIF.
 
   ## Architecture
 
-  Nodes in a cluster form real multi-node Raft groups. Each shard's Raft group
-  includes all N nodes as `initial_members`, so writes go through Raft quorum
+  Nodes in a cluster form real multi-node WARaft groups. Each shard's group
+  includes all N nodes as `initial_members`, so writes go through quorum
   (e.g. 2-of-3) and are replicated to all members. Leader election, failover,
   and log replication are exercised for real.
 
@@ -18,7 +18,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   2. Connect them via Erlang distribution
   3. Set `:cluster_nodes` config on every node (list of all node names)
   4. Start the FerricStore application on every node
-  5. Trigger elections and wait for all shards to have a leader with
+  5. Trigger WARaft elections and wait for all shards to have a leader with
      full membership
 
   ## Single-node addition
@@ -52,14 +52,14 @@ defmodule Ferricstore.Test.ClusterHelper do
   end
 
   @doc """
-  Starts N FerricStore peer nodes forming a real multi-node Raft cluster.
+  Starts N FerricStore peer nodes forming a real multi-node WARaft cluster.
 
   Each node gets:
   - A unique BEAM node name (`ferric_<unique>_<i>@<host>`)
   - Its own temporary directory for Bitcask data
   - The same code path as the test runner
   - An individually started FerricStore application
-  - Shared `cluster_nodes` config so all shards form N-member Raft groups
+  - Shared `cluster_nodes` config so all shards form N-member WARaft groups
 
   ## Parameters
 
@@ -108,13 +108,16 @@ defmodule Ferricstore.Test.ClusterHelper do
       end)
 
     node_names = Enum.map(nodes, & &1.name)
+    normalize_cluster_cookies(nodes)
 
     # Phase 2: Connect all nodes to each other for Erlang distribution.
-    # Must happen before app startup so that ra servers can communicate
+    # Must happen before app startup so that WARaft servers can communicate
     # during leader election.
     for n1 <- node_names, n2 <- node_names, n1 != n2 do
       :rpc.call(n1, Node, :connect, [n2])
     end
+
+    :ok = ensure_nodes_reachable(node_names, timeout: timeout)
 
     # Phase 3: Configure all nodes with cluster_nodes and app env,
     # then start the FerricStore application.
@@ -139,11 +142,11 @@ defmodule Ferricstore.Test.ClusterHelper do
     end)
 
     # Phase 4: Start FerricStore on all nodes CONCURRENTLY. This is critical
-    # for multi-node Raft: each node's Shard.init starts ra servers and
-    # triggers elections. Elections need quorum (e.g. 2 of 3), so if we
+    # for multi-node WARaft: each node starts its consensus partitions during
+    # application boot. Elections need quorum (e.g. 2 of 3), so if we
     # start sequentially, early nodes wait 500ms per shard for elections
     # that cannot succeed (peers not up yet). Starting concurrently ensures
-    # ra servers on all nodes come up roughly simultaneously, enabling
+    # consensus partitions on all nodes come up roughly simultaneously, enabling
     # quorum to be reached promptly.
     tasks =
       Enum.map(nodes, fn node ->
@@ -153,17 +156,16 @@ defmodule Ferricstore.Test.ClusterHelper do
     # Wait for all app starts to complete. Each takes ~2s (4 shards * 500ms
     # election wait). With concurrent start, this is ~2s total instead of 6s.
     Enum.each(tasks, fn task -> Task.await(task, 30_000) end)
+    :ok = ensure_peer_mesh_reachable(node_names, timeout: timeout)
 
     # Re-trigger elections only for shards that don't have a leader yet.
     # Triggering on all nodes causes split-votes on slow CI machines.
     first_node = hd(nodes).name
 
     for shard <- 0..(shards - 1) do
-      server_id = {:"ferricstore_shard_#{shard}", first_node}
-
       has_leader? =
         try do
-          case :rpc.call(first_node, :ra, :members, [server_id, 2_000]) do
+          case members_on_node(first_node, shard, 2_000) do
             {:ok, _members, _leader} -> true
             _ -> false
           end
@@ -172,13 +174,14 @@ defmodule Ferricstore.Test.ClusterHelper do
         end
 
       unless has_leader? do
-        :rpc.call(first_node, :ra, :trigger_election, [server_id])
+        :rpc.call(first_node, Ferricstore.Raft.WARaftBackend, :trigger_election, [shard])
       end
     end
 
     # Phase 5: Wait for all shards to have elected leaders with full
     # membership across the cluster.
     :ok = wait_for_cluster_ready(nodes, shards, timeout)
+    :ok = ensure_peer_mesh_reachable(node_names, timeout: timeout)
 
     nodes
   end
@@ -275,7 +278,33 @@ defmodule Ferricstore.Test.ClusterHelper do
       end)
     end
 
+    :ok = ensure_node_reachable(node_name, timeout: 10_000)
+
     node_name
+  end
+
+  @doc """
+  Ensures the test runner has an Erlang distribution connection to a peer node.
+
+  Cluster tests use `:erpc.call/5` for strict remote calls. `:erpc` does not
+  hide transient host-to-peer disconnects, so destructive suites should call
+  this before remote operations when previous tests may have torn down peers.
+  """
+  @spec ensure_node_reachable(atom(), keyword()) :: :ok | {:error, :noconnection}
+  def ensure_node_reachable(node_name, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 5_000)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_ensure_node_reachable(node_name, deadline)
+  end
+
+  @spec ensure_nodes_reachable([atom()], keyword()) :: :ok | {:error, {atom(), :noconnection}}
+  def ensure_nodes_reachable(node_names, opts \\ []) when is_list(node_names) do
+    Enum.reduce_while(node_names, :ok, fn node_name, :ok ->
+      case ensure_node_reachable(node_name, opts) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {node_name, reason}}}
+      end
+    end)
   end
 
   @doc """
@@ -296,6 +325,7 @@ defmodule Ferricstore.Test.ClusterHelper do
           _, _ -> :ok
         end
 
+        wait_peer_node_down(node_name)
         File.rm_rf(data_dir)
         :ok
 
@@ -319,6 +349,7 @@ defmodule Ferricstore.Test.ClusterHelper do
         _, _ -> :ok
       end
 
+      wait_peer_node_down(node.name)
       File.rm_rf(node.data_dir)
     end)
 
@@ -337,16 +368,27 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec kill_node([map()], map()) :: {map(), [map()]}
   def kill_node(nodes, target) when is_map(target) do
+    remaining = Enum.reject(nodes, &(&1.name == target.name))
+
     try do
       :peer.stop(target.peer)
     catch
       _, _ -> :ok
     end
 
-    remaining = Enum.reject(nodes, &(&1.name == target.name))
-
     for node <- remaining do
       :rpc.call(node.name, :erlang, :disconnect_node, [target.name])
+    end
+
+    wait_peer_node_down(target.name)
+
+    remaining
+    |> Enum.filter(fn node -> Process.alive?(node.peer) end)
+    |> Enum.map(& &1.name)
+    |> ensure_nodes_reachable(timeout: 15_000)
+    |> case do
+      :ok -> :ok
+      {:error, _reason} -> :ok
     end
 
     {target, remaining}
@@ -376,7 +418,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   @doc """
   Finds the current Raft leader for a shard.
 
-  Tries each node in order until one returns a successful `ra:members/1`
+  Tries each node in order until one returns a successful membership result.
   result.
 
   ## Returns
@@ -387,9 +429,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   def find_leader(nodes, shard \\ 0) do
     result =
       Enum.find_value(nodes, fn node ->
-        server_id = {:"ferricstore_shard_#{shard}", node.name}
-
-        case :rpc.call(node.name, :ra, :members, [server_id]) do
+        case members_on_node(node.name, shard) do
           {:ok, _members, {_leader_name, leader_node}} ->
             leader_node
 
@@ -411,7 +451,6 @@ defmodule Ferricstore.Test.ClusterHelper do
   def partition_node(node, all_nodes) do
     others = Enum.reject(all_nodes, &(&1.name == node.name))
     _other_names = Enum.map(others, & &1.name)
-    shards = :rpc.call(node.name, Application, :get_env, [:ferricstore, :shard_count, 4])
 
     # Suspend ClusterManager on ALL nodes to prevent auto-reconnect
     Enum.each(all_nodes, fn n ->
@@ -419,48 +458,54 @@ defmodule Ferricstore.Test.ClusterHelper do
       if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :suspend, [cm_pid])
     end)
 
-    # Stop ra servers on ALL nodes — ra monitors trigger reconnection
-    ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
+    # Stop the isolated node's consensus runtime. Majority-side nodes keep
+    # running so quorum writes continue while the node is unavailable.
+    stop_consensus(node.name)
 
-    for n <- all_nodes, i <- 0..(shards - 1) do
-      server_id = :rpc.call(n.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+    # Block only peer-to-peer reconnection. Do not change the partitioned
+    # node's own cookie: the test runner still needs RPC access in order to
+    # heal the partition deterministically.
+    cookie_state =
+      Enum.flat_map(others, fn other ->
+        node_to_other = :rpc.call(node.name, :erlang, :get_cookie, [other.name])
+        other_to_node = :rpc.call(other.name, :erlang, :get_cookie, [node.name])
+        nonce = :erlang.unique_integer([:positive])
+        blocked_from_node = :"partitioned_node_blocked_#{nonce}_a"
+        blocked_from_other = :"partitioned_node_blocked_#{nonce}_b"
 
-      try do
-        :rpc.call(n.name, :ra, :stop_server, [ra_system, server_id])
-      catch
-        _, _ -> :ok
-      end
-    end
+        :rpc.call(node.name, :erlang, :set_cookie, [other.name, blocked_from_node])
+        :rpc.call(other.name, :erlang, :set_cookie, [node.name, blocked_from_other])
 
-    # Block the partitioned node from accepting connections from peers
-    # by setting -connect_all false and using net_kernel:allow
-    # Actually, use erlang:set_cookie on the partitioned node ITSELF
-    # to a random value — this prevents ANY node from connecting to it
-    real_cookie = :rpc.call(node.name, :erlang, :get_cookie, [])
-    :rpc.call(node.name, :erlang, :set_cookie, [node.name, :partitioned_node_blocked])
+        [
+          {node.name, other.name, node_to_other},
+          {other.name, node.name, other_to_node}
+        ]
+      end)
 
-    # Disconnect
-    Enum.each(others, fn other ->
-      :rpc.call(node.name, :erlang, :disconnect_node, [other.name])
-      :rpc.call(other.name, :erlang, :disconnect_node, [node.name])
-    end)
+    # Disconnect and wait until both sides observe the split. Erlang
+    # distribution disconnect is asynchronous, and ra/ClusterManager monitors
+    # can briefly race by reconnecting before the poisoned peer cookies take
+    # effect.
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn ->
+        Enum.each(others, fn other ->
+          :rpc.call(node.name, :erlang, :disconnect_node, [other.name])
+          :rpc.call(other.name, :erlang, :disconnect_node, [node.name])
+        end)
 
-    Process.sleep(200)
+        Process.sleep(100)
+        assert_partition_disconnected!(node, others)
+      end,
+      "partition should disconnect #{node.name}",
+      50,
+      100
+    )
 
-    # Stash state and restart ra on majority side
-    Process.put({:partition_cookie, node.name}, real_cookie)
-
-    for n <- others, i <- 0..(shards - 1) do
-      server_id = :rpc.call(n.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-
-      try do
-        :rpc.call(n.name, :ra, :restart_server, [ra_system, server_id])
-      catch
-        _, _ -> :ok
-      end
-    end
+    # Stash state for the heal path.
+    Process.put({:partition_cookies, node.name}, cookie_state)
 
     # Wait for majority side to elect leaders (2-of-3 quorum)
+    shards = :rpc.call(hd(others).name, Application, :get_env, [:ferricstore, :shard_count, 4])
     wait_for_leaders(others, shards, timeout: 10_000)
 
     :ok
@@ -474,11 +519,15 @@ defmodule Ferricstore.Test.ClusterHelper do
   @spec heal_partition(map(), [map()]) :: :ok
   def heal_partition(node, all_nodes) do
     others = Enum.reject(all_nodes, &(&1.name == node.name))
-    shards = :rpc.call(node.name, Application, :get_env, [:ferricstore, :shard_count, 4])
 
-    # Restore the node's own cookie so distribution handshake works again
-    real_cookie = Process.get({:partition_cookie, node.name}, :ferricstore)
-    :rpc.call(node.name, :erlang, :set_cookie, [node.name, real_cookie])
+    # Restore every peer-to-peer cookie we poisoned in partition_node/2.
+    node.name
+    |> restored_partition_cookies()
+    |> Enum.each(fn {from, to, cookie} ->
+      :rpc.call(from, :erlang, :set_cookie, [to, cookie])
+    end)
+
+    normalize_cluster_cookies(all_nodes)
 
     # Reconnect from both sides — use erpc with short timeout to avoid blocking
     connect = fn from, to ->
@@ -497,33 +546,36 @@ defmodule Ferricstore.Test.ClusterHelper do
         end)
 
         Process.sleep(200)
-        peers = :rpc.call(node.name, :erlang, :nodes, [], 2_000)
         other_names = Enum.map(others, & &1.name)
 
-        connected =
-          if is_list(peers), do: Enum.filter(peers, fn n -> n in other_names end), else: []
+        node_peers =
+          case :rpc.call(node.name, :erlang, :nodes, [], 2_000) do
+            peers when is_list(peers) -> MapSet.new(peers)
+            _ -> MapSet.new()
+          end
 
-        if length(connected) < length(others) do
-          raise "#{node.name} sees #{length(connected)}/#{length(others)} peers"
+        peers_see_node? =
+          Enum.all?(others, fn other ->
+            case :rpc.call(other.name, :erlang, :nodes, [], 2_000) do
+              peers when is_list(peers) -> node.name in peers
+              _ -> false
+            end
+          end)
+
+        unless Enum.all?(other_names, &MapSet.member?(node_peers, &1)) and peers_see_node? do
+          seen = Enum.count(other_names, &MapSet.member?(node_peers, &1))
+          raise "#{node.name} sees #{seen}/#{length(others)} peers"
         end
+
+        true
       end,
       "heal should reconnect #{node.name}",
       40,
       500
     )
 
-    # Restart ra servers on the partitioned node
-    ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
-
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(node.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
-
-      try do
-        :rpc.call(node.name, :ra, :restart_server, [ra_system, server_id])
-      catch
-        _, _ -> :ok
-      end
-    end
+    # Restart consensus on the healed node.
+    start_consensus(node.name)
 
     # Resume ClusterManager on ALL nodes
     Enum.each(all_nodes, fn n ->
@@ -532,6 +584,56 @@ defmodule Ferricstore.Test.ClusterHelper do
     end)
 
     :ok
+  end
+
+  defp assert_partition_disconnected!(node, others) do
+    other_names = Enum.map(others, & &1.name)
+
+    node_peers =
+      case :rpc.call(node.name, :erlang, :nodes, [], 2_000) do
+        peers when is_list(peers) -> peers
+        other -> raise "#{node.name} peer list unavailable: #{inspect(other)}"
+      end
+
+    if Enum.any?(other_names, &(&1 in node_peers)) do
+      raise "#{node.name} still sees partition peers #{inspect(node_peers)}"
+    end
+
+    Enum.each(others, fn other ->
+      peers =
+        case :rpc.call(other.name, :erlang, :nodes, [], 2_000) do
+          peers when is_list(peers) -> peers
+          value -> raise "#{other.name} peer list unavailable: #{inspect(value)}"
+        end
+
+      if node.name in peers do
+        raise "#{other.name} still sees partitioned node #{node.name}"
+      end
+    end)
+  end
+
+  defp restored_partition_cookies(node_name) do
+    case Process.get({:partition_cookies, node_name}) do
+      cookies when is_list(cookies) ->
+        cookies
+
+      _ ->
+        # Compatibility for failures left behind by older helper versions.
+        case Process.get({:partition_cookie, node_name}) do
+          cookie when is_atom(cookie) -> [{node_name, node_name, cookie}]
+          _ -> []
+        end
+    end
+  end
+
+  defp normalize_cluster_cookies(nodes) do
+    cookie = Node.get_cookie()
+
+    Enum.each(nodes, fn from ->
+      Enum.each(nodes, fn to ->
+        :rpc.call(from.name, :erlang, :set_cookie, [to.name, cookie])
+      end)
+    end)
   end
 
   @doc """
@@ -544,6 +646,31 @@ defmodule Ferricstore.Test.ClusterHelper do
   @spec run(atom(), module(), atom(), [term()]) :: term()
   def run(node_name, module, function, args) do
     :rpc.call(node_name, module, function, args)
+  end
+
+  @doc """
+  Stops the WARaft runtime on a peer node while leaving the FerricStore app up.
+
+  Tests use this to model a node whose local consensus runtime is unavailable
+  without reaching into a legacy consensus implementation.
+  """
+  @spec stop_consensus(atom()) :: :ok | term()
+  def stop_consensus(node_name) do
+    :rpc.call(node_name, Ferricstore.Raft.WARaftBackend, :stop, [])
+  end
+
+  @doc """
+  Starts the WARaft runtime on a peer node using that node's default instance.
+  """
+  @spec start_consensus(atom()) :: :ok | term()
+  def start_consensus(node_name) do
+    case :rpc.call(node_name, FerricStore.Instance, :get, [:default]) do
+      %FerricStore.Instance{} = ctx ->
+        :rpc.call(node_name, Ferricstore.Raft.WARaftBackend, :start, [ctx, []])
+
+      other ->
+        {:error, {:default_instance_unavailable, other}}
+    end
   end
 
   @doc """
@@ -622,9 +749,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     all_ready =
       Enum.all?(shard_range, fn shard ->
         Enum.any?(nodes, fn node ->
-          server_id = {:"ferricstore_shard_#{shard}", node.name}
-
-          case :rpc.call(node.name, :ra, :members, [server_id]) do
+          case members_on_node(node.name, shard) do
             {:ok, members, _leader} when length(members) == expected_members ->
               true
 
@@ -645,7 +770,7 @@ defmodule Ferricstore.Test.ClusterHelper do
       System.monotonic_time(:millisecond) > deadline ->
         # Fall back to basic leader check — even if not all members are
         # visible yet, having a leader means the cluster is functional.
-        # This handles the case where ra reports fewer members during
+        # This handles the case where membership reports fewer members during
         # initial convergence. Give 15s extra for CI.
         do_wait_leaders(nodes, shard_range, deadline + 15_000)
 
@@ -665,9 +790,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     all_have_leaders =
       Enum.all?(shard_range, fn shard ->
         Enum.any?(nodes, fn node ->
-          server_id = {:"ferricstore_shard_#{shard}", node.name}
-
-          case :rpc.call(node.name, :ra, :members, [server_id]) do
+          case members_on_node(node.name, shard) do
             {:ok, _members, {_shard_name, leader_node}} ->
               MapSet.member?(alive_names, leader_node)
 
@@ -693,9 +816,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   defp do_wait_node_leaders(node_name, shard_range, deadline) do
     all_ready =
       Enum.all?(shard_range, fn shard ->
-        server_id = {:"ferricstore_shard_#{shard}", node_name}
-
-        case :rpc.call(node_name, :ra, :members, [server_id]) do
+        case members_on_node(node_name, shard) do
           {:ok, _members, _leader} -> true
           _ -> false
         end
@@ -731,6 +852,8 @@ defmodule Ferricstore.Test.ClusterHelper do
   end
 
   defp configure_remote_node(node_name, data_dir, shards) do
+    quiet_remote_logger(node_name)
+
     env_settings = [
       {:data_dir, data_dir},
       {:port, 0},
@@ -746,6 +869,12 @@ defmodule Ferricstore.Test.ClusterHelper do
     Enum.each(env_settings, fn {key, value} ->
       :ok = :rpc.call(node_name, Application, :put_env, [:ferricstore, key, value])
     end)
+  end
+
+  defp quiet_remote_logger(node_name) do
+    _ = :rpc.call(node_name, Application, :put_env, [:logger, :level, :warning])
+    _ = :rpc.call(node_name, Logger, :configure, [[level: :warning]])
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -789,28 +918,80 @@ defmodule Ferricstore.Test.ClusterHelper do
   # ---------------------------------------------------------------------------
 
   defp ensure_distribution! do
-    case Node.self() do
-      :nonode@nohost ->
-        unique = :erlang.unique_integer([:positive])
-        node_name = :"ferric_runner_#{unique}"
+    Ferricstore.Test.ShardHelpers.ensure_distribution_started!(:ferric_runner)
+  end
 
-        task = Task.async(fn -> Node.start(node_name, :shortnames) end)
+  defp wait_peer_node_down(node_name, attempts \\ 50)
 
-        case Task.yield(task, 10_000) || Task.shutdown(task, :brutal_kill) do
-          {:ok, {:ok, _}} ->
-            :ok
+  defp wait_peer_node_down(_node_name, 0), do: :ok
 
-          {:ok, {:error, reason}} ->
-            raise "Failed to start Erlang distribution (#{inspect(reason)}). " <>
-                    "Try running with: elixir --sname test -S mix test"
+  defp wait_peer_node_down(node_name, attempts) do
+    Node.disconnect(node_name)
 
-          _ ->
-            raise "Node.start timed out after 10s. " <>
-                    "Run with: elixir --sname test -S mix test"
-        end
-
-      _ ->
+    case Node.ping(node_name) do
+      :pang ->
         :ok
+
+      :pong ->
+        Process.sleep(100)
+        wait_peer_node_down(node_name, attempts - 1)
     end
+  end
+
+  defp do_ensure_node_reachable(node_name, deadline) do
+    case Node.ping(node_name) do
+      :pong ->
+        :ok
+
+      :pang ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :noconnection}
+        else
+          Process.sleep(100)
+          do_ensure_node_reachable(node_name, deadline)
+        end
+    end
+  end
+
+  defp ensure_peer_mesh_reachable(node_names, opts) do
+    timeout = Keyword.get(opts, :timeout, 15_000)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_ensure_peer_mesh_reachable(node_names, deadline)
+  end
+
+  defp do_ensure_peer_mesh_reachable(node_names, deadline) do
+    all_connected? =
+      Enum.all?(node_names, fn n1 ->
+        Enum.all?(node_names, fn
+          ^n1 ->
+            true
+
+          n2 ->
+            :rpc.call(n1, Node, :connect, [n2])
+            :rpc.call(n1, Node, :ping, [n2]) == :pong
+        end)
+      end)
+
+    cond do
+      all_connected? ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :peer_mesh_unreachable}
+
+      true ->
+        Process.sleep(100)
+        do_ensure_peer_mesh_reachable(node_names, deadline)
+    end
+  end
+
+  defp members_on_node(node_name, shard, timeout \\ :default)
+
+  defp members_on_node(node_name, shard, :default) do
+    :rpc.call(node_name, Ferricstore.Raft.Cluster, :members, [shard])
+  end
+
+  defp members_on_node(node_name, shard, timeout) do
+    :rpc.call(node_name, Ferricstore.Raft.Cluster, :members, [shard, timeout])
   end
 end

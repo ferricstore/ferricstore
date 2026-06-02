@@ -50,8 +50,8 @@ config :ferricstore, :health_port, 4000
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:data_dir` | `string` | `"data"` | Both | Root directory for Bitcask data files, Raft WAL, mmap structures, and hint files. Each shard gets a subdirectory. |
-| `:shard_count` | `integer` | `0` (auto) | Both | Number of shards. `0` = auto-detect via `System.schedulers_online()`. Each shard is a separate ETS table, Bitcask directory, and Raft group. More shards = more write parallelism but more file descriptors. Set at startup. |
+| `:data_dir` | `string` | `"data"` | Both | Root directory for Bitcask data files, WARaft segment logs, mmap structures, and hint files. Each shard gets a subdirectory. |
+| `:shard_count` | `integer` | `0` (auto) | Both | Number of shards. `0` = auto-detect via `System.schedulers_online()`. Each shard is a separate ETS table, Bitcask directory, and WARaft partition. More shards = more write parallelism but more file descriptors. Set at startup. |
 | `:hot_cache_max_value_size` | `integer` | `65_536` | Both | Maximum value size (bytes) stored in ETS hot cache. Values larger than this are stored as `nil` in ETS and read from Bitcask on access. Prevents large binaries from being copied on every ETS lookup. |
 | `:blob_side_channel_threshold_bytes` | `integer` | `262_144` | Both | Values at or above this size are stored in per-shard append blob segments with a small Bitcask reference. `0` disables the blob side channel. |
 | `:blob_gc_sweeper_enabled` | `boolean` | `true` | Both | Enables automatic conservative cleanup of stale tmp and legacy side-channel blob files. Append-segment record compaction is a separate maintenance path. |
@@ -705,7 +705,7 @@ These environment variables are read from `config/runtime.exs` in production (`M
 |----------|---------|-------------|
 | `FERRICSTORE_PORT` | `6379` | TCP port for RESP3 listener |
 | `FERRICSTORE_HEALTH_PORT` | `6380` | HTTP health/metrics port |
-| `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, Raft WAL, mmap) |
+| `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, WARaft segments, mmap) |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards. `0` = `System.schedulers_online()` |
 
 ### Memory & Eviction
@@ -769,21 +769,16 @@ These environment variables are read from `config/runtime.exs` in production (`M
 |----------|---------|-------------|
 | `FERRICSTORE_SOCKET_ACTIVE_MODE` | `true` | TCP active mode: `true`, `once`, or integer N |
 
-### Raft Internals
+### WARaft Internals
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRICSTORE_RELEASE_CURSOR_INTERVAL` | `10000` | Raft snapshot interval (applies between snapshots) |
-| `FERRICSTORE_RA_WAL_MAX_SIZE_BYTES` | `8589934592` (8 GiB) | Max active Ra WAL file size before rollover. Larger values reduce rollover/segment-flush tail spikes on high-throughput write workloads. |
-| `FERRICSTORE_RA_SEGMENT_MAX_SIZE_BYTES` | `256000000` | Max Ra segment file size written after WAL rollover. |
-| `FERRICSTORE_WAL_COMMIT_DELAY_US` | `6000` | Max adaptive Ra WAL group-commit delay in microseconds. |
-| `FERRICSTORE_RAFT_PIPELINE_PRIORITY` | `low` | Ra pipeline priority for hot writes: `low` favors Ra batching; `normal` is for regression isolation. |
-| `FERRICSTORE_RAFT_BATCHER_MAX_BATCH_BYTES` | `4194304` (4 MiB) | Max estimated payload bytes per Batcher slot before an early Ra submit. Keeps large SET pipelines from forming very large WAL terms while preserving high small-value batching. |
-| `FERRICSTORE_RAFT_BATCHER_MAX_PENDING_BYTES` | `0` (disabled) | Max serialized Ra payload bytes in flight per shard Batcher before overload backpressure. Set a positive value, for example `268435456` for 256 MiB, to bound large-payload bursts while allowing one oversized write through on an empty queue. |
-| `FERRICSTORE_RAFT_DIRECT_BATCH_COMMANDS` | `true` | Submit homogeneous SET/DEL pipeline runs as final compact Ra terms instead of generic per-command batches. |
-| `FERRICSTORE_RAFT_COMPACT_HOT_BATCHES` | `true` | Compact homogeneous generic Ra batches into `put_batch` / `delete_batch` terms inside the batcher. |
-| `FERRICSTORE_RAFT_PUT_BATCH_APPLY_FAST_PATH` | `true` | Use the state-machine SET batch fast path that stages Bitcask records and publishes ETS after append success. |
-| `FERRICSTORE_RAFT_DELETE_BATCH_APPLY_FAST_PATH` | `true` | Use the state-machine DEL batch fast path that stages tombstones and deletes ETS after append success. |
+| `FERRICSTORE_RELEASE_CURSOR_INTERVAL` | `200000` | Applied-entry interval for emitting release-cursor effects. |
+| `FERRICSTORE_WAL_COMMIT_DELAY_US` | `6000` | Max adaptive WARaft segment group-commit delay in microseconds. |
+| `FERRICSTORE_WARAFT_LOG_ROTATION_INTERVAL` | `50000` | WARaft segment rotation interval in entries. |
+| `FERRICSTORE_WARAFT_LOG_ROTATION_KEEP` | `100000` | Entries to keep around rotation/compaction boundaries. |
+| `FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES` | `100000` | Max retained entries after release-cursor trimming. |
+| `FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES` | adaptive | Per-shard cap for WARaft-applied Flow rows waiting for lagged LMDB/history projection. Too low can force synchronous spill/compaction during terminal Flow bursts; validate changes with the DBOS-style 1M Flow benchmark. |
 | `FERRICSTORE_MAX_ACTIVE_FILE_SIZE` | `8589934592` (8 GiB) | Max active Bitcask file size before rollover. Larger values reduce active-file rotation tail spikes on high-throughput write workloads. |
 | `FERRICSTORE_PROMOTION_THRESHOLD` | `100` | Field count to promote collection to dedicated Bitcask |
 

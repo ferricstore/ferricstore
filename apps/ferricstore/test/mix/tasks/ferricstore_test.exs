@@ -55,6 +55,18 @@ defmodule Mix.Tasks.FerricstoreTest do
       assert output =~ "shard_0:"
     end
 
+    test "uses backend-aware membership lookup" do
+      source =
+        Path.expand("../../../lib/mix/tasks/ferricstore.info.ex", __DIR__)
+        |> File.read!()
+
+      refute source =~ ":" <> "ra.members(",
+             "info task must not bypass Ferricstore.Raft.Cluster.members/1 when WARaft is selected"
+
+      assert source =~ "Ferricstore.Raft.Cluster.members(shard_index, 1_000)",
+             "info task membership probes must stay bounded under WARaft"
+    end
+
     test "reflects actual key count after writes" do
       baseline = length(Router.keys(FerricStore.Instance.get(:default)))
       Router.put(FerricStore.Instance.get(:default), "info_test_key1", "v1")

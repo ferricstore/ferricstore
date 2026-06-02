@@ -102,6 +102,26 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
 
   defp ukey(name), do: "ao_#{name}_#{:rand.uniform(999_999)}"
 
+  defp eventually(fun, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    eventually(fun, deadline, nil)
+  end
+
+  defp eventually(fun, deadline, last) do
+    case fun.() do
+      true ->
+        :ok
+
+      other ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("condition was not met, last value: #{inspect(other || last)}")
+        else
+          Process.sleep(20)
+          eventually(fun, deadline, other)
+        end
+    end
+  end
+
   # Polls PUBSUB NUMSUB until the channel has at least 1 subscriber.
   # Prevents race between SUBSCRIBE returning and PUBLISH finding the subscriber.
   defp wait_for_subscription(port, channel, timeout \\ 3_000) do
@@ -113,7 +133,9 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
         send_cmd(sock, ["PUBSUB", "NUMSUB", channel])
 
         case recv_response(sock) do
-          [^channel, count] when is_integer(count) and count > 0 -> {:halt, :ok}
+          [^channel, count] when is_integer(count) and count > 0 ->
+            {:halt, :ok}
+
           _ ->
             if System.monotonic_time(:millisecond) > deadline do
               {:halt, :timeout}
@@ -138,7 +160,9 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
         send_cmd(sock, ["PUBSUB", "NUMPAT"])
 
         case recv_response(sock) do
-          count when is_integer(count) and count > 0 -> {:halt, :ok}
+          count when is_integer(count) and count > 0 ->
+            {:halt, :ok}
+
           _ ->
             if System.monotonic_time(:millisecond) > deadline do
               {:halt, :timeout}
@@ -533,6 +557,45 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
       send_cmd(sock2, ["GET", k])
       assert recv_response(sock2) == "before_close"
       :gen_tcp.close(sock2)
+    end
+
+    test "blocked BLPOP client disconnect unregisters waiter promptly", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("blocked_disconnect")
+
+      send_cmd(sock, ["BLPOP", k, "5"])
+      eventually(fn -> Ferricstore.Waiters.count(k) == 1 end, 1_000)
+
+      :gen_tcp.close(sock)
+
+      eventually(fn -> Ferricstore.Waiters.count(k) == 0 end, 500)
+    end
+
+    test "blocked BLPOP enforces buffered input limit while waiting", %{port: port} do
+      old_limit =
+        Application.get_env(:ferricstore_server, :blocked_command_buffer_max_bytes)
+
+      Application.put_env(:ferricstore_server, :blocked_command_buffer_max_bytes, 64)
+
+      on_exit(fn ->
+        if old_limit == nil do
+          Application.delete_env(:ferricstore_server, :blocked_command_buffer_max_bytes)
+        else
+          Application.put_env(:ferricstore_server, :blocked_command_buffer_max_bytes, old_limit)
+        end
+      end)
+
+      sock = connect_and_hello(port)
+      k = ukey("blocked_buffer_limit")
+
+      send_cmd(sock, ["BLPOP", k, "5"])
+      eventually(fn -> Ferricstore.Waiters.count(k) == 1 end, 1_000)
+
+      :ok = :gen_tcp.send(sock, :binary.copy("x", 128))
+
+      assert {:error, "ERR blocked command buffer overflow" <> _} = recv_response(sock, 1_000)
+
+      eventually(fn -> Ferricstore.Waiters.count(k) == 0 end, 500)
     end
 
     test "server handles rapid connect/disconnect cycles", %{port: port} do

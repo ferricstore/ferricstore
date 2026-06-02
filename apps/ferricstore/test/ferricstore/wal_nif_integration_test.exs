@@ -1,7 +1,8 @@
 defmodule Ferricstore.WalNifIntegrationTest do
   @moduledoc """
-  Integration tests for the Rust NIF WAL module wired into ra_log_wal.
-  Tests the full pipeline: Batcher → {ttb} → ra_log → ra_log_wal → NIF → disk.
+  Integration tests for the Rust NIF WAL module used by WARaft segments.
+  Tests that normal Router writes flow through the replicated storage path and
+  remain readable.
   """
 
   use ExUnit.Case, async: false
@@ -23,10 +24,10 @@ defmodule Ferricstore.WalNifIntegrationTest do
   defp ctx, do: FerricStore.Instance.get(:default)
 
   # ---------------------------------------------------------------------------
-  # {ttb} pre-serialization pipeline
+  # Replicated write pipeline
   # ---------------------------------------------------------------------------
 
-  describe "{ttb} pre-serialization" do
+  describe "WARaft segment writes" do
     test "write and read back through Raft" do
       key = ukey("ttb_rw")
       :ok = Router.put(ctx(), key, "hello_ttb", 0)
@@ -175,6 +176,27 @@ defmodule Ferricstore.WalNifIntegrationTest do
   describe "NIF WAL activation" do
     test "ferricstore_wal_nif module is loaded" do
       assert Code.ensure_loaded?(:ferricstore_wal_nif)
+    end
+
+    test "raw append handle is exported and usable for segment logs" do
+      path = Path.join(System.tmp_dir!(), "ferricstore-wal-raw-#{System.unique_integer([:positive])}.log")
+      File.rm(path)
+
+      try do
+        assert {:ok, handle} = :ferricstore_wal_nif.open_raw_append(path, 0, 1024 * 1024, 0)
+        assert :ok = :ferricstore_wal_nif.write(handle, ["abc", "def"])
+
+        ref = make_ref()
+        assert :ok = :ferricstore_wal_nif.sync_with_delay(handle, self(), ref, 0)
+        assert_receive {synced, ^ref, position} when synced in [:wal_sync_complete, :wal_sync_error], 5_000
+        assert synced == :wal_sync_complete
+        assert position >= 6
+        assert {:ok, 6} = :ferricstore_wal_nif.position(handle)
+        assert {:ok, "abcdef"} = :ferricstore_wal_nif.pread(handle, 0, 6)
+        assert :ok = :ferricstore_wal_nif.close(handle)
+      after
+        File.rm(path)
+      end
     end
 
     test "writes work (proves NIF is active)" do

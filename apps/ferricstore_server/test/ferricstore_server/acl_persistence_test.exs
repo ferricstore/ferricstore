@@ -127,7 +127,7 @@ defmodule FerricstoreServer.AclPersistenceTest do
     end
 
     test "denied commands are serialized as -command", %{tmp_dir: dir} do
-      assert :ok = Acl.set_user("alice", ["on", "-flushdb", "-debug"])
+      assert :ok = Acl.set_user("alice", ["on", "+@all", "-flushdb", "-debug"])
       assert :ok = Acl.save(dir)
 
       contents = File.read!(Acl.acl_file_path(dir))
@@ -215,6 +215,45 @@ defmodule FerricstoreServer.AclPersistenceTest do
       assert Acl.get_user("alice") != nil
     end
 
+    test "load does not expose an empty or partial ACL table while swapping snapshots" do
+      parent = self()
+      assert :ok = Acl.set_user("alice", ["on", "nopass", "~*", "+@all"])
+
+      contents = """
+      user default on nopass ~* &* +@all
+      user bob on nopass ~* &* +@all
+      """
+
+      :persistent_term.put(:ferricstore_acl_before_load_swap_hook, fn ->
+        send(parent, {:load_swap_seen, Acl.get_user("alice"), Acl.get_user("bob")})
+      end)
+
+      on_exit(fn -> :persistent_term.erase(:ferricstore_acl_before_load_swap_hook) end)
+
+      assert :ok = Acl.load_contents(contents)
+      assert_received {:load_swap_seen, alice_during_swap, bob_during_swap}
+      assert alice_during_swap != nil
+      assert bob_during_swap == nil
+      assert Acl.get_user("alice") == nil
+      assert Acl.get_user("bob") != nil
+    end
+
+    test "load keeps the previous ACL snapshot readable for in-flight readers" do
+      assert :ok = Acl.set_user("alice", ["on", "nopass", "~*", "+@all"])
+      old_table = :ets.whereis(:ferricstore_acl)
+      assert [{"alice", _user}] = :ets.lookup(old_table, "alice")
+
+      contents = """
+      user default on nopass ~* &* +@all
+      user bob on nopass ~* &* +@all
+      """
+
+      assert :ok = Acl.load_contents(contents)
+      assert [{"alice", _user}] = :ets.lookup(old_table, "alice")
+      assert Acl.get_user("alice") == nil
+      assert Acl.get_user("bob") != nil
+    end
+
     test "returns error for missing file", %{tmp_dir: dir} do
       assert {:error, msg} = Acl.load(dir)
       assert msg =~ "no ACL file"
@@ -278,7 +317,7 @@ defmodule FerricstoreServer.AclPersistenceTest do
     end
 
     test "preserves denied commands (denied_commands MapSet)", %{tmp_dir: dir} do
-      assert :ok = Acl.set_user("alice", ["on", "-flushdb", "-debug"])
+      assert :ok = Acl.set_user("alice", ["on", "+@all", "-flushdb", "-debug"])
       assert :ok = Acl.save(dir)
 
       Acl.reset!()
@@ -656,7 +695,7 @@ defmodule FerricstoreServer.AclPersistenceTest do
     end
 
     test "loaded denied commands are enforced", %{tmp_dir: dir} do
-      assert :ok = Acl.set_user("alice", ["on", ">pass", "-flushdb"])
+      assert :ok = Acl.set_user("alice", ["on", ">pass", "+@all", "-flushdb"])
       assert :ok = Acl.save(dir)
 
       Acl.reset!()

@@ -1,0 +1,40 @@
+%%% Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+%%%
+%%% This source code is licensed under the Apache 2.0 license found in
+%%% the LICENSE file in the root directory of this source tree.
+%%%
+%%% Pluggable distribution interface. The default implementation uses Erlang
+%%% distribution.
+
+-module(wa_raft_distribution).
+-compile(warn_missing_spec_all).
+
+-export([
+    cast/3
+]).
+
+-include_lib("wa_raft/include/wa_raft.hrl").
+
+-type dest_addr() :: {Name :: atom(), Node :: node()}.
+
+-export_type([
+    dest_addr/0
+]).
+
+%%% ------------------------------------------------------------------------
+%%%  Behaviour callbacks
+%%%
+
+-callback cast(dest_addr(), #raft_identifier{}, term()) -> ok | term().
+
+%%% ------------------------------------------------------------------------
+%%%  Erlang distribution default implementation
+%%%
+
+-spec cast(DestAddr :: dest_addr(), Identifier :: #raft_identifier{}, Message :: term()) -> ok | {error, Reason} when
+    Reason :: noconnect | nosuspend.
+cast(DestAddr, _Identifier, Message) ->
+    case erlang:send(DestAddr, {'$gen_cast', Message}, [noconnect, nosuspend]) of
+        ok -> ok;
+        Reason -> {error, Reason}
+    end.

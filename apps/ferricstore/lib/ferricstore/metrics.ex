@@ -26,6 +26,7 @@ defmodule Ferricstore.Metrics do
   | `ferricstore_slowlog_entries`            | gauge   | `SlowLog.len/0`              |
   | `ferricstore_namespace_window_ms`        | gauge   | `NamespaceConfig.get_all/0`   |
   | `ferricstore_bitcask_*`                  | gauge   | per-shard checkpoint atomics  |
+  | `ferricstore_waraft_inflight_commit_bytes` | gauge | WARaft byte admission counters |
   | `ferricstore_prefix_*`                   | mixed   | `PrefixMetricsCache`          |
   | `ferricstore_quorum_*`                   | counter | `QuorumMetrics` telemetry     |
   | `ferricstore_flow_lmdb_*`                | gauge   | per-shard projection atomics  |
@@ -40,6 +41,7 @@ defmodule Ferricstore.Metrics do
   """
 
   alias Ferricstore.Stats
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.BlobStore
 
   @type metric_type :: :counter | :gauge
@@ -347,6 +349,56 @@ defmodule Ferricstore.Metrics do
         fn shard -> atomic_metric(ctx, :flow_lmdb_writer_flush_failures, shard) end
       ),
       checkpoint_metric_family(
+        "ferricstore_flow_history_projected_index",
+        "Last Flow history projection Raft index durably persisted per shard",
+        fn shard -> atomic_metric(ctx, :flow_history_projected_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_history_requested_index",
+        "Highest Flow history projection Raft index requested per shard",
+        fn shard -> atomic_metric(ctx, :flow_history_requested_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_history_projection_lag",
+        "Difference between requested and durable Flow history projection index per shard",
+        fn shard ->
+          requested = atomic_metric(ctx, :flow_history_requested_index, shard)
+          durable = atomic_metric(ctx, :flow_history_projected_index, shard)
+
+          max(requested - durable, 0)
+        end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_history_projector_pending_entries",
+        "Current pending Flow history projection entries per shard",
+        fn shard -> atomic_metric(ctx, :flow_history_projector_pending_entries, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_history_projector_oldest_pending_age_us",
+        "Oldest pending Flow history projection entry age in microseconds per shard",
+        fn shard -> atomic_metric(ctx, :flow_history_projector_oldest_pending_age_us, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_history_projector_flush_failures_total",
+        "Total Flow history projector flush failures per shard",
+        fn shard -> atomic_metric(ctx, :flow_history_projector_flush_failures, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_history_projector_queue_full_total",
+        "Total Flow history projector queue-full rejections per shard",
+        fn shard -> atomic_metric(ctx, :flow_history_projector_queue_full, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_blob_hardened_protections",
+        "Current hardened blob protections pending reconcile per shard",
+        fn shard -> blob_hardened_stat(ctx, shard, :count) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_blob_hardened_oldest_age_ms",
+        "Oldest hardened blob protection age in milliseconds per shard",
+        fn shard -> blob_hardened_stat(ctx, shard, :oldest_age_ms) end
+      ),
+      checkpoint_metric_family(
         "ferricstore_bitcask_release_cursor_gap",
         "Difference between last applied and last released Raft cursor per shard",
         fn shard ->
@@ -375,6 +427,11 @@ defmodule Ferricstore.Metrics do
         "ferricstore_bitcask_checkpoint_in_flight",
         "Whether a Bitcask fsync checkpoint is currently in flight",
         fn shard -> atomic_metric(ctx, :checkpoint_in_flight, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_waraft_inflight_commit_bytes",
+        "WARaft commit bytes currently admitted and awaiting reply per shard",
+        fn shard -> WARaftBackend.inflight_commit_bytes(shard) end
       )
     ]
     |> Enum.join("\n")
@@ -389,6 +446,17 @@ defmodule Ferricstore.Metrics do
 
     "# HELP #{name} #{help}\n# TYPE #{name} gauge\n#{samples}"
   end
+
+  defp blob_hardened_stat(%{data_dir: data_dir}, shard, field)
+       when is_binary(data_dir) and is_integer(shard) do
+    data_dir
+    |> BlobStore.hardened_protection_stats(shard)
+    |> Map.get(field, 0)
+  rescue
+    _ -> 0
+  end
+
+  defp blob_hardened_stat(_ctx, _shard, _field), do: 0
 
   defp atomic_metric(nil, _field, _shard), do: 0
 

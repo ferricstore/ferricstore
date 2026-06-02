@@ -79,7 +79,7 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
       kill_shard_and_wait(k)
 
       # Lists go through the Raft state machine as serialized blobs.
-      # During shard restart, Raft WAL replay re-applies list_op on
+      # During shard restart, WARaft segment replay re-applies list_op on
       # empty ETS, then recover_keydir overwrites the ETS entry with a
       # cold pointer. The cold read from Bitcask should return the blob.
       ShardHelpers.eventually(fn ->
@@ -91,7 +91,7 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
       {:ok, after_crash} = FerricStore.lrange(k, 0, -1)
 
       # The list should contain exactly the original elements after recovery.
-      # If the Raft WAL replay + Bitcask recovery cooperate correctly, we
+      # If WARaft segment replay + Bitcask recovery cooperate correctly, we
       # get the original list. If not, at minimum writes must still work.
       if after_crash == ["a", "b", "c"] do
         # Full recovery succeeded -- verify continued writes
@@ -100,7 +100,7 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
         assert with_new == ["a", "b", "c", "d"]
       else
         # Known limitation: list data may be lost or duplicated during
-        # Raft WAL replay + Bitcask keydir recovery interaction. Assert
+        # WARaft segment replay + Bitcask keydir recovery interaction. Assert
         # writes still work after recovery.
         {:ok, _} = FerricStore.rpush(k, ["x", "y", "z"])
         {:ok, fresh} = FerricStore.lrange(k, 0, -1)

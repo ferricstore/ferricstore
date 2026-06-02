@@ -14,8 +14,11 @@ defmodule Ferricstore.Stats do
 
   ## Hot/cold read tracking
 
-  Every read through `Router.get/1` is classified as either *hot* (served from
-  ETS) or *cold* (required a Bitcask disk read). Counts are tracked at two
+  User-facing KV reads through `Router.get/1` are classified as either *hot*
+  (served from ETS) or *cold* (required a Bitcask disk read). Flow, compound
+  data-structure, and other internal storage keys are excluded so dashboard
+  cache stats describe client KV access instead of background/index reads.
+  Counts are tracked at two
   levels:
 
   1. **Global** — via atomic counters (slots 3 and 4), used for `INFO stats`.
@@ -62,6 +65,7 @@ defmodule Ferricstore.Stats do
   @max_tracked_prefixes 1000
   @keyspace_hit_sample_acc {__MODULE__, :keyspace_hit_sample_acc}
   @keyspace_miss_sample_acc {__MODULE__, :keyspace_miss_sample_acc}
+  @cache_tracking_disabled {__MODULE__, :cache_tracking_disabled}
 
   # ---------------------------------------------------------------------------
   # Types
@@ -232,21 +236,25 @@ defmodule Ferricstore.Stats do
   def sample_keyspace_misses(_ctx, 0), do: :ok
 
   def sample_keyspace_misses(ctx, count) when is_integer(count) and count > 0 do
-    rate = ctx.read_sample_rate
-
-    if rate <= 1 do
-      incr_keyspace_misses(ctx, count)
+    if cache_tracking_enabled?() do
+      do_sample_keyspace_misses(ctx, count)
     else
-      key = {@keyspace_miss_sample_acc, ctx.stats_counter}
-      total = Process.get(key, 0) + count
-      sampled = div(total, rate)
-      remainder = rem(total, rate)
+      :ok
+    end
+  end
 
-      if sampled > 0 do
-        incr_keyspace_misses(ctx, sampled)
-      end
+  @doc false
+  @spec sample_keyspace_misses_for_key(FerricStore.Instance.t(), binary(), non_neg_integer()) ::
+          :ok
+  def sample_keyspace_misses_for_key(ctx, key, count \\ 1)
 
-      Process.put(key, remainder)
+  def sample_keyspace_misses_for_key(_ctx, _key, 0), do: :ok
+
+  def sample_keyspace_misses_for_key(ctx, key, count)
+      when is_binary(key) and is_integer(count) and count > 0 do
+    if track_cache_stats?(key) do
+      do_sample_keyspace_misses(ctx, count)
+    else
       :ok
     end
   end
@@ -264,25 +272,59 @@ defmodule Ferricstore.Stats do
   def sample_keyspace_hits(_ctx, 0), do: 0
 
   def sample_keyspace_hits(ctx, count) when is_integer(count) and count > 0 do
-    rate = ctx.read_sample_rate
-
-    if rate <= 1 do
-      incr_keyspace_hits(ctx, count)
-      count
+    if cache_tracking_enabled?() do
+      do_sample_keyspace_hits(ctx, count)
     else
-      key = {@keyspace_hit_sample_acc, ctx.stats_counter}
-      total = Process.get(key, 0) + count
-      sampled = div(total, rate)
-      remainder = rem(total, rate)
-
-      if sampled > 0 do
-        incr_keyspace_hits(ctx, sampled)
-      end
-
-      Process.put(key, remainder)
-      sampled
+      0
     end
   end
+
+  @doc false
+  @spec sample_keyspace_hits_for_key(FerricStore.Instance.t(), binary(), non_neg_integer()) ::
+          non_neg_integer()
+  def sample_keyspace_hits_for_key(ctx, key, count \\ 1)
+
+  def sample_keyspace_hits_for_key(_ctx, _key, 0), do: 0
+
+  def sample_keyspace_hits_for_key(ctx, key, count)
+      when is_binary(key) and is_integer(count) and count > 0 do
+    if track_cache_stats?(key) do
+      do_sample_keyspace_hits(ctx, count)
+    else
+      0
+    end
+  end
+
+  @doc false
+  @spec with_cache_tracking_disabled((-> result)) :: result when result: var
+  def with_cache_tracking_disabled(fun) when is_function(fun, 0) do
+    previous = Process.get(@cache_tracking_disabled, false)
+    Process.put(@cache_tracking_disabled, true)
+
+    try do
+      fun.()
+    after
+      if previous do
+        Process.put(@cache_tracking_disabled, true)
+      else
+        Process.delete(@cache_tracking_disabled)
+      end
+    end
+  end
+
+  @doc false
+  @spec cache_tracking_enabled?() :: boolean()
+  def cache_tracking_enabled? do
+    Process.get(@cache_tracking_disabled, false) != true
+  end
+
+  @doc false
+  @spec cache_tracking_key?(term()) :: boolean()
+  def cache_tracking_key?(key) when is_binary(key) do
+    not flow_internal_key?(key) and not compound_internal_key?(key)
+  end
+
+  def cache_tracking_key?(_key), do: false
 
   @doc false
   @spec start_keyspace_hit_batch(FerricStore.Instance.t(), non_neg_integer()) ::
@@ -290,20 +332,24 @@ defmodule Ferricstore.Stats do
           | {:sampled_no_touch, pos_integer(), non_neg_integer(), non_neg_integer()}
           | {:sampled_touch, pos_integer(), non_neg_integer(), non_neg_integer(), pos_integer()}
   def start_keyspace_hit_batch(ctx, max_hits) when is_integer(max_hits) and max_hits >= 0 do
-    rate = ctx.read_sample_rate
+    if cache_tracking_enabled?() do
+      rate = ctx.read_sample_rate
 
-    if rate <= 1 do
-      {:exact, 0}
-    else
-      key = {@keyspace_hit_sample_acc, ctx.stats_counter}
-      previous = Process.get(key, 0)
-      next_sample_offset = rate - previous
-
-      if max_hits < next_sample_offset do
-        {:sampled_no_touch, rate, previous, 0}
+      if rate <= 1 do
+        {:exact, 0}
       else
-        {:sampled_touch, rate, previous, 0, next_sample_offset}
+        key = {@keyspace_hit_sample_acc, ctx.stats_counter}
+        previous = Process.get(key, 0)
+        next_sample_offset = rate - previous
+
+        if max_hits < next_sample_offset do
+          {:sampled_no_touch, rate, previous, 0}
+        else
+          {:sampled_touch, rate, previous, 0, next_sample_offset}
+        end
       end
+    else
+      {:exact, 0}
     end
   end
 
@@ -432,20 +478,26 @@ defmodule Ferricstore.Stats do
   """
   @spec record_hot_read(binary()) :: :ok
   def record_hot_read(key) when is_binary(key) do
-    :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_hot_reads, 1)
-    prefix = extract_prefix(key)
-    resolved = resolve_prefix(prefix)
-    update_hotness(resolved, :hot)
+    if track_cache_stats?(key) do
+      :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_hot_reads, 1)
+      prefix = extract_prefix(key)
+      resolved = resolve_prefix(prefix)
+      update_hotness(resolved, :hot)
+    end
+
     :ok
   end
 
   @doc "Records a hot read using instance ctx."
   @spec record_hot_read(FerricStore.Instance.t(), binary()) :: :ok
   def record_hot_read(ctx, key) when is_binary(key) do
-    :counters.add(ctx.stats_counter, @counter_hot_reads, 1)
-    prefix = extract_prefix(key)
-    resolved = resolve_prefix(prefix)
-    update_hotness(resolved, :hot)
+    if track_cache_stats?(key) do
+      :counters.add(ctx.stats_counter, @counter_hot_reads, 1)
+      prefix = extract_prefix(key)
+      resolved = resolve_prefix(prefix)
+      update_hotness(resolved, :hot)
+    end
+
     :ok
   end
 
@@ -461,20 +513,26 @@ defmodule Ferricstore.Stats do
   """
   @spec record_cold_read(binary()) :: :ok
   def record_cold_read(key) when is_binary(key) do
-    :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_cold_reads, 1)
-    prefix = extract_prefix(key)
-    resolved = resolve_prefix(prefix)
-    update_hotness(resolved, :cold)
+    if track_cache_stats?(key) do
+      :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_cold_reads, 1)
+      prefix = extract_prefix(key)
+      resolved = resolve_prefix(prefix)
+      update_hotness(resolved, :cold)
+    end
+
     :ok
   end
 
   @doc "Records a cold read using instance ctx."
   @spec record_cold_read(FerricStore.Instance.t(), binary()) :: :ok
   def record_cold_read(ctx, key) when is_binary(key) do
-    :counters.add(ctx.stats_counter, @counter_cold_reads, 1)
-    prefix = extract_prefix(key)
-    resolved = resolve_prefix(prefix)
-    update_hotness(resolved, :cold)
+    if track_cache_stats?(key) do
+      :counters.add(ctx.stats_counter, @counter_cold_reads, 1)
+      prefix = extract_prefix(key)
+      resolved = resolve_prefix(prefix)
+      update_hotness(resolved, :cold)
+    end
+
     :ok
   end
 
@@ -695,6 +753,60 @@ defmodule Ferricstore.Stats do
     :counters.get(FerricStore.Instance.get(:default).stats_counter, index)
   rescue
     ArgumentError -> 0
+  end
+
+  defp track_cache_stats?(key) when is_binary(key) do
+    cache_tracking_enabled?() and cache_tracking_key?(key)
+  end
+
+  defp do_sample_keyspace_misses(ctx, count) do
+    rate = ctx.read_sample_rate
+
+    if rate <= 1 do
+      incr_keyspace_misses(ctx, count)
+    else
+      key = {@keyspace_miss_sample_acc, ctx.stats_counter}
+      total = Process.get(key, 0) + count
+      sampled = div(total, rate)
+      remainder = rem(total, rate)
+
+      if sampled > 0 do
+        incr_keyspace_misses(ctx, sampled)
+      end
+
+      Process.put(key, remainder)
+      :ok
+    end
+  end
+
+  defp do_sample_keyspace_hits(ctx, count) do
+    rate = ctx.read_sample_rate
+
+    if rate <= 1 do
+      incr_keyspace_hits(ctx, count)
+      count
+    else
+      key = {@keyspace_hit_sample_acc, ctx.stats_counter}
+      total = Process.get(key, 0) + count
+      sampled = div(total, rate)
+      remainder = rem(total, rate)
+
+      if sampled > 0 do
+        incr_keyspace_hits(ctx, sampled)
+      end
+
+      Process.put(key, remainder)
+      sampled
+    end
+  end
+
+  defp flow_internal_key?(<<"f:{", _rest::binary>>), do: true
+  defp flow_internal_key?(_key), do: false
+
+  defp compound_internal_key?(<<"XG:", _rest::binary>>), do: true
+
+  defp compound_internal_key?(key) do
+    Ferricstore.Store.CompoundKey.internal_key?(key)
   end
 
   # Resolves the prefix to track: if the hotness table already has this prefix

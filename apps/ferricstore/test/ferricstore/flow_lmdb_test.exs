@@ -1,6 +1,42 @@
 defmodule Ferricstore.Flow.LMDBTest do
   use ExUnit.Case, async: false
 
+  defmodule FlushProbeWriter do
+    use GenServer
+
+    def start_link(opts) do
+      GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+    end
+
+    @impl true
+    def init(opts) do
+      {:ok,
+       %{
+         parent: Keyword.fetch!(opts, :parent),
+         shard_index: Keyword.fetch!(opts, :shard_index)
+       }}
+    end
+
+    @impl true
+    def handle_call(:flush, _from, state) do
+      send(state.parent, {:flush_entered, state.shard_index})
+
+      receive do
+        :release_flush -> :ok
+      after
+        2_000 -> :ok
+      end
+
+      {:reply, :ok, state}
+    end
+
+    @impl true
+    def handle_cast(:suspend_without_flush, state) do
+      send(state.parent, {:suspend_without_flush, state.shard_index})
+      {:noreply, state}
+    end
+  end
+
   test "warm opens an empty shard env before first user read" do
     path =
       Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
@@ -11,6 +47,35 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :ok = Ferricstore.Flow.LMDB.warm(path)
     assert File.dir?(path)
     assert :not_found = Ferricstore.Flow.LMDB.get(path, "missing")
+  end
+
+  test "release_all drops cached envs without losing persisted data" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_release_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn ->
+      Ferricstore.Flow.LMDB.release_all()
+      File.rm_rf!(path)
+    end)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "key", "value"}])
+    assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "key")
+
+    assert {:ok, released} = Ferricstore.Flow.LMDB.release_all()
+    assert released >= 1
+
+    assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "key")
+  end
+
+  test "mode parser supports explicit off lagged and legacy boolean values" do
+    assert Ferricstore.Flow.LMDB.normalize_mode("off") == :off
+    assert Ferricstore.Flow.LMDB.normalize_mode("false") == :off
+    assert Ferricstore.Flow.LMDB.normalize_mode("mirror") == :lagged
+    assert Ferricstore.Flow.LMDB.normalize_mode("lagged") == :lagged
+    assert Ferricstore.Flow.LMDB.normalize_mode("true") == :lagged
   end
 
   test "read-only operations do not open a missing LMDB env" do
@@ -29,6 +94,265 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, []} = Ferricstore.Flow.LMDB.prefix_entries(path, "prefix", 10, true)
     assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(path, "prefix")
     refute File.exists?(path)
+  end
+
+  test "flush marker check does not open empty pre-created shard dirs" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_empty_dirs_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 2)
+    assert :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(data_dir, 2)
+
+    for shard_index <- 0..1 do
+      path =
+        data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.LMDB.path()
+
+      assert File.dir?(path)
+      refute Ferricstore.Flow.LMDB.env_present?(path)
+      refute Ferricstore.Flow.LMDB.flush_in_progress?(path)
+      refute Ferricstore.Flow.LMDB.env_present?(path)
+    end
+  end
+
+  test "LMDB replay-safe marker never moves backward" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_replay_safe_marker_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok = Ferricstore.Flow.LMDBReplaySafeIndex.persist(path, 42)
+    assert :ok = Ferricstore.Flow.LMDBReplaySafeIndex.persist(path, 7)
+    assert Ferricstore.Flow.LMDBReplaySafeIndex.read(path) == 42
+  end
+
+  test "prefix entries after resumes from the last returned LMDB key" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_prefix_after_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    prefix = "flow-active-index:test:"
+
+    keys = [
+      prefix <> "001",
+      prefix <> "002",
+      prefix <> "003"
+    ]
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(
+               path,
+               Enum.map(keys, fn key -> {:put, key, "value:" <> key} end) ++
+                 [{:put, "flow-active-index:other:001", "skip"}]
+             )
+
+    assert {:ok, [{first_key, _first_value}, {second_key, _second_value}]} =
+             Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, <<>>, 2)
+
+    assert [first_key, second_key] == Enum.take(keys, 2)
+
+    assert {:ok, [{third_key, _third_value}]} =
+             Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, second_key, 10)
+
+    assert third_key == List.last(keys)
+
+    assert {:ok, []} =
+             Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, third_key, 10)
+  end
+
+  test "segment value pin scan accepts exact limit only when a future pin bounds it" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_segment_pin_scan_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    ops =
+      Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+        {"flow-pin-old-1", 0, {:waraft_apply_projection, 1}, 0, 10},
+        {"flow-pin-old-2", 0, {:waraft_apply_projection, 2}, 0, 10},
+        {"flow-pin-future", 0, {:waraft_apply_projection, 3}, 0, 10}
+      ])
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, ops)
+
+    assert {:ok, pins} = Ferricstore.Flow.LMDB.segment_value_pin_entries_before(path, 3, 2)
+
+    assert Enum.map(pins, fn %{key: key, file_id: file_id} -> {key, file_id} end) ==
+             [
+               {"flow-pin-old-1", {:waraft_apply_projection, 1}},
+               {"flow-pin-old-2", {:waraft_apply_projection, 2}}
+             ]
+
+    assert {:error, {:flow_segment_value_pin_scan_limit, 2}} =
+             Ferricstore.Flow.LMDB.segment_value_pin_entries_before(path, 4, 2)
+  end
+
+  test "segment value pins batch multiple values from the same apply index" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_segment_pin_batch_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    ops =
+      Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+        {"flow-pin-same-1", 0, {:waraft_apply_projection, 7}, 10, 11},
+        {"flow-pin-same-2", 0, {:waraft_apply_projection, 7}, 20, 22},
+        {"flow-pin-other", 0, {:waraft_apply_projection, 8}, 30, 33}
+      ])
+
+    pin_prefix = Ferricstore.Flow.LMDB.segment_value_pin_prefix(:waraft_apply_projection)
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, ops)
+    assert {:ok, 2} = Ferricstore.Flow.LMDB.prefix_count(path, pin_prefix)
+
+    assert {:ok, pins} = Ferricstore.Flow.LMDB.segment_value_pin_entries_before(path, 8, 10)
+
+    assert Enum.map(pins, fn pin ->
+             {pin.key, pin.file_id, pin.offset, pin.value_size, is_binary(pin.pin_key)}
+           end) == [
+             {"flow-pin-same-1", {:waraft_apply_projection, 7}, 10, 11, true},
+             {"flow-pin-same-2", {:waraft_apply_projection, 7}, 20, 22, true}
+           ]
+  end
+
+  test "value_mget materializes direct LMDB blob-ref values" do
+    ctx =
+      Ferricstore.Test.IsolatedInstance.checkout(
+        shard_count: 1,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+    end)
+
+    ref = "f:{lmdb-direct-blob}:v:p:flow-lmdb-direct-blob:1"
+    payload = String.duplicate("payload-", 64)
+    encoded_payload = Ferricstore.Flow.encode_value(payload)
+
+    assert {:ok, blob_ref} = Ferricstore.Store.BlobStore.put(ctx.data_dir, 0, encoded_payload)
+    encoded_blob_ref = Ferricstore.Store.BlobRef.encode!(blob_ref)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, ref, Ferricstore.Flow.LMDB.encode_value(encoded_blob_ref, 0)}
+             ])
+
+    assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [ref])
+  end
+
+  test "blob garbage sweep preserves Flow value refs projected only in LMDB" do
+    ctx =
+      Ferricstore.Test.IsolatedInstance.checkout(
+        shard_count: 1,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+    end)
+
+    ref = "f:{lmdb-blob-gc}:v:p:flow-lmdb-blob-gc:1"
+    payload = String.duplicate("payload-", 64)
+    encoded_payload = Ferricstore.Flow.encode_value(payload)
+
+    assert {:ok, blob_ref} = Ferricstore.Store.BlobStore.put(ctx.data_dir, 0, encoded_payload)
+    encoded_blob_ref = Ferricstore.Store.BlobRef.encode!(blob_ref)
+
+    assert {:ok, {path, _offset, _size}} =
+             Ferricstore.Store.BlobStore.file_ref(ctx.data_dir, 0, blob_ref)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, ref, Ferricstore.Flow.LMDB.encode_value(encoded_blob_ref, 0)}
+             ])
+
+    assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [ref])
+    assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), ref)
+
+    assert {:ok, %{deleted_files: 0}} = Ferricstore.Store.Router.sweep_blob_garbage(ctx)
+    assert File.exists?(path)
+    assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [ref])
+  end
+
+  test "value_mget batches LMDB locators that point to the same WARaft apply projection" do
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+    end)
+
+    ref1 = "f:{lmdb-locator-batch}:v:p:flow-lmdb-locator-batch-1:1"
+    ref2 = "f:{lmdb-locator-batch}:v:p:flow-lmdb-locator-batch-2:1"
+    encoded1 = Ferricstore.Flow.encode_value("value-one")
+    encoded2 = Ferricstore.Flow.encode_value("value-two")
+    index = 12_345
+    file_id = {:waraft_apply_projection, index}
+
+    :ok =
+      Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(ctx.data_dir, 0, index, [
+        {ref1, encoded1, 0},
+        {ref2, encoded2, 0}
+      ])
+
+    assert {:ok, 2} =
+             Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(ctx.data_dir, 0)
+
+    assert 0 = Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(ctx.data_dir, 0)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, ref1,
+                Ferricstore.Flow.LMDB.encode_value_locator(0, file_id, 0, byte_size(encoded1))},
+               {:put, ref2,
+                Ferricstore.Flow.LMDB.encode_value_locator(0, file_id, 0, byte_size(encoded2))}
+             ])
+
+    parent = self()
+
+    Process.put(:ferricstore_waraft_apply_projection_disk_read_hook, fn _root, ^index, source ->
+      send(parent, {:apply_projection_disk_read, source})
+    end)
+
+    assert {:ok, ["value-one", "value-two"]} = Ferricstore.Flow.value_mget(ctx, [ref1, ref2])
+    assert [:latest] = collect_apply_projection_disk_reads()
   end
 
   test "writer does not open LMDB until projection data is flushed" do
@@ -72,6 +396,101 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
+  test "writer flush waits for async enqueue work reserved by another process" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_async_flush_barrier_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_async_flush_barrier_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:state:async-flush-barrier"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    writer =
+      start_supervised!(
+        {Ferricstore.Flow.LMDBWriter,
+         shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+      )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    seq_ref =
+      :persistent_term.get(
+        {Ferricstore.Flow.LMDBWriter, :enqueue_seq, instance_name, shard_index}
+      )
+
+    seq = :atomics.add_get(seq_ref, 1, 1)
+    flush = Task.async(fn -> Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index) end)
+
+    refute Task.yield(flush, 50),
+           "flush replied before the async enqueue reservation reached the writer"
+
+    GenServer.cast(writer, {:enqueue, seq, [{:put, key, "v1"}], []})
+
+    assert Task.await(flush, 1_000) == :ok
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
+  end
+
+  test "writer async enqueue preserves after-flush callbacks without LMDB ops" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_after_flush_only_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_after_flush_only_#{System.unique_integer([:positive])}"
+    ets = :ets.new(:flow_lmdb_after_flush_only_tombstones, [:set, :public])
+    key = "flow:{flow:test}:state:deleted"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    :ets.insert(ets, {key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue_async(instance_name, shard_index, [], [
+               {:delete_flow_tombstone, ets, key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert :ets.lookup(ets, key) == []
+  end
+
   test "lagged mode keeps LMDB projection enabled but uses larger writer batches" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
@@ -110,10 +529,10 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert Ferricstore.Flow.LMDB.mode() == :lagged
     assert Ferricstore.Flow.LMDB.mirror?()
-    assert writer_state.flush_interval_ms == 30_000
-    assert writer_state.flush_jitter_ms == 5_000
-    assert writer_state.max_ops == 100_000
-    assert writer_state.flush_chunk_ops == 10_000
+    assert writer_state.flush_interval_ms == 500
+    assert writer_state.flush_jitter_ms == 250
+    assert writer_state.max_ops == 25_000
+    assert writer_state.flush_chunk_ops == 5_000
     assert writer_state.flush_chunk_pause_ms == 1
 
     path =
@@ -128,7 +547,365 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
-  test "flush coordinator serializes LMDB writers by default" do
+  test "LMDB mode cannot be disabled for Flow production projection" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_enabled = Application.get_env(:ferricstore, :flow_lmdb_enabled)
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_enabled, old_enabled)
+    end)
+
+    Application.delete_env(:ferricstore, :flow_lmdb_mode)
+    Application.delete_env(:ferricstore, :flow_lmdb_enabled)
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
+    assert Ferricstore.Flow.LMDB.mirror?()
+
+    for off <- [:off, false, "false", "FALSE", "0", "off", nil] do
+      Application.put_env(:ferricstore, :flow_lmdb_mode, off)
+      assert Ferricstore.Flow.LMDB.mode() == :lagged
+      assert Ferricstore.Flow.LMDB.mirror?()
+    end
+  end
+
+  test "source projection reads the durable shard file instead of ETS cached value" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_source_projection_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_source_projection_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:policy:source"
+    disk_value = "from-durable-file"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    file_path = Path.join(shard_data_path, "00000.log")
+
+    {:ok, [{offset, value_size}]} =
+      Ferricstore.Bitcask.NIF.v2_append_batch(file_path, [{key, disk_value, 0}])
+
+    keydir = :ets.new(:flow_lmdb_source_projection_keydir, [:set, :public])
+    :ets.insert(keydir, {key, "wrong-ets-cache", 0, 0, 0, offset, value_size})
+
+    instance_ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency])
+    }
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_ctx: instance_ctx}
+    )
+
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:project_kv_from_source, key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(path, key)
+    assert {:ok, ^disk_value} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+  end
+
+  test "source projection treats deleted keydir rows as deletes, not mirror degradation" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_deleted_source_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_deleted_source_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:policy:deleted-source"
+    degraded = :atomics.new(1, signed: false)
+    flush_failures = :atomics.new(1, signed: false)
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, key, Ferricstore.Flow.LMDB.encode_value("stale", 0)}
+             ])
+
+    keydir = :ets.new(:flow_lmdb_deleted_source_keydir, [:set, :public])
+    :ets.insert(keydir, {key, nil, 0, 0, :deleted, 0, 0})
+
+    instance_ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      flow_lmdb_mirror_degraded: degraded,
+      flow_lmdb_writer_flush_failures: flush_failures
+    }
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_ctx: instance_ctx}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:project_kv_from_source, key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
+    assert :atomics.get(degraded, 1) == 0
+    assert :atomics.get(flush_failures, 1) == 0
+  end
+
+  test "source projection waits for pending keydir locations to publish" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_pending_source_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_pending_source_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:policy:pending"
+    disk_value = "from-published-location"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    file_path = Path.join(shard_data_path, "00000.log")
+
+    {:ok, [{offset, value_size}]} =
+      Ferricstore.Bitcask.NIF.v2_append_batch(file_path, [{key, disk_value, 0}])
+
+    keydir = :ets.new(:flow_lmdb_pending_source_keydir, [:set, :public])
+    :ets.insert(keydir, {key, "wrong-ets-cache", 0, 0, :pending, 0, value_size})
+
+    instance_ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency])
+    }
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_ctx: instance_ctx}
+    )
+
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+    parent = self()
+
+    publisher =
+      spawn(fn ->
+        Process.sleep(10)
+        :ets.insert(keydir, {key, "wrong-ets-cache", 0, 0, 0, offset, value_size})
+        send(parent, :pending_location_published)
+      end)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:project_kv_from_source, key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert_receive :pending_location_published, 500
+    refute Process.alive?(publisher)
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(path, key)
+    assert {:ok, ^disk_value} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+  end
+
+  test "source projection reads WARaft segment-backed keydir locations" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_segment_source_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_segment_source_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:policy:segment"
+    disk_value = :binary.copy("segment-durable-value", 32)
+
+    ctx =
+      FerricStore.Instance.build(instance_name,
+        data_dir: data_dir,
+        shard_count: 1,
+        max_memory_bytes: 256 * 1024 * 1024,
+        keydir_max_ram: 64 * 1024 * 1024,
+        hot_cache_max_value_size: 16,
+        blob_side_channel_threshold_bytes: 1024 * 1024,
+        max_active_file_size: 64 * 1024 * 1024,
+        read_sample_rate: 100,
+        lfu_decay_time: 1,
+        lfu_log_factor: 10
+      )
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftBackend.stop()
+      FerricStore.Instance.cleanup(instance_name)
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftBackend.start(ctx,
+               log_module: :ferricstore_waraft_spike_segment_log
+             )
+
+    assert :ok = Ferricstore.Raft.WARaftBackend.write(0, {:put, key, disk_value, 0})
+
+    assert [
+             {^key, nil, 0, _lfu, {:waraft_segment, index}, offset, value_size}
+           ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+    assert is_integer(index) and index > 0
+    assert is_integer(offset) and offset >= 0
+    assert value_size == byte_size(disk_value)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: data_dir, instance_ctx: ctx}
+    )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 0, [
+               {:project_kv_from_source, key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, 0)
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(path, key)
+    assert {:ok, ^disk_value} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+  end
+
+  test "history projector fsyncs copied generated values before publishing LMDB locators" do
+    old_hook = Application.get_env(:ferricstore, :flow_history_projector_fsync_hook)
+    parent = self()
+
+    Application.put_env(:ferricstore, :flow_history_projector_fsync_hook, fn file_path ->
+      send(parent, {:history_projector_fsync, file_path})
+      :ok
+    end)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_projected_value_fsync_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_projected_value_fsync_#{System.unique_integer([:positive])}"
+    flow_id = "projected-value-fsync"
+    history_key = Ferricstore.Flow.Keys.history_key(flow_id)
+    event_id = "1"
+    event_key = Ferricstore.Flow.Keys.stream_entry_key_from_history_key(history_key, event_id)
+    value_ref = "f:{#{flow_id}}:v:p:#{flow_id}:1"
+    payload = "projected-payload"
+
+    on_exit(fn ->
+      restore_env(:flow_history_projector_fsync_hook, old_hook)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    keydir = :ets.new(:flow_lmdb_projected_value_fsync_keydir, [:set, :public])
+    :ets.insert(keydir, {value_ref, payload, 0, 0, 0, 0, byte_size(payload)})
+
+    instance_ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      disk_pressure: :atomics.new(1, signed: false),
+      write_version: :counters.new(1, [:write_concurrency])
+    }
+
+    record = %{
+      id: flow_id,
+      type: "projected-value-fsync",
+      state: "queued",
+      version: 1,
+      payload_ref: value_ref,
+      created_at_ms: 1,
+      updated_at_ms: 1
+    }
+
+    entry = %{
+      key: event_key,
+      expire_at_ms: 0,
+      history_key: history_key,
+      event_id: event_id,
+      event_ms: 1,
+      version: 1,
+      value: Ferricstore.Flow.encode_history_fields(record, "created", 1),
+      value_refs: [value_ref]
+    }
+
+    assert :ok =
+             Ferricstore.Flow.HistoryProjector.write_entries_sync(
+               instance_ctx,
+               shard_index,
+               shard_data_path,
+               [entry],
+               1,
+               keydir: keydir
+             )
+
+    history_path = Ferricstore.Flow.HistoryProjector.history_file_path(shard_data_path, 0)
+    assert_receive {:history_projector_fsync, ^history_path}, 500
+    assert_receive {:history_projector_fsync, ^history_path}, 500
+
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
+    assert {:ok, locator} = Ferricstore.Flow.LMDB.get(lmdb_path, value_ref)
+
+    assert {:ok, {{:flow_history, 0}, offset, value_size}} =
+             Ferricstore.Flow.LMDB.decode_value_locator(locator, 0)
+
+    assert {:ok, ^payload} =
+             Ferricstore.Flow.HistoryProjector.read_value(
+               shard_data_path,
+               {:flow_history, 0},
+               offset
+             )
+
+    assert value_size == byte_size(payload)
+    assert [] = :ets.lookup(keydir, value_ref)
+  end
+
+  test "flush coordinator serializes LMDB writers when configured with one permit" do
     instance_name = :"flow_lmdb_flush_coordinator_#{System.unique_integer([:positive])}"
     parent = self()
 
@@ -162,6 +939,288 @@ defmodule Ferricstore.Flow.LMDBTest do
     send(first, :release_first)
     assert_receive :first_leaving
     assert_receive :second_entered
+  end
+
+  test "flush_all requests shard flushes concurrently instead of multiplying timeout by shard" do
+    instance_name = :"flow_lmdb_flush_all_parallel_#{System.unique_integer([:positive])}"
+    parent = self()
+
+    for shard_index <- 0..1 do
+      start_supervised!(
+        {FlushProbeWriter,
+         name: Ferricstore.Flow.LMDBWriter.name(instance_name, shard_index),
+         parent: parent,
+         shard_index: shard_index},
+        id: {FlushProbeWriter, instance_name, shard_index}
+      )
+    end
+
+    task = Task.async(fn -> Ferricstore.Flow.LMDBWriter.flush_all(instance_name, 2, 2_000) end)
+
+    entered =
+      for _ <- 1..2 do
+        assert_receive {:flush_entered, shard_index}, 200
+        shard_index
+      end
+
+    assert Enum.sort(entered) == [0, 1]
+
+    for shard_index <- 0..1 do
+      send(
+        Process.whereis(Ferricstore.Flow.LMDBWriter.name(instance_name, shard_index)),
+        :release_flush
+      )
+    end
+
+    assert :ok = Task.await(task, 2_000)
+  end
+
+  test "suspend_all can mark projection writers suspended without another flush pass" do
+    instance_name = :"flow_lmdb_suspend_no_flush_#{System.unique_integer([:positive])}"
+    parent = self()
+
+    start_supervised!(
+      {FlushProbeWriter,
+       name: Ferricstore.Flow.LMDBWriter.name(instance_name, 0), parent: parent, shard_index: 0}
+    )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.suspend_all(instance_name, 1, flush: false)
+
+    assert_receive {:suspend_without_flush, 0}, 200
+    refute_receive {:flush_entered, 0}, 50
+  end
+
+  test "resume_all clears a no-flush suspend for test and restart cleanup" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_resume_all_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_resume_all_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    key = "flow:{flow:resume}:state:a"
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.suspend_all(instance_name, 1, flush: false)
+
+    assert {:error, :writer_suspended} =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:put, key, "v1"}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.resume_all(instance_name, 1)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v1"}])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+  end
+
+  test "LMDB writer projects Flow state from provided value without source keydir read" do
+    fixture = start_active_lmdb_projection_fixture!("direct-state")
+
+    record =
+      active_lmdb_record("flow-direct-state", "direct-state", "queued",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 10,
+        next_run_at_ms: 20
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
+               {:project_flow_state, state_key, encoded, 0}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+    assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+  end
+
+  test "terminal Flow state projection removes stale active LMDB rows" do
+    fixture = start_active_lmdb_projection_fixture!("terminal-fast-state")
+
+    active =
+      active_lmdb_record("flow-terminal-fast-state", "terminal-fast-state", "queued",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 10,
+        next_run_at_ms: 20
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(active.id, active.partition_key)
+
+    {active_ops, active_reverse} =
+      Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, active, 0)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(fixture.lmdb_path, active_ops)
+
+    assert {:ok, ^active_reverse} =
+             Ferricstore.Flow.LMDB.get(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+             )
+
+    completed = %{active | state: "completed", version: 2, updated_at_ms: 30}
+    encoded_completed = Ferricstore.Flow.encode_record(completed)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
+               {:project_flow_state, state_key, encoded_completed, 0}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+    assert {:ok, ^encoded_completed} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(active.type, active.state, active.partition_key)
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+
+    assert :not_found =
+             Ferricstore.Flow.LMDB.get(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+             )
+  end
+
+  test "LMDB writer drains terminal Flow projection outbox from durable source" do
+    fixture = start_active_lmdb_projection_fixture!("terminal-outbox")
+
+    completed =
+      active_lmdb_record("flow-terminal-outbox", "terminal-outbox", "completed",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 30,
+        next_run_at_ms: nil,
+        version: 7
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+    encoded = Ferricstore.Flow.encode_record(completed)
+
+    :ets.insert(
+      fixture.source_keydir,
+      {state_key, encoded, 0, {:flow_state_version, completed.version, 0}, :hot, 0,
+       byte_size(encoded)}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue_projection_outbox(
+               fixture.instance_name,
+               fixture.shard_index,
+               [{state_key, completed.version}]
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+    assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+
+  end
+
+  test "lagged LMDB projector reconciles dirty shard from durable Flow state" do
+    fixture = start_active_lmdb_projection_fixture!("lagged-dirty")
+
+    completed =
+      active_lmdb_record("flow-lagged-dirty", "lagged-dirty", "completed",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 40,
+        next_run_at_ms: nil,
+        version: 9
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+    encoded = Ferricstore.Flow.encode_record(completed)
+
+    :ets.insert(
+      fixture.source_keydir,
+      {state_key, encoded, 0, {:flow_state_version, completed.version, 0}, :hot, 0,
+       byte_size(encoded)}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.mark_projection_dirty(
+               fixture.instance_name,
+               fixture.shard_index
+             )
+
+    writer = Process.whereis(Ferricstore.Flow.LMDBWriter.name(fixture.instance_name, 0))
+
+    assert wait_until_true(fn ->
+             %{projection_dirty?: dirty?} = :sys.get_state(writer)
+             dirty?
+           end, 20)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+    assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+    assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+
+    assert wait_until_true(fn -> :ets.lookup(fixture.source_keydir, state_key) == [] end, 20)
   end
 
   test "empty rebuild does not open LMDB" do
@@ -198,6 +1257,1361 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
 
     refute File.exists?(lmdb_path)
+  end
+
+  test "reconcile clears cold-read process state when rebuild fails early" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_reconcile_cleanup_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_reconcile_cleanup_keydir, [:set])
+
+    on_exit(fn ->
+      Process.delete(:flow_lmdb_rebuild_cold_read_errors)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    :ets.delete(keydir)
+    Process.put(:flow_lmdb_rebuild_cold_read_errors, 123)
+
+    assert_raise ArgumentError, fn ->
+      Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+        shard_path,
+        keydir,
+        shard_index,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil
+      )
+    end
+
+    assert Process.get(:flow_lmdb_rebuild_cold_read_errors) == nil
+  end
+
+  test "active index rebuild clears cold-read process state when rebuild fails early" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_active_cleanup_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_active_cleanup_keydir, [:set])
+
+    on_exit(fn ->
+      Process.delete(:flow_lmdb_rebuild_cold_read_errors)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    :ets.delete(keydir)
+    Process.put(:flow_lmdb_rebuild_cold_read_errors, 123)
+
+    assert_raise ArgumentError, fn ->
+      Ferricstore.Flow.LMDBRebuilder.rebuild_active_indexes_from_keydir(
+        shard_path,
+        keydir,
+        shard_index,
+        nil,
+        nil,
+        nil,
+        nil,
+        nil
+      )
+    end
+
+    assert Process.get(:flow_lmdb_rebuild_cold_read_errors) == nil
+  end
+
+  test "startup reconcile counts LMDB history projection write failures" do
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+    old_hook = Application.get_env(:ferricstore, :flow_lmdb_rebuild_history_write_hook)
+
+    Application.put_env(:ferricstore, :flow_async_history, false)
+
+    test_pid = self()
+
+    Application.put_env(:ferricstore, :flow_lmdb_rebuild_history_write_hook, fn _path, ops ->
+      send(test_pid, {:history_projection_rebuild_write, length(ops)})
+      {:error, :injected_history_projection_failure}
+    end)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_history_rebuild_failure_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_history_rebuild_failure_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_history_rebuild_failure_keydir, [:set])
+    handler_id = {:flow_lmdb_history_rebuild_failure, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_rebuild],
+      &__MODULE__.forward_flow_lmdb_rebuild_event/4,
+      test_pid
+    )
+
+    on_exit(fn ->
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_lmdb_rebuild_history_write_hook, old_hook)
+      :telemetry.detach(handler_id)
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+
+    record = %{
+      id: "history-rebuild-failure",
+      type: "startup-history-rebuild",
+      state: "completed",
+      version: 2,
+      attempts: 1,
+      fencing_token: 1,
+      created_at_ms: 1_000,
+      updated_at_ms: 2_000,
+      terminal_retention_until_ms: 60_000,
+      partition_key: "tenant-history-rebuild",
+      root_flow_id: "history-rebuild-failure"
+    }
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+    :ets.insert(keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+
+    event_id = "2000-1"
+    history_key = Ferricstore.Flow.Keys.history_key(record.id, record.partition_key)
+    event_key = Ferricstore.Flow.Keys.stream_entry_key_from_history_key(history_key, event_id)
+    event_value = Ferricstore.Flow.encode_history_fields(record, "completed", 2_000)
+    :ets.insert(keydir, {event_key, event_value, 0, 0, :hot, 0, byte_size(event_value)})
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               nil,
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    assert_receive {:history_projection_rebuild_write, count} when count > 0
+
+    assert_receive {:flow_lmdb_rebuild, [:ferricstore, :flow, :lmdb_rebuild],
+                    %{history: 1, history_lmdb_errors: 1, lmdb_errors: 1}, %{shard_index: 0}}
+  end
+
+  test "startup reconcile writes one history flow expiry marker per flow" do
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+    old_hook = Application.get_env(:ferricstore, :flow_lmdb_rebuild_history_write_hook)
+
+    Application.put_env(:ferricstore, :flow_async_history, false)
+
+    test_pid = self()
+
+    Application.put_env(:ferricstore, :flow_lmdb_rebuild_history_write_hook, fn _path, ops ->
+      send(test_pid, {:history_projection_rebuild_ops, ops})
+      :ok
+    end)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_history_rebuild_expire_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_history_rebuild_expire_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_history_rebuild_expire_keydir, [:set])
+
+    on_exit(fn ->
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_lmdb_rebuild_history_write_hook, old_hook)
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+
+    record = %{
+      id: "history-rebuild-expire",
+      type: "startup-history-rebuild",
+      state: "completed",
+      version: 3,
+      attempts: 1,
+      fencing_token: 1,
+      created_at_ms: 1_000,
+      updated_at_ms: 3_000,
+      terminal_retention_until_ms: 60_000,
+      partition_key: "tenant-history-rebuild",
+      root_flow_id: "history-rebuild-expire",
+      history_max_events: 10
+    }
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+    :ets.insert(keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+
+    history_key = Ferricstore.Flow.Keys.history_key(record.id, record.partition_key)
+
+    for {event_id, version, event_ms} <- [{"1000-1", 1, 1_000}, {"2000-2", 2, 2_000}] do
+      event_key = Ferricstore.Flow.Keys.stream_entry_key_from_history_key(history_key, event_id)
+
+      event_value =
+        Ferricstore.Flow.encode_history_fields(%{record | version: version}, "queued", event_ms)
+
+      :ets.insert(keydir, {event_key, event_value, 0, 0, :hot, 0, byte_size(event_value)})
+    end
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               nil,
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    expire_key =
+      Ferricstore.Flow.LMDB.history_flow_expire_key(
+        record.terminal_retention_until_ms,
+        history_key
+      )
+
+    assert_receive {:history_projection_rebuild_ops, ops}
+
+    assert 1 ==
+             Enum.count(ops, fn
+               {:put, ^expire_key, _value} -> true
+               _ -> false
+             end)
+  end
+
+  test "startup reconcile rebuilds Flow state from WARaft segment-backed keydir rows" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_waraft_rebuild_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_waraft_rebuild_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    index = 12_321
+    keydir = :ets.new(:flow_lmdb_waraft_rebuild_keydir, [:set])
+    degraded = :atomics.new(1, signed: false)
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, shard_index)
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    record = %{
+      id: "flow-waraft-rebuild",
+      type: "startup-waraft",
+      state: "queued",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1,
+      updated_at_ms: 2,
+      next_run_at_ms: 10,
+      priority: 0,
+      partition_key: "tenant-waraft",
+      root_flow_id: "flow-waraft-rebuild"
+    }
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+    file_id = {:waraft_apply_projection, index}
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               data_dir,
+               shard_index,
+               index,
+               [{state_key, encoded, 0}]
+             )
+
+    :ets.insert(keydir, {state_key, nil, 0, 0, file_id, 0, byte_size(encoded)})
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{
+                 data_dir: data_dir,
+                 flow_lmdb_mirror_degraded: degraded
+               },
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    assert :atomics.get(degraded, 1) == 0
+    assert {:ok, lmdb_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+    assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(lmdb_blob, 10)
+
+    state_index_key =
+      Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
+
+    assert [{record.id, 2.0}] ==
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               state_index_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+  end
+
+  test "startup rebuilds active flow indexes from dedicated LMDB active index" do
+    old_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_state_rebuild_scan_limit)
+    Application.put_env(:ferricstore, :flow_lmdb_state_rebuild_scan_limit, 1)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_active_rebuild_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_active_rebuild_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    source_keydir = :ets.new(:flow_lmdb_active_rebuild_source, [:set])
+    empty_recovery_keydir = :ets.new(:flow_lmdb_active_rebuild_empty, [:set])
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_state_rebuild_scan_limit, old_scan_limit)
+      if :ets.info(source_keydir) != :undefined, do: :ets.delete(source_keydir)
+      if :ets.info(empty_recovery_keydir) != :undefined, do: :ets.delete(empty_recovery_keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    record = %{
+      id: "flow-active",
+      type: "startup-active",
+      state: "queued",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1,
+      updated_at_ms: 2,
+      next_run_at_ms: 10,
+      priority: 0,
+      partition_key: "tenant-active",
+      root_flow_id: "flow-active"
+    }
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    :ets.insert(source_keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index,
+       data_dir: data_dir,
+       instance_name: instance_name,
+       instance_ctx: %{name: instance_name, keydir_refs: {source_keydir}}}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:project_flow_state_from_source, state_key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, "f:!large-value-before-state", String.duplicate("x", 1024)}
+             ])
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               empty_recovery_keydir,
+               shard_index,
+               nil,
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    state_index_key =
+      Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
+
+    due_key =
+      Ferricstore.Flow.Keys.due_key(
+        record.type,
+        record.state,
+        record.priority,
+        record.partition_key
+      )
+
+    assert [{"flow-active", 2.0}] =
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               state_index_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+
+    assert [{"flow-active", 10.0}] =
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               due_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+  end
+
+  test "LMDB startup rebuild scans terminal reverse projection once per shard" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_terminal_rebuild_once_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_terminal_rebuild_once_keydir, [:set])
+    test_pid = self()
+    handler_id = {:flow_lmdb_terminal_rebuild_once, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_rebuild],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_rebuild, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    stale_state_key = Ferricstore.Flow.Keys.state_key("stale-terminal", "tenant-startup")
+    stale_terminal_key = Ferricstore.Flow.LMDB.terminal_index_key("idx", "stale-terminal", 1)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, Ferricstore.Flow.LMDB.terminal_by_state_key_key(stale_state_key),
+                stale_terminal_key}
+             ])
+
+    for i <- 1..513 do
+      record = %{
+        id: "terminal-#{i}",
+        type: "startup-terminal",
+        state: "completed",
+        version: 1,
+        attempts: 0,
+        fencing_token: 0,
+        created_at_ms: i,
+        updated_at_ms: i,
+        terminal_retention_until_ms: 10_000,
+        partition_key: "tenant-startup",
+        root_flow_id: "terminal-#{i}"
+      }
+
+      state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+      encoded = Ferricstore.Flow.encode_record(record)
+      :ets.insert(keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+    end
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil
+             )
+
+    assert_receive {:flow_lmdb_rebuild, [:ferricstore, :flow, :lmdb_rebuild],
+                    %{terminal_reverse_cleanup_scans: 1}, %{shard_index: 0}}
+  end
+
+  test "default WARaft shard startup uses LMDB active projection without full LMDB reconcile" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_default_startup_fast_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :default
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_default_startup_fast_keydir, [:set])
+    test_pid = self()
+    handler_id = {:flow_lmdb_default_startup_fast, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_rebuild],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_rebuild, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    record =
+      active_lmdb_record("flow-default-fast", "default-fast", "queued",
+        partition_key: "tenant-default-fast",
+        updated_at_ms: 10,
+        next_run_at_ms: 20
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(
+               lmdb_path,
+               elem(
+                 Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0),
+                 0
+               )
+             )
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{name: :default},
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    state_index_key =
+      Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
+
+    assert [{"flow-default-fast", 10.0}] =
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               state_index_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+
+    refute_received {:flow_lmdb_rebuild, [:ferricstore, :flow, :lmdb_rebuild], _measurements,
+                     _metadata}
+  end
+
+  test "default WARaft startup rebuilds active indexes from keydir when LMDB env is absent" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_default_startup_no_env_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :default
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_default_startup_no_env_keydir, [:set])
+
+    on_exit(fn ->
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    assert :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(data_dir, 1)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    assert File.dir?(lmdb_path)
+    refute Ferricstore.Flow.LMDB.env_present?(lmdb_path)
+
+    record =
+      active_lmdb_record("flow-default-no-env", "default-no-env", "queued",
+        partition_key: "tenant-default-no-env",
+        updated_at_ms: 10,
+        next_run_at_ms: 20
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+    :ets.insert(keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{name: :default},
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    state_index_key =
+      Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
+
+    due_key =
+      Ferricstore.Flow.Keys.due_key(
+        record.type,
+        record.state,
+        record.priority,
+        record.partition_key
+      )
+
+    assert [{record.id, 10.0}] ==
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               state_index_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+
+    assert [{record.id, 20.0}] ==
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               due_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+  end
+
+  test "forced default WARaft startup reconcile materializes blob-backed state records" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_default_forced_blob_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :default
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_default_forced_blob_keydir, [:set])
+
+    on_exit(fn ->
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    record =
+      active_lmdb_record("flow-default-forced-blob", "default-forced-blob", "queued",
+        partition_key: "tenant-default-forced-blob",
+        updated_at_ms: 10,
+        next_run_at_ms: 20
+      )
+
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+    assert {:ok, blob_ref} = Ferricstore.Store.BlobStore.put(data_dir, shard_index, encoded)
+    encoded_ref = Ferricstore.Store.BlobRef.encode!(blob_ref)
+    :ets.insert(keydir, {state_key, encoded_ref, 0, 0, :hot, 0, byte_size(encoded_ref)})
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{
+                 name: :default,
+                 data_dir: data_dir,
+                 blob_side_channel_threshold_bytes: 128
+               },
+               nil,
+               nil,
+               flow_index,
+               flow_lookup,
+               force_full_reconcile?: true,
+               reason: :segment_replay
+             )
+
+    assert {:ok, lmdb_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+    assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(lmdb_blob, 30)
+  end
+
+  test "default WARaft startup rebuilds active LMDB projection in bounded chunks" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_default_startup_chunks_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :default
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_default_startup_chunks_keydir, [:set])
+    test_pid = self()
+    handler_id = {:flow_lmdb_default_startup_chunks, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_startup_active_index_chunk],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_active_chunk, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    1..4097
+    |> Enum.chunk_every(512)
+    |> Enum.each(fn chunk ->
+      ops =
+        Enum.flat_map(chunk, fn i ->
+          record =
+            active_lmdb_record("chunked-#{i}", "chunked-type", "queued",
+              partition_key: "tenant-chunked",
+              updated_at_ms: i
+            )
+
+          state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+          elem(Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0), 0)
+        end)
+
+      assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, ops)
+    end)
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{name: :default},
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    chunks = collect_flow_lmdb_active_chunks()
+
+    assert length(chunks) == 2
+    assert Enum.map(chunks, & &1.entries) == [4096, 1]
+    assert List.last(chunks).total_active == 4097
+  end
+
+  test "startup active LMDB rebuilds are concurrency bounded" do
+    limit = Ferricstore.Flow.LMDBRebuilder.__startup_active_rebuild_concurrency_for_test__()
+    task_count = max(limit * 3, 4)
+    parent = self()
+    active = :atomics.new(1, signed: true)
+
+    tasks =
+      for _ <- 1..task_count do
+        Task.async(fn ->
+          Ferricstore.Flow.LMDBRebuilder.__with_startup_active_rebuild_slot_for_test__(fn ->
+            current = :atomics.add_get(active, 1, 1)
+            send(parent, {:active_lmdb_rebuild_entered, current})
+            Process.sleep(25)
+            :atomics.sub_get(active, 1, 1)
+          end)
+        end)
+      end
+
+    Task.await_many(tasks, 5_000)
+
+    max_seen =
+      1..task_count
+      |> Enum.map(fn _ ->
+        assert_receive {:active_lmdb_rebuild_entered, current}, 1_000
+        current
+      end)
+      |> Enum.max()
+
+    assert max_seen <= limit
+  end
+
+  test "LMDB active projection replaces stale indexes when state changes" do
+    fixture = start_active_lmdb_projection_fixture!("replace-active")
+
+    queued =
+      active_lmdb_record("flow-replace-active", "replace-active", "queued",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 2,
+        next_run_at_ms: 10
+      )
+
+    running =
+      queued
+      |> Map.merge(%{
+        state: "running",
+        version: 2,
+        updated_at_ms: 20,
+        next_run_at_ms: nil,
+        lease_owner: "worker-replace-active",
+        lease_token: "lease-replace-active",
+        lease_deadline_ms: 50
+      })
+
+    state_key = project_active_lmdb_record!(fixture, queued)
+    assert is_binary(state_key)
+    project_active_lmdb_record!(fixture, running)
+
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(queued.type, queued.state, queued.partition_key)
+
+    queued_due_key =
+      Ferricstore.Flow.Keys.due_key(
+        queued.type,
+        queued.state,
+        queued.priority,
+        queued.partition_key
+      )
+
+    running_state_key =
+      Ferricstore.Flow.Keys.state_index_key(running.type, running.state, running.partition_key)
+
+    worker_key =
+      Ferricstore.Flow.Keys.worker_index_key(running.lease_owner, running.partition_key)
+
+    inflight_key = Ferricstore.Flow.Keys.inflight_index_key(running.type, running.partition_key)
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_due_key)
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(running_state_key)
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(worker_key)
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(inflight_key)
+             )
+  end
+
+  test "LMDB terminal projection removes stale active indexes" do
+    fixture = start_active_lmdb_projection_fixture!("terminal-active")
+
+    queued =
+      active_lmdb_record("flow-terminal-active", "terminal-active", "queued",
+        partition_key: fixture.partition_key,
+        updated_at_ms: 2,
+        next_run_at_ms: 10
+      )
+
+    completed =
+      queued
+      |> Map.merge(%{
+        state: "completed",
+        version: 2,
+        updated_at_ms: 20,
+        next_run_at_ms: nil
+      })
+
+    project_active_lmdb_record!(fixture, queued)
+    state_key = project_active_lmdb_record!(fixture, completed)
+
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(queued.type, queued.state, queued.partition_key)
+
+    queued_due_key =
+      Ferricstore.Flow.Keys.due_key(
+        queued.type,
+        queued.state,
+        queued.priority,
+        queued.partition_key
+      )
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_due_key)
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+
+    assert {:ok, terminal_key} =
+             Ferricstore.Flow.LMDB.get(
+               fixture.lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+             )
+
+    assert is_binary(terminal_key)
+  end
+
+  test "LMDB reconcile removes stale active indexes for terminal states" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_reconcile_terminal_active_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_reconcile_terminal_active_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_reconcile_terminal_active_keydir, [:set])
+
+    on_exit(fn ->
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    queued =
+      active_lmdb_record("flow-reconcile-terminal-active", "reconcile-terminal-active", "queued",
+        partition_key: "tenant-reconcile-terminal-active",
+        updated_at_ms: 2,
+        next_run_at_ms: 10
+      )
+
+    completed =
+      queued
+      |> Map.merge(%{
+        state: "completed",
+        version: 2,
+        updated_at_ms: 20,
+        next_run_at_ms: nil
+      })
+
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(
+               lmdb_path,
+               elem(
+                 Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, queued, 0),
+                 0
+               )
+             )
+
+    encoded_completed = Ferricstore.Flow.encode_record(completed)
+
+    :ets.insert(
+      keydir,
+      {state_key, encoded_completed, 0, 0, :hot, 0, byte_size(encoded_completed)}
+    )
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{name: instance_name},
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(queued.type, queued.state, queued.partition_key)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+
+    assert [] =
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               queued_state_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+  end
+
+  test "default startup repairs active projection and clears stale LMDB flush marker" do
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_default_startup_partial_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 88
+    keydir = :ets.new(:flow_lmdb_default_startup_partial_keydir, [:set])
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    File.mkdir_p!(shard_path)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    queued =
+      active_lmdb_record("flow-default-partial", "default-partial", "queued",
+        partition_key: "tenant-default-partial",
+        updated_at_ms: 2,
+        next_run_at_ms: 10
+      )
+
+    completed =
+      queued
+      |> Map.merge(%{
+        state: "completed",
+        version: 2,
+        updated_at_ms: 20,
+        next_run_at_ms: nil
+      })
+
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(
+               lmdb_path,
+               [
+                 Ferricstore.Flow.LMDB.flush_in_progress_put_op()
+                 | elem(
+                     Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(
+                       state_key,
+                       queued,
+                       0
+                     ),
+                     0
+                   )
+               ]
+             )
+
+    encoded_completed = Ferricstore.Flow.encode_record(completed)
+
+    :ets.insert(
+      keydir,
+      {state_key, encoded_completed, 0, 0, :hot, 0, byte_size(encoded_completed)}
+    )
+
+    assert Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(:default, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{name: :default},
+               nil,
+               nil,
+               flow_index,
+               flow_lookup
+             )
+
+    refute Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(queued.type, queued.state, queued.partition_key)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert [] =
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               queued_state_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
+  end
+
+  test "default WARaft segment replay reconcile repairs stale existing LMDB projection" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_default_segment_replay_reconcile_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 89
+    keydir = :ets.new(:flow_lmdb_default_segment_replay_reconcile_keydir, [:set])
+
+    on_exit(fn ->
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    File.mkdir_p!(shard_path)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    queued =
+      active_lmdb_record("flow-default-segment-replay", "default-segment-replay", "queued",
+        partition_key: "tenant-default-segment-replay",
+        updated_at_ms: 2,
+        next_run_at_ms: 10
+      )
+
+    completed =
+      queued
+      |> Map.merge(%{
+        state: "completed",
+        version: 2,
+        updated_at_ms: 20,
+        next_run_at_ms: nil
+      })
+
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(
+               lmdb_path,
+               elem(
+                 Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, queued, 0),
+                 0
+               )
+             )
+
+    assert Ferricstore.Flow.LMDB.env_present?(lmdb_path)
+
+    encoded_completed = Ferricstore.Flow.encode_record(completed)
+
+    :ets.insert(
+      keydir,
+      {state_key, encoded_completed, 0, 0, :hot, 0, byte_size(encoded_completed)}
+    )
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(:default, shard_index)
+
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               %{name: :default},
+               nil,
+               nil,
+               flow_index,
+               flow_lookup,
+               force_full_reconcile?: true,
+               reason: :segment_replay
+             )
+
+    assert {:ok, lmdb_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+    assert {:ok, ^encoded_completed} = Ferricstore.Flow.LMDB.decode_value(lmdb_blob, 30)
+
+    queued_state_key =
+      Ferricstore.Flow.Keys.state_index_key(queued.type, queued.state, queued.partition_key)
+
+    completed_state_key =
+      Ferricstore.Flow.Keys.state_index_key(
+        completed.type,
+        completed.state,
+        completed.partition_key
+      )
+
+    assert [] =
+             Ferricstore.Flow.OrderedIndex.range_slice(
+               flow_index,
+               queued_state_key,
+               :neg_inf,
+               :inf,
+               false,
+               0,
+               :all
+             )
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.terminal_index_prefix(completed_state_key)
+             )
   end
 
   test "stores, reads, overwrites, and deletes raw flow state blobs" do
@@ -259,7 +2673,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.LMDB.decode_query_index_value(legacy_permanent)
   end
 
-  test "terminal_counts batches count reads and caches missing counts as zero" do
+  test "terminal_counts batches count reads without caching missing counts" do
     path =
       Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
 
@@ -271,10 +2685,16 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, [0, 0]} =
              Ferricstore.Flow.LMDB.terminal_counts(path, [completed_key, failed_key])
 
+    refute terminal_count_cache_member?(path, completed_key)
+    refute terminal_count_cache_member?(path, failed_key)
+
     assert :ok = Ferricstore.Flow.LMDB.put_terminal_count(path, completed_key, 7)
 
     assert {:ok, [7, 0]} =
              Ferricstore.Flow.LMDB.terminal_counts(path, [completed_key, failed_key])
+
+    assert terminal_count_cache_member?(path, completed_key)
+    refute terminal_count_cache_member?(path, failed_key)
   end
 
   test "terminal index keys preserve numeric timestamp order in bounded prefix reads" do
@@ -329,6 +2749,85 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert {:ok, [{^older_key, ^older_value}]} =
              Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1)
+  end
+
+  test "sortable flow LMDB keys use fixed-width decimal timestamp bytes" do
+    history_key = Ferricstore.Flow.Keys.history_key("history-pad", "tenant-history-pad")
+    history_prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+    history_index_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "event-1", 42)
+
+    terminal_key = "flow:{terminal-pad}:idx:done"
+    terminal_prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(terminal_key)
+    terminal_index_key = Ferricstore.Flow.LMDB.terminal_index_key(terminal_key, "id-1", 42)
+
+    assert history_index_key == history_prefix <> "00000000000000000042" <> <<0>> <> "event-1"
+    assert terminal_index_key == terminal_prefix <> "00000000000000000042" <> <<0>> <> "id-1"
+  end
+
+  test "terminal expire sweep deletes orphan metadata markers without a state key" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    metadata_index_key = Ferricstore.Flow.Keys.root_index_key("root-orphan", "tenant-orphan")
+    terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(metadata_index_key, "flow-orphan", 10)
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(metadata_index_key)
+    expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(10, terminal_key)
+
+    expire_value =
+      Ferricstore.Flow.LMDB.encode_terminal_expire_value(terminal_key, nil, count_key)
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, expire_key, expire_value}])
+
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.sweep_expired_terminal(path, 11, 100)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, expire_key)
+  end
+
+  test "terminal expire sweep deletes expired live terminal marker" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_live_terminal_expire_#{System.unique_integer([:positive])}"
+      )
+
+    state_index_key = Ferricstore.Flow.Keys.state_index_key("kind", "completed", "tenant-live")
+    state_key = Ferricstore.Flow.Keys.state_key("flow-live-expire", "tenant-live")
+
+    terminal_key =
+      Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, "flow-live-expire", 10)
+
+    reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+    expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(10, terminal_key)
+
+    terminal_value =
+      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+        "flow-live-expire",
+        10,
+        10,
+        state_key,
+        count_key
+      )
+
+    expire_value =
+      Ferricstore.Flow.LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, terminal_key, terminal_value},
+               {:put, reverse_key, terminal_key},
+               {:put, expire_key, expire_value},
+               {:put, count_key, Ferricstore.Flow.LMDB.encode_count(1)}
+             ])
+
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.sweep_expired_terminal(path, 11, 100)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, terminal_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, reverse_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, expire_key)
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
   end
 
   test "history expire sweep removes expired history index entries" do
@@ -396,7 +2895,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, _} = Ferricstore.Flow.LMDB.get(path, reused_key)
   end
 
-  test "flow LMDB mode defaults off unless explicitly enabled" do
+  test "flow LMDB mode is always lagged" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_enabled = Application.get_env(:ferricstore, :flow_lmdb_enabled)
 
@@ -407,30 +2906,38 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     Application.delete_env(:ferricstore, :flow_lmdb_mode)
     Application.delete_env(:ferricstore, :flow_lmdb_enabled)
-    refute Ferricstore.Flow.LMDB.enabled?()
-    assert Ferricstore.Flow.LMDB.mode() == :off
-    refute Ferricstore.Flow.LMDB.mirror?()
+    assert Ferricstore.Flow.LMDB.enabled?()
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
+    assert Ferricstore.Flow.LMDB.mirror?()
 
     Application.put_env(:ferricstore, :flow_lmdb_enabled, true)
     assert Ferricstore.Flow.LMDB.enabled?()
-    assert Ferricstore.Flow.LMDB.mode() == :mirror
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
 
-    for off <- [:off, false, "false", "FALSE", "0", "off", nil] do
-      Application.put_env(:ferricstore, :flow_lmdb_mode, off)
-      assert Ferricstore.Flow.LMDB.mode() == :off
-      refute Ferricstore.Flow.LMDB.mirror?()
-    end
-
-    for lagged <- [:lagged, :async, "lagged", "async", "batched"] do
-      Application.put_env(:ferricstore, :flow_lmdb_mode, lagged)
+    for ignored <- [
+          :off,
+          :lagged,
+          :async,
+          :mirror,
+          :write_through,
+          false,
+          true,
+          "false",
+          "TRUE",
+          "0",
+          "1",
+          "off",
+          "lagged",
+          "async",
+          "batched",
+          "mirror",
+          "write_through",
+          "on",
+          nil
+        ] do
+      Application.put_env(:ferricstore, :flow_lmdb_mode, ignored)
       assert Ferricstore.Flow.LMDB.enabled?()
       assert Ferricstore.Flow.LMDB.mode() == :lagged
-      assert Ferricstore.Flow.LMDB.mirror?()
-    end
-
-    for mirror <- [:mirror, true, "true", "TRUE", "1", "mirror", "on"] do
-      Application.put_env(:ferricstore, :flow_lmdb_mode, mirror)
-      assert Ferricstore.Flow.LMDB.mode() == :mirror
       assert Ferricstore.Flow.LMDB.mirror?()
     end
   end
@@ -552,6 +3059,96 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
+  test "mirror writer rejects enqueue above mailbox guardrail" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_max_mailbox = Application.get_env(:ferricstore, :flow_lmdb_writer_max_mailbox_messages)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_writer_max_mailbox_messages, 0)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_queue_full_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_writer_queue_full_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:state:queue-full"
+    handler_id = {:flow_lmdb_writer_queue_full, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_writer, :unavailable],
+      &__MODULE__.handle_lmdb_writer_unavailable/4,
+      self()
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_writer_max_mailbox_messages, old_max_mailbox)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    assert {:error, :queue_full} =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:put, key, "v1"}
+             ])
+
+    assert_receive {:flow_lmdb_writer_unavailable,
+                    [:ferricstore, :flow, :lmdb_writer, :unavailable], %{op_count: 1},
+                    %{
+                      operation: :enqueue,
+                      instance_name: ^instance_name,
+                      shard_index: ^shard_index,
+                      reason: :queue_full
+                    }}
+  end
+
+  test "mirror writer rejects a single projection batch above configured op guardrail" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_max_enqueue_ops = Application.get_env(:ferricstore, :flow_lmdb_writer_max_enqueue_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_writer_max_enqueue_ops, 1)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_op_guard_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_writer_op_guard_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_writer_max_enqueue_ops, old_max_enqueue_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    assert {:error, :queue_full} =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:put, "flow:{flow:test}:state:op-guard-1", "v1"},
+               {:put, "flow:{flow:test}:state:op-guard-2", "v2"}
+             ])
+  end
+
   test "active mirror writes do not initialize terminal counters" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -604,31 +3201,22 @@ defmodule Ferricstore.Flow.LMDBTest do
     id = "history-project-flow"
     partition_key = "tenant-history-project"
     history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
-    {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
 
     on_exit(fn ->
       restore_env(:flow_lmdb_mode, old_mode)
       File.rm_rf!(data_dir)
-
-      for table <- [flow_index, flow_lookup] do
-        try do
-          :ets.delete(table)
-        rescue
-          ArgumentError -> :ok
-        end
-      end
     end)
 
     Ferricstore.DataDir.ensure_layout!(data_dir, 1)
-    :ets.new(flow_index, [:ordered_set, :public, :named_table])
-    :ets.new(flow_lookup, [:set, :public, :named_table])
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
 
     Ferricstore.Flow.OrderedIndex.put_new_entries(flow_index, flow_lookup, [
       {history_key, "1000-1", 1_000},
       {history_key, "1001-2", 1_001}
     ])
-
-    Ferricstore.Flow.NativeOrderedIndex.rebuild_from_ets(flow_index, flow_lookup)
 
     start_supervised!(
       {Ferricstore.Flow.LMDBWriter,
@@ -642,8 +3230,8 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
-               {:history_project_from_index, flow_index, flow_lookup, id, partition_key, history_key,
-                60_000}
+               {:history_project_from_index, flow_index, flow_lookup, id, partition_key,
+                history_key, 60_000}
              ])
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
@@ -659,32 +3247,310 @@ defmodule Ferricstore.Flow.LMDBTest do
 
              {event_id, event_ms, compound_key}
            end) == [
-             {"1000-1", 1_000, Ferricstore.Flow.Keys.stream_entry_key(id, "1000-1", partition_key)},
-             {"1001-2", 1_001, Ferricstore.Flow.Keys.stream_entry_key(id, "1001-2", partition_key)}
+             {"1000-1", 1_000,
+              Ferricstore.Flow.Keys.stream_entry_key(id, "1000-1", partition_key)},
+             {"1001-2", 1_001,
+              Ferricstore.Flow.Keys.stream_entry_key(id, "1001-2", partition_key)}
            ]
   end
 
-  test "lagged writer debounces flush while writes continue" do
+  test "mirror writer preserves projected history file locators" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_history_project_location_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_history_project_location_#{System.unique_integer([:positive])}"
+    id = "history-project-location-flow"
+    partition_key = "tenant-history-project-location"
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    event_id = "1000-1"
+    event_ms = 1_000
+    compound_key = Ferricstore.Flow.Keys.stream_entry_key(id, event_id, partition_key)
+    history_index_key = Ferricstore.Flow.LMDB.history_index_key(history_key, event_id, event_ms)
+
+    {flow_index, flow_lookup} =
+      Ferricstore.Flow.OrderedIndex.table_names(instance_name, shard_index)
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+    Ferricstore.Flow.OrderedIndex.put_new_entries(flow_index, flow_lookup, [
+      {history_key, event_id, event_ms}
+    ])
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, history_index_key,
+                Ferricstore.Flow.LMDB.encode_history_index_value(
+                  event_id,
+                  event_ms,
+                  compound_key,
+                  60_000,
+                  {:flow_history, 7},
+                  123,
+                  456
+                )}
+             ])
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:history_project_from_index, flow_index, flow_lookup, id, partition_key,
+                history_key, 60_000}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+
+    assert {:ok, value} = Ferricstore.Flow.LMDB.get(path, history_index_key)
+
+    assert {:ok, {^event_id, ^event_ms, 60_000, ^compound_key, {:flow_history, 7}, 123, 456}} =
+             Ferricstore.Flow.LMDB.decode_history_index_location(value)
+  end
+
+  test "lagged writer defers timer flush while writes continue under max lag" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_flush_jitter = Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms)
+    old_flush_quiet = Application.get_env(:ferricstore, :flow_lmdb_flush_quiet_ms)
+    old_flush_max_lag = Application.get_env(:ferricstore, :flow_lmdb_flush_max_lag_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 50)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_jitter_ms, 0)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_quiet_ms, 100)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_max_lag_ms, 500)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_lagged_interval_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_lagged_interval_#{System.unique_integer([:positive])}"
+    key1 = "flow:{flow:test}:state:lagged-interval-1"
+    key2 = "flow:{flow:test}:state:lagged-interval-2"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_flush_jitter_ms, old_flush_jitter)
+      restore_env(:flow_lmdb_flush_quiet_ms, old_flush_quiet)
+      restore_env(:flow_lmdb_flush_max_lag_ms, old_flush_max_lag)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key1, "v1"}])
+
+    Process.sleep(70)
+
+    refute File.exists?(Path.join(path, "data.mdb"))
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key2, "v2"}])
+
+    Process.sleep(80)
+
+    refute File.exists?(Path.join(path, "data.mdb"))
+
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      Ferricstore.Flow.LMDB.get(path, key1) == {:ok, "v1"} and
+        Ferricstore.Flow.LMDB.get(path, key2) == {:ok, "v2"}
+    end)
+  end
+
+  test "lagged writer flushes at max projection lag even when quiet window is not reached" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_flush_jitter = Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms)
+    old_flush_quiet = Application.get_env(:ferricstore, :flow_lmdb_flush_quiet_ms)
+    old_flush_max_lag = Application.get_env(:ferricstore, :flow_lmdb_flush_max_lag_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 20)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_jitter_ms, 0)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_quiet_ms, 1_000)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_max_lag_ms, 100)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_lagged_max_lag_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_lagged_max_lag_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:state:lagged-max-lag"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_flush_jitter_ms, old_flush_jitter)
+      restore_env(:flow_lmdb_flush_quiet_ms, old_flush_quiet)
+      restore_env(:flow_lmdb_flush_max_lag_ms, old_flush_max_lag)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v1"}])
+
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      Ferricstore.Flow.LMDB.get(path, key) == {:ok, "v1"}
+    end)
+  end
+
+  test "lagged writer coalesces replay-safe requests behind hot flush quiet window" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_flush_jitter = Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms)
+    old_flush_quiet = Application.get_env(:ferricstore, :flow_lmdb_flush_quiet_ms)
+    old_flush_max_lag = Application.get_env(:ferricstore, :flow_lmdb_flush_max_lag_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 50)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_jitter_ms, 0)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_quiet_ms, 100)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_max_lag_ms, 500)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_replay_safe_quiet_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_replay_safe_quiet_#{System.unique_integer([:positive])}"
+    key1 = "flow:{flow:test}:state:replay-safe-quiet-1"
+    key2 = "flow:{flow:test}:state:replay-safe-quiet-2"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_flush_jitter_ms, old_flush_jitter)
+      restore_env(:flow_lmdb_flush_quiet_ms, old_flush_quiet)
+      restore_env(:flow_lmdb_flush_max_lag_ms, old_flush_max_lag)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_replay_safe_index: :atomics.new(1, signed: false),
+      flow_lmdb_replay_safe_requested_index: :atomics.new(1, signed: false),
+      flow_lmdb_replay_safe_persist_failures: :atomics.new(1, signed: false),
+      flow_lmdb_mirror_degraded: :atomics.new(1, signed: false),
+      flow_lmdb_writer_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index,
+       data_dir: data_dir,
+       instance_name: instance_name,
+       instance_ctx: instance_ctx}
+    )
+
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key1, "v1"}])
+
+    Process.sleep(70)
+
+    assert :requested =
+             Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 123)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key2, "v2"}])
+
+    Process.sleep(80)
+
+    refute File.exists?(Path.join(path, "data.mdb"))
+
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      Ferricstore.Flow.LMDB.get(path, key1) == {:ok, "v1"} and
+        Ferricstore.Flow.LMDB.get(path, key2) == {:ok, "v2"} and
+        Ferricstore.Flow.LMDBWriter.durable?(instance_ctx, shard_index, shard_data_path, 123)
+    end)
+  end
+
+  test "lagged writer flushes at max ops to bound memory" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
     old_flush_jitter = Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms)
     old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
-    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 100)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
     Application.put_env(:ferricstore, :flow_lmdb_flush_jitter_ms, 0)
     Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 2)
 
     data_dir =
       Path.join(
         System.tmp_dir!(),
-        "ferricstore_flow_lmdb_lagged_debounce_#{System.unique_integer([:positive])}"
+        "ferricstore_flow_lmdb_lagged_cap_#{System.unique_integer([:positive])}"
       )
 
     shard_index = 0
-    instance_name = :"flow_lmdb_lagged_debounce_#{System.unique_integer([:positive])}"
-    key1 = "flow:{flow:test}:state:lagged-debounce-1"
-    key2 = "flow:{flow:test}:state:lagged-debounce-2"
+    instance_name = :"flow_lmdb_lagged_cap_#{System.unique_integer([:positive])}"
+    key1 = "flow:{flow:test}:state:lagged-cap-1"
+    key2 = "flow:{flow:test}:state:lagged-cap-2"
 
     on_exit(fn ->
       restore_env(:flow_lmdb_mode, old_mode)
@@ -709,19 +3575,93 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key1, "v1"}])
 
-    Process.sleep(40)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, key1)
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key2, "v2"}])
 
-    Process.sleep(30)
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      Ferricstore.Flow.LMDB.get(path, key1) == {:ok, "v1"} and
+        Ferricstore.Flow.LMDB.get(path, key2) == {:ok, "v2"}
+    end)
+  end
 
-    refute File.exists?(Path.join(path, "data.mdb"))
+  test "lagged writer suspend cancels source projection timer during shutdown" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_flush_jitter = Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+    old_source_retries = Application.get_env(:ferricstore, :flow_lmdb_source_pending_retries)
 
-    Process.sleep(150)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 20)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_jitter_ms, 0)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+    Application.put_env(:ferricstore, :flow_lmdb_source_pending_retries, 0)
 
-    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key1)
-    assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key2)
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_suspend_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_suspend_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    key = "flow:{flow:suspend}:state:a"
+    keydir = :ets.new(:flow_lmdb_suspend_keydir, [:set, :public])
+
+    instance_ctx = %{
+      name: instance_name,
+      keydir_refs: {keydir},
+      flow_lmdb_writer_flush_failures: :atomics.new(1, signed: false)
+    }
+
+    test_pid = self()
+    handler_id = {:flow_lmdb_writer_suspend, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_writer, :flush],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_writer_suspend, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_flush_jitter_ms, old_flush_jitter)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      restore_env(:flow_lmdb_source_pending_retries, old_source_retries)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_ctx: instance_ctx}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:project_kv_from_source, key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.suspend(instance_name, shard_index)
+    true = :ets.delete(keydir)
+
+    assert_receive {:flow_lmdb_writer_suspend, [:ferricstore, :flow, :lmdb_writer, :flush],
+                    %{op_count: 1}, %{status: :ok}},
+                   500
+
+    refute_receive {:flow_lmdb_writer_suspend, [:ferricstore, :flow, :lmdb_writer, :flush],
+                    _measurements, _metadata},
+                   80
+
+    assert :atomics.get(instance_ctx.flow_lmdb_writer_flush_failures, 1) == 0
   end
 
   test "mirror writer can flush a single shard without draining others" do
@@ -1047,7 +3987,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                     %{count: 1}, %{shard_index: 0, reason: :writer_not_started}}
   end
 
-  test "state-machine skips LMDB mirror enqueue when mode is off" do
+  test "state-machine still requires LMDB mirror enqueue when mode is configured off" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_trap = Process.flag(:trap_exit, true)
     Application.put_env(:ferricstore, :flow_lmdb_mode, :off)
@@ -1088,8 +4028,8 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3
              )
 
-    assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 0
-    assert :atomics.get(ctx.flow_lmdb_mirror_degraded, 1) == 0
+    assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 1
+    assert :atomics.get(ctx.flow_lmdb_mirror_degraded, 1) == 1
   end
 
   test "mirror writer persists replay-safe marker only after pending ops flush" do
@@ -1149,6 +4089,62 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
     assert :atomics.get(durable, shard_index + 1) == 123
     assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 123
+  end
+
+  test "mirror writer persists replay-safe marker without consensus pokes" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_waraft_marker_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 52
+    instance_name = :"flow_lmdb_writer_waraft_marker_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    key = "flow:{flow:test}:state:waraft-marker"
+    atomics_size = shard_index + 1
+    durable = :atomics.new(atomics_size, signed: false)
+    requested = :atomics.new(atomics_size, signed: false)
+    failures = :atomics.new(atomics_size, signed: false)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_replay_safe_index: durable,
+      flow_lmdb_replay_safe_requested_index: requested,
+      flow_lmdb_replay_safe_persist_failures: failures
+    }
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index,
+       data_dir: data_dir,
+       instance_ctx: instance_ctx,
+       instance_name: instance_name}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v1"}])
+
+    assert :requested =
+             Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 222)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert :atomics.get(durable, shard_index + 1) == 222
+    assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 222
+    refute_receive {:"$gen_cast", {:origin_submit, _command}}, 100
   end
 
   test "mirror writer refuses replay-safe marker while shard is degraded" do
@@ -1268,6 +4264,151 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :atomics.get(durable, shard_index + 1) == 0
     assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 0
     assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
+  end
+
+  test "mirror writer restart refuses replay-safe advancement after losing async enqueue mailbox" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_trap = Process.flag(:trap_exit, true)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_async_loss_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 6
+    instance_name = :"flow_lmdb_writer_async_loss_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    key = "flow:{flow:test}:state:async-loss"
+    atomics_size = shard_index + 1
+    durable = :atomics.new(atomics_size, signed: false)
+    requested = :atomics.new(atomics_size, signed: false)
+    failures = :atomics.new(atomics_size, signed: false)
+    degraded = :atomics.new(atomics_size, signed: false)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_replay_safe_index: durable,
+      flow_lmdb_replay_safe_requested_index: requested,
+      flow_lmdb_replay_safe_persist_failures: failures,
+      flow_lmdb_mirror_degraded: degraded
+    }
+
+    on_exit(fn ->
+      Process.flag(:trap_exit, old_trap)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    writer_opts = [
+      shard_index: shard_index,
+      data_dir: data_dir,
+      instance_ctx: instance_ctx,
+      instance_name: instance_name
+    ]
+
+    assert {:ok, pid} = Ferricstore.Flow.LMDBWriter.start_link(writer_opts)
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    :ok = :sys.suspend(pid)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue_async(instance_name, shard_index, [
+               {:put, key, "v1"}
+             ])
+
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+    assert {:ok, restarted} = Ferricstore.Flow.LMDBWriter.start_link(writer_opts)
+    assert Process.alive?(restarted)
+
+    assert {:error, :mirror_degraded} =
+             Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 654)
+
+    assert :atomics.get(requested, shard_index + 1) == 654
+    assert :atomics.get(degraded, shard_index + 1) == 1
+    assert :atomics.get(durable, shard_index + 1) == 0
+    assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 0
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
+  end
+
+  test "mirror writer suspend drains async enqueues accepted before suspend" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_suspend_async_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_writer_suspend_async_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    key = "flow:{flow:test}:state:suspend-async"
+    degraded = :atomics.new(1, signed: false)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_mirror_degraded: degraded
+    }
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    {:ok, pid} =
+      start_supervised(
+        {Ferricstore.Flow.LMDBWriter,
+         shard_index: shard_index,
+         data_dir: data_dir,
+         instance_ctx: instance_ctx,
+         instance_name: instance_name}
+      )
+
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    :ok = :sys.suspend(pid)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue_async(instance_name, shard_index, [
+               {:put, key, "v1"}
+             ])
+
+    parent = self()
+
+    suspend_task =
+      Task.async(fn ->
+        send(parent, :suspend_started)
+        result = Ferricstore.Flow.LMDBWriter.suspend(instance_name, shard_index)
+        send(parent, {:suspend_finished, result})
+        result
+      end)
+
+    assert_receive :suspend_started, 500
+    Process.sleep(20)
+    :ok = :sys.resume(pid)
+
+    assert Task.await(suspend_task, 1_000) == :ok
+    assert_receive {:suspend_finished, :ok}, 500
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
+    assert :atomics.get(degraded, 1) == 0
   end
 
   test "mirror writer persists replay-safe marker with no pending ops" do
@@ -1393,6 +4534,224 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
   end
 
+  test "terminal projection replay repairs legacy partial terminal commits" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_partial_terminal_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 9
+    instance_name = :"flow_lmdb_writer_partial_terminal_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    state_index_key = Ferricstore.Flow.Keys.state_index_key("kind", "completed", "tenant")
+    terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, "flow-a", 10)
+    state_key = Ferricstore.Flow.Keys.state_key("flow-a", "tenant")
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+    value =
+      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+        "flow-a",
+        10,
+        0,
+        state_key,
+        count_key
+      )
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, terminal_key, value}
+             ])
+
+    assert {:ok, ^value} = Ferricstore.Flow.LMDB.get(path, terminal_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, count_key)
+
+    {:ok, _pid} =
+      Ferricstore.Flow.LMDBWriter.start_link(
+        shard_index: shard_index,
+        data_dir: data_dir,
+        instance_name: instance_name
+      )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:terminal_put, terminal_key, value, state_key, count_key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
+  end
+
+  test "terminal projection flush does not expose partial chunk results" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_chunk_ops = Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops)
+    old_chunk_pause = Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_pause_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_chunk_ops, 1)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_chunk_pause_ms, 1_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_no_partial_terminal_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 9
+    instance_name = :"flow_lmdb_writer_no_partial_terminal_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    state_index_key = Ferricstore.Flow.Keys.state_index_key("kind", "completed", "tenant")
+    terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, "flow-a", 10)
+    state_key = Ferricstore.Flow.Keys.state_key("flow-a", "tenant")
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+    value =
+      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+        "flow-a",
+        10,
+        0,
+        state_key,
+        count_key
+      )
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_flush_chunk_ops, old_chunk_ops)
+      restore_env(:flow_lmdb_flush_chunk_pause_ms, old_chunk_pause)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    {:ok, _pid} =
+      Ferricstore.Flow.LMDBWriter.start_link(
+        shard_index: shard_index,
+        data_dir: data_dir,
+        instance_name: instance_name
+      )
+
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:terminal_put, terminal_key, value, state_key, count_key}
+             ])
+
+    parent = self()
+
+    {flusher, monitor} =
+      spawn_monitor(fn ->
+        result = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+        send(parent, {:no_partial_terminal_flush, result})
+      end)
+
+    refute wait_until_true(
+             fn ->
+               Ferricstore.Flow.LMDB.get(path, terminal_key) == {:ok, value} and
+                 Ferricstore.Flow.LMDB.terminal_count(path, state_index_key) == :not_found
+             end,
+             50
+           )
+
+    assert_receive {:no_partial_terminal_flush, :ok}, 2_000
+    assert_receive {:DOWN, ^monitor, :process, ^flusher, :normal}, 1_000
+    assert {:ok, ^value} = Ferricstore.Flow.LMDB.get(path, terminal_key)
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
+  end
+
+  test "non-terminal writer flush honors chunk sizing under an in-progress marker" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_chunk_ops = Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops)
+    old_chunk_pause = Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_pause_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_chunk_ops, 2)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_chunk_pause_ms, 100)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_chunked_puts_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 9
+    instance_name = :"flow_lmdb_writer_chunked_puts_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_flush_chunk_ops, old_chunk_ops)
+      restore_env(:flow_lmdb_flush_chunk_pause_ms, old_chunk_pause)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    {:ok, _pid} =
+      Ferricstore.Flow.LMDBWriter.start_link(
+        shard_index: shard_index,
+        data_dir: data_dir,
+        instance_name: instance_name
+      )
+
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+    keys = Enum.map(1..5, &"chunked-put:#{&1}")
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(
+               instance_name,
+               shard_index,
+               Enum.map(keys, fn key -> {:put, key, "value:" <> key} end)
+             )
+
+    parent = self()
+
+    {flusher, monitor} =
+      spawn_monitor(fn ->
+        result = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+        send(parent, {:chunked_non_terminal_flush, result})
+      end)
+
+    assert wait_until_true(
+             fn ->
+               Ferricstore.Flow.LMDB.flush_in_progress?(path) and
+                 Ferricstore.Flow.LMDB.get(path, hd(keys)) == {:ok, "value:" <> hd(keys)} and
+                 Ferricstore.Flow.LMDB.get(path, List.last(keys)) == :not_found
+             end,
+             50
+           )
+
+    assert_receive {:chunked_non_terminal_flush, :ok}, 2_000
+    assert_receive {:DOWN, ^monitor, :process, ^flusher, :normal}, 1_000
+    refute Ferricstore.Flow.LMDB.flush_in_progress?(path)
+
+    for key <- keys do
+      expected = "value:" <> key
+      assert {:ok, ^expected} = Ferricstore.Flow.LMDB.get(path, key)
+    end
+  end
+
   test "mirror writer maintains terminal metadata index without state reverse pointer" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -1470,7 +4829,12 @@ defmodule Ferricstore.Flow.LMDBTest do
     Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
     Application.put_env(:ferricstore, :flow_terminal_hot_ttl_ms, 0)
 
-    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+    ctx =
+      Ferricstore.Test.IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1,
+        blob_side_channel_threshold_bytes: 128
+      )
 
     on_exit(fn ->
       Ferricstore.Test.IsolatedInstance.checkin(ctx)
@@ -1584,6 +4948,187 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert {:ok, [%{id: "flow-a", state: "queued"}]} =
              Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
+  end
+
+  test "non-idempotent create rejects existing terminal flow after hot state is pruned" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+    old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+    Application.put_env(:ferricstore, :flow_terminal_hot_ttl_ms, 0)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      restore_env(:flow_terminal_hot_ttl_ms, old_hot_ttl)
+    end)
+
+    partition_key = "tenant-cold-duplicate"
+    flow_type = "cold-duplicate"
+    id = "flow-cold-duplicate"
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-cold-duplicate",
+               partition_key: partition_key,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> [] == :ets.lookup(elem(ctx.keydir_refs, 0), state_key) end,
+      "terminal state key was not hot-pruned",
+      200,
+      10
+    )
+
+    assert {:ok, %{state: "completed"}} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:error, "ERR flow already exists"} =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               run_at_ms: 3_000,
+               now_ms: 3_000
+             )
+
+    assert {:error, "ERR flow already exists"} =
+             Ferricstore.Flow.create_many(
+               ctx,
+               partition_key,
+               [%{id: id}, %{id: "flow-cold-duplicate-new"}],
+               type: flow_type,
+               run_at_ms: 3_000,
+               now_ms: 3_000
+             )
+
+    assert {:ok, nil} =
+             Ferricstore.Flow.get(ctx, "flow-cold-duplicate-new", partition_key: partition_key)
+  end
+
+  test "history expiry marker from terminal flow is cleared after rewind" do
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+    end)
+
+    partition_key = "tenant-history-expiry-rewind"
+    flow_type = "history-expiry-rewind"
+    id = "flow-history-expiry-rewind"
+    create_now = System.system_time(:millisecond) + 60_000
+    claim_now = create_now + 1
+    complete_now = create_now + 2
+    rewind_now = complete_now + 10
+    sweep_now = complete_now + 1_000
+
+    assert :ok =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: id,
+               type: flow_type,
+               state: "queued",
+               run_at_ms: create_now,
+               partition_key: partition_key,
+               retention_ttl_ms: 20,
+               now_ms: create_now
+             })
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Store.Router.flow_claim_due(ctx, %{
+               type: flow_type,
+               state: "queued",
+               priority: nil,
+               worker: "worker-history-expiry-rewind",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: claim_now,
+               partition_key: partition_key
+             })
+
+    assert :ok =
+             Ferricstore.Store.Router.flow_complete(ctx, %{
+               id: claimed.id,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: complete_now,
+               partition_key: partition_key
+             })
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    history_prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+
+    assert {:ok, before_rewind_count} =
+             Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
+
+    assert before_rewind_count >= 3
+
+    assert {:ok, [{created_event_id, _fields} | _]} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
+
+    assert :ok =
+             Ferricstore.Store.Router.flow_rewind(ctx, %{
+               id: id,
+               to_event: created_event_id,
+               expect_state: "completed",
+               run_at_ms: sweep_now,
+               now_ms: rewind_now,
+               partition_key: partition_key
+             })
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, after_rewind_count} =
+             Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
+
+    assert after_rewind_count >= before_rewind_count
+
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.sweep_expired_history(lmdb_path, sweep_now, 100)
+
+    assert {:ok, ^after_rewind_count} =
+             Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
+
+    assert {:ok, events} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               now_ms: sweep_now
+             )
+
+    assert Enum.any?(events, fn {_event_id, fields} -> fields["event"] == "rewound" end)
   end
 
   test "lineage queries post-filter stale LMDB secondary index entries" do
@@ -1711,7 +5256,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert is_integer(vsize)
   end
 
-  test "mirror mode persists terminal Flow state for cold reads and info" do
+  test "lagged projection persists terminal Flow state for cold reads and info" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
 
@@ -1730,7 +5275,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     flow_type = "default-mirror"
     id = "flow-default-mirror"
 
-    assert Ferricstore.Flow.LMDB.mode() == :mirror
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
 
     assert :ok =
              Ferricstore.Store.Router.flow_create(ctx, %{
@@ -1957,7 +5502,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
   end
 
-  test "legacy write-through Flow LMDB mode aliases to mirror" do
+  test "legacy Flow LMDB mode values are ignored" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :write_through)
@@ -1966,10 +5511,13 @@ defmodule Ferricstore.Flow.LMDBTest do
       restore_env(:flow_lmdb_mode, old_mode)
     end)
 
-    assert Ferricstore.Flow.LMDB.mode() == :mirror
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    assert Ferricstore.Flow.LMDB.mode() == :lagged
   end
 
-  test "mirror flow get emits telemetry for corrupt LMDB wrapper" do
+  test "lagged projection flow get emits telemetry for corrupt LMDB wrapper" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -2008,7 +5556,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
 
     assert_receive {:flow_lmdb_read_error, [:ferricstore, :flow, :lmdb, :read_error], %{count: 1},
-                    %{mode: :mirror, reason: :decode_error}}
+                    %{mode: :lagged, reason: :decode_error}}
   end
 
   test "lineage queries skip malformed LMDB mirror records" do
@@ -2476,6 +6024,162 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
   end
 
+  test "terminal records leave hot indexes immediately by default after LMDB flush" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.delete_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_terminal_hot_ttl_ms, old_hot_ttl)
+    end)
+
+    partition_key = "tenant-default-terminal-retention"
+    flow_type = "default-terminal-retention"
+    id = "flow-default-terminal-retention"
+    parent = "parent-default-terminal-retention"
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               parent_flow_id: parent,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-default-terminal-retention",
+               partition_key: partition_key,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn ->
+        match?(
+          {:ok, []},
+          Ferricstore.Flow.list(ctx, flow_type,
+            state: "completed",
+            partition_key: partition_key
+          )
+        )
+      end,
+      "terminal hot index was not pruned by default",
+      100,
+      10
+    )
+
+    assert {:ok, []} = Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
+
+    assert {:ok, %{id: ^id, state: "completed"}} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+  end
+
+  test "partitioned cold terminal queries read the same LMDB shard that received projection" do
+    old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+    Application.delete_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 4, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_terminal_hot_ttl_ms, old_hot_ttl)
+    end)
+
+    partition_key = "tenant-cold-terminal-routing"
+    flow_type = "cold-terminal-routing"
+    id = "flow-cold-terminal-routing"
+
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    value_key = Ferricstore.Flow.Keys.value_key(id, :payload, 1, partition_key)
+    index_key = Ferricstore.Flow.Keys.state_index_key(flow_type, "completed", partition_key)
+    state_shard = Ferricstore.Store.Router.shard_for(ctx, state_key)
+
+    # Partitioned Flow keys intentionally share the same hash tag. The state-machine projection
+    # goes to the apply shard, so cold query routing must stay aligned with these keys.
+    assert [
+             ^state_shard,
+             ^state_shard,
+             ^state_shard,
+             ^state_shard
+           ] =
+             Enum.map([state_key, history_key, value_key, index_key], fn key ->
+               Ferricstore.Store.Router.shard_for(ctx, key)
+             end)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: "payload",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-cold-terminal-routing",
+               partition_key: partition_key,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn ->
+        match?(
+          {:ok, []},
+          Ferricstore.Flow.list(ctx, flow_type,
+            state: "completed",
+            partition_key: partition_key
+          )
+        )
+      end,
+      "terminal hot index was not pruned after LMDB projection",
+      200,
+      10
+    )
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(state_shard)
+      |> Ferricstore.Flow.LMDB.path()
+
+    prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, prefix)
+
+    assert {:ok, [%{id: ^id, state: "completed"}]} =
+             Ferricstore.Flow.list(ctx, flow_type,
+               state: "completed",
+               partition_key: partition_key,
+               include_cold: true,
+               consistent_projection: true
+             )
+  end
+
   test "retention cleanup removes terminal source rows after hot prune" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
@@ -2543,6 +6247,107 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
   end
 
+  test "retention cleanup removes terminal metadata query rows" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_terminal_hot_ttl_ms, 0)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_terminal_hot_ttl_ms, old_hot_ttl)
+    end)
+
+    partition_key = "tenant-retention-metadata"
+    flow_type = "retention-metadata"
+    id = "flow-retention-metadata"
+    parent = "parent-retention-metadata"
+    root = "root-retention-metadata"
+    correlation = "correlation-retention-metadata"
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               parent_flow_id: parent,
+               root_flow_id: root,
+               correlation_id: correlation,
+               run_at_ms: now,
+               retention_ttl_ms: 1,
+               now_ms: now
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-metadata",
+               partition_key: partition_key,
+               now_ms: now
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 1
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    metadata_prefixes =
+      [
+        Ferricstore.Flow.Keys.parent_index_key(parent, partition_key),
+        Ferricstore.Flow.Keys.root_index_key(root, partition_key),
+        Ferricstore.Flow.Keys.correlation_index_key(correlation, partition_key)
+      ]
+      |> Enum.map(&Ferricstore.Flow.LMDB.query_index_prefix/1)
+
+    assert Enum.all?(metadata_prefixes, fn prefix ->
+             Ferricstore.Flow.LMDB.prefix_count(lmdb_path, prefix) == {:ok, 1}
+           end)
+
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    assert {:ok, [^state_key]} =
+             Ferricstore.Flow.LMDB.expired_terminal_state_keys(lmdb_path, now + 100, 10)
+
+    totals =
+      Enum.reduce_while(1..10, %{flows: 0, history: 0, values: 0}, fn _, acc ->
+        assert {:ok, cleaned} =
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 100)
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+        next = %{
+          flows: acc.flows + cleaned.flows,
+          history: acc.history + cleaned.history,
+          values: acc.values + cleaned.values
+        }
+
+        if next.flows == 1 do
+          {:halt, next}
+        else
+          {:cont, next}
+        end
+      end)
+
+    assert totals.flows == 1
+
+    assert Enum.all?(metadata_prefixes, fn prefix ->
+             Ferricstore.Flow.LMDB.prefix_count(lmdb_path, prefix) == {:ok, 0}
+           end)
+  end
+
   test "history include_cold returns LMDB-projected events trimmed from hot index" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
@@ -2588,38 +6393,1408 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
-    assert {:ok, hot_events} =
+    assert {:ok, default_events} =
              Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
 
-    assert Enum.map(hot_events, fn {_event_id, fields} -> fields["event"] end) == [
-             "claimed",
-             "completed"
-           ]
-
-    assert {:ok, cold_events} =
-             Ferricstore.Flow.history(ctx, id,
-               partition_key: partition_key,
-               count: 10,
-               include_cold: true
-             )
-
-    assert Enum.map(cold_events, fn {_event_id, fields} -> fields["event"] end) == [
+    assert Enum.map(default_events, fn {_event_id, fields} -> fields["event"] end) == [
              "created",
              "claimed",
              "completed"
            ]
+
+    assert {:ok, hot_events} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               include_cold: false
+             )
+
+    assert hot_events == []
   end
 
-  test "history hot trim survives restart while include_cold reads projected events" do
+  test "async history keeps history cold while default history reads LMDB locations" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_projector_flush =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
 
     ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
 
     on_exit(fn ->
       Ferricstore.Test.IsolatedInstance.checkin(ctx)
       restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_projector_flush)
+    end)
+
+    id = "history-async-cold-locations"
+    partition_key = "tenant-history-async-cold-locations"
+    flow_type = "history-async-cold-locations"
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, %{history_hot_max_events: 0}} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-history-async-cold-locations",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_002
+             )
+
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
+
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert {:ok, 3} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert {:ok, history} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
+
+    assert Enum.map(history, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
+
+    assert {:ok, hot_history} =
+             Ferricstore.Flow.history(
+               ctx,
+               id,
+               partition_key: partition_key,
+               count: 10,
+               include_cold: false
+             )
+
+    assert hot_history == []
+  end
+
+  test "async terminal history is cold-only after LMDB projection" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_projector_flush =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_projector_flush)
+    end)
+
+    id = "history-terminal-cold-only"
+    partition_key = "tenant-history-terminal-cold-only"
+    flow_type = "history-terminal-cold-only"
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-history-terminal-cold-only",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_002
+             )
+
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
+
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert {:ok, 3} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert {:ok, history} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
+
+    assert Enum.map(history, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
+
+    assert {:ok, []} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               include_cold: false
+             )
+  end
+
+  test "async history compacts generated payload value rows after LMDB projection" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_flush_interval =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+    shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+    _projector =
+      start_supervised!(
+        {Ferricstore.Flow.HistoryProjector,
+         [
+           shard_index: 0,
+           shard_data_path: shard_data_path,
+           instance_ctx: ctx,
+           recover_on_init: false
+         ]}
+      )
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+    end)
+
+    id = "history-dematerialize-payload"
+    partition_key = "tenant-history-dematerialize-payload"
+    flow_type = "history-dematerialize-payload"
+    initial_payload = String.duplicate("a", 1024)
+    next_payload = String.duplicate("b", 1024)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: initial_payload,
+               history_hot_max_events: 1,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, created} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-history-dematerialize-payload",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert :ok =
+             Ferricstore.Flow.transition(ctx, id, "running", "waiting",
+               partition_key: partition_key,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               payload: next_payload,
+               run_at_ms: 2_000,
+               now_ms: 1_002
+             )
+
+    assert {:ok, latest} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    set_apply_projection_value!(
+      ctx,
+      created.payload_ref,
+      Ferricstore.Flow.encode_value(initial_payload),
+      101
+    )
+
+    set_apply_projection_value!(
+      ctx,
+      latest.payload_ref,
+      Ferricstore.Flow.encode_value(next_payload),
+      102
+    )
+
+    assert apply_projection_cache_count(ctx, 0) == 2
+
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    refute_keydir_row!(ctx, created.payload_ref)
+    refute_keydir_row!(ctx, latest.payload_ref)
+
+    assert {:ok, pins} =
+             Ferricstore.Flow.LMDB.segment_value_pin_entries_before(
+               Ferricstore.Flow.LMDB.path(shard_data_path),
+               103,
+               10
+             )
+
+    assert pins == []
+
+    history_path = Ferricstore.Flow.HistoryProjector.history_file_path(shard_data_path, 0)
+    assert {:ok, history_records} = Ferricstore.Bitcask.NIF.v2_scan_file(history_path)
+
+    history_record_keys =
+      Enum.map(history_records, fn {key, _offset, _value_size, _expire_at_ms, _deleted?} ->
+        key
+      end)
+
+    assert created.payload_ref in history_record_keys
+    assert latest.payload_ref in history_record_keys
+    assert apply_projection_cache_count(ctx, 0) == 0
+
+    assert {:ok, history} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               values: true
+             )
+
+    events = Map.new(history, fn {_event_id, fields} -> {fields["event"], fields} end)
+    assert events["created"]["payload"] == initial_payload
+    assert events["claimed"]["payload"] == initial_payload
+    assert events["transitioned"]["payload"] == next_payload
+  end
+
+  test "async history skips copying blob-backed generated values already projected to LMDB" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_flush_interval =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+    ctx =
+      Ferricstore.Test.IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+    end)
+
+    id = "history-skip-blob-copy"
+    partition_key = "tenant-history-skip-blob-copy"
+    flow_type = "history-skip-blob-copy"
+    payload = String.duplicate("p", 1024)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: payload,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, created} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+    flush_shard!(ctx, 0)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    refute_keydir_row!(ctx, created.payload_ref)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    history_path = Ferricstore.Flow.HistoryProjector.history_file_path(shard_path, 0)
+    assert {:ok, history_records} = Ferricstore.Bitcask.NIF.v2_scan_file(history_path)
+
+    history_record_keys =
+      Enum.map(history_records, fn {key, _offset, _value_size, _expire_at_ms, _deleted?} ->
+        key
+      end)
+
+    refute created.payload_ref in history_record_keys
+
+    assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
+
+    assert {:ok, history} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               values: true
+             )
+
+    events = Map.new(history, fn {_event_id, fields} -> {fields["event"], fields} end)
+    assert events["created"]["payload"] == payload
+  end
+
+  test "async history compacts generated value refs out of keydir after LMDB projection" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_flush_interval =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+    end)
+
+    id = "history-compact-value-ref"
+    partition_key = "tenant-history-compact-value-ref"
+    flow_type = "history-compact-value-ref"
+    initial_payload = String.duplicate("p", 1024)
+    result_payload = String.duplicate("r", 1024)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: initial_payload,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, created} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-history-compact-value-ref",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               result: result_payload,
+               now_ms: 1_002
+             )
+
+    assert {:ok, completed} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    flush_shard!(ctx, 0)
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    case :ets.lookup(elem(ctx.keydir_refs, 0), state_key) do
+      [] ->
+        assert apply_projection_cache_count(ctx, 0) == 0
+
+      [_row] ->
+        state_value = materialize_keydir_value!(ctx, 0, state_key)
+        set_apply_projection_value!(ctx, state_key, state_value, 202)
+        assert apply_projection_cache_count(ctx, 0) == 1
+    end
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    refute_keydir_row!(ctx, state_key)
+    refute_keydir_row!(ctx, created.payload_ref)
+    refute_keydir_row!(ctx, completed.result_ref)
+    assert apply_projection_cache_count(ctx, 0) == 0
+
+    assert {:ok, [initial_payload, result_payload]} =
+             Ferricstore.Flow.value_mget(ctx, [created.payload_ref, completed.result_ref])
+
+    assert {:ok, %{payload: ^initial_payload, result: ^result_payload}} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key, full: true)
+
+    assert {:ok, history} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               values: true
+             )
+
+    events = Map.new(history, fn {_event_id, fields} -> {fields["event"], fields} end)
+    assert events["created"]["payload"] == initial_payload
+  end
+
+  test "async history compacts generated named value refs out of keydir after LMDB projection" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_flush_interval =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+    end)
+
+    id = "history-compact-named-value-ref"
+    partition_key = "tenant-history-compact-named-value-ref"
+    flow_type = "history-compact-named-value-ref"
+    doc = String.duplicate("d", 1024)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               values: %{"doc" => doc},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, created} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    doc_ref = created.value_refs["doc"].ref
+    assert is_binary(doc_ref)
+
+    flush_shard!(ctx, 0)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    refute_keydir_row!(ctx, doc_ref)
+
+    assert {:ok, [^doc]} = Ferricstore.Flow.value_mget(ctx, [doc_ref])
+
+    assert {:ok, hydrated} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key, values: true)
+
+    assert hydrated.values == %{"doc" => doc}
+  end
+
+  test "retention cleanup removes value refs that only survive in cold LMDB history" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    old_flush_interval =
+      Application.get_env(:ferricstore, :flow_history_projector_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_history_projector_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_history_projector_flush_interval_ms, old_flush_interval)
+    end)
+
+    id = "retention-cold-history-ref"
+    partition_key = "tenant-retention-cold-history-ref"
+    flow_type = "retention-cold-history-ref"
+    initial_payload = String.duplicate("i", 1024)
+    next_payload = String.duplicate("n", 1024)
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: initial_payload,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, created} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, [first_claim]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-cold-history-ref-1",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.transition(ctx, id, "running", "waiting",
+               partition_key: partition_key,
+               lease_token: first_claim.lease_token,
+               fencing_token: first_claim.fencing_token,
+               payload: next_payload,
+               run_at_ms: now + 2,
+               now_ms: now + 2
+             )
+
+    assert {:ok, transitioned} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+    assert transitioned.payload_ref != created.payload_ref
+
+    assert {:ok, [second_claim]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-cold-history-ref-2",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 3
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, second_claim.lease_token,
+               partition_key: partition_key,
+               fencing_token: second_claim.fencing_token,
+               now_ms: now + 4
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    refute_keydir_row!(ctx, created.payload_ref)
+
+    assert {:ok, [^initial_payload, ^next_payload]} =
+             Ferricstore.Flow.value_mget(ctx, [created.payload_ref, transitioned.payload_ref])
+
+    Process.sleep(5)
+
+    assert {:ok, cleaned} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert cleaned.flows == 1
+    assert cleaned.history >= 1
+    assert cleaned.values >= 2
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, [nil, nil]} =
+             Ferricstore.Flow.value_mget(ctx, [created.payload_ref, transitioned.payload_ref])
+  end
+
+  test "retention cleanup still deletes values after terminal query sweep" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+    end)
+
+    id = "retention-after-terminal-sweep"
+    partition_key = "tenant-retention-after-terminal-sweep"
+    flow_type = "retention-after-terminal-sweep"
+    payload = String.duplicate("p", 1024)
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: payload,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, created} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-after-terminal-sweep",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 2
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    lmdb_path = Ferricstore.Flow.LMDB.path(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0))
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> [] == :ets.lookup(elem(ctx.keydir_refs, 0), state_key) end,
+      "terminal state key was not hot-pruned",
+      200,
+      10
+    )
+
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.sweep_expired_terminal(lmdb_path, now + 10_000, 100)
+
+    assert {:ok, [state_key]} ==
+             Ferricstore.Flow.LMDB.expired_terminal_state_keys(lmdb_path, now + 10_000, 100)
+
+    assert {:ok, cleaned} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert cleaned.flows == 1
+    assert cleaned.values >= 1
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert {:ok, [nil]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+  end
+
+  test "retention cleanup pages cold LMDB history without orphaning rows" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+    old_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit, 1)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_lmdb_history_cleanup_scan_limit, old_scan_limit)
+    end)
+
+    id = "retention-cold-history-paged"
+    partition_key = "tenant-retention-cold-history-paged"
+    flow_type = "retention-cold-history-paged"
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-cold-history-paged",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 2
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    lmdb_path = Ferricstore.Flow.LMDB.path(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0))
+
+    assert {:ok, history_count} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert history_count > 1
+
+    Process.sleep(5)
+
+    assert {:ok, first} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert first.flows == 0
+    assert first.history == 1
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert {:ok, _state_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    totals =
+      Enum.reduce_while(1..10, %{flows: first.flows, history: first.history}, fn _, acc ->
+        {:ok, cleaned} = Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+        next = %{flows: acc.flows + cleaned.flows, history: acc.history + cleaned.history}
+
+        if next.flows == 1 do
+          {:halt, next}
+        else
+          {:cont, next}
+        end
+      end)
+
+    assert totals.flows == 1
+    assert totals.history == history_count
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    assert {:ok, 0} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    restart_isolated_shard!(ctx, 0)
+
+    assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, []} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               include_cold: true,
+               consistent_projection: true
+             )
+  end
+
+  test "retention cleanup caps cold LMDB history work per command" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+    old_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit, 1)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_lmdb_history_cleanup_scan_limit, old_scan_limit)
+    end)
+
+    id = "retention-cold-history-capped"
+    partition_key = "tenant-retention-cold-history-capped"
+    flow_type = "retention-cold-history-capped"
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-cold-history-capped",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 2
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    lmdb_path = Ferricstore.Flow.LMDB.path(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0))
+
+    assert {:ok, history_count} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert history_count > 1
+
+    Process.sleep(5)
+
+    assert {:ok, first} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert first.flows == 0
+    assert first.history == 1
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, remaining_after_first} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert remaining_after_first == history_count - 1
+    assert {:ok, _state_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    totals =
+      Enum.reduce_while(1..10, %{flows: first.flows, history: first.history}, fn _, acc ->
+        {:ok, cleaned} = Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+        next = %{flows: acc.flows + cleaned.flows, history: acc.history + cleaned.history}
+
+        if next.flows == 1 do
+          {:halt, next}
+        else
+          {:cont, next}
+        end
+      end)
+
+    assert totals.flows == 1
+    assert totals.history == history_count
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+  end
+
+  test "partial retention cleanup keeps values still referenced by terminal state" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+    old_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+    Application.put_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit, 1)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_lmdb_history_cleanup_scan_limit, old_scan_limit)
+    end)
+
+    id = "retention-partial-keeps-state-value"
+    partition_key = "tenant-retention-partial-keeps-state-value"
+    flow_type = "retention-partial-keeps-state-value"
+    payload = "payload-retention-partial-keeps-state-value"
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               payload: payload,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, created} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-partial-keeps-state-value",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 2
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+    Process.sleep(5)
+
+    assert {:ok, first} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert first.flows == 0
+    assert first.history == 1
+    assert first.values == 0
+    assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
+  end
+
+  test "retention cleanup keeps shared value when LMDB reference scan is unavailable" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+    old_reference_hook = Application.get_env(:ferricstore, :flow_retention_reference_scan_hook)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+    shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+    {:ok, projector} =
+      Ferricstore.Flow.HistoryProjector.start_link(
+        shard_index: 0,
+        shard_data_path: shard_data_path,
+        instance_ctx: ctx
+      )
+
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
+    held_lmdb_path = lmdb_path <> ".held"
+
+    on_exit(fn ->
+      try do
+        if Process.alive?(projector), do: GenServer.stop(projector, :normal, 5_000)
+      catch
+        :exit, _ -> :ok
+      end
+
+      if File.exists?(held_lmdb_path) do
+        File.rm_rf!(lmdb_path)
+        File.rename(held_lmdb_path, lmdb_path)
+      end
+
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+      restore_env(:flow_retention_reference_scan_hook, old_reference_hook)
+    end)
+
+    now = System.system_time(:millisecond)
+    partition_key = "tenant-retention-lmdb-reference-unavailable"
+    owner_id = "retention-lmdb-reference-owner"
+    consumer_id = "retention-lmdb-reference-consumer"
+    owner_type = "retention-lmdb-reference-owner"
+    consumer_type = "retention-lmdb-reference-consumer"
+    doc = "shared-doc"
+    parent = self()
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, owner_id,
+               type: owner_type,
+               partition_key: partition_key,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, %{ref: shared_ref}} =
+             Ferricstore.Flow.value_put(ctx, doc,
+               partition_key: partition_key,
+               owner_flow_id: owner_id,
+               name: "doc",
+               now_ms: now + 1
+             )
+
+    assert {:ok, owner_created} =
+             Ferricstore.Flow.get(ctx, owner_id, partition_key: partition_key)
+
+    assert owner_created.value_refs["doc"].ref == shared_ref
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, consumer_id,
+               type: consumer_type,
+               partition_key: partition_key,
+               value_refs: %{"doc" => shared_ref},
+               retention_ttl_ms: 60_000,
+               run_at_ms: now,
+               now_ms: now + 2
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, owner_type,
+               worker: "worker-retention-lmdb-reference-owner",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 3
+             )
+
+    assert claimed.id == owner_id
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, owner_id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 4
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    delete_keydir_entries_containing!(ctx, 0, consumer_id)
+
+    Application.put_env(:ferricstore, :flow_retention_reference_scan_hook, fn record, refs ->
+      if Map.get(record, :id) == owner_id and shared_ref in refs and File.exists?(lmdb_path) do
+        send(parent, :retention_reference_scan_started)
+        File.rm_rf!(held_lmdb_path)
+        File.rename!(lmdb_path, held_lmdb_path)
+        File.mkdir_p!(lmdb_path)
+      end
+
+      :ok
+    end)
+
+    totals =
+      Enum.reduce_while(1..10, %{flows: 0, history: 0, values: 0}, fn _, acc ->
+        {:ok, cleaned} = Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+        next = %{
+          flows: acc.flows + cleaned.flows,
+          history: acc.history + cleaned.history,
+          values: acc.values + cleaned.values
+        }
+
+        if next.flows == 1, do: {:halt, next}, else: {:cont, next}
+      end)
+
+    assert totals.flows == 1
+    assert_received :retention_reference_scan_started
+    assert totals.values == 0
+    assert {:ok, [^doc]} = Ferricstore.Flow.value_mget(ctx, [shared_ref])
+  end
+
+  test "retention cleanup preserves owned values when another shard has unprojected Flow rows" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 2, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    now = System.system_time(:millisecond)
+    owner_id = "retention-unprojected-owner"
+    owner_partition = "tenant-retention-unprojected-owner"
+    owner_type = "retention-unprojected-owner"
+    doc = "retention-unprojected-doc"
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, owner_id,
+               type: owner_type,
+               partition_key: owner_partition,
+               values: %{"doc" => doc},
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, owner_created} =
+             Ferricstore.Flow.get(ctx, owner_id, partition_key: owner_partition)
+
+    doc_ref = owner_created.value_refs["doc"].ref
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, owner_type,
+               worker: "worker-retention-unprojected-owner",
+               partition_key: owner_partition,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, owner_id, claimed.lease_token,
+               partition_key: owner_partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 2
+             )
+
+    owner_shard =
+      Ferricstore.Store.Router.shard_for(
+        ctx,
+        Ferricstore.Flow.Keys.state_key(owner_id, owner_partition)
+      )
+
+    unprojected_shard = if owner_shard == 0, do: 1, else: 0
+
+    unprojected_lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(unprojected_shard)
+      |> Ferricstore.Flow.LMDB.path()
+
+    File.rm_rf!(unprojected_lmdb_path)
+    File.mkdir_p!(unprojected_lmdb_path)
+    refute Ferricstore.Flow.LMDB.env_present?(unprojected_lmdb_path)
+
+    unprojected =
+      active_lmdb_record("retention-unprojected-other", "retention-unprojected-other", "queued",
+        partition_key: "tenant-retention-unprojected-other",
+        updated_at_ms: now + 3,
+        next_run_at_ms: now + 3
+      )
+
+    unprojected_state_key =
+      Ferricstore.Flow.Keys.state_key(unprojected.id, unprojected.partition_key)
+
+    encoded_unprojected = Ferricstore.Flow.encode_record(unprojected)
+
+    :ets.insert(
+      elem(ctx.keydir_refs, unprojected_shard),
+      {unprojected_state_key, encoded_unprojected, 0, 0, :hot, 0, byte_size(encoded_unprojected)}
+    )
+
+    assert {:ok, cleaned} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert cleaned.flows == 1
+    assert cleaned.values == 0
+    assert {:ok, [^doc]} = Ferricstore.Flow.value_mget(ctx, [doc_ref])
+  end
+
+  test "retention cleanup caps owned value cleanup per command" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    old_history_scan_limit =
+      Application.get_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit)
+
+    old_value_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_value_cleanup_scan_limit)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_history_cleanup_scan_limit, 100)
+    Application.put_env(:ferricstore, :flow_lmdb_value_cleanup_scan_limit, 1)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_history_cleanup_scan_limit, old_history_scan_limit)
+      restore_env(:flow_lmdb_value_cleanup_scan_limit, old_value_scan_limit)
+    end)
+
+    id = "retention-owned-values-capped"
+    partition_key = "tenant-retention-owned-values-capped"
+    flow_type = "retention-owned-values-capped"
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               history_hot_max_events: 0,
+               retention_ttl_ms: 1,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-retention-owned-values-capped",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: now + 1
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 2
+             )
+
+    extra_refs =
+      for version <- 10..12 do
+        ref = Ferricstore.Flow.Keys.value_key(id, :shared, version, partition_key)
+        encoded = Ferricstore.Flow.encode_value("extra-#{version}")
+        assert :ok = Ferricstore.Store.Router.put(ctx, ref, encoded, 0)
+        ref
+      end
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    Process.sleep(5)
+
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    lmdb_path = Ferricstore.Flow.LMDB.path(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0))
+
+    assert {:ok, first} =
+             Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+
+    assert first.flows == 0
+    assert first.values == 1
+    assert {:ok, _state_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    assert {:ok, values_after_first} = Ferricstore.Flow.value_mget(ctx, extra_refs)
+    assert Enum.count(values_after_first, &is_nil/1) == 1
+
+    totals =
+      Enum.reduce_while(1..10, %{flows: first.flows, values: first.values}, fn _, acc ->
+        {:ok, cleaned} = Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+        next = %{flows: acc.flows + cleaned.flows, values: acc.values + cleaned.values}
+
+        if next.flows == 1 do
+          {:halt, next}
+        else
+          {:cont, next}
+        end
+      end)
+
+    assert totals.flows == 1
+    assert totals.values >= length(extra_refs)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+    assert {:ok, [nil, nil, nil]} = Ferricstore.Flow.value_mget(ctx, extra_refs)
+  end
+
+  test "async history hard cap removes trimmed events from LMDB projection" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
+    end)
+
+    id = "history-async-hard-cap"
+    partition_key = "tenant-history-async-hard-cap"
+    flow_type = "history-async-hard-cap"
+
+    assert :ok =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               history_hot_max_events: 1,
+               history_max_events: 2,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-history-async-hard-cap",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert :ok =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_002
+             )
+
+    assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
+
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert {:ok, 2} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert {:ok, history} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
+
+    assert Enum.map(history, fn {_event_id, fields} -> fields["event"] end) == [
+             "claimed",
+             "completed"
+           ]
+  end
+
+  test "history cold projection survives restart while include_cold reads projected events" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_async_history = Application.get_env(:ferricstore, :flow_async_history)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_async_history, true)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_async_history, old_async_history)
     end)
 
     id = "history-cold-projection-restart"
@@ -2629,7 +7804,6 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.create(ctx, id,
                type: "history-cold-projection-restart",
                partition_key: partition_key,
-               history_hot_max_events: 2,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -2654,20 +7828,51 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
     restart_isolated_shard!(ctx, 0)
 
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
+
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert {:ok, 3} =
+             Ferricstore.Flow.LMDB.prefix_count(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+             )
+
+    assert {:ok, lmdb_entries} =
+             Ferricstore.Flow.LMDB.prefix_entries(
+               lmdb_path,
+               Ferricstore.Flow.LMDB.history_index_prefix(history_key),
+               10
+             )
+
+    assert Enum.all?(lmdb_entries, fn {_key, value} ->
+             match?(
+               {:ok,
+                {_event_id, _event_ms, _expire_at_ms, _compound_key, {:flow_history, 0}, offset,
+                 value_size}}
+               when is_integer(offset) and offset >= 0 and is_integer(value_size) and
+                      value_size > 0,
+               Ferricstore.Flow.LMDB.decode_history_index_location(value)
+             )
+           end)
+
     assert {:ok, hot_events} =
-             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
-
-    assert Enum.map(hot_events, fn {_event_id, fields} -> fields["event"] end) == [
-             "claimed",
-             "completed"
-           ]
-
-    assert {:ok, cold_events} =
              Ferricstore.Flow.history(ctx, id,
                partition_key: partition_key,
                count: 10,
-               include_cold: true
+               include_cold: false
              )
+
+    assert hot_events == []
+
+    assert {:ok, cold_events} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
 
     assert Enum.map(cold_events, fn {_event_id, fields} -> fields["event"] end) == [
              "created",
@@ -2914,7 +8119,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.get(ctx, completed.id, partition_key: partition_key)
   end
 
-  test "startup rebuilds native flow history index from durable history entries" do
+  test "startup keeps terminal history cold while durable history remains queryable" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -2934,7 +8139,6 @@ defmodule Ferricstore.Flow.LMDBTest do
                type: "history-restart",
                run_at_ms: 1,
                partition_key: partition_key,
-               history_hot_max_events: 2,
                history_max_events: 5,
                now_ms: 1
              )
@@ -2963,27 +8167,40 @@ defmodule Ferricstore.Flow.LMDBTest do
                now_ms: 3
              )
 
-    assert {:ok, before_restart} = Ferricstore.Flow.history(ctx, id, partition_key: partition_key)
-
-    assert Enum.map(before_restart, fn {_event_id, fields} -> fields["event"] end) == [
-             "lease_extended",
-             "completed"
-           ]
-
     assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
+
+    assert {:ok, before_restart} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               include_cold: false
+             )
+
+    assert before_restart == []
+
     restart_isolated_shard!(ctx, 0)
 
-    assert {:ok, after_restart} = Ferricstore.Flow.history(ctx, id, partition_key: partition_key)
+    assert {:ok, after_restart} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               include_cold: false
+             )
 
-    assert Enum.map(after_restart, fn {_event_id, fields} -> fields["event"] end) == [
-             "lease_extended",
-             "completed"
-           ]
+    assert after_restart == []
 
     history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
     {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 4
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
+
+    assert {:ok, cold_history} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
+
+    assert Enum.map(cold_history, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "lease_extended",
+             "completed"
+           ]
   end
 
   test "startup rebuild recovers terminal LMDB mirror when writer dies before flush" do
@@ -3277,12 +8494,129 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
 
     assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
-    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
     assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
+
+    assert {:ok, _state_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    assert {:ok, [^state_key]} =
+             Ferricstore.Flow.LMDB.expired_terminal_state_keys(
+               lmdb_path,
+               System.os_time(:millisecond),
+               100
+             )
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp start_active_lmdb_projection_fixture!(label) do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_#{label}_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_#{label}_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    source_keydir = :ets.new(:"flow_lmdb_#{label}_source", [:set, :public])
+
+    on_exit(fn ->
+      if :ets.info(source_keydir) != :undefined, do: :ets.delete(source_keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index,
+       data_dir: data_dir,
+       instance_name: instance_name,
+       instance_ctx: %{name: instance_name, keydir_refs: {source_keydir}}}
+    )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+
+    %{
+      data_dir: data_dir,
+      instance_name: instance_name,
+      shard_index: shard_index,
+      source_keydir: source_keydir,
+      partition_key: "tenant-#{label}",
+      lmdb_path: Ferricstore.Flow.LMDB.path(shard_path)
+    }
+  end
+
+  defp collect_flow_lmdb_active_chunks(acc \\ []) do
+    receive do
+      {:flow_lmdb_active_chunk, [:ferricstore, :flow, :lmdb_startup_active_index_chunk],
+       measurements, _metadata} ->
+        collect_flow_lmdb_active_chunks([measurements | acc])
+    after
+      50 -> Enum.reverse(acc)
+    end
+  end
+
+  defp wait_until_true(fun, attempts)
+  defp wait_until_true(_fun, 0), do: false
+
+  defp wait_until_true(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(5)
+      wait_until_true(fun, attempts - 1)
+    end
+  end
+
+  defp active_lmdb_record(id, type, state, opts) do
+    partition_key = Keyword.fetch!(opts, :partition_key)
+    updated_at_ms = Keyword.fetch!(opts, :updated_at_ms)
+
+    %{
+      id: id,
+      type: type,
+      state: state,
+      version: Keyword.get(opts, :version, 1),
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1,
+      updated_at_ms: updated_at_ms,
+      next_run_at_ms: Keyword.get(opts, :next_run_at_ms),
+      priority: Keyword.get(opts, :priority, 0),
+      partition_key: partition_key,
+      root_flow_id: id,
+      lease_owner: Keyword.get(opts, :lease_owner),
+      lease_token: Keyword.get(opts, :lease_token),
+      lease_deadline_ms: Keyword.get(opts, :lease_deadline_ms)
+    }
+  end
+
+  defp project_active_lmdb_record!(fixture, record) do
+    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    :ets.insert(
+      fixture.source_keydir,
+      {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
+               {:project_flow_state_from_source, state_key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+    state_key
+  end
+
+  def handle_lmdb_writer_unavailable(event, measurements, metadata, test_pid) do
+    send(test_pid, {:flow_lmdb_writer_unavailable, event, measurements, metadata})
+  end
+
+  def forward_flow_lmdb_rebuild_event(event, measurements, metadata, test_pid) do
+    send(test_pid, {:flow_lmdb_rebuild, event, measurements, metadata})
+  end
 
   defp history_event_ms(event_id) do
     event_id
@@ -3290,6 +8624,120 @@ defmodule Ferricstore.Flow.LMDBTest do
     |> case do
       [ms, _seq] -> String.to_integer(ms)
       _ -> 0
+    end
+  end
+
+  defp refute_keydir_row!(ctx, key) do
+    idx = Ferricstore.Store.Router.shard_for(ctx, key)
+    assert [] = :ets.lookup(elem(ctx.keydir_refs, idx), key)
+  end
+
+  defp delete_keydir_entries_containing!(ctx, shard_index, token) do
+    table = elem(ctx.keydir_refs, shard_index)
+
+    table
+    |> :ets.tab2list()
+    |> Enum.each(fn
+      {key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}
+      when is_binary(key) ->
+        if String.contains?(key, token), do: :ets.delete(table, key)
+
+      _other ->
+        :ok
+    end)
+  end
+
+  defp flush_shard!(ctx, shard_index) do
+    assert :ok = GenServer.call(elem(ctx.shard_names, shard_index), :flush, 5_000)
+  end
+
+  defp materialize_keydir_value!(ctx, shard_index, key) do
+    keydir = elem(ctx.keydir_refs, shard_index)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
+
+    case :ets.lookup(keydir, key) do
+      [{^key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}]
+      when is_binary(value) ->
+        value
+
+      [{^key, nil, _expire_at_ms, _lfu, {:flow_history, _file_id} = file_id, offset, _value_size}] ->
+        assert {:ok, value} =
+                 Ferricstore.Flow.HistoryProjector.read_value(shard_path, file_id, offset)
+
+        value
+
+      [{^key, nil, _expire_at_ms, _lfu, file_id, offset, _value_size}]
+      when is_integer(file_id) ->
+        path = Ferricstore.Store.Shard.ETS.file_path(shard_path, file_id)
+        assert {:ok, value} = Ferricstore.Store.ColdRead.pread_at(path, offset, key, 10_000)
+        value
+
+      [{^key, nil, _expire_at_ms, _lfu, file_id, _offset, _value_size}] when is_tuple(file_id) ->
+        assert {:ok, value} =
+                 Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                   ctx,
+                   shard_index,
+                   file_id,
+                   key
+                 )
+
+        value
+    end
+  end
+
+  defp set_apply_projection_value!(ctx, key, value, index)
+       when is_binary(value) and is_integer(index) and index > 0 do
+    idx = Ferricstore.Store.Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, idx)
+
+    assert [{^key, _old_value, expire_at_ms, lfu, file_id, offset, value_size}] =
+             :ets.lookup(keydir, key)
+
+    if file_id != :pending do
+      assert readable_locator?(file_id, offset, value_size)
+    end
+
+    :ok =
+      Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(ctx.data_dir, idx, index, [
+        {key, value, expire_at_ms}
+      ])
+
+    :ets.insert(
+      keydir,
+      {key, nil, expire_at_ms, lfu, {:waraft_apply_projection, index}, 0, byte_size(value)}
+    )
+  end
+
+  defp apply_projection_cache_count(ctx, shard_index) do
+    Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, shard_index)
+  end
+
+  defp terminal_count_cache_member?(path, state_index_key) do
+    table = :ets.whereis(:ferricstore_flow_lmdb_terminal_count_cache)
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+    table != :undefined and :ets.member(table, {path, count_key})
+  end
+
+  defp readable_locator?(file_id, offset, value_size)
+       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp readable_locator?({tag, index}, offset, value_size)
+       when tag in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+              is_integer(index) and index > 0 and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp readable_locator?(_file_id, _offset, _value_size), do: false
+
+  defp collect_apply_projection_disk_reads(acc \\ []) do
+    receive do
+      {:apply_projection_disk_read, source} ->
+        collect_apply_projection_disk_reads([source | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 

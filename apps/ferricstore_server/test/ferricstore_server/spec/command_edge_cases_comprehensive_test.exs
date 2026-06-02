@@ -21,7 +21,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
     - SET option combinations (NX+XX, EX+PX, KEEPTTL+EX)
     - Sorted set score parsing (+inf, -inf, NaN, non-numeric)
     - SRANDMEMBER / ZRANDMEMBER with negative count (duplicates allowed)
-    - RENAME / COPY on non-existent source
+    - RENAME on non-existent source and COPY no-op cases
     - SCAN cursor-based iteration edge cases
 
   Each test is independent (flush_all_keys in setup).
@@ -140,13 +140,14 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
   # Hash tag ensures all keys co-locate on the same shard for multi-key ops.
   defp ukey(base), do: "{edgetest}:#{base}_#{:rand.uniform(9_999_999)}"
 
-  defp assert_ok(result), do: assert result == {:simple, "OK"} or result == :ok
+  defp assert_ok(result), do: assert(result == {:simple, "OK"} or result == :ok)
 
   defp assert_error_contains(result, substring) do
     assert {:error, msg} = result
-    assert String.contains?(msg, substring), "Expected error containing #{inspect(substring)}, got: #{inspect(msg)}"
-  end
 
+    assert String.contains?(msg, substring),
+           "Expected error containing #{inspect(substring)}, got: #{inspect(msg)}"
+  end
 
   # ===========================================================================
   # WRONGTYPE CROSS-TYPE ERRORS
@@ -237,7 +238,6 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
       assert_error_contains(result, "WRONGTYPE")
     end
   end
-
 
   # ===========================================================================
   # TTL / EXPIRY EDGE CASES
@@ -474,20 +474,18 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
       assert cmd(sock, ["RENAMENX", k, k]) == 0
     end
 
-    test "COPY non-existent source returns error", %{sock: sock} do
+    test "COPY non-existent source returns 0", %{sock: sock} do
       k1 = ukey("copy_nil")
       k2 = ukey("copy_dst")
-      result = cmd(sock, ["COPY", k1, k2])
-      assert_error_contains(result, "no such key")
+      assert cmd(sock, ["COPY", k1, k2]) == 0
     end
 
-    test "COPY to existing dest without REPLACE returns error", %{sock: sock} do
+    test "COPY to existing dest without REPLACE returns 0", %{sock: sock} do
       k1 = ukey("copy_src")
       k2 = ukey("copy_dst")
       cmd(sock, ["SET", k1, "v1"])
       cmd(sock, ["SET", k2, "v2"])
-      result = cmd(sock, ["COPY", k1, k2])
-      assert_error_contains(result, "target key already exists")
+      assert cmd(sock, ["COPY", k1, k2]) == 0
     end
 
     test "COPY with REPLACE to existing dest succeeds", %{sock: sock} do
@@ -644,7 +642,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
       cmd(sock, ["DISCARD"])
     end
 
-    test "commands that error inside MULTI still queue, errors appear in EXEC result", %{sock: sock} do
+    test "commands that error inside MULTI still queue, errors appear in EXEC result", %{
+      sock: sock
+    } do
       k = ukey("txn_err_inside")
       cmd(sock, ["SET", k, "hello"])
 
@@ -771,13 +771,17 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
 
     test "mixed valid + invalid commands in pipeline", %{sock: sock} do
       k = ukey("pipe_mix")
+
       pipeline =
         IO.iodata_to_binary([
           Encoder.encode(["SET", k, "hello"]),
-          Encoder.encode(["INCR", k]),           # will fail: "hello" is not integer
+          # will fail: "hello" is not integer
+          Encoder.encode(["INCR", k]),
           Encoder.encode(["GET", k]),
-          Encoder.encode(["NOTACOMMAND"]),        # unknown command
-          Encoder.encode(["GET", k])              # should still work
+          # unknown command
+          Encoder.encode(["NOTACOMMAND"]),
+          # should still work
+          Encoder.encode(["GET", k])
         ])
 
       :ok = :gen_tcp.send(sock, pipeline)
@@ -797,6 +801,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
 
     test "pipeline with MULTI/EXEC embedded", %{sock: sock} do
       k = ukey("pipe_txn")
+
       pipeline =
         IO.iodata_to_binary([
           Encoder.encode(["SET", k, "before"]),
@@ -808,11 +813,16 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
 
       :ok = :gen_tcp.send(sock, pipeline)
 
-      r1 = recv_response(sock)  # SET
-      r2 = recv_response(sock)  # MULTI
-      r3 = recv_response(sock)  # SET (QUEUED)
-      r4 = recv_response(sock)  # GET (QUEUED)
-      r5 = recv_response(sock)  # EXEC
+      # SET
+      r1 = recv_response(sock)
+      # MULTI
+      r2 = recv_response(sock)
+      # SET (QUEUED)
+      r3 = recv_response(sock)
+      # GET (QUEUED)
+      r4 = recv_response(sock)
+      # EXEC
+      r5 = recv_response(sock)
 
       assert_ok(r1)
       assert_ok(r2)
@@ -1122,14 +1132,16 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
       for {cmd_name, too_few, too_many} <- wrong_arity_cases do
         if too_few != nil do
           result = cmd(sock, [cmd_name | too_few])
+
           assert {:error, _msg} = result,
-            "#{cmd_name} with args #{inspect(too_few)} should return error, got: #{inspect(result)}"
+                 "#{cmd_name} with args #{inspect(too_few)} should return error, got: #{inspect(result)}"
         end
 
         if too_many != nil do
           result = cmd(sock, [cmd_name | too_many])
+
           assert {:error, _msg} = result,
-            "#{cmd_name} with args #{inspect(too_many)} should return error, got: #{inspect(result)}"
+                 "#{cmd_name} with args #{inspect(too_many)} should return error, got: #{inspect(result)}"
         end
       end
     end
@@ -1175,10 +1187,12 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
       assert cmd(sock, ["ZCARD", zset_k]) == 0
 
       # Re-create with DIFFERENT types to ensure no stale type metadata
-      cmd(sock, ["RPUSH", str_k, "now_a_list"])  # was string, now list
+      # was string, now list
+      cmd(sock, ["RPUSH", str_k, "now_a_list"])
       assert cmd(sock, ["LRANGE", str_k, "0", "-1"]) == ["now_a_list"]
 
-      cmd(sock, ["SET", hash_k, "now_a_string"])  # was hash, now string
+      # was hash, now string
+      cmd(sock, ["SET", hash_k, "now_a_string"])
       assert cmd(sock, ["GET", hash_k]) == "now_a_string"
     end
   end

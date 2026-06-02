@@ -13,6 +13,10 @@ defmodule Ferricstore.Commands.ConfigTest do
   setup do
     # Capture original Application env values that CONFIG SET may alter
     orig_eviction = Application.get_env(:ferricstore, :eviction_policy)
+    orig_keydir_max_ram = Application.get_env(:ferricstore, :keydir_max_ram)
+    orig_hot_cache_max_ram = Application.get_env(:ferricstore, :hot_cache_max_ram)
+    orig_hot_cache_min_ram = Application.get_env(:ferricstore, :hot_cache_min_ram)
+    orig_hot_cache_max_value_size = Application.get_env(:ferricstore, :hot_cache_max_value_size)
     orig_slowlog_us = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
     orig_slowlog_max = Application.get_env(:ferricstore, :slowlog_max_len)
     orig_data_dir = Application.get_env(:ferricstore, :data_dir)
@@ -22,10 +26,14 @@ defmodule Ferricstore.Commands.ConfigTest do
     reset_config_defaults()
 
     on_exit(fn ->
-      reset_config_defaults()
-
-      # Restore Application env
-      if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
+      # Restore Application env first. `reset_config_defaults/0` reads from
+      # Application env, so doing this in the opposite order would preserve a
+      # CONFIG SET keydir-max-ram value as the next test's "default".
+      restore_env(:eviction_policy, orig_eviction)
+      restore_env(:keydir_max_ram, orig_keydir_max_ram)
+      restore_env(:hot_cache_max_ram, orig_hot_cache_max_ram)
+      restore_env(:hot_cache_min_ram, orig_hot_cache_min_ram)
+      restore_env(:hot_cache_max_value_size, orig_hot_cache_max_value_size)
 
       if orig_data_dir do
         Application.put_env(:ferricstore, :data_dir, orig_data_dir)
@@ -35,10 +43,15 @@ defmodule Ferricstore.Commands.ConfigTest do
 
       if orig_slowlog_us, do: Ferricstore.SlowLog.set_threshold(orig_slowlog_us)
       if orig_slowlog_max, do: Ferricstore.SlowLog.set_max_len(orig_slowlog_max)
+
+      reset_config_defaults()
     end)
 
     :ok
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   defp reset_config_defaults do
     defaults = Config.defaults()
@@ -218,6 +231,11 @@ defmodule Ferricstore.Commands.ConfigTest do
     test "CONFIG SET maxmemory-policy updates Application env" do
       Server.handle("CONFIG", ["SET", "maxmemory-policy", "allkeys-lru"], MockStore.make())
       assert :allkeys_lru == Application.get_env(:ferricstore, :eviction_policy)
+    end
+
+    test "CONFIG SET maxmemory-policy reconfigures MemoryGuard" do
+      Server.handle("CONFIG", ["SET", "maxmemory-policy", "noeviction"], MockStore.make())
+      assert :noeviction == Ferricstore.MemoryGuard.eviction_policy()
     end
 
     test "CONFIG SET maxmemory-policy with invalid value returns error" do

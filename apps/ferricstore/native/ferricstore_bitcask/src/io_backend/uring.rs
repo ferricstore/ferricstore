@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use io_uring::{opcode, types, IoUring};
 
-use super::{append_lock_for_path, lock_append_guard, IoBackend};
+use super::{append_lock_for_path, IoBackend};
 
 /// Ring capacity in submission-queue entries. Must be a power of two.
 ///
@@ -188,7 +188,7 @@ impl UringBackend {
 impl IoBackend for UringBackend {
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = lock_append_guard(&append_lock)?;
+        let _guard = append_lock.lock().expect("append lock poisoned");
 
         let start = self.file.metadata()?.len();
         self.submit_write_at(data, start)?;
@@ -232,7 +232,7 @@ impl IoBackend for UringBackend {
     /// failure never leaves `self.offset` pointing past un-confirmed bytes.
     fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = lock_append_guard(&append_lock)?;
+        let _guard = append_lock.lock().expect("append lock poisoned");
 
         if buffers.is_empty() {
             return Ok(Vec::new());

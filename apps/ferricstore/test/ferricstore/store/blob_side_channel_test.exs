@@ -17,6 +17,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
   alias Ferricstore.Raft.StateMachine
   alias Ferricstore.Test.IsolatedInstance
 
+  @router_source_path Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
+
   setup do
     ctx =
       IsolatedInstance.checkout(
@@ -54,6 +56,21 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     %{ctx: ctx, shard: elem(ctx.shard_names, 0), keydir: elem(ctx.keydir_refs, 0)}
   end
 
+  test "blob garbage sweep streams keydir refs without copying the full ETS table" do
+    source = File.read!(@router_source_path)
+
+    [function_source] =
+      Regex.run(
+        ~r/defp blob_gc_keydir_live_refs\(ctx, idx, state, keydir, now\) do.*?^  end/ms,
+        source
+      )
+
+    refute function_source =~ ":ets.tab2list",
+           "blob GC must not materialize the whole keydir while collecting live refs"
+
+    assert function_source =~ ":ets.foldl"
+  end
+
   test "large direct values are persisted as blob refs and materialized on reads", %{
     ctx: ctx,
     shard: shard,
@@ -89,55 +106,56 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert payload == GenServer.call(shard, {:get, key})
   end
 
-  test "deferred file-ref lookup skips blob validation open", %{ctx: ctx} do
+  test "deferred file-ref lookup returns validated blob segment ref", %{ctx: ctx} do
     key = "blob:auto:deferred-file-ref"
     payload = :binary.copy("D", 1024)
-    parent = self()
 
     assert :ok = Router.put(ctx, key, payload, 0)
 
-    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
-      send(parent, {:blob_store_open, path})
-      File.open(path, modes)
-    end)
+    assert {:cold_ref, blob_path, blob_offset, 1024} =
+             Router.get_with_deferred_blob_file_ref(ctx, key)
 
-    try do
-      assert {:cold_ref, blob_path, blob_offset, 1024} =
-               Router.get_with_deferred_blob_file_ref(ctx, key)
-
-      assert Path.extname(blob_path) == ".bloblog"
-      assert is_integer(blob_offset) and blob_offset >= 0
-      refute_received {:blob_store_open, _path}
-    after
-      Process.delete(:ferricstore_blob_store_open_read_hook)
-    end
+    assert Path.extname(blob_path) == ".bloblog"
+    assert is_integer(blob_offset) and blob_offset >= 0
   end
 
-  test "deferred batch file-ref lookup skips blob validation open", %{ctx: ctx} do
+  test "deferred batch file-ref lookup returns validated blob segment refs", %{ctx: ctx} do
     key = "blob:auto:deferred-batch-file-ref"
     payload = :binary.copy("B", 1024)
-    parent = self()
 
     assert :ok = Router.put(ctx, key, payload, 0)
 
-    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
-      send(parent, {:blob_store_open, path})
-      File.open(path, modes)
-    end)
+    assert [{:file_ref, blob_path, blob_offset, 1024}] =
+             Router.batch_get_with_deferred_blob_file_refs(ctx, [key], 64)
 
-    try do
-      assert [{:file_ref, blob_path, blob_offset, 1024}] =
-               Router.batch_get_with_deferred_blob_file_refs(ctx, [key], 64)
+    assert {[{:file_ref, ^blob_path, ^blob_offset, 1024}], true} =
+             Router.batch_get_with_deferred_blob_file_refs_and_presence(ctx, [key], 64)
 
-      assert {[{:file_ref, ^blob_path, ^blob_offset, 1024}], true} =
-               Router.batch_get_with_deferred_blob_file_refs_and_presence(ctx, [key], 64)
+    assert Path.extname(blob_path) == ".bloblog"
+    assert is_integer(blob_offset) and blob_offset >= 0
+  end
 
-      assert Path.extname(blob_path) == ".bloblog"
-      assert is_integer(blob_offset) and blob_offset >= 0
-      refute_received {:blob_store_open, _path}
-    after
-      Process.delete(:ferricstore_blob_store_open_read_hook)
-    end
+  test "deferred file-ref lookup rejects corrupt blob segment headers", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "blob:auto:deferred-corrupt-segment-header"
+    payload = :binary.copy("H", 1024)
+
+    assert :ok = Router.put(ctx, key, payload, 0)
+    assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, key)
+
+    corrupt_segment_header!(ctx.data_dir, 0, ref)
+
+    refute match?(
+             {:cold_ref, _path, _offset, _size},
+             Router.get_with_deferred_blob_file_ref(ctx, key)
+           )
+
+    refute match?(
+             [{:file_ref, _path, _offset, _size}],
+             Router.batch_get_with_deferred_blob_file_refs(ctx, [key], 64)
+           )
   end
 
   test "file-ref reads keep streaming fast path while materialized reads reject corrupt blobs", %{
@@ -527,6 +545,55 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert payload == Router.get(ctx, key)
   end
 
+  test "Ra apply verifies pre-externalized put refs without materializing payload", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "blob:auto:raft-ref-verify-only"
+    payload = :binary.copy("V", 1536)
+    assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, payload)
+    encoded_ref = BlobRef.encode!(ref)
+    parent = self()
+    data_dir = ctx.data_dir
+
+    Process.put(:ferricstore_blob_store_verify_hook, fn ^data_dir, 0, ^ref ->
+      send(parent, {:blob_verify, ref})
+      :ok
+    end)
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn _path, _modes ->
+      raise "unexpected full blob materialization"
+    end)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_blob_store_verify_hook)
+      Process.delete(:ferricstore_blob_store_open_read_hook)
+    end)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    active_file_path = ShardETS.file_path(shard_path, 0)
+
+    state =
+      StateMachine.init(%{
+        shard_index: 0,
+        shard_data_path: shard_path,
+        active_file_id: 0,
+        active_file_path: active_file_path,
+        ets: keydir,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        instance_name: ctx.name
+      })
+
+    assert_state_machine_result(
+      :ok,
+      StateMachine.apply(%{index: 1}, {:put_blob_ref, key, encoded_ref, 0}, state)
+    )
+
+    assert_received {:blob_verify, ^ref}
+    assert {:ok, ^encoded_ref, ^ref} = raw_disk_blob_ref(ctx, keydir, key)
+  end
+
   test "Ra apply rejects a pre-externalized blob ref when the blob is missing", %{
     ctx: ctx,
     keydir: keydir
@@ -651,7 +718,14 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
       :ok
     end)
 
-    on_exit(fn -> Process.delete(:ferricstore_blob_store_verify_hook) end)
+    Process.put(:ferricstore_blob_store_open_read_hook, fn _path, _modes ->
+      raise "unexpected full blob materialization"
+    end)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_blob_store_verify_hook)
+      Process.delete(:ferricstore_blob_store_open_read_hook)
+    end)
 
     shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
     active_file_path = ShardETS.file_path(shard_path, 0)
@@ -683,6 +757,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
     assert_received {:blob_verify, ^ref}
     refute_received {:blob_verify, _}
+    Process.delete(:ferricstore_blob_store_open_read_hook)
     assert payload == Router.get(ctx, first_key)
     assert payload == Router.get(ctx, second_key)
   end
@@ -1071,9 +1146,47 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
       )
     )
 
-    assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, payload_key)
+    assert [] = :ets.lookup(keydir, payload_key)
+
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    assert {:ok, lmdb_value} = Ferricstore.Flow.LMDB.get(lmdb_path, payload_key)
+    assert {:ok, encoded_ref} = Ferricstore.Flow.LMDB.decode_value(lmdb_value, 1_000)
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
     assert {:ok, encoded_payload} = BlobStore.get(ctx.data_dir, 0, ref)
     assert Ferricstore.Flow.decode_value(encoded_payload) == payload
+    assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [payload_key])
+  end
+
+  test "owner-scoped Flow named values store large values as live blob refs", %{ctx: ctx} do
+    id = "blob-flow-named-value"
+    partition_key = "tenant-blob-named-value"
+    payload = :binary.copy("N", 512)
+
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+    try do
+      assert :ok =
+               Ferricstore.Flow.create(ctx, id,
+                 type: "blob-flow-named-value",
+                 partition_key: partition_key,
+                 run_at_ms: 1,
+                 now_ms: 1
+               )
+
+      assert {:ok, %{ref: value_ref}} =
+               Ferricstore.Flow.value_put(ctx, payload,
+                 partition_key: partition_key,
+                 owner_flow_id: id,
+                 name: "doc",
+                 now_ms: 2
+               )
+
+      assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [value_ref])
+      assert {:ok, %{deleted_files: 0}} = Router.sweep_blob_garbage(ctx)
+      assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [value_ref])
+    after
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+    end
   end
 
   test "active Flow state records with large metadata are persisted as blob refs", %{
@@ -1108,6 +1221,12 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     ctx: ctx,
     keydir: keydir
   } do
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+    end)
+
     id = "blob-flow-retention"
     partition_key = "tenant-blob-retention"
     state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
@@ -1140,6 +1259,9 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, state_key)
     assert {:ok, encoded_state} = BlobStore.get(ctx.data_dir, 0, ref)
     assert %{id: ^id, state: "completed"} = Ferricstore.Flow.decode_record(encoded_state)
+
+    assert {:ok, %{deleted_files: 0}} = Router.sweep_blob_garbage(ctx)
+    assert {:ok, _encoded_state} = BlobStore.get(ctx.data_dir, 0, ref)
 
     cleanup_now = System.system_time(:millisecond) + 10_000
 
@@ -1537,6 +1659,74 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert :binary.copy("P", 1024) == GenServer.call(shard, {:compound_get, redis_key, field})
   end
 
+  test "blob garbage sweep ignores expired blob refs still present in keydir", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+    end)
+
+    key = "blob:gc:expired-ref"
+    payload = :binary.copy("E", 1024)
+
+    assert {:ok, blob_ref} = BlobStore.put(ctx.data_dir, 0, payload)
+    encoded_ref = BlobRef.encode!(blob_ref)
+    assert {:ok, {path, _offset, _size}} = BlobStore.file_ref(ctx.data_dir, 0, blob_ref)
+    assert File.exists?(path)
+
+    expired_at = Ferricstore.HLC.now_ms() - 1_000
+
+    :ets.insert(
+      keydir,
+      {key, encoded_ref, expired_at, LFU.initial(), :memory, 0, byte_size(encoded_ref)}
+    )
+
+    assert {:ok, %{deleted_files: 1}} = Router.sweep_blob_garbage(ctx)
+    refute File.exists?(path)
+  end
+
+  test "blob garbage sweep preserves live refs stored behind WARaft segment locations" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 0,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "blob:gc:waraft-segment-live"
+    payload = :binary.copy("W", 1536)
+
+    try do
+      Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+      assert :ok =
+               Ferricstore.Raft.WARaftBackend.start(ctx,
+                 log_module: :ferricstore_waraft_spike_segment_log
+               )
+
+      assert :ok = Ferricstore.Raft.WARaftBackend.write(0, {:put, key, payload, 0})
+
+      assert [
+               {^key, nil, 0, _lfu, {:waraft_segment, index}, offset, value_size}
+             ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+      assert is_integer(index) and index > 0
+      assert is_integer(offset) and offset >= 0
+      assert value_size == byte_size(payload)
+      assert payload == Router.get(ctx, key)
+
+      assert {:ok, _stats} = Router.sweep_blob_garbage(ctx)
+      assert payload == Router.get(ctx, key)
+    after
+      Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+      Ferricstore.Raft.WARaftBackend.stop()
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "blob garbage sweep skips deletion while Ra replay cursor still covers possible blob refs",
        %{ctx: ctx, shard: shard} do
     payload = "dead-but-possibly-still-in-raft-log"
@@ -1561,6 +1751,60 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
             }} = Router.sweep_blob_garbage(ctx)
 
     assert File.exists?(path)
+  end
+
+  test "blob garbage sweep skips deletion while WARaft replay cursor still covers possible blob refs",
+       %{ctx: ctx, shard: shard} do
+    payload = "dead-but-possibly-still-in-waraft-log"
+    ref = BlobRef.from_payload(payload)
+    path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+
+    :atomics.put(ctx.last_applied_index, 1, 10)
+    :atomics.put(ctx.last_released_cursor_index, 1, 9)
+    state = :sys.get_state(shard)
+    refute state.raft?
+    assert :atomics.get(state.instance_ctx.last_applied_index, 1) == 10
+    assert :atomics.get(state.instance_ctx.last_released_cursor_index, 1) == 9
+
+    assert {:ok,
+            %{
+              deleted_files: 0,
+              deleted_bytes: 0,
+              kept_files: 0,
+              skipped: true,
+              reason: {:raft_replay_gap, 10, 9}
+            }} = Router.sweep_blob_garbage(ctx)
+
+    assert File.exists?(path)
+  end
+
+  test "blob garbage sweep continues safe shards when another shard is replay-unsafe" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 2,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    try do
+      safe_payload = "safe-shard-orphan-blob"
+      unsafe_payload = "unsafe-shard-orphan-blob"
+      safe_ref = BlobRef.from_payload(safe_payload)
+      unsafe_ref = BlobRef.from_payload(unsafe_payload)
+      safe_path = write_legacy_blob!(ctx.data_dir, 0, safe_ref, safe_payload)
+      unsafe_path = write_legacy_blob!(ctx.data_dir, 1, unsafe_ref, unsafe_payload)
+
+      :atomics.put(ctx.last_applied_index, 2, 10)
+      :atomics.put(ctx.last_released_cursor_index, 2, 9)
+
+      assert {:ok, %{deleted_files: 1, skipped: true, reason: {:raft_replay_gap, 10, 9}}} =
+               Router.sweep_blob_garbage(ctx)
+
+      refute File.exists?(safe_path)
+      assert File.exists?(unsafe_path)
+    after
+      IsolatedInstance.checkin(ctx)
+    end
   end
 
   test "blob garbage sweep fails closed when Ra replay metrics are unavailable", %{
@@ -1588,6 +1832,107 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     after
       :sys.replace_state(shard, fn _state -> original_state end)
     end
+  end
+
+  test "blob garbage sweep fails closed when Ra replay metrics are invalid", %{
+    ctx: ctx,
+    shard: shard
+  } do
+    payload = "dead-but-invalid-raft-replay-metrics"
+    ref = BlobRef.from_payload(payload)
+    path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+    original_state = :sys.get_state(shard)
+
+    :sys.replace_state(shard, fn state ->
+      %{
+        state
+        | raft?: true,
+          instance_ctx: %{
+            state.instance_ctx
+            | last_applied_index: {:not, :atomics},
+              last_released_cursor_index: {:not, :atomics}
+          }
+      }
+    end)
+
+    try do
+      assert {:ok,
+              %{
+                deleted_files: 0,
+                deleted_bytes: 0,
+                kept_files: 0,
+                skipped: true,
+                reason: :missing_raft_replay_metrics
+              }} = Router.sweep_blob_garbage(ctx)
+
+      assert File.exists?(path)
+    after
+      :sys.replace_state(shard, fn _state -> original_state end)
+    end
+  end
+
+  test "blob garbage sweep fails closed when a live cold location cannot be read", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    attach_blob_gc_handler()
+
+    payload = "dead-but-live-ref-scan-fails"
+    ref = BlobRef.from_payload(payload)
+    path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+    live_key = "blob:gc:missing-live-location"
+
+    :ets.insert(keydir, {live_key, nil, 0, LFU.initial(), 999_999, 0, BlobRef.encoded_size()})
+
+    try do
+      assert {:error, {0, {:blob_gc_live_ref_scan_failed, ^live_key, _reason}}} =
+               Router.sweep_blob_garbage(ctx)
+
+      assert_receive {:blob_gc_failed, [:ferricstore, :blob, :gc, :failed], %{count: 1},
+                      %{
+                        shard_index: 0,
+                        reason: {:blob_gc_live_ref_scan_failed, ^live_key, _reason}
+                      }}
+
+      assert File.exists?(path)
+    after
+      :ets.delete(keydir, live_key)
+      :sys.replace_state(shard, fn state -> state end)
+    end
+  end
+
+  test "blob garbage sweep does not delete a blob written after live-ref scan starts", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    parent = self()
+    key = "blob:gc:concurrent-large-write"
+    payload = :binary.copy("W", 1024)
+
+    Process.put(:ferricstore_blob_gc_after_live_refs_hook, fn _ctx, 0, _live_refs ->
+      task =
+        Task.async(fn ->
+          result = Router.put(ctx, key, payload, 0)
+          send(parent, {:blob_gc_writer_done, result})
+          result
+        end)
+
+      send(parent, {:blob_gc_writer_task, task})
+
+      refute_receive {:blob_gc_writer_done, :ok}, 50
+
+      :ok
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_gc_after_live_refs_hook) end)
+
+    assert {:ok, _stats} = Router.sweep_blob_garbage(ctx)
+    assert_receive {:blob_gc_writer_task, task}, 1_000
+    assert :ok = Task.await(task, 1_000)
+    assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, key)
+    assert File.exists?(BlobRef.path(ctx.data_dir, 0, ref))
+    assert payload == Router.get(ctx, key)
   end
 
   test "blob garbage sweep fails closed when the active Bitcask file cannot fsync", %{
@@ -1773,6 +2118,20 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
     try do
       assert :ok = :file.pwrite(io, offset, payload)
+    after
+      :file.close(io)
+    end
+  end
+
+  defp corrupt_segment_header!(data_dir, shard_index, ref) do
+    assert {:ok, {path, offset, _size}} = BlobStore.file_ref(data_dir, shard_index, ref)
+    header_offset = offset - 48
+    assert header_offset >= 0
+
+    {:ok, io} = File.open(path, [:read, :write, :raw, :binary])
+
+    try do
+      assert :ok = :file.pwrite(io, header_offset, :binary.copy(<<0>>, 48))
     after
       :file.close(io)
     end

@@ -277,7 +277,7 @@ defmodule Ferricstore.Commands.TopK do
                NIF.topk_file_count_v2_async(proxy, corr_id, path, items)
              end) do
           {:ok, counts} ->
-            Enum.zip(items, counts) |> Enum.flat_map(fn {elem, count} -> [elem, count] end)
+            topk_items_with_counts(items, counts, [])
 
           {:error, "enoent"} ->
             {:error, "ERR TOPK: key does not exist"}
@@ -290,6 +290,12 @@ defmodule Ferricstore.Commands.TopK do
         end
     end
   end
+
+  defp topk_items_with_counts([item | items], [count | counts], acc) do
+    topk_items_with_counts(items, counts, [count, item | acc])
+  end
+
+  defp topk_items_with_counts(_items, _counts, acc), do: Enum.reverse(acc)
 
   defp do_reserve(key, k_str, width, depth, decay, store) do
     with {:ok, k} <- parse_pos_integer(k_str, "k"),

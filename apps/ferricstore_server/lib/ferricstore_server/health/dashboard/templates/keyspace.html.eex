@@ -1,0 +1,24 @@
+<% data = assigns.data %>
+<% query = URI.encode_query(%{
+  "key" => Map.get(data.filters, :key, ""),
+  "prefix" => Map.get(data.filters, :prefix, ""),
+  "limit" => Map.get(data.filters, :limit, 50),
+  "include_internal" => if(Map.get(data.filters, :include_internal, false), do: "true", else: "")
+}) %>
+<%= page_head("Keyspace - FerricStore", 10) %>
+<body data-dashboard-live-page="keyspace" data-dashboard-live-url="/dashboard/api/keyspace?<%= query %>" data-dashboard-live-interval-ms="10000">
+<div class="layout">
+<%= render_sidebar_static("keyspace") %>
+<main class="main-content">
+<%= render_subpage_header("Keyspace") %>
+<div class="content">
+<%= render_page_intro("Keyspace", "Find keys, inspect metadata, and confirm whether values are hot in memory, cold in Bitcask/WARaft segments, or represented by blob refs without loading large payloads.") %>
+<%= render_kv_subnav("keyspace") %>
+<%= render_keyspace_controls(data) %>
+<%= render_live_component("keyspace_inspector", render_keyspace_inspector(data.inspected)) %>
+<%= render_live_component("keyspace_table", render_keyspace_table(data)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

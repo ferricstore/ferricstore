@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // On Linux, bring in the uring backend modules.
 #[cfg(target_os = "linux")]
@@ -107,13 +107,8 @@ static APPEND_LOCKS: OnceLock<Mutex<HashMap<PathBuf, AppendLock>>> = OnceLock::n
 pub(crate) fn append_lock_for_path(path: &Path) -> AppendLock {
     let key = path.to_path_buf();
     let locks = APPEND_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut locks = locks.lock().expect("append lock registry poisoned");
     Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
-}
-
-pub(crate) fn lock_append_guard(lock: &AppendLock) -> io::Result<MutexGuard<'_, ()>> {
-    lock.lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "append lock poisoned"))
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +168,7 @@ impl SyncBackend {
 impl IoBackend for SyncBackend {
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = lock_append_guard(&append_lock)?;
+        let _guard = append_lock.lock().expect("append lock poisoned");
 
         self.writer.flush()?;
         let start = self.writer.get_ref().metadata()?.len();
@@ -209,7 +204,7 @@ impl IoBackend for SyncBackend {
 
     fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = lock_append_guard(&append_lock)?;
+        let _guard = append_lock.lock().expect("append lock poisoned");
 
         self.writer.flush()?;
         let mut running = self.writer.get_ref().metadata()?.len();
@@ -360,21 +355,6 @@ mod tests {
 
         assert_eq!(offsets, vec![0, 3, 5]);
         assert_eq!(backend.offset(), 6);
-    }
-
-    #[test]
-    fn append_lock_guard_reports_poison_without_panicking() {
-        let lock = Arc::new(Mutex::new(()));
-        let lock_to_poison = Arc::clone(&lock);
-        let result = std::panic::catch_unwind(move || {
-            let _guard = lock_to_poison.lock().unwrap();
-            panic!("poison append lock");
-        });
-
-        assert!(result.is_err());
-        let err = lock_append_guard(&lock).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(err.to_string().contains("append lock poisoned"));
     }
 
     #[test]

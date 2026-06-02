@@ -116,7 +116,7 @@ security_opt:
 
 Docker's overlay filesystem adds a VFS layer between the application and disk.
 For a storage engine that does its own caching (ETS) and write-ahead logging
-(Raft WAL + Bitcask), this overhead is pure waste.
+(WARaft segment log + Bitcask), this overhead is pure waste.
 
 Mount the NVMe partition directly:
 ```yaml

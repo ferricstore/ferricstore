@@ -1,0 +1,19 @@
+<% data = assigns.data %>
+<%= page_head("FerricFlow Retention - FerricStore", nil) %>
+<body>
+  <div class="layout">
+    <%= render_sidebar_static("flow") %>
+    <main class="main-content">
+      <%= render_subpage_header("FerricFlow Retention") %>
+      <div class="content">
+        <%= render_page_intro("FerricFlow Retention", "Preview and run guarded terminal workflow cleanup so history, state, and referenced payload values do not grow forever.") %>
+        <%= render_flow_subnav("retention") %>
+        <%= render_flow_retention_summary(data) %>
+        <%= render_flow_retention_controls(data) %>
+        <%= render_flow_retention_commands() %>
+        <%= render_flow_retention_candidates(data) %>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

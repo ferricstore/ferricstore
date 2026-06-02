@@ -278,6 +278,21 @@ defmodule Ferricstore.Commands.List do
            |> return_after_list_delete_count(key, store)
   end
 
+  def handle_ast({:lpos, [key, element | opts]}, store) do
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case parse_lpos_opts(opts) do
+        {:ok, rank, count, maxlen} ->
+          ListOps.execute(key, store, {:lpos, element, rank, count, maxlen})
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
+  def handle_ast({:lpos, _args}, _store),
+    do: {:error, "ERR wrong number of arguments for 'lpos' command"}
+
   def handle_ast({:linsert, _key, {:error, reason}, _pivot, _element}, _store),
     do: {:error, reason}
 

@@ -124,7 +124,7 @@ defmodule Ferricstore.Commands.Cluster do
   # -- CLUSTER.STATUS ---------------------------------------------------------
 
   def handle("CLUSTER.STATUS", [], _store) do
-    status = ClusterManager.node_status()
+    status = ClusterManager.node_status(1_000)
 
     header = [
       "mode: #{status.mode}",
@@ -281,9 +281,9 @@ defmodule Ferricstore.Commands.Cluster do
 
   def handle("CLUSTER.ROLE", [], _store) do
     role =
-      case ClusterManager.mode() do
-        :standalone -> "standalone"
-        :cluster -> Atom.to_string(Application.get_env(:ferricstore, :cluster_role, :voter))
+      case Ferricstore.ReplicationMode.current() do
+        :raft -> Atom.to_string(Application.get_env(:ferricstore, :cluster_role, :voter))
+        other -> Atom.to_string(other)
       end
 
     role
@@ -473,9 +473,9 @@ defmodule Ferricstore.Commands.Cluster do
 
   # Returns "leader" or "follower" for the given shard on this node.
   defp shard_role(index) do
-    shard_id = Ferricstore.Raft.Cluster.shard_server_id(index)
+    shard_id = {:"raft_server_ferricstore_waraft_backend_#{index + 1}", node()}
 
-    case :ra.members(shard_id) do
+    case Ferricstore.Raft.Cluster.members(index, 1_000) do
       {:ok, _members, ^shard_id} -> "leader"
       {:ok, _members, _other} -> "follower"
       _ -> "unknown"

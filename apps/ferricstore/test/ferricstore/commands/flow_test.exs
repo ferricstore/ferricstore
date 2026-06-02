@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.FlowTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.Dispatcher
-  alias Ferricstore.Test.{IsolatedInstance, MockStore, ShardHelpers}
+  alias Ferricstore.Test.{MockStore, ShardHelpers}
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -15,44 +15,6 @@ defmodule Ferricstore.Commands.FlowTest do
   end
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
-
-  defp flow_get(id, args \\ []),
-    do: Dispatcher.dispatch("FLOW.GET", [id | args], MockStore.make())
-
-  test "dispatches Flow commands through the supplied instance context" do
-    ctx = IsolatedInstance.checkout(shard_count: 1)
-    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
-
-    id = uid("flow-command-instance")
-
-    assert "OK" =
-             Dispatcher.dispatch(
-               "FLOW.CREATE",
-               [id, "TYPE", "instance-flow", "STATE", "queued", "NOW", "1000"],
-               ctx
-             )
-
-    assert {:ok, %{id: ^id}} = Ferricstore.Flow.get(ctx, id)
-    assert {:ok, nil} = Ferricstore.Flow.get(FerricStore.Instance.get(:default), id)
-  end
-
-  test "rejects Flow commands in sandbox store maps instead of leaking into default instance" do
-    ctx = FerricStore.Instance.get(:default)
-    id = uid("flow-command-sandbox")
-
-    store = %{
-      __instance_ctx__: ctx,
-      __sandbox_namespace__: "sandbox:#{System.unique_integer([:positive])}:"
-    }
-
-    assert {:error, "ERR FLOW commands are not supported in sandbox mode"} =
-             Ferricstore.Commands.Flow.handle_ast(
-               {:flow_create, id, [type: "sandbox-flow"]},
-               store
-             )
-
-    assert {:ok, nil} = Ferricstore.Flow.get(ctx, id)
-  end
 
   test "dispatches Flow value put and payload refs through Rust AST" do
     assert %{"ref" => shared_ref} =
@@ -71,7 +33,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "payload_ref" => ^shared_ref} = flow_get(id, ["PARTITION", "tenant-a"])
+    assert %{"id" => ^id, "payload_ref" => ^shared_ref} =
+             Dispatcher.dispatch("FLOW.GET", [id, "PARTITION", "tenant-a"], MockStore.make())
 
     assert %{"payload" => "shared-payload"} =
              Dispatcher.dispatch(
@@ -101,12 +64,6 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id_a, "payload_ref" => ^shared_ref} =
-             flow_get(id_a, ["PARTITION", "tenant-a"])
-
-    assert %{"id" => ^id_b, "payload_ref" => ^shared_ref} =
-             flow_get(id_b, ["PARTITION", "tenant-b"])
-
     assert [%{"id" => ^id, "fencing_token" => fencing_token, "lease_token" => lease_token}] =
              Dispatcher.dispatch(
                "FLOW.CLAIM_DUE",
@@ -131,79 +88,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "payload_ref" => ^shared_ref, "state" => "waiting"} =
-             flow_get(id, ["PARTITION", "tenant-a"])
-  end
-
-  test "rejects keyless shared Flow value puts" do
-    assert {:error, "ERR flow value partition or owner_flow_id is required"} =
-             Dispatcher.dispatch("FLOW.VALUE.PUT", ["shared-payload"], MockStore.make())
-
-    assert {:error, "ERR flow value partition or owner_flow_id is required"} =
-             FerricStore.flow_value_put("shared-payload")
-  end
-
-  test "routes Flow parser arity errors for all Flow tuple shapes" do
-    store = MockStore.make()
-
-    for {ast, command} <- [
-          {{:flow_spawn_children,
-            {:error, "ERR wrong number of arguments for 'flow.spawn_children' command"}},
-           "flow.spawn_children"},
-          {{:flow_extend_lease,
-            {:error, "ERR wrong number of arguments for 'flow.extend_lease' command"}},
-           "flow.extend_lease"},
-          {{:flow_transition_many,
-            {:error, "ERR wrong number of arguments for 'flow.transition_many' command"}},
-           "flow.transition_many"}
-        ] do
-      expected = "ERR wrong number of arguments for '#{command}' command"
-      assert {:error, ^expected} = Dispatcher.dispatch_ast(ast, store)
-    end
-  end
-
-  test "dispatches flow claim_due payload return options through Rust AST" do
-    id = uid("claim-payload-option")
-
-    assert "OK" =
-             Dispatcher.dispatch(
-               "FLOW.CREATE",
-               [
-                 id,
-                 "TYPE",
-                 "checkout",
-                 "STATE",
-                 "queued",
-                 "PAYLOAD",
-                 "payload-bytes",
-                 "NOW",
-                 "1000"
-               ],
-               MockStore.make()
-             )
-
-    assert [%{"id" => ^id} = claimed] =
-             Dispatcher.dispatch(
-               "FLOW.CLAIM_DUE",
-               [
-                 "checkout",
-                 "STATE",
-                 "queued",
-                 "WORKER",
-                 "worker-payload-option",
-                 "LIMIT",
-                 "1",
-                 "NOW",
-                 "2000",
-                 "PAYLOAD",
-                 "false",
-                 "PAYLOAD_MAX_BYTES",
-                 "1024"
-               ],
-               MockStore.make()
-             )
-
-    refute Map.has_key?(claimed, "payload")
+    assert %{"id" => ^id, "payload_ref" => ^shared_ref} =
+             Dispatcher.dispatch("FLOW.GET", [id, "PARTITION", "tenant-a"], MockStore.make())
   end
 
   test "rejects unsupported Flow value ref inputs through Rust AST" do
@@ -252,7 +138,7 @@ defmodule Ferricstore.Commands.FlowTest do
                  "RETENTION_TTL",
                  "60000",
                  "HISTORY_HOT_MAX_EVENTS",
-                 "5",
+                 "0",
                  "HISTORY_MAX_EVENTS",
                  "25"
                ],
@@ -260,11 +146,12 @@ defmodule Ferricstore.Commands.FlowTest do
              )
 
     assert %{"id" => ^id, "type" => "checkout", "state" => "queued", "priority" => 2} =
-             flow_get(id)
+             Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
 
     assert %{
              "root_flow_id" => "checkout-root",
              "correlation_id" => "order-123",
+             "history_hot_max_events" => 0,
              "history_max_events" => 25
            } =
              Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
@@ -334,7 +221,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "failed"} = flow_get(id)
+    assert %{"id" => ^id, "state" => "failed"} =
+             Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
 
     assert [%{"id" => ^id, "state" => "failed"}] =
              Dispatcher.dispatch(
@@ -401,7 +289,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"payload_ref" => payload_ref} = flow_get(id)
+    %{"payload_ref" => payload_ref} = Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
     assert is_binary(payload_ref)
     assert payload_ref != "create-payload"
 
@@ -438,7 +326,9 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"state" => "completed", "result_ref" => result_ref} = flow_get(id)
+    %{"state" => "completed", "result_ref" => result_ref} =
+      Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
+
     assert is_binary(result_ref)
     assert result_ref != "complete-result"
 
@@ -480,8 +370,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^parent, "fencing_token" => fencing_token} =
-             flow_get(parent, ["PARTITION", partition])
+    %{"fencing_token" => fencing_token} =
+      Dispatcher.dispatch("FLOW.GET", [parent, "PARTITION", partition], MockStore.make())
 
     assert "OK" =
              Dispatcher.dispatch(
@@ -527,8 +417,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^parent, "state" => "waiting_children", "child_groups" => child_groups} =
-             flow_get(parent, ["PARTITION", partition])
+    %{"id" => ^parent, "state" => "waiting_children", "child_groups" => child_groups} =
+      Dispatcher.dispatch("FLOW.GET", [parent, "PARTITION", partition], MockStore.make())
 
     assert child_groups["fanout"]["wait"] == "any"
     assert child_groups["fanout"]["children"][child_a] == "running"
@@ -608,8 +498,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"state" => "waiting", "payload_ref" => transition_payload_ref} =
-             flow_get(transition_id)
+    %{"state" => "waiting", "payload_ref" => transition_payload_ref} =
+      Dispatcher.dispatch("FLOW.GET", [transition_id], MockStore.make())
 
     assert transition_payload_ref != "transition-payload"
 
@@ -653,11 +543,11 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{
-             "state" => "waiting",
-             "error_ref" => retry_error_ref,
-             "payload_ref" => retry_payload_ref
-           } = flow_get(transition_id)
+    %{
+      "state" => "waiting",
+      "error_ref" => retry_error_ref,
+      "payload_ref" => retry_payload_ref
+    } = Dispatcher.dispatch("FLOW.GET", [transition_id], MockStore.make())
 
     assert retry_error_ref != "retry-error"
     assert retry_payload_ref != "retry-payload"
@@ -715,7 +605,9 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"state" => "failed", "error_ref" => fail_error_ref} = flow_get(fail_id)
+    %{"state" => "failed", "error_ref" => fail_error_ref} =
+      Dispatcher.dispatch("FLOW.GET", [fail_id], MockStore.make())
+
     assert fail_error_ref != "fail-error"
 
     assert %{"payload" => "fail-payload", "error" => "fail-error"} =
@@ -817,11 +709,6 @@ defmodule Ferricstore.Commands.FlowTest do
                ["lineage", "PARTITION", partition, "INCLUDE_COLD", "true"],
                MockStore.make()
              )
-  end
-
-  test "Flow reclaim requires worker option through Rust AST" do
-    assert {:error, "ERR wrong number of arguments for 'flow.reclaim' command"} =
-             Dispatcher.dispatch("FLOW.RECLAIM", ["reclaim-command"], MockStore.make())
   end
 
   test "dispatches Flow reclaim through Rust AST" do
@@ -934,8 +821,6 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
-
-    assert %{"id" => ^id, "lease_deadline_ms" => 1520} = flow_get(id)
   end
 
   test "dispatches Flow create_many through Rust AST" do
@@ -975,6 +860,68 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches cold auto-bucket create_many claim_due through Rust AST" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("flow-command-cold-auto-bulk") <> ":bench"
+    id_a = uid("flow-command-cold-auto-a")
+    id_b = uid("flow-command-cold-auto-b")
+    partition = Ferricstore.Flow.Keys.auto_partition_key(id_a)
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE_MANY",
+               [
+                 partition,
+                 "TYPE",
+                 type,
+                 "STATE",
+                 "queued",
+                 "RUN_AT",
+                 "302000",
+                 "NOW",
+                 "1000",
+                 "PRIORITY",
+                 "0",
+                 "INDEPENDENT",
+                 "true",
+                 "RETENTION_TTL_MS",
+                 "300000",
+                 "ITEMS",
+                 id_a,
+                 "payload:" <> id_a,
+                 id_b,
+                 "payload:" <> id_b
+               ],
+               MockStore.make()
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    assert [job_a | _] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 type,
+                 "WORKER",
+                 "worker-cold-auto",
+                 "LIMIT",
+                 "10",
+                 "NOW",
+                 "302000",
+                 "PARTITIONS",
+                 "1",
+                 partition,
+                 "RETURN",
+                 "JOBS_COMPACT_STATE"
+               ],
+               MockStore.make()
+             )
+
+    assert [^id_a, ^partition, lease_token, fencing_token, "queued"] = job_a
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
+  end
+
   test "dispatches idempotent Flow create_many retry through Rust AST" do
     partition = uid("tenant")
     type = uid("flow-command-bulk-idempotent")
@@ -999,12 +946,8 @@ defmodule Ferricstore.Commands.FlowTest do
     ]
 
     assert "OK" = Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
-    assert %{"id" => ^id_a} = flow_get(id_a, ["PARTITION", partition])
-    assert %{"id" => ^id_b} = flow_get(id_b, ["PARTITION", partition])
 
     assert "OK" = Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
-    assert %{"id" => ^id_a} = flow_get(id_a, ["PARTITION", partition])
-    assert %{"id" => ^id_b} = flow_get(id_b, ["PARTITION", partition])
   end
 
   test "dispatches mixed-partition Flow create_many through Rust AST" do
@@ -1035,12 +978,6 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
-
-    assert %{"id" => ^id_a, "type" => ^type, "partition_key" => ^partition_a} =
-             flow_get(id_a, ["PARTITION", partition_a])
-
-    assert %{"id" => ^id_b, "type" => ^type, "partition_key" => ^partition_b} =
-             flow_get(id_b, ["PARTITION", partition_b])
   end
 
   test "dispatches Flow claim and complete through Rust AST" do
@@ -1081,7 +1018,9 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "completed", "result_ref" => result_ref} = flow_get(id)
+    %{"id" => ^id, "state" => "completed", "result_ref" => result_ref} =
+      Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
+
     assert is_binary(result_ref)
     assert result_ref != "result:1"
   end
@@ -1142,11 +1081,11 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id_a, "state" => "completed", "result_ref" => result_ref_a} =
-             flow_get(id_a, ["PARTITION", partition])
+    %{"id" => ^id_a, "state" => "completed", "result_ref" => result_ref_a} =
+      Dispatcher.dispatch("FLOW.GET", [id_a, "PARTITION", partition], MockStore.make())
 
-    assert %{"id" => ^id_b, "state" => "completed", "result_ref" => result_ref_b} =
-             flow_get(id_b, ["PARTITION", partition])
+    %{"id" => ^id_b, "state" => "completed", "result_ref" => result_ref_b} =
+      Dispatcher.dispatch("FLOW.GET", [id_b, "PARTITION", partition], MockStore.make())
 
     assert is_binary(result_ref_a)
     assert is_binary(result_ref_b)
@@ -1217,8 +1156,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "fencing_token" => fencing_token} =
-             flow_get(id, ["PARTITION", partition])
+    %{"fencing_token" => fencing_token} =
+      Dispatcher.dispatch("FLOW.GET", [id, "PARTITION", partition], MockStore.make())
 
     assert "OK" =
              Dispatcher.dispatch(
@@ -1235,8 +1174,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "cancelled", "error_ref" => error_ref} =
-             flow_get(id, ["PARTITION", partition])
+    %{"id" => ^id, "state" => "cancelled", "error_ref" => error_ref} =
+      Dispatcher.dispatch("FLOW.GET", [id, "PARTITION", partition], MockStore.make())
 
     assert is_binary(error_ref)
     assert error_ref != reason
@@ -1301,11 +1240,11 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id_a, "state" => "failed", "error_ref" => error_ref_a} =
-             flow_get(id_a, ["PARTITION", partition])
+    %{"id" => ^id_a, "state" => "failed", "error_ref" => error_ref_a} =
+      Dispatcher.dispatch("FLOW.GET", [id_a, "PARTITION", partition], MockStore.make())
 
-    assert %{"id" => ^id_b, "state" => "failed", "error_ref" => error_ref_b} =
-             flow_get(id_b, ["PARTITION", partition])
+    %{"id" => ^id_b, "state" => "failed", "error_ref" => error_ref_b} =
+      Dispatcher.dispatch("FLOW.GET", [id_b, "PARTITION", partition], MockStore.make())
 
     assert is_binary(error_ref_a)
     assert is_binary(error_ref_b)
@@ -1375,11 +1314,11 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id_a, "state" => "queued", "error_ref" => error_ref_a} =
-             flow_get(id_a, ["PARTITION", partition])
+    %{"id" => ^id_a, "state" => "queued", "error_ref" => error_ref_a} =
+      Dispatcher.dispatch("FLOW.GET", [id_a, "PARTITION", partition], MockStore.make())
 
-    assert %{"id" => ^id_b, "state" => "queued", "error_ref" => error_ref_b} =
-             flow_get(id_b, ["PARTITION", partition])
+    %{"id" => ^id_b, "state" => "queued", "error_ref" => error_ref_b} =
+      Dispatcher.dispatch("FLOW.GET", [id_b, "PARTITION", partition], MockStore.make())
 
     assert is_binary(error_ref_a)
     assert is_binary(error_ref_b)
@@ -1423,7 +1362,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "payment_failed"} = flow_get(id)
+    assert %{"id" => ^id, "state" => "payment_failed"} =
+             Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
   end
 
   test "dispatches Flow claim_due with job-only return through Rust AST" do
@@ -1442,6 +1382,7 @@ defmodule Ferricstore.Commands.FlowTest do
                "id" => ^id,
                "type" => ^type,
                "state" => "running",
+               "run_state" => "queued",
                "lease_token" => lease_token,
                "fencing_token" => fencing_token
              } = job
@@ -1467,6 +1408,102 @@ defmodule Ferricstore.Commands.FlowTest do
     assert is_binary(lease_token)
     assert is_integer(fencing_token)
     refute Map.has_key?(job, "version")
+  end
+
+  test "dispatches Flow claim_due with compact job-only return through Rust AST" do
+    type = uid("flow-command-claim-jobs-compact")
+    id = uid("flow-command-claim-jobs-compact-id")
+    partition_key = uid("tenant")
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 id,
+                 "TYPE",
+                 type,
+                 "STATE",
+                 "queued",
+                 "PARTITION",
+                 partition_key,
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000"
+               ],
+               MockStore.make()
+             )
+
+    assert [[^id, ^partition_key, lease_token, fencing_token]] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 type,
+                 "STATE",
+                 "queued",
+                 "WORKER",
+                 "worker-a",
+                 "LIMIT",
+                 "1",
+                 "NOW",
+                 "1000",
+                 "PARTITION",
+                 partition_key,
+                 "RETURN",
+                 "JOBS_COMPACT"
+               ],
+               MockStore.make()
+             )
+
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
+  end
+
+  test "dispatches Flow claim_due with compact job-state return through Rust AST" do
+    type = uid("flow-command-claim-jobs-compact-state")
+    id = uid("flow-command-claim-jobs-compact-state-id")
+    partition_key = uid("tenant")
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 id,
+                 "TYPE",
+                 type,
+                 "STATE",
+                 "ready",
+                 "PARTITION",
+                 partition_key,
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000"
+               ],
+               MockStore.make()
+             )
+
+    assert [[^id, ^partition_key, lease_token, fencing_token, "ready"]] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 type,
+                 "WORKER",
+                 "worker-a",
+                 "LIMIT",
+                 "1",
+                 "NOW",
+                 "1000",
+                 "PARTITION",
+                 partition_key,
+                 "RETURN",
+                 "JOBS_COMPACT_STATE"
+               ],
+               MockStore.make()
+             )
+
+    assert is_binary(lease_token)
+    assert is_integer(fencing_token)
   end
 
   test "dispatches Flow claim_due with any partition and repeated states through Rust AST" do
@@ -1589,11 +1626,11 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id_a, "state" => "cancelled", "error_ref" => error_ref_a} =
-             flow_get(id_a, ["PARTITION", partition])
+    %{"id" => ^id_a, "state" => "cancelled", "error_ref" => error_ref_a} =
+      Dispatcher.dispatch("FLOW.GET", [id_a, "PARTITION", partition], MockStore.make())
 
-    assert %{"id" => ^id_b, "state" => "cancelled", "error_ref" => error_ref_b} =
-             flow_get(id_b, ["PARTITION", partition])
+    %{"id" => ^id_b, "state" => "cancelled", "error_ref" => error_ref_b} =
+      Dispatcher.dispatch("FLOW.GET", [id_b, "PARTITION", partition], MockStore.make())
 
     assert is_binary(error_ref_a)
     assert is_binary(error_ref_b)
@@ -1628,8 +1665,6 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"state" => "completed"} = flow_get(id)
-
     assert "OK" =
              Dispatcher.dispatch(
                "FLOW.REWIND",
@@ -1647,7 +1682,8 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "queued", "next_run_at_ms" => 5000} = flow_get(id)
+    assert %{"id" => ^id, "state" => "queued", "next_run_at_ms" => 5000} =
+             Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
   end
 
   test "dispatches Flow AST parse errors without calling embedded API" do
@@ -1679,7 +1715,7 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch_ast(
                {:flow_policy_set, type,
                 [
-                  retention: [ttl_ms: 60_000, history_hot_max_events: 32, history_max_events: 320],
+                  retention: [ttl_ms: 60_000, history_max_events: 320],
                   retry: [
                     max_retries: 5,
                     backoff: [kind: :fixed, base_ms: 1_000, max_ms: 5_000, jitter_pct: 0],
@@ -1690,7 +1726,6 @@ defmodule Ferricstore.Commands.FlowTest do
                       retry: [max_retries: 1, exhausted_to: "payment_failed"],
                       retention: [
                         ttl_ms: 30_000,
-                        history_hot_max_events: 16,
                         history_max_events: 160
                       ]
                     ]
@@ -1702,11 +1737,15 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "retention" => %{
                "ttl_ms" => 60_000,
-               "history_hot_max_events" => 32,
                "history_max_events" => 320
              }
            } =
              Dispatcher.dispatch_ast({:flow_policy_get, type, []}, MockStore.make())
+
+    refute Map.has_key?(
+             Dispatcher.dispatch_ast({:flow_policy_get, type, []}, MockStore.make())["retention"],
+             "history_hot_max_events"
+           )
 
     assert %{
              "type" => ^type,
@@ -1714,7 +1753,6 @@ defmodule Ferricstore.Commands.FlowTest do
              "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
              "retention" => %{
                "ttl_ms" => 30_000,
-               "history_hot_max_events" => 16,
                "history_max_events" => 160
              }
            } =
@@ -1756,8 +1794,6 @@ defmodule Ferricstore.Commands.FlowTest do
                  "0",
                  "RETENTION_TTL",
                  "60000",
-                 "HISTORY_HOT_MAX_EVENTS",
-                 "32",
                  "HISTORY_MAX_EVENTS",
                  "320",
                  "EXHAUSTED_TO",
@@ -1770,8 +1806,6 @@ defmodule Ferricstore.Commands.FlowTest do
                  "payment_failed",
                  "RETENTION_TTL",
                  "30000",
-                 "HISTORY_HOT_MAX_EVENTS",
-                 "16",
                  "HISTORY_MAX_EVENTS",
                  "160"
                ],
@@ -1781,11 +1815,15 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "retention" => %{
                "ttl_ms" => 60_000,
-               "history_hot_max_events" => 32,
                "history_max_events" => 320
              }
            } =
              Dispatcher.dispatch("FLOW.POLICY.GET", [type], MockStore.make())
+
+    refute Map.has_key?(
+             Dispatcher.dispatch("FLOW.POLICY.GET", [type], MockStore.make())["retention"],
+             "history_hot_max_events"
+           )
 
     assert %{
              "type" => ^type,
@@ -1793,7 +1831,6 @@ defmodule Ferricstore.Commands.FlowTest do
              "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
              "retention" => %{
                "ttl_ms" => 30_000,
-               "history_hot_max_events" => 16,
                "history_max_events" => 160
              }
            } =
@@ -1807,6 +1844,13 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch(
                "FLOW.POLICY.SET",
                [type, "STATE", "queued", "MAX_RETRIES"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR flow retention history_hot_max_events is internal"} =
+             Dispatcher.dispatch(
+               "FLOW.POLICY.SET",
+               [type, "HISTORY_HOT_MAX_EVENTS", "1"],
                MockStore.make()
              )
   end

@@ -7,7 +7,7 @@ defmodule Ferricstore.GracefulShutdownIsolationTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
-  test "isolated data dir setup does not corrupt live Ra WAL state" do
+  test "isolated data dir setup does not corrupt live WARaft segment state" do
     original_dir = Application.fetch_env!(:ferricstore, :data_dir)
 
     log =

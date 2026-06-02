@@ -1,0 +1,17 @@
+<% data = assigns.data %>
+<%= page_head("Config - FerricStore", nil) %>
+<body>
+<div class="layout">
+<%= render_sidebar_static("config") %>
+<main class="main-content">
+<%= render_subpage_header("Config") %>
+<div class="content">
+<%= render_page_intro("Config", "Inspect runtime configuration commands, current namespace overrides, and tunable server parameters.") %>
+<%= render_config_commands(Map.get(data, :config_commands, config_command_reference())) %>
+<%= render_config_table(data.namespace_config) %>
+<%= render_config_parameters(Map.get(data, :config_parameters, runtime_config_parameter_reference())) %>
+</div>
+</main>
+</div>
+</body>
+</html>

@@ -937,12 +937,15 @@ defmodule Ferricstore.Commands.Bitmap do
   defp clear_compound_data_structure(key, store) do
     if Ops.has_compound?(store) do
       with :ok <- Ops.compound_delete(store, key, CompoundKey.type_key(key)),
-           :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)) do
+           :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)),
+           :ok <- Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key)) do
         [
           CompoundKey.hash_prefix(key),
           CompoundKey.list_prefix(key),
           CompoundKey.set_prefix(key),
-          CompoundKey.zset_prefix(key)
+          CompoundKey.zset_prefix(key),
+          CompoundKey.stream_prefix(key),
+          CompoundKey.stream_group_prefix(key)
         ]
         |> Enum.reduce_while(:ok, fn prefix, :ok ->
           case Ops.compound_delete_prefix(store, key, prefix) do
@@ -1009,21 +1012,35 @@ defmodule Ferricstore.Commands.Bitmap do
         []
       end
 
-    type_entries ++ list_meta_entries
+    stream_meta_entries =
+      if type == "stream" do
+        stream_meta_key = CompoundKey.stream_meta_key(key)
+
+        case Ops.compound_get_meta(store, key, stream_meta_key) do
+          nil -> []
+          {value, expire_at_ms} -> [{stream_meta_key, value, expire_at_ms}]
+        end
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries ++ stream_meta_entries
   end
 
   defp compound_backup_member_entries(key, type, store) do
-    prefix = compound_backup_prefix(key, type)
+    prefixes = compound_backup_prefixes(key, type)
 
     compound_keys =
-      store
-      |> Ops.compound_scan(key, prefix)
-      |> Enum.map(fn {member_or_key, _value} ->
-        if String.starts_with?(member_or_key, prefix) do
-          member_or_key
-        else
-          prefix <> member_or_key
-        end
+      Enum.flat_map(prefixes, fn prefix ->
+        store
+        |> Ops.compound_scan(key, prefix)
+        |> Enum.map(fn {member_or_key, _value} ->
+          if String.starts_with?(member_or_key, prefix) do
+            member_or_key
+          else
+            prefix <> member_or_key
+          end
+        end)
       end)
 
     store
@@ -1040,6 +1057,11 @@ defmodule Ferricstore.Commands.Bitmap do
   defp compound_backup_prefix(key, "set"), do: CompoundKey.set_prefix(key)
   defp compound_backup_prefix(key, "zset"), do: CompoundKey.zset_prefix(key)
   defp compound_backup_prefix(key, "stream"), do: CompoundKey.stream_prefix(key)
+
+  defp compound_backup_prefixes(key, "stream"),
+    do: [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]
+
+  defp compound_backup_prefixes(key, type), do: [compound_backup_prefix(key, type)]
 
   # --- Binary manipulation --------------------------------------------------
 

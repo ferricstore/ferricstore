@@ -166,8 +166,8 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       tracking: tracking
     })
 
-    assert_receive {:tracking_invalidation, _payload, [^source]}
-    assert_receive {:tracking_invalidation, _payload, [^destination]}
+    assert_receive {:tracking_invalidation, _payload, invalidated}
+    assert MapSet.new(invalidated) == MapSet.new([source, destination])
     assert :ets.lookup(:ferricstore_tracking, source) == []
     assert :ets.lookup(:ferricstore_tracking, destination) == []
   end
@@ -209,8 +209,8 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       tracking: tracking
     })
 
-    assert_receive {:tracking_invalidation, _payload, [^key_a]}
-    assert_receive {:tracking_invalidation, _payload, [^key_b]}
+    assert_receive {:tracking_invalidation, _payload, invalidated}
+    assert MapSet.new(invalidated) == MapSet.new([key_a, key_b])
     assert :ets.lookup(:ferricstore_tracking, key_a) == []
     assert :ets.lookup(:ferricstore_tracking, key_b) == []
   end
@@ -230,8 +230,8 @@ defmodule FerricstoreServer.Connection.TrackingTest do
 
     Tracking.maybe_notify_tracking("RENAMENX", [source, destination], 1, %{tracking: tracking})
 
-    assert_receive {:tracking_invalidation, _payload, [^source]}
-    assert_receive {:tracking_invalidation, _payload, [^destination]}
+    assert_receive {:tracking_invalidation, _payload, invalidated}
+    assert MapSet.new(invalidated) == MapSet.new([source, destination])
     assert :ets.lookup(:ferricstore_tracking, source) == []
     assert :ets.lookup(:ferricstore_tracking, destination) == []
   end

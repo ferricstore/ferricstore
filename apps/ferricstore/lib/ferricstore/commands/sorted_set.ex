@@ -51,11 +51,8 @@ defmodule Ferricstore.Commands.SortedSet do
 
       compound_keys = Enum.map(unique_members, &CompoundKey.zset_member(key, &1))
 
-      current_by_member =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> then(&Enum.zip(unique_members, &1))
-        |> Map.new()
+      current_values = Ops.compound_batch_get(store, key, compound_keys)
+      current_by_member = zset_current_by_member(unique_members, current_values, %{})
 
       {added, changed, _current_by_member, writes_by_member} =
         Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
@@ -101,13 +98,7 @@ defmodule Ferricstore.Commands.SortedSet do
           end
         end)
 
-      write_entries =
-        Enum.flat_map(Enum.zip(unique_members, compound_keys), fn {member, compound_key} ->
-          case Map.fetch(writes_by_member, member) do
-            {:ok, score_str} -> [{compound_key, score_str, 0}]
-            :error -> []
-          end
-        end)
+      write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
 
       case Ops.compound_batch_put(store, key, write_entries) do
         :ok -> if opts.ch, do: added + changed, else: added
@@ -304,7 +295,7 @@ defmodule Ferricstore.Commands.SortedSet do
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
-      elements = Enum.flat_map(batch, fn {member, score} -> [member, format_score_str(score)] end)
+      elements = zset_score_string_pairs_to_flat_list(batch)
       [next_cursor, elements]
     end
   end
@@ -413,7 +404,7 @@ defmodule Ferricstore.Commands.SortedSet do
                 end
 
               if with_scores do
-                Enum.flat_map(filtered, fn {member, score} -> [member, format_score(score)] end)
+                zset_score_pairs_to_flat_list(filtered)
               else
                 Enum.map(filtered, fn {member, _score} -> member end)
               end
@@ -471,7 +462,7 @@ defmodule Ferricstore.Commands.SortedSet do
                 end
 
               if with_scores do
-                Enum.flat_map(filtered, fn {member, score} -> [member, format_score(score)] end)
+                zset_score_pairs_to_flat_list(filtered)
               else
                 Enum.map(filtered, fn {member, _score} -> member end)
               end
@@ -718,11 +709,8 @@ defmodule Ferricstore.Commands.SortedSet do
 
       compound_keys = Enum.map(unique_members, &CompoundKey.zset_member(key, &1))
 
-      current_by_member =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> then(&Enum.zip(unique_members, &1))
-        |> Map.new()
+      current_values = Ops.compound_batch_get(store, key, compound_keys)
+      current_by_member = zset_current_by_member(unique_members, current_values, %{})
 
       {added, changed, _current_by_member, writes_by_member} =
         Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
@@ -766,13 +754,7 @@ defmodule Ferricstore.Commands.SortedSet do
           end
         end)
 
-      write_entries =
-        Enum.flat_map(Enum.zip(unique_members, compound_keys), fn {member, compound_key} ->
-          case Map.fetch(writes_by_member, member) do
-            {:ok, score_str} -> [{compound_key, score_str, 0}]
-            :error -> []
-          end
-        end)
+      write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
 
       case Ops.compound_batch_put(store, key, write_entries) do
         :ok -> if opts.ch, do: added + changed, else: added
@@ -792,6 +774,29 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp rollback_new_zset_type_marker(_key, _store, :ok, write_error), do: write_error
+
+  defp zset_current_by_member([member | members], [value | values], acc) do
+    zset_current_by_member(members, values, Map.put(acc, member, value))
+  end
+
+  defp zset_current_by_member(_members, _values, acc), do: acc
+
+  defp zset_write_entries([], [], _writes_by_member, entries), do: Enum.reverse(entries)
+
+  defp zset_write_entries(
+         [member | members],
+         [compound_key | compound_keys],
+         writes_by_member,
+         entries
+       ) do
+    next_entries =
+      case Map.fetch(writes_by_member, member) do
+        {:ok, score_str} -> [{compound_key, score_str, 0} | entries]
+        :error -> entries
+      end
+
+    zset_write_entries(members, compound_keys, writes_by_member, next_entries)
+  end
 
   defp zincrby_parsed(key, increment, member, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
@@ -888,7 +893,7 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp format_rank_members(members, true) do
-    Enum.flat_map(members, fn {member, score} -> [member, format_score(score)] end)
+    zset_score_pairs_to_flat_list(members)
   end
 
   defp format_rank_members(members, false) do
@@ -915,10 +920,7 @@ defmodule Ferricstore.Commands.SortedSet do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       to_pop = zpop_members(key, count, reverse?, store)
 
-      result =
-        Enum.flat_map(to_pop, fn {member, score} ->
-          [member, format_score(score)]
-        end)
+      result = zset_score_pairs_to_flat_list(to_pop)
 
       compound_keys =
         Enum.map(to_pop, fn {member, _score} -> CompoundKey.zset_member(key, member) end)
@@ -988,7 +990,7 @@ defmodule Ferricstore.Commands.SortedSet do
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
-      elements = Enum.flat_map(batch, fn {member, score} -> [member, format_score_str(score)] end)
+      elements = zset_score_string_pairs_to_flat_list(batch)
       [next_cursor, elements]
     end
   end
@@ -1016,7 +1018,7 @@ defmodule Ferricstore.Commands.SortedSet do
         end
 
       if with_scores do
-        Enum.flat_map(filtered, fn {member, score} -> [member, format_score(score)] end)
+        zset_score_pairs_to_flat_list(filtered)
       else
         Enum.map(filtered, fn {member, _score} -> member end)
       end
@@ -1105,6 +1107,23 @@ defmodule Ferricstore.Commands.SortedSet do
       _ -> score_str
     end
   end
+
+  defp zset_score_pairs_to_flat_list(pairs), do: zset_score_pairs_to_flat_list(pairs, [])
+
+  defp zset_score_pairs_to_flat_list([{member, score} | pairs], acc) do
+    zset_score_pairs_to_flat_list(pairs, [format_score(score), member | acc])
+  end
+
+  defp zset_score_pairs_to_flat_list([], acc), do: Enum.reverse(acc)
+
+  defp zset_score_string_pairs_to_flat_list(pairs),
+    do: zset_score_string_pairs_to_flat_list(pairs, [])
+
+  defp zset_score_string_pairs_to_flat_list([{member, score} | pairs], acc) do
+    zset_score_string_pairs_to_flat_list(pairs, [format_score_str(score), member | acc])
+  end
+
+  defp zset_score_string_pairs_to_flat_list([], acc), do: Enum.reverse(acc)
 
   # Parse ZADD options and score/member pairs
   defp parse_zadd_opts(args) do
@@ -1370,7 +1389,7 @@ defmodule Ferricstore.Commands.SortedSet do
         selected = Enum.take_random(pairs, count)
 
         if with_scores do
-          Enum.flat_map(selected, fn {member, score} -> [member, format_score_str(score)] end)
+          zset_score_string_pairs_to_flat_list(selected)
         else
           Enum.map(selected, fn {member, _score} -> member end)
         end
@@ -1384,7 +1403,7 @@ defmodule Ferricstore.Commands.SortedSet do
           selected = for _ <- 1..abs_count, do: Enum.random(pairs)
 
           if with_scores do
-            Enum.flat_map(selected, fn {member, score} -> [member, format_score_str(score)] end)
+            zset_score_string_pairs_to_flat_list(selected)
           else
             Enum.map(selected, fn {member, _score} -> member end)
           end

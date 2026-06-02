@@ -16,8 +16,7 @@ defmodule Ferricstore.Bitcask.NIF do
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-musl
       x86_64-unknown-linux-musl
-    ),
-    force_build: System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
+    )
 
   # -- Tracking allocator --
   @spec rust_allocated_bytes() :: {:ok, non_neg_integer()} | {:error, term()}
@@ -42,6 +41,9 @@ defmodule Ferricstore.Bitcask.NIF do
 
   @spec flow_index_delete_members(flow_index_resource(), binary(), [binary()]) :: :ok
   def flow_index_delete_members(_resource, _key, _members), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_delete_entries(flow_index_resource(), [{binary(), binary()}]) :: :ok
+  def flow_index_delete_entries(_resource, _entries), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec flow_index_apply_batch(
           flow_index_resource(),
@@ -104,8 +106,12 @@ defmodule Ferricstore.Bitcask.NIF do
           float(),
           non_neg_integer(),
           non_neg_integer()
-        ) :: [{binary(), binary(), float()}]
+        ) :: [{binary(), [{binary(), float()}]}]
   def flow_index_claim_due_candidates(_resource, _keys, _max_score, _limit, _max_scan),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_due_keys_present(flow_index_resource(), [binary()], float()) :: [binary()]
+  def flow_index_due_keys_present(_resource, _keys, _max_score),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @spec flow_index_count_all(flow_index_resource(), binary()) :: non_neg_integer()
@@ -142,6 +148,14 @@ defmodule Ferricstore.Bitcask.NIF do
   @type flow_record_claim_plan ::
           {binary(), flow_index_claim_entry(), binary(), non_neg_integer() | nil}
 
+  @type flow_record_claim_history_entry ::
+          {binary(), binary(), non_neg_integer(), non_neg_integer(), binary(), binary(),
+           non_neg_integer() | nil, non_neg_integer() | nil, boolean()}
+
+  @type flow_record_claim_history_plan ::
+          {binary(), flow_index_claim_entry(), binary(), non_neg_integer() | nil,
+           flow_record_claim_history_entry()}
+
   @spec flow_record_plan_claims(
           [{binary(), float()}],
           [binary() | nil],
@@ -175,6 +189,45 @@ defmodule Ferricstore.Bitcask.NIF do
         _inflight_key,
         _worker_key,
         _state_key_prefix
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_record_plan_claims_with_history(
+          [{binary(), float()}],
+          [binary() | nil],
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary()
+        ) ::
+          {:ok, [flow_record_claim_history_plan()], [binary()], non_neg_integer()} | :fallback
+  def flow_record_plan_claims_with_history(
+        _candidates,
+        _values,
+        _type,
+        _expected_state,
+        _worker,
+        _lease_ms,
+        _now_ms,
+        _remaining,
+        _from_due_key,
+        _to_due_key,
+        _from_state_key,
+        _to_state_key,
+        _inflight_key,
+        _worker_key,
+        _state_key_prefix,
+        _history_key_prefix
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
@@ -332,6 +385,12 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:error, term()}
   def v2_scan_file_from_offset(_path, _start_offset), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_scan_file_page(binary(), non_neg_integer(), pos_integer()) ::
+          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}],
+           non_neg_integer(), boolean()}
+          | {:error, term()}
+  def v2_scan_file_page(_path, _start_offset, _limit), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_scan_tombstones(binary()) ::
           {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]}
           | {:error, term()}
@@ -439,14 +498,43 @@ defmodule Ferricstore.Bitcask.NIF do
   def lmdb_write_batch_with_originals(_path, _ops, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_clear(binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def lmdb_clear(_path, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_release_all() ::
+          {:ok, non_neg_integer()} | {:busy, non_neg_integer()} | {:error, term()}
+  def lmdb_release_all, do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_prefix_entries(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_prefix_entries_after(
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{binary(), binary()}]} | {:error, term()}
+  def lmdb_prefix_entries_after(_path, _prefix, _after_key, _limit, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_prefix_entries_reverse(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries_reverse(_path, _prefix, _limit, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_prefix_entries_reverse_before(
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{binary(), binary()}]} | {:error, term()}
+  def lmdb_prefix_entries_reverse_before(_path, _prefix, _before_key, _limit, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @spec lmdb_prefix_count(binary(), binary(), non_neg_integer()) ::
@@ -511,13 +599,13 @@ defmodule Ferricstore.Bitcask.NIF do
 
   # -- Stateless pread/pwrite Bloom NIFs --
   @spec bloom_file_create(binary(), non_neg_integer(), non_neg_integer()) ::
-          {:ok, :ok} | {:error, term()}
+          :ok | {:error, term()}
   def bloom_file_create(_path, _num_bits, _num_hashes), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec bloom_file_add(binary(), binary()) :: {:ok, 0 | 1} | {:error, term()}
+  @spec bloom_file_add(binary(), binary()) :: :ok | {:error, term()}
   def bloom_file_add(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec bloom_file_madd(binary(), [binary()]) :: {:ok, [0 | 1]} | {:error, term()}
+  @spec bloom_file_madd(binary(), [binary()]) :: :ok | {:error, term()}
   def bloom_file_madd(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec bloom_file_exists(binary(), binary()) :: {:ok, boolean()} | {:error, term()}

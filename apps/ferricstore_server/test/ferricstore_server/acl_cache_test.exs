@@ -36,6 +36,26 @@ defmodule FerricstoreServer.AclCacheTest do
     recv_response_acc(sock, "", timeout)
   end
 
+  defp recv_responses(sock, count, timeout \\ 5_000) do
+    recv_responses_acc(sock, count, "", [], timeout)
+  end
+
+  defp recv_responses_acc(_sock, count, _buf, acc, _timeout) when length(acc) >= count,
+    do: Enum.take(acc, count)
+
+  defp recv_responses_acc(sock, count, buf, acc, timeout) do
+    {:ok, data} = :gen_tcp.recv(sock, 0, timeout)
+    buf2 = buf <> data
+
+    case Parser.parse(buf2) do
+      {:ok, [], _rest} ->
+        recv_responses_acc(sock, count, buf2, acc, timeout)
+
+      {:ok, values, rest} ->
+        recv_responses_acc(sock, count, rest, acc ++ values, timeout)
+    end
+  end
+
   defp recv_response_acc(sock, buf, timeout) do
     {:ok, data} = :gen_tcp.recv(sock, 0, timeout)
     buf2 = buf <> data
@@ -66,6 +86,13 @@ defmodule FerricstoreServer.AclCacheTest do
   defp enable_requirepass do
     Ferricstore.Config.set("requirepass", "testpass")
 
+    on_exit(fn ->
+      Ferricstore.Config.set("requirepass", "")
+      Acl.reset!()
+    end)
+  end
+
+  defp cleanup_requirepass do
     on_exit(fn ->
       Ferricstore.Config.set("requirepass", "")
       Acl.reset!()
@@ -112,6 +139,58 @@ defmodule FerricstoreServer.AclCacheTest do
       send_cmd(sock, ["PING"])
       assert recv_response(sock) == {:simple, "PONG"}
       :gen_tcp.close(sock)
+    end
+  end
+
+  describe "pipeline auth state" do
+    test "pipelined GET observes requirepass enabled after connection init", %{port: port} do
+      cleanup_requirepass()
+
+      key = "acl:pipeline:live-requirepass:#{System.unique_integer([:positive])}"
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["SET", key, "secret"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      admin = connect_and_hello(port)
+      send_cmd(admin, ["CONFIG", "SET", "requirepass", "testpass"])
+      assert recv_response(admin) == {:simple, "OK"}
+
+      pipeline =
+        IO.iodata_to_binary([
+          Encoder.encode(["GET", key]),
+          Encoder.encode(["GET", key])
+        ])
+
+      :ok = :gen_tcp.send(sock, pipeline)
+
+      assert [
+               {:error, "NOAUTH Authentication required."},
+               {:error, "NOAUTH Authentication required."}
+             ] = recv_responses(sock, 2)
+    end
+
+    test "CONFIG SET requirepass is a pipeline auth barrier", %{port: port} do
+      cleanup_requirepass()
+
+      key = "acl:pipeline:config-barrier:#{System.unique_integer([:positive])}"
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["SET", key, "secret"])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      pipeline =
+        IO.iodata_to_binary([
+          Encoder.encode(["CONFIG", "SET", "requirepass", "testpass"]),
+          Encoder.encode(["GET", key])
+        ])
+
+      :ok = :gen_tcp.send(sock, pipeline)
+
+      assert [
+               {:simple, "OK"},
+               {:error, "NOAUTH Authentication required."}
+             ] = recv_responses(sock, 2)
     end
   end
 
@@ -182,6 +261,32 @@ defmodule FerricstoreServer.AclCacheTest do
   # ---------------------------------------------------------------------------
 
   describe "check_command_cached allows permitted commands" do
+    test "specific ACL subcommand grant does not grant all ACL subcommands" do
+      cache = %{
+        commands: MapSet.new(["ACL.WHOAMI"]),
+        denied_commands: MapSet.new(),
+        keys: :all,
+        channels: :all,
+        enabled: true
+      }
+
+      assert :ok = Auth.check_command_cached(cache, "ACL.WHOAMI")
+      assert {:error, "NOPERM" <> _} = Auth.check_command_cached(cache, "ACL.SETUSER")
+    end
+
+    test "parent ACL command grant covers known ACL subcommands" do
+      cache = %{
+        commands: MapSet.new(["ACL"]),
+        denied_commands: MapSet.new(),
+        keys: :all,
+        channels: :all,
+        enabled: true
+      }
+
+      assert :ok = Auth.check_command_cached(cache, "ACL.SETUSER")
+      assert :ok = Auth.check_command_cached(cache, "ACL.GETUSER")
+    end
+
     test "user with +@all can run any command", %{port: port} do
       enable_requirepass()
       :ok = Acl.set_user("admin", ["on", ">adminpass", "~*", "+@all"])

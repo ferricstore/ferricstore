@@ -168,14 +168,13 @@ defmodule Ferricstore.ApplicationTest do
   end
 
   describe "graceful shutdown" do
-    test "stopping the application stops the Ra system" do
+    test "stopping the application clears WARaft backend state" do
       server_started? = application_started?(:ferricstore_server)
-      system = Ferricstore.Raft.Cluster.system_name()
 
       try do
         stop_app_if_started(:ferricstore_server)
         assert :ok = Application.stop(:ferricstore)
-        assert :ra_system.fetch(system) == :undefined
+        assert Ferricstore.Raft.Backend.running() == :undefined
 
         assert_raise ArgumentError, fn ->
           FerricStore.Instance.get(:default)
@@ -190,9 +189,8 @@ defmodule Ferricstore.ApplicationTest do
       end
     end
 
-    test "failed startup clears partial Ra system and default instance context" do
+    test "failed startup clears WARaft backend and default instance context" do
       server_started? = application_started?(:ferricstore_server)
-      system = Ferricstore.Raft.Cluster.system_name()
 
       try do
         stop_app_if_started(:ferricstore_server)
@@ -208,7 +206,7 @@ defmodule Ferricstore.ApplicationTest do
         Process.register(blocker, Ferricstore.Stats)
 
         assert {:error, {:ferricstore, _reason}} = Application.ensure_all_started(:ferricstore)
-        assert :ra_system.fetch(system) == :undefined
+        assert Ferricstore.Raft.Backend.running() == :undefined
 
         assert_raise ArgumentError, fn ->
           FerricStore.Instance.get(:default)
@@ -320,6 +318,63 @@ defmodule Ferricstore.ApplicationTest do
       assert vsize == byte_size(value)
 
       assert {:ok, ^value} = NIF.v2_pread_at(path, offset)
+    end
+
+    test "prep_stop skips lagged Flow LMDB projection drain because it is rebuildable" do
+      original_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+      original_ready = Ferricstore.Health.ready?()
+
+      Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_index = 0
+      writer_name = Ferricstore.Flow.LMDBWriter.name(shard_index)
+      writer = Process.whereis(writer_name)
+      assert is_pid(writer)
+
+      key = "flow:{application-test}:state:lagged-shutdown-#{System.unique_integer([:positive])}"
+
+      path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.LMDB.path()
+
+      on_exit(fn ->
+        restore_env(:flow_lmdb_mode, original_mode)
+        Ferricstore.Health.set_ready(original_ready)
+        _ = Ferricstore.Flow.LMDBWriter.resume_all(ctx.shard_count)
+        _ = Ferricstore.Raft.WARaftBackend.start(ctx)
+
+        if pid = Process.whereis(writer_name) do
+          :sys.replace_state(pid, fn state ->
+            if timer = Map.get(state, :timer_ref), do: Process.cancel_timer(timer)
+
+            %{
+              state
+              | pending: [],
+                pending_after_flush: [],
+                count: 0,
+                first_pending_at: nil,
+                last_enqueue_at: nil,
+                timer_ref: nil
+            }
+          end)
+        end
+      end)
+
+      assert :ok = Ferricstore.Flow.LMDBWriter.enqueue(shard_index, [{:put, key, "v1"}])
+
+      assert %{count: count} = :sys.get_state(writer)
+      assert count > 0
+
+      capture_log([level: :info], fn ->
+        Ferricstore.Application.prep_stop(%{
+          shard_count: ctx.shard_count,
+          data_dir: ctx.data_dir
+        })
+      end)
+
+      assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
     end
 
     test "shutdown Bitcask fsync reports active-file and fallback listing failures" do

@@ -83,7 +83,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
         :ok
 
       {:error, {:already_exists, _}} ->
-        if File.dir?(path), do: :ok, else: {:error, :enotdir}
+        if Ferricstore.FS.dir?(path), do: :ok, else: {:error, :enotdir}
 
       {:error, {:not_a_directory, _}} ->
         {:error, :enotdir}

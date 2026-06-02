@@ -10,7 +10,7 @@ defmodule Ferricstore.DataDir do
     dedicated/shard_0/ ... shard_N/ (for future promoted collections)
     blob/shard_0/ ... shard_N/      (large-value side-channel blobs)
     prob/shard_0/ ... shard_N/      (probabilistic structure files)
-    raft/shard_0/ ... shard_N/      (Raft WAL - managed by ra)
+    waraft/                         (WARaft consensus segment logs)
     registry/                        (merge scheduler state)
     hints/                           (hot cache warm-up files)
   ```
@@ -26,13 +26,13 @@ defmodule Ferricstore.DataDir do
 
   require Logger
 
-  @top_level_dirs ~w(data dedicated blob prob raft registry hints)
-  @sharded_dirs ~w(data dedicated blob prob raft)
+  @top_level_dirs ~w(data dedicated blob prob waraft registry hints)
+  @sharded_dirs ~w(data dedicated blob prob)
 
   @doc """
   Creates the full directory layout under `data_dir`.
 
-  For each of `data/`, `dedicated/`, `blob/`, `prob/`, and `raft/`,
+  For each of `data/`, `dedicated/`, `blob/`, and `prob/`,
   per-shard subdirectories `shard_0` through `shard_{N-1}` are created.
   `registry/` and `hints/` are top-level directories without per-shard
   subdirectories.
@@ -140,7 +140,7 @@ defmodule Ferricstore.DataDir do
   """
   @spec shard_data_path(binary(), non_neg_integer()) :: binary()
   def shard_data_path(data_dir, shard_index) do
-    Path.join([data_dir, "data", "shard_#{shard_index}"])
+    shard_path(data_dir, "data", shard_index)
   end
 
   @doc """
@@ -152,8 +152,45 @@ defmodule Ferricstore.DataDir do
   """
   @spec blob_shard_path(binary(), non_neg_integer()) :: binary()
   def blob_shard_path(data_dir, shard_index) do
-    Path.join([data_dir, "blob", "shard_#{shard_index}"])
+    shard_path(data_dir, "blob", shard_index)
   end
+
+  defp shard_path(data_dir, class, shard_index)
+       when is_binary(data_dir) and is_binary(class) and is_integer(shard_index) and
+              shard_index >= 0 do
+    prefix = trim_trailing_slashes(data_dir)
+
+    base =
+      cond do
+        prefix != "" -> prefix <> "/" <> class
+        absolute_path?(data_dir) -> "/" <> class
+        true -> class
+      end
+
+    base <> "/shard_" <> Integer.to_string(shard_index)
+  end
+
+  defp trim_trailing_slashes(path) do
+    trim_trailing_slashes(path, byte_size(path))
+  end
+
+  defp trim_trailing_slashes(_path, 0), do: ""
+
+  defp trim_trailing_slashes(path, size) do
+    cond do
+      :binary.at(path, size - 1) == ?/ ->
+        trim_trailing_slashes(path, size - 1)
+
+      size == byte_size(path) ->
+        path
+
+      true ->
+        :binary.part(path, 0, size)
+    end
+  end
+
+  defp absolute_path?(<<?/, _::binary>>), do: true
+  defp absolute_path?(_path), do: false
 
   @doc """
   Returns the FerricStore root data directory for a shard Bitcask path.

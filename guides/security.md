@@ -57,8 +57,8 @@ redis-cli ACL SETUSER metrics on >metricspass +INFO +DBSIZE +KEYS ~*
 |----------|----------|
 | `@read` | GET, MGET, HGET, HGETALL, LRANGE, SMEMBERS, ZSCORE, EXISTS, TTL, SCAN, TYPE, and other read-only commands |
 | `@write` | SET, DEL, HSET, LPUSH, SADD, ZADD, INCR, EXPIRE, and other mutation commands |
-| `@admin` | CONFIG, ACL, DEBUG, FLUSHDB, FLUSHALL, SHUTDOWN, and server administration |
-| `@dangerous` | FLUSHDB, FLUSHALL, DEBUG, KEYS, SHUTDOWN, and potentially destructive commands |
+| `@admin` | CONFIG, ACL, DEBUG, FLUSHDB, FLUSHALL, SHUTDOWN, FERRICSTORE.DOCTOR, and server administration |
+| `@dangerous` | FLUSHDB, FLUSHALL, DEBUG, KEYS, SHUTDOWN, FERRICSTORE.DOCTOR repair jobs, and potentially destructive commands |
 
 ### Authenticating
 

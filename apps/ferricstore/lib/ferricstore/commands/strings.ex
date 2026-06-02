@@ -505,6 +505,8 @@ defmodule Ferricstore.Commands.Strings do
 
   defp mget_keys(keys, store), do: Ops.batch_get(store, keys)
 
+  defp mset_args([], _store), do: {:error, "ERR wrong number of arguments for 'mset' command"}
+
   defp mset_args(args, store) do
     if even_length?(args) do
       case mset_validate(args) do
@@ -567,6 +569,8 @@ defmodule Ferricstore.Commands.Strings do
       end
     end
   end
+
+  defp msetnx_args([], _store), do: {:error, "ERR wrong number of arguments for 'msetnx' command"}
 
   defp msetnx_args(args, store) do
     if even_length?(args) do
@@ -1065,17 +1069,12 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp backup_compound_entries(key, type, store) do
-    key
-    |> compound_prefix_for_type(type)
-    |> case do
-      nil ->
-        []
+    entries =
+      key
+      |> compound_prefixes_for_type(type)
+      |> Enum.flat_map(&scan_compound_entries(&1, key, store))
 
-      prefix ->
-        prefix
-        |> scan_compound_entries(key, store)
-        |> maybe_add_list_meta_entry(key, type, store)
-    end
+    maybe_add_list_meta_entry(entries, key, type, store)
   end
 
   defp scan_compound_entries(prefix, key, store) do
@@ -1148,6 +1147,16 @@ defmodule Ferricstore.Commands.Strings do
   defp compound_prefix_for_type(key, "zset"), do: CompoundKey.zset_prefix(key)
   defp compound_prefix_for_type(key, "stream"), do: CompoundKey.stream_prefix(key)
   defp compound_prefix_for_type(_key, _type), do: nil
+
+  defp compound_prefixes_for_type(key, "stream"),
+    do: [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]
+
+  defp compound_prefixes_for_type(key, type) do
+    case compound_prefix_for_type(key, type) do
+      nil -> []
+      prefix -> [prefix]
+    end
+  end
 
   # Checks if any key in a flat [k, v, k, v, ...] list already exists.
   defp msetnx_any_exists?([], _store), do: false
@@ -1262,12 +1271,19 @@ defmodule Ferricstore.Commands.Strings do
     do: Ops.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
 
   defp clear_compound_prefix(key, "stream", store) do
-    case Ops.compound_delete_prefix(store, key, CompoundKey.stream_prefix(key)) do
-      :ok ->
-        :ok
-
-      {:error, _reason} = error ->
-        error
+    with :ok <-
+           Enum.reduce_while(
+             [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)],
+             :ok,
+             fn prefix, :ok ->
+               case Ops.compound_delete_prefix(store, key, prefix) do
+                 :ok -> {:cont, :ok}
+                 {:error, _reason} = error -> {:halt, error}
+               end
+             end
+           ),
+         :ok <- Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key)) do
+      :ok
     end
   end
 
@@ -1299,16 +1315,23 @@ defmodule Ferricstore.Commands.Strings do
         []
       end
 
-    type_entries ++ list_meta_entries
+    stream_meta_entries =
+      if type == "stream" do
+        compound_key_backup_entry(key, CompoundKey.stream_meta_key(key), store)
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries ++ stream_meta_entries
   end
 
   defp compound_clear_member_entries(key, type, store) do
-    prefix = compound_prefix_for_type(key, type)
+    prefixes = compound_prefixes_for_type(key, type)
 
-    if prefix == nil do
+    if prefixes == [] do
       []
     else
-      compound_clear_member_entries_for_prefix(key, prefix, store)
+      Enum.flat_map(prefixes, &compound_clear_member_entries_for_prefix(key, &1, store))
     end
   end
 
@@ -1438,6 +1461,8 @@ defmodule Ferricstore.Commands.Strings do
 
   defp delete_compound_key_data(key, type_str, prefix, store) do
     with :ok <- delete_compound_prefix_if_present(key, prefix, store),
+         :ok <- delete_stream_groups_if_needed(key, type_str, store),
+         :ok <- delete_stream_durable_meta_if_needed(key, type_str, store),
          :ok <- delete_list_meta_if_needed(key, type_str, store),
          :ok <- delete_stream_metadata_if_needed(key, type_str),
          :ok <- TypeRegistry.delete_type(key, store) do
@@ -1456,6 +1481,18 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp delete_list_meta_if_needed(_key, _type_str, _store), do: :ok
+
+  defp delete_stream_groups_if_needed(key, "stream", store) do
+    Ops.compound_delete_prefix(store, key, CompoundKey.stream_group_prefix(key))
+  end
+
+  defp delete_stream_groups_if_needed(_key, _type_str, _store), do: :ok
+
+  defp delete_stream_durable_meta_if_needed(key, "stream", store) do
+    Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key))
+  end
+
+  defp delete_stream_durable_meta_if_needed(_key, _type_str, _store), do: :ok
 
   defp delete_stream_metadata_if_needed(key, "stream") do
     cleanup_stream_metadata(key)
@@ -1507,15 +1544,19 @@ defmodule Ferricstore.Commands.Strings do
 
   defp maybe_delete_stream_key(key, store) do
     prefix = CompoundKey.stream_prefix(key)
+    group_prefix = CompoundKey.stream_group_prefix(key)
+    meta_key = CompoundKey.stream_meta_key(key)
 
-    if Ops.compound_scan(store, key, prefix) != [] or stream_metadata_exists?(key) do
-      case Ops.compound_delete_prefix(store, key, prefix) do
-        :ok ->
-          cleanup_stream_metadata(key)
-          true
-
-        {:error, _reason} = error ->
-          error
+    if Ops.compound_scan(store, key, prefix) != [] or
+         Ops.compound_scan(store, key, group_prefix) != [] or
+         Ops.compound_get(store, key, meta_key) != nil or stream_metadata_exists?(key) do
+      with :ok <- Ops.compound_delete_prefix(store, key, prefix),
+           :ok <- Ops.compound_delete_prefix(store, key, group_prefix),
+           :ok <- Ops.compound_delete(store, key, meta_key) do
+        cleanup_stream_metadata(key)
+        true
+      else
+        {:error, _reason} = error -> error
       end
     else
       false

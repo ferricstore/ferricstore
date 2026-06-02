@@ -31,7 +31,7 @@
 Developers with Rust installed can compile the NIF from source:
 
 ```bash
-FERRICSTORE_BUILD_NIF=1 mix compile
+mix compile
 ```
 
 Pre-release versions (e.g., `0.2.0-dev`) automatically force source compilation.

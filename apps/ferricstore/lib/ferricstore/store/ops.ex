@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.Ops do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
   alias Ferricstore.Store.Shard.ZSetIndex
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
 
   @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
   @max_int64 9_223_372_036_854_775_807
@@ -31,6 +32,15 @@ defmodule Ferricstore.Store.Ops do
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
+
+  defguardp valid_waraft_segment_location(file_id, offset, value_size)
+            when is_tuple(file_id) and tuple_size(file_id) == 2 and
+                   (elem(file_id, 0) == :waraft_segment or
+                      elem(file_id, 0) == :waraft_projection or
+                      elem(file_id, 0) == :waraft_apply_projection) and
+                   is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
+                   is_integer(offset) and offset >= 0 and is_integer(value_size) and
+                   value_size >= 0
 
   # --- Basic key operations ---
 
@@ -896,6 +906,16 @@ defmodule Ferricstore.Store.Ops do
   def compound_scan(store, redis_key, prefix) when is_map(store),
     do: store.compound_scan.(redis_key, prefix)
 
+  @spec compound_fields(store(), binary(), binary()) :: [binary()]
+  def compound_fields(%FerricStore.Instance{} = ctx, redis_key, prefix),
+    do: Router.compound_fields(ctx, redis_key, prefix)
+
+  def compound_fields(store, redis_key, prefix) do
+    store
+    |> compound_scan(redis_key, prefix)
+    |> Enum.map(fn {field, _value} -> field end)
+  end
+
   @spec compound_count(store(), binary(), binary()) :: non_neg_integer()
   def compound_count(%FerricStore.Instance{} = ctx, redis_key, prefix),
     do: Router.compound_count(ctx, redis_key, prefix)
@@ -1131,20 +1151,70 @@ defmodule Ferricstore.Store.Ops do
 
   @spec flush(store()) :: :ok | {:error, term()}
   def flush(%FerricStore.Instance{} = ctx) do
-    with :ok <- flush_keys(ctx, Router.keys(ctx)) do
+    with :ok <- flush_keys(ctx, Router.keys(ctx)),
+         :ok <- clear_flow_projection_storage(ctx) do
       clear_stream_tables()
+      NativeFlowIndex.reset_all(ctx.name, ctx.shard_count)
       :ok
     end
   end
 
   def flush(%LocalTxStore{} = tx) do
-    with :ok <- flush_keys(tx.instance_ctx, Router.keys(tx.instance_ctx)) do
+    with :ok <- flush_keys(tx.instance_ctx, Router.keys(tx.instance_ctx)),
+         :ok <- clear_flow_projection_storage(tx.instance_ctx) do
       clear_stream_tables()
+      NativeFlowIndex.reset_all(tx.instance_ctx.name, tx.instance_ctx.shard_count)
       :ok
     end
   end
 
   def flush(store) when is_map(store), do: store.flush.()
+
+  defp clear_flow_projection_storage(ctx) do
+    with :ok <- flush_flow_history_projectors(ctx),
+         :ok <- flush_flow_lmdb_writers(ctx),
+         :ok <- Ferricstore.Flow.LMDB.clear_all(ctx.data_dir, ctx.shard_count),
+         :ok <- clear_flow_history_dirs(ctx) do
+      :ok
+    end
+  end
+
+  defp flush_flow_lmdb_writers(%{name: name, shard_count: shard_count})
+       when is_atom(name) and is_integer(shard_count) and shard_count >= 0 do
+    case Ferricstore.Flow.LMDBWriter.flush_all(name, shard_count, 30_000) do
+      :ok -> :ok
+      {:error, :writer_not_started} -> :ok
+      {:error, {:noproc, _}} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flush_flow_lmdb_writers(_ctx), do: :ok
+
+  defp flush_flow_history_projectors(ctx) do
+    0..max(ctx.shard_count - 1, -1)//1
+    |> Enum.reduce_while(:ok, fn shard_index, :ok ->
+      case Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index, 30_000) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp clear_flow_history_dirs(ctx) do
+    0..max(ctx.shard_count - 1, -1)//1
+    |> Enum.reduce_while(:ok, fn shard_index, :ok ->
+      history_dir =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.HistoryProjector.history_dir()
+
+      case Ferricstore.FS.rm_rf(history_dir) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
 
   defp flush_keys(store, keys) do
     keys
@@ -1191,6 +1261,8 @@ defmodule Ferricstore.Store.Ops do
       "stream" ->
         run_flush_steps(key, [
           fn -> compound_delete_prefix(store, key, "X:" <> key <> <<0>>) end,
+          fn -> compound_delete_prefix(store, key, CompoundKey.stream_group_prefix(key)) end,
+          fn -> compound_delete(store, key, CompoundKey.stream_meta_key(key)) end,
           fn -> compound_delete(store, key, type_key) end,
           fn -> delete(store, key) end
         ])
@@ -1217,17 +1289,22 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp clear_stream_tables do
-    Ferricstore.Commands.Stream.clear_local_state()
+    Ferricstore.Stream.LocalState.clear()
   end
 
   # --- On push callback (for Waiters notification) ---
 
-  @spec on_push(store(), binary()) :: :ok | nil
-  def on_push(store, key) do
+  @spec on_push(store(), binary(), non_neg_integer()) :: [pid()] | pid() | nil
+  def on_push(store, key, count \\ 1) do
     case store do
-      %FerricStore.Instance{} -> Ferricstore.Waiters.notify_push(key)
-      %LocalTxStore{} -> Ferricstore.Waiters.notify_push(key)
-      store when is_map(store) -> if fun = store[:on_push], do: fun.(key)
+      %FerricStore.Instance{} -> Ferricstore.Waiters.notify_push(key, count)
+      %LocalTxStore{} -> Ferricstore.Waiters.notify_push(key, count)
+      store when is_map(store) ->
+        case store[:on_push] do
+          fun when is_function(fun, 2) -> fun.(key, count)
+          fun when is_function(fun, 1) -> fun.(key)
+          _ -> nil
+        end
     end
   end
 
@@ -1703,22 +1780,27 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp local_cold_value_size(tx, key, fid, off, vsize) do
-    if BlobValue.threshold(tx.instance_ctx) > 0 and BlobRef.encoded_size?(vsize) do
-      path = ShardETS.file_path(tx.shard_state.shard_data_path, fid)
+    cond do
+      valid_waraft_segment_location(fid, off, vsize) ->
+        Router.value_size(tx.instance_ctx, key)
 
-      case ColdRead.pread_at(path, off, key, @cold_read_timeout_ms) do
-        {:ok, value} ->
-          case BlobRef.decode(value) do
-            {:ok, %BlobRef{size: logical_size}} -> logical_size
-            :error -> vsize
-          end
+      BlobValue.threshold(tx.instance_ctx) > 0 and BlobRef.encoded_size?(vsize) ->
+        path = ShardETS.file_path(tx.shard_state.shard_data_path, fid)
 
-        {:error, reason} ->
-          ColdRead.emit_pread_error(path, reason)
-          vsize
-      end
-    else
-      vsize
+        case ColdRead.pread_at(path, off, key, @cold_read_timeout_ms) do
+          {:ok, value} ->
+            case BlobRef.decode(value) do
+              {:ok, %BlobRef{size: logical_size}} -> logical_size
+              :error -> vsize
+            end
+
+          {:error, reason} ->
+            ColdRead.emit_pread_error(path, reason)
+            vsize
+        end
+
+      true ->
+        vsize
     end
   end
 

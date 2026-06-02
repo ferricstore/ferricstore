@@ -2,12 +2,30 @@ defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BlobRef, BlobValue, ColdRead, ExpiryTracker, LFU, ValueCodec}
+
+  alias Ferricstore.Store.{
+    BlobRef,
+    BlobValue,
+    ColdRead,
+    CompoundKey,
+    ExpiryTracker,
+    LFU,
+    ValueCodec
+  }
 
   @cold_batch_read_timeout_ms 10_000
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+                   is_integer(value_size) and value_size >= 0
+
+  defguardp valid_waraft_segment_location(file_id, offset, value_size)
+            when is_tuple(file_id) and tuple_size(file_id) == 2 and
+                   (elem(file_id, 0) == :waraft_segment or
+                      elem(file_id, 0) == :waraft_projection or
+                      elem(file_id, 0) == :waraft_apply_projection) and
+                   is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0 and
+                   is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
 
   # -------------------------------------------------------------------
@@ -50,6 +68,10 @@ defmodule Ferricstore.Store.Shard.ETS do
              is_integer(vsize) and vsize >= 0 ->
         {:cold, fid, off, vsize, 0}
 
+      [{^key, nil, 0, _lfu, fid, off, vsize}]
+      when valid_waraft_segment_location(fid, off, vsize) ->
+        {:cold, fid, off, vsize, 0}
+
       [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
         lfu_touch(keydir, key, lfu)
         {:hit, value, exp}
@@ -66,6 +88,10 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, {:flow_history, file_id} = fid, off, vsize}]
       when exp > now and is_integer(file_id) and file_id >= 0 and is_integer(off) and
              off >= 0 and is_integer(vsize) and vsize >= 0 ->
+        {:cold, fid, off, vsize, exp}
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
         {:cold, fid, off, vsize, exp}
 
       [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
@@ -86,6 +112,16 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def ets_lookup_warm(state, key) do
     case ets_lookup(state, key) do
+      {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
+        case read_waraft_segment_value(state, fid, key) do
+          {:ok, value} when is_binary(value) ->
+            cold_read_warm_ets(state, key, value)
+            {:hit, value, exp}
+
+          _ ->
+            :miss
+        end
+
       {:cold, fid, off, _vsize, exp} ->
         p = file_path(state.shard_data_path, fid)
 
@@ -164,7 +200,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     v = value_for_ets(value, threshold)
     {original_fid, original_vsize} = pending_original_location(key, previous)
     track_binary_insert(state, key, v, previous)
-    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
+    adjust_expiry_for_insert(state, previous, expire_at_ms)
 
     :ets.insert(
       state.keydir,
@@ -199,13 +235,109 @@ defmodule Ferricstore.Store.Shard.ETS do
         ) :: true
   @doc false
   def ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
-    threshold = hot_cache_threshold(state)
+    ets_insert_with_location(
+      state,
+      key,
+      value,
+      expire_at_ms,
+      file_id,
+      offset,
+      value_size,
+      :ets.lookup(state.keydir, key)
+    )
+  end
+
+  @spec ets_insert_with_location(
+          map(),
+          binary(),
+          term(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          list()
+        ) :: true
+  @doc false
+  def ets_insert_with_location(
+        state,
+        key,
+        value,
+        expire_at_ms,
+        file_id,
+        offset,
+        value_size,
+        previous
+      ) do
+    ets_insert_with_location(
+      state,
+      key,
+      value,
+      expire_at_ms,
+      file_id,
+      offset,
+      value_size,
+      previous,
+      hot_cache_threshold(state)
+    )
+  end
+
+  @spec ets_insert_with_location(
+          map(),
+          binary(),
+          term(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          list(),
+          non_neg_integer()
+        ) :: true
+  @doc false
+  def ets_insert_with_location(
+        state,
+        key,
+        value,
+        expire_at_ms,
+        file_id,
+        offset,
+        value_size,
+        previous,
+        threshold
+      ) do
     v = value_for_ets(value, threshold)
-    previous = :ets.lookup(state.keydir, key)
     track_binary_insert(state, key, v, previous)
-    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
+    adjust_expiry_for_insert(state, previous, expire_at_ms)
     :ets.insert(state.keydir, {key, v, expire_at_ms, LFU.initial(), file_id, offset, value_size})
   end
+
+  @spec ets_insert_fresh_no_expiry_many_with_location(
+          map(),
+          [{binary(), binary(), 0}],
+          term(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: {:ok, non_neg_integer()} | :fallback
+  @doc false
+  def ets_insert_fresh_no_expiry_many_with_location(state, entries, file_id, offset, threshold)
+      when is_list(entries) and is_integer(offset) and offset >= 0 and is_integer(threshold) and
+             threshold >= 0 do
+    lfu = LFU.initial()
+
+    case fresh_no_expiry_location_records(entries, state, file_id, offset, threshold, lfu) do
+      {:ok, [], 0, 0} ->
+        {:ok, 0}
+
+      {:ok, records, binary_delta, count} ->
+        true = :ets.insert(state.keydir, records)
+        add_keydir_binary_delta(state, binary_delta)
+        {:ok, count}
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  def ets_insert_fresh_no_expiry_many_with_location(_, _, _, _, _), do: :fallback
 
   # Deletes a key from the keydir table.
   @spec ets_delete_key(map(), binary()) :: true
@@ -270,6 +402,10 @@ defmodule Ferricstore.Store.Shard.ETS do
   def cold_read_warm_ets(state, key, value) do
     case :ets.lookup(state.keydir, key) do
       [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when valid_waraft_segment_location(fid, off, vsize) ->
         cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
 
       _ ->
@@ -354,6 +490,19 @@ defmodule Ferricstore.Store.Shard.ETS do
             nil
         end
 
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when valid_waraft_segment_location(fid, off, vsize) ->
+        case read_waraft_segment_value(state, fid, key) do
+          {:ok, value} when is_binary(value) ->
+            v = value_for_ets(value, hot_cache_threshold(state))
+            track_binary_cold_to_warm(state, key, v)
+            :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
+            value
+
+          _ ->
+            nil
+        end
+
       [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
         track_binary_delete(state, key, nil)
         :ets.delete(state.keydir, key)
@@ -423,20 +572,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   def prefix_scan_entries(keydir, prefix, shard_data_path),
     do: do_prefix_scan_entries(nil, keydir, prefix, shard_data_path)
 
-  def prefix_scan_entries(_state, _prefix, _shard_data_path, limit)
-      when not is_integer(limit) or limit <= 0,
-      do: []
-
-  def prefix_scan_entries(%{keydir: keydir} = state, prefix, shard_data_path, limit),
-    do: do_prefix_scan_entries(state, keydir, prefix, shard_data_path, limit)
-
-  def prefix_scan_entries(keydir, prefix, shard_data_path, limit),
-    do: do_prefix_scan_entries(nil, keydir, prefix, shard_data_path, limit)
-
-  defp do_prefix_scan_entries(state, keydir, prefix, shard_data_path),
-    do: do_prefix_scan_entries(state, keydir, prefix, shard_data_path, :all)
-
-  defp do_prefix_scan_entries(state, keydir, prefix, shard_data_path, limit) do
+  defp do_prefix_scan_entries(state, keydir, prefix, shard_data_path) do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     # Select all 7-tuple fields so we can cold-read nil values
@@ -450,9 +586,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     ]
 
     {tokens, {cold_entries, _cold_count}} =
-      keydir
-      |> :ets.select(ms)
-      |> maybe_limit_prefix_scan(limit)
+      :ets.select(keydir, ms)
       |> Enum.reduce({[], {[], 0}}, fn {key, value, exp, fid, off, vsize},
                                        {tokens, {cold_entries, cold_count}} ->
         cond do
@@ -462,9 +596,20 @@ defmodule Ferricstore.Store.Shard.ETS do
 
           value == nil and
               not (valid_cold_location(fid, off, vsize) or
-                       flow_history_cold_location?(fid, off, vsize)) ->
+                     flow_history_cold_location?(fid, off, vsize) or
+                       valid_waraft_segment_location(fid, off, vsize)) ->
             maybe_delete_expired_prefix_entry(state, keydir, key)
             {tokens, {cold_entries, cold_count}}
+
+          value == nil and valid_waraft_segment_location(fid, off, vsize) and state != nil ->
+            case read_waraft_segment_value(state, fid, key) do
+              {:ok, segment_value} ->
+                {[{:value, {prefix_field(key), segment_value}} | tokens],
+                 {cold_entries, cold_count}}
+
+              _ ->
+                {tokens, {cold_entries, cold_count}}
+            end
 
           value == nil and shard_data_path != nil ->
             field = prefix_field(key)
@@ -498,19 +643,68 @@ defmodule Ferricstore.Store.Shard.ETS do
     end)
   end
 
-  defp maybe_limit_prefix_scan(entries, :all), do: entries
-
-  defp maybe_limit_prefix_scan(entries, limit) do
-    entries
-    |> Enum.sort_by(fn {key, _value, _exp, _fid, _off, _vsize} -> key end)
-    |> Enum.take(-limit)
-  end
-
   defp prefix_field(key) do
     case :binary.split(key, <<0>>) do
       [_pre, sub] -> sub
       _ -> key
     end
+  end
+
+  @spec prefix_scan_fields(map() | :ets.tid(), binary()) :: [binary()]
+  @doc false
+  def prefix_scan_fields(%{keydir: keydir} = state, prefix),
+    do: do_prefix_scan_fields(state, keydir, prefix)
+
+  def prefix_scan_fields(keydir, prefix),
+    do: do_prefix_scan_fields(nil, keydir, prefix)
+
+  defp do_prefix_scan_fields(state, keydir, prefix) do
+    now = HLC.now_ms()
+    prefix_len = byte_size(prefix)
+
+    prefix_guard =
+      {:andalso, {:is_binary, :"$1"},
+       {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+        {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+
+    live_exp_guard = {:orelse, {:==, :"$3", 0}, {:>, :"$3", now}}
+
+    valid_bitcask_cold_guard =
+      {:andalso, {:is_integer, :"$4"},
+       {:andalso, {:>=, :"$4", 0},
+        {:andalso, {:is_integer, :"$5"},
+         {:andalso, {:>=, :"$5", 0}, {:andalso, {:is_integer, :"$6"}, {:>=, :"$6", 0}}}}}}
+
+    valid_waraft_segment_guard =
+      {:andalso, {:is_tuple, :"$4"},
+       {:andalso, {:==, {:tuple_size, :"$4"}, 2},
+        {:andalso,
+         {:orelse, {:==, {:element, 1, :"$4"}, :waraft_segment},
+          {:orelse, {:==, {:element, 1, :"$4"}, :waraft_projection},
+           {:==, {:element, 1, :"$4"}, :waraft_apply_projection}}},
+         {:andalso, {:is_integer, {:element, 2, :"$4"}},
+          {:andalso, {:>, {:element, 2, :"$4"}, 0},
+           {:andalso, {:is_integer, :"$5"},
+            {:andalso, {:>=, :"$5", 0}, {:andalso, {:is_integer, :"$6"}, {:>=, :"$6", 0}}}}}}}}}
+
+    valid_cold_guard = {:orelse, valid_bitcask_cold_guard, valid_waraft_segment_guard}
+
+    visible_value_guard =
+      {:orelse, {:"/=", :"$2", nil}, {:orelse, valid_cold_guard, {:==, :"$4", :pending}}}
+
+    ms = [
+      {{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
+       [{:andalso, prefix_guard, {:andalso, live_exp_guard, visible_value_guard}}], [:"$1"]}
+    ]
+
+    keys = :ets.select(keydir, ms)
+
+    if state != nil do
+      delete_expired_prefix_entries(state, keydir, prefix, prefix_len, now)
+      delete_invalid_cold_prefix_entries(state, keydir, prefix, prefix_len, now)
+    end
+
+    Enum.map(keys, &prefix_field/1)
   end
 
   defp flow_history_cold_location?({:flow_history, file_id}, offset, value_size)
@@ -607,6 +801,21 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
+  defp read_waraft_segment_value(%{instance_ctx: ctx, index: shard_index} = state, file_id, key) do
+    with {:ok, value} <-
+           Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+             ctx,
+             shard_index,
+             file_id,
+             key
+           ),
+         {:ok, materialized} <- materialize_blob_value(state, value) do
+      {:ok, materialized}
+    end
+  end
+
+  defp read_waraft_segment_value(_state, _file_id, _key), do: {:error, :missing_instance_ctx}
+
   defp materialize_blob_value(%{data_dir: data_dir, index: shard_index} = state, value) do
     BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
   end
@@ -635,11 +844,25 @@ defmodule Ferricstore.Store.Shard.ETS do
 
     live_exp_guard = {:orelse, {:==, :"$3", 0}, {:>, :"$3", now}}
 
-    valid_cold_guard =
+    valid_bitcask_cold_guard =
       {:andalso, {:is_integer, :"$4"},
        {:andalso, {:>=, :"$4", 0},
         {:andalso, {:is_integer, :"$5"},
          {:andalso, {:>=, :"$5", 0}, {:andalso, {:is_integer, :"$6"}, {:>=, :"$6", 0}}}}}}
+
+    valid_waraft_segment_guard =
+      {:andalso, {:is_tuple, :"$4"},
+       {:andalso, {:==, {:tuple_size, :"$4"}, 2},
+        {:andalso,
+         {:orelse, {:==, {:element, 1, :"$4"}, :waraft_segment},
+          {:orelse, {:==, {:element, 1, :"$4"}, :waraft_projection},
+           {:==, {:element, 1, :"$4"}, :waraft_apply_projection}}},
+         {:andalso, {:is_integer, {:element, 2, :"$4"}},
+          {:andalso, {:>, {:element, 2, :"$4"}, 0},
+           {:andalso, {:is_integer, :"$5"},
+            {:andalso, {:>=, :"$5", 0}, {:andalso, {:is_integer, :"$6"}, {:>=, :"$6", 0}}}}}}}}}
+
+    valid_cold_guard = {:orelse, valid_bitcask_cold_guard, valid_waraft_segment_guard}
 
     live_hot_ms = [
       {{:"$1", :"$2", :"$3", :_, :_, :_, :_},
@@ -698,7 +921,8 @@ defmodule Ferricstore.Store.Shard.ETS do
     keydir
     |> :ets.select(cold_ms)
     |> Enum.each(fn {key, fid, off, vsize} ->
-      unless fid == :pending or valid_cold_location(fid, off, vsize) do
+      unless fid == :pending or valid_cold_location(fid, off, vsize) or
+               valid_waraft_segment_location(fid, off, vsize) do
         delete_prefix_entry(state, keydir, key)
       end
     end)
@@ -781,6 +1005,114 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   defp track_binary_insert(_, _, _, _), do: :ok
+
+  defp fresh_no_expiry_location_records(entries, state, file_id, offset, threshold, lfu) do
+    fresh_no_expiry_location_records(
+      entries,
+      state,
+      file_id,
+      offset,
+      threshold,
+      lfu,
+      %{},
+      [],
+      0,
+      0
+    )
+  end
+
+  defp fresh_no_expiry_location_records(
+         [],
+         _state,
+         _file_id,
+         _offset,
+         _threshold,
+         _lfu,
+         _seen,
+         records,
+         binary_delta,
+         count
+       ) do
+    {:ok, records, binary_delta, count}
+  end
+
+  defp fresh_no_expiry_location_records(
+         [{key, value, 0} | rest],
+         %{keydir: keydir} = state,
+         file_id,
+         offset,
+         threshold,
+         lfu,
+         seen,
+         records,
+         binary_delta,
+         count
+       )
+       when is_binary(key) and is_binary(value) do
+    cond do
+      Map.has_key?(seen, key) ->
+        :fallback
+
+      :ets.lookup(keydir, key) != [] ->
+        :fallback
+
+      not fresh_string_put_without_compound_clear?(keydir, key) ->
+        :fallback
+
+      true ->
+        ets_value = value_for_ets(value, threshold)
+
+        fresh_no_expiry_location_records(
+          rest,
+          state,
+          file_id,
+          offset,
+          threshold,
+          lfu,
+          Map.put(seen, key, true),
+          [{key, ets_value, 0, lfu, file_id, offset, byte_size(value)} | records],
+          binary_delta + offheap_size(key) + offheap_size(ets_value),
+          count + 1
+        )
+    end
+  end
+
+  defp fresh_no_expiry_location_records(
+         _entries,
+         _state,
+         _file_id,
+         _offset,
+         _threshold,
+         _lfu,
+         _seen,
+         _records,
+         _binary_delta,
+         _count
+       ),
+       do: :fallback
+
+  defp fresh_string_put_without_compound_clear?(keydir, key) do
+    CompoundKey.internal_key?(key) or :ets.lookup(keydir, CompoundKey.type_key(key)) == []
+  end
+
+  defp add_keydir_binary_delta(
+         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx},
+         delta
+       )
+       when ref != nil and delta != 0 do
+    :atomics.add(ref, idx + 1, delta)
+  end
+
+  defp add_keydir_binary_delta(_, _), do: :ok
+
+  defp adjust_expiry_for_insert(_state, [], 0), do: :ok
+
+  defp adjust_expiry_for_insert(_state, [{_key, _value, 0, _lfu, _fid, _offset, _value_size}], 0),
+    do: :ok
+
+  defp adjust_expiry_for_insert(state, previous, expire_at_ms) do
+    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
+  end
 
   # Tracks bytes removed for delete. Must be called BEFORE :ets.delete.
   defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state, key)

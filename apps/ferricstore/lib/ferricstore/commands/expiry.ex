@@ -410,7 +410,9 @@ defmodule Ferricstore.Commands.Expiry do
     entries =
       [{type_key, type, expire_at_ms}] ++
         list_meta_ttl_entries(key, type, expire_at_ms, store) ++
-        compound_member_ttl_entries(compound_prefix(type, key), key, expire_at_ms, store)
+        stream_meta_ttl_entries(key, type, expire_at_ms, store) ++
+        compound_member_ttl_entries(compound_prefix(type, key), key, expire_at_ms, store) ++
+        stream_group_ttl_entries(key, type, expire_at_ms, store)
 
     Ops.compound_batch_put(store, key, entries)
   end
@@ -431,6 +433,23 @@ defmodule Ferricstore.Commands.Expiry do
   defp compound_prefix("set", key), do: CompoundKey.set_prefix(key)
   defp compound_prefix("zset", key), do: CompoundKey.zset_prefix(key)
   defp compound_prefix("stream", key), do: CompoundKey.stream_prefix(key)
+
+  defp stream_meta_ttl_entries(_key, type, _expire_at_ms, _store) when type != "stream", do: []
+
+  defp stream_meta_ttl_entries(key, "stream", expire_at_ms, store) do
+    meta_key = CompoundKey.stream_meta_key(key)
+
+    case Ops.compound_get(store, key, meta_key) do
+      nil -> []
+      meta -> [{meta_key, meta, expire_at_ms}]
+    end
+  end
+
+  defp stream_group_ttl_entries(_key, type, _expire_at_ms, _store) when type != "stream", do: []
+
+  defp stream_group_ttl_entries(key, "stream", expire_at_ms, store) do
+    compound_member_ttl_entries(CompoundKey.stream_group_prefix(key), key, expire_at_ms, store)
+  end
 
   defp compound_member_ttl_entries(prefix, key, expire_at_ms, store) do
     store

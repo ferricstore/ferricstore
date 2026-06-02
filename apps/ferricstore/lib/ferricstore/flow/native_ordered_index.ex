@@ -8,66 +8,50 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   @type resource :: reference()
   @type score_input :: binary() | integer() | float()
 
+  @spec table_names(atom(), non_neg_integer()) :: {atom(), atom()}
+  def table_names(instance_name, shard_index) do
+    {
+      :"ferricstore_flow_index_#{instance_name}_#{shard_index}",
+      :"ferricstore_flow_lookup_#{instance_name}_#{shard_index}"
+    }
+  end
+
   @spec new() :: resource()
   def new, do: NIF.flow_index_new()
 
-  @spec register(:ets.tid() | atom(), :ets.tid() | atom(), resource()) :: :ok
+  @type index_name :: atom() | reference()
+
+  @spec register(index_name(), index_name(), resource()) :: :ok
   def register(index_table, lookup_table, resource) do
     :persistent_term.put(registry_key(index_table, lookup_table), resource)
     :ok
   end
 
-  @spec get(:ets.tid() | atom(), :ets.tid() | atom()) :: resource() | nil
+  @spec reset(index_name(), index_name()) :: resource()
+  def reset(index_table, lookup_table) do
+    resource = new()
+    register(index_table, lookup_table, resource)
+    resource
+  end
+
+  @spec reset_shard(atom(), non_neg_integer()) :: resource()
+  def reset_shard(instance_name, shard_index) do
+    {index_table, lookup_table} = table_names(instance_name, shard_index)
+    reset(index_table, lookup_table)
+  end
+
+  @spec reset_all(atom(), non_neg_integer()) :: :ok
+  def reset_all(instance_name, shard_count) when is_integer(shard_count) and shard_count >= 0 do
+    if shard_count > 0 do
+      Enum.each(0..(shard_count - 1), &reset_shard(instance_name, &1))
+    end
+
+    :ok
+  end
+
+  @spec get(index_name(), index_name()) :: resource() | nil
   def get(index_table, lookup_table) do
     :persistent_term.get(registry_key(index_table, lookup_table), nil)
-  end
-
-  @spec rebuild_from_ets(:ets.tid() | atom(), :ets.tid() | atom()) :: :ok
-  def rebuild_from_ets(index_table, lookup_table) do
-    resource = new()
-
-    merge_ets_into_resource(resource, index_table, lookup_table)
-    register(index_table, lookup_table, resource)
-  end
-
-  @spec merge_from_ets(:ets.tid() | atom(), :ets.tid() | atom()) :: :ok
-  def merge_from_ets(index_table, lookup_table) do
-    resource =
-      case get(index_table, lookup_table) do
-        nil ->
-          resource = new()
-          register(index_table, lookup_table, resource)
-          resource
-
-        resource ->
-          resource
-      end
-
-    merge_ets_into_resource(resource, index_table, lookup_table)
-  end
-
-  defp merge_ets_into_resource(resource, index_table, lookup_table) do
-    index_table
-    |> :ets.tab2list()
-    |> Enum.flat_map(fn
-      {{key, score, member}, true}
-      when is_binary(key) and is_binary(member) and (is_integer(score) or is_float(score)) ->
-        [{key, member, score * 1.0}]
-
-      _other ->
-        []
-    end)
-    |> then(&put_new_entries(resource, &1))
-
-    lookup_table
-    |> :ets.tab2list()
-    |> Enum.each(fn
-      {{:count, key}, count} when is_binary(key) and is_integer(count) ->
-        restore_count(resource, key, count)
-
-      _other ->
-        :ok
-    end)
   end
 
   @spec put_member(resource(), binary(), binary(), score_input()) :: :ok
@@ -143,6 +127,13 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
 
   def delete_members(resource, key, members) do
     NIF.flow_index_delete_members(resource, key, members)
+  end
+
+  @spec delete_entries(resource(), [{binary(), binary()}]) :: :ok
+  def delete_entries(_resource, []), do: :ok
+
+  def delete_entries(resource, entries) do
+    NIF.flow_index_delete_entries(resource, entries)
   end
 
   @spec score_of(resource(), binary(), binary()) :: {:ok, float()} | :miss
@@ -248,11 +239,11 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
 
     NIF.flow_index_apply_batch(
       resource,
-      put_entries |> reverse_flatten() |> parse_entries(),
-      put_new_entries |> reverse_flatten() |> parse_entries(),
-      move_entries |> reverse_flatten() |> parse_move_entries(),
+      parse_reversed_entry_groups(put_entries),
+      parse_reversed_entry_groups(put_new_entries),
+      parse_reversed_move_groups(move_entries),
       Enum.reverse(delete_entries),
-      reverse_flatten(claim_entries)
+      prepend_reversed_groups(claim_entries)
     )
   end
 
@@ -262,13 +253,23 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
           score_input(),
           non_neg_integer(),
           non_neg_integer()
-        ) :: [{binary(), binary(), float()}]
+        ) :: [{binary(), [{binary(), float()}]}]
   def claim_due_candidates(_resource, _keys, _now_score, 0, _max_scan), do: []
   def claim_due_candidates(_resource, _keys, _now_score, _limit, 0), do: []
 
   def claim_due_candidates(resource, keys, now_score, limit, max_scan) when is_list(keys) do
     case parse_score(now_score) do
       {:ok, score} -> NIF.flow_index_claim_due_candidates(resource, keys, score, limit, max_scan)
+      :error -> []
+    end
+  end
+
+  @spec due_keys_present(resource(), [binary()], score_input()) :: [binary()]
+  def due_keys_present(_resource, [], _now_score), do: []
+
+  def due_keys_present(resource, keys, now_score) when is_list(keys) do
+    case parse_score(now_score) do
+      {:ok, score} -> NIF.flow_index_due_keys_present(resource, keys, score)
       :error -> []
     end
   end
@@ -288,7 +289,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   end
 
   @spec plan_claims(
-          [{binary(), score_input()}],
+          [{binary(), float()}],
           [binary() | nil],
           binary(),
           binary(),
@@ -319,12 +320,10 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         to_state_key,
         inflight_key,
         worker_key,
-      state_key_prefix
+        state_key_prefix
       ) do
-    native_candidates = parse_claim_candidates(candidates, [])
-
     NIF.flow_record_plan_claims(
-      native_candidates,
+      candidates,
       values,
       type,
       expected_state,
@@ -342,21 +341,61 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
     )
   end
 
-  defp parse_claim_candidates([], acc), do: Enum.reverse(acc)
-
-  defp parse_claim_candidates([{id, score} | rest], acc)
-       when is_binary(id) and is_float(score) do
-    parse_claim_candidates(rest, [{id, score} | acc])
+  @spec plan_claims_with_history(
+          [{binary(), float()}],
+          [binary() | nil],
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary()
+        ) :: {:ok, [tuple()], [binary()], non_neg_integer()} | :fallback
+  def plan_claims_with_history(
+        candidates,
+        values,
+        type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix,
+        history_key_prefix
+      ) do
+    NIF.flow_record_plan_claims_with_history(
+      candidates,
+      values,
+      type,
+      expected_state,
+      worker,
+      lease_ms,
+      now_ms,
+      remaining,
+      from_due_key,
+      to_due_key,
+      from_state_key,
+      to_state_key,
+      inflight_key,
+      worker_key,
+      state_key_prefix,
+      history_key_prefix
+    )
   end
-
-  defp parse_claim_candidates([{id, score_input} | rest], acc) when is_binary(id) do
-    case parse_score(score_input) do
-      {:ok, score} -> parse_claim_candidates(rest, [{id, score} | acc])
-      :error -> parse_claim_candidates(rest, acc)
-    end
-  end
-
-  defp parse_claim_candidates([_other | rest], acc), do: parse_claim_candidates(rest, acc)
 
   defp registry_key(index_table, lookup_table), do: {@registry_key, index_table, lookup_table}
 
@@ -369,20 +408,41 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
     end)
   end
 
-  defp parse_move_entries(entries) do
-    Enum.flat_map(entries, fn {from_key, to_key, member, score_input} ->
-      case parse_score(score_input) do
-        {:ok, score} -> [{from_key, to_key, member, score}]
-        :error -> []
-      end
-    end)
+  defp parse_reversed_entry_groups(groups) do
+    Enum.reduce(groups, [], &prepend_parsed_entries/2)
   end
 
-  defp reverse_flatten(lists) do
-    lists
-    |> Enum.reverse()
-    |> List.flatten()
+  defp prepend_parsed_entries([], acc), do: acc
+
+  defp prepend_parsed_entries([{key, member, score_input} | rest], acc) do
+    case parse_score(score_input) do
+      {:ok, score} -> [{key, member, score} | prepend_parsed_entries(rest, acc)]
+      :error -> prepend_parsed_entries(rest, acc)
+    end
   end
+
+  defp parse_reversed_move_groups(groups) do
+    Enum.reduce(groups, [], &prepend_parsed_move_entries/2)
+  end
+
+  defp prepend_parsed_move_entries([], acc), do: acc
+
+  defp prepend_parsed_move_entries([{from_key, to_key, member, score_input} | rest], acc) do
+    case parse_score(score_input) do
+      {:ok, score} ->
+        [{from_key, to_key, member, score} | prepend_parsed_move_entries(rest, acc)]
+
+      :error ->
+        prepend_parsed_move_entries(rest, acc)
+    end
+  end
+
+  defp prepend_reversed_groups(groups) do
+    Enum.reduce(groups, [], &prepend_group_entries/2)
+  end
+
+  defp prepend_group_entries([], acc), do: acc
+  defp prepend_group_entries([entry | rest], acc), do: [entry | prepend_group_entries(rest, acc)]
 
   defp encode_min_bound(:neg_inf), do: {0, 0.0}
   defp encode_min_bound({:inclusive, score}), do: {1, score * 1.0}

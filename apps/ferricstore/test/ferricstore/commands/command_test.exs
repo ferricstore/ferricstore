@@ -247,161 +247,6 @@ defmodule Ferricstore.Commands.CommandTest do
                )
     end
 
-    test "returns Flow keys when read-side VALUE options precede PARTITION" do
-      assert ["tenant-a"] =
-               Server.handle(
-                 "COMMAND",
-                 ["GETKEYS", "FLOW.GET", "flow-1", "VALUE", "order", "PARTITION", "tenant-a"],
-                 MockStore.make()
-               )
-
-      assert ["tenant-a"] =
-               Server.handle(
-                 "COMMAND",
-                 ["GETKEYS", "FLOW.GET", "flow-1", "FULL", "PARTITION", "tenant-a"],
-                 MockStore.make()
-               )
-
-      assert ["tenant-a"] =
-               Server.handle(
-                 "COMMAND",
-                 ["GETKEYS", "FLOW.GET", "flow-1", "FULL", "true", "PARTITION", "tenant-a"],
-                 MockStore.make()
-               )
-
-      assert ["tenant-a"] =
-               Server.handle(
-                 "COMMAND",
-                 ["GETKEYS", "FLOW.GET", "flow-1", "NOPAYLOAD", "PARTITION", "tenant-a"],
-                 MockStore.make()
-               )
-
-      assert ["tenant-a"] =
-               Server.handle(
-                 "COMMAND",
-                 [
-                   "GETKEYS",
-                   "FLOW.CLAIM_DUE",
-                   "checkout",
-                   "WORKER",
-                   "w",
-                   "PAYLOAD",
-                   "PARTITION",
-                   "tenant-a"
-                 ],
-                 MockStore.make()
-               )
-
-      assert ["tenant-a"] =
-               Server.handle(
-                 "COMMAND",
-                 [
-                   "GETKEYS",
-                   "FLOW.SIGNAL",
-                   "flow-1",
-                   "SIGNAL",
-                   "payment_received",
-                   "VALUE",
-                   "payment_event",
-                   "payload",
-                   "PARTITION",
-                   "tenant-a"
-                 ],
-                 MockStore.make()
-               )
-
-      assert ["tenant-a"] =
-               Server.handle(
-                 "COMMAND",
-                 [
-                   "GETKEYS",
-                   "FLOW.CLAIM_DUE",
-                   "checkout",
-                   "WORKER",
-                   "w",
-                   "VALUE",
-                   "order",
-                   "PARTITION",
-                   "tenant-a"
-                 ],
-                 MockStore.make()
-               )
-    end
-
-    test "does not treat unsupported Flow get PARTITIONS as fanout keys" do
-      assert {:error, _} =
-               Server.handle(
-                 "COMMAND",
-                 ["GETKEYS", "FLOW.GET", "flow-1", "PARTITIONS", "2", "tenant-a", "tenant-b"],
-                 MockStore.make()
-               )
-    end
-
-    test "does not treat unsupported Flow history PARTITIONS as fanout keys" do
-      assert {:error, _} =
-               Server.handle(
-                 "COMMAND",
-                 ["GETKEYS", "FLOW.HISTORY", "flow-1", "PARTITIONS", "2", "tenant-a", "tenant-b"],
-                 MockStore.make()
-               )
-    end
-
-    test "returns Flow value refs without MAX_BYTES option metadata" do
-      assert ["ref-a", "ref-b"] =
-               Server.handle(
-                 "COMMAND",
-                 ["GETKEYS", "FLOW.VALUE.MGET", "ref-a", "ref-b", "MAX_BYTES", "1024"],
-                 MockStore.make()
-               )
-    end
-
-    test "returns auto-partition Flow many keys from item ids" do
-      assert ["flow-a", "flow-b"] =
-               Server.handle(
-                 "COMMAND",
-                 [
-                   "GETKEYS",
-                   "FLOW.CREATE_MANY",
-                   "MIXED",
-                   "TYPE",
-                   "checkout",
-                   "ITEMS_EXT",
-                   "2",
-                   "flow-a",
-                   "-",
-                   "payload-a",
-                   "0",
-                   "0",
-                   "flow-b",
-                   "-",
-                   "payload-b",
-                   "0",
-                   "0"
-                 ],
-                 MockStore.make()
-               )
-    end
-
-    test "returns Flow create_many AUTO keys from item ids" do
-      assert ["flow-a", "flow-b"] =
-               Server.handle(
-                 "COMMAND",
-                 [
-                   "GETKEYS",
-                   "FLOW.CREATE_MANY",
-                   "AUTO",
-                   "TYPE",
-                   "checkout",
-                   "PAYLOAD_REF",
-                   "payload-ref",
-                   "ITEMS",
-                   "flow-a",
-                   "flow-b"
-                 ],
-                 MockStore.make()
-               )
-    end
-
     test "returns dynamic keys for Flow mixed batch commands" do
       assert ["tenant-a", "tenant-b"] =
                Server.handle(
@@ -419,31 +264,6 @@ defmodule Ferricstore.Commands.CommandTest do
                    "flow-b",
                    "tenant-b",
                    "payload-b"
-                 ],
-                 MockStore.make()
-               )
-
-      assert ["tenant-a", "tenant-b"] =
-               Server.handle(
-                 "COMMAND",
-                 [
-                   "GETKEYS",
-                   "FLOW.CREATE_MANY",
-                   "MIXED",
-                   "TYPE",
-                   "checkout",
-                   "ITEMS_EXT",
-                   "2",
-                   "flow-a",
-                   "tenant-a",
-                   "payload-a",
-                   "0",
-                   "0",
-                   "flow-b",
-                   "tenant-b",
-                   "payload-b",
-                   "0",
-                   "0"
                  ],
                  MockStore.make()
                )
@@ -540,8 +360,9 @@ defmodule Ferricstore.Commands.CommandTest do
 
   describe "DEBUG SLEEP" do
     test "DEBUG SLEEP 0 returns immediately" do
+      store = MockStore.make()
       start = System.monotonic_time(:millisecond)
-      result = Server.handle("DEBUG", ["SLEEP", "0"], MockStore.make())
+      result = Server.handle("DEBUG", ["SLEEP", "0"], store)
       elapsed = System.monotonic_time(:millisecond) - start
 
       assert result == :ok

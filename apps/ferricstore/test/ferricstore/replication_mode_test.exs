@@ -53,6 +53,19 @@ defmodule Ferricstore.ReplicationModeTest do
              ReplicationMode.read(dir)
   end
 
+  test "marker stores node identity as data, not as a dynamic atom", %{dir: dir} do
+    node_name = :"ferricstore_restart_marker_#{System.unique_integer([:positive])}@host"
+
+    ReplicationMode.write!(dir, %{
+      replication_mode: :raft,
+      shard_count: 4,
+      node: node_name
+    })
+
+    assert {:ok, %{node: encoded_node}} = ReplicationMode.read(dir)
+    assert encoded_node == Atom.to_string(node_name)
+  end
+
   test "corrupted marker fails closed", %{dir: dir} do
     File.write!(ReplicationMode.marker_path(dir), "not a marker")
 
@@ -61,11 +74,46 @@ defmodule Ferricstore.ReplicationModeTest do
     end
   end
 
+  test "marker decode does not create atoms from corrupt outer term", %{dir: dir} do
+    atom_name = "ferricstore_cluster_state_outer_#{System.unique_integer([:positive])}"
+    refute existing_atom?(atom_name)
+
+    File.write!(ReplicationMode.marker_path(dir), unknown_atom_payload(atom_name))
+
+    assert {:error, _reason} = ReplicationMode.read(dir)
+    refute existing_atom?(atom_name)
+  end
+
+  test "marker decode does not create atoms from corrupt checksummed payload", %{dir: dir} do
+    atom_name = "ferricstore_cluster_state_payload_#{System.unique_integer([:positive])}"
+    refute existing_atom?(atom_name)
+
+    payload = unknown_atom_payload(atom_name)
+    checksum = :crypto.hash(:sha256, payload)
+    encoded = :erlang.term_to_binary({:ferricstore_cluster_state_v1, payload, checksum})
+
+    File.write!(ReplicationMode.marker_path(dir), encoded)
+
+    assert {:error, _reason} = ReplicationMode.read(dir)
+    refute existing_atom?(atom_name)
+  end
+
   test "shard count mismatch fails closed", %{dir: dir} do
     ReplicationMode.mark_raft!(dir, 4, 1, %{})
 
     assert_raise RuntimeError, ~r/shard_count mismatch/, fn ->
       ReplicationMode.resolve!(dir, 8)
     end
+  end
+
+  defp unknown_atom_payload(atom_name) when is_binary(atom_name) and byte_size(atom_name) < 256 do
+    <<131, 119, byte_size(atom_name), atom_name::binary>>
+  end
+
+  defp existing_atom?(atom_name) do
+    _ = String.to_existing_atom(atom_name)
+    true
+  rescue
+    ArgumentError -> false
   end
 end

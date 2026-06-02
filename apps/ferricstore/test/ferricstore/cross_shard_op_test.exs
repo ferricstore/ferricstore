@@ -13,6 +13,7 @@ defmodule Ferricstore.CrossShardOpTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.MemoryGuard
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
   alias Ferricstore.CrossShardOp
@@ -23,7 +24,51 @@ defmodule Ferricstore.CrossShardOpTest do
   setup do
     ShardHelpers.flush_all_keys()
     NamespaceConfig.reset_all()
+    force_memory_guard_ok()
+
+    on_exit(fn ->
+      ShardHelpers.reset_memory_guard_pressure()
+    end)
+
     :ok
+  end
+
+  defp default_ctx, do: FerricStore.Instance.get(:default)
+
+  defp force_memory_guard_ok do
+    try do
+      MemoryGuard.reconfigure(%{
+        max_memory_bytes: 100_000_000_000,
+        keydir_max_ram: 100_000_000_000,
+        hot_cache_min_ram: 0,
+        hot_cache_max_ram: :auto,
+        eviction_policy: :volatile_lru
+      })
+
+      :sys.replace_state(MemoryGuard, fn state ->
+        %{state | last_pressure_level: :ok, keydir_pressure_level: :ok}
+      end)
+
+      MemoryGuard.reset_pressure_flags()
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  defp put_existing!(key, value, expire_at_ms \\ 0) do
+    put_existing!(default_ctx(), key, value, expire_at_ms)
+  end
+
+  defp put_existing!(ctx, key, value, expire_at_ms) do
+    force_memory_guard_ok()
+    assert :ok = Router.put(ctx, key, value, expire_at_ms)
+
+    ShardHelpers.eventually(
+      fn -> Router.get(ctx, key) == value end,
+      "cross-shard test seed key #{inspect(key)} should be readable",
+      250,
+      10
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -131,7 +176,7 @@ defmodule Ferricstore.CrossShardOpTest do
                Router.shard_for(FerricStore.Instance.get(:default), new_key)
 
       # Create the old key with a value
-      Router.put(FerricStore.Instance.get(:default), old_key, "rename_value", 0)
+      put_existing!(old_key, "rename_value")
 
       # Call RENAME directly -- the handler calls CrossShardOp.execute internally
       result = Generic.handle("RENAME", [old_key, new_key], %{})
@@ -156,7 +201,7 @@ defmodule Ferricstore.CrossShardOpTest do
                Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source key
-      Router.put(FerricStore.Instance.get(:default), src, "copy_value", 0)
+      put_existing!(src, "copy_value")
 
       # Call COPY directly -- the handler calls CrossShardOp.execute internally
       result = Generic.handle("COPY", [src, dst], %{})
@@ -178,8 +223,8 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2, k3, k4] = ShardHelpers.keys_on_different_shards(4)
 
       # Set up source keys
-      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
-      Router.put(FerricStore.Instance.get(:default), k3, "v3", 0)
+      put_existing!(k1, "v1")
+      put_existing!(k3, "v3")
 
       # Run two independent cross-shard RENAMEs concurrently
       # Each command handler calls CrossShardOp.execute internally
@@ -214,7 +259,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "locks expire after TTL allowing subsequent operations" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "val", 0)
+      put_existing!(k1, "val")
 
       # Acquire locks with a very short TTL (200ms for testing)
       owner_ref = make_ref()
@@ -228,22 +273,22 @@ defmodule Ferricstore.CrossShardOpTest do
       shard2_id = Ferricstore.Raft.Cluster.shard_server_id(shard2_idx)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard1_id, {:lock_keys, [k1], owner_ref, now + 200})
+        Ferricstore.Raft.CommandClock.process_command(shard1_id, {:lock_keys, [k1], owner_ref, now + 200})
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard2_id, {:lock_keys, [k2], owner_ref, now + 200})
+        Ferricstore.Raft.CommandClock.process_command(shard2_id, {:lock_keys, [k2], owner_ref, now + 200})
 
       # Immediately after locking, another owner should fail
       other_ref = make_ref()
 
       {:ok, {:applied_at, _, {:error, :keys_locked}}, _} =
-        :ra.process_command(shard1_id, {:lock_keys, [k1], other_ref, now + 5000})
+        Ferricstore.Raft.CommandClock.process_command(shard1_id, {:lock_keys, [k1], other_ref, now + 5000})
 
       # Wait for locks to expire — poll instead of fixed sleep for CI tolerance
       Ferricstore.Test.Utils.eventually(
         fn ->
           {:ok, {:applied_at, _, :ok}, _} =
-            :ra.process_command(
+            Ferricstore.Raft.CommandClock.process_command(
               shard1_id,
               {:lock_keys, [k1], other_ref, System.os_time(:millisecond) + 10_000}
             )
@@ -252,7 +297,7 @@ defmodule Ferricstore.CrossShardOpTest do
       )
 
       # Clean up
-      :ra.process_command(shard1_id, {:unlock_keys, [k1], other_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard1_id, {:unlock_keys, [k1], other_ref})
     end
   end
 
@@ -264,8 +309,8 @@ defmodule Ferricstore.CrossShardOpTest do
     test "overlapping cross-shard operations don't deadlock (ordered locking)" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
-      Router.put(FerricStore.Instance.get(:default), k2, "v2", 0)
+      put_existing!(k1, "v1")
+      put_existing!(k2, "v2")
 
       # Two tasks try to RENAME the SAME pair of keys in opposite directions.
       # CrossShardOp normalizes lock acquisition order by shard index.
@@ -319,17 +364,17 @@ defmodule Ferricstore.CrossShardOpTest do
       }
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
 
       # Verify intent exists
-      {:ok, {:applied_at, _, intents_before}, _} = :ra.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_before}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
       assert Map.has_key?(intents_before, owner_ref)
 
       # Run intent resolver
       CrossShardOp.IntentResolver.resolve_stale_intents()
 
       # The intent should be cleaned up (it's older than stale threshold)
-      {:ok, {:applied_at, _, intents_after}, _} = :ra.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_after}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
       refute Map.has_key?(intents_after, owner_ref)
     end
   end
@@ -345,7 +390,7 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), k1) ==
                Router.shard_for(FerricStore.Instance.get(:default), k2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "val1", 0)
+      put_existing!(k1, "val1")
 
       # Call RENAME directly -- handler calls CrossShardOp internally (same-shard fast path)
       result = Generic.handle("RENAME", [k1, k2], %{})
@@ -366,7 +411,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set a value first
-      Router.put(FerricStore.Instance.get(:default), k1, "before_lock", 0)
+      put_existing!(k1, "before_lock")
       assert Router.get(FerricStore.Instance.get(:default), k1) == "before_lock"
 
       # Lock the key with a long TTL
@@ -376,7 +421,7 @@ defmodule Ferricstore.CrossShardOpTest do
       now = System.os_time(:millisecond)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
 
       # Try a regular put -- should be rejected
       result = Router.put(FerricStore.Instance.get(:default), k1, "during_lock", 0)
@@ -386,13 +431,13 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.get(FerricStore.Instance.get(:default), k1) == "before_lock"
 
       # Clean up
-      :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
     end
 
     test "Router.delete on a locked key returns {:error, :key_locked}" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "value", 0)
+      put_existing!(k1, "value")
 
       owner_ref = make_ref()
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
@@ -400,7 +445,7 @@ defmodule Ferricstore.CrossShardOpTest do
       now = System.os_time(:millisecond)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
 
       # Delete should be rejected
       result = Router.delete(FerricStore.Instance.get(:default), k1)
@@ -410,13 +455,13 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.get(FerricStore.Instance.get(:default), k1) == "value"
 
       # Clean up
-      :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
     end
 
     test "reads on locked keys still work" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), k1, "readable", 0)
+      put_existing!(k1, "readable")
 
       owner_ref = make_ref()
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
@@ -424,14 +469,14 @@ defmodule Ferricstore.CrossShardOpTest do
       now = System.os_time(:millisecond)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
 
       # Reads should still work -- locks only block writes
       assert Router.get(FerricStore.Instance.get(:default), k1) == "readable"
       assert Router.exists?(FerricStore.Instance.get(:default), k1) == true
 
       # Clean up
-      :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
+      Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
     end
   end
 
@@ -476,7 +521,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "RENAME across shards works when called directly" do
       [old_key, new_key] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), old_key, "rename_test", 0)
+      put_existing!(old_key, "rename_test")
 
       result = Generic.handle("RENAME", [old_key, new_key], %{})
       assert result == :ok
@@ -488,7 +533,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "COPY across shards works when called directly" do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), src, "copy_test", 0)
+      put_existing!(src, "copy_test")
 
       result = Generic.handle("COPY", [src, dst], %{})
       assert result == 1
@@ -500,7 +545,7 @@ defmodule Ferricstore.CrossShardOpTest do
     test "RENAMENX across shards works when called directly" do
       [old_key, new_key] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(FerricStore.Instance.get(:default), old_key, "renamenx_test", 0)
+      put_existing!(old_key, "renamenx_test")
 
       result = Generic.handle("RENAMENX", [old_key, new_key], %{})
       assert result == 1
@@ -562,7 +607,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up keys with known values
-      Router.put(FerricStore.Instance.get(:default), k1, "hash_test_value", 0)
+      put_existing!(k1, "hash_test_value")
 
       # Rename will write an intent with value hashes
       result = Generic.handle("RENAME", [k1, k2], %{})
@@ -591,7 +636,7 @@ defmodule Ferricstore.CrossShardOpTest do
       ctx = FerricStore.Instance.get(:default)
       value = :binary.copy("i", ctx.hot_cache_max_value_size + 1024)
 
-      Router.put(ctx, k1, value, 0)
+      put_existing!(ctx, k1, value, 0)
 
       ShardHelpers.eventually(fn ->
         match?({:ok, {_fid, _off, _vsize}}, Router.get_keydir_file_ref(ctx, k1))
@@ -608,7 +653,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up k1 with a value
-      Router.put(FerricStore.Instance.get(:default), k1, "intent_hash_test", 0)
+      put_existing!(k1, "intent_hash_test")
 
       # Write a stale intent with matching value hash
       owner_ref = make_ref()
@@ -630,12 +675,12 @@ defmodule Ferricstore.CrossShardOpTest do
       }
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
 
       # Run intent resolver -- should clean up because intent is stale
       CrossShardOp.IntentResolver.resolve_stale_intents()
 
-      {:ok, {:applied_at, _, intents_after}, _} = :ra.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_after}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
       refute Map.has_key?(intents_after, owner_ref)
     end
 
@@ -643,7 +688,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up k1 with a value
-      Router.put(FerricStore.Instance.get(:default), k1, "current_value", 0)
+      put_existing!(k1, "current_value")
 
       # Write a stale intent with a DIFFERENT value hash (simulating data changed)
       owner_ref = make_ref()
@@ -665,12 +710,12 @@ defmodule Ferricstore.CrossShardOpTest do
       }
 
       {:ok, {:applied_at, _, :ok}, _} =
-        :ra.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
 
       # Run intent resolver -- should still clean up (don't re-execute)
       CrossShardOp.IntentResolver.resolve_stale_intents()
 
-      {:ok, {:applied_at, _, intents_after}, _} = :ra.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_after}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
       refute Map.has_key?(intents_after, owner_ref)
     end
   end

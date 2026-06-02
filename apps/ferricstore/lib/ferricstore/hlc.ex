@@ -34,8 +34,6 @@ defmodule Ferricstore.HLC do
 
   The GenServer is retained only for:
 
-    * `update/1` -- merging remote timestamps from Raft heartbeats (~6 calls/sec).
-      This must be serialized to avoid lost-update races between concurrent merges.
     * Process supervision -- the `init/1` callback creates the atomics ref and
       stores it in `:persistent_term`.
 
@@ -79,8 +77,8 @@ defmodule Ferricstore.HLC do
   HLC sync across nodes currently happens via Raft heartbeats (~6/sec), giving
   ~150ms max drift. This is sufficient for all current use cases:
 
-    * **Read-your-writes** on the writing node: guaranteed by
-      `ra:process_command(reply_from: :local)`.
+    * **Read-your-writes** on the writing node: guaranteed by local apply
+      barriers on committed entries.
     * **Cross-node reads** after quorum write: guaranteed by Raft consensus —
       all quorum nodes applied the command before the write returns.
     * **TTL expiry**: second-granularity TTLs are unaffected by 150ms drift.
@@ -266,9 +264,10 @@ defmodule Ferricstore.HLC do
       during `apply/3` on each follower, giving per-command causal sync.
       See the module doc for when to enable this.
 
-  This is a `GenServer.call` because remote timestamp merges must be
-  serialized to avoid lost-update races. This is acceptable because merges
-  are rare (~6 calls/sec from Raft heartbeats).
+  This is lock-free on the normal path. Remote timestamp merges use the same
+  packed atomic as `now/0` and publish with compare-and-swap, so state-machine
+  apply does not serialize through the HLC GenServer when commands carry
+  stamped HLC metadata.
 
   The merge rule follows the standard HLC algorithm:
 
@@ -285,7 +284,7 @@ defmodule Ferricstore.HLC do
   """
   @spec update(timestamp()) :: :ok
   def update(remote_ts) do
-    GenServer.call(__MODULE__, {:update, remote_ts})
+    hlc_update_packed(remote_ts)
   end
 
   @doc """
@@ -298,8 +297,15 @@ defmodule Ferricstore.HLC do
 
   """
   @spec update(GenServer.server(), timestamp()) :: :ok
+  def update(__MODULE__, remote_ts) do
+    hlc_update_packed(remote_ts)
+  end
+
   def update(server, remote_ts) do
-    GenServer.call(server, {:update, remote_ts})
+    case atomics_ref() do
+      nil -> GenServer.call(server, {:update, remote_ts})
+      _ref -> hlc_update_packed(remote_ts)
+    end
   end
 
   @doc """
@@ -422,19 +428,7 @@ defmodule Ferricstore.HLC do
 
   @impl true
   def handle_call({:update, {remote_phys, remote_log}}, _from, state) do
-    ref = :persistent_term.get(@atomics_key)
-    wall = System.os_time(:millisecond)
-    {local_phys, local_logical} = unpack(:atomics.get(ref, @slot))
-
-    {new_physical, new_logical} =
-      merge_timestamps(wall, local_phys, local_logical, remote_phys, remote_log)
-
-    # CAS loop to safely write the merged value without clobbering
-    # concurrent now() callers.
-    write_packed_cas(ref, pack(new_physical, new_logical))
-
-    maybe_emit_drift_warning(new_physical, wall)
-
+    _ = hlc_update_packed({remote_phys, remote_log})
     {:reply, :ok, state}
   end
 
@@ -521,18 +515,44 @@ defmodule Ferricstore.HLC do
     end
   end
 
-  # CAS loop for update/1 — write a packed value that is at least as
-  # large as `target`. If current is already >= target, leave it.
-  defp write_packed_cas(ref, target) do
-    current = :atomics.get(ref, @slot)
+  defp hlc_update_packed({remote_phys, remote_log})
+       when is_integer(remote_phys) and remote_phys >= 0 and is_integer(remote_log) and
+              remote_log >= 0 do
+    case atomics_ref() do
+      nil ->
+        :ok
 
-    if target > current do
-      case :atomics.compare_exchange(ref, @slot, current, target) do
-        :ok -> :ok
-        _actual -> write_packed_cas(ref, target)
-      end
-    else
-      :ok
+      ref ->
+        hlc_update_packed(ref, remote_phys, remote_log)
+    end
+  end
+
+  defp hlc_update_packed(_remote_ts), do: :ok
+
+  defp hlc_update_packed(ref, remote_phys, remote_log) do
+    current = :atomics.get(ref, @slot)
+    wall = System.os_time(:millisecond)
+    {local_phys, local_logical} = unpack(current)
+
+    {new_physical, new_logical} =
+      merge_timestamps(wall, local_phys, local_logical, remote_phys, remote_log)
+
+    target = pack(new_physical, new_logical)
+
+    cond do
+      target <= current ->
+        maybe_emit_drift_warning(local_phys, wall)
+        :ok
+
+      true ->
+        case :atomics.compare_exchange(ref, @slot, current, target) do
+          :ok ->
+            maybe_emit_drift_warning(new_physical, wall)
+            :ok
+
+          _actual ->
+            hlc_update_packed(ref, remote_phys, remote_log)
+        end
     end
   end
 

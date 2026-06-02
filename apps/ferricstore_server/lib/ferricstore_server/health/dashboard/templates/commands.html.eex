@@ -1,0 +1,18 @@
+<% data = assigns.data %>
+<%= page_head("Commands - FerricStore", 10) %>
+<body data-dashboard-live-page="commands" data-dashboard-live-url="/dashboard/api/commands" data-dashboard-live-interval-ms="10000">
+<div class="layout">
+<%= render_sidebar_static("commands") %>
+<main class="main-content">
+<%= render_subpage_header("Commands") %>
+<div class="content">
+<%= render_page_intro("Commands", "Understand command traffic, slow command shape, and which Redis-compatible command families map to the generic KV engine.") %>
+<%= render_kv_subnav("commands") %>
+<%= render_live_component("commands_summary", render_commands_summary(data)) %>
+<%= render_live_component("commands_slowlog", render_command_slowlog_table(data)) %>
+<%= render_kv_command_reference(data) %>
+</div>
+</main>
+</div>
+</body>
+</html>

@@ -12,9 +12,7 @@ defmodule FerricstoreServer.Connection.Store do
 
     %{
       raw
-      | __sandbox_namespace__: ns,
-        __flow_default_instance__: false,
-        get: fn key -> raw.get.(ns <> key) end,
+      | get: fn key -> raw.get.(ns <> key) end,
         get_meta: fn key -> raw.get_meta.(ns <> key) end,
         batch_get: fn keys -> raw.batch_get.(namespace_keys(ns, keys)) end,
         value_size: fn key -> raw.value_size.(ns <> key) end,
@@ -40,6 +38,7 @@ defmodule FerricstoreServer.Connection.Store do
           raw.ratelimit_add.(ns <> key, window, max, count)
         end,
         list_op: fn key, op -> raw.list_op.(ns <> key, op) end,
+        on_push: fn key, count -> raw.on_push.(ns <> key, count) end,
         compound_get: fn redis_key, compound_key ->
           raw.compound_get.(ns <> redis_key, namespace_compound_key(ns, redis_key, compound_key))
         end,
@@ -121,8 +120,6 @@ defmodule FerricstoreServer.Connection.Store do
   defp raw_store_complete?(store, ctx) do
     Map.get(store, :__ctx_identity__) == raw_store_identity(ctx) and
       Map.get(store, :__instance_ctx__) == ctx and
-      Map.has_key?(store, :__sandbox_namespace__) and
-      Map.has_key?(store, :__flow_default_instance__) and
       is_function(Map.get(store, :batch_get), 1) and
       is_function(Map.get(store, :value_size), 1) and
       is_function(Map.get(store, :object_lfu), 1) and
@@ -150,8 +147,6 @@ defmodule FerricstoreServer.Connection.Store do
     %{
       __ctx_identity__: raw_store_identity(ctx),
       __instance_ctx__: ctx,
-      __sandbox_namespace__: nil,
-      __flow_default_instance__: false,
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,
@@ -243,7 +238,7 @@ defmodule FerricstoreServer.Connection.Store do
         Path.join(shard_path, "prob")
       end,
       flush_prob_dirs: fn -> Ferricstore.ProbCleanup.flush_all(ctx.data_dir, ctx.shard_count) end,
-      on_push: &Ferricstore.Waiters.notify_push/1
+      on_push: &Ferricstore.Waiters.notify_push/2
     }
   end
 

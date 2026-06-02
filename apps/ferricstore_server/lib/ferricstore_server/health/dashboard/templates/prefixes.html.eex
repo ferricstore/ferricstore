@@ -1,0 +1,17 @@
+<% data = assigns.data %>
+<%= page_head("Key Prefixes - FerricStore", 10) %>
+<body data-dashboard-live-page="prefixes" data-dashboard-live-url="/dashboard/api/prefixes" data-dashboard-live-interval-ms="10000">
+<div class="layout">
+<%= render_sidebar_static("prefixes") %>
+<main class="main-content">
+<%= render_subpage_header("Key Prefixes") %>
+<div class="content">
+<%= render_page_intro("Key Prefixes", "Sample keydir distribution by prefix and correlate prefix size with sampled hot/cold read pressure.") %>
+<%= render_kv_subnav("prefixes") %>
+<%= render_live_component("prefixes_summary", render_prefixes_summary(data)) %>
+<%= render_live_component("prefixes_table", render_prefixes_table(data)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

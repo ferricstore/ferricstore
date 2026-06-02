@@ -1,0 +1,59 @@
+defmodule Ferricstore.Commands.ServerWARaftTest do
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Commands.Server
+
+  test "SAVE flushes through the WARaft write facade" do
+    # Use a shard count above the default test app's supervised shard count.
+    # SAVE must tolerate absent runtime processes for inactive shards.
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_server_waraft_save_#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "00000.log")
+    File.write!(path, "")
+    Ferricstore.Store.ActiveFile.publish(4, 0, path, dir)
+
+    on_exit(fn ->
+      if :ets.whereis(:ferricstore_active_files) != :undefined do
+        :ets.delete(:ferricstore_active_files, 4)
+        :atomics.add(:persistent_term.get(:ferricstore_active_file_gen), 1, 1)
+      end
+
+      File.rm_rf!(dir)
+    end)
+
+    ctx = %FerricStore.Instance{name: :default, shard_count: 5}
+
+    assert :ok = Server.handle("SAVE", [], ctx)
+  end
+
+  test "DEBUG BATCHER-STATS reports WARaft processes" do
+    assert {:simple, stats_line} = Server.handle("DEBUG", ["BATCHER-STATS"], nil)
+
+    assert String.contains?(stats_line, "WA0:")
+    assert String.contains?(stats_line, "server=")
+    assert String.contains?(stats_line, "acceptor=")
+    assert String.contains?(stats_line, "queue=")
+    assert String.contains?(stats_line, "storage=")
+    assert String.contains?(stats_line, "inflight_bytes=0")
+
+    refute String.contains?(stats_line, "B0")
+    refute String.contains?(stats_line, "WAL")
+    refute String.contains?(stats_line, "R0")
+    refute String.contains?(stats_line, "\n")
+  end
+
+  test "INFO raft reports WARaft in-flight commit bytes" do
+    info = Server.handle("INFO", ["raft"], nil)
+
+    assert String.contains?(info, "shard_0_waraft_inflight_commit_bytes:0")
+    assert String.contains?(info, "shard_0_waraft_segment_log_ets_entries:")
+    assert String.contains?(info, "shard_0_waraft_segment_log_max_ets_entries:")
+    assert String.contains?(info, "shard_0_waraft_segment_log_ets_bytes:")
+    assert String.contains?(info, "shard_0_waraft_segment_log_max_ets_bytes:")
+  end
+end

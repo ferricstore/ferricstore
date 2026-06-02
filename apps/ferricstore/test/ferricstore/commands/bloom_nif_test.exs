@@ -65,7 +65,9 @@ defmodule Ferricstore.Commands.BloomNifTest do
   end
 
   defp make_temp_dir do
-    dir = Path.join(System.tmp_dir!(), "bloom_nif_test_#{:rand.uniform(1_000_000)}")
+    suffix = "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive, :monotonic])}"
+    dir = Path.join(System.tmp_dir!(), "bloom_nif_test_#{suffix}")
+    File.rm_rf!(dir)
     File.mkdir_p!(dir)
     dir
   end

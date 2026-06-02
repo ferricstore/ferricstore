@@ -1,0 +1,30 @@
+<% data = assigns.data %>
+<% filters = flow_failures_page_filters(data) %>
+<div class="flow-filter-panel">
+  <form class="flow-filter-form" action="/dashboard/flow/failures" method="get">
+    <label>
+      Type
+      <select class="flow-search-input mono" name="type" title="Filter by workflow type">
+        <%= render_flow_type_options(Map.get(data, :available_types, []), filters.type) %>
+      </select>
+    </label>
+    <label>
+      Partition
+      <input class="flow-search-input mono" type="search" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="optional" title="Filter by Flow partition key">
+    </label>
+    <label>
+      ID contains
+      <input class="flow-search-input mono" type="search" name="q" value="<%= escape_attr(filters.q || "") %>" placeholder="flow id" title="Filter by Flow id substring">
+    </label>
+    <label>
+      Limit
+      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>" title="Maximum rows to render">
+    </label>
+    <label class="flow-check-label" title="Run exact FLOW.FAILURES and FLOW.STUCK queries. This can be slower than the default sampled view under load.">
+      <input type="checkbox" name="exact" value="true" <%= if Map.get(filters, :scan_exact, false), do: "checked", else: "" %>>
+      Exact scan
+    </label>
+    <button class="flow-search-button" type="submit">Apply</button>
+  </form>
+  <span class="flow-filter-note">Default view uses the bounded dashboard sample. Enable Exact scan for FLOW.FAILURES/FLOW.STUCK queries. Actions are explicit.</span>
+</div>

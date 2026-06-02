@@ -396,10 +396,32 @@ defmodule Ferricstore.Store.BlobStoreTest do
   end
 
   test "get_range reads only the requested segment blob slice", %{root: root} do
-    payload = :binary.copy("a", 2048) <> "target-slice" <> :binary.copy("z", 2048)
+    slice = :binary.copy("target-slice", 16)
+    payload = :binary.copy("a", 128 * 1024) <> slice <> :binary.copy("z", 128 * 1024)
 
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
-    assert {:ok, "target"} = BlobStore.get_range(root, 0, ref, 2048, 6)
+    assert {:ok, returned_slice} = BlobStore.get_range(root, 0, ref, 128 * 1024, byte_size(slice))
+    assert returned_slice == slice
+    assert :binary.referenced_byte_size(returned_slice) <= byte_size(returned_slice)
+  end
+
+  test "get_range does not scan unrelated segment bytes for a partial slice", %{root: root} do
+    prefix = :binary.copy("a", 128 * 1024)
+    slice = :binary.copy("target-slice", 16)
+    suffix = :binary.copy("z", 128 * 1024)
+    payload = prefix <> slice <> suffix
+
+    assert {:ok, ref} = BlobStore.put(root, 0, payload)
+
+    overwrite_segment_payload!(
+      root,
+      0,
+      ref,
+      prefix <> slice <> :binary.copy("x", byte_size(suffix))
+    )
+
+    assert {:ok, ^slice} = BlobStore.get_range(root, 0, ref, byte_size(prefix), byte_size(slice))
+    assert {:error, :checksum_mismatch} = BlobStore.get_range(root, 0, ref, 0, byte_size(payload))
   end
 
   test "get_range rejects an oversized legacy blob file", %{root: root} do
@@ -516,6 +538,52 @@ defmodule Ferricstore.Store.BlobStoreTest do
 
     assert File.stat!(segment_path).size == dirty_size - 12
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
+  test "recover_shard rejects symlinked append segments without mutating the target", %{
+    root: root
+  } do
+    segment_dir = Path.join(Ferricstore.DataDir.blob_shard_path(root, 0), "segments")
+    File.mkdir_p!(segment_dir)
+
+    outside_path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_blob_symlink_target_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm(outside_path) end)
+
+    File.write!(outside_path, "sentinel")
+    segment_path = Path.join(segment_dir, "00000000000000000000.bloblog")
+    assert :ok = File.ln_s(outside_path, segment_path)
+
+    assert {:error, {:unsafe_blob_segment_path, ^segment_path, :symlink}} =
+             BlobStore.recover_shard(root, 0)
+
+    assert File.read!(outside_path) == "sentinel"
+  end
+
+  test "put rejects a cached append segment replaced by a symlink", %{root: root} do
+    assert {:ok, ref} = BlobStore.put(root, 0, "first")
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+
+    outside_path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_blob_append_symlink_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm(outside_path) end)
+
+    File.rm!(segment_path)
+    File.write!(outside_path, "sentinel")
+    assert :ok = File.ln_s(outside_path, segment_path)
+
+    assert {:error, {:unsafe_blob_segment_path, ^segment_path, :symlink}} =
+             BlobStore.put(root, 0, "second")
+
+    assert File.read!(outside_path) == "sentinel"
   end
 
   test "recover_shard invalidates cached append offsets after truncating a corrupt record", %{
@@ -642,6 +710,15 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, ref)
   end
 
+  test "get_range detects same-size corrupt blob bytes", %{root: root} do
+    payload = "correct"
+
+    assert {:ok, ref} = BlobStore.put(root, 0, payload)
+    overwrite_segment_payload!(root, 0, ref, "corrupt")
+
+    assert {:error, :checksum_mismatch} = BlobStore.get_range(root, 0, ref, 0, byte_size(payload))
+  end
+
   test "get emits blob error telemetry when checksum verification fails", %{root: root} do
     parent = self()
     handler_id = {:blob_store_error_telemetry, self(), make_ref()}
@@ -755,6 +832,8 @@ defmodule Ferricstore.Store.BlobStoreTest do
   test "sweep_unreferenced deletes an append segment when no live ref points to it", %{
     root: root
   } do
+    with_blob_segment_gc_grace_ms(0)
+
     assert {:ok, refs} =
              BlobStore.put_many(root, 0, [
                :binary.copy("a", 256),
@@ -777,7 +856,26 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute File.exists?(segment_path)
   end
 
+  test "sweep_unreferenced preserves a fresh append segment even before keydir refs appear", %{
+    root: root
+  } do
+    with_blob_segment_gc_grace_ms(60_000)
+
+    assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("pending", 256))
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+    segment_bytes = File.stat!(segment_path).size
+
+    assert {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 1}} =
+             BlobStore.sweep_unreferenced(root, 0, [])
+
+    assert File.exists?(segment_path)
+    assert File.stat!(segment_path).size == segment_bytes
+    assert {:ok, :binary.copy("pending", 256)} == BlobStore.get(root, 0, ref)
+  end
+
   test "sweep_unreferenced ignores malformed live refs", %{root: root} do
+    with_blob_segment_gc_grace_ms(0)
+
     assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("d", 256))
     assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
 
@@ -814,10 +912,116 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^live_payload} = BlobStore.get(root, 0, live_ref)
   end
 
+  test "sweep_unreferenced does not let stale legacy protection rows pin dead segments", %{
+    root: root
+  } do
+    with_blob_segment_gc_grace_ms(0)
+
+    assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("stale-protected", 256))
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+    relative_path = BlobRef.relative_path(ref)
+    segment_bytes = File.stat!(segment_path).size
+
+    BlobStore.init_tables()
+    :ets.insert(:ferricstore_blob_store_protected_refs, {{root, 0, relative_path}, 1})
+
+    assert {:ok, %{deleted_files: 1, deleted_bytes: ^segment_bytes, kept_files: 0}} =
+             BlobStore.sweep_unreferenced(root, 0, [])
+
+    refute File.exists?(segment_path)
+    assert [] = :ets.lookup(:ferricstore_blob_store_protected_refs, {root, 0, relative_path})
+  end
+
+  test "sweep_unreferenced expires modern protection rows from uncertain submits", %{
+    root: root
+  } do
+    with_blob_segment_gc_grace_ms(0)
+    with_blob_protection_ttl_ms(0)
+
+    assert {:ok, ref, token} =
+             BlobStore.put_protected(root, 0, :binary.copy("modern-protected", 256))
+
+    relative_path = BlobRef.relative_path(ref)
+
+    assert {:blob_store_protection, ^root, 0, [^relative_path]} = token
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+    segment_bytes = File.stat!(segment_path).size
+
+    assert [{_, 1, deadline_ms}] =
+             :ets.lookup(:ferricstore_blob_store_protected_refs, {root, 0, relative_path})
+
+    assert is_integer(deadline_ms)
+
+    assert {:ok, %{deleted_files: 1, deleted_bytes: ^segment_bytes, kept_files: 0}} =
+             BlobStore.sweep_unreferenced(root, 0, [])
+
+    refute File.exists?(segment_path)
+    assert [] = :ets.lookup(:ferricstore_blob_store_protected_refs, {root, 0, relative_path})
+  end
+
+  test "hardened unknown-outcome protection is not expired by the wall-clock TTL", %{
+    root: root
+  } do
+    with_blob_segment_gc_grace_ms(0)
+    with_blob_protection_ttl_ms(0)
+
+    assert {:ok, ref, token} =
+             BlobStore.put_protected(root, 0, :binary.copy("unknown-outcome", 256))
+
+    relative_path = BlobRef.relative_path(ref)
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+
+    assert :ok = BlobStore.harden_protection(token)
+
+    assert [{_, 1, :infinity}] =
+             :ets.lookup(:ferricstore_blob_store_protected_refs, {root, 0, relative_path})
+
+    assert {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 1}} =
+             BlobStore.sweep_unreferenced(root, 0, [])
+
+    assert File.exists?(segment_path)
+
+    assert :ok = BlobStore.unprotect(token)
+
+    assert {:ok, %{deleted_files: 1}} = BlobStore.sweep_unreferenced(root, 0, [])
+    refute File.exists?(segment_path)
+  end
+
+  test "hardened protections can be reconciled one token at a time", %{root: root} do
+    with_blob_segment_gc_grace_ms(0)
+    with_blob_protection_ttl_ms(0)
+
+    assert {:ok, first_ref, first_token} =
+             BlobStore.put_protected(root, 0, :binary.copy("first-hardened", 256))
+
+    assert {:ok, second_ref, second_token} =
+             BlobStore.put_protected(root, 0, :binary.copy("second-hardened", 256))
+
+    assert first_ref.segment_id == second_ref.segment_id
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
+
+    assert :ok = BlobStore.harden_protection(first_token, reason: :unknown_commit)
+    assert :ok = BlobStore.harden_protection(second_token, reason: :unknown_commit)
+
+    assert [first_id, second_id] = BlobStore.hardened_protection_ids(root, 0, 10)
+
+    assert {:ok, %{hardened_protections_released: 1, deleted_files: 0, kept_files: 1}} =
+             BlobStore.sweep_unreferenced_releasing_hardened(root, 0, [first_id], [])
+
+    assert File.exists?(segment_path)
+
+    assert {:ok, %{hardened_protections_released: 1, deleted_files: 1}} =
+             BlobStore.sweep_unreferenced_releasing_hardened(root, 0, [second_id], [])
+
+    refute File.exists?(segment_path)
+    assert [] = BlobStore.hardened_protection_ids(root, 0, 10)
+  end
+
   test "sweep_unreferenced can reclaim a dead rotated segment while newer segment stays live", %{
     root: root
   } do
     with_blob_segment_max_bytes(600)
+    with_blob_segment_gc_grace_ms(0)
 
     first_payload = :binary.copy("a", 400)
     second_payload = :binary.copy("b", 400)
@@ -843,6 +1047,7 @@ defmodule Ferricstore.Store.BlobStoreTest do
     root: root
   } do
     with_blob_segment_max_bytes(600)
+    with_blob_segment_gc_grace_ms(0)
 
     assert {:ok, first_ref} = BlobStore.put(root, 0, :binary.copy("a", 400))
     assert {:ok, {first_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
@@ -897,6 +1102,16 @@ defmodule Ferricstore.Store.BlobStoreTest do
   defp with_blob_segment_max_bytes(bytes) do
     Process.put(:ferricstore_blob_store_segment_max_bytes, bytes)
     on_exit(fn -> Process.delete(:ferricstore_blob_store_segment_max_bytes) end)
+  end
+
+  defp with_blob_segment_gc_grace_ms(ms) do
+    Process.put(:ferricstore_blob_store_segment_gc_grace_ms, ms)
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_segment_gc_grace_ms) end)
+  end
+
+  defp with_blob_protection_ttl_ms(ms) do
+    Process.put(:ferricstore_blob_store_protection_ttl_ms, ms)
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_protection_ttl_ms) end)
   end
 
   defp count_regular_files(path) do

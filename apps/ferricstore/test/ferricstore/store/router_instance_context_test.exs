@@ -80,6 +80,17 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert nil == Router.compound_get(ctx, key, field_key)
   end
 
+  test "custom writes stay local when WARaft owns the default instance", %{ctx: ctx} do
+    key = "router:instance:waraft-local:#{System.unique_integer([:positive])}"
+    field_key = CompoundKey.hash_field(key, "field")
+
+    assert :ok = Router.put(ctx, key, "custom")
+    assert "custom" == Router.get(ctx, key)
+
+    assert :ok = Router.compound_put(ctx, key, field_key, "field-value", 0)
+    assert "field-value" == Router.compound_get(ctx, key, field_key)
+  end
+
   test "custom write version survives shard process restart", %{ctx: ctx} do
     key = "router:instance:version-restart:#{System.unique_integer([:positive])}"
     idx = Router.shard_for(ctx, key)
@@ -182,4 +193,5 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
       )
     end
   end
+
 end

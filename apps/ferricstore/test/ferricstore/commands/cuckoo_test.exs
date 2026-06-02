@@ -11,6 +11,14 @@ defmodule Ferricstore.Commands.CuckooTest do
   alias Ferricstore.Commands.Cuckoo
   alias Ferricstore.Test.ProbMockStore
 
+  defp temp_prob_dir(prefix, suffix) do
+    Path.join(System.tmp_dir!(), "#{prefix}_#{suffix}")
+  end
+
+  defp unique_suffix do
+    "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive, :monotonic])}"
+  end
+
   # ===========================================================================
   # CF.RESERVE
   # ===========================================================================
@@ -24,13 +32,11 @@ defmodule Ferricstore.Commands.CuckooTest do
     end
 
     test "uses key-specific probabilistic directory when available" do
-      wrong_dir =
-        Path.join(System.tmp_dir!(), "cuckoo_wrong_prob_#{System.unique_integer([:positive])}")
+      suffix = unique_suffix()
+      wrong_dir = temp_prob_dir("cuckoo_wrong_prob", suffix)
+      right_dir = temp_prob_dir("cuckoo_right_prob", suffix)
 
-      right_dir =
-        Path.join(System.tmp_dir!(), "cuckoo_right_prob_#{System.unique_integer([:positive])}")
-
-      key = "key_specific_cuckoo"
+      key = "key_specific_cuckoo_#{suffix}"
       safe = Base.url_encode64(key, padding: false)
 
       store =
@@ -38,9 +44,14 @@ defmodule Ferricstore.Commands.CuckooTest do
         |> Map.put(:prob_dir, fn -> wrong_dir end)
         |> Map.put(:prob_dir_for_key, fn ^key -> right_dir end)
 
-      assert :ok = Cuckoo.handle("CF.RESERVE", [key, "1024"], store)
-      assert File.exists?(Path.join(right_dir, "#{safe}.cuckoo"))
-      refute File.exists?(Path.join(wrong_dir, "#{safe}.cuckoo"))
+      try do
+        assert :ok = Cuckoo.handle("CF.RESERVE", [key, "1024"], store)
+        assert File.exists?(Path.join(right_dir, "#{safe}.cuckoo"))
+        refute File.exists?(Path.join(wrong_dir, "#{safe}.cuckoo"))
+      after
+        File.rm_rf!(wrong_dir)
+        File.rm_rf!(right_dir)
+      end
     end
 
     test "returns error when key already exists" do

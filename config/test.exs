@@ -1,5 +1,10 @@
 import Config
 
+# Keep test runs quiet by default. A warning floor prevents debug/info/notice
+# floods from dominating CI time and hiding real failures; tests that need to
+# assert logs should use ExUnit.CaptureLog or set Logger locally.
+config :logger, level: :warning
+
 # Use port 0 in test so the OS assigns an ephemeral port.
 # Tests that need the port call Application.get_env(:ferricstore, :port).
 config :ferricstore, :port, 0
@@ -21,8 +26,10 @@ config :ferricstore, :sync_flush_timeout_ms, 1_000
 
 # MemoryGuard: use large budget and slow interval to avoid noise in tests
 config :ferricstore, :max_memory_bytes, 1_073_741_824
+config :ferricstore, :keydir_max_ram, 100_000_000_000
 config :ferricstore, :eviction_policy, :volatile_lru
 config :ferricstore, :memory_guard_interval_ms, 5_000
+config :ferricstore, :operational_guard_enabled, false
 
 # Merge: use a very long check interval to prevent periodic merge timers
 # from firing during tests. Tests that need to trigger merges use

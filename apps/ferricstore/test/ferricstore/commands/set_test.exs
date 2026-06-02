@@ -70,6 +70,18 @@ defmodule Ferricstore.Commands.SetTest do
       refute_received {:compound_batch_put, _}
     end
 
+    test "SADD builds new member entries directly from batch reads" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/set.ex", __DIR__))
+
+      [sadd_source] = Regex.run(~r/defp sadd_members\(.*?^  end/ms, source)
+
+      assert sadd_source =~
+               "new_entries = set_member_entries_for_missing(compound_keys, values, [])"
+
+      refute sadd_source =~ "Enum.zip(compound_keys)"
+      refute sadd_source =~ "Enum.flat_map"
+    end
+
     test "SADD with all duplicates returns 0" do
       store = MockStore.make()
       Set.handle("SADD", ["myset", "a"], store)
@@ -202,6 +214,18 @@ defmodule Ferricstore.Commands.SetTest do
       assert_received {:compound_batch_delete, deleted_keys}
       assert Enum.sort(deleted_keys) == Enum.sort(Enum.take(member_keys, 2))
       refute_received {:compound_batch_delete, _}
+    end
+
+    test "SREM builds removed member entries directly from batch reads" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/commands/set.ex", __DIR__))
+
+      [srem_source] = Regex.run(~r/defp srem_args\(\[key \| members\].*?^  end/ms, source)
+
+      assert srem_source =~
+               "removed_entries = set_member_entries_for_present(compound_keys, values, [])"
+
+      refute srem_source =~ "Enum.zip(compound_keys)"
+      refute srem_source =~ "Enum.flat_map"
     end
 
     test "SREM cleans up type metadata when set becomes empty" do
@@ -407,6 +431,58 @@ defmodule Ferricstore.Commands.SetTest do
       }
 
       assert ["b"] == Set.handle("SINTER", ["s1", "s2"], store)
+    end
+
+    test "SINTER batches membership probes per remaining set" do
+      parent = self()
+      type_base = CompoundKey.type_key("base")
+      type_other1 = CompoundKey.type_key("other1")
+      type_other2 = CompoundKey.type_key("other2")
+
+      other1_present =
+        MapSet.new([CompoundKey.set_member("other1", "a"), CompoundKey.set_member("other1", "b")])
+
+      other2_present = CompoundKey.set_member("other2", "b")
+
+      store = %{
+        compound_get: fn
+          "base", ^type_base -> "set"
+          "other1", ^type_other1 -> "set"
+          "other2", ^type_other2 -> "set"
+          key, "S:" <> _rest -> flunk("SINTER should batch membership probes for #{key}")
+        end,
+        compound_count: fn
+          "base", _prefix -> 3
+          "other1", _prefix -> 10
+          "other2", _prefix -> 10
+        end,
+        compound_scan: fn
+          "base", _prefix -> [{"a", "1"}, {"b", "1"}, {"c", "1"}]
+          key, _prefix -> flunk("SINTER should not scan larger set #{key}")
+        end,
+        compound_batch_get: fn
+          "other1", keys ->
+            send(parent, {:batch_probe, "other1", keys})
+
+            Enum.map(keys, fn key ->
+              if MapSet.member?(other1_present, key), do: "1", else: nil
+            end)
+
+          "other2", keys ->
+            send(parent, {:batch_probe, "other2", keys})
+
+            Enum.map(keys, fn key ->
+              if key == other2_present, do: "1", else: nil
+            end)
+        end
+      }
+
+      assert ["b"] == Set.handle("SINTER", ["base", "other1", "other2"], store)
+
+      assert_receive {:batch_probe, "other1", other1_keys}
+      assert length(other1_keys) == 3
+      assert_receive {:batch_probe, "other2", other2_keys}
+      assert length(other2_keys) == 2
     end
 
     test "SINTER returns empty without member scans when any set is empty" do

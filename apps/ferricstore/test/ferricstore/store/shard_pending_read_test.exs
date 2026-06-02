@@ -1,10 +1,15 @@
 defmodule Ferricstore.Store.ShardPendingReadTest do
-  use ExUnit.Case, async: true
+  # Async cold-read warming consults the shared MemoryGuard skip-promotion flag.
+  # Keep this module synchronous so pressure tests cannot race these assertions.
+  use ExUnit.Case, async: false
 
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard
+  alias Ferricstore.Test.ShardHelpers
 
   setup do
+    ShardHelpers.reset_memory_guard_pressure()
+
     handler_id = {:pending_read_telemetry, self(), make_ref()}
     parent = self()
 
@@ -15,7 +20,10 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
       parent
     )
 
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      ShardHelpers.reset_memory_guard_pressure()
+    end)
 
     :ok
   end

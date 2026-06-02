@@ -105,6 +105,10 @@ defmodule FerricStore.Instance.Supervisor do
         bitcask_writer_children ++
         flow_lmdb_writer_children ++
         [
+          Supervisor.child_spec(
+            {Ferricstore.Store.KeydirTableOwner, instance_ctx: ctx},
+            id: :"#{name}.KeydirTableOwner"
+          ),
           # Stats and MemoryGuard are global application processes today. The
           # instance context owns isolated counters/flags, but these GenServers are
           # not instance-scoped yet, so embedded instances must not start duplicates.

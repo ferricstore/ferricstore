@@ -10,6 +10,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
@@ -17,7 +18,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # The application already started the ra system, ra servers, and
+    # The application already started WARaft partitions and
     # batchers for shards 0-3. Reuse them.
     :ok
   end
@@ -272,16 +273,30 @@ defmodule Ferricstore.Raft.WritePathTest do
       GenServer.call(shard_pid, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 
-      # v2: verify the value is on disk via the ETS 7-tuple location
+      # Verify the value is on disk via the ETS 7-tuple location. The
+      # production WARaft path stores small values in unified segment records;
+      # older direct-Bitcask paths still use integer Bitcask file ids.
       [{^k, _value, _exp, _lfu, fid, off, _vsize}] = :ets.lookup(state.keydir, k)
 
-      log_path =
-        Path.join(
-          state.data_dir |> Ferricstore.DataDir.shard_data_path(state.index),
-          "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
-        )
+      case fid do
+        {:waraft_segment, _index} ->
+          assert {:ok, "durable_value"} =
+                   WARaftSegmentReader.read_value_from_location(
+                     FerricStore.Instance.get(:default),
+                     state.index,
+                     fid,
+                     k
+                   )
 
-      assert {:ok, "durable_value"} = NIF.v2_pread_at(log_path, off)
+        fid when is_integer(fid) ->
+          log_path =
+            Path.join(
+              state.data_dir |> Ferricstore.DataDir.shard_data_path(state.index),
+              "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+            )
+
+          assert {:ok, "durable_value"} = NIF.v2_pread_at(log_path, off)
+      end
     end
 
     test "DEL tombstone is persisted in Bitcask" do

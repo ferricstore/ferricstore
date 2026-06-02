@@ -7,7 +7,7 @@
 #   * flow_transition_many batch
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start \
+#   MIX_ENV=bench mix run --no-start \
 #     -e 'Code.require_file("bench/flow_pipeline_write_bench.exs")'
 #
 # Options:
@@ -33,7 +33,6 @@ Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
-Application.put_env(:ferricstore, :flow_lmdb_mode, System.get_env("FLOW_LMDB_MODE", "mirror"))
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 

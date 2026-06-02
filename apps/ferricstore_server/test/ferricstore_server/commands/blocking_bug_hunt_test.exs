@@ -34,8 +34,13 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.{Blocking, List}
+  alias Ferricstore.Commands.{Blocking, List, Stream}
+  alias Ferricstore.Store.Router
+  alias FerricstoreServer.Acl
+  alias FerricstoreServer.Connection
+  alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
+  alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Test.MockStore
@@ -131,16 +136,413 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
         _redis_key, _compound_key -> nil
       end)
       |> Map.put(:compound_scan, fn ^key, _prefix -> raise "write key latch timeout after 5ms" end)
+      |> Map.put(:list_op, fn ^key, {:lpop, 1} -> raise "write key latch timeout after 5ms" end)
     end)
 
     try do
       assert {:continue, response, ^state} =
                ConnBlocking.dispatch_blpop_ast([key], 1, state)
 
-      assert IO.iodata_to_binary(response) =~ "-ERR internal error:"
+      response = IO.iodata_to_binary(response)
+      assert response =~ "-ERR internal error"
+      refute response =~ "write key latch timeout"
+      refute response =~ "RuntimeError"
     after
       restore_raw_store(ctx)
     end
+  end
+
+  test "BLPOP on a non-list key returns WRONGTYPE instead of blocking" do
+    ctx = FerricStore.Instance.get(:default)
+    key = ukey("blpop_wrongtype")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+
+    assert :ok = Router.put(ctx, key, "string-value", 0)
+
+    assert {:continue, response, ^state} = ConnBlocking.dispatch_blpop_ast([key], 1, state)
+    assert {:ok, [{:error, msg}], ""} = Parser.parse(IO.iodata_to_binary(response))
+    assert msg =~ "WRONGTYPE"
+  end
+
+  test "BLMPOP on a non-list key returns WRONGTYPE instead of treating it as empty" do
+    ctx = FerricStore.Instance.get(:default)
+    key = ukey("blmpop_wrongtype")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+
+    assert :ok = Router.put(ctx, key, "string-value", 0)
+
+    assert {:continue, response, ^state} =
+             ConnBlocking.dispatch_blmpop_ast([key], :left, 1, 1, state)
+
+    assert {:ok, [{:error, msg}], ""} = Parser.parse(IO.iodata_to_binary(response))
+    assert msg =~ "WRONGTYPE"
+  end
+
+  test "spurious BLPOP wake keeps waiting until real work or timeout" do
+    ctx = FerricStore.Instance.get(:default)
+    key = ukey("spurious_wake")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = FerricstoreServer.Connection.Store.build_store(ctx, nil)
+
+    task =
+      Task.async(fn ->
+        ConnBlocking.dispatch_blpop_ast([key], 1_000, state)
+      end)
+
+    wait_until(fn -> Waiters.count(key) == 1 end)
+    send(task.pid, {:waiter_notify, key})
+
+    refute Task.yield(task, 150),
+           "a notify that does not pop a value must not complete the blocking command"
+
+    assert 1 = List.handle("RPUSH", [key, "v1"], store)
+    send(task.pid, {:waiter_notify, key})
+
+    assert {:ok, {:continue, response, ^state}} = Task.yield(task, 500)
+    assert Parser.parse(IO.iodata_to_binary(response)) == {:ok, [[key, "v1"]], ""}
+  end
+
+  test "stale waiter notification cannot make BLPOP pop an unrelated key" do
+    ctx = FerricStore.Instance.get(:default)
+    stale_key = ukey("stale_notify_blpop_old")
+    blocked_key = ukey("stale_notify_blpop_new")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = FerricstoreServer.Connection.Store.build_store(ctx, nil)
+
+    assert 1 = List.handle("RPUSH", [stale_key, "old-value"], store)
+    send(self(), {:waiter_notify, stale_key})
+
+    assert {:continue, response, ^state} =
+             ConnBlocking.dispatch_blpop_ast([blocked_key], 25, state)
+
+    assert Parser.parse(IO.iodata_to_binary(response)) == {:ok, [nil], ""}
+    assert "old-value" = List.handle("LPOP", [stale_key], store)
+  end
+
+  test "stale waiter notification cannot make BLMPOP pop an unrelated key" do
+    ctx = FerricStore.Instance.get(:default)
+    stale_key = ukey("stale_notify_blmpop_old")
+    blocked_key = ukey("stale_notify_blmpop_new")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = FerricstoreServer.Connection.Store.build_store(ctx, nil)
+
+    assert 1 = List.handle("RPUSH", [stale_key, "old-value"], store)
+    send(self(), {:waiter_notify, stale_key})
+
+    assert {:continue, response, ^state} =
+             ConnBlocking.dispatch_blmpop_ast([blocked_key], :left, 1, 25, state)
+
+    assert Parser.parse(IO.iodata_to_binary(response)) == {:ok, [nil], ""}
+    assert "old-value" = List.handle("LPOP", [stale_key], store)
+  end
+
+  test "contended BLPOP wake re-registers waiter before the next push" do
+    ctx = FerricStore.Instance.get(:default)
+    key = ukey("blpop_contended_reregister")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = FerricstoreServer.Connection.Store.build_store(ctx, nil)
+
+    task =
+      Task.async(fn ->
+        ConnBlocking.dispatch_blpop_ast([key], 500, state)
+      end)
+
+    wait_until(fn -> Waiters.count(key) == 1 end)
+
+    Waiters.unregister(key, task.pid)
+    send(task.pid, {:waiter_notify, key})
+    wait_until(fn -> Waiters.count(key) == 1 end)
+
+    assert 1 = List.handle("RPUSH", [key, "fresh-value"], store)
+
+    assert {:ok, {:continue, response, ^state}} = Task.yield(task, 500)
+    assert Parser.parse(IO.iodata_to_binary(response)) == {:ok, [[key, "fresh-value"]], ""}
+  end
+
+  test "BLPOP rechecks after waiter registration to avoid missed list wake" do
+    ctx = FerricStore.Instance.get(:default)
+    key = ukey("blpop_register_gap")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = ConnStore.build_store(ctx, nil)
+
+    Process.put(:ferricstore_list_block_before_register_hook, fn ->
+      assert 1 = List.handle("RPUSH", [key, "v1"], store)
+    end)
+
+    try do
+      assert {:continue, response, ^state} = ConnBlocking.dispatch_blpop_ast([key], 50, state)
+      assert Parser.parse(IO.iodata_to_binary(response)) == {:ok, [[key, "v1"]], ""}
+    after
+      Process.delete(:ferricstore_list_block_before_register_hook)
+    end
+  end
+
+  test "BLMOVE rechecks after waiter registration to avoid missed list wake" do
+    ctx = FerricStore.Instance.get(:default)
+    source = ukey("blmove_register_gap_src")
+    destination = ukey("blmove_register_gap_dst")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = ConnStore.build_store(ctx, nil)
+
+    Process.put(:ferricstore_list_block_before_register_hook, fn ->
+      assert 1 = List.handle("RPUSH", [source, "v1"], store)
+    end)
+
+    try do
+      assert {:continue, response, ^state} =
+               ConnBlocking.dispatch_blmove_ast(source, destination, :left, :right, 50, state)
+
+      assert Parser.parse(IO.iodata_to_binary(response)) == {:ok, ["v1"], ""}
+      assert "v1" = List.handle("RPOP", [destination], store)
+    after
+      Process.delete(:ferricstore_list_block_before_register_hook)
+    end
+  end
+
+  test "BLMPOP rechecks after waiter registration to avoid missed list wake" do
+    ctx = FerricStore.Instance.get(:default)
+    key = ukey("blmpop_register_gap")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = ConnStore.build_store(ctx, nil)
+
+    Process.put(:ferricstore_list_block_before_register_hook, fn ->
+      assert 1 = List.handle("RPUSH", [key, "v1"], store)
+    end)
+
+    try do
+      assert {:continue, response, ^state} =
+               ConnBlocking.dispatch_blmpop_ast([key], :left, 1, 50, state)
+
+      assert Parser.parse(IO.iodata_to_binary(response)) == {:ok, [[key, ["v1"]]], ""}
+    after
+      Process.delete(:ferricstore_list_block_before_register_hook)
+    end
+  end
+
+  test "blocked BLPOP stops when the authenticated user is revoked", context do
+    require_tcp!(context)
+    FerricstoreServer.Acl.reset!()
+    on_exit(fn -> FerricstoreServer.Acl.reset!() end)
+
+    key = ukey("acl_block")
+    admin = connect_and_hello(context.port)
+    worker = connect_and_hello(context.port)
+
+    send_cmd(admin, ["ACL", "SETUSER", "worker", "on", ">pass", "~#{key}", "+@all"])
+    assert {:ok, {:simple, "OK"}} = recv_response(admin)
+
+    send_cmd(worker, ["AUTH", "worker", "pass"])
+    assert {:ok, {:simple, "OK"}} = recv_response(worker)
+
+    send_cmd(worker, ["BLPOP", key, "5"])
+    wait_until(fn -> Waiters.count(key) == 1 end)
+
+    send_cmd(admin, ["ACL", "SETUSER", "worker", "off"])
+    assert {:ok, {:simple, "OK"}} = recv_response(admin)
+
+    send_cmd(admin, ["RPUSH", key, "secret-work"])
+    assert {:ok, 1} = recv_response(admin)
+
+    assert {:ok, {:error, msg}} = recv_response(worker)
+    assert msg =~ "NOPERM"
+
+    send_cmd(admin, ["LPOP", key])
+    assert {:ok, "secret-work"} = recv_response(admin)
+
+    :gen_tcp.close(admin)
+    :gen_tcp.close(worker)
+  end
+
+  test "FLOW.CLAIM_DUE BLOCK refreshes ACL before post-register claim" do
+    Acl.reset!()
+    on_exit(fn -> Acl.reset!() end)
+
+    ctx = FerricStore.Instance.get(:default)
+    type = ukey("flow_acl_block")
+    partition = ukey("tenant")
+    id = ukey("flow")
+
+    create_result =
+      FerricStore.flow_create(id,
+        type: type,
+        partition_key: partition,
+        state: "queued",
+        run_at_ms: 1
+      )
+
+    assert create_result == :ok or match?({:ok, _record}, create_result)
+
+    assert :ok = Acl.set_user("worker", ["on", ">pass", "~#{partition}", "+FLOW.CLAIM_DUE"])
+    stale_cache = ConnAuth.build_acl_cache("worker")
+    assert :ok = Acl.set_user("worker", ["off"])
+
+    state = %Connection{
+      instance_ctx: ctx,
+      sandbox_namespace: nil,
+      username: "worker",
+      acl_cache: stale_cache,
+      authenticated: true,
+      require_auth: false
+    }
+
+    assert {:continue, response, _state} =
+             ConnBlocking.dispatch_flow_claim_due_ast(
+               type,
+               [
+                 partition_key: partition,
+                 worker: "w1",
+                 limit: 1,
+                 now_ms: 1,
+                 block_ms: 50
+               ],
+               state
+             )
+
+    assert {:ok, [{:error, msg}], ""} = Parser.parse(IO.iodata_to_binary(response))
+    assert msg =~ "NOPERM"
+
+    assert {:ok, [%{id: ^id}]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "admin",
+               limit: 1,
+               now_ms: 1
+             )
+  end
+
+  test "BLPOP refreshes ACL before post-register pop" do
+    Acl.reset!()
+    on_exit(fn -> Acl.reset!() end)
+
+    ctx = FerricStore.Instance.get(:default)
+    key = ukey("blpop_acl_register_gap")
+    store = ConnStore.build_store(ctx, nil)
+
+    assert :ok = Acl.set_user("worker", ["on", ">pass", "~#{key}", "+BLPOP"])
+    stale_cache = ConnAuth.build_acl_cache("worker")
+
+    Process.put(:ferricstore_list_block_before_register_hook, fn ->
+      assert :ok = Acl.set_user("worker", ["off"])
+      assert 1 = List.handle("RPUSH", [key, "secret-work"], store)
+    end)
+
+    state = %Connection{
+      instance_ctx: ctx,
+      sandbox_namespace: nil,
+      username: "worker",
+      acl_cache: stale_cache,
+      authenticated: true,
+      require_auth: false
+    }
+
+    try do
+      assert {:continue, response, _state} = ConnBlocking.dispatch_blpop_ast([key], 50, state)
+      assert {:ok, [{:error, msg}], ""} = Parser.parse(IO.iodata_to_binary(response))
+      assert msg =~ "NOPERM"
+      assert "secret-work" = List.handle("LPOP", [key], store)
+    after
+      Process.delete(:ferricstore_list_block_before_register_hook)
+    end
+  end
+
+  test "XREAD BLOCK refreshes ACL before post-register stream read" do
+    Acl.reset!()
+    on_exit(fn -> Acl.reset!() end)
+
+    ctx = FerricStore.Instance.get(:default)
+    stream = ukey("xread_acl_register_gap")
+    store = ConnStore.build_store(ctx, nil)
+
+    assert :ok = Acl.set_user("worker", ["on", ">pass", "~#{stream}", "+XREAD"])
+    stale_cache = ConnAuth.build_acl_cache("worker")
+
+    Process.put(:ferricstore_stream_block_before_register_hook, fn ->
+      assert :ok = Acl.set_user("worker", ["off"])
+      assert is_binary(Stream.handle("XADD", [stream, "1-0", "f", "v"], store))
+    end)
+
+    state = %Connection{
+      instance_ctx: ctx,
+      sandbox_namespace: nil,
+      username: "worker",
+      acl_cache: stale_cache,
+      authenticated: true,
+      require_auth: false
+    }
+
+    try do
+      ast = {:xread, :infinity, {:block, 50}, [{stream, "0-0"}]}
+      args = ["BLOCK", "50", "STREAMS", stream, "0-0"]
+
+      assert {:continue, response, _state} =
+               ConnBlocking.dispatch_stream_read_ast("XREAD", ast, args, state)
+
+      assert {:ok, [{:error, msg}], ""} = Parser.parse(IO.iodata_to_binary(response))
+      assert msg =~ "NOPERM"
+    after
+      Process.delete(:ferricstore_stream_block_before_register_hook)
+    end
+  end
+
+  test "XREAD BLOCK rechecks after waiter registration to avoid missed stream wake" do
+    ctx = FerricStore.Instance.get(:default)
+    stream = ukey("xread_register_gap")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = ConnStore.build_store(ctx, nil)
+
+    Process.put(:ferricstore_stream_block_before_register_hook, fn ->
+      assert is_binary(Stream.handle("XADD", [stream, "1-0", "f", "v"], store))
+    end)
+
+    try do
+      ast = {:xread, :infinity, {:block, 50}, [{stream, "0-0"}]}
+      args = ["BLOCK", "50", "STREAMS", stream, "0-0"]
+
+      assert {:continue, response, ^state} = ConnBlocking.dispatch_xread_ast(ast, args, state)
+
+      assert {:ok, [[[^stream, [["1-0", "f", "v"]]]]], ""} =
+               Parser.parse(IO.iodata_to_binary(response))
+    after
+      Process.delete(:ferricstore_stream_block_before_register_hook)
+    end
+  end
+
+  test "XREADGROUP BLOCK loser remains registered after contended wake" do
+    ctx = FerricStore.Instance.get(:default)
+    stream = ukey("xreadgroup_contended")
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    store = ConnStore.build_store(ctx, nil)
+    parent = self()
+
+    assert is_binary(Stream.handle("XADD", [stream, "1-0", "seed", "v0"], store))
+    assert :ok = Stream.handle("XGROUP", ["CREATE", stream, "grp", "$"], store)
+
+    task_fun = fn consumer ->
+      ast = {:xreadgroup, "grp", consumer, {:infinity, {:block, 500}, [{stream, ">"}]}}
+      args = ["GROUP", "grp", consumer, "BLOCK", "500", "STREAMS", stream, ">"]
+      result = ConnBlocking.dispatch_xread_ast(ast, args, state)
+      send(parent, {:xreadgroup_done, consumer, result})
+      result
+    end
+
+    t1 = Task.async(fn -> task_fun.("c1") end)
+    t2 = Task.async(fn -> task_fun.("c2") end)
+
+    wait_until(fn -> Stream.stream_waiter_count(stream) == 2 end)
+
+    assert is_binary(Stream.handle("XADD", [stream, "2-0", "f", "v1"], store))
+    assert_receive {:xreadgroup_done, first_consumer, first_result}, 500
+    assert first_consumer in ["c1", "c2"]
+    assert_stream_entry(first_result, stream, "2-0")
+
+    assert is_binary(Stream.handle("XADD", [stream, "3-0", "f", "v2"], store))
+    assert_receive {:xreadgroup_done, second_consumer, second_result}, 800
+    assert second_consumer in ["c1", "c2"]
+    assert second_consumer != first_consumer
+    assert_stream_entry(second_result, stream, "3-0")
+
+    Task.shutdown(t1, :brutal_kill)
+    Task.shutdown(t2, :brutal_kill)
   end
 
   # Raw helpers used in setup_all (before context is available)
@@ -206,6 +608,30 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
 
   defp ukey(name), do: "bughunt_#{name}_#{:erlang.unique_integer([:positive])}"
 
+  defp wait_until(fun, deadline_ms \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+    do_wait_until(fun, deadline)
+  end
+
+  defp assert_stream_entry({:continue, response, _state}, stream, id) do
+    assert {:ok, [[[^stream, [[^id, "f", _value]]]]], ""} =
+             Parser.parse(IO.iodata_to_binary(response))
+  end
+
+  defp do_wait_until(fun, deadline) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("condition was not met before timeout")
+
+      true ->
+        Process.sleep(5)
+        do_wait_until(fun, deadline)
+    end
+  end
+
   defp with_raw_store(ctx, update_fn) do
     raw_store_key = raw_store_key(ctx)
     old_raw_store = :persistent_term.get(raw_store_key, :missing)
@@ -243,6 +669,13 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   # ===========================================================================
 
   describe "BLPOP with float timeout 0.5" do
+    test "timeout 0 uses a real infinite server-side wait deadline" do
+      assert :infinity = ConnBlocking.__block_deadline_for_test__(0)
+      assert deadline = ConnBlocking.__block_deadline_for_test__(1)
+      assert is_integer(deadline)
+      assert deadline >= System.monotonic_time(:millisecond)
+    end
+
     test "parse_timeout converts 0.5 seconds to 500 milliseconds" do
       assert {:ok, ["k"], 500} = Blocking.parse_blpop_args(["k", "0.5"])
     end
@@ -696,6 +1129,33 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
       :gen_tcp.close(sock2)
       :gen_tcp.close(sock3)
     end
+
+    test "one multi-element RPUSH wakes enough blocked clients over TCP", context do
+      require_tcp!(context)
+      key = ukey("two_clients_multi_push")
+
+      sock1 = connect_and_hello(context.port)
+      send_cmd(sock1, ["BLPOP", key, "5"])
+      Process.sleep(50)
+
+      sock2 = connect_and_hello(context.port)
+      send_cmd(sock2, ["BLPOP", key, "5"])
+      Process.sleep(50)
+
+      sock3 = connect_and_hello(context.port)
+      send_cmd(sock3, ["RPUSH", key, "val1", "val2"])
+      {:ok, 2} = recv_response(sock3)
+
+      {:ok, result1} = recv_response(sock1, 3_000)
+      {:ok, result2} = recv_response(sock2, 3_000)
+
+      assert result1 == [key, "val1"]
+      assert result2 == [key, "val2"]
+
+      :gen_tcp.close(sock1)
+      :gen_tcp.close(sock2)
+      :gen_tcp.close(sock3)
+    end
   end
 
   # ===========================================================================
@@ -749,6 +1209,57 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
       assert Waiters.count(k3) == 0
 
       Process.exit(pid, :kill)
+    end
+
+    test "waiter is removed when the blocked connection process dies" do
+      ctx = FerricStore.Instance.get(:default)
+      key = ukey("killed_waiter")
+      state = %Connection{instance_ctx: ctx, sandbox_namespace: nil}
+
+      pid =
+        spawn(fn ->
+          ConnBlocking.dispatch_blpop_ast([key], 30_000, state)
+        end)
+
+      wait_until(fn -> Waiters.count(key) == 1 end)
+
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+
+      wait_until(fn -> Waiters.count(key) == 0 end)
+    end
+
+    test "sandboxed BLPOP waiters only wake for pushes in the same sandbox" do
+      ctx = FerricStore.Instance.get(:default)
+      key = ukey("sandbox_blpop")
+      ns_a = "sandbox:a:#{System.unique_integer([:positive])}:"
+      ns_b = "sandbox:b:#{System.unique_integer([:positive])}:"
+      state_a = %Connection{instance_ctx: ctx, sandbox_namespace: ns_a}
+      state_b = %Connection{instance_ctx: ctx, sandbox_namespace: ns_b}
+      store_b = ConnStore.build_store(ctx, ns_b)
+
+      task_a =
+        Task.async(fn ->
+          ConnBlocking.dispatch_blpop_ast([key], 500, state_a)
+        end)
+
+      wait_until(fn -> Waiters.total_count() == 1 end)
+
+      task_b =
+        Task.async(fn ->
+          ConnBlocking.dispatch_blpop_ast([key], 500, state_b)
+        end)
+
+      wait_until(fn -> Waiters.total_count() == 2 end)
+
+      assert 1 = List.handle("RPUSH", [key, "for-b"], store_b)
+
+      assert {:continue, response_b, _state} = Task.await(task_b, 1_000)
+      assert {:ok, [[^key, "for-b"]], ""} = Parser.parse(IO.iodata_to_binary(response_b))
+
+      assert {:continue, response_a, _state} = Task.await(task_a, 1_000)
+      assert {:ok, [nil], ""} = Parser.parse(IO.iodata_to_binary(response_a))
     end
   end
 

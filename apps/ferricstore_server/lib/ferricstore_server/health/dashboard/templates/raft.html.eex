@@ -1,0 +1,17 @@
+<% data = assigns.data %>
+<%= page_head("Consensus - FerricStore", 5) %>
+<body data-dashboard-live-page="raft" data-dashboard-live-url="/dashboard/api/raft" data-dashboard-live-interval-ms="5000">
+<div class="layout">
+<%= render_sidebar_static("raft") %>
+<main class="main-content">
+<%= render_subpage_header("Consensus") %>
+<div class="content">
+<%= render_page_intro("Consensus", "Check WARaft shard leadership, commit/apply lag, cluster membership, and replication health.") %>
+<%= render_live_component("cluster_info", render_cluster_info(data.cluster)) %>
+<%= render_live_component("consensus_summary", render_consensus_summary(data.raft_shards)) %>
+<%= render_live_component("raft_table", render_raft_table(data.raft_shards)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

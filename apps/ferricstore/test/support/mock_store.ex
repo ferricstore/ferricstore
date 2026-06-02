@@ -17,8 +17,14 @@ defmodule Ferricstore.Test.MockStore do
   @spec make(map()) :: map()
   def make(initial \\ %{}) do
     {:ok, pid} = Agent.start_link(fn -> initial end)
-    tmp_dir = System.tmp_dir!() <> "/ferricstore_mock_#{:erlang.unique_integer([:positive])}"
+    tmp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_mock_#{:os.getpid()}_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
     prob_dir = Path.join(tmp_dir, "prob")
+    File.rm_rf!(tmp_dir)
     File.mkdir_p!(prob_dir)
 
     # Per-type resource registries for probabilistic data structures.
@@ -32,7 +38,6 @@ defmodule Ferricstore.Test.MockStore do
     bloom_registry = make_registry(bloom_pid, prob_dir, ".bloom")
 
     %{
-      __flow_default_instance__: true,
       cms_registry: cms_registry,
       cuckoo_registry: cuckoo_registry,
       bloom_registry: bloom_registry,

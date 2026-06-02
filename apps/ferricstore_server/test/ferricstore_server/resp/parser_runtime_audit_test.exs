@@ -15,7 +15,7 @@ defmodule FerricstoreServer.Resp.ParserRuntimeAuditTest do
            "RESP parser is release-critical; it must load the same precompiled artifact shape as the Bitcask and WAL NIFs instead of requiring a manually copied local .so"
 
     assert nif_source =~ ~s(crate: "resp_parser_nif")
-    assert nif_source =~ "force_build:"
+    refute nif_source =~ "force_build: System.get_env"
     assert mix_source =~ ":rustler_precompiled"
 
     assert release_workflow =~

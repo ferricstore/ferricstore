@@ -1,0 +1,16 @@
+<% data = assigns.data %>
+<%= page_head("Merge Status - FerricStore", 10) %>
+<body data-dashboard-live-page="merge" data-dashboard-live-url="/dashboard/api/merge" data-dashboard-live-interval-ms="10000">
+<div class="layout">
+<%= render_sidebar_static("merge") %>
+<main class="main-content">
+<%= render_subpage_header("Merge Status") %>
+<div class="content">
+<%= render_page_intro("Merge Status", "Watch compaction progress, reclaimed bytes, and shards currently doing storage maintenance work.") %>
+<%= render_live_component("merge_summary", render_merge_summary(data.merge)) %>
+<%= render_live_component("merge_table", render_merge_table(data.merge)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

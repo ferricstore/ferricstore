@@ -17,8 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-pub const MAX_PREAD_BYTES: usize = 64 * 1024 * 1024;
-
 pub struct WalHandle {
     /// Shared write buffer. NIF write() appends here, background thread takes.
     buffer: Arc<Mutex<AlignedBuffer>>,
@@ -88,6 +86,49 @@ impl WalHandle {
         })
     }
 
+    /// Open a generic append file from byte 0.
+    ///
+    /// Used by WARaft segment logs where byte 0 is the first segment record.
+    pub fn open_raw_append(
+        path: String,
+        commit_delay_us: u64,
+        max_buffer_bytes: u64,
+        start_offset: u64,
+    ) -> io::Result<Self> {
+        let (file, _o_direct) = background_thread::open_raw_append_file(&path, start_offset)?;
+
+        let read_file = std::fs::OpenOptions::new().read(true).open(&path)?;
+
+        let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
+        let (flush_tx, flush_rx) = crossbeam_channel::bounded(1024);
+        let alive = Arc::new(AtomicBool::new(true));
+        let file_size = Arc::new(AtomicU64::new(start_offset));
+        let config = ThreadConfig {
+            file,
+            buffer: buffer.clone(),
+            rx: flush_rx,
+            alive: alive.clone(),
+            file_size: file_size.clone(),
+            commit_delay: Duration::from_micros(commit_delay_us),
+            _use_o_direct: _o_direct,
+        };
+
+        let thread_handle = std::thread::Builder::new()
+            .name("ferricstore-wal".into())
+            .spawn(move || background_thread::thread_loop(config))?;
+
+        Ok(WalHandle {
+            buffer,
+            flush_tx,
+            alive,
+            file_size_counter: file_size,
+            max_buffer_bytes,
+            commit_delay: Duration::from_micros(commit_delay_us),
+            thread_handle: Mutex::new(Some(thread_handle)),
+            read_file: Mutex::new(read_file),
+        })
+    }
+
     /// Check if the background thread is alive. Returns Err if dead.
     pub fn check_alive(&self) -> Result<(), rustler::Error> {
         if self.alive.load(Ordering::Acquire) {
@@ -95,10 +136,6 @@ impl WalHandle {
         } else {
             Err(rustler::Error::Term(Box::new("wal_thread_dead")))
         }
-    }
-
-    pub fn max_buffer_bytes(&self) -> u64 {
-        self.max_buffer_bytes
     }
 
     /// Append data to the shared write buffer.
@@ -115,11 +152,9 @@ impl WalHandle {
         let incoming = data.len() as u64;
 
         // A single write larger than the configured limit can never become
-        // acceptable by retrying. Reject it before copying into the shared
-        // buffer, then apply normal backpressure until the WAL thread drains.
-        if incoming > self.max_buffer_bytes
-            || buffered > self.max_buffer_bytes.saturating_sub(incoming)
-        {
+        // acceptable by retrying. Treat the limit as soft only while the buffer
+        // is empty, then apply normal backpressure until the WAL thread drains.
+        if buffered > 0 && buffered + incoming > self.max_buffer_bytes {
             return Err(rustler::Error::Term(Box::new("backpressure")));
         }
 
@@ -218,19 +253,12 @@ impl WalHandle {
 
     /// Read bytes from the WAL at offset. For recovery.
     pub fn pread(&self, offset: u64, len: u64) -> Result<Vec<u8>, rustler::Error> {
-        let len_usize =
-            usize::try_from(len).map_err(|_| rustler::Error::Term(Box::new("pread_too_large")))?;
-
-        if len_usize > MAX_PREAD_BYTES {
-            return Err(rustler::Error::Term(Box::new("pread_too_large")));
-        }
-
         let mut file = self
             .read_file
             .lock()
             .map_err(|_| rustler::Error::Term(Box::new("read_mutex_poisoned")))?;
 
-        background_thread::pread_from_file(&mut file, offset, len_usize as u64)
+        background_thread::pread_from_file(&mut file, offset, len)
             .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))
     }
 }
@@ -343,6 +371,20 @@ mod tests {
         let contents = std::fs::read(&path_clone).unwrap();
         assert!(contents.len() >= hdr + 18);
         assert_eq!(&contents[hdr..hdr + 18], b"first second third");
+    }
+
+    #[test]
+    fn raw_append_starts_at_requested_offset_without_wal_header_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment.seg").to_str().unwrap().to_string();
+        let path_clone = path.clone();
+
+        let handle = WalHandle::open_raw_append(path, 0, 64 * 1024 * 1024, 0).unwrap();
+        handle.buffer_write(b"segment-record").unwrap();
+        handle.close().unwrap();
+
+        assert_eq!(handle.file_size(), 14);
+        assert_eq!(std::fs::read(path_clone).unwrap(), b"segment-record");
     }
 
     #[test]

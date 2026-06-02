@@ -23,7 +23,19 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
   alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
 
   setup do
-    on_exit(fn -> Ferricstore.Health.set_ready(true) end)
+    protected_mode = Application.get_env(:ferricstore, :protected_mode)
+    Application.put_env(:ferricstore, :protected_mode, false)
+
+    on_exit(fn ->
+      Ferricstore.Health.set_ready(true)
+
+      if is_nil(protected_mode) do
+        Application.delete_env(:ferricstore, :protected_mode)
+      else
+        Application.put_env(:ferricstore, :protected_mode, protected_mode)
+      end
+    end)
+
     :ok
   end
 
@@ -292,6 +304,87 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
       assert String.contains?(body, "</html>")
       assert String.contains?(body, "<title>FerricStore Dashboard</title>")
     end
+
+    test "overview dashboard is a live shell without full-page meta refresh" do
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard")
+      body = extract_body(response)
+
+      refute String.contains?(body, ~s(http-equiv="refresh"))
+      assert String.contains?(body, ~s(data-dashboard-live-page="overview"))
+      assert String.contains?(body, ~s(data-dashboard-live-url="/dashboard/api/overview"))
+      assert String.contains?(body, "dashboard-live.js")
+    end
+
+    test "flow dashboard is a live shell without full-page meta refresh" do
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard/flow")
+      body = extract_body(response)
+
+      refute String.contains?(body, ~s(http-equiv="refresh"))
+      assert String.contains?(body, ~s(data-dashboard-live-page="flow"))
+      assert String.contains?(body, ~s(data-dashboard-live-url="/dashboard/api/flow"))
+      assert String.contains?(body, "dashboard-live.js")
+    end
+  end
+
+  describe "GET /dashboard/api" do
+    test "overview live endpoint returns component JSON" do
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard/api/overview")
+
+      assert extract_status_code(response) == 200
+      assert extract_headers(response) =~ "Content-Type: application/json"
+
+      {:ok, decoded} = Jason.decode(extract_body(response))
+      assert is_integer(decoded["generated_at_ms"])
+      assert is_map(decoded["components"])
+      assert is_binary(decoded["components"]["top_bar"])
+      assert is_binary(decoded["components"]["content"])
+      assert is_binary(decoded["components"]["footer"])
+    end
+
+    test "flow live endpoint returns component JSON" do
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard/api/flow")
+
+      assert extract_status_code(response) == 200
+      assert extract_headers(response) =~ "Content-Type: application/json"
+
+      {:ok, decoded} = Jason.decode(extract_body(response))
+      assert is_integer(decoded["generated_at_ms"])
+      assert is_map(decoded["components"])
+      assert is_binary(decoded["components"]["flow_overview"])
+      assert is_binary(decoded["components"]["flow_recent_records"])
+    end
+
+    test "all live dashboard component endpoints return JSON payloads" do
+      port = HealthEndpoint.port()
+
+      for path <- [
+            "/dashboard/api/slowlog",
+            "/dashboard/api/merge",
+            "/dashboard/api/raft",
+            "/dashboard/api/clients",
+            "/dashboard/api/storage",
+            "/dashboard/api/prefixes",
+            "/dashboard/api/flow/states",
+            "/dashboard/api/flow/workers",
+            "/dashboard/api/flow/due"
+          ] do
+        response = http_get(port, path)
+
+        assert extract_status_code(response) == 200,
+               "expected #{path} to return 200"
+
+        assert extract_headers(response) =~ "Content-Type: application/json"
+
+        {:ok, decoded} = Jason.decode(extract_body(response))
+        assert is_integer(decoded["generated_at_ms"])
+        assert is_map(decoded["components"])
+        assert map_size(decoded["components"]) > 0
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -365,6 +458,14 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
 
       assert String.contains?(headers, "Content-Type:"),
              "Expected Content-Type header in response for /metrics"
+    end
+
+    test "favicon request does not produce browser console 404 noise" do
+      port = HealthEndpoint.port()
+      response = http_get(port, "/favicon.ico")
+
+      assert response =~ "HTTP/1.1 204 No Content"
+      assert response =~ "Content-Length: 0"
     end
 
     test "all responses include Content-Length header" do

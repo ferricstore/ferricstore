@@ -1,0 +1,12 @@
+<% data = assigns.data %>
+<% result = data.result %>
+<div class="section-title">Result <span class="badge badge-idle"><%= escape(flow_query_result_command(result)) %></span></div>
+<%= render_flow_query_status(result) %>
+<table>
+  <thead>
+    <tr><th>ID / Event</th><th>Type</th><th>State / Action</th><th>Time</th><th>Worker</th><th>Values</th></tr>
+  </thead>
+  <tbody>
+    <%= render_flow_query_rows(result) %>
+  </tbody>
+</table>

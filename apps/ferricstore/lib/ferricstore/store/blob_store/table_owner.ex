@@ -35,6 +35,22 @@ defmodule Ferricstore.Store.BlobStore.TableOwner do
        :set,
        {:read_concurrency, true},
        {:write_concurrency, :auto}
+     ]},
+    {:ferricstore_blob_store_protected_refs,
+     [
+       :named_table,
+       :public,
+       :set,
+       {:read_concurrency, true},
+       {:write_concurrency, :auto}
+     ]},
+    {:ferricstore_blob_store_hardened_protections,
+     [
+       :named_table,
+       :public,
+       :set,
+       {:read_concurrency, true},
+       {:write_concurrency, :auto}
      ]}
   ]
 

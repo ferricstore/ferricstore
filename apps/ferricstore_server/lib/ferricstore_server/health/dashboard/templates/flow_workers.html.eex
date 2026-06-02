@@ -1,0 +1,18 @@
+<% data = assigns.data %>
+<%= page_head("Flow Workers - FerricStore", 2, chartjs: true) %>
+<body data-dashboard-live-page="flow-workers" data-dashboard-live-url="/dashboard/api/flow/workers" data-dashboard-live-interval-ms="2000">
+<div class="layout">
+<%= render_sidebar_static("flow") %>
+<main class="main-content">
+<%= render_subpage_header("Flow Workers") %>
+<div class="content">
+<%= render_page_intro("Flow Workers", "Track worker leases, running jobs, lease age, and stalled worker pressure.") %>
+<%= render_flow_subnav("workers") %>
+<%= render_live_component("flow_workers_chart", render_flow_workers_chart(data.workers)) %>
+<%= render_live_component("flow_workers", render_flow_workers(data.workers)) %>
+<%= render_live_component("flow_running_records", render_flow_running_records(data.running_records, data.total_sampled, data.sample_limit)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

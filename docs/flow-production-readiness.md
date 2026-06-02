@@ -1,9 +1,74 @@
 # Flow Production Readiness Notes
 
-Flow command correctness is based on Ra + Bitcask Flow state/history records and
+Flow command correctness is based on Raft + Bitcask Flow state/history records and
 the hot ETS Flow indexes. LMDB is a cold projection for terminal, lineage, and
 deep-history queries. Hot commands must not wait for LMDB projection flush unless
 the caller explicitly asks for a consistent projection read.
+
+## Operational Limits And Overload
+
+FerricStore derives default guardrails from the actual node/container capacity:
+
+- memory budget: detected cgroup/host memory, or `:operational_memory_limit_bytes`
+- disk budget: filesystem capacity for `:data_dir`, or
+  `:operational_disk_total_bytes` / `:operational_disk_available_bytes`
+- CPU/shards: `System.schedulers_online()` unless `:shard_count` is configured
+
+Default memory ratios:
+
+- warn: `70%`
+- pressure: `80%`
+- reject: `88%`
+- panic: `94%`
+
+Default disk ratios:
+
+- warn: `70%`
+- pressure: `80%`
+- reject: `90%`
+- panic: `95%`
+
+Behavior:
+
+- `pressure`: retention runs with the pressure cadence and merge checks are
+  triggered more aggressively.
+- `disk reject`: all shard disk-pressure flags are set, so new writes fail
+  cleanly instead of queuing work that cannot be persisted.
+- `rss pressure`: cold-read promotion is skipped to avoid hot-cache thrashing.
+- `rss reject`: write rejection follows the same backpressure path as memory
+  exhaustion.
+
+Important operational rule: terminal retention is logical deletion, not instant
+disk reclaim. Bitcask and Raft logs are append-oriented, so disk usage falls only
+after retention commands, merge/compaction, and release cursors catch up. The
+guard therefore starts cleanup at pressure level and rejects new writes before
+the filesystem reaches ENOSPC.
+
+For a larger VM, do not copy small-instance constants. Example: on a 16 CPU,
+64 GiB RAM, 1 TiB NVMe node, the default reject points are derived as roughly
+`56 GiB RSS` and `921 GiB disk used`. If you move the data directory to a larger
+disk, the disk thresholds automatically move with that filesystem.
+
+Operational telemetry:
+
+- `[:ferricstore, :operational, :guard]`
+
+The event includes RSS bytes, memory limit bytes, disk used/total bytes, memory
+level, disk level, ratios, data directory, and shard count.
+
+Recommended starting points for DBOS/Temporal-style Flow workloads:
+
+- shards: one per CPU up to the workload-tested limit, then benchmark
+- queue/workflow batch size: `500`
+- pipeline depth: `50`
+- client connections: at least `cpu_count * 16` for high-throughput benchmarks
+- inline value comfort zone: `64 KiB`
+- blob side-channel threshold: default `256 KiB`
+
+Under overload the Python SDK should treat write rejection/backpressure as a
+signal to slow producers, retry with jitter, or shed load. The server protects
+durability first; it will reject new work before allowing memory or disk
+pressure to corrupt the runtime.
 
 ## LMDB Projection Visibility
 
@@ -16,6 +81,8 @@ Telemetry:
 - `[:ferricstore, :flow, :lmdb_writer, :unavailable]`
 - `[:ferricstore, :flow, :lmdb_replay_safe_index, :persist]`
 - `[:ferricstore, :flow, :lmdb_mirror, :degraded]`
+- `[:ferricstore, :flow, :history_projector, :queue_full]`
+- `[:ferricstore, :flow, :history_projector, :recover]`
 
 Prometheus / `FERRICSTORE.METRICS`:
 
@@ -25,16 +92,65 @@ Prometheus / `FERRICSTORE.METRICS`:
 - `ferricstore_flow_lmdb_replay_safe_persist_failures_total`
 - `ferricstore_flow_lmdb_mirror_enqueue_failures_total`
 - `ferricstore_flow_lmdb_mirror_degraded`
+- `ferricstore_flow_history_projected_index`
+- `ferricstore_flow_history_requested_index`
+- `ferricstore_flow_history_projection_lag`
+- `ferricstore_flow_history_projector_pending_entries`
+- `ferricstore_flow_history_projector_oldest_pending_age_us`
+- `ferricstore_flow_history_projector_flush_failures_total`
+- `ferricstore_flow_history_projector_queue_full_total`
 
-`INFO bitcask` exposes the same shard fields with `shard_N_flow_lmdb_*` names.
-Alert on non-zero degraded flags, increasing enqueue/persist failures, or a
-replay-safe lag that grows instead of draining.
+`INFO bitcask` exposes the same shard fields with `shard_N_flow_lmdb_*` and
+`shard_N_flow_history_*` names. Alert on non-zero degraded flags, increasing
+enqueue/persist/flush failures, or a replay-safe/projection lag that grows
+instead of draining.
+
+Durability boundary:
+
+- Flow command success waits for Ra commit/apply and Bitcask truth writes.
+- LMDB terminal/lineage projection is async.
+- History projection is async, but every requested replay-safe marker is
+  monotonic and never moves backward.
+- `CONSISTENT_PROJECTION`/projection requests may wait for the async projectors;
+  normal hot commands must not.
+
+Failure mode:
+
+- If LMDB/history projection fails, the command remains durable because state and
+  history truth are in Bitcask.
+- Projection lag metrics rise until the projector catches up or an operator
+  fixes the underlying disk/LMDB issue.
+- On restart, projectors replay from durable Flow state/history records and the
+  persisted projected-index markers.
+- Operators can inspect projection state with
+  `FERRICSTORE.DOCTOR CHECK SCOPE FLOW_LMDB`. If the projection remains degraded
+  after fixing the underlying issue, run
+  `FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB` to reconcile the
+  cold/query projection from durable Flow records.
+- The optional LMDB release-cursor poke is disabled by default through
+  `:flow_lmdb_release_cursor_poke_enabled`. Enable it only after validating that
+  the deployment benefits from faster cursor nudges without adding noisy Ra
+  traffic.
+
+Important tuning note: the hot-path throughput cliff during large terminal Flow
+bursts is usually not fixed by making LMDB flush more aggressively. The critical
+budget is `:waraft_apply_projection_cache_max_entries` /
+`FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES`, which buffers applied
+Flow state/value rows until lagged LMDB/history projection consumes them. If it
+is too small, WARaft has to spill/compact that cache synchronously and the
+DBOS-style 1M Flow benchmark can fall from the ~58K/s range to the ~35K/s range.
+Treat LMDB flush interval/batch knobs as lag controls; treat the apply-projection
+cache as the burst-throughput guardrail.
 
 ## Retention And Cleanup
 
 Terminal flows stay in hot indexes for `:flow_terminal_hot_ttl_ms` after LMDB
-flush, then the writer prunes hot terminal/lineage index entries. The Flow state
-record remains durable until normal Flow TTL expiry.
+flush, then the writer prunes hot terminal/lineage index entries. The default is
+`0`, so terminal rows leave hot indexes as soon as the LMDB projection is flushed.
+Terminal history is also cold-only after LMDB projection: it remains queryable
+from LMDB/history storage, but no terminal history rows are kept in the hot Flow
+index by default. The Flow state record remains durable until normal Flow TTL
+expiry.
 
 LMDB terminal and history projections have explicit expire indexes:
 
@@ -44,6 +160,51 @@ LMDB terminal and history projections have explicit expire indexes:
 Cold query paths run bounded sweeps before reading projection rows. This keeps
 expired terminal/history projection rows from growing forever even if no exact
 record is read.
+
+## Blob Protection Cleanup
+
+Blob writes prepared before Ra commit are protected from GC until the command
+outcome is known. If the caller loses the commit outcome after submit, the blob
+protection is intentionally hardened instead of deleted. This is safe: GC keeps
+the blob until the system can prove all older Ra/apply state is replay-safe.
+
+The cleanup path is background-only:
+
+- Hardened protections are tracked in ETS with creation time and metadata.
+- Blob GC snapshots a bounded set of hardened protection IDs per shard.
+- Blob GC commits a no-op Ra barrier for that shard.
+- Blob GC waits until apply/release metrics prove the shard is replay-safe.
+- Under the blob GC shard lock, it releases only the snapshotted hardened IDs and
+  sweeps normally against the current live-ref set.
+
+Telemetry:
+
+- `[:ferricstore, :blob, :protection, :hardened]`
+- `[:ferricstore, :blob, :protection, :reconcile]`
+- `[:ferricstore, :blob, :protection, :reconcile, :failed]`
+
+Prometheus / `FERRICSTORE.METRICS`:
+
+- `ferricstore_blob_hardened_protections`
+- `ferricstore_blob_hardened_oldest_age_ms`
+
+`FERRICSTORE.BLOBGC` also returns:
+
+- `hardened_protections_seen`
+- `hardened_protections_released`
+- `hardened_protections_blocked`
+
+Runbook:
+
+- If `ferricstore_blob_hardened_protections` rises briefly and drains, no action
+  is needed.
+- If `ferricstore_blob_hardened_oldest_age_ms` keeps rising, check Ra health,
+  replay-safe cursor lag, disk pressure, and blob GC errors.
+- `:blob_protection_reconcile_enabled` can disable automatic release if an
+  operator needs manual inspection.
+- `:blob_protection_reconcile_max_records` bounds one GC pass, default `1000`.
+- `:blob_protection_reconcile_barrier_timeout_ms` bounds the Ra/replay wait,
+  default `30000`.
 
 ## Lease Reclaim
 
@@ -87,14 +248,16 @@ when retry exhaustion moves a Flow into `completed`, `failed`, or `cancelled`.
 
 ## History Caps
 
-History has two separate caps:
+History has one user-facing policy cap and one internal hot cache cap:
 
-- `history_hot_max_events`: default `1024`, hard max `10000`
 - `history_max_events`: default `100000`, hard max `1000000`
+- internal hot history cache: default `0`
 
-The hot cap bounds the recent history kept in memory/indexed for quick reads.
-The total cap bounds durable history growth for one Flow. `history_max_events`
-must be greater than or equal to `history_hot_max_events`.
+The internal hot cache keeps history rows only until LMDB projection catches up.
+It is intentionally not exposed through `FLOW.POLICY.SET`; policies should only
+control terminal retention TTL and total durable history growth for one Flow.
+Terminal flows override the hot cap to zero after LMDB projection, because
+terminal history is not on the worker hot path.
 
 ## Fairness
 
@@ -118,11 +281,13 @@ workers, but it is not a replacement for explicit tenant/device worker pools.
 
 Use the lineage bench for large terminal/lineage query surfaces:
 
+LMDB projection is mandatory for Flow and always runs as a lagged cold
+projection. There is no synchronous/write-through mode in production.
+
 ```sh
-MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB=1 FLOW_LMDB_MODE=mirror \
-FLOW_LINEAGE_BACKLOG=1000000 FLOW_LINEAGE_TERMINAL=1000000 \
-FLOW_LINEAGE_ITER=200 FLOW_LINEAGE_QUERY_COUNT=100 \
-mix run --no-start bench/flow_lineage_bench.exs
+MIX_ENV=bench FLOW_LINEAGE_BACKLOG=1000000 \
+FLOW_LINEAGE_TERMINAL=1000000 FLOW_LINEAGE_ITER=200 FLOW_LINEAGE_QUERY_COUNT=100 \
+  mix run --no-start bench/flow_lineage_bench.exs
 ```
 
 For 10M projection scale, run the same bench with:
@@ -157,16 +322,32 @@ existing LMDB lineage indexes. They support `FROM_MS`, `TO_MS`, `REV`, `STATE`,
 and `TERMINAL_ONLY` as read-side filters; no new LMDB rows are written for
 these query shapes.
 
-## Flow Schema Migration
+## Flow Schema And Compact Codec
 
 Before public release, Flow uses one compact current schema:
 
-- Flow record magic: `FSF4`
-- Flow history magic: `FSH1`
-- Flow value magic: `FSV1`
+- Flow record magic: `FSF5`
+- Flow history magic: `FSH2`
+- Flow value magic: `FSV2`
 
 User payload/result/error bytes are raw refs and are not decoded by FerricStore.
 Only Flow metadata is schema-owned by FerricStore.
+
+`FSF5` stores required mutable state fields inline and uses a flag word for
+optional/default fields. Nil values, default counters, default priority,
+missing leases, empty sidecars, and the common `root_flow_id == id` case are not
+written repeatedly. The Elixir codec and Rust NIF codec must stay byte-compatible.
+
+`FSH2` stores per-event history fields only. It intentionally omits immutable
+workflow metadata such as id, type, parent/root, partition, and correlation id.
+User-facing history decode must pass the current/snapshot Flow record as context
+through `Ferricstore.Flow.decode_history_fields/2`; no-context decode is only
+for low-level projection/ref extraction.
+
+Generated payload/result/error refs can be dematerialized from the hot keydir
+after LMDB/history projection confirms the history event. Public Flow value
+reads must go through Flow value helpers so they can resolve hot keydir rows,
+LMDB locators, history-projector files, and WARaft segment locations.
 
 Before public release, old Flow record magic may be rejected cleanly because no
 external user data depends on it yet. After public release, incompatible

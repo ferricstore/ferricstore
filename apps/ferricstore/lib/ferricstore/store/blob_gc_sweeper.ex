@@ -30,7 +30,14 @@ defmodule Ferricstore.Store.BlobGCSweeper do
     tmp_files: 0,
     tmp_bytes: 0
   }
-  @zero_gc %{deleted_files: 0, deleted_bytes: 0, kept_files: 0}
+  @zero_gc %{
+    deleted_files: 0,
+    deleted_bytes: 0,
+    kept_files: 0,
+    hardened_protections_seen: 0,
+    hardened_protections_released: 0,
+    hardened_protections_blocked: 0
+  }
 
   def start_link(opts \\ []) do
     if enabled?(opts) do
@@ -204,6 +211,9 @@ defmodule Ferricstore.Store.BlobGCSweeper do
       kept_files: Map.get(stats, :kept_files, 0),
       deleted_tmp_files: Map.get(stats, :deleted_tmp_files, 0),
       deleted_tmp_bytes: Map.get(stats, :deleted_tmp_bytes, 0),
+      hardened_protections_seen: Map.get(stats, :hardened_protections_seen, 0),
+      hardened_protections_released: Map.get(stats, :hardened_protections_released, 0),
+      hardened_protections_blocked: Map.get(stats, :hardened_protections_blocked, 0),
       skipped: Map.get(stats, :skipped, false),
       reason: Map.get(stats, :reason)
     }

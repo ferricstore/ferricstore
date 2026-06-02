@@ -437,18 +437,6 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_create(__instance__(), id, opts)
       end
 
-      def flow_signal(id, opts) do
-        FerricStore.Impl.flow_signal(__instance__(), id, opts)
-      end
-
-      def flow_value_put(value, opts \\ []) do
-        FerricStore.Impl.flow_value_put(__instance__(), value, opts)
-      end
-
-      def flow_value_mget(refs, opts \\ []) do
-        FerricStore.Impl.flow_value_mget(__instance__(), refs, opts)
-      end
-
       def flow_create_many(partition_key, items, opts \\ []) do
         FerricStore.Impl.flow_create_many(__instance__(), partition_key, items, opts)
       end
@@ -459,14 +447,6 @@ defmodule FerricStore.Macro do
 
       def flow_get(id, opts \\ []) do
         FerricStore.Impl.flow_get(__instance__(), id, opts)
-      end
-
-      def flow_policy_set(type, opts) do
-        FerricStore.Impl.flow_policy_set(__instance__(), type, opts)
-      end
-
-      def flow_policy_get(type, opts \\ []) do
-        FerricStore.Impl.flow_policy_get(__instance__(), type, opts)
       end
 
       def flow_claim_due(type, opts) do
@@ -483,10 +463,6 @@ defmodule FerricStore.Macro do
 
       def flow_complete(id, lease_token, opts \\ []) do
         FerricStore.Impl.flow_complete(__instance__(), id, lease_token, opts)
-      end
-
-      def flow_complete_many(partition_key, items, opts \\ []) do
-        FerricStore.Impl.flow_complete_many(__instance__(), partition_key, items, opts)
       end
 
       def flow_transition(id, from_state, to_state, opts \\ []) do
@@ -508,24 +484,12 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_retry(__instance__(), id, lease_token, opts)
       end
 
-      def flow_retry_many(partition_key, items, opts \\ []) do
-        FerricStore.Impl.flow_retry_many(__instance__(), partition_key, items, opts)
-      end
-
       def flow_fail(id, lease_token, opts \\ []) do
         FerricStore.Impl.flow_fail(__instance__(), id, lease_token, opts)
       end
 
-      def flow_fail_many(partition_key, items, opts \\ []) do
-        FerricStore.Impl.flow_fail_many(__instance__(), partition_key, items, opts)
-      end
-
       def flow_cancel(id, opts \\ []) do
         FerricStore.Impl.flow_cancel(__instance__(), id, opts)
-      end
-
-      def flow_cancel_many(partition_key, items, opts \\ []) do
-        FerricStore.Impl.flow_cancel_many(__instance__(), partition_key, items, opts)
       end
 
       def flow_rewind(id, opts) do
@@ -534,14 +498,6 @@ defmodule FerricStore.Macro do
 
       def flow_list(type, opts \\ []) do
         FerricStore.Impl.flow_list(__instance__(), type, opts)
-      end
-
-      def flow_terminals(type, opts \\ []) do
-        FerricStore.Impl.flow_terminals(__instance__(), type, opts)
-      end
-
-      def flow_failures(type, opts \\ []) do
-        FerricStore.Impl.flow_failures(__instance__(), type, opts)
       end
 
       def flow_by_parent(parent_flow_id, opts \\ []) do
@@ -566,10 +522,6 @@ defmodule FerricStore.Macro do
 
       def flow_history(id, opts \\ []) do
         FerricStore.Impl.flow_history(__instance__(), id, opts)
-      end
-
-      def flow_retention_cleanup(opts \\ []) do
-        FerricStore.Impl.flow_retention_cleanup(__instance__(), opts)
       end
 
       # ---------------------------------------------------------------

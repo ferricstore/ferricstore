@@ -224,4 +224,21 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
       assert result =~ "barrier_indices="
     end
   end
+
+  describe "CLUSTER.ROLE" do
+    test "reports the configured raft role even with no remote cluster nodes", %{store: store} do
+      previous_role = Application.get_env(:ferricstore, :cluster_role)
+
+      try do
+        Application.put_env(:ferricstore, :cluster_role, :voter)
+
+        assert "voter" == Cluster.handle("CLUSTER.ROLE", [], store)
+      after
+        restore_env(:cluster_role, previous_role)
+      end
+    end
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

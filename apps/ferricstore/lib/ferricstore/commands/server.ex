@@ -33,8 +33,12 @@ defmodule Ferricstore.Commands.Server do
 
   alias Ferricstore.AuditLog
   alias Ferricstore.Commands.Catalog
+  alias Ferricstore.Raft.Cluster, as: RaftCluster
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
   alias Ferricstore.Stats
+
+  @waraft_table :ferricstore_waraft_backend
 
   @doc """
   Handles a server command.
@@ -292,48 +296,7 @@ defmodule Ferricstore.Commands.Server do
         ctx = FerricStore.Instance.get(:default)
         shard_count = ctx.shard_count
 
-        batcher_parts =
-          for i <- 0..(shard_count - 1) do
-            name = :"Ferricstore.Raft.Batcher.#{i}"
-
-            case Process.whereis(name) do
-              nil ->
-                "B#{i}=down"
-
-              pid ->
-                info = Process.info(pid, [:message_queue_len, :reductions])
-                "B#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-            end
-          end
-
-        wal_name = :ra_ferricstore_raft_log_wal
-
-        wal_part =
-          case Process.whereis(wal_name) do
-            nil ->
-              "WAL=down"
-
-            pid ->
-              info = Process.info(pid, [:message_queue_len, :reductions])
-              "WAL:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-          end
-
-        ra_parts =
-          for i <- 0..(shard_count - 1) do
-            name = :"ferricstore_shard_#{i}"
-
-            case Process.whereis(name) do
-              nil ->
-                "R#{i}=down"
-
-              pid ->
-                info = Process.info(pid, [:message_queue_len, :reductions])
-                "R#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-            end
-          end
-
-        all = batcher_parts ++ [wal_part] ++ ra_parts
-        {:simple, Enum.join(all, " | ")}
+        {:simple, debug_batcher_stats(shard_count)}
 
       "SET-ACTIVE-EXPIRE" when length(rest) == 1 ->
         :ok
@@ -486,9 +449,69 @@ defmodule Ferricstore.Commands.Server do
     {:error, "ERR wrong number of arguments for 'ferricstore.blobgc' command"}
   end
 
+  def handle("FERRICSTORE.DOCTOR", args, store) when is_list(args) do
+    with {:ok, ctx} <- server_instance_ctx(store) do
+      Ferricstore.Doctor.handle_command(normalize_doctor_args(args), ctx)
+    else
+      {:error, :no_default_instance} ->
+        {:error, "ERR no default instance available for 'ferricstore.doctor' command"}
+    end
+  end
+
   # ===========================================================================
   # Private helpers
   # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # DEBUG helpers
+  # ---------------------------------------------------------------------------
+
+  defp debug_batcher_stats(shard_count), do: debug_waraft_stats(shard_count)
+
+  defp debug_waraft_stats(shard_count) do
+    if shard_count <= 0 do
+      ""
+    else
+      0..(shard_count - 1)
+      |> Enum.map(&debug_waraft_shard_stats/1)
+      |> Enum.join(" | ")
+    end
+  end
+
+  defp debug_waraft_shard_stats(shard_index) do
+    partition = shard_index + 1
+
+    components = [
+      {"server", :wa_raft_server.registered_name(@waraft_table, partition)},
+      {"acceptor", :wa_raft_acceptor.registered_name(@waraft_table, partition)},
+      {"queue", :wa_raft_queue.registered_name(@waraft_table, partition)},
+      {"storage", :wa_raft_storage.registered_name(@waraft_table, partition)}
+    ]
+
+    body =
+      components
+      |> Enum.map(fn {label, name} -> "#{label}=#{component_process_stat(name)}" end)
+      |> Kernel.++(["inflight_bytes=#{WARaftBackend.inflight_commit_bytes(shard_index)}"])
+      |> Enum.join(",")
+
+    "WA#{shard_index}:#{body}"
+  end
+
+  defp component_process_stat(name) do
+    case process_stat(name) do
+      :down -> "down"
+      {mq, reductions} -> "mq=#{mq},r=#{reductions}"
+    end
+  end
+
+  defp process_stat(name) do
+    with pid when is_pid(pid) <- Process.whereis(name),
+         info when is_list(info) <- Process.info(pid, [:message_queue_len, :reductions]) do
+      {Keyword.get(info, :message_queue_len, 0), Keyword.get(info, :reductions, 0)}
+    else
+      _ -> :down
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # SAVE helpers
@@ -882,23 +905,14 @@ defmodule Ferricstore.Commands.Server do
 
     fields =
       Enum.flat_map(0..(shard_count - 1), fn i ->
-        shard_id = {:"ferricstore_shard_#{i}", node()}
-
         try do
-          case :ra.members(shard_id) do
+          case RaftCluster.members(i, 1_000) do
             {:ok, _members, leader} ->
-              # Get counters from ra_counters
-              counters =
-                try do
-                  :ra_counters.overview(shard_id)
-                rescue
-                  _ -> %{}
-                catch
-                  _, _ -> %{}
-                end
+              local_id = local_raft_member_id(i)
+              {commit_index, last_applied, current_term} = raft_section_counters(i, local_id)
 
               role =
-                if leader == shard_id do
+                if leader == local_id do
                   "leader"
                 else
                   "follower"
@@ -910,17 +924,13 @@ defmodule Ferricstore.Commands.Server do
                   _ -> "unknown"
                 end
 
-              commit_index = Map.get(counters, :commit_index, 0)
-              last_applied = Map.get(counters, :last_applied, 0)
-              current_term = Map.get(counters, :term, 0)
-
               [
                 {"shard_#{i}_role", role},
                 {"shard_#{i}_current_term", Integer.to_string(current_term)},
                 {"shard_#{i}_commit_index", Integer.to_string(commit_index)},
                 {"shard_#{i}_last_applied", Integer.to_string(last_applied)},
                 {"shard_#{i}_leader_node", leader_node_str}
-              ]
+              ] ++ waraft_info_fields(i)
 
             _ ->
               [
@@ -929,7 +939,7 @@ defmodule Ferricstore.Commands.Server do
                 {"shard_#{i}_commit_index", "0"},
                 {"shard_#{i}_last_applied", "0"},
                 {"shard_#{i}_leader_node", "unknown"}
-              ]
+              ] ++ waraft_info_fields(i)
           end
         rescue
           _ ->
@@ -939,7 +949,7 @@ defmodule Ferricstore.Commands.Server do
               {"shard_#{i}_commit_index", "0"},
               {"shard_#{i}_last_applied", "0"},
               {"shard_#{i}_leader_node", "unknown"}
-            ]
+            ] ++ waraft_info_fields(i)
         catch
           _, _ ->
             [
@@ -948,7 +958,7 @@ defmodule Ferricstore.Commands.Server do
               {"shard_#{i}_commit_index", "0"},
               {"shard_#{i}_last_applied", "0"},
               {"shard_#{i}_leader_node", "unknown"}
-            ]
+            ] ++ waraft_info_fields(i)
         end
       end)
 
@@ -1041,6 +1051,22 @@ defmodule Ferricstore.Commands.Server do
         flow_lmdb_writer_flush_failures =
           atomic_metric(instance_ctx, :flow_lmdb_writer_flush_failures, i)
 
+        flow_history_projected = atomic_metric(instance_ctx, :flow_history_projected_index, i)
+        flow_history_requested = atomic_metric(instance_ctx, :flow_history_requested_index, i)
+        flow_history_lag = max(flow_history_requested - flow_history_projected, 0)
+
+        flow_history_projector_pending_entries =
+          atomic_metric(instance_ctx, :flow_history_projector_pending_entries, i)
+
+        flow_history_projector_oldest_pending_age_us =
+          atomic_metric(instance_ctx, :flow_history_projector_oldest_pending_age_us, i)
+
+        flow_history_projector_flush_failures =
+          atomic_metric(instance_ctx, :flow_history_projector_flush_failures, i)
+
+        flow_history_projector_queue_full =
+          atomic_metric(instance_ctx, :flow_history_projector_queue_full, i)
+
         release_gap = max(last_applied - last_released, 0)
 
         release_cursor_blocked_apply_count =
@@ -1076,6 +1102,17 @@ defmodule Ferricstore.Commands.Server do
            Integer.to_string(flow_lmdb_writer_oldest_pending_age_us)},
           {"shard_#{i}_flow_lmdb_writer_flush_failures",
            Integer.to_string(flow_lmdb_writer_flush_failures)},
+          {"shard_#{i}_flow_history_projected_index", Integer.to_string(flow_history_projected)},
+          {"shard_#{i}_flow_history_requested_index", Integer.to_string(flow_history_requested)},
+          {"shard_#{i}_flow_history_projection_lag", Integer.to_string(flow_history_lag)},
+          {"shard_#{i}_flow_history_projector_pending_entries",
+           Integer.to_string(flow_history_projector_pending_entries)},
+          {"shard_#{i}_flow_history_projector_oldest_pending_age_us",
+           Integer.to_string(flow_history_projector_oldest_pending_age_us)},
+          {"shard_#{i}_flow_history_projector_flush_failures",
+           Integer.to_string(flow_history_projector_flush_failures)},
+          {"shard_#{i}_flow_history_projector_queue_full",
+           Integer.to_string(flow_history_projector_queue_full)},
           {"shard_#{i}_release_cursor_gap", Integer.to_string(release_gap)},
           {"shard_#{i}_release_cursor_blocked_apply_count",
            Integer.to_string(release_cursor_blocked_apply_count)},
@@ -1096,16 +1133,8 @@ defmodule Ferricstore.Commands.Server do
 
     raft_committed =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
-        shard_id = {:"ferricstore_shard_#{i}", node()}
-
-        try do
-          counters = :ra_counters.overview(shard_id)
-          acc + Map.get(counters, :last_applied, 0)
-        rescue
-          _ -> acc
-        catch
-          _, _ -> acc
-        end
+        {_commit_index, last_applied, _term} = raft_section_counters(i, local_raft_member_id(i))
+        acc + last_applied
       end)
 
     hot_cache_evictions =
@@ -1183,6 +1212,58 @@ defmodule Ferricstore.Commands.Server do
     fields = [{"distinct_prefixes", Integer.to_string(distinct_prefixes)} | prefix_fields]
 
     format_section("Keydir_Analysis", fields)
+  end
+
+  defp waraft_info_fields(shard_index) do
+    segment_log = WARaftBackend.segment_log_memory_status(shard_index)
+
+    [
+      {"shard_#{shard_index}_waraft_inflight_commit_bytes",
+       Integer.to_string(WARaftBackend.inflight_commit_bytes(shard_index))},
+      {"shard_#{shard_index}_waraft_segment_log_ets_entries",
+       waraft_info_value(segment_log[:ets_entries])},
+      {"shard_#{shard_index}_waraft_segment_log_ets_bytes",
+       waraft_info_value(segment_log[:ets_bytes])},
+      {"shard_#{shard_index}_waraft_segment_log_disk_first_index",
+       waraft_info_value(segment_log[:disk_first_index])},
+      {"shard_#{shard_index}_waraft_segment_log_disk_last_index",
+       waraft_info_value(segment_log[:disk_last_index])},
+      {"shard_#{shard_index}_waraft_segment_log_max_ets_entries",
+       waraft_info_value(segment_log[:max_ets_entries])},
+      {"shard_#{shard_index}_waraft_segment_log_max_ets_bytes",
+       waraft_info_value(segment_log[:max_ets_bytes])},
+      {"shard_#{shard_index}_waraft_segment_log_min_ets_entries",
+       waraft_info_value(segment_log[:min_ets_entries])}
+    ]
+  end
+
+  defp waraft_info_value(:infinity), do: "infinity"
+  defp waraft_info_value(:undefined), do: "0"
+  defp waraft_info_value(nil), do: "0"
+  defp waraft_info_value(value) when is_integer(value), do: Integer.to_string(value)
+  defp waraft_info_value(value) when is_binary(value), do: value
+  defp waraft_info_value(value), do: inspect(value)
+
+  defp local_raft_member_id(shard_index) do
+    RaftCluster.shard_server_id(shard_index)
+  end
+
+  defp raft_section_counters(shard_index, local_id) do
+    _ = local_id
+    waraft_section_counters(shard_index)
+  end
+
+  defp waraft_section_counters(shard_index) do
+    {last_applied, term_from_position} =
+      case WARaftBackend.storage_position(shard_index) do
+        {:ok, {:raft_log_pos, index, term}} when is_integer(index) and is_integer(term) ->
+          {index, term}
+
+        _other ->
+          {0, 0}
+      end
+
+    {last_applied, last_applied, term_from_position}
   end
 
   defp emit_info_bitcask_scan_failed(phase, shard_index, path, reason) do
@@ -1427,6 +1508,42 @@ defmodule Ferricstore.Commands.Server do
 
   defp upcase_local_modifier(args), do: args
 
+  defp normalize_doctor_args([]), do: []
+
+  defp normalize_doctor_args([command | rest]) when is_binary(command) do
+    case String.upcase(command) do
+      "CHECK" -> ["CHECK" | normalize_doctor_scope_args(rest)]
+      "START" -> ["START" | normalize_doctor_start_args(rest)]
+      "STATUS" -> ["STATUS" | rest]
+      "LIST" -> ["LIST" | rest]
+      "CANCEL" -> ["CANCEL" | rest]
+      other -> [other | rest]
+    end
+  end
+
+  defp normalize_doctor_args(args), do: args
+
+  defp normalize_doctor_start_args([kind, subject | rest])
+       when is_binary(kind) and is_binary(subject) do
+    [String.upcase(kind), String.upcase(subject) | normalize_doctor_scope_args(rest)]
+  end
+
+  defp normalize_doctor_start_args([kind | rest]) when is_binary(kind),
+    do: [String.upcase(kind) | rest]
+
+  defp normalize_doctor_start_args(args), do: args
+
+  defp normalize_doctor_scope_args([scope_kw, scope | rest])
+       when is_binary(scope_kw) and is_binary(scope) do
+    case String.upcase(scope_kw) do
+      "SCOPE" -> ["SCOPE", scope | rest]
+      "SCOPES" -> ["SCOPES", scope | rest]
+      _other -> [scope_kw, scope | rest]
+    end
+  end
+
+  defp normalize_doctor_scope_args(args), do: args
+
   defp server_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: {:ok, ctx}
 
   defp server_instance_ctx(_store) do
@@ -1446,7 +1563,13 @@ defmodule Ferricstore.Commands.Server do
       "deleted_tmp_files",
       Map.get(stats, :deleted_tmp_files, 0),
       "deleted_tmp_bytes",
-      Map.get(stats, :deleted_tmp_bytes, 0)
+      Map.get(stats, :deleted_tmp_bytes, 0),
+      "hardened_protections_seen",
+      Map.get(stats, :hardened_protections_seen, 0),
+      "hardened_protections_released",
+      Map.get(stats, :hardened_protections_released, 0),
+      "hardened_protections_blocked",
+      Map.get(stats, :hardened_protections_blocked, 0)
     ]
   end
 

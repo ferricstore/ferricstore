@@ -1,0 +1,10 @@
+<% data = assigns.data %>
+<div class="section-title">Lineage Records</div>
+<table>
+  <thead>
+    <tr><th>ID</th><th>Type</th><th>State</th><th>Parent</th><th>Root</th><th>Correlation</th><th>Updated</th><th>Values</th></tr>
+  </thead>
+  <tbody>
+    <%= render_flow_lineage_rows(data.records) %>
+  </tbody>
+</table>

@@ -251,6 +251,47 @@ defmodule Ferricstore.Commands.SetStoreCommandsTest do
       assert 2 == Set.handle("SINTERCARD", ["2", "s1", "s2", "LIMIT", "2"], store)
     end
 
+    test "batches membership probes while preserving LIMIT" do
+      parent = self()
+      type_base = CompoundKey.type_key("base")
+      type_other = CompoundKey.type_key("other")
+
+      present =
+        MapSet.new([
+          CompoundKey.set_member("other", "a"),
+          CompoundKey.set_member("other", "b"),
+          CompoundKey.set_member("other", "c")
+        ])
+
+      store = %{
+        compound_get: fn
+          "base", ^type_base -> "set"
+          "other", ^type_other -> "set"
+          key, "S:" <> _rest -> flunk("SINTERCARD should batch membership probes for #{key}")
+        end,
+        compound_count: fn
+          "base", _prefix -> 4
+          "other", _prefix -> 10
+        end,
+        compound_scan: fn
+          "base", _prefix -> [{"a", "1"}, {"b", "1"}, {"c", "1"}, {"d", "1"}]
+          "other", _prefix -> flunk("SINTERCARD should not scan the larger set")
+        end,
+        compound_batch_get: fn "other", keys ->
+          send(parent, {:batch_probe, keys})
+
+          Enum.map(keys, fn key ->
+            if MapSet.member?(present, key), do: "1", else: nil
+          end)
+        end
+      }
+
+      assert 2 == Set.handle("SINTERCARD", ["2", "base", "other", "LIMIT", "2"], store)
+
+      assert_receive {:batch_probe, keys}
+      assert length(keys) <= 4
+    end
+
     test "LIMIT 0 means no limit" do
       store = MockStore.make()
       Set.handle("SADD", ["s1", "a", "b", "c"], store)

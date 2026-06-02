@@ -8,7 +8,7 @@
 #   * 100 x FLOW.TRANSITION in one TCP pipeline
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start \
+#   MIX_ENV=bench mix run --no-start \
 #     -e 'Code.require_file("bench/flow_resp_pipeline_bench.exs")'
 #
 # Options:
@@ -34,7 +34,6 @@ Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
-Application.put_env(:ferricstore, :flow_lmdb_mode, System.get_env("FLOW_LMDB_MODE", "mirror"))
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 {:ok, _} = Application.ensure_all_started(:ferricstore_server)
@@ -192,13 +191,16 @@ defmodule FlowRespPipelineBench do
           %{id: id(prefix, group, j), payload: "payload:" <> id(prefix, group, j)}
         end
 
-      {:ok, _flows} =
-        FerricStore.flow_create_many(partition_key, items,
-          type: flow_type,
-          state: "queued",
-          run_at_ms: 1_000,
-          now_ms: 1_000
-        )
+      case FerricStore.flow_create_many(partition_key, items,
+             type: flow_type,
+             state: "queued",
+             run_at_ms: 1_000,
+             now_ms: 1_000
+           ) do
+        :ok -> :ok
+        {:ok, _flows} -> :ok
+        other -> raise("seed flow_create_many failed: #{inspect(other)}")
+      end
     end
   end
 

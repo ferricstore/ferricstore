@@ -14,7 +14,6 @@ defmodule Ferricstore.MixProject do
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      compilers: Mix.compilers() ++ [:patched_wal],
       deps: deps(),
       package: package(),
       docs: docs()
@@ -57,7 +56,8 @@ defmodule Ferricstore.MixProject do
 
   defp package do
     [
-      description: "Distributed persistent key-value cache with Redis wire protocol (RESP3), Raft consensus, and Bitcask storage engine.",
+      description:
+        "Distributed persistent key-value cache with Redis wire protocol (RESP3), Raft consensus, and Bitcask storage engine.",
       files: [
         "lib",
         "native/ferricstore_bitcask/.cargo",
@@ -83,7 +83,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.37", optional: true},
-      {:ra, "~> 3.1.3-ferricstore.2", hex: :ra_ferricstore},
+      {:wa_raft, path: "../../vendor/waraft", manager: :rebar3},
       {:libcluster, "3.3.3"},
       {:libcluster_consul, "1.3.0", optional: true},
       {:libcluster_etcd, "1.1.2", optional: true},

@@ -385,59 +385,26 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_store_for_shard(FerricStore.Instance.t(), non_neg_integer()) :: map()
   def build_store_for_shard(ctx, shard_idx) do
-    shard = Router.shard_name(ctx, shard_idx)
-
-    # Reads can stay local (we read our own ETS — fast). Writes route through
-    # Router so they get the not_leader → forward path. Without this, msetnx
-    # and other cross-shard ops would silently no-op when the local node
-    # isn't the leader for the target shard (the local shard call returns
-    # {:error, {:not_leader, ...}}, the closure returns it as a value, and
-    # the caller treats it as success).
+    # Reads use Router's direct keydir path instead of the Shard GenServer.
+    # WARaft applies default-instance writes through its storage backend, so the
+    # old shard process is not the source of truth in replacement mode. This
+    # also avoids a GenServer hop for same-shard generic and compound commands.
+    #
+    # Writes still route through Router so they get the selected replication
+    # backend and not_leader/forward handling.
     %{
       shard_idx: shard_idx,
-      get: fn key ->
-        try do
-          GenServer.call(shard, {:get, key}, 5_000)
-        catch
-          :exit, _ -> nil
-        end
-      end,
-      get_meta: fn key ->
-        try do
-          GenServer.call(shard, {:get_meta, key}, 5_000)
-        catch
-          :exit, _ -> nil
-        end
-      end,
+      get: fn key -> Router.get(ctx, key) end,
+      get_meta: fn key -> Router.get_meta(ctx, key) end,
       put: fn key, value, expire_at_ms -> Router.put(ctx, key, value, expire_at_ms) end,
       delete: fn key -> Router.delete(ctx, key) end,
-      exists?: fn key ->
-        try do
-          GenServer.call(shard, {:exists, key}, 5_000)
-        catch
-          :exit, _ -> false
-        end
-      end,
-      keys: fn ->
-        try do
-          GenServer.call(shard, :keys, 5_000)
-        catch
-          :exit, _ -> []
-        end
-      end,
+      exists?: fn key -> Router.exists?(ctx, key) end,
+      keys: fn -> Router.keys(ctx) end,
       compound_get: fn redis_key, compound_key ->
-        try do
-          GenServer.call(shard, {:compound_get, redis_key, compound_key}, 5_000)
-        catch
-          :exit, _ -> nil
-        end
+        Router.compound_get(ctx, redis_key, compound_key)
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        try do
-          GenServer.call(shard, {:compound_get_meta, redis_key, compound_key}, 5_000)
-        catch
-          :exit, _ -> nil
-        end
+        Router.compound_get_meta(ctx, redis_key, compound_key)
       end,
       compound_batch_get: fn redis_key, compound_keys ->
         Router.compound_batch_get(ctx, redis_key, compound_keys)
@@ -457,20 +424,8 @@ defmodule Ferricstore.CrossShardOp do
       compound_batch_delete: fn redis_key, compound_keys ->
         Router.compound_batch_delete(ctx, redis_key, compound_keys)
       end,
-      compound_scan: fn redis_key, prefix ->
-        try do
-          GenServer.call(shard, {:compound_scan, redis_key, prefix}, 5_000)
-        catch
-          :exit, _ -> []
-        end
-      end,
-      compound_count: fn redis_key, prefix ->
-        try do
-          GenServer.call(shard, {:compound_count, redis_key, prefix}, 5_000)
-        catch
-          :exit, _ -> 0
-        end
-      end,
+      compound_scan: fn redis_key, prefix -> Router.compound_scan(ctx, redis_key, prefix) end,
+      compound_count: fn redis_key, prefix -> Router.compound_count(ctx, redis_key, prefix) end,
       compound_delete_prefix: fn redis_key, prefix ->
         Router.compound_delete_prefix(ctx, redis_key, prefix)
       end
@@ -694,7 +649,7 @@ defmodule Ferricstore.CrossShardOp do
   end
 
   defp single_member_raft_group?(shard_index) do
-    case Cluster.members(shard_index) do
+    case Cluster.members(shard_index, 0) do
       {:ok, members, _leader} when is_list(members) -> length(members) == 1
       _other -> false
     end
@@ -726,8 +681,8 @@ defmodule Ferricstore.CrossShardOp do
 
   # The ferricstore state machine wraps every reply as `{:applied_at, ra_index, real}`
   # so the Batcher can gate on local-apply for read-your-write. CrossShardOp uses
-  # `:ra.process_command/2` which surfaces that wrap directly to the caller —
-  # unwrap before pattern-matching against `{:ok, :ok, _}` etc.
+  # Direct command submission surfaces that wrap to the caller, so unwrap before
+  # pattern-matching against `{:ok, :ok, _}` etc.
   defp unwrap_ra_reply({:ok, {:applied_at, _idx, real}, leader}), do: {:ok, real, leader}
   defp unwrap_ra_reply(other), do: other
 end

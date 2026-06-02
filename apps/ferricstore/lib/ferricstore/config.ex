@@ -444,8 +444,7 @@ defmodule Ferricstore.Config do
   end
 
   defp atomic_write_file(path, content) do
-    dir = Path.dirname(path)
-    tmp_path = Path.join(dir, ".#{Path.basename(path)}.tmp.#{System.unique_integer([:positive])}")
+    tmp_path = path <> ".tmp"
 
     with :ok <- secure_write_tmp(tmp_path, content),
          :ok <- Ferricstore.FS.rename(tmp_path, path),
@@ -755,9 +754,10 @@ defmodule Ferricstore.Config do
         "allkeys-lru" -> :allkeys_lru
         "volatile-ttl" -> :volatile_ttl
         "noeviction" -> :noeviction
-      end
+    end
 
     Application.put_env(:ferricstore, :eviction_policy, atom)
+    reconfigure_memory_guard("maxmemory-policy", %{eviction_policy: atom})
   end
 
   defp apply_side_effect("slowlog-log-slower-than", value) do

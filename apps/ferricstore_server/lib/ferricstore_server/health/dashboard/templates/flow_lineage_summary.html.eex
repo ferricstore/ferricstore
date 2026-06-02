@@ -1,0 +1,24 @@
+<% data = assigns.data %>
+<% summary = data.summary %>
+<div class="flow-card-grid">
+  <div class="flow-card">
+    <div class="flow-card-label">Records</div>
+    <div class="flow-card-value"><%= format_number(summary.total) %></div>
+    <div class="flow-card-detail"><%= escape(flow_lineage_result_label(data.result)) %></div>
+  </div>
+  <div class="flow-card">
+    <div class="flow-card-label">Active</div>
+    <div class="flow-card-value"><%= format_number(summary.active) %></div>
+    <div class="flow-card-detail">non-terminal children/workflows</div>
+  </div>
+  <div class="flow-card">
+    <div class="flow-card-label">Terminal</div>
+    <div class="flow-card-value"><%= format_number(summary.terminal) %></div>
+    <div class="flow-card-detail">completed, failed, cancelled</div>
+  </div>
+  <div class="flow-card">
+    <div class="flow-card-label">Failed</div>
+    <div class="flow-card-value c-red"><%= format_number(summary.failed) %></div>
+    <div class="flow-card-detail">failed lineage records</div>
+  </div>
+</div>
