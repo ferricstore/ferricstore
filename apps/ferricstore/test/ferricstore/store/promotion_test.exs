@@ -229,6 +229,29 @@ defmodule Ferricstore.Store.PromotionTest do
     GenServer.call(shard, {:promoted?, redis_key})
   end
 
+  defp promoted_state(shard, redis_key, attempts \\ 50)
+
+  defp promoted_state(shard, redis_key, attempts) when attempts > 0 do
+    state = :sys.get_state(shard)
+
+    case state.promoted_instances[redis_key] do
+      nil ->
+        Process.sleep(20)
+        promoted_state(shard, redis_key, attempts - 1)
+
+      promoted_instance ->
+        {state, promoted_instance}
+    end
+  end
+
+  defp promoted_state(shard, redis_key, 0) do
+    state = :sys.get_state(shard)
+
+    flunk(
+      "expected promoted instance for #{inspect(redis_key)}, got #{inspect(state.promoted_instances)}"
+    )
+  end
+
   # ---------------------------------------------------------------------------
   # Small hash stays in shared Bitcask (under threshold)
   # ---------------------------------------------------------------------------
@@ -357,8 +380,8 @@ defmodule Ferricstore.Store.PromotionTest do
 
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
-      state = :sys.get_state(shard)
-      dedicated_path = state.promoted_instances[key].path
+      {state, promoted_instance} = promoted_state(shard, key)
+      dedicated_path = promoted_instance.path
       compound_key = CompoundKey.hash_field(key, "large_field")
 
       assert {:ok, {fid, offset, record_size}} =
@@ -399,8 +422,8 @@ defmodule Ferricstore.Store.PromotionTest do
       ctx = FerricStore.Instance.get(:default)
       shard_idx = Router.shard_for(ctx, key)
       shard = Router.shard_name(ctx, shard_idx)
-      state = :sys.get_state(shard)
-      dedicated_path = state.promoted_instances[key].path
+      {state, promoted_instance} = promoted_state(shard, key)
+      dedicated_path = promoted_instance.path
 
       assert {:ok, {fid, offset, record_size}} =
                ShardCompound.promoted_write(dedicated_path, compound_key, large_value, 0)

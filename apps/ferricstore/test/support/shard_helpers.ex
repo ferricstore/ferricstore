@@ -87,8 +87,9 @@ defmodule Ferricstore.Test.ShardHelpers do
     reset_server_auth_state()
     reset_memory_guard_pressure()
 
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = shard_count()
     flush_timeout = 30_000
+    ready_timeout = min(flush_timeout, 10_000)
 
     # Flush background BitcaskWriter so deferred writes are on disk
     # before we snapshot keys for deletion.
@@ -101,7 +102,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # by hashing the compound key string. Use one delete batch per shard so a
     # restart-heavy full suite cannot spend 30s per key waiting on stale leader
     # state during cleanup.
-    wait_default_waraft_ready(flush_timeout)
+    wait_default_waraft_ready(ready_timeout)
 
     Enum.each(0..(shard_count - 1), fn i ->
       shard = Router.shard_name(FerricStore.Instance.get(:default), i)
@@ -569,6 +570,20 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   defp shard_count do
+    case FerricStore.Instance.get(:default) do
+      %{shard_count: count} when is_integer(count) and count > 0 ->
+        count
+
+      _ ->
+        configured_shard_count()
+    end
+  rescue
+    _ -> configured_shard_count()
+  catch
+    _, _ -> configured_shard_count()
+  end
+
+  defp configured_shard_count do
     :persistent_term.get(
       :ferricstore_shard_count,
       Application.get_env(:ferricstore, :shard_count, 4)

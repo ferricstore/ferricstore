@@ -48,8 +48,8 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
     source = File.read!(@router_path)
 
     # High-volume cold reads must not call blocking pread on a Normal scheduler.
-    assert source =~ "ColdRead.pread_at",
-           "expected direct Router cold reads to use ColdRead.pread_at/3"
+    assert source =~ "ColdRead.pread_keyed",
+           "expected direct Router cold reads to use keyed ColdRead async wrapper"
 
     refute Regex.match?(~r/(?<!_)v2_pread_at\(/, source),
            "expected Router cold reads to avoid blocking v2_pread_at/2"

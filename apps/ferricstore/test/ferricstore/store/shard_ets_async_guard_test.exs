@@ -11,8 +11,8 @@ defmodule Ferricstore.Store.ShardETSAsyncGuardTest do
     assert source =~ "ColdRead.pread_batch_keyed",
            "expected Shard.ETS prefix warm helpers to use keyed batched async cold reads"
 
-    assert source =~ "ColdRead.pread_at",
-           "expected Shard.ETS point warm helper to use ColdRead async wrapper"
+    assert source =~ "ColdRead.pread_keyed",
+           "expected Shard.ETS point warm helper to use keyed ColdRead async wrapper"
 
     refute Regex.match?(~r/NIF\.v2_pread_at\(/, source),
            "expected Shard.ETS warm helpers to avoid blocking v2_pread_at/2"
