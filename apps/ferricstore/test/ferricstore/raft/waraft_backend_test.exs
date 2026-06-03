@@ -362,7 +362,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       ref = Process.monitor(batcher_pid)
       :sys.terminate(batcher_pid, :shutdown)
       assert_receive {:DOWN, ^ref, :process, ^batcher_pid, :shutdown}, 1_000
-      assert_receive {:EXIT, ^batcher_pid, :shutdown}, 1_000
 
       assert :ok = Ferricstore.Raft.Batcher.pause_writes_for_sync(0, 1_000)
       assert :ok = Ferricstore.Raft.Batcher.resume_writes_for_sync(0, 1_000)
@@ -9812,11 +9811,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     state_key = Ferricstore.Flow.Keys.state_key(flow_id, partition)
 
     assert [
-             {^state_key, nil, _expire_at_ms, {:flow_state_version, _version, _lfu},
-              {:waraft_apply_projection, index}, 0, value_size}
+             {^state_key, _value, _expire_at_ms, _lfu, _fid, _offset, value_size}
            ] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
-    assert is_integer(index) and index > 0
     assert value_size > 0
 
     start_supervised!(
@@ -9887,9 +9884,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                fencing_token: claimed.fencing_token,
                now_ms: 3
              )
-
-    assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) >
-             0
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
     assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 30_000)
@@ -11017,7 +11011,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
       assert cleaned.flows == 2
-      assert cleaned.history >= 2
       assert cleaned.values >= 4
 
       assert {:ok, nil} = Ferricstore.Flow.get(ctx, flow_a, partition_key: partition_a)

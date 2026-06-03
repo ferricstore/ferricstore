@@ -528,7 +528,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     writer_state = :sys.get_state(writer_pid)
 
     assert Ferricstore.Flow.LMDB.mode() == :lagged
-    assert Ferricstore.Flow.LMDB.mirror?()
+    assert Ferricstore.Flow.LMDB.projection_enabled?()
     assert writer_state.flush_interval_ms == 500
     assert writer_state.flush_jitter_ms == 250
     assert writer_state.max_ops == 25_000
@@ -559,12 +559,12 @@ defmodule Ferricstore.Flow.LMDBTest do
     Application.delete_env(:ferricstore, :flow_lmdb_mode)
     Application.delete_env(:ferricstore, :flow_lmdb_enabled)
     assert Ferricstore.Flow.LMDB.mode() == :lagged
-    assert Ferricstore.Flow.LMDB.mirror?()
+    assert Ferricstore.Flow.LMDB.projection_enabled?()
 
     for off <- [:off, false, "false", "FALSE", "0", "off", nil] do
       Application.put_env(:ferricstore, :flow_lmdb_mode, off)
       assert Ferricstore.Flow.LMDB.mode() == :lagged
-      assert Ferricstore.Flow.LMDB.mirror?()
+      assert Ferricstore.Flow.LMDB.projection_enabled?()
     end
   end
 
@@ -2908,7 +2908,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     Application.delete_env(:ferricstore, :flow_lmdb_enabled)
     assert Ferricstore.Flow.LMDB.enabled?()
     assert Ferricstore.Flow.LMDB.mode() == :lagged
-    assert Ferricstore.Flow.LMDB.mirror?()
+    assert Ferricstore.Flow.LMDB.projection_enabled?()
 
     Application.put_env(:ferricstore, :flow_lmdb_enabled, true)
     assert Ferricstore.Flow.LMDB.enabled?()
@@ -2938,7 +2938,7 @@ defmodule Ferricstore.Flow.LMDBTest do
       Application.put_env(:ferricstore, :flow_lmdb_mode, ignored)
       assert Ferricstore.Flow.LMDB.enabled?()
       assert Ferricstore.Flow.LMDB.mode() == :lagged
-      assert Ferricstore.Flow.LMDB.mirror?()
+      assert Ferricstore.Flow.LMDB.projection_enabled?()
     end
   end
 
@@ -3535,11 +3535,13 @@ defmodule Ferricstore.Flow.LMDBTest do
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
     old_flush_jitter = Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms)
     old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+    old_flush_on_max_ops = Application.get_env(:ferricstore, :flow_lmdb_flush_on_max_ops)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :lagged)
     Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
     Application.put_env(:ferricstore, :flow_lmdb_flush_jitter_ms, 0)
     Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 2)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_on_max_ops, true)
 
     data_dir =
       Path.join(
@@ -3557,6 +3559,7 @@ defmodule Ferricstore.Flow.LMDBTest do
       restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
       restore_env(:flow_lmdb_flush_jitter_ms, old_flush_jitter)
       restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      restore_env(:flow_lmdb_flush_on_max_ops, old_flush_on_max_ops)
       File.rm_rf!(data_dir)
     end)
 

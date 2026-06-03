@@ -21,6 +21,7 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
   # Sendfile threshold matches the one in connection.ex
   @sendfile_threshold 65_536
+  @blob_side_channel_threshold 256 * 1024
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -83,6 +84,25 @@ defmodule FerricstoreServer.Integration.SendfileTest do
   end
 
   defp ukey(suffix), do: "sendfile_test:#{suffix}:#{System.unique_integer([:positive])}"
+
+  defp blob_stream_value(byte, extra \\ 4096) do
+    :binary.copy(byte, @blob_side_channel_threshold + extra)
+  end
+
+  defp force_cold_key(key) do
+    ctx = FerricStore.Instance.get(:default)
+    idx = Ferricstore.Store.Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, idx)
+
+    case :ets.lookup(keydir, key) do
+      [{^key, _value, exp, lfu, file_id, offset, value_size}] ->
+        :ets.insert(keydir, {key, nil, exp, lfu, file_id, offset, value_size})
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
 
   defp attach_sendfile_handler(test_pid) do
     id = {__MODULE__, test_pid, System.unique_integer([:positive])}
@@ -323,11 +343,15 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       sock = connect_and_hello(port)
       keys = Enum.map(1..3, fn i -> ukey("true_pipe_large_#{i}") end)
-      values = Enum.map(1..3, fn i -> :binary.copy(<<i>>, @sendfile_threshold + i * 4096) end)
+      values =
+        Enum.map(1..3, fn i ->
+          :binary.copy(<<i>>, @blob_side_channel_threshold + i * 4096)
+        end)
 
       for {key, value} <- Enum.zip(keys, values) do
         send_cmd(sock, ["SET", key, value])
         assert recv_response(sock) == {:simple, "OK"}
+        force_cold_key(key)
       end
 
       :gen_tcp.close(sock)
@@ -354,10 +378,11 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       sock = connect_and_hello(port)
       large_key = ukey("mixed_pipe_large")
       set_key = ukey("mixed_pipe_set")
-      large_value = :binary.copy("M", @sendfile_threshold + 4096)
+      large_value = blob_stream_value("M")
 
       send_cmd(sock, ["SET", large_key, large_value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(large_key)
 
       :gen_tcp.close(sock)
       sock = connect_and_hello(port)
@@ -386,10 +411,11 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       sock = connect_and_hello(port)
       large_key = ukey("general_pipe_large")
-      large_value = :binary.copy("G", @sendfile_threshold + 4096)
+      large_value = blob_stream_value("G")
 
       send_cmd(sock, ["SET", large_key, large_value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(large_key)
 
       :gen_tcp.close(sock)
       sock = connect_and_hello(port)
@@ -418,10 +444,11 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       sock = connect_and_hello(port)
       large_key = ukey("pipeline_exists_get_large")
-      large_value = :binary.copy("E", @sendfile_threshold + 4096)
+      large_value = blob_stream_value("E")
 
       send_cmd(sock, ["SET", large_key, large_value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(large_key)
 
       :gen_tcp.close(sock)
       sock = connect_and_hello(port)
@@ -431,8 +458,7 @@ defmodule FerricstoreServer.Integration.SendfileTest do
         ["GET", large_key]
       ])
 
-      assert recv_response(sock) == 1
-      assert recv_response(sock) == large_value
+      assert recv_n(sock, 2) == [1, large_value]
 
       size = byte_size(large_value)
 
@@ -451,11 +477,14 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       missing = ukey("mget_missing")
 
       values =
-        Enum.map(1..3, fn i -> :binary.copy(<<10 + i>>, @sendfile_threshold + i * 2048) end)
+        Enum.map(1..3, fn i ->
+          :binary.copy(<<10 + i>>, @blob_side_channel_threshold + i * 2048)
+        end)
 
       for {key, value} <- Enum.zip(keys, values) do
         send_cmd(sock, ["SET", key, value])
         assert recv_response(sock) == {:simple, "OK"}
+        force_cold_key(key)
       end
 
       :gen_tcp.close(sock)
@@ -488,11 +517,14 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       keys = Enum.map(1..2, fn i -> ukey("pipe_mget_large_#{i}") end)
 
       values =
-        Enum.map(1..2, fn i -> :binary.copy(<<20 + i>>, @sendfile_threshold + i * 2048) end)
+        Enum.map(1..2, fn i ->
+          :binary.copy(<<20 + i>>, @blob_side_channel_threshold + i * 2048)
+        end)
 
       for {key, value} <- Enum.zip(keys, values) do
         send_cmd(sock, ["SET", key, value])
         assert recv_response(sock) == {:simple, "OK"}
+        force_cold_key(key)
       end
 
       :gen_tcp.close(sock)
@@ -522,12 +554,13 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       sock = connect_and_hello(port)
       key = ukey("getrange_large")
       prefix = :binary.copy("P", 128)
-      slice = :binary.copy("S", @sendfile_threshold + 8192)
+      slice = :binary.copy("S", @blob_side_channel_threshold + 8192)
       suffix = :binary.copy("T", 128)
       value = [prefix, slice, suffix] |> IO.iodata_to_binary()
 
       send_cmd(sock, ["SET", key, value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(key)
 
       :gen_tcp.close(sock)
       sock = connect_and_hello(port)
@@ -556,11 +589,12 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       sock = connect_and_hello(port)
       key = ukey("pipe_getrange_large")
       prefix = :binary.copy("A", 64)
-      slice = :binary.copy("B", @sendfile_threshold + 4096)
+      slice = :binary.copy("B", @blob_side_channel_threshold + 4096)
       value = IO.iodata_to_binary([prefix, slice, :binary.copy("C", 64)])
 
       send_cmd(sock, ["SET", key, value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(key)
 
       :gen_tcp.close(sock)
       sock = connect_and_hello(port)

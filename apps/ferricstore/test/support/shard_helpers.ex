@@ -84,6 +84,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   def flush_all_keys do
     alias Ferricstore.Store.Router
 
+    reset_server_auth_state()
     reset_memory_guard_pressure()
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
@@ -159,6 +160,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # Fully reset namespace config overrides so per-prefix commit windows
     # cannot leak across tests and alter batching timings.
     Ferricstore.NamespaceConfig.reset_all()
+    reset_server_auth_state()
 
     # The safety-net ETS clear above bypasses normal insert/delete hooks, so
     # reset the auxiliary memory accounting that MemoryGuard reads lock-free.
@@ -168,12 +170,27 @@ defmodule Ferricstore.Test.ShardHelpers do
     reset_memory_guard_pressure()
   end
 
+  defp reset_server_auth_state do
+    Ferricstore.Config.set("requirepass", "")
+
+    acl = Module.concat([FerricstoreServer, Acl])
+
+    if Code.ensure_loaded?(acl) and function_exported?(acl, :reset!, 0) and
+         Process.whereis(acl) do
+      apply(acl, :reset!, [])
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
   defp clear_flow_projection_storage(ctx, shard_count) do
     Enum.each(0..max(shard_count - 1, -1)//1, fn shard_index ->
-      :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index)
+      :ok = Ferricstore.Flow.HistoryProjector.discard(ctx, shard_index)
     end)
 
-    :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, shard_count)
+    :ok = Ferricstore.Flow.LMDBWriter.discard_all(ctx.name, shard_count)
     :ok = Ferricstore.Flow.LMDB.clear_all(ctx.data_dir, shard_count)
 
     Enum.each(0..max(shard_count - 1, -1)//1, fn shard_index ->

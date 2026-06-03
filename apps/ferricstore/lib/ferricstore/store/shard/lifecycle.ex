@@ -263,14 +263,19 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         do_expiry_sweep_scan(state, now)
 
       ExpiryTracker.count_for_state(state) == 0 ->
-        %{state | sweep_at_ceiling_count: 0, sweep_struggling: false}
+        recover_sweep_if_needed(state)
 
       not ExpiryTracker.due_for_state?(state, now) and not memory_pressure?(state) ->
-        %{state | sweep_at_ceiling_count: 0, sweep_struggling: false}
+        recover_sweep_if_needed(state)
 
       true ->
         do_expiry_sweep_scan(state, now)
     end
+  end
+
+  defp recover_sweep_if_needed(state) do
+    {new_ceiling_count, new_struggling} = update_sweep_ceiling(state, false, 0)
+    %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
   end
 
   defp do_expiry_sweep_scan(state, now) do

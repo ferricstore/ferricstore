@@ -4,33 +4,28 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
   @native_ops_path Path.expand("../../../../lib/ferricstore/store/shard/native_ops.ex", __DIR__)
 
   alias Ferricstore.ErrorReasons
-  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.NativeOps
 
   test "forwarded compound result returns unknown outcome when local apply barrier times out" do
     shard_index = 0
-    batcher = Batcher.batcher_name(shard_index)
-    %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
 
     assert ErrorReasons.write_timeout_unknown() ==
              NativeOps.__barrier_forwarded_result__(
                shard_index,
-               {:remote_applied_at, last_local_applied + 1_000, :ok},
+               {:remote_applied_at, 1_000_000_000, :ok},
                25
              )
   end
 
   test "forwarded compound result returns leader result after local apply barrier passes" do
     shard_index = 0
-    batcher = Batcher.batcher_name(shard_index)
-    %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
 
     assert :ok ==
              NativeOps.__barrier_forwarded_result__(
                shard_index,
-               {:remote_applied_at, last_local_applied, :ok},
+               {:remote_applied_at, 0, :ok},
                25
              )
   end

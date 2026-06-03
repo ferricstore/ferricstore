@@ -123,6 +123,9 @@ defmodule FerricstoreServer.Connection.Store do
       is_function(Map.get(store, :batch_get), 1) and
       is_function(Map.get(store, :value_size), 1) and
       is_function(Map.get(store, :object_lfu), 1) and
+      is_function(Map.get(store, :exists?), 1) and
+      is_function(Map.get(store, :prob_write), 1) and
+      is_function(Map.get(store, :prob_dir_for_key), 1) and
       is_function(Map.get(store, :persistence_barrier), 0) and
       is_function(Map.get(store, :compound_batch_get), 2) and
       is_function(Map.get(store, :compound_batch_get_meta), 2)

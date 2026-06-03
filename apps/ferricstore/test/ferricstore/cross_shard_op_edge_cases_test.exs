@@ -93,34 +93,23 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
     test "two SMOVEs on different members both succeed" do
       {src, dst} = cross_shard_keys()
 
-      # Create source set
-      shard =
-        Router.shard_name(
-          FerricStore.Instance.get(:default),
-          Router.shard_for(FerricStore.Instance.get(:default), src)
-        )
-
-      GenServer.call(shard, {:tx_execute, [{"SADD", [src, "a", "b"]}], nil}, 10_000)
+      # Create source set through the public command path.
+      ctx = FerricStore.Instance.get(:default)
+      assert 2 = Set.handle("SADD", [src, "a", "b"], ctx)
 
       # Two sequential SMOVE (concurrent is hard to guarantee without races)
-      result1 = Set.handle("SMOVE", [src, dst, "a"], %{})
-      result2 = Set.handle("SMOVE", [src, dst, "b"], %{})
+      result1 = Set.handle("SMOVE", [src, dst, "a"], ctx)
+      result2 = Set.handle("SMOVE", [src, dst, "b"], ctx)
 
       # Both should succeed
       assert result1 == 1
       assert result2 == 1
 
       # Source should be empty, dest should have both
-      [src_members] = GenServer.call(shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
+      src_members = Set.handle("SMEMBERS", [src], ctx)
       assert src_members == [] or src_members == nil
 
-      dst_shard =
-        Router.shard_name(
-          FerricStore.Instance.get(:default),
-          Router.shard_for(FerricStore.Instance.get(:default), dst)
-        )
-
-      [dst_members] = GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
+      dst_members = Set.handle("SMEMBERS", [dst], ctx)
       assert "a" in dst_members
       assert "b" in dst_members
     end

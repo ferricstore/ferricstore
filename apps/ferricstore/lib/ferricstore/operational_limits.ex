@@ -221,7 +221,7 @@ defmodule Ferricstore.OperationalLimits do
     expanded = Path.expand(path || ".")
 
     cond do
-      File.exists?(expanded) ->
+      Ferricstore.FS.exists?(expanded) ->
         expanded
 
       Path.dirname(expanded) == expanded ->

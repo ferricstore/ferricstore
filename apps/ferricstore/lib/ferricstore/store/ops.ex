@@ -1171,30 +1171,31 @@ defmodule Ferricstore.Store.Ops do
   def flush(store) when is_map(store), do: store.flush.()
 
   defp clear_flow_projection_storage(ctx) do
-    with :ok <- flush_flow_history_projectors(ctx),
-         :ok <- flush_flow_lmdb_writers(ctx),
-         :ok <- Ferricstore.Flow.LMDB.clear_all(ctx.data_dir, ctx.shard_count),
-         :ok <- clear_flow_history_dirs(ctx) do
-      :ok
+    Ferricstore.Flow.LMDBWriter.suspend_all(ctx.name, ctx.shard_count, flush: false)
+
+    try do
+      with :ok <- discard_flow_history_projectors(ctx),
+           :ok <- discard_flow_lmdb_writers(ctx),
+           :ok <- Ferricstore.Flow.LMDB.clear_all(ctx.data_dir, ctx.shard_count),
+           :ok <- clear_flow_history_dirs(ctx) do
+        :ok
+      end
+    after
+      Ferricstore.Flow.LMDBWriter.resume_all(ctx.name, ctx.shard_count)
     end
   end
 
-  defp flush_flow_lmdb_writers(%{name: name, shard_count: shard_count})
+  defp discard_flow_lmdb_writers(%{name: name, shard_count: shard_count})
        when is_atom(name) and is_integer(shard_count) and shard_count >= 0 do
-    case Ferricstore.Flow.LMDBWriter.flush_all(name, shard_count, 30_000) do
-      :ok -> :ok
-      {:error, :writer_not_started} -> :ok
-      {:error, {:noproc, _}} -> :ok
-      {:error, _reason} = error -> error
-    end
+    Ferricstore.Flow.LMDBWriter.discard_all(name, shard_count)
   end
 
-  defp flush_flow_lmdb_writers(_ctx), do: :ok
+  defp discard_flow_lmdb_writers(_ctx), do: :ok
 
-  defp flush_flow_history_projectors(ctx) do
+  defp discard_flow_history_projectors(ctx) do
     0..max(ctx.shard_count - 1, -1)//1
     |> Enum.reduce_while(:ok, fn shard_index, :ok ->
-      case Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index, 30_000) do
+      case Ferricstore.Flow.HistoryProjector.discard(ctx, shard_index, 5_000) do
         :ok -> {:cont, :ok}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -1787,7 +1788,7 @@ defmodule Ferricstore.Store.Ops do
       BlobValue.threshold(tx.instance_ctx) > 0 and BlobRef.encoded_size?(vsize) ->
         path = ShardETS.file_path(tx.shard_state.shard_data_path, fid)
 
-        case ColdRead.pread_at(path, off, key, @cold_read_timeout_ms) do
+        case ColdRead.pread_keyed(path, off, key, @cold_read_timeout_ms) do
           {:ok, value} ->
             case BlobRef.decode(value) do
               {:ok, %BlobRef{size: logical_size}} -> logical_size
@@ -2098,6 +2099,6 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp read_cold_async(path, offset, key) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
+    Ferricstore.Store.ColdRead.pread_keyed(path, offset, key, @cold_read_timeout_ms)
   end
 end

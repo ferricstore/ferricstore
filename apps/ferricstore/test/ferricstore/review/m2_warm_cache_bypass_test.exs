@@ -35,12 +35,12 @@ defmodule Ferricstore.Review.M2WarmCacheBypassTest do
     keydir = :"keydir_#{idx}"
 
     [{^key, nil, _exp, _lfu, file_id, _offset, vsize}] = :ets.lookup(keydir, key)
-    assert is_integer(file_id)
+    assert is_integer(file_id) or match?({:waraft_segment, _}, file_id)
     assert vsize == @large_size
 
-    # Router.get's cold-read direct-pread path requires file_id > 0.
-    # Fresh shards start at file 0; symlink so pread resolves file_id 1.
-    unless file_id > 0 do
+    # Legacy Bitcask cold-read direct-pread path required file_id > 0.
+    # WARaft segment locations are already readable and must not be rewritten.
+    if is_integer(file_id) and file_id <= 0 do
       data_dir = Application.get_env(:ferricstore, :data_dir, "data")
       shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
       src = Path.join(shard_path, "00000.log")

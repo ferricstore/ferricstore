@@ -673,7 +673,7 @@ defmodule Ferricstore.Store.Promotion do
   defp promotion_entry_value(_shard_data_path, _key, _value, _fid, _off), do: nil
 
   defp read_cold_async(path, offset, key) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
+    Ferricstore.Store.ColdRead.pread_keyed(path, offset, key, @cold_read_timeout_ms)
   end
 
   @spec type_label(atom()) :: binary()

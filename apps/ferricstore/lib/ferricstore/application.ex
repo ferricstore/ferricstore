@@ -695,7 +695,7 @@ defmodule Ferricstore.Application do
         |> Ferricstore.DataDir.shard_data_path(shard_index)
         |> Ferricstore.Store.Shard.ETS.file_path(fid)
 
-      case Ferricstore.Store.ColdRead.pread_at(
+      case Ferricstore.Store.ColdRead.pread_keyed(
              path,
              off,
              key,

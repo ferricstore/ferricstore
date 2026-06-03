@@ -406,6 +406,29 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
+  def discard_all(shard_count) when is_integer(shard_count) and shard_count >= 0 do
+    discard_all(:default, shard_count)
+  end
+
+  def discard_all(instance_name, shard_count)
+      when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
+    Enum.each(shard_indexes(shard_count), fn shard_index ->
+      _ = discard(instance_name, shard_index)
+    end)
+
+    :ok
+  end
+
+  def discard(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
+    case Process.whereis(name(instance_name, shard_index)) do
+      pid when is_pid(pid) -> GenServer.call(pid, :discard, 5_000)
+      nil -> :ok
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
   def name(shard_index), do: :"Ferricstore.Flow.LMDBWriter.#{shard_index}"
 
   def name(:default, shard_index), do: name(shard_index)
@@ -790,6 +813,33 @@ defmodule Ferricstore.Flow.LMDBWriter do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
     {state, _reply} = flush_pending_with_reply(%{state | timer_ref: nil})
     {:reply, :ok, %{state | timer_ref: nil, suspended?: true}}
+  end
+
+  def handle_call(:discard, _from, state) do
+    if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+    clear_projection_outbox(state)
+
+    processed = enqueue_seq_target(state)
+    publish_processed_enqueue_seq(state.enqueue_seq, processed)
+    Enum.each(state.flush_waiters, fn {from, _target} -> GenServer.reply(from, :ok) end)
+
+    state = %{
+      state
+      | pending: [],
+        pending_after_flush: [],
+        count: 0,
+        first_pending_at: nil,
+        last_enqueue_at: nil,
+        timer_ref: nil,
+        projection_dirty?: false,
+        processed_enqueue_seq: processed,
+        processed_enqueue_gaps: MapSet.new(),
+        flush_waiters: []
+    }
+
+    publish_backlog(state, 0)
+
+    {:reply, :ok, state}
   end
 
   defp handle_enqueue(ops, after_flush, state) do
@@ -1333,6 +1383,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
     ArgumentError -> :ok
   end
 
+  defp clear_projection_outbox(state) do
+    case :ets.whereis(projection_outbox_name(state.instance_name, state.shard_index)) do
+      :undefined -> :ok
+      tid -> :ets.delete_all_objects(tid)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
   defp write_op_chunks(state, ops, chunk_ops) do
     ops
     |> Enum.chunk_every(chunk_ops)
@@ -1439,7 +1498,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
     with {:ok, acc} <- expand_path_op(path, {:put, key, wrapper}, acc) do
       case decode_flow_record_value(wrapper) do
         {:ok, record} ->
-          expand_flow_state_projection(path, key, expire_at_ms, record, acc)
+          projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
+          expand_flow_state_projection(path, key, projection_expire_at_ms, record, acc)
 
         :error ->
           {:ok, acc}
@@ -1477,6 +1537,13 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
         {:ok, acc}
       end
+    end
+  end
+
+  defp flow_state_projection_expire_at(record, fallback_expire_at_ms) when is_map(record) do
+    case Map.get(record, :terminal_retention_until_ms) do
+      expire_at_ms when is_integer(expire_at_ms) and expire_at_ms > 0 -> expire_at_ms
+      _other -> fallback_expire_at_ms
     end
   end
 

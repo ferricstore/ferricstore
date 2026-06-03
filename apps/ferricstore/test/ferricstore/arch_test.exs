@@ -66,6 +66,7 @@ defmodule Ferricstore.ArchTest do
     |> excluding("Ferricstore.Flow.LMDBWriter")
     |> excluding("Ferricstore.Flow.HistoryProjector")
     |> excluding("Ferricstore.Flow.LMDBRebuilder")
+    |> excluding("Ferricstore.Waiters.Monitor")
     |> should_be_free_of_cycles()
   end
 end

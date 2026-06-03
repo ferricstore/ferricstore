@@ -17,8 +17,11 @@ defmodule Ferricstore.Raft.CommandPrefix do
         {:origin_checked, key, _inner, _expected_value, _expire_at_ms} ->
           key
 
-        _ ->
+        command when tuple_size(command) >= 2 ->
           elem(command, 1)
+
+        _ ->
+          nil
       end
 
     if is_binary(key) do

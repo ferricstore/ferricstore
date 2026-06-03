@@ -396,7 +396,7 @@ defmodule Ferricstore.Store.Router do
        when is_binary(key) and is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 do
     path = blob_gc_entry_file_path(ctx, idx, state, key, fid)
 
-    case Ferricstore.Store.ColdRead.pread_at(path, off, key, @cold_batch_read_timeout_ms) do
+    case Ferricstore.Store.ColdRead.pread_keyed(path, off, key, @cold_batch_read_timeout_ms) do
       {:ok, value} -> blob_gc_decode_ref(value)
       {:error, reason} -> {:error, {:blob_gc_live_ref_scan_failed, key, reason}}
     end
@@ -2881,7 +2881,7 @@ defmodule Ferricstore.Store.Router do
   defp cold_batch_read_error_reason(_value), do: :nil_from_cold_location
 
   defp read_cold_async(path, offset, expected_key) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_batch_read_timeout_ms)
+    Ferricstore.Store.ColdRead.pread_keyed(path, offset, expected_key, @cold_batch_read_timeout_ms)
   end
 
   defp read_cold_materialized(ctx, idx, path, offset, expected_key) do
@@ -3848,17 +3848,13 @@ defmodule Ferricstore.Store.Router do
       lfu = LFU.initial()
 
       try do
-        replaced =
-          :ets.select_replace(keydir, [
-            {
-              {key, nil, :"$1", :"$2", file_id, offset, :"$3"},
-              [],
-              [{{key, value, :"$1", lfu, file_id, offset, :"$3"}}]
-            }
-          ])
+        case :ets.lookup(keydir, key) do
+          [{^key, nil, expire_at_ms, _old_lfu, ^file_id, ^offset, value_size}] ->
+            :ets.insert(keydir, {key, value, expire_at_ms, lfu, file_id, offset, value_size})
+            track_keydir_binary_warm(ctx, idx, value)
 
-        if replaced > 0 do
-          track_keydir_binary_warm(ctx, idx, value)
+          _other ->
+            :ok
         end
 
         :ok
@@ -4791,7 +4787,11 @@ defmodule Ferricstore.Store.Router do
     key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
     case Stats.with_cache_tracking_disabled(fn -> get(ctx, key) end) do
-      nil -> flow_get_lmdb(ctx, key, :lagged)
+      nil ->
+        if flow_state_deleted_tombstone?(ctx, key),
+          do: nil,
+          else: flow_get_lmdb(ctx, key, :lagged)
+
       value -> value
     end
   end
@@ -4863,6 +4863,26 @@ defmodule Ferricstore.Store.Router do
     ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
   end
 
+  defp flow_state_deleted_tombstone?(ctx, key) when is_binary(key) do
+    idx = shard_for(ctx, key)
+
+    case Map.get(ctx, :keydir_refs) do
+      refs when is_tuple(refs) and idx >= 0 and idx < tuple_size(refs) ->
+        case :ets.lookup(elem(refs, idx), key) do
+          [{^key, nil, _expire_at_ms, :flow_state_deleted, :deleted, _offset, _value_size}] ->
+            true
+
+          _other ->
+            false
+        end
+
+      _other ->
+        false
+    end
+  rescue
+    _ -> false
+  end
+
   defp flow_lmdb_get_many(_ctx, _path, [], _now_ms, _mode), do: []
 
   defp flow_lmdb_get_many(ctx, path, keys, now_ms, mode) do
@@ -4917,7 +4937,7 @@ defmodule Ferricstore.Store.Router do
        when valid_cold_location(fid, offset, value_size) do
     idx = shard_for(ctx, key)
 
-    case Ferricstore.Store.ColdRead.pread_at(
+    case Ferricstore.Store.ColdRead.pread_keyed(
            cold_file_path(ctx, idx, fid),
            offset,
            key,
@@ -4975,7 +4995,12 @@ defmodule Ferricstore.Store.Router do
   defp flow_decode_lmdb_get_result({:ok, blob}, path, key, now_ms, mode) when is_binary(blob) do
     case Ferricstore.Flow.LMDB.decode_value(blob, now_ms) do
       {:ok, value} ->
-        value
+        if flow_lmdb_terminal_record_expired?(value, now_ms) do
+          Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
+          nil
+        else
+          value
+        end
 
       :expired ->
         Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
@@ -4993,6 +5018,23 @@ defmodule Ferricstore.Store.Router do
 
   defp flow_decode_lmdb_get_result(_other, _path, _key, _now_ms, mode),
     do: flow_lmdb_read_error_result(mode, :unexpected_result)
+
+  defp flow_lmdb_terminal_record_expired?(value, now_ms)
+       when is_binary(value) and is_integer(now_ms) do
+    try do
+      record = Ferricstore.Flow.decode_record(value)
+
+      Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) and
+        case Map.get(record, :terminal_retention_until_ms) do
+          expire_at_ms when is_integer(expire_at_ms) and expire_at_ms <= now_ms -> true
+          _other -> false
+        end
+    rescue
+      _ -> false
+    end
+  end
+
+  defp flow_lmdb_terminal_record_expired?(_value, _now_ms), do: false
 
   defp flow_lmdb_read_error_result(mode, reason) do
     flow_observe_lmdb_read_error(mode, reason)

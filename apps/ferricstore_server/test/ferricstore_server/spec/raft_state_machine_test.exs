@@ -584,7 +584,8 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
   describe "SN-001: release_cursor triggers after N applies" do
     setup do
-      dir = Path.join(System.tmp_dir!(), "sn001_test_#{:rand.uniform(9_999_999)}")
+      root_dir = Path.join(System.tmp_dir!(), "sn001_test_#{:rand.uniform(9_999_999)}")
+      dir = Ferricstore.DataDir.shard_data_path(root_dir, 0)
       File.mkdir_p!(dir)
 
       # v2: create the active log file directly (no NIF store reference)
@@ -603,10 +604,11 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           ArgumentError -> :ok
         end
 
-        File.rm_rf(dir)
+        File.rm_rf(root_dir)
       end)
 
       %{
+        data_dir: root_dir,
         shard_data_path: dir,
         active_file_id: active_file_id,
         active_file_path: active_file_path,
@@ -648,19 +650,19 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       assert state_before.applied_count == interval - 1
 
-      # The interval-th apply should emit release_cursor
+      # The interval-th apply should mark a pending release cursor. The actual
+      # release effect is emitted only after replay-safe durability catches up.
       meta = %{index: interval, term: 1, system_time: System.os_time(:millisecond)}
 
       {new_state, {:applied_at, _, :ok}, effects} =
         StateMachine.apply(meta, {:put, "sn001_#{interval}", "v#{interval}", 0}, state_before)
 
       assert new_state.applied_count == interval
-      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
-      assert {:release_cursor, ^interval, cursor_state} = cursor_effect
-      assert cursor_state.applied_count == interval
+      refute Enum.any?(effects, &match?({:release_cursor, _}, &1))
+      assert new_state.pending_release_cursor_index == interval
     end
 
-    test "release_cursor emitted at every multiple of the interval", ctx do
+    test "pending release_cursor advances at every multiple of the interval", ctx do
       interval = 5
 
       state =
@@ -673,20 +675,20 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           release_cursor_interval: interval
         })
 
-      # Apply 3 * interval commands, track where release_cursor is emitted
+      # Apply 3 * interval commands, track where pending release cursor advances.
       {_final_state, cursor_indices} =
         Enum.reduce(1..(interval * 3), {state, []}, fn i, {acc, cursors} ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
 
           case StateMachine.apply(meta, {:put, "sn001m_#{i}", "v#{i}", 0}, acc) do
-            {new_state, {:applied_at, _, :ok}, effects} ->
-              cursor_idx =
-                Enum.find_value(effects, fn
-                  {:release_cursor, idx, _snap} -> idx
-                  _ -> nil
-                end)
+            {new_state, {:applied_at, _, :ok}, _effects} ->
+              pending = new_state.pending_release_cursor_index
 
-              if cursor_idx, do: {new_state, cursors ++ [cursor_idx]}, else: {new_state, cursors}
+              if pending != acc.pending_release_cursor_index do
+                {new_state, cursors ++ [pending]}
+              else
+                {new_state, cursors}
+              end
           end
         end)
 
@@ -758,9 +760,10 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       assert length(results) == 4
       assert new_state.applied_count == 7
-      # Single release_cursor emitted for the batch
-      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
-      assert {:release_cursor, 4, _cursor_state} = cursor_effect
+      # A single pending release cursor is recorded for the Ra index that
+      # crossed the boundary; release waits for replay-safe durability.
+      refute Enum.any?(effects, &match?({:release_cursor, _}, &1))
+      assert new_state.pending_release_cursor_index == 4
     end
   end
 end

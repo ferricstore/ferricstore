@@ -83,36 +83,24 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), src) ==
                Router.shard_for(FerricStore.Instance.get(:default), dst)
 
-      # Create source set with members via tx_execute (writes to ETS directly)
-      shard =
-        Router.shard_name(
-          FerricStore.Instance.get(:default),
-          Router.shard_for(FerricStore.Instance.get(:default), src)
-        )
+      # Create source set through the public command path.
+      ctx = FerricStore.Instance.get(:default)
+      assert 3 = Set.handle("SADD", [src, "a", "b", "c"], ctx)
 
-      [sadd_result] =
-        GenServer.call(shard, {:tx_execute, [{"SADD", [src, "a", "b", "c"]}], nil}, 10_000)
-
-      assert sadd_result == 3
-
-      # Verify we can read the members back via tx_execute
-      [members_before] =
-        GenServer.call(shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
+      # Verify we can read the members back through the public command path.
+      members_before = Set.handle("SMEMBERS", [src], ctx)
 
       assert "a" in members_before
 
       # Call SMOVE directly -- the handler calls CrossShardOp.execute internally.
       # For same-shard, this uses the fast path (no locking).
-      result = Set.handle("SMOVE", [src, dst, "a"], %{})
+      result = Set.handle("SMOVE", [src, dst, "a"], ctx)
 
       assert result == 1
 
       # Verify member moved
-      [members_src] =
-        GenServer.call(shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
-
-      [members_dst] =
-        GenServer.call(shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
+      members_src = Set.handle("SMEMBERS", [src], ctx)
+      members_dst = Set.handle("SMEMBERS", [dst], ctx)
 
       assert "a" not in members_src
       assert "a" in members_dst
@@ -131,32 +119,18 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), src) !=
                Router.shard_for(FerricStore.Instance.get(:default), dst)
 
-      # Create source set via its shard
-      src_shard =
-        Router.shard_name(
-          FerricStore.Instance.get(:default),
-          Router.shard_for(FerricStore.Instance.get(:default), src)
-        )
-
-      GenServer.call(src_shard, {:tx_execute, [{"SADD", [src, "x", "y"]}], nil}, 10_000)
+      # Create source set through the public command path.
+      ctx = FerricStore.Instance.get(:default)
+      assert 2 = Set.handle("SADD", [src, "x", "y"], ctx)
 
       # Call SMOVE directly -- the handler calls CrossShardOp.execute internally
-      result = Set.handle("SMOVE", [src, dst, "x"], %{})
+      result = Set.handle("SMOVE", [src, dst, "x"], ctx)
 
       assert result == 1
 
       # Verify: "x" removed from source, added to destination
-      [src_members] =
-        GenServer.call(src_shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
-
-      dst_shard =
-        Router.shard_name(
-          FerricStore.Instance.get(:default),
-          Router.shard_for(FerricStore.Instance.get(:default), dst)
-        )
-
-      [dst_members] =
-        GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
+      src_members = Set.handle("SMEMBERS", [src], ctx)
+      dst_members = Set.handle("SMEMBERS", [dst], ctx)
 
       assert "x" not in src_members
       assert "x" in dst_members
@@ -281,8 +255,11 @@ defmodule Ferricstore.CrossShardOpTest do
       # Immediately after locking, another owner should fail
       other_ref = make_ref()
 
-      {:ok, {:applied_at, _, {:error, :keys_locked}}, _} =
+      lock_result =
         Ferricstore.Raft.CommandClock.process_command(shard1_id, {:lock_keys, [k1], other_ref, now + 5000})
+
+      assert lock_result == {:error, :keys_locked} or
+               match?({:ok, {:applied_at, _, {:error, :keys_locked}}, _}, lock_result)
 
       # Wait for locks to expire — poll instead of fixed sleep for CI tolerance
       Ferricstore.Test.Utils.eventually(
@@ -488,31 +465,17 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), src) !=
                Router.shard_for(FerricStore.Instance.get(:default), dst)
 
-      # Create source set
-      src_shard =
-        Router.shard_name(
-          FerricStore.Instance.get(:default),
-          Router.shard_for(FerricStore.Instance.get(:default), src)
-        )
-
-      GenServer.call(src_shard, {:tx_execute, [{"SADD", [src, "member1"]}], nil}, 10_000)
+      # Create source set through the public command path.
+      ctx = FerricStore.Instance.get(:default)
+      assert 1 = Set.handle("SADD", [src, "member1"], ctx)
 
       # Call SMOVE directly -- handler uses CrossShardOp internally
-      result = Set.handle("SMOVE", [src, dst, "member1"], %{})
+      result = Set.handle("SMOVE", [src, dst, "member1"], ctx)
       assert result == 1
 
       # Verify member moved
-      [src_members] =
-        GenServer.call(src_shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
-
-      dst_shard =
-        Router.shard_name(
-          FerricStore.Instance.get(:default),
-          Router.shard_for(FerricStore.Instance.get(:default), dst)
-        )
-
-      [dst_members] =
-        GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
+      src_members = Set.handle("SMEMBERS", [src], ctx)
+      dst_members = Set.handle("SMEMBERS", [dst], ctx)
 
       assert "member1" not in src_members
       assert "member1" in dst_members

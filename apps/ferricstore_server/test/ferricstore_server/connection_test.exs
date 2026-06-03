@@ -1414,7 +1414,7 @@ defmodule FerricstoreServer.ConnectionTest do
     type = "block-delayed-empty-wake:" <> Integer.to_string(System.unique_integer([:positive]))
     id = "#{type}:#{System.unique_integer([:positive])}"
     now = Ferricstore.CommandTime.now_ms()
-    run_at = now + 120
+    run_at = now + 500
 
     try do
       assert :ok =
@@ -1457,7 +1457,7 @@ defmodule FerricstoreServer.ConnectionTest do
       Ferricstore.Test.ShardHelpers.eventually(
         fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
         "RESP claim_due waiter re-registered after empty delayed wake",
-        200,
+        50,
         10
       )
 

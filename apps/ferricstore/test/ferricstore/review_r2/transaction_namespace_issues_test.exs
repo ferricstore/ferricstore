@@ -100,7 +100,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
         end)
 
       if matching_slots != [] do
-        {{_prefix, _dur}, slot} = hd(matching_slots)
+        {_slot_key, slot} = hd(matching_slots)
 
         # The new slot should use the updated window_ms=1000.
         assert slot.window_ms == 1000,
@@ -136,10 +136,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       # Verify the slot exists with the old window.
       state = :sys.get_state(Batcher.batcher_name(shard_idx))
-      old_slot = Enum.find(state.slots, fn {{p, _}, _} -> p == prefix end)
+      old_slot = Enum.find(state.slots, fn {slot_key, _} -> slot_prefix(slot_key) == prefix end)
 
       if old_slot do
-        {{_, _}, slot_data} = old_slot
+        {_slot_key, slot_data} = old_slot
         assert slot_data.window_ms == 5000
         assert slot_data.timer_ref != nil, "slot should have an active timer"
       end
@@ -550,6 +550,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   # ---------------------------------------------------------------------------
   # Helper: build a real store map for direct handler invocation
   # ---------------------------------------------------------------------------
+
+  defp slot_prefix({prefix, _duration}) when is_binary(prefix), do: prefix
+  defp slot_prefix(prefix) when is_binary(prefix), do: prefix
+  defp slot_prefix(_slot_key), do: nil
 
   defp build_real_store do
     %{

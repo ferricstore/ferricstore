@@ -40,7 +40,9 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
     # other tests (e.g. a high hot-cache-min-ram) doesn't cause cross-validation
     # failures when setting hot-cache-max-ram. Use Application.put_env directly
     # to avoid triggering MemoryGuard reconfigure that would override :auto max.
+    Application.put_env(:ferricstore, :keydir_max_ram, @default_keydir_max_ram)
     Application.put_env(:ferricstore, :hot_cache_min_ram, 1_048_576)
+    MemoryGuard.reconfigure(%{keydir_max_ram: @default_keydir_max_ram})
 
     on_exit(fn ->
       # Restore original config
@@ -66,10 +68,12 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
         Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
       end
 
-      # Reconfigure MemoryGuard back to defaults (256 MB keydir, 1GB total)
+      # Reconfigure MemoryGuard back to the suite-level config. test.exs uses
+      # a larger keydir budget to avoid incidental KEYDIR_FULL pressure outside
+      # this focused budget spec.
       MemoryGuard.reconfigure(%{
-        keydir_max_ram: 256 * 1024 * 1024,
-        max_memory_bytes: 1_073_741_824
+        keydir_max_ram: orig_keydir_max || @default_keydir_max_ram,
+        max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824)
       })
 
       MemoryGuard.force_check()

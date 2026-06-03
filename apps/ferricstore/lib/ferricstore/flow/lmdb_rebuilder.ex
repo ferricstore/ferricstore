@@ -381,6 +381,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         lmdb_ops = [{:put, key, LMDB.encode_value(value, expire_at_ms)} | ops]
 
         if LMDB.terminal_state?(Map.get(record, :state)) do
+          projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
+
           index_key =
             Flow.Keys.state_index_key(record.type, record.state, Map.get(record, :partition_key))
 
@@ -394,12 +396,12 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             LMDB.encode_terminal_index_value(
               record.id,
               updated_at_ms,
-              expire_at_ms,
+              projection_expire_at_ms,
               key,
               count_key
             )
 
-          terminal_expire_key = LMDB.terminal_expire_key(expire_at_ms, terminal_key)
+          terminal_expire_key = LMDB.terminal_expire_key(projection_expire_at_ms, terminal_key)
           terminal_expire_value = LMDB.encode_terminal_expire_value(terminal_key, key, count_key)
 
           terminal_expire_ops =
@@ -410,7 +412,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             end
 
           reverse_key = LMDB.terminal_by_state_key_key(key)
-          metadata_ops = query_metadata_index_ops(record, expire_at_ms)
+          metadata_ops = query_metadata_index_ops(record, projection_expire_at_ms)
           active_delete_ops = LMDB.active_index_delete_ops(lmdb_path, key)
 
           {
@@ -1354,6 +1356,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        do: expire_at_ms
 
   defp flow_record_expire_at(_record), do: 0
+
+  defp flow_state_projection_expire_at(record, fallback_expire_at_ms) when is_map(record) do
+    case flow_record_expire_at(record) do
+      expire_at_ms when is_integer(expire_at_ms) and expire_at_ms > 0 -> expire_at_ms
+      _other -> fallback_expire_at_ms
+    end
+  end
 
   defp history_max_events_for_key(
          keydir,

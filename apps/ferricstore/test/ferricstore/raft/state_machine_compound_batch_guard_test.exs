@@ -54,7 +54,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
 
   test "state-machine compound batch metadata reads use keyed batched cold path" do
     source = File.read!(@state_machine_path)
-    body = function_body(source, "cross_shard_read_cold_meta_batch")
+    body = function_body(source, "cross_shard_read_cold_meta_bitcask_batch")
 
     # HGETEX/HEXPIRE-style logic reads value+TTL for many fields. If this
     # helper falls back to one pread per field, large hashes/sets/zsets create

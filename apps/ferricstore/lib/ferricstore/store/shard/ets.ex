@@ -795,7 +795,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   defp read_cold_async(state, path, offset, key) do
     with {:ok, value} <-
-           Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_batch_read_timeout_ms),
+           Ferricstore.Store.ColdRead.pread_keyed(path, offset, key, @cold_batch_read_timeout_ms),
          {:ok, materialized} <- materialize_blob_value(state, value) do
       {:ok, materialized}
     end

@@ -18,6 +18,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
 
   alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
   alias Ferricstore.Metrics
+  alias Ferricstore.PrefixMetricsCache
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
@@ -27,8 +28,20 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
   # ---------------------------------------------------------------------------
 
   setup do
+    protected_mode = Application.get_env(:ferricstore, :protected_mode)
+    Application.put_env(:ferricstore, :protected_mode, false)
+
+    on_exit(fn ->
+      if is_nil(protected_mode) do
+        Application.delete_env(:ferricstore, :protected_mode)
+      else
+        Application.put_env(:ferricstore, :protected_mode, protected_mode)
+      end
+    end)
+
     ShardHelpers.flush_all_keys()
     Stats.reset_hotness()
+    PrefixMetricsCache.reset()
     :ok
   end
 
@@ -65,7 +78,13 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
   end
 
+  defp scrape_metrics do
+    :ok = PrefixMetricsCache.refresh_now()
+    Metrics.scrape()
+  end
+
   defp scrape_http do
+    :ok = PrefixMetricsCache.refresh_now()
     port = HealthEndpoint.port()
     response = http_get(port, "/metrics")
     extract_body(response)
@@ -129,7 +148,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       Router.put(FerricStore.Instance.get(:default), "session:abc", "val1")
       Router.put(FerricStore.Instance.get(:default), "session:def", "val2")
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       assert String.contains?(text, "# HELP ferricstore_prefix_key_count")
       assert String.contains?(text, "# TYPE ferricstore_prefix_key_count gauge")
@@ -146,12 +165,12 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
 
     test "keys without a colon appear under _root prefix" do
-      before = metric_value(Metrics.scrape(), "ferricstore_prefix_key_count", "_root") || 0
+      before = metric_value(scrape_metrics(), "ferricstore_prefix_key_count", "_root") || 0
 
       key = "plainkey_#{System.unique_integer([:positive])}"
       Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
       after_val = metric_value(text, "ferricstore_prefix_key_count", "_root") || 0
 
       assert after_val >= before + 1
@@ -171,7 +190,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       Router.put(FerricStore.Instance.get(:default), "order:200", "item-b")
       Router.put(FerricStore.Instance.get(:default), "cache:x", "hit")
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       assert metric_value(text, "ferricstore_prefix_key_count", "user") == 3
       assert metric_value(text, "ferricstore_prefix_key_count", "order") == 2
@@ -183,7 +202,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       Router.put(FerricStore.Instance.get(:default), "temp:b", "2")
       Router.delete(FerricStore.Instance.get(:default), "temp:a")
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       assert metric_value(text, "ferricstore_prefix_key_count", "temp") == 1
     end
@@ -196,7 +215,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       # Give lazy expiry a moment to take effect
       Process.sleep(10)
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       # The prefix should either be absent or have count 0
       count = metric_value(text, "ferricstore_prefix_key_count", "ephemeral")
@@ -212,7 +231,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     test "is positive after writing keys" do
       Router.put(FerricStore.Instance.get(:default), "session:abc", "value")
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       assert String.contains?(text, "# HELP ferricstore_prefix_keydir_bytes")
       assert String.contains?(text, "# TYPE ferricstore_prefix_keydir_bytes gauge")
@@ -225,7 +244,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       Router.put(FerricStore.Instance.get(:default), "big:1", String.duplicate("x", 1000))
       Router.put(FerricStore.Instance.get(:default), "big:2", String.duplicate("y", 1000))
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       bytes = metric_value(text, "ferricstore_prefix_keydir_bytes", "big")
       assert is_integer(bytes) and bytes > 0
@@ -243,7 +262,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       Router.get(FerricStore.Instance.get(:default), "session:abc")
       Router.get(FerricStore.Instance.get(:default), "session:abc")
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       assert String.contains?(text, "# HELP ferricstore_prefix_hot_reads")
       assert String.contains?(text, "# TYPE ferricstore_prefix_hot_reads counter")
@@ -256,7 +275,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       Stats.record_cold_read("analytics:event2")
       Stats.record_cold_read("analytics:event3")
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       assert String.contains?(text, "# HELP ferricstore_prefix_cold_reads")
       assert String.contains?(text, "# TYPE ferricstore_prefix_cold_reads counter")
@@ -271,7 +290,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
       # Record a cold read for the same prefix directly
       Stats.record_cold_read("mixed:other")
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       assert metric_value(text, "ferricstore_prefix_hot_reads", "mixed") == 1
       assert metric_value(text, "ferricstore_prefix_cold_reads", "mixed") == 1
@@ -296,7 +315,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
         Router.get(FerricStore.Instance.get(:default), "#{prefix}:key#{j}")
       end
 
-      text = Metrics.scrape()
+      text = scrape_metrics()
 
       # Verify key counts
       key_counts = all_prefix_values(text, "ferricstore_prefix_key_count")

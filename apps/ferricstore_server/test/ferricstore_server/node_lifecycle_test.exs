@@ -435,7 +435,6 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       slot_map: nil_tuple,
       shard_names: nil_tuple,
       keydir_refs: nil_tuple,
-      ra_system: nil,
       pressure_flags: :atomics.new(3, signed: false),
       disk_pressure: :atomics.new(n, signed: false),
       checkpoint_flags: :atomics.new(n, signed: false),

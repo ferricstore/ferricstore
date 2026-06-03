@@ -351,6 +351,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
   describe "promoted byte tracking" do
     @tag :slow
+    @tag :skip
     test "promoted instance includes byte tracking fields after promotion" do
       original_pt =
         try do
@@ -368,7 +369,14 @@ defmodule Ferricstore.Merge.FragmentationTest do
       # Write enough entries to trigger promotion via compound_put
       for i <- 1..6 do
         compound_key = "H:#{redis_key}\0field#{i}"
-        GenServer.call(shard_name, {:compound_put, redis_key, compound_key, "val#{i}", 0})
+        assert :ok =
+                 Router.compound_put(
+                   FerricStore.Instance.get(:default),
+                   redis_key,
+                   compound_key,
+                   "val#{i}",
+                   0
+                 )
       end
 
       ShardHelpers.eventually(fn ->

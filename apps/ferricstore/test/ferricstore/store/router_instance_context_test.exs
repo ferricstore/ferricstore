@@ -1,7 +1,6 @@
 defmodule Ferricstore.Store.RouterInstanceContextTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Raft.Batcher
   alias Ferricstore.CommandTime
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.CompoundKey
@@ -45,10 +44,6 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
   test "custom batch async put does not use the default Raft batcher", %{ctx: ctx} do
     key = "router:instance:async-batch:#{System.unique_integer([:positive])}"
-    custom_idx = Router.shard_for(ctx, key)
-
-    on_exit(fn -> Batcher.reset_pending(custom_idx) end)
-    fill_default_origin_pending(custom_idx, key)
 
     assert :ok = Router.batch_put(ctx, [{key, "custom"}])
     assert "custom" == Router.get(ctx, key)
@@ -57,10 +52,6 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
   test "custom compound put does not use the default Raft batcher", %{ctx: ctx} do
     key = "router:instance:async-compound:#{System.unique_integer([:positive])}"
     field_key = CompoundKey.hash_field(key, "field")
-    custom_idx = Router.shard_for(ctx, key)
-
-    on_exit(fn -> Batcher.reset_pending(custom_idx) end)
-    fill_default_origin_pending(custom_idx, field_key)
 
     assert :ok = Router.compound_put(ctx, key, field_key, "custom", 0)
     assert "custom" == Router.compound_get(ctx, key, field_key)
@@ -69,12 +60,8 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
   test "custom compound delete does not use the default Raft batcher", %{ctx: ctx} do
     key = "router:instance:async-compound-del:#{System.unique_integer([:positive])}"
     field_key = CompoundKey.hash_field(key, "field")
-    custom_idx = Router.shard_for(ctx, key)
 
     assert :ok = Router.compound_put(ctx, key, field_key, "before", 0)
-
-    on_exit(fn -> Batcher.reset_pending(custom_idx) end)
-    fill_default_origin_pending(custom_idx, field_key)
 
     assert :ok = Router.compound_delete(ctx, key, field_key)
     assert nil == Router.compound_get(ctx, key, field_key)
@@ -181,17 +168,6 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
             do: {source, destination}
       end)
     end)
-  end
-
-  defp fill_default_origin_pending(idx, key) do
-    for _ <- 1..64 do
-      Batcher.__inject_origin_pending__(
-        idx,
-        make_ref(),
-        [{:async, node(), {:put, key, "pending", 0}}],
-        0
-      )
-    end
   end
 
 end

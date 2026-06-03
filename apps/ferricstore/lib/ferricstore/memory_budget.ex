@@ -310,11 +310,11 @@ defmodule Ferricstore.MemoryBudget do
     expanded = Path.expand(path)
 
     cond do
-      File.exists?(expanded) ->
+      Ferricstore.FS.exists?(expanded) ->
         expanded
 
       parent = Path.dirname(expanded) ->
-        if File.exists?(parent), do: parent, else: existing_parent(parent)
+        if Ferricstore.FS.exists?(parent), do: parent, else: existing_parent(parent)
     end
   end
 

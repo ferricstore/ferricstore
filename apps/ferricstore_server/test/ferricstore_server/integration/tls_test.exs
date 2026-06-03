@@ -15,7 +15,6 @@ defmodule FerricstoreServer.Integration.TlsTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
-  alias FerricstoreServer.Connection.Sendfile
   alias FerricstoreServer.TlsListener
   alias Ferricstore.Test.TlsCertHelper
 
@@ -28,6 +27,11 @@ defmodule FerricstoreServer.Integration.TlsTest do
   # buffer parsed values and leftover binary across calls.
   @parsed_key :tls_parsed_queue
   @binary_key :tls_binary_buf
+  @blob_side_channel_threshold 256 * 1024
+
+  defp blob_stream_value(byte, extra) do
+    :binary.copy(byte, @blob_side_channel_threshold + extra)
+  end
 
   defp send_cmd(ssl_sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))
@@ -89,6 +93,21 @@ defmodule FerricstoreServer.Integration.TlsTest do
   end
 
   defp ukey(base), do: "tls_#{base}_#{:rand.uniform(9_999_999)}"
+
+  defp force_cold_key(key) do
+    ctx = FerricStore.Instance.get(:default)
+    idx = Ferricstore.Store.Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, idx)
+
+    case :ets.lookup(keydir, key) do
+      [{^key, _value, exp, lfu, file_id, offset, value_size}] ->
+        :ets.insert(keydir, {key, nil, exp, lfu, file_id, offset, value_size})
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
 
   defp attach_file_stream_handler(test_pid) do
     id = {__MODULE__, test_pid, :file_stream, System.unique_integer([:positive])}
@@ -212,10 +231,11 @@ defmodule FerricstoreServer.Integration.TlsTest do
 
       sock = connect_tls_and_hello(port)
       k = ukey("large_get_stream")
-      value = :binary.copy("T", Sendfile.threshold_bytes() + 131_072)
+      value = blob_stream_value("T", 131_072)
 
       send_cmd(sock, ["SET", k, value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(k)
 
       :ssl.close(sock)
       sock = connect_tls_and_hello(port)
@@ -243,11 +263,12 @@ defmodule FerricstoreServer.Integration.TlsTest do
       sock = connect_tls_and_hello(port)
       k = ukey("large_getrange_stream")
       prefix = :binary.copy("A", 128)
-      slice = :binary.copy("R", Sendfile.threshold_bytes() + 131_072)
+      slice = blob_stream_value("R", 131_072)
       value = IO.iodata_to_binary([prefix, slice, :binary.copy("Z", 128)])
 
       send_cmd(sock, ["SET", k, value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(k)
 
       :ssl.close(sock)
       sock = connect_tls_and_hello(port)
@@ -278,13 +299,15 @@ defmodule FerricstoreServer.Integration.TlsTest do
       sock = connect_tls_and_hello(port)
       key1 = ukey("large_mget_stream_a")
       key2 = ukey("large_mget_stream_b")
-      value1 = :binary.copy("A", Sendfile.threshold_bytes() + 65_536)
-      value2 = :binary.copy("B", Sendfile.threshold_bytes() + 131_072)
+      value1 = blob_stream_value("A", 65_536)
+      value2 = blob_stream_value("B", 131_072)
 
       send_cmd(sock, ["SET", key1, value1])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(key1)
       send_cmd(sock, ["SET", key2, value2])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(key2)
 
       :ssl.close(sock)
       sock = connect_tls_and_hello(port)
@@ -373,10 +396,11 @@ defmodule FerricstoreServer.Integration.TlsTest do
 
       sock = connect_tls_and_hello(port)
       k = ukey("pipe_large_get_stream")
-      value = :binary.copy("P", Sendfile.threshold_bytes() + 131_072)
+      value = blob_stream_value("P", 131_072)
 
       send_cmd(sock, ["SET", k, value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(k)
 
       :ssl.close(sock)
       sock = connect_tls_and_hello(port)
@@ -406,11 +430,12 @@ defmodule FerricstoreServer.Integration.TlsTest do
       sock = connect_tls_and_hello(port)
       k = ukey("pipe_large_getrange_stream")
       prefix = :binary.copy("A", 128)
-      slice = :binary.copy("G", Sendfile.threshold_bytes() + 131_072)
+      slice = blob_stream_value("G", 131_072)
       value = IO.iodata_to_binary([prefix, slice, :binary.copy("Z", 128)])
 
       send_cmd(sock, ["SET", k, value])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(k)
 
       :ssl.close(sock)
       sock = connect_tls_and_hello(port)
@@ -443,13 +468,15 @@ defmodule FerricstoreServer.Integration.TlsTest do
       sock = connect_tls_and_hello(port)
       key1 = ukey("pipe_large_mget_stream_a")
       key2 = ukey("pipe_large_mget_stream_b")
-      value1 = :binary.copy("M", Sendfile.threshold_bytes() + 65_536)
-      value2 = :binary.copy("N", Sendfile.threshold_bytes() + 131_072)
+      value1 = blob_stream_value("M", 65_536)
+      value2 = blob_stream_value("N", 131_072)
 
       send_cmd(sock, ["SET", key1, value1])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(key1)
       send_cmd(sock, ["SET", key2, value2])
       assert recv_response(sock) == {:simple, "OK"}
+      force_cold_key(key2)
 
       :ssl.close(sock)
       sock = connect_tls_and_hello(port)

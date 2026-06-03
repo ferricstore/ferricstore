@@ -27,10 +27,12 @@ defmodule FerricstoreServer.Bugs.TransactionSandboxWatchTest do
       multi_state: :none,
       multi_queue: [],
       multi_queue_count: 0,
-      watched_keys: %{},
-      sandbox_namespace: sandbox,
-      acl_cache: :full_access
-    }
+          watched_keys: %{},
+          sandbox_namespace: sandbox,
+          acl_cache: :full_access,
+          require_auth: false,
+          username: "default"
+        }
 
     assert {:continue, _ok, watched_state} = Transaction.dispatch_watch([key], state)
     assert Map.has_key?(watched_state.watched_keys, sandbox <> key)

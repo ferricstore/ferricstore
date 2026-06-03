@@ -12,6 +12,7 @@ defmodule Ferricstore.Doctor do
   use GenServer
 
   alias Ferricstore.DataDir
+  alias Ferricstore.FS
   alias Ferricstore.Flow.{LMDB, LMDBRebuilder, LMDBWriter}
 
   @default_scopes [:bitcask, :blob_refs, :flow_lmdb]
@@ -417,7 +418,7 @@ defmodule Ferricstore.Doctor do
 
     %{
       "shard" => shard_index,
-      "lmdb_dir" => File.dir?(lmdb_path),
+      "lmdb_dir" => FS.dir?(lmdb_path),
       "pending_ops" => atomic_get(ctx.flow_lmdb_writer_pending_ops, shard_index),
       "oldest_pending_age_ms" =>
         div(atomic_get(ctx.flow_lmdb_writer_oldest_pending_age_us, shard_index), 1_000),
@@ -579,7 +580,7 @@ defmodule Ferricstore.Doctor do
   end
 
   defp matching_files(path, patterns) do
-    if File.dir?(path) do
+    if FS.dir?(path) do
       Enum.flat_map(patterns, fn pattern -> Path.wildcard(Path.join(path, pattern)) end)
     else
       []

@@ -7,9 +7,9 @@ defmodule Ferricstore.Raft.StateMachineColdReadErrorGuardTest do
     source = File.read!(@state_machine_path)
 
     for function <- [
-          "cross_shard_read_cold_batch",
-          "cross_shard_read_cold_meta_batch",
-          "sm_store_read_cold_batch"
+          "cross_shard_read_cold_bitcask_values",
+          "cross_shard_read_cold_meta_bitcask_batch",
+          "sm_store_read_bitcask_cold_batch"
         ] do
       [_, body] = Regex.run(~r/defp #{function}\([^\n]*\) do(.*?)(?=\n  defp )/s, source)
 

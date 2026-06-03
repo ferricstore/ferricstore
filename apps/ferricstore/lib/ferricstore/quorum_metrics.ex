@@ -14,6 +14,7 @@ defmodule Ferricstore.QuorumMetrics do
 
   @events [
     [:ferricstore, :batcher, :slot_flush],
+    [:ferricstore, :waraft, :batcher, :slot_flush],
     [:ferricstore, :batcher, :quorum_submit],
     [:ferricstore, :batcher, :quorum_applied],
     [:ferricstore, :batcher, :local_apply_waiters],
@@ -180,6 +181,11 @@ defmodule Ferricstore.QuorumMetrics do
     rescue
       ArgumentError -> :ok
     end
+  end
+
+  @doc false
+  def handle_event([:ferricstore, :waraft, :batcher, :slot_flush], measurements, metadata, config) do
+    handle_event([:ferricstore, :batcher, :slot_flush], measurements, metadata, config)
   end
 
   @doc false

@@ -344,17 +344,24 @@ defmodule FerricstoreServer.ReviewR4Test do
       current_active = Ferricstore.Stats.active_connections()
 
       try do
-        Application.put_env(:ferricstore, :maxclients, current_active + 1)
+        Application.put_env(:ferricstore, :maxclients, current_active + 2)
 
         allowed = connect()
         assert "PONG" == unwrap(cmd(allowed, ["PING"]))
 
+        allowed2 = connect()
+        assert "PONG" == unwrap(cmd(allowed2, ["PING"]))
+
         rejected = connect()
-        assert match?({:error, "ERR max number of clients reached" <> _}, recv_one(rejected))
+        assert match?(
+                 {:error, "ERR max number of clients reached" <> _},
+                 cmd(rejected, ["PING"])
+               )
 
         assert {:tcp_error, :closed} = recv_one(rejected, 1_000)
 
         :gen_tcp.close(allowed)
+        :gen_tcp.close(allowed2)
       after
         Application.put_env(:ferricstore, :maxclients, old_maxclients)
       end

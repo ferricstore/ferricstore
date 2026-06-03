@@ -32,6 +32,11 @@ defmodule Ferricstore.Store.ColdRead do
 
   @spec pread_at(binary(), non_neg_integer(), binary(), timeout()) :: result()
   def pread_at(path, offset, expected_key, timeout_ms) do
+    pread_keyed(path, offset, expected_key, timeout_ms)
+  end
+
+  @spec pread_keyed(binary(), non_neg_integer(), binary(), timeout()) :: result()
+  def pread_keyed(path, offset, expected_key, timeout_ms) do
     await_tokio(
       fn proxy, corr_id ->
         NIF.v2_pread_at_key_async(proxy, corr_id, path, offset, expected_key)

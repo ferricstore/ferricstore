@@ -71,8 +71,13 @@ defmodule FerricstoreServer.ApplicationTest do
       children = Supervisor.which_children(Ferricstore.Supervisor)
 
       for {id, pid, _type, _mods} <- children do
-        assert is_pid(pid) and Process.alive?(pid),
-               "Child #{inspect(id)} is not alive (pid=#{inspect(pid)})"
+        if id == Ferricstore.OperationalGuard and
+             Application.get_env(:ferricstore, :operational_guard_enabled, true) != true do
+          assert pid == :undefined
+        else
+          assert is_pid(pid) and Process.alive?(pid),
+                 "Child #{inspect(id)} is not alive (pid=#{inspect(pid)})"
+        end
       end
     end
   end

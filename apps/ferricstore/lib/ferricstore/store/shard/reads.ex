@@ -357,7 +357,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   end
 
   defp read_cold_async(path, offset, expected_key) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_read_timeout_ms)
+    Ferricstore.Store.ColdRead.pread_keyed(path, offset, expected_key, @cold_read_timeout_ms)
   end
 
   defp read_cold_raw(state, file_id, _offset, expected_key)

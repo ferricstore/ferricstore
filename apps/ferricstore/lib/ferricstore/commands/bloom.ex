@@ -132,6 +132,56 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp bf_exists_args([key, element], store) do
+    case bloom_read_status(key, store) do
+      :ok -> do_bf_exists(key, element, store)
+      :missing -> 0
+      {:error, _} = error -> error
+    end
+  end
+
+  defp bf_exists_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'bf.exists' command"}
+  end
+
+  defp bf_mexists_args([key | elements], store) when elements != [] do
+    with :ok <- validate_bloom_batch_size(elements) do
+      case bloom_read_status(key, store) do
+        :ok -> do_bf_mexists(key, elements, store)
+        :missing -> List.duplicate(0, length(elements))
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp bf_mexists_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'bf.mexists' command"}
+  end
+
+  defp bf_card_args([key], store) do
+    case bloom_read_status(key, store) do
+      :ok -> do_bf_card(key, store)
+      :missing -> 0
+      {:error, _} = error -> error
+    end
+  end
+
+  defp bf_card_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'bf.card' command"}
+  end
+
+  defp bf_info_args([key], store) do
+    case bloom_read_status(key, store) do
+      :ok -> do_bf_info(key, store)
+      :missing -> {:error, "ERR not found"}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp bf_info_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'bf.info' command"}
+  end
+
+  defp do_bf_exists(key, element, store) do
     path = prob_path(store, key, "bloom")
 
     case await_nif(fn proxy, corr_id ->
@@ -151,37 +201,27 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  defp bf_exists_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'bf.exists' command"}
-  end
+  defp do_bf_mexists(key, elements, store) do
+    path = prob_path(store, key, "bloom")
 
-  defp bf_mexists_args([key | elements], store) when elements != [] do
-    with :ok <- validate_bloom_batch_size(elements) do
-      path = prob_path(store, key, "bloom")
+    case await_nif(fn proxy, corr_id ->
+           NIF.bloom_file_mexists_async(proxy, corr_id, path, elements)
+         end) do
+      {:ok, results} ->
+        results
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.bloom_file_mexists_async(proxy, corr_id, path, elements)
-           end) do
-        {:ok, results} ->
-          results
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, List.duplicate(0, length(elements)))
 
-        {:error, "enoent"} ->
-          missing_or_wrongtype(key, store, List.duplicate(0, length(elements)))
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
-
-        {:error, reason} ->
-          {:error, "ERR bloom mexists failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR bloom mexists failed: #{reason}"}
     end
   end
 
-  defp bf_mexists_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'bf.mexists' command"}
-  end
-
-  defp bf_card_args([key], store) do
+  defp do_bf_card(key, store) do
     path = prob_path(store, key, "bloom")
 
     case await_nif(fn proxy, corr_id ->
@@ -201,11 +241,7 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  defp bf_card_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'bf.card' command"}
-  end
-
-  defp bf_info_args([key], store) do
+  defp do_bf_info(key, store) do
     path = prob_path(store, key, "bloom")
 
     case await_nif(fn proxy, corr_id ->
@@ -243,10 +279,6 @@ defmodule Ferricstore.Commands.Bloom do
       {:error, reason} ->
         {:error, "ERR bloom info failed: #{reason}"}
     end
-  end
-
-  defp bf_info_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'bf.info' command"}
   end
 
   # ---------------------------------------------------------------------------
@@ -287,6 +319,54 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
+
+  defp bloom_read_status(key, store) do
+    case Map.get(store, :exists?) do
+      exists_fn when is_function(exists_fn, 1) ->
+        if exists_fn.(key), do: ProbType.check_expected(key, :bloom, store), else: :missing
+
+      _ ->
+        if production_prob_store?(store) do
+          production_bloom_read_status(key, store)
+        else
+          bloom_file_read_status(key, store)
+        end
+    end
+  rescue
+    _ -> false
+  end
+
+  defp production_bloom_read_status(key, store) do
+    case ProbType.check_create(key, :bloom, store) do
+      {:error, :exists} ->
+        if Ferricstore.FS.exists?(prob_path(store, key, "bloom")), do: :ok, else: :missing
+
+      :ok ->
+        :missing
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp bloom_file_read_status(key, store) do
+    if Ferricstore.FS.exists?(prob_path(store, key, "bloom")) do
+      :ok
+    else
+      case ProbType.check_expected(key, :bloom, store) do
+        :ok -> :missing
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp production_prob_store?(%FerricStore.Instance{}), do: true
+  defp production_prob_store?(%Ferricstore.Store.LocalTxStore{}), do: true
+
+  defp production_prob_store?(store) when is_map(store),
+    do: is_function(Map.get(store, :prob_write), 1)
+
+  defp production_prob_store?(_store), do: false
 
   defp missing_or_wrongtype(key, store, missing_result) do
     case ProbType.check_expected(key, :bloom, store) do

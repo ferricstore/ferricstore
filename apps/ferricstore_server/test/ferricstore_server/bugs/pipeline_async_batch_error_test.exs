@@ -74,18 +74,14 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     ctx = FerricStore.Instance.get(:default)
     id = "pipe_flow_order_#{System.unique_integer([:positive])}"
     partition_key = "tenant-pipe-flow-order"
-    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-    shard = Router.shard_for(ctx, key)
     handler_id = {:pipeline_flow_write_batch, self(), make_ref()}
 
     :ok =
       :telemetry.attach(
         handler_id,
-        [:ferricstore, :batcher, :slot_flush],
+        [:ferricstore, :flow, :pipeline_write, :stop],
         fn _event, measurements, metadata, test_pid ->
-          if metadata.shard_index == shard and metadata.prefix == "f" do
-            send(test_pid, {:slot_flush, measurements, metadata})
-          end
+          send(test_pid, {:pipeline_write_batch, measurements, metadata})
         end,
         self()
       )
@@ -119,9 +115,8 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
       assert {:ok, %{state: "ready", version: 2}} =
                FerricStore.flow_get(id, partition_key: partition_key)
 
-      assert Enum.any?(drain_slot_flushes(), fn {measurements, _metadata} ->
-               measurements.batch_size >= 2
-             end)
+      assert_receive {:pipeline_write_batch, %{count: count}, _metadata}, 1_000
+      assert count >= 2
     after
       :telemetry.detach(handler_id)
     end
@@ -131,18 +126,14 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     ctx = FerricStore.Instance.get(:default)
     id = "pipe_flow_mixed_#{System.unique_integer([:positive])}"
     partition_key = "tenant-pipe-flow-mixed"
-    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-    shard = Router.shard_for(ctx, key)
     handler_id = {:pipeline_flow_mixed_write_batch, self(), make_ref()}
 
     :ok =
       :telemetry.attach(
         handler_id,
-        [:ferricstore, :batcher, :slot_flush],
+        [:ferricstore, :flow, :pipeline_write, :stop],
         fn _event, measurements, metadata, test_pid ->
-          if metadata.shard_index == shard and metadata.prefix == "f" do
-            send(test_pid, {:slot_flush, measurements, metadata})
-          end
+          send(test_pid, {:pipeline_write_batch, measurements, metadata})
         end,
         self()
       )
@@ -171,9 +162,8 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
       assert {:ok, %{state: "ready", version: 2}} =
                FerricStore.flow_get(id, partition_key: partition_key)
 
-      assert Enum.any?(drain_slot_flushes(), fn {measurements, _metadata} ->
-               measurements.batch_size >= 2
-             end)
+      assert_receive {:pipeline_write_batch, %{count: count}, _metadata}, 1_000
+      assert count >= 2
     after
       :telemetry.detach(handler_id)
     end
@@ -681,12 +671,4 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     Router.shard_for(ctx, key)
   end
 
-  defp drain_slot_flushes(acc \\ []) do
-    receive do
-      {:slot_flush, measurements, metadata} ->
-        drain_slot_flushes([{measurements, metadata} | acc])
-    after
-      100 -> Enum.reverse(acc)
-    end
-  end
 end

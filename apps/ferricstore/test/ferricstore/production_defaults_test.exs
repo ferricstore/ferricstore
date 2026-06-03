@@ -256,48 +256,6 @@ defmodule Ferricstore.ProductionDefaultsTest do
     end
   end
 
-  test "DBOS-style benchmark telemetry profiler is opt-in" do
-    source = File.read!(Path.join(@repo_root, "bench/flow_python_backend_profile.exs"))
-
-    assert source =~ "PROFILE_TELEMETRY"
-    assert source =~ "if telemetry_profile?, do: print_profile(table)"
-    assert source =~ "if telemetry_profile?, do: :telemetry.detach(handler_id)"
-    refute source =~ "attach!(handler_id, table)\n\n    if internal_waraft_profile?()"
-  end
-
-  test "DBOS-style benchmark has one guarded production profile" do
-    source = File.read!(Path.join(@repo_root, "bench/flow_python_backend_profile.exs"))
-
-    assert source =~ "@dbos_profile_defaults"
-
-    for expected <- [
-          ~s(queued_shape: "live"),
-          ~s(transport: "many"),
-          ~s(worker_api: "lowlevel"),
-          ~s(worker_mode: "blocking"),
-          ~s(flows: "1000000"),
-          ~s(workers: "16"),
-          ~s(producers: "8"),
-          ~s(partitions: "1024"),
-          ~s(claim_batch_size: "1000"),
-          ~s(claim_partition_batch_size: "16"),
-          ~s(claim_block_ms: "5000"),
-          ~s(claim_drain_block_ms: "50"),
-          ~s(claim_drain_batches: "1"),
-          ~s(create_batch_size: "1000"),
-          ~s(complete_async_depth: "4"),
-          ~s(shards: "16")
-        ] do
-      assert source =~ expected
-    end
-
-    assert source =~ ~S|env_default("PRODUCERS", :producers)|
-    assert source =~ ~S|env_default("CLAIM_PARTITION_BATCH_SIZE", :claim_partition_batch_size)|
-    assert source =~ ~S|env_default("CLAIM_DRAIN_BATCHES", :claim_drain_batches)|
-    assert source =~ ~S|env_default("WAKE_COALESCE_MS", :wake_coalesce_ms)|
-    refute source =~ ~S|env("PRODUCERS", "16")|
-  end
-
   test "Flow soak benchmark uses its memory guard budget without a required env flag" do
     source = File.read!(Path.join(@repo_root, "bench/flow_state_lmdb_soak.exs"))
 

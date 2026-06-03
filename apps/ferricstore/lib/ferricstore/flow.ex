@@ -412,7 +412,7 @@ defmodule Ferricstore.Flow do
     ctx.data_dir
     |> Ferricstore.DataDir.shard_data_path(shard_index)
     |> ShardETS.file_path(file_id)
-    |> ColdRead.pread_at(offset, key, 10_000)
+    |> ColdRead.pread_keyed(offset, key, 10_000)
   end
 
   defp flow_value_read_locator_bytes(
@@ -5555,13 +5555,21 @@ defmodule Ferricstore.Flow do
       [:ferricstore, :flow, :pipeline_read_batch],
       %{
         count: length(ops),
-        gets: Enum.count(ops, &match?({:get, _id, _opts}, &1)),
-        histories: Enum.count(ops, &match?({:history, _id, _opts}, &1)),
+        gets: Enum.count(ops, &pipeline_read_get?/1),
+        histories: Enum.count(ops, &pipeline_read_history?/1),
         duration: System.monotonic_time() - started
       },
       %{source: :pipeline}
     )
   end
+
+  defp pipeline_read_get?({:get, _id, _opts}), do: true
+  defp pipeline_read_get?({:flow_get, _id, _opts}), do: true
+  defp pipeline_read_get?(_op), do: false
+
+  defp pipeline_read_history?({:history, _id, _opts}), do: true
+  defp pipeline_read_history?({:flow_history, _id, _opts}), do: true
+  defp pipeline_read_history?(_op), do: false
 
   defp flow_measurements(started, command, result, success_count) do
     count = result_count(result, success_count)
@@ -8727,9 +8735,7 @@ defmodule Ferricstore.Flow do
       "X:" <> history_key <> <<0>> <> event_id
     end
 
-    def state_key?(key) when is_binary(key) do
-      String.starts_with?(key, "f:{f") and String.contains?(key, "}:s:")
-    end
+    def state_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:s:") != :nomatch
 
     def state_key?(_key), do: false
 

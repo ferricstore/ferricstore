@@ -156,6 +156,18 @@ defmodule Ferricstore.Flow.HistoryProjector do
     :exit, reason -> {:error, {:flush_exit, reason}}
   end
 
+  @spec discard(map() | nil, non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def discard(instance_ctx, shard_index, timeout \\ 5_000) do
+    projector = name(instance_ctx, shard_index)
+
+    case Process.whereis(projector) do
+      nil -> :ok
+      _pid -> GenServer.call(projector, :discard, timeout)
+    end
+  catch
+    :exit, reason -> {:error, {:discard_exit, reason}}
+  end
+
   @spec pending_count(map() | nil, non_neg_integer(), timeout()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def pending_count(instance_ctx, shard_index, timeout \\ 1_000) do
@@ -335,6 +347,23 @@ defmodule Ferricstore.Flow.HistoryProjector do
         else: {:error, :flush_failed}
 
     {:reply, result, state}
+  end
+
+  def handle_call(:discard, _from, state) do
+    state = cancel_flush(state)
+    :ok = release_pending(state, state.pending_count)
+
+    state =
+      state
+      |> Map.merge(%{
+        pending: [],
+        pending_count: 0,
+        first_pending_at: nil,
+        requested_index: nil
+      })
+      |> publish_backlog_state()
+
+    {:reply, :ok, state}
   end
 
   def handle_call(:pending_count, _from, state) do
@@ -1407,7 +1436,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
        when is_integer(file_id) and file_id >= 0 do
     shard_data_path
     |> ShardETS.file_path(file_id)
-    |> Ferricstore.Store.ColdRead.pread_at(offset, key, 10_000)
+    |> Ferricstore.Store.ColdRead.pread_keyed(offset, key, 10_000)
   end
 
   defp projected_flow_value_bytes(

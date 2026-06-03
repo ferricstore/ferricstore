@@ -1129,7 +1129,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     end
   end
 
-  test "custom durable segment log trims persisted records after apply rotation", %{root: root} do
+  test "custom durable segment log records a logical trim floor after apply rotation", %{root: root} do
     previous_interval = Application.get_env(:ferricstore, :raft_max_log_records_per_file)
     previous_keep = Application.get_env(:ferricstore, :raft_max_log_records)
 
@@ -1143,62 +1143,43 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
         assert :ok = :ferricstore_waraft_spike.put("trim:k#{i}", "v#{i}")
       end
 
-      assert eventually(fn ->
-               first_persisted_segment_index(root) > 1
-             end)
+      assert eventually(fn -> logical_trim_floor(root) > 1 end)
 
       assert :ok = :ferricstore_waraft_spike.stop()
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
       assert {:ok, "v8"} = :ferricstore_waraft_spike.get("trim:k8")
-      assert first_persisted_segment_index(root) > 1
+      assert logical_trim_floor(root) > 1
     after
       restore_env(:raft_max_log_records_per_file, previous_interval)
       restore_env(:raft_max_log_records, previous_keep)
     end
   end
 
-  test "custom durable segment log recovers an interrupted trim rewrite", %{root: root} do
+  test "custom durable segment log logical trim does not rewrite the live segment directory", %{
+    root: root
+  } do
     previous_interval = Application.get_env(:ferricstore, :raft_max_log_records_per_file)
     previous_keep = Application.get_env(:ferricstore, :raft_max_log_records)
-    previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_rewrite_hook)
 
     try do
-      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
-      assert :ok = :ferricstore_waraft_spike.put("rewrite:seed", "v0")
-
       Application.put_env(:ferricstore, :raft_max_log_records_per_file, 1)
       Application.put_env(:ferricstore, :raft_max_log_records, 0)
 
-      Application.put_env(
-        :ferricstore,
-        :waraft_segment_log_rewrite_hook,
-        {:fail_once_after_live_backup, self()}
-      )
+      assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
 
-      hook_result =
-        Enum.reduce_while(1..20, :pending, fn i, _acc ->
-          _ = :ferricstore_waraft_spike.put("rewrite:k#{i}", "v#{i}")
+      for i <- 1..20 do
+        assert :ok = :ferricstore_waraft_spike.put("logical-trim:k#{i}", "v#{i}")
+      end
 
-          receive do
-            {:waraft_segment_log_rewrite_hook, :after_live_backup} = message ->
-              {:halt, message}
-          after
-            100 ->
-              {:cont, :pending}
-          end
-        end)
-
-      assert {:waraft_segment_log_rewrite_hook, :after_live_backup} = hook_result
+      assert eventually(fn -> logical_trim_floor(root) > 1 end)
+      refute_receive {:waraft_segment_log_rewrite_hook, :after_live_backup}, 200
 
       assert :ok = :ferricstore_waraft_spike.stop()
-      rewind_spike_storage!(root, ["rewrite:seed"], {:raft_log_pos, 1, 1})
-
       assert :ok = :ferricstore_waraft_spike.start_segment_log(root)
-      assert {:ok, "v0"} = :ferricstore_waraft_spike.get("rewrite:seed")
+      assert {:ok, "v20"} = :ferricstore_waraft_spike.get("logical-trim:k20")
     after
       restore_env(:raft_max_log_records_per_file, previous_interval)
       restore_env(:raft_max_log_records, previous_keep)
-      restore_env(:waraft_segment_log_rewrite_hook, previous_hook)
     end
   end
 
@@ -1240,7 +1221,7 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     refute File.exists?(marker)
   end
 
-  test "custom durable segment log rejects trim rewrite when backup cleanup fsync fails", %{
+  test "custom durable segment log rejects logical trim when trim floor fsync fails", %{
     root: root
   } do
     previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_sync_dir_hook)
@@ -1262,18 +1243,18 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
       {:log_view, log, _first, _last, _config} = view
       assert :ok = :ferricstore_waraft_spike_segment_log.close_process_writers(log)
 
-      parent = segment_log_dir(root) |> Path.dirname()
+      segment_dir = segment_log_dir(root)
 
       Application.put_env(
         :ferricstore,
         :waraft_segment_log_sync_dir_hook,
-        {:fail_on_count, 7, self()}
+        {:fail_once, self()}
       )
 
-      assert {:error, {:sync_dir_hook, ^parent, 7}} =
+      assert {:error, {:sync_dir_hook, ^segment_dir}} =
                :wa_raft_log.trim(view, 2)
 
-      assert_receive {:waraft_segment_log_sync_dir, ^parent, 7}, 1_000
+      assert_receive {:waraft_segment_log_sync_dir, ^segment_dir}, 1_000
     after
       restore_env(:waraft_segment_log_sync_dir_hook, previous_hook)
     end
@@ -1600,28 +1581,21 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
     send(parent, {:segment_log_corrupt, event, measurements, metadata})
   end
 
-  defp first_persisted_segment_index(root) do
-    root
-    |> segment_records()
-    |> Enum.map(fn {index, _entry} -> index end)
-    |> Enum.min(fn -> 0 end)
-  end
+  defp logical_trim_floor(root) do
+    path = root |> segment_log_dir() |> Path.join("trim_floor.term")
 
-  defp segment_records(root) do
-    root
-    |> segment_log_dir()
-    |> Path.join("*.seg")
-    |> Path.wildcard()
-    |> Enum.sort()
-    |> Enum.flat_map(fn path ->
-      case File.read(path) do
-        {:ok, binary} ->
-          decode_segment_records(binary, [])
+    case File.read(path) do
+      {:ok, binary} ->
+        case :erlang.binary_to_term(binary, [:safe]) do
+          %{version: 1, index: index} when is_integer(index) -> index
+          _other -> 0
+        end
 
-        {:error, :enoent} ->
-          []
-      end
-    end)
+      {:error, :enoent} ->
+        0
+    end
+  rescue
+    _ -> 0
   end
 
   defp segment_log_dir(root) do
@@ -1806,15 +1780,6 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
       app == :telemetry
     end)
   end
-
-  defp decode_segment_records(<<len::32, crc::32, rest::binary>>, acc)
-       when byte_size(rest) >= len do
-    <<payload::binary-size(len), tail::binary>> = rest
-    assert :erlang.crc32(payload) == crc
-    decode_segment_records(tail, [:erlang.binary_to_term(payload, [:safe]) | acc])
-  end
-
-  defp decode_segment_records(_tail, acc), do: Enum.reverse(acc)
 
   defp ensure_distribution! do
     Ferricstore.Test.ShardHelpers.ensure_distribution_started!(:waraft_runner)

@@ -71,7 +71,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert "OK" =
+    assert ["OK", "OK"] =
              Dispatcher.dispatch(
                "FLOW.TRANSITION_MANY",
                [
@@ -867,7 +867,7 @@ defmodule Ferricstore.Commands.FlowTest do
     id_b = uid("flow-command-cold-auto-b")
     partition = Ferricstore.Flow.Keys.auto_partition_key(id_a)
 
-    assert "OK" =
+    assert ["OK", "OK"] =
              Dispatcher.dispatch(
                "FLOW.CREATE_MANY",
                [

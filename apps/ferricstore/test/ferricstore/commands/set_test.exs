@@ -575,6 +575,7 @@ defmodule Ferricstore.Commands.SetTest do
       s2_type = CompoundKey.type_key("s2")
       dst_type = CompoundKey.type_key("dst")
       dst_list_meta = CompoundKey.list_meta_key("dst")
+      dst_stream_meta = CompoundKey.stream_meta_key("dst")
 
       store = %{
         get: fn _key -> nil end,
@@ -597,6 +598,9 @@ defmodule Ferricstore.Commands.SetTest do
         end,
         compound_delete: fn
           "dst", ^dst_list_meta ->
+            :ok
+
+          "dst", ^dst_stream_meta ->
             :ok
 
           "dst", ^dst_type ->
@@ -673,6 +677,7 @@ defmodule Ferricstore.Commands.SetTest do
       s2_type = CompoundKey.type_key("s2")
       dst_type = CompoundKey.type_key("dst")
       dst_list_meta = CompoundKey.list_meta_key("dst")
+      dst_stream_meta = CompoundKey.stream_meta_key("dst")
 
       store = %{
         get: fn _key -> nil end,
@@ -689,6 +694,9 @@ defmodule Ferricstore.Commands.SetTest do
         compound_delete_prefix: fn "dst", _prefix -> :ok end,
         compound_delete: fn
           "dst", ^dst_list_meta ->
+            :ok
+
+          "dst", ^dst_stream_meta ->
             :ok
 
           "dst", ^dst_type ->

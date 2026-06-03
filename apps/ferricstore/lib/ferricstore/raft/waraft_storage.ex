@@ -4002,8 +4002,8 @@ defmodule Ferricstore.Raft.WARaftStorage do
     do: Path.join(root_dir, @segment_projection_checkpoint_dir)
 
   defp segment_projection_files_present?(root_dir) do
-    File.exists?(segment_projection_root(root_dir)) or
-      File.exists?(segment_projection_checkpoint_root(root_dir))
+    Ferricstore.FS.exists?(segment_projection_root(root_dir)) or
+      Ferricstore.FS.exists?(segment_projection_checkpoint_root(root_dir))
   end
 
   defp apply_projection_root(root_dir), do: Path.join(root_dir, @apply_projection_dir)
@@ -4803,7 +4803,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> ShardETS.file_path(file_id)
 
-    ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
+    ColdRead.pread_keyed(path, offset, key, @cold_read_timeout_ms)
   end
 
   defp read_keydir_cold_value(ctx, shard_index, key, {:flow_history, file_id} = location, offset)
@@ -4813,7 +4813,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> ShardETS.file_path(location)
 
-    ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
+    ColdRead.pread_keyed(path, offset, key, @cold_read_timeout_ms)
   end
 
   defp read_keydir_cold_value(_ctx, _shard_index, _key, file_id, _offset),
@@ -5526,9 +5526,9 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp delete_metadata_journal(path) do
     journal_path = metadata_journal_path(path)
 
-    case File.rm(journal_path) do
+    case Ferricstore.FS.rm(journal_path) do
       :ok -> fsync_dir(Path.dirname(journal_path))
-      {:error, :enoent} -> :ok
+      {:error, {:not_found, _}} -> :ok
       {:error, reason} -> {:error, {:delete_storage_metadata_journal, reason}}
     end
   end
