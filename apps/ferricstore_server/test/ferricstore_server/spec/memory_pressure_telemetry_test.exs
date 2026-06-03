@@ -41,14 +41,35 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
   # MemoryGuard checks don't leak KEYDIR_FULL into other tests.
   setup do
     original_ctx = FerricStore.Instance.get(:default)
+    global_guard = Process.whereis(MemoryGuard)
 
     # These tests exercise MemoryGuard's keydir/NIF accounting thresholds.
     # Disable host RSS in this module so macOS/Linux runner process size does
     # not force a higher overall pressure level than the synthetic budget.
-    FerricStore.Instance.inject_callbacks(:default, process_rss_fn: nil)
+    FerricStore.Instance.inject_callbacks(:default, process_rss_fn: fn -> 0 end)
+
+    # The application-level guard also emits the same telemetry event. Suspend it
+    # while this module tests standalone guards so background pressure telemetry
+    # cannot race with the synthetic threshold assertions.
+    if is_pid(global_guard) do
+      try do
+        :sys.suspend(global_guard)
+      catch
+        :exit, _ -> :ok
+      end
+    end
 
     on_exit(fn ->
       :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+
+      if is_pid(global_guard) and Process.alive?(global_guard) do
+        try do
+          :sys.resume(global_guard)
+        catch
+          :exit, _ -> :ok
+        end
+      end
+
       MemoryGuard.reset_pressure_flags()
     end)
 
