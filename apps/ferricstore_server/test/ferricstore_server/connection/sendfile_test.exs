@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   alias Ferricstore.Store.ActiveFile
   alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
+  alias Ferricstore.Test.ShardHelpers
   alias Ferricstore.Bitcask.NIF
   alias FerricstoreServer.ClientTracking
   alias FerricstoreServer.Connection
@@ -28,6 +29,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     ActiveFile.init(1)
     :ets.delete_all_objects(:ferricstore_tracking)
     :ets.delete_all_objects(:ferricstore_tracking_connections)
+    ShardHelpers.reset_memory_guard_pressure()
 
     ctx = IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1024)
 
