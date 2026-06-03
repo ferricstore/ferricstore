@@ -391,7 +391,22 @@ jobs:
         run: |
           epmd -daemon
           set +e
-          elixir --sname ci_cluster --cookie ferricstore_test -S mix test --only cluster --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster.log
+
+          run_cluster_suite() {
+            name="$1"
+            node="$2"
+            path="$3"
+            log="$4"
+            data_dir=$(mktemp -d "/tmp/ferricstore-${name}-XXXXXX")
+
+            echo "Running ${name} cluster tests with data_dir=${data_dir}"
+            FERRICSTORE_DATA_DIR="$data_dir" \
+              elixir --sname "$node" --cookie ferricstore_test -S mix test "$path" --only cluster --timeout 180000 --seed 0 2>&1 | tee "$log"
+            echo "${PIPESTATUS[0]}" > "${log}.status"
+          }
+
+          run_cluster_suite ferricstore ci_cluster_ferricstore apps/ferricstore/test /tmp/cluster_ferricstore.log
+          run_cluster_suite ferricstore_server ci_cluster_server apps/ferricstore_server/test /tmp/cluster_ferricstore_server.log
 
           count_failures() {
             line=$(grep -E '^[[:space:]]*[0-9]+ tests?, [0-9]+ failures?' "$1" | tail -n 1 || true)
@@ -402,7 +417,22 @@ jobs:
             fi
           }
 
-          FAILURES=$(count_failures /tmp/cluster.log)
+          effective_failures() {
+            failures=$(count_failures "$1")
+            status=$(cat "${1}.status")
+
+            if [ "$status" -ne 0 ] && [ "$failures" -eq 0 ]; then
+              echo 999
+            else
+              echo "$failures"
+            fi
+          }
+
+          APP_FAILURES=$(effective_failures /tmp/cluster_ferricstore.log)
+          SERVER_FAILURES=$(effective_failures /tmp/cluster_ferricstore_server.log)
+          FAILURES=$((APP_FAILURES + SERVER_FAILURES))
+          echo "FerricStore cluster failures: $APP_FAILURES"
+          echo "FerricStore server cluster failures: $SERVER_FAILURES"
           echo "Total cluster failures: $FAILURES"
 
           if [ "$FAILURES" -gt 5 ]; then
@@ -416,5 +446,7 @@ jobs:
         if: always()
         with:
           name: test-results-cluster
-          path: test-results/
+          path: |
+            test-results/
+            /tmp/cluster_*.log
           retention-days: 14

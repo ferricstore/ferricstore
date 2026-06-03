@@ -255,6 +255,15 @@ defmodule Ferricstore.Test.ClusterHelper do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_role, cluster_role])
     end
 
+    # Peers start with -connect_all false. Connect them to their configured
+    # cluster before starting FerricStore so WARaft/data-sync startup paths do
+    # not block waiting for peers they cannot reach yet.
+    if cluster_nodes != [] do
+      Enum.each(cluster_nodes, fn cn ->
+        :rpc.call(node_name, Node, :connect, [cn])
+      end)
+    end
+
     start_ferricstore_on_node(node_name)
 
     # Wait for shards to be alive and accepting calls
@@ -268,15 +277,6 @@ defmodule Ferricstore.Test.ClusterHelper do
         end
       end)
     end)
-
-    # Connect this node to its cluster_nodes so existing nodes see :nodeup
-    # and can trigger auto-join. The peer starts with -connect_all false,
-    # so connections must be explicit.
-    if cluster_nodes != [] do
-      Enum.each(cluster_nodes, fn cn ->
-        :rpc.call(node_name, Node, :connect, [cn])
-      end)
-    end
 
     :ok = ensure_node_reachable(node_name, timeout: 10_000)
 
@@ -717,7 +717,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   # ---------------------------------------------------------------------------
 
   defp start_ferricstore_on_node(node_name) do
-    case :rpc.call(node_name, Application, :ensure_all_started, [:ferricstore]) do
+    case :rpc.call(node_name, Application, :ensure_all_started, [:ferricstore], 120_000) do
       {:ok, _apps} ->
         :ok
 
@@ -725,7 +725,25 @@ defmodule Ferricstore.Test.ClusterHelper do
         raise "Failed to start FerricStore on #{node_name}: #{inspect(reason)}"
 
       {:badrpc, reason} ->
-        raise "RPC to #{node_name} failed: #{inspect(reason)}"
+        diagnostics = start_failure_diagnostics(node_name)
+
+        raise "RPC to #{node_name} failed while starting FerricStore: #{inspect(reason)}; " <>
+                "diagnostics=#{inspect(diagnostics)}"
+    end
+  end
+
+  defp start_failure_diagnostics(node_name) do
+    %{
+      connected: Node.ping(node_name),
+      applications: safe_rpc(node_name, Application, :started_applications, []),
+      ferricstore_env: safe_rpc(node_name, Application, :get_all_env, [:ferricstore])
+    }
+  end
+
+  defp safe_rpc(node_name, module, function, args) do
+    case :rpc.call(node_name, module, function, args, 5_000) do
+      {:badrpc, reason} -> {:badrpc, reason}
+      other -> other
     end
   end
 

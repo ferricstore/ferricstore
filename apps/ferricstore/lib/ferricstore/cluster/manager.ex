@@ -1159,7 +1159,7 @@ defmodule Ferricstore.Cluster.Manager do
     end
   end
 
-  defp wait_for_remote_app(target_node, attempts \\ 20) do
+  defp wait_for_remote_app(target_node, attempts \\ 600) do
     if attempts <= 0 do
       Logger.warning("ClusterManager: timed out waiting for FerricStore on #{target_node}")
       {:error, :remote_app_not_ready}

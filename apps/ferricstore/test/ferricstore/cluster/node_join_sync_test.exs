@@ -730,11 +730,18 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         500
       )
 
-      # 8. Verify replica is NOT a voter (doesn't affect quorum)
-      #    Check ra membership on any shard
-      {:ok, members, _leader} = :erpc.call(n_a, Ferricstore.Raft.Cluster, :members, [0])
-      replica_member = Enum.find(members, fn {_name, node} -> node == node_name(replica) end)
-      assert replica_member != nil, "replica should be in member list"
+      # 8. Verify replica is a participant but NOT a voter (doesn't affect quorum).
+      #    `Cluster.members/1` intentionally returns voting membership only.
+      status = :erpc.call(node_name(replica), Ferricstore.Raft.WARaftBackend, :status, [0])
+      config = Keyword.fetch!(status, :config)
+      participants = Map.get(config, :participants, [])
+      voters = Map.get(config, :membership, [])
+
+      assert Enum.any?(participants, fn {_name, node} -> node == node_name(replica) end),
+             "replica should be in participant list"
+
+      refute Enum.any?(voters, fn {_name, node} -> node == node_name(replica) end),
+             "readonly replica should not be in voter membership"
     end
   end
 
@@ -772,11 +779,17 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         IO.puts("Shard #{i}: cloned data at raft index #{idx}")
       end
 
-      # Delete ra dir — has source node's server IDs, can't reuse.
+      # Delete Raft dirs — they contain source node server IDs and cannot be reused.
+      # Keep Bitcask data so the cloned node still boots with snapshot data.
       File.rm_rf!(Path.join(clone_dir, "ra"))
+      File.rm_rf!(Path.join(clone_dir, "waraft"))
 
-      # 4. Start peer node but DON'T start FerricStore yet.
-      #    Connect to cluster first so ra can reach other nodes during election.
+      # Stop the writer before join. The test still covers writes during the
+      # live disk copy, but add_node/1 should sync a finite backlog instead of
+      # chasing an unbounded moving target in CI.
+      {during_keys, during_count} = stop_continuous_writer(writer_pid)
+      IO.puts("Writes during clone copy: #{during_count}")
+
       all_cluster_nodes = Enum.map(nodes, &node_name/1)
 
       node_d =
@@ -788,14 +801,12 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
-      # 5. Connect is automatic via cluster_nodes in start_node
-      #    node_a's auto-join detects pre-existing data → just add_member
+      # 5. Connect is automatic via cluster_nodes in start_node.
+      #    Existing nodes detect pre-existing Bitcask data and add the node.
 
-      # 6. Stop writer after join has time to complete
+      # 6. Wait briefly for post-join replication and dump diagnostics.
       Process.sleep(5_000)
       dump_raft_diagnostics(node_a, node_d, @shards, "disk clone after join wait")
-      {during_keys, during_count} = stop_continuous_writer(writer_pid)
-      IO.puts("Writes during clone join: #{during_count}")
 
       # 7. Write post-join data
       post_keys = write_keys(node_a, "post_clone", 1..10)
