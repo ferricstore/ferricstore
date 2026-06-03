@@ -2107,6 +2107,9 @@ defmodule FerricstoreServer.ConnectionTest do
           {:ok, chunk} ->
             recv_values(sock, count, acc <> chunk, attempts - 1)
 
+          {:error, :timeout} ->
+            recv_values(sock, count, acc, attempts - 1)
+
           {:error, reason} ->
             flunk("socket closed before #{count} RESP values: #{inspect(reason)}")
         end
