@@ -100,13 +100,19 @@ defmodule FerricstoreServer.Commands.BlockingTrackingTest do
     parent = self()
 
     Task.start_link(fn ->
-      Process.sleep(20)
+      ShardHelpers.eventually(
+        fn -> Stream.stream_waiter_count(stream) == 1 end,
+        "XREAD waiter should be registered before XADD wakes it",
+        100,
+        10
+      )
+
       assert is_binary(Stream.handle("XADD", [stream, "*", "f", "v"], store))
       send(parent, :xadd_done)
     end)
 
-    ast = {:xread, :infinity, {:block, 500}, [{stream, "0-0"}]}
-    args = ["BLOCK", "500", "STREAMS", stream, "0-0"]
+    ast = {:xread, :infinity, {:block, 2_000}, [{stream, "0-0"}]}
+    args = ["BLOCK", "2000", "STREAMS", stream, "0-0"]
 
     assert {:continue, encoded, new_state} = Blocking.dispatch_xread_ast(ast, args, state)
 
