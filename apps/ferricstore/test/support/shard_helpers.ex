@@ -173,7 +173,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     reset_memory_guard_pressure()
   end
 
-  defp reset_server_auth_state do
+  def reset_server_auth_state do
     Ferricstore.Config.set("requirepass", "")
 
     acl = Module.concat([FerricstoreServer, Acl])

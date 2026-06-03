@@ -81,6 +81,8 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
   end
 
   setup %{port: port} do
+    ShardHelpers.reset_server_auth_state()
+
     sock = connect_and_hello(port)
     send_cmd(sock, ["FLUSHDB"])
     recv_response(sock, "", 60_000)

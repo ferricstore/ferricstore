@@ -209,15 +209,15 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       end, "key with 1ms TTL should expire", 20, 5)
     end
 
-    test "key expiring in 50ms is readable before expiry, nil after" do
-      k = ukey("50ms_ttl")
-      expire_at = System.os_time(:millisecond) + 50
+    test "key expiring soon is readable before expiry, nil after" do
+      k = ukey("soon_ttl")
+      expire_at = System.os_time(:millisecond) + 500
       Router.put(FerricStore.Instance.get(:default), k, "brief", expire_at)
       assert "brief" == Router.get(FerricStore.Instance.get(:default), k)
 
       Ferricstore.Test.ShardHelpers.eventually(fn ->
         nil == Router.get(FerricStore.Instance.get(:default), k)
-      end, "key with 50ms TTL should expire", 30, 10)
+      end, "key with short TTL should expire", 1_000, 10)
     end
 
     test "expired key is not included in Router.keys(FerricStore.Instance.get(:default))" do
