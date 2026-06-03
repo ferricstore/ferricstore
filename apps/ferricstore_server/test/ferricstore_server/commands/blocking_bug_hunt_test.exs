@@ -1172,10 +1172,12 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
       sock = connect_and_hello(context.port)
       send_cmd(sock, ["BLPOP", key, "30"])
 
-      Process.sleep(100)
-
-      initial_count = Waiters.count(key)
-      assert initial_count >= 1, "Expected at least 1 waiter, got #{initial_count}"
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn -> Waiters.count(key) >= 1 end,
+        "BLPOP waiter registered before disconnect",
+        1_000,
+        10
+      )
 
       :gen_tcp.close(sock)
 

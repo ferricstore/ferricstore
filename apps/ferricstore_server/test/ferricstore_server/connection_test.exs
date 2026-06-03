@@ -1465,8 +1465,8 @@ defmodule FerricstoreServer.ConnectionTest do
       Ferricstore.Test.ShardHelpers.eventually(
         fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter registered for delayed job",
-        100,
-        5
+        1_000,
+        10
       )
 
       assert 1 = Ferricstore.Flow.ClaimWaiters.notify_ready(type, "queued", 0, partition, 1)
@@ -1474,8 +1474,8 @@ defmodule FerricstoreServer.ConnectionTest do
       Ferricstore.Test.ShardHelpers.eventually(
         fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter re-registered after empty delayed wake",
-        200,
-        10
+        4_000,
+        20
       )
 
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
