@@ -83,6 +83,11 @@ defmodule Ferricstore.Raft.WARaftBackend do
                         :tombstone_batch_result_mismatch
                       ])
 
+  defguardp is_write_timeout_unknown_reason(reason)
+            when reason == :write_timeout_unknown or
+                   (is_tuple(reason) and tuple_size(reason) == 2 and
+                      elem(reason, 0) == :timeout and elem(reason, 1) == :unknown_outcome)
+
   defguardp valid_shard_index_shape(shard_index)
             when is_integer(shard_index) and shard_index >= 0
 
@@ -2323,6 +2328,12 @@ defmodule Ferricstore.Raft.WARaftBackend do
       {:error, :already_member} ->
         :already_member
 
+      {:error, reason} = error when is_write_timeout_unknown_reason(reason) ->
+        case wait_storage_participant(shard_index, node_name, timeout_ms) do
+          :ok -> :ok
+          _other -> error
+        end
+
       {:error, _reason} = error ->
         error
     end
@@ -2343,6 +2354,12 @@ defmodule Ferricstore.Raft.WARaftBackend do
 
       {:error, :already_member} ->
         current_member_position(shard_index, node_name, timeout_ms)
+
+      {:error, reason} = error when is_write_timeout_unknown_reason(reason) ->
+        case current_member_position(shard_index, node_name, timeout_ms) do
+          {:ok, _position} = ok -> ok
+          _other -> error
+        end
 
       {:error, _reason} = error ->
         error

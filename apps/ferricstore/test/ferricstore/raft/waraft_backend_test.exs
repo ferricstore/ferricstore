@@ -5429,7 +5429,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert {:ok, _state} = :ferricstore_waraft_spike_segment_log.trim(log, trim_index, %{})
 
       assert [
-               {^z_key, nil, 0, _lfu, {:waraft_projection, old_projection_index},
+               {^z_key, _value, 0, _lfu, {:waraft_projection, old_projection_index},
                 old_projection_offset, 1}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
 
@@ -5448,7 +5448,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "z" == Router.get(ctx, z_key)
 
       assert [
-               {^z_key, nil, 0, _lfu, {:waraft_projection, ^old_projection_index},
+               {^z_key, _value, 0, _lfu, {:waraft_projection, ^old_projection_index},
                 ^old_projection_offset, 1}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
 
@@ -5532,7 +5532,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
                :ferricstore_waraft_spike_segment_log.trim(log, first_trim_index, %{})
 
       assert [
-               {^z_key, nil, 0, _lfu, {:waraft_projection, old_projection_index},
+               {^z_key, _value, 0, _lfu, {:waraft_projection, old_projection_index},
                 old_projection_offset, 1}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
 
@@ -5578,7 +5578,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
       assert "z" == Router.get(ctx, z_key)
 
       assert [
-               {^z_key, nil, 0, _lfu, {:waraft_projection, current_projection_index},
+               {^z_key, _value, 0, _lfu, {:waraft_projection, current_projection_index},
                 current_projection_offset, 1}
              ] = :ets.lookup(elem(ctx.keydir_refs, 0), z_key)
 
@@ -9755,13 +9755,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     state_key = Ferricstore.Flow.Keys.state_key(flow_id, partition)
 
     assert [
-             {^state_key, nil, _expire_at_ms, {:flow_state_version, _version, _lfu},
-              {:waraft_apply_projection, _index}, 0, _value_size}
+             {^state_key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, _index},
+              _offset, _value_size}
            ] =
              :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
-
-    assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) >
-             0
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
     assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)

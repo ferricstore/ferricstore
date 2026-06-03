@@ -583,21 +583,14 @@ defmodule Ferricstore.Cluster.ManagerTest do
         {:ok, false}
       end)
 
-      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-        send(parent, :direct_sync)
-        {:ok, %{0 => 7}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target,
-                                                                             1,
-                                                                             %{0 => 7} ->
-        send(parent, :target_raft_start)
-        :ok
-      end)
-
       Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
         send(parent, :raft_add)
         {:ok, %{0 => :ok}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 1 ->
+        send(parent, :barrier_read)
+        {:ok, %{0 => 7}}
       end)
 
       Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target,
@@ -609,11 +602,6 @@ defmodule Ferricstore.Cluster.ManagerTest do
 
       Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
         %{0 => false}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
-        send(parent, :target_raft_stop)
-        :ok
       end)
 
       Process.put(:ferricstore_cluster_manager_remove_added_member_hook, fn ^target, 0 ->
@@ -628,12 +616,10 @@ defmodule Ferricstore.Cluster.ManagerTest do
 
       on_exit(fn ->
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
-        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
-        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
         Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
-        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
         Process.delete(:ferricstore_cluster_manager_remove_added_member_hook)
         Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
       end)
@@ -653,11 +639,9 @@ defmodule Ferricstore.Cluster.ManagerTest do
       assert {:reply, {:error, :simulated_marker_failure}, new_state} =
                Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
 
-      assert_received :direct_sync
-      assert_received :target_raft_start
       assert_received :raft_add
+      assert_received :barrier_read
       assert_received :marker_write
-      assert_received :target_raft_stop
       assert_received {:raft_remove, 0}
       assert_received :target_data_cleanup
       refute MapSet.member?(new_state.known_nodes, target)
@@ -749,8 +733,8 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "disk clone join aborts before stopping target when raft index read fails" do
-      target = :"disk_clone_index_failure_target@127.0.0.1"
+    test "data-bearing raft target with matching cluster marker uses snapshot add path" do
+      target = :"disk_clone_snapshot_target@127.0.0.1"
       parent = self()
       ctx = FerricStore.Instance.get(:default)
       {:ok, %{cluster_id: cluster_id}} = Ferricstore.ReplicationMode.read(ctx.data_dir)
@@ -767,106 +751,35 @@ defmodule Ferricstore.Cluster.ManagerTest do
         %{0 => false}
       end)
 
-      Process.put(:ferricstore_cluster_manager_read_target_indices_hook, fn ^target, 1 ->
-        send(parent, :target_indices_read)
-        {:error, {:target_index_read_failed, target, 0, :simulated_read_failure}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
-        send(parent, :target_raft_stop)
-        :ok
-      end)
-
-      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target, 1, _idx ->
-        send(parent, :target_raft_start)
-        :ok
-      end)
-
       Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
         send(parent, :raft_add)
         {:ok, %{0 => :ok}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 1 ->
+        send(parent, :barrier_read)
+        {:ok, %{0 => 12}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target,
+                                                                            _ctx,
+                                                                            %{0 => 12} ->
+        send(parent, :marker_write)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
+        send(parent, :target_cleanup)
+        :ok
       end)
 
       on_exit(fn ->
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
         Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
-        Process.delete(:ferricstore_cluster_manager_read_target_indices_hook)
-        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
-        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
-      end)
-
-      state = %{
-        mode: :cluster,
-        role: :voter,
-        cluster_nodes: [],
-        remove_delay_ms: 60_000,
-        known_nodes: MapSet.new(),
-        remove_timers: %{},
-        sync_status: :synced,
-        shard_sync_status: %{},
-        shard_count: 1
-      }
-
-      assert {:reply, {:error, {:target_index_read_failed, ^target, 0, :simulated_read_failure}},
-              new_state} =
-               Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
-
-      assert_received :target_indices_read
-      refute_received :target_raft_stop
-      refute_received :target_raft_start
-      refute_received :raft_add
-      refute MapSet.member?(new_state.known_nodes, target)
-    end
-
-    test "target raft start failure aborts join before raft membership and cleans copied data" do
-      target = :"raft_start_failure_target@127.0.0.1"
-      parent = self()
-
-      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
-        {:ok, false}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-        send(parent, :direct_sync)
-        {:ok, %{0 => 9}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target,
-                                                                             1,
-                                                                             %{0 => 9} ->
-        send(parent, :target_raft_start)
-        {:error, {:target_raft_start_failed, 0, :simulated_start_failure}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
-        send(parent, :raft_add)
-        {:ok, %{0 => :ok}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target, _ctx, _idx ->
-        send(parent, :marker_write)
-        :ok
-      end)
-
-      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
-        send(parent, :target_raft_stop)
-        :ok
-      end)
-
-      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
-        send(parent, :target_data_cleanup)
-        :ok
-      end)
-
-      on_exit(fn ->
-        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
-        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
-        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
-        Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
         Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
-        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
         Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
       end)
 
@@ -882,21 +795,90 @@ defmodule Ferricstore.Cluster.ManagerTest do
         shard_count: 1
       }
 
-      assert {:reply, {:error, {:target_raft_start_failed, 0, :simulated_start_failure}},
-              new_state} =
+      assert {:reply, :ok, new_state} =
                Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
 
-      assert_received :direct_sync
-      assert_received :target_raft_start
-      assert_received :target_raft_stop
+      assert_received :raft_add
+      assert_received :barrier_read
+      assert_received :marker_write
+      refute_received :target_cleanup
+      assert MapSet.member?(new_state.known_nodes, target)
+    end
+
+    test "marker failure after empty target add rolls back and cleans target data" do
+      target = :"empty_target_marker_failure@127.0.0.1"
+      parent = self()
+
+      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
+        {:ok, false}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
+        %{0 => false}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
+        send(parent, :raft_add)
+        {:ok, %{0 => :ok}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 1 ->
+        send(parent, :barrier_read)
+        {:ok, %{0 => 9}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target,
+                                                                            _ctx,
+                                                                            %{0 => 9} ->
+        send(parent, :marker_write)
+        {:error, :simulated_marker_failure}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_remove_added_member_hook, fn ^target, 0 ->
+        send(parent, {:raft_remove, 0})
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
+        send(parent, :target_data_cleanup)
+        :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_target_membership_hook)
+        Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
+        Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
+        Process.delete(:ferricstore_cluster_manager_remove_added_member_hook)
+        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 1
+      }
+
+      assert {:reply, {:error, :simulated_marker_failure}, new_state} =
+               Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
+
+      assert_received :raft_add
+      assert_received :barrier_read
+      assert_received :marker_write
+      assert_received {:raft_remove, 0}
       assert_received :target_data_cleanup
-      refute_received :raft_add
-      refute_received :marker_write
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "join aborts before target raft start when a sync index is missing" do
-      target = :"missing_sync_index_target@127.0.0.1"
+    test "barrier failure after add rolls back newly-added members and cleans empty target" do
+      target = :"missing_barrier_index_target@127.0.0.1"
       parent = self()
 
       Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 2 ->
@@ -907,33 +889,33 @@ defmodule Ferricstore.Cluster.ManagerTest do
         %{0 => false, 1 => false}
       end)
 
-      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 2 ->
-        send(parent, :target_raft_stop)
-        :ok
-      end)
-
-      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-        send(parent, :direct_sync)
-        {:ok, %{0 => 9}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target, 2, _idx ->
-        send(parent, :target_raft_start)
-        :ok
-      end)
-
       Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
         send(parent, :raft_add)
         {:ok, %{0 => :ok, 1 => :ok}}
       end)
 
+      Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 2 ->
+        send(parent, :barrier_read)
+        {:error, {:waraft_barrier_index_unavailable, 1, :missing_index}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_remove_added_member_hook, fn ^target, shard_idx ->
+        send(parent, {:raft_remove, shard_idx})
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 2 ->
+        send(parent, :target_data_cleanup)
+        :ok
+      end)
+
       on_exit(fn ->
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
-        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
-        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
-        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
+        Process.delete(:ferricstore_cluster_manager_remove_added_member_hook)
+        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
       end)
 
       state = %{
@@ -948,42 +930,28 @@ defmodule Ferricstore.Cluster.ManagerTest do
         shard_count: 2
       }
 
-      assert {:reply, {:error, {:target_index_read_failed, ^target, 1, :missing_index}},
+      assert {:reply, {:error, {:waraft_barrier_index_unavailable, 1, :missing_index}},
               new_state} =
                Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
 
-      assert_received :target_raft_stop
-      assert_received :direct_sync
-      refute_received :target_raft_start
-      refute_received :raft_add
+      assert_received :raft_add
+      assert_received :barrier_read
+      assert_received {:raft_remove, 0}
+      assert_received {:raft_remove, 1}
+      assert_received :target_data_cleanup
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "target raft start aborts when cluster membership cannot be read" do
-      target = :"cluster_members_unavailable_target@127.0.0.1"
+    test "barrier failure surfaces cleanup rollback failure" do
+      target = :"barrier_cleanup_failure_target@127.0.0.1"
       parent = self()
 
       Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
         {:ok, false}
       end)
 
-      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-        send(parent, :direct_sync)
-        {:ok, %{0 => 9}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_cluster_members_hook, fn ^target ->
-        {:error, :members_unavailable}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
-        send(parent, :target_raft_stop)
-        :ok
-      end)
-
-      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
-        send(parent, :target_data_cleanup)
-        :ok
+      Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
+        %{0 => false}
       end)
 
       Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
@@ -991,13 +959,28 @@ defmodule Ferricstore.Cluster.ManagerTest do
         {:ok, %{0 => :ok}}
       end)
 
+      Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 1 ->
+        send(parent, :barrier_read)
+        {:error, :barrier_failed}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_remove_added_member_hook, fn ^target, 0 ->
+        send(parent, {:raft_remove, 0})
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
+        send(parent, :target_data_cleanup)
+        {:error, :simulated_cleanup_failure}
+      end)
+
       on_exit(fn ->
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
-        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
-        Process.delete(:ferricstore_cluster_manager_cluster_members_hook)
-        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
-        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
+        Process.delete(:ferricstore_cluster_manager_target_membership_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
+        Process.delete(:ferricstore_cluster_manager_remove_added_member_hook)
+        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
       end)
 
       state = %{
@@ -1013,19 +996,21 @@ defmodule Ferricstore.Cluster.ManagerTest do
       }
 
       assert {:reply,
-              {:error, {:target_raft_start_failed, :cluster_members, :members_unavailable}},
+              {:error,
+               {:waraft_target_marker_failed_rollback_failed, {:error, :barrier_failed}, :ok,
+                {:error, :simulated_cleanup_failure}}},
               new_state} =
                Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
 
-      assert_received :direct_sync
-      assert_received :target_raft_stop
+      assert_received :raft_add
+      assert_received :barrier_read
+      assert_received {:raft_remove, 0}
       assert_received :target_data_cleanup
-      refute_received :raft_add
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "target raft stop failure aborts before sync start or add" do
-      target = :"target_raft_stop_failure@127.0.0.1"
+    test "add failure surfaces cleanup rollback failure" do
+      target = :"target_add_cleanup_failure@127.0.0.1"
       parent = self()
 
       Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
@@ -1036,33 +1021,21 @@ defmodule Ferricstore.Cluster.ManagerTest do
         %{0 => false}
       end)
 
-      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
-        send(parent, :target_raft_stop)
-        {:error, {:target_raft_stop_failed, target, 0, :simulated_rpc_failure}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-        send(parent, :direct_sync)
-        {:ok, %{0 => 1}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target, 1, _idx ->
-        send(parent, :target_raft_start)
-        :ok
-      end)
-
       Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
         send(parent, :raft_add)
-        {:ok, %{0 => :ok}}
+        {{:error, {:partial_add, %{0 => {:error, :boom}}}}, %{0 => {:error, :boom}}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
+        send(parent, :target_data_cleanup)
+        {:error, :simulated_cleanup_failure}
       end)
 
       on_exit(fn ->
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
-        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
-        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
-        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
       end)
 
       state = %{
@@ -1077,14 +1050,16 @@ defmodule Ferricstore.Cluster.ManagerTest do
         shard_count: 1
       }
 
-      assert {:reply, {:error, {:target_raft_stop_failed, ^target, 0, :simulated_rpc_failure}},
+      assert {:reply,
+              {:error,
+               {:waraft_add_failed_rollback_failed,
+                {:error, {:partial_add, %{0 => {:error, :boom}}}}, :ok,
+                {:error, :simulated_cleanup_failure}}},
               new_state} =
                Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
 
-      assert_received :target_raft_stop
-      refute_received :direct_sync
-      refute_received :target_raft_start
-      refute_received :raft_add
+      assert_received :raft_add
+      assert_received :target_data_cleanup
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
@@ -1150,7 +1125,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "replace join cleans target data then syncs starts raft adds member and writes marker" do
+    test "replace join cleans target data then adds member and writes marker" do
       target = :"replace_success_target@127.0.0.1"
       parent = self()
       ctx = FerricStore.Instance.get(:default)
@@ -1173,26 +1148,14 @@ defmodule Ferricstore.Cluster.ManagerTest do
         %{0 => false}
       end)
 
-      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
-        send(parent, :target_raft_stop)
-        :ok
-      end)
-
-      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-        send(parent, :direct_sync)
-        {:ok, %{0 => 11}}
-      end)
-
-      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target,
-                                                                             1,
-                                                                             %{0 => 11} ->
-        send(parent, :target_raft_start)
-        :ok
-      end)
-
       Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
         send(parent, :raft_add)
         {:ok, %{0 => :ok}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_waraft_barrier_indices_hook, fn 1 ->
+        send(parent, :barrier_read)
+        {:ok, %{0 => 11}}
       end)
 
       Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target,
@@ -1207,10 +1170,8 @@ defmodule Ferricstore.Cluster.ManagerTest do
         Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
         Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
-        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
-        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
-        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_waraft_barrier_indices_hook)
         Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
       end)
 
@@ -1233,11 +1194,9 @@ defmodule Ferricstore.Cluster.ManagerTest do
                  state
                )
 
-      assert_received :target_data_cleanup
-      assert_received :target_raft_stop
-      assert_received :direct_sync
-      assert_received :target_raft_start
+      refute_received :target_data_cleanup
       assert_received :raft_add
+      assert_received :barrier_read
       assert_received :marker_write
       assert MapSet.member?(new_state.known_nodes, target)
     end

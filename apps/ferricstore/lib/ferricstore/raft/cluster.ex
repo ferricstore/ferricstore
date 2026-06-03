@@ -73,7 +73,19 @@ defmodule Ferricstore.Raft.Cluster do
   def add_member(shard_index, node, membership \\ :voter)
 
   def add_member(shard_index, node, :voter) do
-    case WARaftBackend.add_member(shard_index, node) do
+    add_member(shard_index, node, :voter, [])
+  end
+
+  def add_member(shard_index, node, membership) when membership in [:promotable, :non_voter] do
+    add_member(shard_index, node, membership, [])
+  end
+
+  def add_member(_shard_index, _node, membership),
+    do: {:error, {:unsupported_membership, membership}}
+
+  @spec add_member(non_neg_integer(), node(), atom(), keyword()) :: :ok | {:error, term()}
+  def add_member(shard_index, node, :voter, opts) do
+    case WARaftBackend.add_member(shard_index, node, opts) do
       {:ok, _position} -> :ok
       :already_member -> :ok
       {:error, :already_member} -> :ok
@@ -82,21 +94,21 @@ defmodule Ferricstore.Raft.Cluster do
     end
   end
 
-  def add_member(shard_index, node, membership) when membership in [:promotable, :non_voter] do
+  def add_member(shard_index, node, membership, opts) when membership in [:promotable, :non_voter] do
     case WARaftBackend.adjust_membership(shard_index, :remove_membership, node) do
       {:ok, _position} -> :ok
-      {:error, :not_a_member} -> add_participant(shard_index, node)
-      {:error, :not_member} -> add_participant(shard_index, node)
+      {:error, :not_a_member} -> add_participant(shard_index, node, opts)
+      {:error, :not_member} -> add_participant(shard_index, node, opts)
       {:error, _reason} = error -> error
       other -> {:error, other}
     end
   end
 
-  def add_member(_shard_index, _node, membership),
+  def add_member(_shard_index, _node, membership, _opts),
     do: {:error, {:unsupported_membership, membership}}
 
-  defp add_participant(shard_index, node) do
-    case WARaftBackend.add_participant(shard_index, node) do
+  defp add_participant(shard_index, node, opts) do
+    case WARaftBackend.add_participant(shard_index, node, opts) do
       {:ok, _position} -> :ok
       {:error, _reason} = error -> error
       other -> {:error, other}

@@ -422,7 +422,14 @@ defmodule Ferricstore.Cluster.Manager do
     with {:ok, target_has_data} <- target_has_data?(target_node, state.shard_count),
          :ok <- validate_target_data_identity(target_node, ctx, target_has_data, replace?),
          {:ok, preexisting_membership} <- target_membership_by_shard(target_node, state),
-         :ok <- maybe_cleanup_replace_target(target_node, state, replace?, target_has_data) do
+         :ok <-
+           prepare_waraft_snapshot_target(
+             target_node,
+             state,
+             replace?,
+             target_has_data,
+             preexisting_membership
+           ) do
       cleanup_data_on_failure? = replace? or not target_has_data
 
       add_node_and_persist_waraft_target_marker(
@@ -440,22 +447,122 @@ defmodule Ferricstore.Cluster.Manager do
     end
   end
 
-  defp maybe_cleanup_replace_target(_target_node, _state, false, _target_has_data), do: :ok
-  defp maybe_cleanup_replace_target(_target_node, _state, true, false), do: :ok
+  defp prepare_waraft_snapshot_target(
+         target_node,
+         state,
+         replace?,
+         target_has_data,
+         preexisting_membership
+       ) do
+    case Process.get(:ferricstore_cluster_manager_prepare_snapshot_target_hook) do
+      hook when is_function(hook, 4) ->
+        normalize_cluster_operation_result(hook.(target_node, state, replace?, target_has_data))
 
-  defp maybe_cleanup_replace_target(target_node, state, true, true) do
-    Logger.warning("ClusterManager: replacing pre-existing data on #{target_node}")
+      _other ->
+        do_prepare_waraft_snapshot_target(
+          target_node,
+          state,
+          replace?,
+          target_has_data,
+          preexisting_membership
+        )
+    end
+  end
 
-    case cleanup_target_data(target_node, state.shard_count) do
-      :ok ->
+  defp do_prepare_waraft_snapshot_target(
+         target_node,
+         state,
+         replace?,
+         target_has_data,
+         preexisting_membership
+       ) do
+    cond do
+      not replace? and target_has_data ->
         :ok
 
-      {:error, _reason} = error ->
-        Logger.error(
-          "ClusterManager: refusing REPLACE join after cleanup failure: #{inspect(error)}"
-        )
+      not replace? and target_already_member?(preexisting_membership) ->
+        :ok
 
-        error
+      Process.get(:ferricstore_cluster_manager_do_add_node_hook) != nil ->
+        :ok
+
+      true ->
+        if replace? and target_has_data do
+          Logger.warning("ClusterManager: replacing pre-existing data on #{target_node}")
+        end
+
+        with :ok <- stop_waraft_on_target(target_node, state.shard_count),
+             :ok <- cleanup_target_data(target_node, state.shard_count),
+             :ok <- start_waraft_on_target_for_snapshot(target_node, state.shard_count) do
+          :ok
+        else
+          {:error, _reason} = error ->
+            Logger.error(
+              "ClusterManager: refusing join after WARaft snapshot target preparation failure: #{inspect(error)}"
+            )
+
+            error
+
+          other ->
+            {:error, other}
+        end
+    end
+  end
+
+  defp target_already_member?(membership) when is_map(membership) do
+    Enum.any?(membership, fn {_shard_idx, member?} -> member? == true end)
+  end
+
+  defp target_already_member?(_membership), do: false
+
+  defp stop_waraft_on_target(target_node, shard_count) do
+    case Process.get(:ferricstore_cluster_manager_stop_raft_on_target_hook) do
+      hook when is_function(hook, 2) ->
+        normalize_cluster_operation_result(hook.(target_node, shard_count))
+
+      _other ->
+        try do
+          :erpc.call(target_node, Ferricstore.Raft.WARaftBackend, :stop, [], 30_000)
+          |> normalize_cluster_operation_result()
+        catch
+          kind, reason -> {:error, {:target_raft_stop_failed, target_node, {kind, reason}}}
+        end
+    end
+  end
+
+  defp start_waraft_on_target_for_snapshot(target_node, shard_count) do
+    case Process.get(:ferricstore_cluster_manager_start_raft_on_target_hook) do
+      hook when is_function(hook, 3) ->
+        normalize_cluster_operation_result(hook.(target_node, shard_count, :snapshot_join))
+
+      _other ->
+        do_start_waraft_on_target_for_snapshot(target_node)
+    end
+  end
+
+  defp do_start_waraft_on_target_for_snapshot(target_node) do
+    try do
+      target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
+
+      :erpc.call(
+        target_node,
+        Ferricstore.Raft.WARaftBackend,
+        :start,
+        [
+          target_ctx,
+          [
+            bootstrap: false,
+            log_module: Ferricstore.Raft.WARaftBackend.default_log_module(),
+            commit_batch_interval_ms:
+              Ferricstore.Raft.WARaftBackend.default_commit_batch_interval_ms(),
+            commit_batch_max: Ferricstore.Raft.WARaftBackend.default_commit_batch_max()
+          ]
+        ],
+        30_000
+      )
+      |> normalize_cluster_operation_result()
+    catch
+      kind, reason -> {:error, {:target_raft_start_failed, target_node, {kind, reason}}}
     end
   end
 
@@ -1072,9 +1179,11 @@ defmodule Ferricstore.Cluster.Manager do
       "ClusterManager: adding #{target_node} as #{membership} to all #{state.shard_count} shards"
     )
 
+    timeout_ms = cluster_membership_timeout_ms()
+
     shard_results =
       for shard_idx <- 0..(state.shard_count - 1), into: %{} do
-        case RaftCluster.add_member(shard_idx, target_node, membership) do
+        case RaftCluster.add_member(shard_idx, target_node, membership, timeout_ms: timeout_ms) do
           :ok ->
             Logger.debug("ClusterManager: added #{target_node} to shard #{shard_idx}")
             {shard_idx, :ok}
@@ -1094,6 +1203,13 @@ defmodule Ferricstore.Cluster.Manager do
       {{:error, {:partial_add, shard_results}}, shard_results}
     else
       {:ok, shard_results}
+    end
+  end
+
+  defp cluster_membership_timeout_ms do
+    case Application.get_env(:ferricstore, :cluster_membership_timeout_ms, 30_000) do
+      timeout_ms when is_integer(timeout_ms) and timeout_ms > 0 -> timeout_ms
+      _other -> 30_000
     end
   end
 
