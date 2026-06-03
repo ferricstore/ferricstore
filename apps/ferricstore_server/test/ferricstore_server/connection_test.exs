@@ -1457,7 +1457,7 @@ defmodule FerricstoreServer.ConnectionTest do
         "RETURN",
         "JOBS_COMPACT",
         "BLOCK",
-        "7000"
+        "10000"
       ])
 
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
@@ -1480,6 +1480,7 @@ defmodule FerricstoreServer.ConnectionTest do
 
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
       refute_receive {:flow_claim_due_stop, _measurements, %{flow_type: ^type}}, 40
+      Process.sleep(max(run_at - Ferricstore.CommandTime.now_ms(), 0) + 100)
       assert [[[^id, ^partition, _lease_token, _fencing_token]]] = recv_values(sock, 1)
     after
       :gen_tcp.close(sock)

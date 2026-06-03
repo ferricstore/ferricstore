@@ -180,9 +180,10 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
       drain_pressure_messages()
 
       {:ok, pid} = start_guard(max_memory_bytes: 1_073_741_824)
+      budget = budget_for_ratio(pid, 0.90)
 
       :sys.replace_state(pid, fn state ->
-        %{state | max_memory_bytes: budget_for_ratio(pid, 0.90)}
+        %{state | max_memory_bytes: budget}
       end)
 
       measurements = trigger_until_level(pid, :pressure)
@@ -205,9 +206,10 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
       drain_pressure_messages()
 
       {:ok, pid} = start_guard(max_memory_bytes: 1_073_741_824)
+      budget = budget_for_ratio(pid, 0.77)
 
       :sys.replace_state(pid, fn state ->
-        %{state | max_memory_bytes: budget_for_ratio(pid, 0.77)}
+        %{state | max_memory_bytes: budget}
       end)
 
       measurements = trigger_until_level(pid, :warn)

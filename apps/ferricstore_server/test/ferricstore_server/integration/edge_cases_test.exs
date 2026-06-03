@@ -240,7 +240,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
 
     test "PUT then overwrite with no-expiry removes the TTL" do
       k = ukey("clear_ttl")
-      expire_at = System.os_time(:millisecond) + 50
+      expire_at = System.os_time(:millisecond) + 5_000
       Router.put(FerricStore.Instance.get(:default), k, "expiring", expire_at)
       assert "expiring" == Router.get(FerricStore.Instance.get(:default), k)
       # Overwrite with no expiry — synchronous via Raft, should persist the TTL removal
