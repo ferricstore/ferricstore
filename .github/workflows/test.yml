@@ -203,6 +203,7 @@ jobs:
     name: "Core tests (ubuntu)"
     needs: build-ubuntu
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
@@ -218,6 +219,7 @@ jobs:
             apps/ferricstore/priv/native
           key: build-Linux-${{ github.sha }}
       - name: Run ferricstore tests
+        timeout-minutes: 40
         run: mix test apps/ferricstore/test --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
@@ -230,6 +232,7 @@ jobs:
     name: "Core tests (macos)"
     needs: build-macos
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
@@ -245,6 +248,7 @@ jobs:
             apps/ferricstore/priv/native
           key: build-macOS-${{ github.sha }}
       - name: Run ferricstore tests
+        timeout-minutes: 40
         run: mix test apps/ferricstore/test --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()

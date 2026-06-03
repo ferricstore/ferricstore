@@ -1,6 +1,8 @@
 defmodule Ferricstore.Bench.RespRouterLoadTest do
   use ExUnit.Case, async: true
 
+  @moduletag :bench
+
   @support_path Path.expand("../../../../../bench/support/resp_router_load.exs", __DIR__)
 
   Code.require_file(@support_path)

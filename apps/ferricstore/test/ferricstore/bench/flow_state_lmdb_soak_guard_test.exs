@@ -1,6 +1,8 @@
 defmodule Ferricstore.Bench.FlowStateLMDBSoakGuardTest do
   use ExUnit.Case, async: true
 
+  @moduletag :bench
+
   test "production soak reports projection, blob protection, and release cursor health" do
     source =
       File.read!(
