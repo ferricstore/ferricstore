@@ -881,7 +881,7 @@ defmodule FerricstoreServer.ConnectionTest do
       ])
 
     send_raw(sock, pipeline)
-    assert [{:simple, "OK"}, nil] = recv_values(sock, 2)
+    assert [{:simple, "OK"}, nil] = recv_values(sock, 2, "", 60)
 
     :gen_tcp.close(sock)
   end
