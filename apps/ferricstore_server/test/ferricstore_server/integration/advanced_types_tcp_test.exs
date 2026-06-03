@@ -11,6 +11,7 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
+  alias Ferricstore.Test.ShardHelpers
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -99,6 +100,8 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   end
 
   setup %{port: port} do
+    ShardHelpers.flush_all_keys()
+
     sock = connect_and_hello(port)
     send_cmd(sock, ["FLUSHDB"])
     recv_response(sock)

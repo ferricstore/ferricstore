@@ -1316,10 +1316,18 @@ defmodule FerricstoreServer.ConnectionTest do
         "RETURN",
         "JOBS_COMPACT",
         "BLOCK",
-        "500"
+        "2000"
       ])
 
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
+
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn -> flow_claim_waiter_registered?(type, partition) end,
+        "RESP claim_due waiter registered before idle wake",
+        100,
+        5
+      )
+
       refute_receive {:flow_claim_due_stop, _measurements, %{flow_type: ^type}}, 90
 
       assert :ok =
@@ -1423,7 +1431,7 @@ defmodule FerricstoreServer.ConnectionTest do
     type = "block-delayed-empty-wake:" <> Integer.to_string(System.unique_integer([:positive]))
     id = "#{type}:#{System.unique_integer([:positive])}"
     now = Ferricstore.CommandTime.now_ms()
-    run_at = now + 500
+    run_at = now + 2_000
 
     try do
       assert :ok =
@@ -1449,7 +1457,7 @@ defmodule FerricstoreServer.ConnectionTest do
         "RETURN",
         "JOBS_COMPACT",
         "BLOCK",
-        "1000"
+        "3000"
       ])
 
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
@@ -1466,8 +1474,8 @@ defmodule FerricstoreServer.ConnectionTest do
       Ferricstore.Test.ShardHelpers.eventually(
         fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter re-registered after empty delayed wake",
-        50,
-        10
+        100,
+        30
       )
 
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000

@@ -40,7 +40,15 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
   # Reset atomics flags after each test so that tiny-budget
   # MemoryGuard checks don't leak KEYDIR_FULL into other tests.
   setup do
+    original_ctx = FerricStore.Instance.get(:default)
+
+    # These tests exercise MemoryGuard's keydir/NIF accounting thresholds.
+    # Disable host RSS in this module so macOS/Linux runner process size does
+    # not force a higher overall pressure level than the synthetic budget.
+    FerricStore.Instance.inject_callbacks(:default, process_rss_fn: nil)
+
     on_exit(fn ->
+      :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
       MemoryGuard.reset_pressure_flags()
     end)
 
