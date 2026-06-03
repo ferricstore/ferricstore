@@ -480,7 +480,10 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp blob_gc_merge_stats(acc, stats) do
-    Map.merge(acc, stats, fn _key, a, b when is_integer(a) and is_integer(b) -> a + b end)
+    Map.merge(acc, stats, fn
+      _key, a, b when is_integer(a) and is_integer(b) -> a + b
+      _key, _a, b -> b
+    end)
   end
 
   defp emit_blob_protection_reconcile(ctx, idx, released_count, blocked_count) do
@@ -2881,7 +2884,12 @@ defmodule Ferricstore.Store.Router do
   defp cold_batch_read_error_reason(_value), do: :nil_from_cold_location
 
   defp read_cold_async(path, offset, expected_key) do
-    Ferricstore.Store.ColdRead.pread_keyed(path, offset, expected_key, @cold_batch_read_timeout_ms)
+    Ferricstore.Store.ColdRead.pread_keyed(
+      path,
+      offset,
+      expected_key,
+      @cold_batch_read_timeout_ms
+    )
   end
 
   defp read_cold_materialized(ctx, idx, path, offset, expected_key) do
@@ -4792,7 +4800,8 @@ defmodule Ferricstore.Store.Router do
           do: nil,
           else: flow_get_lmdb(ctx, key, :lagged)
 
-      value -> value
+      value ->
+        value
     end
   end
 
@@ -5437,7 +5446,12 @@ defmodule Ferricstore.Store.Router do
           {:ok, []}
 
         {:non_empty, cold_due_mode} ->
-          raft_write(ctx, idx, key, {:flow_claim_due, key, Map.put(attrs, :cold_due_mode, cold_due_mode)})
+          raft_write(
+            ctx,
+            idx,
+            key,
+            {:flow_claim_due, key, Map.put(attrs, :cold_due_mode, cold_due_mode)}
+          )
 
         _unknown ->
           raft_write(ctx, idx, key, {:flow_claim_due, key, attrs})
@@ -5532,14 +5546,14 @@ defmodule Ferricstore.Store.Router do
         {filtered, modes} =
           Enum.reduce(partition_keys, {[], []}, fn partition_key, {keys_acc, modes_acc} ->
             case flow_claim_due_empty_precheck(
-              ctx,
-              idx,
-              type,
-              requested_state,
-              priority,
-              partition_key,
-              attrs
-            ) do
+                   ctx,
+                   idx,
+                   type,
+                   requested_state,
+                   priority,
+                   partition_key,
+                   attrs
+                 ) do
               :empty ->
                 {keys_acc, modes_acc}
 
@@ -5621,7 +5635,8 @@ defmodule Ferricstore.Store.Router do
             :empty
           end
 
-        [_ | _] -> {:non_empty, :skip}
+        [_ | _] ->
+          {:non_empty, :skip}
       end
     else
       _other -> :unknown

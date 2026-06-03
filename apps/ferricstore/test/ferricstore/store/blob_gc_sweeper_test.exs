@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.BlobGCSweeperTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.BlobGCSweeper
+  alias Ferricstore.Store.Router
 
   setup do
     old_enabled = Application.get_env(:ferricstore, :blob_gc_sweeper_enabled)
@@ -169,6 +170,46 @@ defmodule Ferricstore.Store.BlobGCSweeperTest do
 
     assert %{last_sweep: %{status: :skipped, skipped: true, reason: ^reason}} =
              BlobGCSweeper.info(name)
+  end
+
+  test "router aggregates multiple skipped shard stats without crashing" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_blob_gc_skip_#{System.unique_integer([:positive])}"
+      )
+
+    File.rm_rf!(data_dir)
+    File.mkdir_p!(data_dir)
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    shard_a =
+      start_supervised!(%{
+        id: {:blob_gc_skip_aggregate_shard, 0},
+        start: {Agent, :start_link, [fn -> %{raft?: true} end]}
+      })
+
+    shard_b =
+      start_supervised!(%{
+        id: {:blob_gc_skip_aggregate_shard, 1},
+        start: {Agent, :start_link, [fn -> %{raft?: true} end]}
+      })
+
+    ctx = %{
+      name: :blob_gc_skip_aggregate_test,
+      data_dir: data_dir,
+      shard_count: 2,
+      shard_names: {shard_a, shard_b}
+    }
+
+    assert {:ok,
+            %{
+              skipped: true,
+              deleted_files: 0,
+              deleted_bytes: 0,
+              kept_files: 0
+            }} = Router.sweep_blob_garbage(ctx)
   end
 
   test "emits error telemetry when automatic GC fails" do

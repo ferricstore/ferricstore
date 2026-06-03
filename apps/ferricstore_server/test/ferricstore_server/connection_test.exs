@@ -1510,7 +1510,7 @@ defmodule FerricstoreServer.ConnectionTest do
     type = "block-delayed-any-partition:" <> Integer.to_string(System.unique_integer([:positive]))
     id = "#{type}:#{System.unique_integer([:positive])}"
     now = Ferricstore.CommandTime.now_ms()
-    run_at = now + 350
+    run_at = now + 1_500
 
     try do
       assert :ok =
@@ -1536,7 +1536,7 @@ defmodule FerricstoreServer.ConnectionTest do
         "RETURN",
         "JOBS_COMPACT",
         "BLOCK",
-        "1200"
+        "3000"
       ])
 
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
