@@ -151,7 +151,8 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
       drain_pressure_messages()
 
       # We need to find a max_memory_bytes value that puts the ratio in [0.85, 0.95).
-      # Measure actual ETS memory first, then compute a budget that produces ~90%.
+      # Measure the same hot-path bytes MemoryGuard uses, then compute a budget
+      # that produces ~90%.
       total_ets_bytes = measure_total_ets_bytes()
 
       # Target ratio of 0.90 -- so max_memory_bytes = total_ets_bytes / 0.90
@@ -183,7 +184,7 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
       handler_id = attach([:ferricstore, :memory, :pressure])
       drain_pressure_messages()
 
-      # Target ratio of 0.77 -- so max_memory_bytes = total_ets_bytes / 0.77
+      # Target ratio of 0.77 -- so max_memory_bytes = measured bytes / 0.77
       total_ets_bytes = measure_total_ets_bytes()
 
       max_bytes =
@@ -454,10 +455,24 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
   # ---------------------------------------------------------------------------
 
   defp measure_total_ets_bytes do
-    Enum.reduce(0..3, 0, fn i, acc ->
-      keydir_bytes = safe_ets_memory(:"keydir_#{i}")
-      acc + keydir_bytes
-    end)
+    keydir_bytes =
+      Enum.reduce(0..3, 0, fn i, acc ->
+        keydir_bytes = safe_ets_memory(:"keydir_#{i}")
+        acc + keydir_bytes
+      end)
+
+    keydir_bytes + rust_allocated_bytes()
+  end
+
+  defp rust_allocated_bytes do
+    case Ferricstore.Bitcask.NIF.rust_allocated_bytes() do
+      bytes when is_integer(bytes) and bytes > 0 -> bytes
+      _other -> 0
+    end
+  rescue
+    _ -> 0
+  catch
+    _, _ -> 0
   end
 
   defp safe_ets_memory(table_name) do

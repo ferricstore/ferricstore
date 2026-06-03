@@ -101,6 +101,8 @@ defmodule Ferricstore.Test.ShardHelpers do
     # by hashing the compound key string. Use one delete batch per shard so a
     # restart-heavy full suite cannot spend 30s per key waiting on stale leader
     # state during cleanup.
+    wait_default_waraft_ready(flush_timeout)
+
     Enum.each(0..(shard_count - 1), fn i ->
       shard = Router.shard_name(FerricStore.Instance.get(:default), i)
 

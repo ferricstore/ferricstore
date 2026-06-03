@@ -404,31 +404,37 @@ defmodule Ferricstore.Commands.Cluster do
     ctx = default_instance()
     shard_count = if ctx, do: ctx.shard_count, else: configured_shard_count()
 
-    Enum.map(0..(shard_count - 1), fn index ->
-      keydir = :"keydir_#{index}"
-      name = if ctx, do: Router.shard_name(ctx, index), else: nil
+    if is_nil(ctx) do
+      Enum.map(0..(shard_count - 1), fn index ->
+        {index, %{keys: 0, memory_bytes: 0, status: "down"}}
+      end)
+    else
+      Enum.map(0..(shard_count - 1), fn index ->
+        keydir = :"keydir_#{index}"
+        name = Router.shard_name(ctx, index)
 
-      info =
-        try do
-          keys = ets_count(keydir)
-          keydir_words = ets_memory(keydir)
-          word_size = :erlang.system_info(:wordsize)
-          memory_bytes = keydir_words * word_size
+        info =
+          try do
+            keys = ets_count(keydir)
+            keydir_words = ets_memory(keydir)
+            word_size = :erlang.system_info(:wordsize)
+            memory_bytes = keydir_words * word_size
 
-          status =
-            case Process.whereis(name) do
-              pid when is_pid(pid) -> if Process.alive?(pid), do: "ok", else: "down"
-              nil -> "down"
-            end
+            status =
+              case Process.whereis(name) do
+                pid when is_pid(pid) -> if Process.alive?(pid), do: "ok", else: "down"
+                nil -> "down"
+              end
 
-          %{keys: keys, memory_bytes: memory_bytes, status: status}
-        rescue
-          ArgumentError ->
-            %{keys: 0, memory_bytes: 0, status: "down"}
-        end
+            %{keys: keys, memory_bytes: memory_bytes, status: status}
+          rescue
+            ArgumentError ->
+              %{keys: 0, memory_bytes: 0, status: "down"}
+          end
 
-      {index, info}
-    end)
+        {index, info}
+      end)
+    end
   end
 
   defp default_instance do

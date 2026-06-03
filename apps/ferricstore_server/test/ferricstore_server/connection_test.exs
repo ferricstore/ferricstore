@@ -31,6 +31,15 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.send(sock, IO.iodata_to_binary(Encoder.encode(args)))
   end
 
+  defp flow_claim_waiter_registered?(type, partition) do
+    [nil, "queued"]
+    |> Enum.any?(fn state ->
+      type
+      |> Ferricstore.Flow.ClaimWaiters.wait_keys(state, nil, partition)
+      |> Enum.any?(&(Ferricstore.Flow.ClaimWaiters.count(&1) > 0))
+    end)
+  end
+
   # ---------------------------------------------------------------------------
   # Setup / teardown
   # ---------------------------------------------------------------------------
@@ -1060,7 +1069,7 @@ defmodule FerricstoreServer.ConnectionTest do
     send_raw(sock, claim)
 
     Ferricstore.Test.ShardHelpers.eventually(
-      fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+      fn -> flow_claim_waiter_registered?(type, partition) end,
       "RESP claim_due waiter registered",
       100,
       5
@@ -1196,7 +1205,7 @@ defmodule FerricstoreServer.ConnectionTest do
       ])
 
       Ferricstore.Test.ShardHelpers.eventually(
-        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter registered",
         100,
         5
@@ -1205,7 +1214,7 @@ defmodule FerricstoreServer.ConnectionTest do
       assert 1 = Ferricstore.Flow.ClaimWaiters.notify_ready(type, "queued", 0, partition, 1)
 
       Ferricstore.Test.ShardHelpers.eventually(
-        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter re-registered after empty wake",
         200,
         10
@@ -1446,7 +1455,7 @@ defmodule FerricstoreServer.ConnectionTest do
       assert_receive {:flow_claim_due_stop, %{count: 0}, %{flow_type: ^type}}, 1_000
 
       Ferricstore.Test.ShardHelpers.eventually(
-        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter registered for delayed job",
         100,
         5
@@ -1455,7 +1464,7 @@ defmodule FerricstoreServer.ConnectionTest do
       assert 1 = Ferricstore.Flow.ClaimWaiters.notify_ready(type, "queued", 0, partition, 1)
 
       Ferricstore.Test.ShardHelpers.eventually(
-        fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
+        fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter re-registered after empty delayed wake",
         50,
         10
