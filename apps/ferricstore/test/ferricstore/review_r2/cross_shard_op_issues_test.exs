@@ -21,6 +21,9 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
     :ok
   end
 
+  defp raft_result({:ok, {:applied_at, _, result}, _}), do: result
+  defp raft_result({:error, _reason} = error), do: error
+
   # ---------------------------------------------------------------------------
   # R2-C2: Locks/intents stored in process dictionary -- lost on shard restart
   #
@@ -50,8 +53,12 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       # Confirm lock is active: another owner should fail
       other_ref = make_ref()
 
-      {:ok, {:applied_at, _, {:error, :keys_locked}}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [key], other_ref, expire_at})
+      assert {:error, :keys_locked} =
+               shard_id
+               |> Ferricstore.Raft.CommandClock.process_command(
+                 {:lock_keys, [key], other_ref, expire_at}
+               )
+               |> raft_result()
 
       # Kill the shard and wait for restart
       ShardHelpers.compact_wal()
@@ -62,8 +69,12 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       new_other_ref = make_ref()
       new_expire = System.os_time(:millisecond) + 30_000
 
-      {:ok, {:applied_at, _, result}, _} =
-        Ferricstore.Raft.CommandClock.process_command(new_shard_id, {:lock_keys, [key], new_other_ref, new_expire})
+      result =
+        new_shard_id
+        |> Ferricstore.Raft.CommandClock.process_command(
+          {:lock_keys, [key], new_other_ref, new_expire}
+        )
+        |> raft_result()
 
       # Lock survives restart -- another owner cannot acquire it
       assert result == {:error, :keys_locked},
@@ -326,8 +337,12 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       # Verify the lock is active
       other_ref = make_ref()
 
-      {:ok, {:applied_at, _, {:error, :keys_locked}}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], other_ref, expire_at})
+      assert {:error, :keys_locked} =
+               shard_id
+               |> Ferricstore.Raft.CommandClock.process_command(
+                 {:lock_keys, [k1], other_ref, expire_at}
+               )
+               |> raft_result()
 
       # Run the intent resolver
       CrossShardOp.IntentResolver.resolve_stale_intents()

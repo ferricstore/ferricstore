@@ -327,9 +327,11 @@ jobs:
           epmd -daemon
           set +e
 
-          # Run all durability tests, capture exit codes
-          mix test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
-          elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --only jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
+          # Run core durability tests only. Server lifecycle tests run in the
+          # dedicated server jobs; mixing destructive app suites in one umbrella
+          # invocation can leave supervised state polluted for later suites.
+          mix test apps/ferricstore/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
+          elixir --sname ci_jepsen --cookie ferricstore_test -S mix test apps/ferricstore/test --only jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
           mix test apps/ferricstore/test --only large_alloc --timeout 120000 2>&1 | tee /tmp/durability_large_alloc.log
 
           count_failures() {

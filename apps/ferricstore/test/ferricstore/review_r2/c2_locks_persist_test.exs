@@ -22,6 +22,9 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
     "#{base}_persist_#{:rand.uniform(9_999_999)}"
   end
 
+  defp raft_result({:ok, {:applied_at, _, result}, _}), do: result
+  defp raft_result({:error, _reason} = error), do: error
+
   describe "locks survive shard restart" do
     test "lock persists after shard kill + restart" do
       key = unique_key(0)
@@ -40,7 +43,12 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
       # because the original lock should have survived
       other_ref = make_ref()
       other_expire = System.os_time(:millisecond) + 5000
-      {:ok, {:applied_at, _, result}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [key], other_ref, other_expire})
+      result =
+        shard_id
+        |> Ferricstore.Raft.CommandClock.process_command(
+          {:lock_keys, [key], other_ref, other_expire}
+        )
+        |> raft_result()
 
       assert result == {:error, :keys_locked},
              "Lock should survive shard restart — got #{inspect(result)} instead of {:error, :keys_locked}"
