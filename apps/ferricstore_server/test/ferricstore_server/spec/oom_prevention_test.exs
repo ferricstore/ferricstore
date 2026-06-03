@@ -9,6 +9,14 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
 
   alias Ferricstore.MemoryGuard
 
+  setup do
+    MemoryGuard.reset_pressure_flags()
+
+    on_exit(fn ->
+      MemoryGuard.reset_pressure_flags()
+    end)
+  end
+
   # Helper: send :check and wait for MemoryGuard to process it
   defp trigger_and_wait(pid, expected_reject) do
     send(pid, :check)
