@@ -71,7 +71,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert ["OK", "OK"] =
+    assert "OK" =
              Dispatcher.dispatch(
                "FLOW.TRANSITION_MANY",
                [

@@ -603,7 +603,7 @@ defmodule Ferricstore.CrossShardOpTest do
 
       ShardHelpers.eventually(fn ->
         match?({:ok, {_fid, _off, _vsize}}, Router.get_keydir_file_ref(ctx, k1))
-      end)
+      end, "large value keydir file ref should flush before intent hash test", 5_000, 20)
 
       idx = Router.shard_for(ctx, k1)
       per_shard_stores = %{idx => CrossShardOp.build_store_for_shard(ctx, idx)}

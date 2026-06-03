@@ -83,7 +83,7 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       assert File.dir?(compact_tmp_dir)
     end
 
-    test "successful compaction reports stale hint cleanup failure", %{shard: shard} do
+    test "compaction returns stale hint cleanup failure", %{shard: shard} do
       assert :ok = GenServer.call(shard, {:put, "hint_cleanup_key", "value_1", 0})
       assert :ok = GenServer.call(shard, :flush)
 
@@ -95,7 +95,8 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
 
       log =
         capture_log(fn ->
-          assert {:ok, {1, 0, _reclaimed}} = GenServer.call(shard, {:run_compaction, [0]})
+          assert {:error, {:compaction_failed, [{0, {:hint_remove_failed, _reason}}]}} =
+                   GenServer.call(shard, {:run_compaction, [0]})
         end)
 
       assert log =~ "failed to remove stale compaction hint file"

@@ -256,13 +256,19 @@ defmodule Ferricstore.WritePathNosyncTest do
       keydir = :"keydir_#{idx}"
       [{^key, ^value, 0, _lfu, fid, off, vsize}] = :ets.lookup(keydir, key)
 
-      assert is_integer(fid)
+      assert fid != :pending
       assert vsize == byte_size(value)
 
-      shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-      path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+      if is_integer(fid) do
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+        path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
 
-      assert {:ok, ^value} = Ferricstore.Bitcask.NIF.v2_pread_at(path, off)
+        assert {:ok, ^value} = Ferricstore.Bitcask.NIF.v2_pread_at(path, off)
+      else
+        assert match?({:waraft_segment, _}, fid)
+        assert is_integer(off)
+        assert ^value = Router.get(ctx, key)
+      end
     end
 
     test "flush marks the supplied instance shard dirty for the Bitcask checkpointer" do

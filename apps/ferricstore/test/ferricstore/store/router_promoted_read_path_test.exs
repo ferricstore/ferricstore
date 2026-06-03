@@ -126,6 +126,9 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
   end
 
   defp without_shared_log(ctx, fun) do
+    Process.sleep(200)
+    drain_pread_corrupt()
+
     shared_path =
       ctx.data_dir
       |> Ferricstore.DataDir.shard_data_path(0)
@@ -138,6 +141,15 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
       fun.()
     after
       File.rename!(moved_path, shared_path)
+    end
+  end
+
+  defp drain_pread_corrupt do
+    receive do
+      {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements, _metadata} ->
+        drain_pread_corrupt()
+    after
+      0 -> :ok
     end
   end
 

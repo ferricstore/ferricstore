@@ -149,6 +149,16 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
     Promotion.dedicated_path(data_dir, shard_idx, :hash, key)
   end
 
+  defp promoted_path!(state, key) do
+    case ShardCompound.promoted_store(state, key) do
+      path when is_binary(path) ->
+        path
+
+      nil ->
+        flunk("expected promoted path for #{inspect(key)}")
+    end
+  end
+
   defp attach_dedicated_compaction_failed_handler do
     parent = self()
     handler_id = {__MODULE__, make_ref()}
@@ -292,7 +302,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
                :ets.lookup(state.keydir, marker_key)
 
       :sys.replace_state(shard, fn state ->
-        dedicated_path = state.promoted_instances[key].path
+        dedicated_path = promoted_path!(state, key)
         ShardCompound.compact_dedicated(state, key, dedicated_path)
       end)
 
@@ -313,7 +323,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       shard = Router.shard_name(ctx, shard_idx)
 
       :sys.replace_state(shard, fn state ->
-        dedicated_path = state.promoted_instances[key].path
+        dedicated_path = promoted_path!(state, key)
         ShardCompound.compact_dedicated(state, key, dedicated_path)
       end)
 
@@ -400,7 +410,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       shard_idx = Router.shard_for(ctx, key)
       shard = Router.shard_name(ctx, shard_idx)
       state = :sys.get_state(shard)
-      dedicated_path = state.promoted_instances[key].path
+      dedicated_path = promoted_path!(state, key)
       compound_key = CompoundKey.hash_field(key, "field_1")
 
       assert [{^compound_key, "value_1", 0, _lfu, _fid, _off, _vsize}] =
@@ -443,7 +453,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       shard_idx = Router.shard_for(ctx, key)
       shard = Router.shard_name(ctx, shard_idx)
       state = :sys.get_state(shard)
-      dedicated_path = state.promoted_instances[key].path
+      dedicated_path = promoted_path!(state, key)
       missing_compound_key = CompoundKey.hash_field(key, "missing_cold")
 
       refute File.exists?(Path.join(dedicated_path, "00099.log"))
@@ -613,11 +623,14 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
         Hash.handle("HDEL", [key, "field_#{i}"], store)
       end
 
-      # Trigger compaction via writes
-      for i <- 1..1001 do
-        Hash.handle("HSET", [key, "temp", "v#{i}"], store)
-        Hash.handle("HDEL", [key, "temp"], store)
-      end
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, shard_idx)
+
+      :sys.replace_state(shard, fn state ->
+        dedicated_path = promoted_path!(state, key)
+        ShardCompound.compact_dedicated(state, key, dedicated_path)
+      end)
 
       # Should not crash
       dir = dedicated_dir(key)
