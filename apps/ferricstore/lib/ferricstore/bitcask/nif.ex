@@ -22,6 +22,9 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec rust_allocated_bytes() :: {:ok, non_neg_integer()} | {:error, term()}
   def rust_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec io_uring_available() :: boolean()
+  def io_uring_available, do: :erlang.nif_error(:nif_not_loaded)
+
   # -- Flow native ordered index resource --
   @type flow_index_resource :: reference()
 

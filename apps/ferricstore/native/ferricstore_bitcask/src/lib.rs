@@ -2053,6 +2053,11 @@ fn v2_fsync_async(
     Ok(atoms::ok().encode(env))
 }
 
+#[rustler::nif]
+fn io_uring_available() -> bool {
+    io_backend::detect_io_uring()
+}
+
 /// Append a batch of records **without** fsync. The data is written to the OS
 /// page cache (~1-10us) but not forced to durable storage. The caller must
 /// call `v2_fsync` or `v2_fsync_async` later to guarantee durability.

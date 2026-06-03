@@ -87,6 +87,16 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      - name: Run Linux io_uring integration tests when available
+        run: |
+          set -e
+          echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo unknown)"
+          if ! mix run -e 'if Ferricstore.Bitcask.NIF.io_uring_available(), do: System.halt(0), else: System.halt(1)'; then
+            echo "::notice::io_uring unavailable on this runner; skipping tagged Linux io_uring tests"
+            exit 0
+          fi
+          mix test apps/ferricstore/test/ferricstore/store/io_uring_integration_test.exs --only linux_io_uring --timeout 120000
+
       - name: Credo
         run: mix credo --min-priority high --mute-exit-status
 
@@ -357,8 +367,9 @@ jobs:
             echo "PASS: $FAILURES failures within threshold of 5"
           fi
 
-      # io_uring tests run via cargo test in the build step (Rust-level).
-      # No Elixir tests are tagged :linux_io_uring.
+      # io_uring tests run in build-ubuntu:
+      # - Rust-level backend tests via cargo test.
+      # - Elixir :linux_io_uring integration tests when the runner supports io_uring.
 
       - uses: actions/upload-artifact@v4
         if: always()
