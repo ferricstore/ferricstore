@@ -16,6 +16,7 @@ defmodule FerricstoreServer.Integration.StreamTcpTest do
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
+  alias Ferricstore.Test.ShardHelpers
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -84,6 +85,8 @@ defmodule FerricstoreServer.Integration.StreamTcpTest do
 
   # Clean ETS tables for stream metadata between tests.
   setup do
+    ShardHelpers.reset_server_auth_state()
+
     for table <- [Ferricstore.Stream.Meta, Ferricstore.Stream.Groups] do
       try do
         :ets.delete_all_objects(table)
