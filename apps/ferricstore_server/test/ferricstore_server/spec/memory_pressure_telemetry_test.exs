@@ -179,20 +179,11 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
       handler_id = attach([:ferricstore, :memory, :pressure])
       drain_pressure_messages()
 
-      # We need to find a max_memory_bytes value that puts the ratio in [0.85, 0.95).
-      # Measure the same hot-path bytes MemoryGuard uses, then compute a budget
-      # that produces ~90%.
-      total_ets_bytes = measure_total_ets_bytes()
+      {:ok, pid} = start_guard(max_memory_bytes: 1_073_741_824)
 
-      # Target ratio of 0.90 -- so max_memory_bytes = total_ets_bytes / 0.90
-      max_bytes =
-        if total_ets_bytes > 0 do
-          trunc(total_ets_bytes / 0.90)
-        else
-          100
-        end
-
-      {:ok, pid} = start_guard(max_memory_bytes: max_bytes)
+      :sys.replace_state(pid, fn state ->
+        %{state | max_memory_bytes: budget_for_ratio(pid, 0.90)}
+      end)
 
       measurements = trigger_until_level(pid, :pressure)
       assert measurements != nil, "expected :pressure level telemetry"
@@ -213,17 +204,11 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
       handler_id = attach([:ferricstore, :memory, :pressure])
       drain_pressure_messages()
 
-      # Target ratio of 0.77 -- so max_memory_bytes = measured bytes / 0.77
-      total_ets_bytes = measure_total_ets_bytes()
+      {:ok, pid} = start_guard(max_memory_bytes: 1_073_741_824)
 
-      max_bytes =
-        if total_ets_bytes > 0 do
-          trunc(total_ets_bytes / 0.77)
-        else
-          100
-        end
-
-      {:ok, pid} = start_guard(max_memory_bytes: max_bytes)
+      :sys.replace_state(pid, fn state ->
+        %{state | max_memory_bytes: budget_for_ratio(pid, 0.77)}
+      end)
 
       measurements = trigger_until_level(pid, :warn)
       assert measurements != nil, "expected :warn level telemetry"
@@ -397,16 +382,16 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
 
       {:ok, pid} = start_guard(max_memory_bytes: 1_073_741_824)
 
-      total_ets_bytes = measure_total_ets_bytes()
+      total_bytes = measure_guard_total_bytes(pid)
 
       # Cycle through levels: :ok -> :warn -> :pressure -> :full -> :ok
       budgets = [
         # :ok -- generous budget
         {1_073_741_824, :ok},
         # :warn -- ~77% usage
-        {max(trunc(total_ets_bytes / 0.77), 1), :warn},
+        {budget_from_total(total_bytes, 0.77), :warn},
         # :pressure -- ~90% usage
-        {max(trunc(total_ets_bytes / 0.90), 1), :pressure},
+        {budget_from_total(total_bytes, 0.90), :pressure},
         # :full -- tiny budget
         {1, :full},
         # back to :ok
@@ -483,36 +468,22 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp measure_total_ets_bytes do
-    keydir_bytes =
-      Enum.reduce(0..3, 0, fn i, acc ->
-        keydir_bytes = safe_ets_memory(:"keydir_#{i}")
-        acc + keydir_bytes
-      end)
-
-    keydir_bytes + rust_allocated_bytes()
+  defp budget_for_ratio(pid, target_ratio) do
+    pid
+    |> measure_guard_total_bytes()
+    |> budget_from_total(target_ratio)
   end
 
-  defp rust_allocated_bytes do
-    case Ferricstore.Bitcask.NIF.rust_allocated_bytes() do
-      bytes when is_integer(bytes) and bytes > 0 -> bytes
-      _other -> 0
+  defp budget_from_total(total_bytes, target_ratio) do
+    if total_bytes > 0 do
+      max(:erlang.ceil(total_bytes / target_ratio), 1)
+    else
+      100
     end
-  rescue
-    _ -> 0
-  catch
-    _, _ -> 0
   end
 
-  defp safe_ets_memory(table_name) do
-    case :ets.info(table_name, :memory) do
-      :undefined -> 0
-      memory when is_integer(memory) -> memory * :erlang.system_info(:wordsize)
-      _ -> 0
-    end
-  rescue
-    _ -> 0
-  catch
-    _, _ -> 0
+  defp measure_guard_total_bytes(pid) do
+    stats = GenServer.call(pid, :stats)
+    stats.total_bytes
   end
 end
