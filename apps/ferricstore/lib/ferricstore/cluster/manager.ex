@@ -673,9 +673,10 @@ defmodule Ferricstore.Cluster.Manager do
          add_error,
          cleanup_data_on_failure?,
          preexisting_membership,
-         _shard_results
+         shard_results
        ) do
-    membership_rollback = remove_join_added_members(target_node, state, preexisting_membership)
+    membership_rollback =
+      remove_join_added_members(target_node, state, preexisting_membership, shard_results)
 
     target_rollback =
       cleanup_waraft_target_join_state(target_node, state, cleanup_data_on_failure?)
@@ -771,6 +772,24 @@ defmodule Ferricstore.Cluster.Manager do
     rollback_results =
       for shard_idx <- 0..(state.shard_count - 1),
           Map.get(preexisting_membership, shard_idx, true) == false,
+          into: %{} do
+        {shard_idx, remove_join_added_member(target_node, shard_idx)}
+      end
+
+    failed = Enum.filter(rollback_results, fn {_shard_idx, result} -> result != :ok end)
+
+    if failed == [] do
+      :ok
+    else
+      {:error, {:partial_join_rollback, rollback_results}}
+    end
+  end
+
+  defp remove_join_added_members(target_node, state, preexisting_membership, shard_results) do
+    rollback_results =
+      for shard_idx <- 0..(state.shard_count - 1),
+          Map.get(preexisting_membership, shard_idx, true) == false,
+          Map.get(shard_results, shard_idx) == :ok,
           into: %{} do
         {shard_idx, remove_join_added_member(target_node, shard_idx)}
       end
@@ -1183,7 +1202,7 @@ defmodule Ferricstore.Cluster.Manager do
 
     shard_results =
       for shard_idx <- 0..(state.shard_count - 1), into: %{} do
-        case RaftCluster.add_member(shard_idx, target_node, membership, timeout_ms: timeout_ms) do
+        case add_member_to_shard(shard_idx, target_node, membership, timeout_ms) do
           :ok ->
             Logger.debug("ClusterManager: added #{target_node} to shard #{shard_idx}")
             {shard_idx, :ok}
@@ -1199,11 +1218,78 @@ defmodule Ferricstore.Cluster.Manager do
 
     failed = Enum.filter(shard_results, fn {_, v} -> v != :ok end)
 
-    if failed != [] do
-      {{:error, {:partial_add, shard_results}}, shard_results}
-    else
-      {:ok, shard_results}
+    cond do
+      failed == [] ->
+        {:ok, shard_results}
+
+      transient_partial_add?(failed) and
+          target_member_on_all_shards?(target_node, state.shard_count) ->
+        Logger.info(
+          "ClusterManager: concurrent add for #{target_node} already converged across all shards"
+        )
+
+        {:ok, mark_all_shards_ok(shard_results, state.shard_count)}
+
+      true ->
+        {{:error, {:partial_add, shard_results}}, shard_results}
     end
+  end
+
+  defp add_member_to_shard(shard_idx, target_node, membership, timeout_ms, attempts_left \\ 3) do
+    case RaftCluster.add_member(shard_idx, target_node, membership, timeout_ms: timeout_ms) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        cond do
+          target_member_now?(target_node, shard_idx) ->
+            :ok
+
+          attempts_left > 1 and transient_add_member_error?(reason) ->
+            Process.sleep(add_member_retry_delay_ms(attempts_left))
+            add_member_to_shard(shard_idx, target_node, membership, timeout_ms, attempts_left - 1)
+
+          true ->
+            error
+        end
+    end
+  end
+
+  defp add_member_retry_delay_ms(3), do: 100
+  defp add_member_retry_delay_ms(2), do: 250
+  defp add_member_retry_delay_ms(_attempts_left), do: 500
+
+  defp transient_partial_add?(failed) do
+    Enum.any?(failed, fn
+      {_shard_idx, {:error, reason}} -> transient_add_member_error?(reason)
+      _other -> false
+    end)
+  end
+
+  defp transient_add_member_error?(:not_ready), do: true
+  defp transient_add_member_error?(:peer_ready_timeout), do: true
+  defp transient_add_member_error?(:timeout), do: true
+  defp transient_add_member_error?({:timeout, _reason}), do: true
+  defp transient_add_member_error?({:unknown_outcome, _reason}), do: true
+  defp transient_add_member_error?({:membership_unknown_outcome, _reason}), do: true
+  defp transient_add_member_error?({:add_member_unknown_outcome, _reason}), do: true
+  defp transient_add_member_error?(_reason), do: false
+
+  defp target_member_now?(target_node, shard_idx) do
+    case target_member?(target_node, shard_idx) do
+      {:ok, true} -> true
+      _other -> false
+    end
+  end
+
+  defp target_member_on_all_shards?(target_node, shard_count) do
+    Enum.all?(0..(shard_count - 1), fn shard_idx -> target_member_now?(target_node, shard_idx) end)
+  end
+
+  defp mark_all_shards_ok(shard_results, shard_count) do
+    Enum.reduce(0..(shard_count - 1), shard_results, fn shard_idx, acc ->
+      Map.put(acc, shard_idx, :ok)
+    end)
   end
 
   defp cluster_membership_timeout_ms do

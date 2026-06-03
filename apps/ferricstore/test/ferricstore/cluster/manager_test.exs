@@ -194,7 +194,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
       assert MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "WARaft partial add rolls back shards that were newly added" do
+    test "WARaft partial add rolls back only shards added by this failed attempt" do
       target = :"waraft_partial_add_target@127.0.0.1"
       parent = self()
 
@@ -245,7 +245,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
                Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
 
       assert_receive {:remove_added_member, 0}
-      assert_receive {:remove_added_member, 1}
+      refute_received {:remove_added_member, 1}
       assert_receive :target_cleanup
       refute MapSet.member?(new_state.known_nodes, target)
     end

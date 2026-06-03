@@ -1128,7 +1128,7 @@ defmodule Ferricstore.Store.Shard do
 
   # Check if a redis_key has been promoted to dedicated storage.
   def handle_call({:promoted?, redis_key}, _from, state) do
-    {:reply, Map.has_key?(state.promoted_instances, redis_key), state}
+    {:reply, ShardCompound.promoted_store(state, redis_key) != nil, state}
   end
 
   # -------------------------------------------------------------------

@@ -793,6 +793,17 @@ defmodule Ferricstore.Test.ShardHelpers do
     :ok
   end
 
+  @doc """
+  Restarts FerricStore against the current data directory without deleting it.
+
+  Use this for graceful shutdown/restart tests that need to exercise the real
+  application lifecycle while preserving records written before shutdown.
+  """
+  @spec restart_current_data_dir(map()) :: :ok
+  def restart_current_data_dir(%{tmp_dir: data_dir, server_started?: server_started?}) do
+    restart_with_data_dir(data_dir, server_started?, clean?: false)
+  end
+
   defp restart_with_data_dir(data_dir, server_started?, opts) do
     # Keep Ra isolation coarse-grained. Force-deleting individual Ra servers
     # while the Ra system/WAL is live can leave old UID entries in WAL and make

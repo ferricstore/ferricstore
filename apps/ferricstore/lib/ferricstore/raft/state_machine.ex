@@ -135,6 +135,7 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_flow_native_ops,
     :sm_pending_flow_native_flush?,
     :sm_pending_zset_index_ops,
+    :sm_pending_compound_promotions,
     :sm_pending_prob_creates,
     :sm_pending_has_delete,
     :sm_pending_fast_put_batch,
@@ -157,6 +158,7 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_flow_native_ops: [],
     sm_pending_flow_native_flush?: false,
     sm_pending_zset_index_ops: [],
+    sm_pending_compound_promotions: MapSet.new(),
     sm_pending_prob_creates: [],
     sm_pending_has_delete: false,
     sm_pending_fast_put_batch: false,
@@ -231,6 +233,8 @@ defmodule Ferricstore.Raft.StateMachine do
         )
       end)
 
+    instance_ctx = Map.get(config, :instance_ctx)
+
     %{
       shard_index: config.shard_index,
       shard_data_path: config.shard_data_path,
@@ -240,9 +244,10 @@ defmodule Ferricstore.Raft.StateMachine do
       ets: config.ets,
       data_dir: data_dir,
       data_dir_expanded: Path.expand(data_dir),
-      instance_ctx: Map.get(config, :instance_ctx),
+      instance_ctx: instance_ctx,
       instance_name: Map.get(config, :instance_name, :default),
-      blob_side_channel_threshold_bytes: Map.get(config, :blob_side_channel_threshold_bytes, 0),
+      blob_side_channel_threshold_bytes:
+        Map.get(config, :blob_side_channel_threshold_bytes, BlobValue.threshold(instance_ctx)),
       zset_score_index_name:
         Map.get(config, :zset_score_index_name) ||
           elem(
@@ -1980,13 +1985,17 @@ defmodule Ferricstore.Raft.StateMachine do
         state
 
       pending_state ->
-        %{
-          state
-          | active_file_id: pending_state.active_file_id,
-            active_file_path: pending_state.active_file_path,
-            active_file_size: pending_state.active_file_size,
-            file_stats: pending_state.file_stats
-        }
+        state
+        |> Map.merge(%{
+          active_file_id: pending_state.active_file_id,
+          active_file_path: pending_state.active_file_path,
+          active_file_size: pending_state.active_file_size,
+          file_stats: pending_state.file_stats
+        })
+        |> Map.put(
+          :promoted_instances,
+          Map.get(pending_state, :promoted_instances, Map.get(state, :promoted_instances, %{}))
+        )
     end
   end
 
@@ -5931,6 +5940,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
         case flush_result do
           :ok ->
+            state = run_pending_compound_promotions(state)
+
             case publish_pending_flow_history_projections(state) do
               :ok ->
                 result
@@ -21752,23 +21763,22 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
+    dedicated_path = promoted_compound_path(state, redis_key, compound_key)
+
     result =
-      case promoted_compound_path(state, redis_key, compound_key) do
+      case dedicated_path do
         nil ->
           do_put(state, compound_key, value, expire_at_ms)
 
-        dedicated_path ->
-          do_promoted_compound_put(
-            state,
-            redis_key,
-            compound_key,
-            value,
-            expire_at_ms,
-            dedicated_path
-          )
+        path ->
+          do_promoted_compound_put(state, redis_key, compound_key, value, expire_at_ms, path)
       end
 
     if result == :ok do
+      if dedicated_path == nil do
+        maybe_queue_compound_promotion_after_flush(state, redis_key, compound_key, 1)
+      end
+
       zset_index_put(state, redis_key, compound_key, value)
     end
 
@@ -21820,6 +21830,19 @@ defmodule Ferricstore.Raft.StateMachine do
   # only after the append succeeds.
   defp do_shared_compound_batch_put_fast(state, redis_key, entries) do
     if compound_shared_fast_path?(state) do
+      case List.last(entries) do
+        {compound_key, _value, _expire_at_ms} ->
+          maybe_queue_compound_promotion_after_flush(
+            state,
+            redis_key,
+            compound_key,
+            length(entries)
+          )
+
+        nil ->
+          :ok
+      end
+
       pending = Process.get(:sm_pending_writes, [])
       pending_values = Process.get(:sm_pending_values, %{})
       fast_publish? = fast_put_publish_possible?(pending, pending_values)
@@ -21842,6 +21865,107 @@ defmodule Ferricstore.Raft.StateMachine do
   defp compound_shared_fast_path?(_state) do
     not cross_shard_pending_active?() and not standalone_staged_apply?()
   end
+
+  defp maybe_queue_compound_promotion_after_flush(state, redis_key, compound_key, write_count) do
+    threshold = Promotion.threshold(state.instance_ctx)
+
+    if threshold > 0 and compound_promotion_candidate?(state, redis_key, compound_key, write_count) do
+      pending = Process.get(:sm_pending_compound_promotions, MapSet.new())
+      Process.put(:sm_pending_compound_promotions, MapSet.put(pending, {redis_key, compound_key}))
+    end
+
+    :ok
+  end
+
+  defp compound_promotion_candidate?(state, redis_key, compound_key, write_count) do
+    case compound_prefix_from_key(redis_key, compound_key) do
+      nil ->
+        false
+
+      prefix ->
+        threshold = Promotion.threshold(state.instance_ctx)
+
+        Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix) +
+          write_count > threshold
+    end
+  end
+
+  defp run_pending_compound_promotions(state) do
+    promotions = Process.get(:sm_pending_compound_promotions, MapSet.new())
+
+    Enum.reduce(promotions, state, fn {redis_key, compound_key}, acc ->
+      maybe_promote_compound_collection(acc, redis_key, compound_key)
+    end)
+  end
+
+  defp maybe_promote_compound_collection(state, redis_key, compound_key) do
+    threshold = Promotion.threshold(state.instance_ctx)
+
+    cond do
+      threshold == 0 ->
+        state
+
+      promoted_compound_path(state, redis_key, compound_key) != nil ->
+        state
+
+      true ->
+        case {compound_type_from_key(compound_key), compound_prefix_from_key(redis_key, compound_key)} do
+          {nil, _prefix} ->
+            state
+
+          {_type, nil} ->
+            state
+
+          {type, prefix} ->
+            if Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix) >
+                 threshold do
+              promote_compound_collection!(state, redis_key, type)
+            else
+              state
+            end
+        end
+    end
+  end
+
+  defp promote_compound_collection!(state, redis_key, type) do
+    {:ok, dedicated_store} =
+      Promotion.promote_collection!(
+        type,
+        redis_key,
+        state.shard_data_path,
+        state.ets,
+        promoted_data_dir(state),
+        state.shard_index,
+        state.instance_ctx
+      )
+
+    total_bytes = Ferricstore.Store.Shard.Compound.promoted_dir_size(dedicated_store)
+
+    promoted_instances =
+      Map.put(Map.get(state, :promoted_instances, %{}), redis_key, %{
+        path: dedicated_store,
+        writes: 0,
+        total_bytes: total_bytes,
+        dead_bytes: 0,
+        last_compacted_at: nil
+      })
+
+    pending_state = apply_state_get(:pending_state, state)
+    apply_state_put(:pending_state, Map.put(pending_state, :promoted_instances, promoted_instances))
+
+    Map.put(state, :promoted_instances, promoted_instances)
+  end
+
+  defp compound_prefix_from_key(redis_key, <<"H:", _rest::binary>>),
+    do: CompoundKey.hash_prefix(redis_key)
+
+  defp compound_prefix_from_key(redis_key, <<"S:", _rest::binary>>),
+    do: CompoundKey.set_prefix(redis_key)
+
+  defp compound_prefix_from_key(redis_key, <<"Z:", _rest::binary>>),
+    do: CompoundKey.zset_prefix(redis_key)
+
+  defp compound_prefix_from_key(_redis_key, _compound_key), do: nil
 
   defp do_promoted_compound_batch_put(state, redis_key, entries, dedicated_path) do
     Promotion.await_compaction_latch(state, redis_key)

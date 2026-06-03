@@ -10,8 +10,10 @@ defmodule Ferricstore.Raft.WARaftStorage do
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.BlobStore
+  alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Promotion
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
   alias Ferricstore.Store.Shard.ZSetIndex
@@ -781,7 +783,14 @@ defmodule Ferricstore.Raft.WARaftStorage do
     redis_key = if is_binary(compound_key), do: CompoundKey.extract_redis_key(compound_key)
 
     with :ok <- segment_project_check_key_lock(sm_state, redis_key, nil),
-         true <- segment_projectable_compound_put?(redis_key, compound_key, value, expire_at_ms) do
+         true <-
+           segment_projectable_compound_put?(
+             sm_state,
+             redis_key,
+             compound_key,
+             value,
+             expire_at_ms
+           ) do
       new_sm_state =
         sm_state
         |> segment_project_put(compound_key, value, expire_at_ms, position)
@@ -802,6 +811,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
     redis_key = if is_binary(compound_key), do: CompoundKey.extract_redis_key(compound_key)
 
     if segment_projectable_compound_blob_ref_put?(
+         sm_state,
          redis_key,
          compound_key,
          encoded_ref,
@@ -831,27 +841,35 @@ defmodule Ferricstore.Raft.WARaftStorage do
        when is_binary(compound_key) do
     redis_key = CompoundKey.extract_redis_key(compound_key)
 
-    case segment_project_check_key_lock(sm_state, redis_key, nil) do
-      :ok ->
+    with :ok <- segment_project_check_key_lock(sm_state, redis_key, nil),
+         true <- segment_shared_compound_projection_safe?(sm_state, redis_key) do
         new_sm_state =
           sm_state
           |> segment_project_delete(compound_key)
           |> segment_project_zset_delete(redis_key, compound_key)
 
         {:ok, new_sm_state, :ok, 1}
-
+    else
       {:error, _reason} = error ->
         {:ok, sm_state, error, 0}
+
+      false ->
+        :unsupported
     end
   end
 
   defp segment_project_command({:put_batch, entries}, position, sm_state) when is_list(entries) do
-    if segment_projection_locks_present?(sm_state) do
+    cond do
+      segment_projection_locks_present?(sm_state) ->
       case put_batch_entry_commands(entries) do
         {:ok, commands} -> segment_project_generic_batch(commands, position, sm_state)
         :error -> :unsupported
       end
-    else
+
+      segment_project_batch_has_blob_candidate?(sm_state, entries) ->
+        :unsupported
+
+      true ->
       file_id = {:waraft_segment, position_index(position)}
       offset = segment_record_offset(sm_state, position)
       shard_state = shard_ets_state_from_sm(sm_state)
@@ -924,7 +942,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
          sm_state
        )
        when is_binary(redis_key) and is_list(entries) do
-    if Enum.all?(entries, &segment_projectable_compound_put?(redis_key, &1)) do
+    if segment_projectable_compound_batch_put?(sm_state, redis_key, entries) do
       new_sm_state =
         Enum.reduce(entries, sm_state, fn {compound_key, value, expire_at_ms}, acc ->
           acc
@@ -946,6 +964,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
        when is_binary(redis_key) and is_list(entries) do
     with {:ok, prepared, encoded_refs} <-
            prepare_segment_compound_blob_batch_entries(redis_key, entries),
+         true <- segment_projectable_prepared_compound_blob_batch?(sm_state, redis_key, prepared),
          :ok <- verify_segment_blob_refs(sm_state, encoded_refs) do
       new_sm_state =
         Enum.reduce(prepared, sm_state, fn
@@ -963,6 +982,9 @@ defmodule Ferricstore.Raft.WARaftStorage do
       {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(entries))}, length(entries)}
     else
       {:unsupported, _reason} ->
+        :unsupported
+
+      false ->
         :unsupported
 
       {:error, _reason} = error ->
@@ -992,7 +1014,8 @@ defmodule Ferricstore.Raft.WARaftStorage do
          sm_state
        )
        when is_binary(redis_key) and is_list(compound_keys) do
-    if Enum.all?(compound_keys, &compound_key_for_redis_key?(redis_key, &1)) do
+    if segment_shared_compound_projection_safe?(sm_state, redis_key) and
+         Enum.all?(compound_keys, &compound_key_for_redis_key?(redis_key, &1)) do
       new_sm_state =
         Enum.reduce(compound_keys, sm_state, fn compound_key, acc ->
           acc
@@ -1011,13 +1034,16 @@ defmodule Ferricstore.Raft.WARaftStorage do
        when is_binary(prefix) do
     redis_key = CompoundKey.extract_redis_key(prefix)
 
-    case segment_project_check_key_lock(sm_state, redis_key, nil) do
-      :ok ->
+    with :ok <- segment_project_check_key_lock(sm_state, redis_key, nil),
+         true <- segment_shared_compound_projection_safe?(sm_state, redis_key) do
         new_sm_state = segment_project_delete_prefix(sm_state, redis_key, prefix)
         {:ok, new_sm_state, :ok, 1}
-
+    else
       {:error, _reason} = error ->
         {:ok, sm_state, error, 0}
+
+      false ->
+        :unsupported
     end
   end
 
@@ -1152,37 +1178,67 @@ defmodule Ferricstore.Raft.WARaftStorage do
   defp segment_projectable_batch_command?(_sm_state, {:delete, key}), do: is_binary(key)
 
   defp segment_projectable_batch_command?(
-         _sm_state,
+         sm_state,
          {:compound_put, compound_key, value, expire_at_ms}
        ) do
     redis_key = if is_binary(compound_key), do: CompoundKey.extract_redis_key(compound_key)
-    segment_projectable_compound_put?(redis_key, compound_key, value, expire_at_ms)
+
+    segment_projectable_compound_put?(
+      sm_state,
+      redis_key,
+      compound_key,
+      value,
+      expire_at_ms
+    )
   end
 
-  defp segment_projectable_batch_command?(_sm_state, {:compound_delete, compound_key}),
-    do: is_binary(compound_key)
+  defp segment_projectable_batch_command?(sm_state, {:compound_delete, compound_key}) do
+    redis_key = if is_binary(compound_key), do: CompoundKey.extract_redis_key(compound_key)
 
-  defp segment_projectable_batch_command?(_sm_state, {:compound_batch_put, redis_key, entries})
+    is_binary(compound_key) and segment_shared_compound_projection_safe?(sm_state, redis_key)
+  end
+
+  defp segment_projectable_batch_command?(sm_state, {:compound_batch_put, redis_key, entries})
        when is_binary(redis_key) and is_list(entries),
-       do: Enum.all?(entries, &segment_projectable_compound_put?(redis_key, &1))
+       do: segment_projectable_compound_batch_put?(sm_state, redis_key, entries)
 
-  defp segment_projectable_batch_command?(_sm_state, {:compound_batch_delete, redis_key, keys})
+  defp segment_projectable_batch_command?(sm_state, {:compound_batch_delete, redis_key, keys})
        when is_binary(redis_key) and is_list(keys),
-       do: Enum.all?(keys, &compound_key_for_redis_key?(redis_key, &1))
+       do:
+         segment_shared_compound_projection_safe?(sm_state, redis_key) and
+           Enum.all?(keys, &compound_key_for_redis_key?(redis_key, &1))
 
-  defp segment_projectable_batch_command?(_sm_state, {:compound_delete_prefix, prefix}),
-    do: is_binary(prefix)
+  defp segment_projectable_batch_command?(sm_state, {:compound_delete_prefix, prefix}) do
+    redis_key = if is_binary(prefix), do: CompoundKey.extract_redis_key(prefix)
+
+    is_binary(prefix) and segment_shared_compound_projection_safe?(sm_state, redis_key)
+  end
 
   defp segment_projectable_batch_command?(_sm_state, _command), do: false
 
-  defp segment_projectable_put?(_sm_state, key, value, expire_at_ms) do
+  defp segment_projectable_put?(sm_state, key, value, expire_at_ms) do
     is_binary(key) and is_binary(value) and non_neg_integer?(expire_at_ms) and
-      segment_projection_fast_key?(key)
+      segment_projection_fast_key?(key) and
+      not segment_blob_candidate?(sm_state, value)
   end
 
   # Flow policy writes are issued as raw PUTs but carry LMDB projection side
   # effects. Keep them on the full state-machine path; policy writes are cold.
   defp segment_projection_fast_key?(key), do: not FlowKeys.policy_key?(key)
+
+  defp segment_blob_candidate?(sm_state, value) when is_binary(value) do
+    threshold = BlobValue.threshold(Map.get(sm_state, :instance_ctx))
+    threshold > 0 and (byte_size(value) >= threshold or BlobRef.encoded_size?(byte_size(value)))
+  end
+
+  defp segment_blob_candidate?(_sm_state, _value), do: false
+
+  defp segment_project_batch_has_blob_candidate?(sm_state, entries) do
+    Enum.any?(entries, fn
+      {_key, value, _expire_at_ms} -> segment_blob_candidate?(sm_state, value)
+      _entry -> false
+    end)
+  end
 
   defp apply_segment_put_batch_entries(
          [],
@@ -1244,12 +1300,53 @@ defmodule Ferricstore.Raft.WARaftStorage do
     :unsupported
   end
 
-  defp segment_projectable_compound_put?(redis_key, {compound_key, value, expire_at_ms}),
-    do: segment_projectable_compound_put?(redis_key, compound_key, value, expire_at_ms)
+  defp segment_projectable_compound_put?(
+         sm_state,
+         redis_key,
+         compound_key,
+         value,
+         expire_at_ms
+       ) do
+    compound_key_for_redis_key?(redis_key, compound_key) and is_binary(value) and
+      non_neg_integer?(expire_at_ms) and
+      segment_shared_compound_projection_safe?(sm_state, redis_key, compound_key, 1)
+  end
 
-  defp segment_projectable_compound_put?(redis_key, compound_key, value, expire_at_ms) do
+  defp segment_projectable_compound_batch_put?(sm_state, redis_key, entries) do
+    case List.last(entries) do
+      {compound_key, _value, _expire_at_ms} ->
+        Enum.all?(entries, &segment_projectable_compound_put_shape?(redis_key, &1)) and
+          segment_shared_compound_projection_safe?(sm_state, redis_key, compound_key, length(entries))
+
+      nil ->
+        true
+
+      _entry ->
+        false
+    end
+  end
+
+  defp segment_projectable_compound_put_shape?(redis_key, {compound_key, value, expire_at_ms}) do
     compound_key_for_redis_key?(redis_key, compound_key) and is_binary(value) and
       non_neg_integer?(expire_at_ms)
+  end
+
+  defp segment_projectable_compound_put_shape?(_redis_key, _entry), do: false
+
+  defp segment_projectable_prepared_compound_blob_batch?(sm_state, redis_key, prepared) do
+    case List.last(prepared) do
+      {:value, compound_key, _value, _expire_at_ms} ->
+        segment_shared_compound_projection_safe?(sm_state, redis_key, compound_key, length(prepared))
+
+      {:blob_ref, compound_key, _encoded_ref, _expire_at_ms} ->
+        segment_shared_compound_projection_safe?(sm_state, redis_key, compound_key, length(prepared))
+
+      nil ->
+        true
+
+      _entry ->
+        false
+    end
   end
 
   defp segment_projectable_blob_ref_put?(key, encoded_ref, expire_at_ms) do
@@ -1257,14 +1354,62 @@ defmodule Ferricstore.Raft.WARaftStorage do
   end
 
   defp segment_projectable_compound_blob_ref_put?(
+         sm_state,
          redis_key,
          compound_key,
          encoded_ref,
          expire_at_ms
        ) do
     compound_key_for_redis_key?(redis_key, compound_key) and is_binary(encoded_ref) and
-      non_neg_integer?(expire_at_ms)
+      non_neg_integer?(expire_at_ms) and
+      segment_shared_compound_projection_safe?(sm_state, redis_key, compound_key, 1)
   end
+
+  defp segment_shared_compound_projection_safe?(sm_state, redis_key) do
+    is_binary(redis_key) and not segment_compound_promoted?(sm_state, redis_key)
+  end
+
+  defp segment_shared_compound_projection_safe?(sm_state, redis_key, compound_key, write_count) do
+    segment_shared_compound_projection_safe?(sm_state, redis_key) and
+      not segment_compound_promotion_candidate?(sm_state, redis_key, compound_key, write_count)
+  end
+
+  defp segment_compound_promoted?(sm_state, redis_key) do
+    Map.has_key?(Map.get(sm_state, :promoted_instances, %{}), redis_key)
+  end
+
+  defp segment_compound_promotion_candidate?(sm_state, redis_key, compound_key, write_count) do
+    threshold = Promotion.threshold(Map.get(sm_state, :instance_ctx))
+
+    cond do
+      threshold == 0 ->
+        false
+
+      not is_integer(write_count) or write_count <= 0 ->
+        false
+
+      true ->
+        case segment_compound_prefix(redis_key, compound_key) do
+          nil ->
+            false
+
+          prefix ->
+            shard_state = shard_ets_state_from_sm(sm_state)
+            ShardETS.prefix_count_entries(shard_state, prefix) + write_count > threshold
+        end
+    end
+  end
+
+  defp segment_compound_prefix(redis_key, <<"H:", _rest::binary>>),
+    do: CompoundKey.hash_prefix(redis_key)
+
+  defp segment_compound_prefix(redis_key, <<"S:", _rest::binary>>),
+    do: CompoundKey.set_prefix(redis_key)
+
+  defp segment_compound_prefix(redis_key, <<"Z:", _rest::binary>>),
+    do: CompoundKey.zset_prefix(redis_key)
+
+  defp segment_compound_prefix(_redis_key, _compound_key), do: nil
 
   defp compound_key_for_redis_key?(redis_key, compound_key)
        when is_binary(redis_key) and is_binary(compound_key),

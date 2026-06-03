@@ -52,10 +52,7 @@ defmodule Ferricstore.Cluster.BlobSideChannelClusterTest do
     assert :ok = remote_put(writer.name, key, payload)
 
     Enum.each(nodes, fn node ->
-      eventually(fn ->
-        assert payload == remote_get(node.name, key)
-        assert remote_blob_file_count(node.name) > 0
-      end)
+      eventually_blob_materialized(node.name, key, payload)
     end)
 
     shard = remote_shard_for(writer.name, key)
@@ -91,9 +88,51 @@ defmodule Ferricstore.Cluster.BlobSideChannelClusterTest do
     ctx = :erpc.call(n, FerricStore.Instance, :get, [:default], 10_000)
 
     legacy_files = Path.wildcard(Path.join([ctx.data_dir, "blob", "shard_*", "*", "*.blob"]))
-    segment_files = Path.wildcard(Path.join([ctx.data_dir, "blob", "shard_*", "*", "*.bloblog"]))
+    segment_files = Path.wildcard(Path.join([ctx.data_dir, "blob", "shard_*", "segments", "*.bloblog"]))
 
     length(legacy_files) + length(segment_files)
+  end
+
+  defp eventually_blob_materialized(node, key, payload, attempts \\ 120)
+
+  defp eventually_blob_materialized(node, key, payload, attempts) when attempts > 0 do
+    status = blob_status(node, key, payload)
+
+    if status.value_matches? and status.blob_file_count > 0 do
+      :ok
+    else
+      Process.sleep(250)
+      eventually_blob_materialized(node, key, payload, attempts - 1)
+    end
+  end
+
+  defp eventually_blob_materialized(node, key, payload, 0) do
+    status = blob_status(node, key, payload)
+
+    flunk(
+      "blob value was not materialized on #{node}: " <>
+        inspect(%{
+          value_matches?: status.value_matches?,
+          value_size: status.value_size,
+          blob_file_count: status.blob_file_count,
+          threshold: status.threshold,
+          data_dir: status.data_dir
+        })
+    )
+  end
+
+  defp blob_status(node, key, payload) do
+    value = remote_get(node, key)
+    count = remote_blob_file_count(node)
+    ctx = :erpc.call(node_name(node), FerricStore.Instance, :get, [:default], 10_000)
+
+    %{
+      value_matches?: value == payload,
+      value_size: if(is_binary(value), do: byte_size(value), else: value),
+      blob_file_count: count,
+      threshold: ctx.blob_side_channel_threshold_bytes,
+      data_dir: ctx.data_dir
+    }
   end
 
   defp join_cluster(new_node, existing_node) do

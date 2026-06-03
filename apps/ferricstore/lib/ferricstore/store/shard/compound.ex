@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BlobValue, ColdRead, CompoundCommand, LFU, Promotion}
+  alias Ferricstore.Store.{BlobValue, ColdRead, CompoundCommand, CompoundKey, LFU, Promotion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.ZSetIndex
@@ -1305,11 +1305,41 @@ defmodule Ferricstore.Store.Shard.Compound do
   @spec promoted_store(map(), binary()) :: binary() | nil
   @doc false
   def promoted_store(state, redis_key) do
-    case Map.get(state.promoted_instances, redis_key) do
+    case Map.get(Map.get(state, :promoted_instances, %{}), redis_key) do
       %{path: path} -> path
       path when is_binary(path) -> path
-      nil -> nil
+      nil -> marker_promoted_store(state, redis_key)
     end
+  end
+
+  defp marker_promoted_store(state, redis_key) do
+    marker_key = Promotion.marker_key(redis_key)
+    now = HLC.now_ms()
+
+    case :ets.lookup(Map.get(state, :ets), marker_key) do
+      [{^marker_key, type_str, expire_at_ms, _lfu, _fid, _offset, _value_size}]
+      when expire_at_ms == 0 or expire_at_ms > now ->
+        case decode_promoted_marker_type(type_str) do
+          nil ->
+            nil
+
+          type ->
+            path = Promotion.dedicated_path(state.data_dir, state.index, type, redis_key)
+            if Ferricstore.FS.dir?(path), do: path, else: nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp decode_promoted_marker_type(type_str) do
+    case CompoundKey.decode_type(type_str) do
+      type when type in [:hash, :set, :zset] -> type
+      _other -> nil
+    end
+  rescue
+    _ -> nil
   end
 
   defp promoted_store_for_compound(state, redis_key, compound_key) do

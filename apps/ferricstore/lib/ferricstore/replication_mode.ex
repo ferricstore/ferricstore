@@ -71,7 +71,7 @@ defmodule Ferricstore.ReplicationMode do
     checksum = :crypto.hash(:sha256, payload)
     encoded = :erlang.term_to_binary({:ferricstore_cluster_state_v1, payload, checksum})
     path = marker_path(data_dir)
-    tmp_path = path <> ".tmp"
+    tmp_path = unique_marker_tmp_path(path)
 
     :ok =
       File.open!(tmp_path, [:write, :binary], fn io ->
@@ -82,6 +82,16 @@ defmodule Ferricstore.ReplicationMode do
     Ferricstore.FS.rename!(tmp_path, path)
     fsync_dir!(data_dir)
     :ok
+  end
+
+  defp unique_marker_tmp_path(path) do
+    suffix =
+      [node(), self(), System.unique_integer([:positive, :monotonic])]
+      |> :erlang.term_to_binary()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.url_encode64(padding: false)
+
+    path <> "." <> suffix <> ".tmp"
   end
 
   @spec mark_raft!(binary(), pos_integer(), non_neg_integer(), map()) :: :ok

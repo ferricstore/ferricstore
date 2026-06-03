@@ -332,8 +332,20 @@ jobs:
           elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --only jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
           mix test apps/ferricstore/test --only large_alloc --timeout 120000 2>&1 | tee /tmp/durability_large_alloc.log
 
-          # Count total failures across all runs
-          FAILURES=$(grep -h "failures" /tmp/durability_*.log | grep -oP '\d+ failure' | awk '{s+=$1} END {print s+0}')
+          count_failures() {
+            line=$(grep -E '^[[:space:]]*[0-9]+ tests?, [0-9]+ failures?' "$1" | tail -n 1 || true)
+            if [ -z "$line" ]; then
+              echo 0
+            else
+              echo "$line" | sed -E 's/.*[0-9]+ tests?, ([0-9]+) failures?.*/\1/'
+            fi
+          }
+
+          FAILURES=0
+          for log in /tmp/durability_*.log; do
+            count=$(count_failures "$log")
+            FAILURES=$((FAILURES + count))
+          done
           echo "Total durability failures: $FAILURES"
 
           if [ "$FAILURES" -gt 5 ]; then
@@ -381,7 +393,16 @@ jobs:
           set +e
           elixir --sname ci_cluster --cookie ferricstore_test -S mix test --only cluster --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster.log
 
-          FAILURES=$(grep -oP '\d+ failure' /tmp/cluster.log | awk '{s+=$1} END {print s+0}')
+          count_failures() {
+            line=$(grep -E '^[[:space:]]*[0-9]+ tests?, [0-9]+ failures?' "$1" | tail -n 1 || true)
+            if [ -z "$line" ]; then
+              echo 0
+            else
+              echo "$line" | sed -E 's/.*[0-9]+ tests?, ([0-9]+) failures?.*/\1/'
+            fi
+          }
+
+          FAILURES=$(count_failures /tmp/cluster.log)
           echo "Total cluster failures: $FAILURES"
 
           if [ "$FAILURES" -gt 5 ]; then
