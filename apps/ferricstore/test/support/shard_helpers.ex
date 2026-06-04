@@ -89,7 +89,7 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     shard_count = shard_count()
     flush_timeout = 30_000
-    ready_timeout = flush_timeout
+    ready_timeout = min(flush_timeout, 10_000)
 
     # Flush background BitcaskWriter so deferred writes are on disk
     # before we snapshot keys for deletion.
@@ -129,7 +129,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     end)
 
     # Prove the WARaft write/apply path is usable before handing control back.
-    wait_default_waraft_ready(flush_timeout)
+    wait_default_waraft_ready(ready_timeout)
 
     ctx = FerricStore.Instance.get(:default)
 
@@ -584,10 +584,17 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   defp configured_shard_count do
-    :persistent_term.get(
-      :ferricstore_shard_count,
-      Application.get_env(:ferricstore, :shard_count, 4)
-    )
+    count =
+      :persistent_term.get(
+        :ferricstore_shard_count,
+        Application.get_env(:ferricstore, :shard_count, 4)
+      )
+
+    case count do
+      n when is_integer(n) and n > 0 -> n
+      0 -> max(System.schedulers_online(), 1)
+      _ -> 4
+    end
   end
 
   # ---------------------------------------------------------------------------

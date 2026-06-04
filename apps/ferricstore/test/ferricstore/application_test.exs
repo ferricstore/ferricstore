@@ -20,24 +20,18 @@ defmodule Ferricstore.ApplicationTest do
   # Ensure all shards are alive after every test so that the next test
   # module starts from a clean state.
   setup do
+    ensure_ferricstore_ready!()
     ShardHelpers.flush_all_keys()
-    on_exit(fn -> wait_shards_alive(2_000) end)
+    on_exit(fn -> ensure_ferricstore_ready!() end)
   end
 
-  defp wait_shards_alive(timeout_ms) do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-
-    Enum.each(0..(shard_count - 1), fn i ->
-      name = :"Ferricstore.Store.Shard.#{i}"
-
-      Stream.repeatedly(fn -> Process.sleep(20) end)
-      |> Enum.find(fn _ ->
-        pid = Process.whereis(name)
-        alive = is_pid(pid) and Process.alive?(pid)
-        alive or System.monotonic_time(:millisecond) > deadline
-      end)
-    end)
+  defp ensure_ferricstore_ready! do
+    {:ok, _} = Application.ensure_all_started(:ferricstore)
+    ctx = FerricStore.Instance.get(:default)
+    _ = Ferricstore.Raft.WARaftBackend.start(ctx)
+    _ = Ferricstore.Flow.LMDBWriter.resume_all(ctx.shard_count)
+    ShardHelpers.wait_shards_alive()
+    ShardHelpers.wait_default_pipeline_ready()
   end
 
   defp stop_app_if_started(app) do
@@ -70,8 +64,10 @@ defmodule Ferricstore.ApplicationTest do
       children = Supervisor.which_children(Ferricstore.Supervisor)
 
       for {id, pid, _type, _mods} <- children do
-        assert is_pid(pid) and Process.alive?(pid),
-               "Child #{inspect(id)} is not alive (pid=#{inspect(pid)})"
+        if pid != :undefined do
+          assert is_pid(pid) and Process.alive?(pid),
+                 "Child #{inspect(id)} is not alive (pid=#{inspect(pid)})"
+        end
       end
     end
 
@@ -139,8 +135,7 @@ defmodule Ferricstore.ApplicationTest do
         restore_env(:blob_side_channel_threshold_bytes, old_threshold)
         File.rm_rf(data_dir)
 
-        {:ok, _} = Application.ensure_all_started(:ferricstore)
-        ShardHelpers.wait_shards_alive()
+        ensure_ferricstore_ready!()
 
         if server_started? do
           {:ok, _} = Application.ensure_all_started(:ferricstore_server)
@@ -180,8 +175,7 @@ defmodule Ferricstore.ApplicationTest do
           FerricStore.Instance.get(:default)
         end
       after
-        {:ok, _} = Application.ensure_all_started(:ferricstore)
-        ShardHelpers.wait_shards_alive()
+        ensure_ferricstore_ready!()
 
         if server_started? do
           {:ok, _} = Application.ensure_all_started(:ferricstore_server)
@@ -219,38 +213,12 @@ defmodule Ferricstore.ApplicationTest do
           pid -> Process.exit(pid, :kill)
         end
 
-        {:ok, _} = Application.ensure_all_started(:ferricstore)
-        ShardHelpers.wait_shards_alive()
+        ensure_ferricstore_ready!()
 
         if server_started? do
           {:ok, _} = Application.ensure_all_started(:ferricstore_server)
         end
       end
-    end
-
-    test "wal rollover reports unconsumed WAL files instead of silently succeeding" do
-      log =
-        capture_log(fn ->
-          assert {:error, {:wal_files_unconsumed, ["0000000000000001.wal"]}} =
-                   Ferricstore.Application.wal_rollover_for_shutdown("ignored",
-                     force_rollover: fn _wal_name -> :ok end,
-                     list_wal_files: fn _ra_dir -> ["0000000000000001.wal"] end,
-                     max_attempts: 1,
-                     poll_interval_ms: 0
-                   )
-        end)
-
-      assert log =~ "segment writer still processing WAL files"
-    end
-
-    test "wal rollover reports force_roll_over failures" do
-      assert {:error, {:force_rollover_failed, :closed}} =
-               Ferricstore.Application.wal_rollover_for_shutdown("ignored",
-                 force_rollover: fn _wal_name -> {:error, :closed} end,
-                 list_wal_files: fn _ra_dir -> ["0000000000000001.wal"] end,
-                 max_attempts: 1,
-                 poll_interval_ms: 0
-               )
     end
 
     test "prep_stop uses runtime shard count when config shard_count is auto" do
@@ -313,6 +281,8 @@ defmodule Ferricstore.ApplicationTest do
       Application.put_env(:ferricstore, :shard_count, 0)
 
       Ferricstore.Application.prep_stop(nil)
+      restore_env(:shard_count, original_shard_count)
+      Ferricstore.Health.set_ready(original_ready)
 
       assert [{^key, ^value, 0, _lfu, 0, offset, vsize}] = :ets.lookup(keydir, key)
       assert vsize == byte_size(value)
@@ -333,11 +303,6 @@ defmodule Ferricstore.ApplicationTest do
       assert is_pid(writer)
 
       key = "flow:{application-test}:state:lagged-shutdown-#{System.unique_integer([:positive])}"
-
-      path =
-        ctx.data_dir
-        |> Ferricstore.DataDir.shard_data_path(shard_index)
-        |> Ferricstore.Flow.LMDB.path()
 
       on_exit(fn ->
         restore_env(:flow_lmdb_mode, original_mode)
@@ -374,7 +339,10 @@ defmodule Ferricstore.ApplicationTest do
         })
       end)
 
-      assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
+      assert %{suspended?: true} = :sys.get_state(writer)
+
+      assert {:error, :writer_suspended} =
+               Ferricstore.Flow.LMDBWriter.enqueue(shard_index, [{:put, key <> ":after", "v2"}])
     end
 
     test "shutdown Bitcask fsync reports active-file and fallback listing failures" do

@@ -247,16 +247,25 @@ defmodule Ferricstore.CrossShardOpTest do
       shard2_id = Ferricstore.Raft.Cluster.shard_server_id(shard2_idx)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard1_id, {:lock_keys, [k1], owner_ref, now + 200})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard1_id,
+          {:lock_keys, [k1], owner_ref, now + 200}
+        )
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard2_id, {:lock_keys, [k2], owner_ref, now + 200})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard2_id,
+          {:lock_keys, [k2], owner_ref, now + 200}
+        )
 
       # Immediately after locking, another owner should fail
       other_ref = make_ref()
 
       lock_result =
-        Ferricstore.Raft.CommandClock.process_command(shard1_id, {:lock_keys, [k1], other_ref, now + 5000})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard1_id,
+          {:lock_keys, [k1], other_ref, now + 5000}
+        )
 
       assert lock_result == {:error, :keys_locked} or
                match?({:ok, {:applied_at, _, {:error, :keys_locked}}, _}, lock_result)
@@ -341,17 +350,24 @@ defmodule Ferricstore.CrossShardOpTest do
       }
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:cross_shard_intent, owner_ref, intent_map}
+        )
 
       # Verify intent exists
-      {:ok, {:applied_at, _, intents_before}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_before}, _} =
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+
       assert Map.has_key?(intents_before, owner_ref)
 
       # Run intent resolver
       CrossShardOp.IntentResolver.resolve_stale_intents()
 
       # The intent should be cleaned up (it's older than stale threshold)
-      {:ok, {:applied_at, _, intents_after}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_after}, _} =
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+
       refute Map.has_key?(intents_after, owner_ref)
     end
   end
@@ -398,7 +414,10 @@ defmodule Ferricstore.CrossShardOpTest do
       now = System.os_time(:millisecond)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:lock_keys, [k1], owner_ref, now + 30_000}
+        )
 
       # Try a regular put -- should be rejected
       result = Router.put(FerricStore.Instance.get(:default), k1, "during_lock", 0)
@@ -422,7 +441,10 @@ defmodule Ferricstore.CrossShardOpTest do
       now = System.os_time(:millisecond)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:lock_keys, [k1], owner_ref, now + 30_000}
+        )
 
       # Delete should be rejected
       result = Router.delete(FerricStore.Instance.get(:default), k1)
@@ -446,7 +468,10 @@ defmodule Ferricstore.CrossShardOpTest do
       now = System.os_time(:millisecond)
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:lock_keys, [k1], owner_ref, now + 30_000}
+        )
 
       # Reads should still work -- locks only block writes
       assert Router.get(FerricStore.Instance.get(:default), k1) == "readable"
@@ -601,9 +626,14 @@ defmodule Ferricstore.CrossShardOpTest do
 
       put_existing!(ctx, k1, value, 0)
 
-      ShardHelpers.eventually(fn ->
-        match?({:ok, {_fid, _off, _vsize}}, Router.get_keydir_file_ref(ctx, k1))
-      end, "large value keydir file ref should flush before intent hash test", 5_000, 20)
+      ShardHelpers.eventually(
+        fn ->
+          match?({:ok, {_fid, _off, _vsize}}, Router.get_keydir_file_ref(ctx, k1))
+        end,
+        "large value keydir file ref should flush before intent hash test",
+        250,
+        20
+      )
 
       idx = Router.shard_for(ctx, k1)
       per_shard_stores = %{idx => CrossShardOp.build_store_for_shard(ctx, idx)}
@@ -638,12 +668,17 @@ defmodule Ferricstore.CrossShardOpTest do
       }
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:cross_shard_intent, owner_ref, intent_map}
+        )
 
       # Run intent resolver -- should clean up because intent is stale
       CrossShardOp.IntentResolver.resolve_stale_intents()
 
-      {:ok, {:applied_at, _, intents_after}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_after}, _} =
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+
       refute Map.has_key?(intents_after, owner_ref)
     end
 
@@ -673,12 +708,17 @@ defmodule Ferricstore.CrossShardOpTest do
       }
 
       {:ok, {:applied_at, _, :ok}, _} =
-        Ferricstore.Raft.CommandClock.process_command(shard_id, {:cross_shard_intent, owner_ref, intent_map})
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:cross_shard_intent, owner_ref, intent_map}
+        )
 
       # Run intent resolver -- should still clean up (don't re-execute)
       CrossShardOp.IntentResolver.resolve_stale_intents()
 
-      {:ok, {:applied_at, _, intents_after}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_after}, _} =
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+
       refute Map.has_key?(intents_after, owner_ref)
     end
   end

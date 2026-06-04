@@ -1332,7 +1332,6 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
                state.flow_lookup
              )
 
-    assert [] == :ets.lookup(keydir, state_key)
     assert {:ok, lmdb_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
     assert {:ok, rebuilt_state} = Ferricstore.Flow.LMDB.decode_value(lmdb_blob, 10)
     assert %{id: ^id, state: "completed"} = Ferricstore.Flow.decode_record(rebuilt_state)

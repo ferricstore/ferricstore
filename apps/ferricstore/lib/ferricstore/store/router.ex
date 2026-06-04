@@ -7702,7 +7702,7 @@ defmodule Ferricstore.Store.Router do
   Used by sendfile zero-copy and STRLEN on cold keys.
   """
   @spec get_keydir_file_ref(FerricStore.Instance.t(), binary()) ::
-          {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | :miss
+          {:ok, {term(), non_neg_integer(), non_neg_integer()}} | :miss
   def get_keydir_file_ref(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
@@ -7710,7 +7710,7 @@ defmodule Ferricstore.Store.Router do
 
     try do
       case :ets.lookup(keydir, key) do
-        [{_, _, 0, _, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        [{_, _, 0, _, fid, off, vsize}] when readable_cold_ref?(fid, off, vsize) ->
           {:ok, {fid, off, vsize}}
 
         [{^key, nil, 0, _, fid, _off, _vsize}] when is_integer(fid) ->
@@ -7722,7 +7722,7 @@ defmodule Ferricstore.Store.Router do
           :miss
 
         [{_, _, exp, _, fid, off, vsize}]
-        when exp > now and valid_cold_location(fid, off, vsize) ->
+        when exp > now and readable_cold_ref?(fid, off, vsize) ->
           {:ok, {fid, off, vsize}}
 
         [{^key, nil, exp, _, fid, _off, _vsize}] when exp > now and is_integer(fid) ->
