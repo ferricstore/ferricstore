@@ -36,28 +36,6 @@ defmodule FerricstoreServer.Integration.ListGenericTcpTest do
     end
   end
 
-  defp recv_n(sock, n) do
-    do_recv_n(sock, n, "", [])
-  end
-
-  defp do_recv_n(_sock, 0, _buf, acc), do: acc
-
-  defp do_recv_n(sock, remaining, buf, acc) when remaining > 0 do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
-    buf2 = buf <> data
-
-    case Parser.parse(buf2) do
-      {:ok, [_ | _] = vals, rest} ->
-        taken = Enum.take(vals, remaining)
-        new_acc = acc ++ taken
-        new_remaining = remaining - length(taken)
-        do_recv_n(sock, new_remaining, rest, new_acc)
-
-      {:ok, [], _} ->
-        do_recv_n(sock, remaining, buf2, acc)
-    end
-  end
-
   defp connect_and_hello(port) do
     {:ok, sock} =
       :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
