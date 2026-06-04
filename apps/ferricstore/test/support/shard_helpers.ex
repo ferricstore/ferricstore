@@ -11,6 +11,9 @@ defmodule Ferricstore.Test.ShardHelpers do
 
   alias Ferricstore.Store.Router
 
+  @test_max_memory_bytes 1_073_741_824
+  @test_keydir_max_ram 64 * 1024 * 1024
+
   @doc """
   Synchronously flushes all pending async writes on all application-supervised
   shards to disk.
@@ -86,6 +89,7 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     reset_server_auth_state()
     reset_memory_guard_pressure()
+    reset_runtime_pressure_state()
 
     shard_count = shard_count()
     flush_timeout = 30_000
@@ -102,6 +106,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # by hashing the compound key string. Use one delete batch per shard so a
     # restart-heavy full suite cannot spend 30s per key waiting on stale leader
     # state during cleanup.
+    ensure_default_waraft_started()
     wait_default_waraft_ready(ready_timeout)
 
     Enum.each(0..(shard_count - 1), fn i ->
@@ -321,8 +326,16 @@ defmodule Ferricstore.Test.ShardHelpers do
 
         try do
           Ferricstore.MemoryGuard.reconfigure(%{
-            max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
-            keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 64 * 1024 * 1024),
+            max_memory_bytes:
+              sane_positive_bytes(
+                Application.get_env(:ferricstore, :max_memory_bytes),
+                @test_max_memory_bytes
+              ),
+            keydir_max_ram:
+              sane_positive_bytes(
+                Application.get_env(:ferricstore, :keydir_max_ram),
+                @test_keydir_max_ram
+              ),
             hot_cache_min_ram: Application.get_env(:ferricstore, :hot_cache_min_ram, 0),
             hot_cache_max_ram: :auto,
             eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lru)
@@ -336,6 +349,50 @@ defmodule Ferricstore.Test.ShardHelpers do
         catch
           :exit, _ -> :ok
         end
+    end
+  end
+
+  defp sane_positive_bytes(value, _default) when is_integer(value) and value >= 1_048_576,
+    do: value
+
+  defp sane_positive_bytes(_value, default), do: default
+
+  defp reset_runtime_pressure_state do
+    try do
+      Ferricstore.Flow.Admission.clear_create_pause()
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+
+    try do
+      Ferricstore.OperationalGuard.reset_for_test()
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      FerricStore.Instance.inject_callbacks(:default, process_rss_fn: nil)
+      Ferricstore.Flow.LMDBWriter.resume_all(ctx.name, ctx.shard_count)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
+
+  defp ensure_default_waraft_started do
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      Ferricstore.Raft.WARaftBackend.start(ctx)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
     end
   end
 
