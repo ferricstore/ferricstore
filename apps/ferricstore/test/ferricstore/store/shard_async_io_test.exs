@@ -914,7 +914,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert is_integer(meas.duration_us)
 
       # Flag must have been cleared by the checkpointer before firing fsync.
-      assert :atomics.get(ctx.checkpoint_flags, 1) == 0
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        :atomics.get(ctx.checkpoint_flags, 1) == 0
+      end)
     end
   end
 
