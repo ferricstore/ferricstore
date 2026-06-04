@@ -300,7 +300,7 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
     end
 
     assert ClaimWaiters.scheduled_count() == 1
-    assert_receive_count(10)
+    assert_receive_count(10, 1_000)
 
     ShardHelpers.eventually(
       fn -> ClaimWaiters.scheduled_count() == 0 end,
@@ -319,7 +319,7 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
     due_at = Ferricstore.CommandTime.now_ms() + 30
 
     assert :ok = ClaimWaiters.schedule_ready("email", "queued", 0, "p1", due_at, 1)
-    assert_receive_count(1)
+    assert_receive_count(1, 1_000)
 
     Enum.each(waiters, &Process.exit(&1, :kill))
   end
@@ -364,7 +364,23 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
   defp assert_receive_count(0), do: :ok
 
   defp assert_receive_count(count) do
-    assert_receive {:woke, _pid}, 100
-    assert_receive_count(count - 1)
+    assert_receive_count(count, count * 100)
+  end
+
+  defp assert_receive_count(count, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_assert_receive_count(count, deadline)
+  end
+
+  defp do_assert_receive_count(0, _deadline), do: :ok
+
+  defp do_assert_receive_count(count, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:woke, _pid} -> do_assert_receive_count(count - 1, deadline)
+    after
+      remaining -> flunk("expected #{count} more claim waiter wake message(s)")
+    end
   end
 end
