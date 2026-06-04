@@ -14,11 +14,12 @@ defmodule Ferricstore.HealthReadinessTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
-    ShardHelpers.wait_shards_alive()
+    Health.set_ready(true)
+    ShardHelpers.wait_default_pipeline_ready()
 
     on_exit(fn ->
       Health.set_ready(true)
-      ShardHelpers.wait_shards_alive()
+      ShardHelpers.wait_default_pipeline_ready()
     end)
   end
 
