@@ -3373,19 +3373,42 @@ defmodule Ferricstore.Flow.LMDBTest do
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> Ferricstore.Flow.LMDB.path()
 
+    now = System.monotonic_time()
+    seventy_ms = System.convert_time_unit(70, :millisecond, :native)
+
+    pending_state = %{
+      pending: [{:put, key1, "v1"}],
+      pending_after_flush: [],
+      flush_on_max_ops?: false,
+      count: 1,
+      max_ops: 1_000_000,
+      first_pending_at: now - seventy_ms,
+      last_enqueue_at: now - seventy_ms,
+      flush_quiet_ms: 100,
+      flush_max_lag_ms: 500
+    }
+
+    assert {:defer, delay_ms} =
+             Ferricstore.Flow.LMDBWriter.__timer_flush_decision_for_test__(
+               pending_state,
+               now
+             )
+
+    assert delay_ms in 1..30
+
+    assert {:defer, delay_ms_after_second_enqueue} =
+             Ferricstore.Flow.LMDBWriter.__timer_flush_decision_for_test__(
+               %{pending_state | last_enqueue_at: now},
+               now
+             )
+
+    assert delay_ms_after_second_enqueue == 100
+
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key1, "v1"}])
 
-    Process.sleep(70)
-
-    refute File.exists?(Path.join(path, "data.mdb"))
-
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key2, "v2"}])
-
-    Process.sleep(80)
-
-    refute File.exists?(Path.join(path, "data.mdb"))
 
     Ferricstore.Test.ShardHelpers.eventually(fn ->
       Ferricstore.Flow.LMDB.get(path, key1) == {:ok, "v1"} and
@@ -3508,8 +3531,6 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key1, "v1"}])
-
-    Process.sleep(70)
 
     assert :requested =
              Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 123)

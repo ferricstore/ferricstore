@@ -27,6 +27,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
   @enqueue_seq_queued 1
   @enqueue_seq_processed 2
 
+  @doc false
+  def __timer_flush_decision_for_test__(state, now)
+      when is_map(state) and is_integer(now) do
+    timer_flush_decision(state, now)
+  end
+
   def start_link(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
     instance_name = instance_name_from_opts(opts)
@@ -972,7 +978,18 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp timer_flush_decision(%{last_enqueue_at: nil}), do: :flush
   defp timer_flush_decision(%{first_pending_at: nil}), do: :flush
 
-  defp timer_flush_decision(state) do
+  defp timer_flush_decision(state), do: timer_flush_decision(state, System.monotonic_time())
+
+  defp timer_flush_decision(%{pending: [], pending_after_flush: []}, _now), do: :flush
+
+  defp timer_flush_decision(%{flush_on_max_ops?: true, count: count, max_ops: max_ops}, _now)
+       when is_integer(count) and is_integer(max_ops) and count >= max_ops,
+       do: :flush
+
+  defp timer_flush_decision(%{last_enqueue_at: nil}, _now), do: :flush
+  defp timer_flush_decision(%{first_pending_at: nil}, _now), do: :flush
+
+  defp timer_flush_decision(state, now) do
     quiet_ms =
       normalize_non_negative_integer(state.flush_quiet_ms, @default_lagged_flush_quiet_ms)
 
@@ -984,7 +1001,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
         :flush
 
       true ->
-        now = System.monotonic_time()
         idle_ms = elapsed_ms(state.last_enqueue_at, now)
         pending_age_ms = elapsed_ms(state.first_pending_at, now)
 
