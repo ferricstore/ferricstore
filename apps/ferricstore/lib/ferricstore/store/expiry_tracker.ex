@@ -1,6 +1,8 @@
 defmodule Ferricstore.Store.ExpiryTracker do
   @moduledoc false
 
+  @max_atomic_i64 9_223_372_036_854_775_807
+
   def expiring?(expire_at_ms) when is_integer(expire_at_ms) and expire_at_ms > 0, do: true
   def expiring?(_expire_at_ms), do: false
 
@@ -141,8 +143,10 @@ defmodule Ferricstore.Store.ExpiryTracker do
         idx = shard_index + 1
         current = :atomics.get(ref, idx)
 
-        if current <= 0 or expire_at_ms < current do
-          :atomics.put(ref, idx, expire_at_ms)
+        due_at_ms = clamp_due_at_ms(expire_at_ms)
+
+        if current <= 0 or due_at_ms < current do
+          :atomics.put(ref, idx, due_at_ms)
         end
     end
   end
@@ -159,7 +163,12 @@ defmodule Ferricstore.Store.ExpiryTracker do
   defp set_due(ctx, shard_index, due_at_ms) do
     case due_ref(ctx, shard_index) do
       nil -> :ok
-      ref -> :atomics.put(ref, shard_index + 1, due_at_ms)
+      ref -> :atomics.put(ref, shard_index + 1, clamp_due_at_ms(due_at_ms))
     end
   end
+
+  defp clamp_due_at_ms(value) when is_integer(value) and value > @max_atomic_i64,
+    do: @max_atomic_i64
+
+  defp clamp_due_at_ms(value), do: value
 end
