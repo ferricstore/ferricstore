@@ -5,6 +5,7 @@ defmodule Ferricstore.FlowBackpressureTest do
   alias Ferricstore.Flow.Admission
   alias Ferricstore.OperationalGuard
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
 
   def handle_telemetry(event, measurements, metadata, test_pid) do
     send(test_pid, {:flow_telemetry, event, measurements, metadata})
@@ -71,6 +72,25 @@ defmodule Ferricstore.FlowBackpressureTest do
     assert msg_a =~ "BUSY"
     assert msg_b =~ "BUSY"
     assert msg_a =~ "retry_after_ms="
+  end
+
+  test "flow_create_pipeline_batch rejects malformed attrs without crashing shard" do
+    ctx = FerricStore.Instance.get(:default)
+
+    results =
+      Router.flow_create_pipeline_batch(ctx, [
+        %{id: "flow-malformed-batch-a-#{System.unique_integer([:positive])}"},
+        %{
+          id: "flow-malformed-batch-b-#{System.unique_integer([:positive])}",
+          type: "overload"
+        }
+      ])
+
+    assert [{:error, msg_a}, {:error, msg_b}] = results
+    assert msg_a =~ "ERR flow type"
+    assert msg_b =~ "ERR flow state"
+
+    assert :ok = ShardHelpers.wait_shards_alive()
   end
 
   test "flow_create_many_independent returns top-level overload for SDK backpressure" do

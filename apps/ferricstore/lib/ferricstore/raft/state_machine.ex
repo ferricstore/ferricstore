@@ -6263,17 +6263,19 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_create_apply_new_record(state, attrs, state_key) do
-    key_info = flow_create_fast_key_info(attrs, state_key)
-    record = flow_create_record(state, attrs)
-    plan = flow_create_fast_plan(record, attrs, key_info)
+    with :ok <- flow_validate_create_attrs(attrs) do
+      key_info = flow_create_fast_key_info(attrs, state_key)
+      record = flow_create_record(state, attrs)
+      plan = flow_create_fast_plan(record, attrs, key_info)
 
-    with false <- Map.get(attrs, :idempotent, false),
-         :ok <- flow_many_same_state_machine_shard_by_keys?(state, [key_info]),
-         :ok <- flow_validate_create_fast_plan_keys(plan) do
-      flow_create_many_fast_apply(state, [plan])
-    else
-      {:error, _reason} = error -> error
-      _ -> flow_create_apply_new_record_slow(state, attrs, state_key, record)
+      with false <- Map.get(attrs, :idempotent, false),
+           :ok <- flow_many_same_state_machine_shard_by_keys?(state, [key_info]),
+           :ok <- flow_validate_create_fast_plan_keys(plan) do
+        flow_create_many_fast_apply(state, [plan])
+      else
+        {:error, _reason} = error -> error
+        _ -> flow_create_apply_new_record_slow(state, attrs, state_key, record)
+      end
     end
   end
 
@@ -6353,7 +6355,8 @@ defmodule Ferricstore.Raft.StateMachine do
     if Enum.any?(attrs_list, &Map.get(&1, :idempotent, false)) do
       :fallback
     else
-      with :ok <- flow_many_partition_keys_present?(attrs_list),
+      with :ok <- flow_validate_create_attrs_list(attrs_list),
+           :ok <- flow_many_partition_keys_present?(attrs_list),
            key_infos = flow_create_fast_key_infos(attrs_list, stamped_shard),
            :ok <- flow_many_same_state_machine_shard_by_keys?(state, key_infos),
            :ok <- flow_create_many_unique?(attrs_list),
@@ -6547,18 +6550,24 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_create_pipeline_batch_prepare(state, attrs_list) do
     {results, plans, _seen} =
       Enum.reduce(attrs_list, {[], [], MapSet.new()}, fn attrs, {results, plans, seen} ->
-        key = FlowKeys.state_key(Map.get(attrs, :id), Map.get(attrs, :partition_key))
+        case flow_validate_create_attrs(attrs) do
+          :ok ->
+            key = FlowKeys.state_key(Map.fetch!(attrs, :id), Map.get(attrs, :partition_key))
 
-        if MapSet.member?(seen, key) do
-          {[{:error, "ERR flow already exists"} | results], plans, seen}
-        else
-          case flow_create_many_prepare(state, [attrs]) do
-            {:ok, _records, new_plans} ->
-              {[:ok | results], Enum.reverse(new_plans) ++ plans, MapSet.put(seen, key)}
+            if MapSet.member?(seen, key) do
+              {[{:error, "ERR flow already exists"} | results], plans, seen}
+            else
+              case flow_create_many_prepare(state, [attrs]) do
+                {:ok, _records, new_plans} ->
+                  {[:ok | results], Enum.reverse(new_plans) ++ plans, MapSet.put(seen, key)}
 
-            {:error, _reason} = error ->
-              {[error | results], plans, seen}
-          end
+                {:error, _reason} = error ->
+                  {[error | results], plans, seen}
+              end
+            end
+
+          {:error, _reason} = error ->
+            {[error | results], plans, seen}
         end
       end)
 
@@ -7381,39 +7390,71 @@ defmodule Ferricstore.Raft.StateMachine do
     result
   end
 
-  defp flow_create_many_prepare(state, attrs_list) do
-    existing_records = flow_create_many_existing_states(state, attrs_list)
-
-    attrs_list
-    |> Enum.zip(existing_records)
-    |> Enum.reduce_while({:ok, [], [], %{}}, fn
-      {%{id: _id} = attrs, existing}, {:ok, acc, new_acc, retention_cache} ->
-        case existing do
-          nil ->
-            {record, retention_cache} =
-              flow_create_record_cached_retention(state, attrs, retention_cache)
-
-            case flow_validate_record_keys(record) do
-              :ok -> {:cont, {:ok, [record | acc], [{record, attrs} | new_acc], retention_cache}}
-              {:error, _reason} = error -> {:halt, error}
-            end
-
-          :present ->
-            {:halt, {:error, "ERR flow already exists"}}
-
-          existing ->
-            case flow_create_duplicate_result(state, existing, attrs) do
-              {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc, retention_cache}}
-              {:error, _reason} = error -> {:halt, error}
-            end
-        end
+  defp flow_validate_create_attrs_list(attrs_list) do
+    Enum.reduce_while(attrs_list, :ok, fn attrs, :ok ->
+      case flow_validate_create_attrs(attrs) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
     end)
-    |> case do
-      {:ok, records, new_records, _retention_cache} ->
-        {:ok, Enum.reverse(records), Enum.reverse(new_records)}
+  end
 
-      {:error, _reason} = error ->
-        error
+  defp flow_validate_create_attrs(%{id: id} = attrs) when is_binary(id) and id != "" do
+    cond do
+      not flow_non_empty_binary?(Map.get(attrs, :type)) ->
+        {:error, "ERR flow type must be a non-empty string"}
+
+      not flow_non_empty_binary?(Map.get(attrs, :state)) ->
+        {:error, "ERR flow state must be a non-empty string"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp flow_validate_create_attrs(_attrs),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp flow_non_empty_binary?(value), do: is_binary(value) and value != ""
+
+  defp flow_create_many_prepare(state, attrs_list) do
+    with :ok <- flow_validate_create_attrs_list(attrs_list) do
+      existing_records = flow_create_many_existing_states(state, attrs_list)
+
+      attrs_list
+      |> Enum.zip(existing_records)
+      |> Enum.reduce_while({:ok, [], [], %{}}, fn
+        {%{id: _id} = attrs, existing}, {:ok, acc, new_acc, retention_cache} ->
+          case existing do
+            nil ->
+              {record, retention_cache} =
+                flow_create_record_cached_retention(state, attrs, retention_cache)
+
+              case flow_validate_record_keys(record) do
+                :ok ->
+                  {:cont, {:ok, [record | acc], [{record, attrs} | new_acc], retention_cache}}
+
+                {:error, _reason} = error ->
+                  {:halt, error}
+              end
+
+            :present ->
+              {:halt, {:error, "ERR flow already exists"}}
+
+            existing ->
+              case flow_create_duplicate_result(state, existing, attrs) do
+                {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc, retention_cache}}
+                {:error, _reason} = error -> {:halt, error}
+              end
+          end
+      end)
+      |> case do
+        {:ok, records, new_records, _retention_cache} ->
+          {:ok, Enum.reverse(records), Enum.reverse(new_records)}
+
+        {:error, _reason} = error ->
+          error
+      end
     end
   end
 
@@ -12231,11 +12272,11 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_retention_value_refs_used_by_other_lmdb_states(
-       state,
-       owner_record,
-       target_refs,
-       referenced
-     ) do
+         state,
+         owner_record,
+         target_refs,
+         referenced
+       ) do
     if flow_lmdb_lagged_projection_enabled?() do
       prefix = "f:{"
       limit = flow_retention_value_lmdb_scan_limit()
@@ -14940,6 +14981,7 @@ defmodule Ferricstore.Raft.StateMachine do
     terminal? = Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state))
     disk_val = to_disk_binary(stored_value)
     blob_ref? = stored_value != encoded_record
+
     if projection_enabled? and terminal? do
       maybe_queue_lmdb_indexes_for_state_record(state, key, encoded_record, expire_at_ms, record)
     end
@@ -14996,6 +15038,7 @@ defmodule Ferricstore.Raft.StateMachine do
     disk_val = to_disk_binary(stored_value)
     blob_ref? = stored_value != encoded_record
     lfu = LFU.initial()
+
     if projection_enabled? and terminal? do
       maybe_queue_lmdb_indexes_for_state_record(state, key, encoded_record, expire_at_ms, record)
     end
@@ -17121,7 +17164,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp maybe_queue_terminal_lmdb_history_indexes(state, record) do
-    if flow_lmdb_projection_enabled?(state) and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+    if flow_lmdb_projection_enabled?(state) and
+         Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
       id = Map.fetch!(record, :id)
       partition_key = Map.get(record, :partition_key)
       history_key = FlowKeys.history_key(id, partition_key)
@@ -21941,7 +21985,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_queue_compound_promotion_after_flush(state, redis_key, compound_key, write_count) do
     threshold = Promotion.threshold(state.instance_ctx)
 
-    if threshold > 0 and compound_promotion_candidate?(state, redis_key, compound_key, write_count) do
+    if threshold > 0 and
+         compound_promotion_candidate?(state, redis_key, compound_key, write_count) do
       pending = Process.get(:sm_pending_compound_promotions, MapSet.new())
       Process.put(:sm_pending_compound_promotions, MapSet.put(pending, {redis_key, compound_key}))
     end
@@ -21981,7 +22026,8 @@ defmodule Ferricstore.Raft.StateMachine do
         state
 
       true ->
-        case {compound_type_from_key(compound_key), compound_prefix_from_key(redis_key, compound_key)} do
+        case {compound_type_from_key(compound_key),
+              compound_prefix_from_key(redis_key, compound_key)} do
           {nil, _prefix} ->
             state
 
@@ -22023,7 +22069,11 @@ defmodule Ferricstore.Raft.StateMachine do
       })
 
     pending_state = apply_state_get(:pending_state, state)
-    apply_state_put(:pending_state, Map.put(pending_state, :promoted_instances, promoted_instances))
+
+    apply_state_put(
+      :pending_state,
+      Map.put(pending_state, :promoted_instances, promoted_instances)
+    )
 
     Map.put(state, :promoted_instances, promoted_instances)
   end
