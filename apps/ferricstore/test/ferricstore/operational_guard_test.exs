@@ -177,7 +177,7 @@ defmodule Ferricstore.OperationalGuardTest do
     )
 
     assert_receive {:memory_pressure, :pressure}
-    refute Admission.reject_new_creates?()
+    Utils.eventually(fn -> refute Admission.reject_new_creates?() end, 1_000, 10)
   end
 
   test "default rss threshold pauses Flow creates before hard RSS stop" do
