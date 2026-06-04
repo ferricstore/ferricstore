@@ -426,13 +426,19 @@ defmodule Ferricstore.MemoryGuard do
         target_evict(state, stats, 0.65, 50)
 
       :pressure ->
-        Logger.error("MemoryGuard: high memory pressure (#{Float.round(stats.ratio * 100, 1)}%)")
+        if state.last_pressure_level != :pressure do
+          Logger.error("MemoryGuard: high memory pressure (#{Float.round(stats.ratio * 100, 1)}%)")
+        end
+
         emit_shard_pressure_events(stats)
         # Aggressive eviction: evict down to 75% target
         target_evict(state, stats, 0.75, 200)
 
       :reject ->
-        Logger.critical("MemoryGuard: critical memory (#{Float.round(stats.ratio * 100, 1)}%)")
+        if state.last_pressure_level != :reject do
+          Logger.critical("MemoryGuard: critical memory (#{Float.round(stats.ratio * 100, 1)}%)")
+        end
+
         emit_shard_pressure_events(stats)
         # Emergency eviction: evict down to 80% target
         target_evict(state, stats, 0.80, 1000)

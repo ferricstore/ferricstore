@@ -6419,7 +6419,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_create_non_idempotent_many_prepare(state, attrs_list, key_infos) do
     keys = Enum.map(key_infos, & &1.state_key)
 
-    if Enum.any?(flow_state_keys_present(state, keys), & &1) do
+    if Enum.any?(flow_state_keys_present_hot_only(state, keys), & &1) do
       {:error, "ERR flow already exists"}
     else
       attrs_list
@@ -15796,8 +15796,14 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_read_record_by_key(state, key) do
-    case flow_read_ets_record(state, key) do
-      nil ->
+    case flow_read_state_record_status(state, key) do
+      {:record, record} ->
+        record
+
+      :expired ->
+        nil
+
+      :miss ->
         if flow_lmdb_lagged_projection_enabled?() do
           case flow_read_lmdb_record(state, key) do
             {:ok, record} -> record
@@ -15806,9 +15812,6 @@ defmodule Ferricstore.Raft.StateMachine do
         else
           nil
         end
-
-      record ->
-        record
     end
   end
 
@@ -15872,6 +15875,10 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_state_keys_present_hot_only(state, keys) do
+    Enum.map(keys, &flow_state_key_present_hot?(state, &1))
+  end
+
   defp flow_state_key_present?(state, key) do
     [present?] = flow_state_keys_present(state, [key])
     present?
@@ -15907,14 +15914,14 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_read_mirror_records(state, keys) do
-    ets_results = Enum.map(keys, &flow_read_ets_record(state, &1))
+    ets_results = Enum.map(keys, &flow_read_state_record_status(state, &1))
 
     lmdb_reads =
       keys
       |> Enum.zip(ets_results)
       |> Enum.with_index()
       |> Enum.flat_map(fn
-        {{key, nil}, idx} -> [{idx, key}]
+        {{key, :miss}, idx} -> [{idx, key}]
         {_present, _idx} -> []
       end)
 
@@ -15932,6 +15939,15 @@ defmodule Ferricstore.Raft.StateMachine do
       ets_results
       |> Enum.with_index()
       |> Enum.reduce(results, fn
+        {:miss, _idx}, acc ->
+          acc
+
+        {:expired, idx}, acc ->
+          Map.put(acc, idx, nil)
+
+        {{:record, record}, idx}, acc ->
+          Map.put(acc, idx, record)
+
         {nil, _idx}, acc ->
           acc
 
@@ -16089,12 +16105,29 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_lmdb_blob_present?(_blob), do: false
 
   defp flow_read_ets_record(state, key) do
+    case flow_read_state_record_status(state, key) do
+      {:record, record} -> record
+      :expired -> nil
+      :miss -> nil
+    end
+  end
+
+  defp flow_read_state_record_status(state, key) do
     case ets_lookup(state, key) do
       {:hit, value, _expire_at_ms} when is_binary(value) ->
-        flow_decode_hot_state_value(value)
+        case flow_decode_hot_state_value(value) do
+          nil -> :miss
+          record -> {:record, record}
+        end
+
+      :expired ->
+        :expired
 
       _ ->
-        flow_read_cold_ets_record(state, key)
+        case flow_read_cold_ets_record(state, key) do
+          nil -> :miss
+          record -> {:record, record}
+        end
     end
   end
 

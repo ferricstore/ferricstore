@@ -46,7 +46,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
     @tag :jepsen
     @tag timeout: 300_000
     test "set: no ACKed member missing after sibling node kills", %{nodes: nodes} do
-      [n1, n2, n3] = nodes
+      [n1, _n2, n3] = nodes
       key = "jepsen:set"
 
       {:ok, history} = HistoryRecorder.new()

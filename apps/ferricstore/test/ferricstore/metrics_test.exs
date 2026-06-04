@@ -1,7 +1,6 @@
 defmodule Ferricstore.MetricsTest do
   @moduledoc false
   use ExUnit.Case, async: false
-  import ExUnit.CaptureLog
 
   alias Ferricstore.Metrics
   alias Ferricstore.PrefixMetricsCache

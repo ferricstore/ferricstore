@@ -168,7 +168,7 @@ defmodule Ferricstore.AuditFixesHighTest do
 
     test "empty list is not more than 1" do
       empty = []
-      refute match?([_, _ | _], empty)
+      assert empty == []
     end
 
     test "three-element list is more than 1" do
@@ -384,7 +384,7 @@ defmodule Ferricstore.AuditFixesHighTest do
       empty = []
       one = ["a"]
       two = ["a", "b"]
-      refute match?([_, _, _ | _], empty)
+      assert empty == []
       refute match?([_, _, _ | _], one)
       refute match?([_, _, _ | _], two)
     end

@@ -4793,36 +4793,71 @@ defmodule Ferricstore.Store.Router do
   @doc false
   def flow_get(ctx, id, partition_key) when is_binary(id) do
     key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    now_ms = CommandTime.now_ms()
 
-    case Stats.with_cache_tracking_disabled(fn -> get(ctx, key) end) do
-      nil ->
-        if flow_state_deleted_tombstone?(ctx, key),
-          do: nil,
-          else: flow_get_lmdb(ctx, key, :lagged)
+    if flow_state_expired_or_deleted?(ctx, key, now_ms) do
+      nil
+    else
+      case Stats.with_cache_tracking_disabled(fn -> get(ctx, key) end) do
+        nil ->
+          if flow_state_expired_or_deleted?(ctx, key, CommandTime.now_ms()),
+            do: nil,
+            else: flow_get_lmdb(ctx, key, :lagged)
 
-      value ->
-        value
+        value when is_binary(value) ->
+          if flow_terminal_record_expired?(value, CommandTime.now_ms()), do: nil, else: value
+
+        value ->
+          value
+      end
     end
   end
 
   @doc false
   def flow_batch_get(ctx, ids, partition_key) when is_list(ids) do
     keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
+    now_ms = CommandTime.now_ms()
+
+    blocked_keys =
+      keys
+      |> Enum.filter(&flow_state_expired_or_deleted?(ctx, &1, now_ms))
+      |> MapSet.new()
 
     values =
       Stats.with_cache_tracking_disabled(fn ->
         batch_get(ctx, keys)
       end)
 
-    missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
+    missing_keys =
+      for {key, nil} <- Enum.zip(keys, values),
+          not MapSet.member?(blocked_keys, key),
+          not flow_state_expired_or_deleted?(ctx, key, CommandTime.now_ms()),
+          do: key
+
     missing_values = flow_batch_get_lmdb(ctx, missing_keys, :lagged)
 
     {merged, []} =
-      Enum.map_reduce(values, missing_values, fn
-        value, remaining when is_binary(value) -> {value, remaining}
-        nil, [value | remaining] -> {value, remaining}
-        nil, [] -> {nil, []}
-        _other, remaining -> {nil, remaining}
+      keys
+      |> Enum.zip(values)
+      |> Enum.map_reduce(missing_values, fn {key, value}, remaining ->
+        cond do
+          MapSet.member?(blocked_keys, key) ->
+            {nil, remaining}
+
+          is_binary(value) ->
+            if flow_terminal_record_expired?(value, CommandTime.now_ms()),
+              do: {nil, remaining},
+              else: {value, remaining}
+
+          is_nil(value) ->
+            case remaining do
+              [cold_value | rest] -> {cold_value, rest}
+              [] -> {nil, []}
+            end
+
+          true ->
+            {nil, remaining}
+        end
       end)
 
     merged
@@ -4872,13 +4907,17 @@ defmodule Ferricstore.Store.Router do
     ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
   end
 
-  defp flow_state_deleted_tombstone?(ctx, key) when is_binary(key) do
+  defp flow_state_expired_or_deleted?(ctx, key, now_ms) when is_binary(key) do
     idx = shard_for(ctx, key)
 
     case Map.get(ctx, :keydir_refs) do
       refs when is_tuple(refs) and idx >= 0 and idx < tuple_size(refs) ->
         case :ets.lookup(elem(refs, idx), key) do
           [{^key, nil, _expire_at_ms, :flow_state_deleted, :deleted, _offset, _value_size}] ->
+            true
+
+          [{^key, _value, expire_at_ms, _lfu, _fid, _offset, _value_size}]
+          when is_integer(expire_at_ms) and expire_at_ms > 0 and expire_at_ms <= now_ms ->
             true
 
           _other ->
@@ -4891,6 +4930,8 @@ defmodule Ferricstore.Store.Router do
   rescue
     _ -> false
   end
+
+  defp flow_state_expired_or_deleted?(_ctx, _key, _now_ms), do: false
 
   defp flow_lmdb_get_many(_ctx, _path, [], _now_ms, _mode), do: []
 
@@ -5004,7 +5045,7 @@ defmodule Ferricstore.Store.Router do
   defp flow_decode_lmdb_get_result({:ok, blob}, path, key, now_ms, mode) when is_binary(blob) do
     case Ferricstore.Flow.LMDB.decode_value(blob, now_ms) do
       {:ok, value} ->
-        if flow_lmdb_terminal_record_expired?(value, now_ms) do
+        if flow_terminal_record_expired?(value, now_ms) do
           Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
           nil
         else
@@ -5028,7 +5069,7 @@ defmodule Ferricstore.Store.Router do
   defp flow_decode_lmdb_get_result(_other, _path, _key, _now_ms, mode),
     do: flow_lmdb_read_error_result(mode, :unexpected_result)
 
-  defp flow_lmdb_terminal_record_expired?(value, now_ms)
+  defp flow_terminal_record_expired?(value, now_ms)
        when is_binary(value) and is_integer(now_ms) do
     try do
       record = Ferricstore.Flow.decode_record(value)
@@ -5043,7 +5084,7 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp flow_lmdb_terminal_record_expired?(_value, _now_ms), do: false
+  defp flow_terminal_record_expired?(_value, _now_ms), do: false
 
   defp flow_lmdb_read_error_result(mode, reason) do
     flow_observe_lmdb_read_error(mode, reason)
@@ -7802,6 +7843,14 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
+    if promoted_data_compound_key?(keydir, redis_key, compound_key, now) do
+      fallback_compound_get(ctx, idx, redis_key, compound_key)
+    else
+      compound_get_from_keydir(ctx, idx, keydir, redis_key, compound_key, now)
+    end
+  end
+
+  defp compound_get_from_keydir(ctx, idx, keydir, redis_key, compound_key, now) do
     case ets_get_full(ctx, idx, keydir, compound_key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
@@ -7852,57 +7901,65 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    {results, {fallback_keys, hot_hits}} =
-      Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
-        case ets_get_full(ctx, idx, keydir, compound_key, now) do
-          {:hit, value, lfu} ->
-            {{:value, value}, {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
-
-          {:cold, file_id, offset, value_size}
-          when valid_cold_location(file_id, offset, value_size) or
-                 valid_waraft_segment_location(file_id, offset, value_size) ->
-            case direct_waraft_compound_cold_get(
-                   ctx,
-                   idx,
-                   keydir,
-                   compound_key,
-                   file_id,
-                   offset,
-                   value_size,
-                   now
-                 ) do
-              {:ok, value} -> {{:value, value}, {fallback_keys, hot_hits}}
-              :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
-            end
-
-          _ ->
-            {:fallback, {[compound_key | fallback_keys], hot_hits}}
-        end
-      end)
-
-    sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
-
-    fallback_values =
-      case fallback_keys do
-        [] ->
-          []
-
-        keys ->
-          pending_keys = Enum.reverse(keys)
-
-          case safe_read_call(ctx, idx, {:compound_batch_get, redis_key, pending_keys}) do
-            {:ok, values} -> values
-            :unavailable -> List.duplicate(nil, length(pending_keys))
-          end
+    if promoted_compound_collection?(keydir, redis_key, now) and
+         Enum.any?(compound_keys, &(not shared_log_compound_key?(&1))) do
+      case safe_read_call(ctx, idx, {:compound_batch_get, redis_key, compound_keys}) do
+        {:ok, values} -> values
+        :unavailable -> List.duplicate(nil, length(compound_keys))
       end
+    else
+      {results, {fallback_keys, hot_hits}} =
+        Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
+          case ets_get_full(ctx, idx, keydir, compound_key, now) do
+            {:hit, value, lfu} ->
+              {{:value, value}, {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
 
-    {values, []} =
-      Enum.map_reduce(results, fallback_values, fn
-        {:value, value}, remaining -> {value, remaining}
-        :fallback, [value | remaining] -> {value, remaining}
-      end)
+            {:cold, file_id, offset, value_size}
+            when valid_cold_location(file_id, offset, value_size) or
+                   valid_waraft_segment_location(file_id, offset, value_size) ->
+              case direct_waraft_compound_cold_get(
+                     ctx,
+                     idx,
+                     keydir,
+                     compound_key,
+                     file_id,
+                     offset,
+                     value_size,
+                     now
+                   ) do
+                {:ok, value} -> {{:value, value}, {fallback_keys, hot_hits}}
+                :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
+              end
 
-    values
+            _ ->
+              {:fallback, {[compound_key | fallback_keys], hot_hits}}
+          end
+        end)
+
+      sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
+
+      fallback_values =
+        case fallback_keys do
+          [] ->
+            []
+
+          keys ->
+            pending_keys = Enum.reverse(keys)
+
+            case safe_read_call(ctx, idx, {:compound_batch_get, redis_key, pending_keys}) do
+              {:ok, values} -> values
+              :unavailable -> List.duplicate(nil, length(pending_keys))
+            end
+        end
+
+      {values, []} =
+        Enum.map_reduce(results, fallback_values, fn
+          {:value, value}, remaining -> {value, remaining}
+          :fallback, [value | remaining] -> {value, remaining}
+        end)
+
+      values
+    end
   end
 
   defp retry_or_fallback_compound_get(
@@ -8020,6 +8077,14 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
+    if promoted_data_compound_key?(keydir, redis_key, compound_key, now) do
+      fallback_compound_get_meta(ctx, idx, redis_key, compound_key)
+    else
+      compound_get_meta_from_keydir(ctx, idx, keydir, redis_key, compound_key, now)
+    end
+  end
+
+  defp compound_get_meta_from_keydir(ctx, idx, keydir, redis_key, compound_key, now) do
     case ets_get_meta_full(ctx, idx, keydir, compound_key, now) do
       {:hit, value, expire_at_ms, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
@@ -8058,59 +8123,86 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    {results, {fallback_keys, hot_hits}} =
-      Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
-        case ets_get_meta_full(ctx, idx, keydir, compound_key, now) do
-          {:hit, value, expire_at_ms, lfu} ->
-            {{:value, {value, expire_at_ms}},
-             {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
-
-          {:cold, file_id, offset, value_size, expire_at_ms}
-          when readable_cold_ref?(file_id, offset, value_size) ->
-            case direct_waraft_compound_cold_get_meta(
-                   ctx,
-                   idx,
-                   keydir,
-                   compound_key,
-                   file_id,
-                   offset,
-                   value_size,
-                   now,
-                   expire_at_ms
-                 ) do
-              {:ok, meta} -> {{:value, meta}, {fallback_keys, hot_hits}}
-              :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
-            end
-
-          _ ->
-            {:fallback, {[compound_key | fallback_keys], hot_hits}}
-        end
-      end)
-
-    sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
-
-    fallback_values =
-      case fallback_keys do
-        [] ->
-          []
-
-        keys ->
-          pending_keys = Enum.reverse(keys)
-
-          case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, pending_keys}) do
-            {:ok, metas} -> metas
-            :unavailable -> List.duplicate(nil, length(pending_keys))
-          end
+    if promoted_compound_collection?(keydir, redis_key, now) and
+         Enum.any?(compound_keys, &(not shared_log_compound_key?(&1))) do
+      case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, compound_keys}) do
+        {:ok, metas} -> metas
+        :unavailable -> List.duplicate(nil, length(compound_keys))
       end
+    else
+      {results, {fallback_keys, hot_hits}} =
+        Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
+          case ets_get_meta_full(ctx, idx, keydir, compound_key, now) do
+            {:hit, value, expire_at_ms, lfu} ->
+              {{:value, {value, expire_at_ms}},
+               {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
 
-    {values, []} =
-      Enum.map_reduce(results, fallback_values, fn
-        {:value, value}, remaining -> {value, remaining}
-        :fallback, [value | remaining] -> {value, remaining}
-      end)
+            {:cold, file_id, offset, value_size, expire_at_ms}
+            when readable_cold_ref?(file_id, offset, value_size) ->
+              case direct_waraft_compound_cold_get_meta(
+                     ctx,
+                     idx,
+                     keydir,
+                     compound_key,
+                     file_id,
+                     offset,
+                     value_size,
+                     now,
+                     expire_at_ms
+                   ) do
+                {:ok, meta} -> {{:value, meta}, {fallback_keys, hot_hits}}
+                :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
+              end
 
-    values
+            _ ->
+              {:fallback, {[compound_key | fallback_keys], hot_hits}}
+          end
+        end)
+
+      sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
+
+      fallback_values =
+        case fallback_keys do
+          [] ->
+            []
+
+          keys ->
+            pending_keys = Enum.reverse(keys)
+
+            case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, pending_keys}) do
+              {:ok, metas} -> metas
+              :unavailable -> List.duplicate(nil, length(pending_keys))
+            end
+        end
+
+      {values, []} =
+        Enum.map_reduce(results, fallback_values, fn
+          {:value, value}, remaining -> {value, remaining}
+          :fallback, [value | remaining] -> {value, remaining}
+        end)
+
+      values
+    end
   end
+
+  defp promoted_data_compound_key?(keydir, redis_key, compound_key, now) do
+    not shared_log_compound_key?(compound_key) and
+      promoted_compound_collection?(keydir, redis_key, now)
+  end
+
+  defp promoted_compound_collection?(keydir, redis_key, now) do
+    case :ets.lookup(keydir, "PM:" <> redis_key) do
+      [{_, _value, 0, _lfu, _fid, _off, _vsize}] -> true
+      [{_, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now -> true
+      _ -> false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp shared_log_compound_key?(<<"T:", _rest::binary>>), do: true
+  defp shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
+  defp shared_log_compound_key?(_key), do: false
 
   defp direct_waraft_compound_cold_get_meta(
          ctx,

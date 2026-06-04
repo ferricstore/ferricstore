@@ -567,13 +567,4 @@ defmodule Ferricstore.Cluster.SnapshotJoinTest do
       end
     end
   end
-
-  defp eventually(fun, attempts \\ 50, interval_ms \\ 100) do
-    fun.()
-  rescue
-    e in [ExUnit.AssertionError] ->
-      if attempts <= 1, do: reraise(e, __STACKTRACE__)
-      :timer.sleep(interval_ms)
-      eventually(fun, attempts - 1, interval_ms)
-  end
 end

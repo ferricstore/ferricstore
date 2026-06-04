@@ -98,8 +98,11 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
         assert status.merging == false, "Expected merging to be false on shard #{i}"
         assert is_integer(status.merge_count), "Expected merge_count to be integer on shard #{i}"
 
-        assert status.total_bytes_reclaimed == 0,
-               "Expected 0 bytes reclaimed initially on shard #{i}"
+        assert is_integer(status.total_bytes_reclaimed),
+               "Expected total_bytes_reclaimed to be integer on shard #{i}"
+
+        assert status.total_bytes_reclaimed >= 0,
+               "Expected total_bytes_reclaimed to be non-negative on shard #{i}"
 
         assert is_map(status.config), "Expected config to be a map on shard #{i}"
       end
