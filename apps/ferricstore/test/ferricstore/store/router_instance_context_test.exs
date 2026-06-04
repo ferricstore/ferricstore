@@ -6,8 +6,10 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Promotion
   alias Ferricstore.Test.IsolatedInstance
+  alias Ferricstore.Test.ShardHelpers
 
   setup do
+    ShardHelpers.wait_shards_alive()
     ctx = IsolatedInstance.checkout(shard_count: 2)
     on_exit(fn -> IsolatedInstance.checkin(ctx) end)
     {:ok, ctx: ctx}

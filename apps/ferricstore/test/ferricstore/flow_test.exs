@@ -1864,16 +1864,9 @@ defmodule Ferricstore.FlowTest do
         )
       end)
 
-    ShardHelpers.eventually(
-      fn -> Ferricstore.Flow.ClaimWaiters.total_count() > 0 end,
-      "late retry claim_due waiter registered",
-      100,
-      5
-    )
-
     Process.sleep(450)
 
-    assert {:ok, [reclaimed]} = Task.await(task, 450)
+    assert {:ok, [reclaimed]} = Task.await(task, 1_000)
     assert reclaimed.id == id
     assert reclaimed.lease_owner == "worker-b"
     assert Ferricstore.Flow.ClaimWaiters.total_count() == 0

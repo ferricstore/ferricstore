@@ -17,7 +17,7 @@ defmodule Ferricstore.Review.M2WarmCacheBypassTest do
   @large_size 100_000
 
   setup do
-    ShardHelpers.flush_all_shards()
+    ShardHelpers.flush_all_keys()
     :ok
   end
 

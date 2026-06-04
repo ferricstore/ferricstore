@@ -175,12 +175,12 @@ defmodule Ferricstore.QuorumMetrics do
   """
   @spec reset() :: :ok
   def reset do
-    try do
-      :ets.delete_all_objects(@table)
-      :ok
-    rescue
-      ArgumentError -> :ok
-    end
+    ensure_table()
+    attach_handler()
+    :ets.delete_all_objects(@table)
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @doc false
