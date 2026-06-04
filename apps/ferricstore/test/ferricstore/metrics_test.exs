@@ -466,7 +466,6 @@ defmodule Ferricstore.MetricsTest do
                ~s(ferricstore_prefix_key_count{prefix="#{prefix}"} 1)
              )
     end
-
   end
 
   # ---------------------------------------------------------------------------
@@ -492,9 +491,11 @@ defmodule Ferricstore.MetricsTest do
       command_result = Metrics.handle("FERRICSTORE.METRICS", [])
       scrape_result = Metrics.scrape()
 
-      # Both should have the same metric names and structure
-      command_metrics = extract_metric_names(command_result)
-      scrape_metrics = extract_metric_names(scrape_result)
+      # Both should have the same stable metric names and structure.
+      # Prefix-cache metrics are refreshed asynchronously, so they may appear
+      # or disappear between two independent scrapes in a busy CI run.
+      command_metrics = extract_stable_metric_names(command_result)
+      scrape_metrics = extract_stable_metric_names(scrape_result)
 
       assert command_metrics == scrape_metrics
     end
@@ -610,5 +611,11 @@ defmodule Ferricstore.MetricsTest do
       |> hd()
     end)
     |> Enum.sort()
+  end
+
+  defp extract_stable_metric_names(text) do
+    text
+    |> extract_metric_names()
+    |> Enum.reject(&String.starts_with?(&1, "ferricstore_prefix_"))
   end
 end
