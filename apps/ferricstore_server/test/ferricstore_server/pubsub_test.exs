@@ -107,10 +107,20 @@ defmodule FerricstoreServer.PubSubTest do
   end
 
   setup do
+    reset_server_auth_state()
+    on_exit(fn -> reset_server_auth_state() end)
+
     # Clean ETS tables between tests to avoid cross-test interference
     clear_table(:ferricstore_pubsub)
     clear_table(:ferricstore_pubsub_patterns)
     clear_table(:ferricstore_pubsub_channel_cache)
+    :ok
+  end
+
+  defp reset_server_auth_state do
+    Ferricstore.Config.set("requirepass", "")
+    Acl.reset!()
+    ConnAuth.broadcast_acl_invalidation(:all)
     :ok
   end
 

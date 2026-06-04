@@ -106,6 +106,9 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   end
 
   setup do
+    reset_server_auth_state()
+    on_exit(fn -> reset_server_auth_state() end)
+
     # Ensure ETS table exists
     if :ets.whereis(:ferricstore_waiters) == :undefined do
       Waiters.init()
@@ -114,6 +117,13 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
     # Clean up stale waiters from prior tests
     :ets.delete_all_objects(:ferricstore_waiters)
 
+    :ok
+  end
+
+  defp reset_server_auth_state do
+    Ferricstore.Config.set("requirepass", "")
+    Acl.reset!()
+    ConnAuth.broadcast_acl_invalidation(:all)
     :ok
   end
 

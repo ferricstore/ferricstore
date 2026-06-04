@@ -201,10 +201,14 @@ jobs:
   # Core tests (parallel per OS, independent)
   # ===========================================================================
   test-core-ubuntu:
-    name: "Core tests (ubuntu)"
+    name: "Core tests (ubuntu ${{ matrix.partition }}/3)"
     needs: build-ubuntu
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
@@ -220,20 +224,24 @@ jobs:
             apps/ferricstore/priv/native
           key: build-Linux-${{ github.sha }}
       - name: Run ferricstore tests
-        timeout-minutes: 60
-        run: mix test apps/ferricstore/test --timeout 30000
+        timeout-minutes: 45
+        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results-core-ubuntu
+          name: test-results-core-ubuntu-${{ matrix.partition }}
           path: test-results/
           retention-days: 14
 
   test-core-macos:
-    name: "Core tests (macos)"
+    name: "Core tests (macos ${{ matrix.partition }}/3)"
     needs: build-macos
     runs-on: macos-latest
-    timeout-minutes: 70
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
@@ -249,12 +257,12 @@ jobs:
             apps/ferricstore/priv/native
           key: build-macOS-${{ github.sha }}
       - name: Run ferricstore tests
-        timeout-minutes: 60
-        run: mix test apps/ferricstore/test --timeout 30000
+        timeout-minutes: 45
+        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results-core-macos
+          name: test-results-core-macos-${{ matrix.partition }}
           path: test-results/
           retention-days: 14
 
