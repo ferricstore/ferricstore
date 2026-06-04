@@ -99,6 +99,7 @@ defmodule Ferricstore.Raft.StateMachine do
   }
 
   alias Ferricstore.Store.Shard.ZSetIndex
+  alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Transaction.Ast, as: TxAst
 
@@ -1128,6 +1129,10 @@ defmodule Ferricstore.Raft.StateMachine do
       path = prob_path(state, key, "topk")
       NIF.topk_file_incrby_v2(path, pairs)
     end)
+  end
+
+  def apply(meta, {:tx_execute, queue, sandbox_namespace}, state) when is_list(queue) do
+    apply_pending_with_time(meta, state, fn -> do_tx_execute(state, queue, sandbox_namespace) end)
   end
 
   # -- Flow --
@@ -3975,6 +3980,12 @@ defmodule Ferricstore.Raft.StateMachine do
   # Private: command execution
   # ---------------------------------------------------------------------------
 
+  defp do_tx_execute(state, queue, sandbox_namespace) do
+    case ShardTransaction.handle_tx_execute(queue, sandbox_namespace, state) do
+      {:reply, results, _state} -> results
+    end
+  end
+
   # 3-tuple async clauses (current shape, with origin node tag).
   #
   # Origin node decides skip vs apply: each peer compares the embedded
@@ -4345,6 +4356,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:ratelimit_add, key, window_ms, max, count, now_ms}) do
     do_ratelimit_add(state, key, window_ms, max, count, now_ms)
+  end
+
+  defp apply_single(state, {:tx_execute, queue, sandbox_namespace}) when is_list(queue) do
+    do_tx_execute(state, queue, sandbox_namespace)
   end
 
   defp apply_single(state, {:locked_put, key, value, expire_at_ms, owner_ref}) do

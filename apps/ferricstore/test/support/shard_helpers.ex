@@ -89,7 +89,7 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     shard_count = shard_count()
     flush_timeout = 30_000
-    ready_timeout = min(flush_timeout, 10_000)
+    ready_timeout = flush_timeout
 
     # Flush background BitcaskWriter so deferred writes are on disk
     # before we snapshot keys for deletion.

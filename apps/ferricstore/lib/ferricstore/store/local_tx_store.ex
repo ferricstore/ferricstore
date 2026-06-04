@@ -20,19 +20,22 @@ defmodule Ferricstore.Store.LocalTxStore do
 
   @doc "Creates a LocalTxStore from shard state."
   def new(state) do
+    shard_index = Map.get(state, :index) || Map.fetch!(state, :shard_index)
+    keydir = Map.get(state, :keydir) || Map.fetch!(state, :ets)
+
     %__MODULE__{
-      instance_ctx: state.instance_ctx,
-      shard_index: state.index,
+      instance_ctx: Map.fetch!(state, :instance_ctx),
+      shard_index: shard_index,
       shard_state: %{
-        instance_ctx: state.instance_ctx,
-        keydir: state.keydir,
-        index: state.index,
-        shard_data_path: state.shard_data_path,
-        data_dir: state.data_dir,
-        promoted_instances: state.promoted_instances,
-        zset_score_index: state.zset_score_index,
-        zset_score_lookup: state.zset_score_lookup,
-        zset_index_ready: state.zset_index_ready
+        instance_ctx: Map.fetch!(state, :instance_ctx),
+        keydir: keydir,
+        index: shard_index,
+        shard_data_path: Map.fetch!(state, :shard_data_path),
+        data_dir: Map.fetch!(state, :data_dir),
+        promoted_instances: Map.get(state, :promoted_instances, %{}),
+        zset_score_index: Map.get(state, :zset_score_index),
+        zset_score_lookup: Map.get(state, :zset_score_lookup),
+        zset_index_ready: Map.get(state, :zset_index_ready)
       }
     }
   end

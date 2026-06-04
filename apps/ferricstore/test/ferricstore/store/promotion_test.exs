@@ -234,13 +234,16 @@ defmodule Ferricstore.Store.PromotionTest do
   defp promoted_state(shard, redis_key, attempts) when attempts > 0 do
     state = :sys.get_state(shard)
 
-    case state.promoted_instances[redis_key] do
+    case state.promoted_instances[redis_key] || ShardCompound.promoted_store(state, redis_key) do
       nil ->
         Process.sleep(20)
         promoted_state(shard, redis_key, attempts - 1)
 
-      promoted_instance ->
+      %{path: _path} = promoted_instance ->
         {state, promoted_instance}
+
+      path when is_binary(path) ->
+        {state, %{path: path}}
     end
   end
 
