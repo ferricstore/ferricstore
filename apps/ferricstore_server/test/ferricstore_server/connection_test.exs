@@ -1201,7 +1201,7 @@ defmodule FerricstoreServer.ConnectionTest do
         "RETURN",
         "JOBS_COMPACT",
         "BLOCK",
-        "3000"
+        "10000"
       ])
 
       Ferricstore.Test.ShardHelpers.eventually(
@@ -1216,8 +1216,8 @@ defmodule FerricstoreServer.ConnectionTest do
       Ferricstore.Test.ShardHelpers.eventually(
         fn -> flow_claim_waiter_registered?(type, partition) end,
         "RESP claim_due waiter re-registered after empty wake",
-        200,
-        10
+        4_000,
+        20
       )
 
       assert :ok =

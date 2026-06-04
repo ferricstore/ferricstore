@@ -15876,7 +15876,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_state_keys_present_hot_only(state, keys) do
-    Enum.map(keys, &flow_state_key_present_hot?(state, &1))
+    flow_state_keys_present(state, keys)
   end
 
   defp flow_state_key_present?(state, key) do
@@ -15885,9 +15885,10 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_state_key_present_hot?(state, key) do
-    case ets_lookup(state, key) do
-      {:hit, value, _expire_at_ms} when is_binary(value) -> true
-      _ -> false
+    case flow_read_state_record_status(state, key) do
+      {:record, _record} -> true
+      :expired -> false
+      :miss -> false
     end
   end
 
