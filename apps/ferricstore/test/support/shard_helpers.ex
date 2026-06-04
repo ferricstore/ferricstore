@@ -293,7 +293,10 @@ defmodule Ferricstore.Test.ShardHelpers do
   user keys.
   """
   @spec wait_default_pipeline_ready(non_neg_integer()) :: :ok
-  def wait_default_pipeline_ready(timeout_ms \\ 60_000), do: wait_default_waraft_ready(timeout_ms)
+  def wait_default_pipeline_ready(timeout_ms \\ 60_000) do
+    ensure_default_waraft_started()
+    wait_default_waraft_ready(timeout_ms)
+  end
 
   defp reset_keydir_binary_counters(%{keydir_binary_bytes: ref}, shard_count)
        when is_reference(ref) do
