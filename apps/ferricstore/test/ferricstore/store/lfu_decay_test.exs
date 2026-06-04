@@ -29,6 +29,38 @@ defmodule Ferricstore.Store.LFUDecayTest do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
   end
 
+  defp setup_router_backed_test(_context) do
+    neutralize_memory_guard()
+    flush_all_keys()
+
+    on_exit(fn ->
+      neutralize_memory_guard()
+      Ferricstore.Test.ShardHelpers.wait_shards_alive()
+    end)
+
+    :ok
+  end
+
+  defp neutralize_memory_guard do
+    try do
+      FerricStore.Instance.inject_callbacks(:default, process_rss_fn: nil)
+
+      Ferricstore.MemoryGuard.reconfigure(%{
+        max_memory_bytes: 1_073_741_824,
+        keydir_max_ram: 64 * 1024 * 1024,
+        hot_cache_min_ram: 0,
+        hot_cache_max_ram: :auto,
+        eviction_policy: :volatile_lru
+      })
+
+      Ferricstore.MemoryGuard.reset_pressure_flags()
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
+
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
   defp keydir_lookup(key) do
@@ -38,14 +70,6 @@ defmodule Ferricstore.Store.LFUDecayTest do
   defp get_packed_lfu(key) do
     [{_, _, _, packed, _, _, _}] = keydir_lookup(key)
     packed
-  end
-
-  setup do
-    flush_all_keys()
-    on_exit(fn ->
-      Ferricstore.Test.ShardHelpers.wait_shards_alive()
-    end)
-    :ok
   end
 
   # =========================================================================
@@ -109,7 +133,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
     test "decays counter based on elapsed minutes" do
       # ldt 10 minutes ago, counter=50, decay_time=1 -> effective = 50 - 10 = 40
-      old_ldt = (LFU.now_minutes() - 10) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 10 &&& 0xFFFF
       packed = LFU.pack(old_ldt, 50)
 
       decay_time = Application.get_env(:ferricstore, :lfu_decay_time, 1)
@@ -123,7 +147,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
     test "counter doesn't go below 0 after decay" do
       # ldt 300 minutes ago, counter=5 -> effective = max(0, 5 - 300) = 0
-      old_ldt = (LFU.now_minutes() - 300) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 300 &&& 0xFFFF
       packed = LFU.pack(old_ldt, 5)
       assert LFU.effective_counter(packed) >= 0
     end
@@ -134,7 +158,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       LFU.init_config_cache()
 
       try do
-        old_ldt = (LFU.now_minutes() - 100) &&& 0xFFFF
+        old_ldt = LFU.now_minutes() - 100 &&& 0xFFFF
         packed = LFU.pack(old_ldt, 200)
         assert LFU.effective_counter(packed) == 200
       after
@@ -149,6 +173,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
   # =========================================================================
 
   describe "packed LFU in keydir" do
+    setup :setup_router_backed_test
+
     test "new key starts with packed LFU (counter=5, current ldt)" do
       Router.put(FerricStore.Instance.get(:default), "lfu_packed_new", "val")
       drain_all()
@@ -158,6 +184,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
       assert counter == 5, "new keys must start at counter 5, got #{counter}"
       now_min = LFU.now_minutes()
+
       assert LFU.elapsed_minutes(now_min, ldt) <= 1,
              "ldt should be approximately now"
     end
@@ -215,13 +242,15 @@ defmodule Ferricstore.Store.LFUDecayTest do
   # =========================================================================
 
   describe "time-based decay" do
+    setup :setup_router_backed_test
+
     test "key with old ldt gets counter decayed on access" do
       Router.put(FerricStore.Instance.get(:default), "lfu_decay_access", "val")
       drain_all()
 
       # Simulate a key that was last touched 20 minutes ago with counter=50
       keydir = keydir_for("lfu_decay_access")
-      old_ldt = (LFU.now_minutes() - 20) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 20 &&& 0xFFFF
       :ets.update_element(keydir, "lfu_decay_access", {4, LFU.pack(old_ldt, 50)})
 
       # Read the key -- this triggers lfu_touch which decays first
@@ -236,14 +265,17 @@ defmodule Ferricstore.Store.LFUDecayTest do
         # After 20 minutes with decay_time=1, counter should decay by ~20
         # Then probabilistic increment may add 1
         expected_decayed = max(0, 50 - div(20, decay_time))
+
         assert counter <= expected_decayed + 1,
                "counter should be at most #{expected_decayed + 1} after decay+increment, got #{counter}"
+
         assert counter >= expected_decayed,
                "counter should be at least #{expected_decayed} after decay, got #{counter}"
       end
 
       # ldt should be updated to approximately now
       now_min = LFU.now_minutes()
+
       assert LFU.elapsed_minutes(now_min, ldt) <= 1,
              "ldt should be updated to current time"
     end
@@ -254,7 +286,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
       # Simulate a key last touched 500 minutes ago with counter=10
       keydir = keydir_for("lfu_decay_zero")
-      old_ldt = (LFU.now_minutes() - 500) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 500 &&& 0xFFFF
       :ets.update_element(keydir, "lfu_decay_zero", {4, LFU.pack(old_ldt, 10)})
 
       # Read the key
@@ -302,7 +334,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
         # Simulate old ldt with high counter
         keydir = keydir_for(key)
-        old_ldt = (LFU.now_minutes() - 100) &&& 0xFFFF
+        old_ldt = LFU.now_minutes() - 100 &&& 0xFFFF
         :ets.update_element(keydir, key, {4, LFU.pack(old_ldt, 200)})
 
         # Read the key — with decay=0, counter should not decrease
@@ -363,6 +395,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
   # =========================================================================
 
   describe "eviction uses effective (decayed) counter" do
+    setup :setup_router_backed_test
+
     test "recently-accessed key has higher effective counter than stale key" do
       Router.put(FerricStore.Instance.get(:default), "evict_recent", "val")
       Router.put(FerricStore.Instance.get(:default), "evict_stale", "val")
@@ -370,7 +404,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
       # Set stale key to old ldt with high raw counter
       keydir_stale = keydir_for("evict_stale")
-      old_ldt = (LFU.now_minutes() - 100) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 100 &&& 0xFFFF
       :ets.update_element(keydir_stale, "evict_stale", {4, LFU.pack(old_ldt, 50)})
 
       # Set recent key to current ldt with moderate counter
@@ -394,7 +428,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       # Old key: ldt 30 minutes ago
       # New key: ldt now
       keydir_old = keydir_for("eff_old")
-      old_ldt = (LFU.now_minutes() - 30) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 30 &&& 0xFFFF
       :ets.update_element(keydir_old, "eff_old", {4, LFU.pack(old_ldt, 40)})
 
       keydir_new = keydir_for("eff_new")
@@ -417,6 +451,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
   # =========================================================================
 
   describe "OBJECT FREQ returns effective counter" do
+    setup :setup_router_backed_test
+
     test "returns decayed counter for existing key" do
       Router.put(FerricStore.Instance.get(:default), "freq_key", "val")
       drain_all()
@@ -441,7 +477,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
       # Set counter to 100 with ldt 50 minutes ago
       keydir = keydir_for("freq_old_key")
-      old_ldt = (LFU.now_minutes() - 50) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 50 &&& 0xFFFF
       :ets.update_element(keydir, "freq_old_key", {4, LFU.pack(old_ldt, 100)})
 
       store = %{
@@ -456,6 +492,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
       if decay_time > 0 do
         expected = max(0, 100 - div(50, decay_time))
+
         assert result == expected,
                "OBJECT FREQ should return decayed counter #{expected}, got #{result}"
       end
@@ -477,6 +514,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
   # =========================================================================
 
   describe "re-warm after eviction resets LFU" do
+    setup :setup_router_backed_test
+
     test "re-warmed key gets fresh LFU (counter=5, current ldt)" do
       Router.put(FerricStore.Instance.get(:default), "rewarm_lfu", "val")
       drain_all()
@@ -494,17 +533,23 @@ defmodule Ferricstore.Store.LFUDecayTest do
       # Re-warm by reading
       Router.get(FerricStore.Instance.get(:default), "rewarm_lfu")
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        packed = get_packed_lfu("rewarm_lfu")
-        {_ldt, counter} = LFU.unpack(packed)
-        counter == 5
-      end, "re-warmed key should reset to counter=5", 20, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          packed = get_packed_lfu("rewarm_lfu")
+          {_ldt, counter} = LFU.unpack(packed)
+          counter == 5
+        end,
+        "re-warmed key should reset to counter=5",
+        20,
+        50
+      )
 
       packed = get_packed_lfu("rewarm_lfu")
       {ldt, counter} = LFU.unpack(packed)
 
       assert counter == 5, "re-warmed key should reset to counter=5, got #{counter}"
       now_min = LFU.now_minutes()
+
       assert LFU.elapsed_minutes(now_min, ldt) <= 1,
              "re-warmed key should have current ldt"
     end
