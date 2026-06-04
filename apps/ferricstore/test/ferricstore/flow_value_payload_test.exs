@@ -207,11 +207,11 @@ defmodule Ferricstore.FlowValuePayloadTest do
                fencing_token: claimed.fencing_token
              )
 
-    Process.sleep(40)
+    wait_terminal_removed!(id, "tenant-retention")
+    assert {:ok, [%{large: large_blob_after_terminal_expiry}]} =
+             FerricStore.flow_value_mget([created.payload_ref])
 
-    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert {:ok, value_blob_after_terminal_expiry} = FerricStore.get(created.payload_ref)
-    assert is_binary(value_blob_after_terminal_expiry)
+    assert large_blob_after_terminal_expiry == String.duplicate("x", 256)
   end
 
   test "cancel terminal retention does not materialize existing generated payload value refs" do
@@ -237,11 +237,11 @@ defmodule Ferricstore.FlowValuePayloadTest do
                fencing_token: created.fencing_token
              )
 
-    Process.sleep(150)
+    wait_terminal_removed!(id, "tenant-retention")
+    assert {:ok, [%{large: large_blob_after_terminal_expiry}]} =
+             FerricStore.flow_value_mget([created.payload_ref])
 
-    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert {:ok, value_blob_after_terminal_expiry} = FerricStore.get(created.payload_ref)
-    assert is_binary(value_blob_after_terminal_expiry)
+    assert large_blob_after_terminal_expiry == String.duplicate("x", 256)
   end
 
   test "cancel rejects public reason_ref input without touching external value" do
@@ -307,9 +307,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert fetched.error == reason
 
-    Process.sleep(150)
-
-    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    wait_terminal_removed!(id, "tenant-retention")
     assert {:ok, nil} = FerricStore.get(cancelled.error_ref)
   end
 
@@ -494,8 +492,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert fetched.state == created.state
     assert fetched.payload == %{large: String.duplicate("x", 256)}
-    assert {:ok, value_blob} = FerricStore.get(created.payload_ref)
-    assert is_binary(value_blob)
+    assert {:ok, [%{large: large_blob}]} = FerricStore.flow_value_mget([created.payload_ref])
+    assert large_blob == String.duplicate("x", 256)
   end
 
   test "batch APIs also persist full value fields" do
@@ -654,6 +652,19 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert value_events["claimed"]["payload"] == %{input: 1}
     assert value_events["completed"]["payload"] == %{input: 1}
     assert value_events["completed"]["result"] == %{output: 2}
+  end
+
+  defp wait_terminal_removed!(id, partition_key) do
+    Process.sleep(150)
+    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
+    assert cleaned.flows >= 0
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> match?({:ok, nil}, FerricStore.flow_get(id, partition_key: partition_key)) end,
+      "terminal flow #{inspect(id)} should be removed by retention",
+      1_000,
+      10
+    )
   end
 
   defp unique_id(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"

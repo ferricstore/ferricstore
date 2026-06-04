@@ -327,7 +327,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # WATCH: capture value hash
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # Within MULTI, queue SET NX (will fail since key exists)
@@ -356,7 +356,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key_a, "original", 0)
 
       # Client A: WATCH key_a (snapshot value hash)
-      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
+      hash_a = watch_token(key_a)
 
       # Client B: cross-shard MULTI with SET NX on key_a (fails) + SET key_b
       client_b_queue = [
@@ -367,8 +367,8 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
 
       # Client A: value hash should be unchanged since key_a was not modified.
       # With value-hash WATCH, the cross-shard WriteVersion.increment is
-      # irrelevant -- we compare phash2(value) not shard versions.
-      hash_a_after = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
+      # irrelevant -- we compare the watched key token, not shard versions.
+      hash_a_after = watch_token(key_a)
 
       assert hash_a == hash_a_after,
              "R2-H13: value hash should be unchanged after NX skip"
@@ -384,6 +384,8 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       assert Router.get(FerricStore.Instance.get(:default), key_a) == "updated_by_a"
     end
   end
+
+  defp watch_token(key), do: Router.watch_token(FerricStore.Instance.get(:default), key)
 
   # ---------------------------------------------------------------------------
   # Helper: build a real store map for direct handler invocation

@@ -6377,7 +6377,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_create_non_idempotent_many_prepare(state, attrs_list, key_infos) do
     keys = Enum.map(key_infos, & &1.state_key)
 
-    if Enum.any?(flow_state_keys_present_hot_only(state, keys), & &1) do
+    if Enum.any?(flow_state_keys_present(state, keys), & &1) do
       {:error, "ERR flow already exists"}
     else
       attrs_list
@@ -15833,10 +15833,6 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_state_key_present?(state, key) do
     [present?] = flow_state_keys_present(state, [key])
     present?
-  end
-
-  defp flow_state_keys_present_hot_only(state, keys) do
-    Enum.map(keys, &flow_state_key_present_hot?(state, &1))
   end
 
   defp flow_state_key_present_hot?(state, key) do

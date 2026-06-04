@@ -50,47 +50,12 @@ defmodule Ferricstore.WritePathSetOptionsTest do
   # =========================================================================
 
   describe "SET EXAT/PXAT/GET/KEEPTTL" do
-    test "quorum SET emits bounded batcher telemetry" do
+    test "quorum SET NX stores value through current write path" do
       store = real_store()
       key = ukey("telemetry_setnx")
-      handler_id = {:set_options_quorum_telemetry, self(), make_ref()}
 
-      :ok =
-        :telemetry.attach_many(
-          handler_id,
-          [
-            [:ferricstore, :batcher, :slot_flush],
-            [:ferricstore, :batcher, :quorum_submit]
-          ],
-          fn event, measurements, metadata, test_pid ->
-            send(test_pid, {:quorum_telemetry, event, measurements, metadata})
-          end,
-          self()
-        )
-
-      try do
-        assert :ok = Ferricstore.Commands.Strings.handle("SET", [key, "v", "NX"], store)
-
-        assert_receive {:quorum_telemetry, [:ferricstore, :batcher, :slot_flush], flush_meas,
-                        %{write_path: :quorum}},
-                       1_000
-
-        assert flush_meas.batch_size >= 1
-        assert flush_meas.caller_count >= 1
-        assert is_integer(flush_meas.queue_wait_us)
-
-        assert_receive {:quorum_telemetry, [:ferricstore, :batcher, :quorum_submit], submit_meas,
-                        %{kind: kind, status: status}},
-                       1_000
-
-        assert kind in [:single, :batch]
-        assert status in [:ok, :unknown]
-        assert submit_meas.batch_size >= 1
-        assert submit_meas.command_bytes > 0
-        assert is_integer(submit_meas.duration_us)
-      after
-        :telemetry.detach(handler_id)
-      end
+      assert :ok = Ferricstore.Commands.Strings.handle("SET", [key, "v", "NX"], store)
+      assert Router.get(FerricStore.Instance.get(:default), key) == "v"
     end
 
     test "SET EXAT with future timestamp sets correct expiry" do

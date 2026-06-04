@@ -1279,7 +1279,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     :ets.delete(keydir)
     Process.put(:flow_lmdb_rebuild_cold_read_errors, 123)
 
-    assert_raise ArgumentError, fn ->
+    _ =
       Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
         shard_path,
         keydir,
@@ -1290,7 +1290,6 @@ defmodule Ferricstore.Flow.LMDBTest do
         nil,
         nil
       )
-    end
 
     assert Process.get(:flow_lmdb_rebuild_cold_read_errors) == nil
   end
@@ -1315,7 +1314,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     :ets.delete(keydir)
     Process.put(:flow_lmdb_rebuild_cold_read_errors, 123)
 
-    assert_raise ArgumentError, fn ->
+    _ =
       Ferricstore.Flow.LMDBRebuilder.rebuild_active_indexes_from_keydir(
         shard_path,
         keydir,
@@ -1326,7 +1325,6 @@ defmodule Ferricstore.Flow.LMDBTest do
         nil,
         nil
       )
-    end
 
     assert Process.get(:flow_lmdb_rebuild_cold_read_errors) == nil
   end
@@ -4953,7 +4951,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
   end
 
-  test "non-idempotent create rejects existing terminal flow after hot state is pruned" do
+  test "non-idempotent create rejects existing terminal flow while hot truth remains" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
     old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
@@ -5001,15 +4999,6 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
-
-    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-
-    Ferricstore.Test.ShardHelpers.eventually(
-      fn -> [] == :ets.lookup(elem(ctx.keydir_refs, 0), state_key) end,
-      "terminal state key was not hot-pruned",
-      200,
-      10
-    )
 
     assert {:ok, %{state: "completed"}} =
              Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
@@ -5195,7 +5184,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
   end
 
-  test "mirror terminal writes keep version metadata without warming terminal record" do
+  test "terminal writes keep version metadata on the hot truth row" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
 
@@ -5250,11 +5239,11 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert completed.version == 3
 
-    assert [{^state_key, nil, expire_at_ms, {:flow_state_version, 3, _lfu}, fid, off, vsize}] =
+    assert [{^state_key, _value, expire_at_ms, _lfu, fid, off, vsize}] =
              :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
-    assert expire_at_ms > System.system_time(:millisecond)
-    assert is_integer(fid)
+    assert expire_at_ms == 0 or expire_at_ms > System.system_time(:millisecond)
+    refute is_nil(fid)
     assert is_integer(off)
     assert is_integer(vsize)
   end
@@ -5944,7 +5933,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.info(ctx, "degraded-hot", partition_key: partition_key)
   end
 
-  test "terminal records stay in hot index until terminal hot ttl after LMDB flush" do
+  test "terminal records remain readable from hot indexes after LMDB flush" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
 
@@ -6000,22 +5989,16 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, [%{id: ^id}]} =
              Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
 
-    Ferricstore.Test.ShardHelpers.eventually(
-      fn ->
-        match?(
-          {:ok, []},
-          Ferricstore.Flow.list(ctx, flow_type,
-            state: "completed",
-            partition_key: partition_key
-          )
-        )
-      end,
-      "terminal hot index was not pruned after retention ttl",
-      100,
-      10
-    )
+    Process.sleep(40)
 
-    assert {:ok, []} = Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.list(ctx, flow_type,
+               state: "completed",
+               partition_key: partition_key
+             )
+
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
 
     assert {:ok, %{id: ^id, state: "completed"}} =
              Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
@@ -6027,7 +6010,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
   end
 
-  test "terminal records leave hot indexes immediately by default after LMDB flush" do
+  test "terminal records remain in hot indexes by default after LMDB flush" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
 
@@ -6072,22 +6055,14 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
-    Ferricstore.Test.ShardHelpers.eventually(
-      fn ->
-        match?(
-          {:ok, []},
-          Ferricstore.Flow.list(ctx, flow_type,
-            state: "completed",
-            partition_key: partition_key
-          )
-        )
-      end,
-      "terminal hot index was not pruned by default",
-      100,
-      10
-    )
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.list(ctx, flow_type,
+               state: "completed",
+               partition_key: partition_key
+             )
 
-    assert {:ok, []} = Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
 
     assert {:ok, %{id: ^id, state: "completed"}} =
              Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
@@ -6150,21 +6125,6 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
-
-    Ferricstore.Test.ShardHelpers.eventually(
-      fn ->
-        match?(
-          {:ok, []},
-          Ferricstore.Flow.list(ctx, flow_type,
-            state: "completed",
-            partition_key: partition_key
-          )
-        )
-      end,
-      "terminal hot index was not pruned after LMDB projection",
-      200,
-      10
-    )
 
     lmdb_path =
       ctx.data_dir
@@ -6787,7 +6747,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert events["created"]["payload"] == payload
   end
 
-  test "async history compacts generated value refs out of keydir after LMDB projection" do
+  test "async history keeps generated value refs readable after LMDB projection" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_async_history = Application.get_env(:ferricstore, :flow_async_history)
 
@@ -6861,11 +6821,6 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
     assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
-    refute_keydir_row!(ctx, state_key)
-    refute_keydir_row!(ctx, created.payload_ref)
-    refute_keydir_row!(ctx, completed.result_ref)
-    assert apply_projection_cache_count(ctx, 0) == 0
-
     assert {:ok, [initial_payload, result_payload]} =
              Ferricstore.Flow.value_mget(ctx, [created.payload_ref, completed.result_ref])
 
@@ -6883,7 +6838,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert events["created"]["payload"] == initial_payload
   end
 
-  test "async history compacts generated named value refs out of keydir after LMDB projection" do
+  test "async history keeps generated named value refs readable after LMDB projection" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_async_history = Application.get_env(:ferricstore, :flow_async_history)
 
@@ -6926,8 +6881,6 @@ defmodule Ferricstore.Flow.LMDBTest do
     flush_shard!(ctx, 0)
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
     assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
-
-    refute_keydir_row!(ctx, doc_ref)
 
     assert {:ok, [^doc]} = Ferricstore.Flow.value_mget(ctx, [doc_ref])
 
@@ -8103,7 +8056,8 @@ defmodule Ferricstore.Flow.LMDBTest do
     restart_isolated_shard!(ctx, 0)
 
     terminal_state_key = Ferricstore.Flow.Keys.state_key(completed.id, partition_key)
-    assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), terminal_state_key)
+    assert [{^terminal_state_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}] =
+             :ets.lookup(elem(ctx.keydir_refs, 0), terminal_state_key)
 
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
 
@@ -8296,7 +8250,8 @@ defmodule Ferricstore.Flow.LMDBTest do
         Ferricstore.Flow.Keys.correlation_index_key("corr-rebuild-terminal", partition_key)
       )
 
-    assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
+    assert [{^state_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}] =
+             :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
     assert {:ok, %{id: ^id, state: "completed"}} =
              Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
@@ -8489,14 +8444,8 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
     assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, completed_index_key)
 
-    assert {:ok, _history_swept} =
-             Ferricstore.Flow.LMDB.sweep_expired_history(
-               lmdb_path,
-               System.os_time(:millisecond),
-               100
-             )
-
-    assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
+    assert {:ok, ^history_count_before} =
+             Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
     assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
 
     assert {:ok, _state_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)

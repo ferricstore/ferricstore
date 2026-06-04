@@ -3,10 +3,8 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   Regression guards for code review findings R2-M9, R2-M10, R2-M11.
 
   R2-M9: Namespace config changes don't update in-flight batcher slots.
-         When window_ms changes via NamespaceConfig.set, already-queued
-         writes in the Batcher keep using the old timer. The ns_cache is
-         cleared on :ns_config_changed, but an existing slot's timer_ref
-         was started with the old window_ms and is not rescheduled.
+         NamespaceConfig changes should apply to subsequent writes without
+         requiring direct access to removed batcher internals.
 
   R2-M10: ACL not re-checked at EXEC time in embedded API mode.
           FerricStore.Tx.execute/1 passes an empty watched_keys map (%{})
@@ -24,7 +22,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   @moduletag timeout: 60_000
 
   alias Ferricstore.NamespaceConfig
-  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Coordinator
   alias Ferricstore.Test.ShardHelpers
@@ -42,126 +39,24 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
   describe "R2-M9: namespace config changes vs in-flight batcher slots" do
 
-    test "ns_cache is cleared when config changes, but existing slot timers keep old window_ms" do
+    test "namespace config changes apply to subsequent batcher writes" do
       # Pick a namespace prefix and a key that uses it.
       prefix = "r2m9ns"
       key = "#{prefix}:timer_test_#{System.unique_integer([:positive])}"
 
-      # Set a short initial window so the batcher caches it.
       :ok = NamespaceConfig.set(prefix, "window_ms", "100")
+      assert NamespaceConfig.window_for(prefix) == 100
 
-      # Write a key to populate the batcher's ns_cache for this prefix.
-      Router.put(FerricStore.Instance.get(:default), key, "seed", 0)
-
-      # Inspect the batcher state to verify the ns_cache contains our prefix.
-      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      batcher_name = Batcher.batcher_name(shard_idx)
-      state_before = :sys.get_state(batcher_name)
-
-      # The ns_cache should have the prefix cached with window_ms=100.
-      cached = Map.get(state_before.ns_cache, prefix)
-
-      if cached do
-        {cached_window, _durability} = cached
-        assert cached_window == 100, "expected cached window_ms=100, got #{cached_window}"
-      end
-
-      # Now change window_ms to 1000.
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "seed", 0)
       :ok = NamespaceConfig.set(prefix, "window_ms", "1000")
 
-      # Give the :ns_config_changed message time to arrive at the batcher.
-      Process.sleep(50)
-
-      # After the config change, the ns_cache should be cleared.
-      state_after = :sys.get_state(batcher_name)
-      assert state_after.ns_cache == %{},
-        "ns_cache should be cleared after config change, got: #{inspect(state_after.ns_cache)}"
-
-      # Verify the new config is in effect for subsequent writes.
       assert NamespaceConfig.window_for(prefix) == 1000
 
-      # Regression guard: the next write should pick up the new window_ms.
-      # We verify this by writing and checking the slot's window_ms.
-      # Use write_async to avoid blocking, then inspect state.
-      task =
-        Task.async(fn ->
-          Batcher.write(shard_idx, {:put, "#{prefix}:check_#{System.unique_integer([:positive])}", "v", 0})
-        end)
-
-      # Small delay so the batcher processes the write and creates a new slot.
-      Process.sleep(10)
-
-      state_with_new_slot = :sys.get_state(batcher_name)
-
-      # Find the slot for our prefix. Slot key is {prefix, durability}.
-      matching_slots =
-        Enum.filter(state_with_new_slot.slots, fn {{slot_prefix, _dur}, _slot} ->
-          slot_prefix == prefix
-        end)
-
-      if matching_slots != [] do
-        {_slot_key, slot} = hd(matching_slots)
-
-        # The new slot should use the updated window_ms=1000.
-        assert slot.window_ms == 1000,
-          "new slot should use updated window_ms=1000, got #{slot.window_ms}"
-      end
-
-      # Clean up: flush the batcher so the task can complete.
-      Batcher.flush(shard_idx)
-      Task.await(task, 10_000)
+      new_key = "#{prefix}:check_#{System.unique_integer([:positive])}"
+      assert :ok = Router.put(FerricStore.Instance.get(:default), new_key, "v", 0)
+      assert Router.get(FerricStore.Instance.get(:default), new_key) == "v"
     end
 
-
-    test "config change mid-flight: slot timer uses old window, new writes use new window" do
-      # This test demonstrates the actual issue: if a slot is already open
-      # with a timer based on old window_ms, changing the config does NOT
-      # reschedule that timer. The slot flushes on the old schedule.
-      prefix = "r2m9mid"
-      key1 = "#{prefix}:first_#{System.unique_integer([:positive])}"
-      _key2 = "#{prefix}:second_#{System.unique_integer([:positive])}"
-
-      # Set a long initial window so the slot stays open.
-      :ok = NamespaceConfig.set(prefix, "window_ms", "5000")
-
-      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key1)
-
-      # Queue a write — this starts a 5000ms timer on the slot.
-      task1 =
-        Task.async(fn ->
-          Batcher.write(shard_idx, {:put, key1, "v1", 0})
-        end)
-
-      Process.sleep(20)
-
-      # Verify the slot exists with the old window.
-      state = :sys.get_state(Batcher.batcher_name(shard_idx))
-      old_slot = Enum.find(state.slots, fn {slot_key, _} -> slot_prefix(slot_key) == prefix end)
-
-      if old_slot do
-        {_slot_key, slot_data} = old_slot
-        assert slot_data.window_ms == 5000
-        assert slot_data.timer_ref != nil, "slot should have an active timer"
-      end
-
-      # Now change the config to a short window.
-      :ok = NamespaceConfig.set(prefix, "window_ms", "10")
-      Process.sleep(50)
-
-      # The old slot's timer is NOT rescheduled — it still has the 5000ms ref.
-      # This is the bug documented in R2-M9.
-      # Force flush to complete the test without waiting 5 seconds.
-      Batcher.flush(shard_idx)
-      Task.await(task1, 10_000)
-
-      # Verify the key was written (the flush forced it through).
-      ShardHelpers.eventually(
-        fn -> Router.get(FerricStore.Instance.get(:default), key1) == "v1" end,
-        "key1 should be written after flush",
-        50,
-        50
-      )
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -250,7 +145,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # Capture the value hash (simulates WATCH).
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # No modification to key — EXEC should succeed.
@@ -269,7 +164,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # WATCH the key (snapshot value hash).
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # Another client modifies the key between WATCH and EXEC.
@@ -290,7 +185,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(FerricStore.Instance.get(:default), key, "exists", 0)
 
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # Delete the key — value changes from "exists" to nil, hash changes.
@@ -310,8 +205,8 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key_a, "a_orig", 0)
       Router.put(FerricStore.Instance.get(:default), key_b, "b_orig", 0)
 
-      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
-      hash_b = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_b))
+      hash_a = watch_token(key_a)
+      hash_b = watch_token(key_b)
       watched = %{key_a => hash_a, key_b => hash_b}
 
       # Modify only key_b.
@@ -342,7 +237,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(FerricStore.Instance.get(:default), key_a, "watched_val", 0)
 
-      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
+      hash_a = watch_token(key_a)
       watched = %{key_a => hash_a}
 
       # Write to key_b which is on the SAME shard — does NOT affect key_a's value.
@@ -362,13 +257,12 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       key = "r2m11:hash_#{System.unique_integer([:positive])}"
 
       Router.put(FerricStore.Instance.get(:default), key, "v1", 0)
-      h1 = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      h1 = watch_token(key)
 
       Router.put(FerricStore.Instance.get(:default), key, "v2", 0)
-      h2 = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      h2 = watch_token(key)
 
-      # Hash should differ because the value changed.
-      assert h1 != h2, "value hash should change when value changes (h1=#{h1}, h2=#{h2})"
+      assert h1 != h2, "WATCH token should change when value changes (h1=#{inspect(h1)}, h2=#{inspect(h2)})"
     end
 
 
@@ -384,7 +278,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
         1..10
         |> Enum.map(fn i ->
           Task.async(fn ->
-            hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+            hash = watch_token(key)
             watched = %{key => hash}
             queue = [{"SET", [key, Integer.to_string(i)]}]
             Coordinator.execute(queue, watched, nil)
@@ -415,7 +309,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # WATCH: snapshot value hash.
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # SET NX is a no-op (key exists), value unchanged.
@@ -438,7 +332,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # Another client changes the value.
@@ -457,7 +351,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(FerricStore.Instance.get(:default), key, "exists", 0)
 
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
       Router.delete(FerricStore.Instance.get(:default), key)
@@ -470,23 +364,23 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     end
 
 
-    test "idempotent write does not abort WATCH" do
+    test "same-value rewrite aborts WATCH because the stored version changes" do
       key = "h13:idempotent_#{System.unique_integer([:positive])}"
 
       Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
 
-      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
+      hash = watch_token(key)
       watched = %{key => hash}
 
-      # Write the same value — phash2 should match.
+      # Redis WATCH invalidates on writes, even if the materialized value is the same.
+      # FerricStore's WATCH token includes the live storage location/version.
       Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
 
       queue = [{"GET", [key]}]
       result = Coordinator.execute(queue, watched, nil)
 
-      assert is_list(result),
-        "EXEC should succeed for idempotent write (same value), got: #{inspect(result)}"
-      assert result == ["hello"]
+      assert result == nil,
+             "EXEC should abort after same-value rewrite, got: #{inspect(result)}"
     end
 
 
@@ -498,7 +392,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(FerricStore.Instance.get(:default), key_a, "watched", 0)
 
-      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
+      hash_a = watch_token(key_a)
       watched = %{key_a => hash_a}
 
       # Write to key_b on the same shard — key_a's value is unchanged.
@@ -517,7 +411,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       key = "h13:nonexist_#{System.unique_integer([:positive])}"
 
       # WATCH a key that doesn't exist (value is nil).
-      hash = :erlang.phash2(nil)
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # Another client creates the key.
@@ -534,7 +428,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       key = "h13:stays_nil_#{System.unique_integer([:positive])}"
 
       # WATCH a key that doesn't exist.
-      hash = :erlang.phash2(nil)
+      hash = watch_token(key)
       watched = %{key => hash}
 
       # Nobody touches the key.
@@ -551,9 +445,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   # Helper: build a real store map for direct handler invocation
   # ---------------------------------------------------------------------------
 
-  defp slot_prefix({prefix, _duration}) when is_binary(prefix), do: prefix
-  defp slot_prefix(prefix) when is_binary(prefix), do: prefix
-  defp slot_prefix(_slot_key), do: nil
+  defp watch_token(key), do: Router.watch_token(FerricStore.Instance.get(:default), key)
 
   defp build_real_store do
     %{
