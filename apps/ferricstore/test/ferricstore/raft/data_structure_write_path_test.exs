@@ -18,13 +18,15 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
-    ShardHelpers.wait_shards_alive()
+    ShardHelpers.wait_default_pipeline_ready()
 
     :ok
   end
 
   setup do
-    on_exit(fn -> ShardHelpers.wait_shards_alive() end)
+    ShardHelpers.wait_default_pipeline_ready()
+
+    on_exit(fn -> ShardHelpers.wait_default_pipeline_ready() end)
   end
 
   # ---------------------------------------------------------------------------
