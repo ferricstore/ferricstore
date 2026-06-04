@@ -2173,13 +2173,40 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp raft_apply_hook(%{instance_ctx: %{raft_apply_hook: fun}}) when is_function(fun), do: fun
-
-  defp raft_apply_hook(%{instance_name: name}) when is_atom(name) do
-    raft_apply_hook_for_instance(name)
+  defp raft_apply_hook(%{instance_name: name} = state) when is_atom(name) do
+    case current_raft_apply_hook(name) do
+      {:ok, hook} -> hook
+      :error -> raft_apply_hook_from_ctx(state)
+    end
   end
 
-  defp raft_apply_hook(_state), do: raft_apply_hook_for_instance(:default)
+  defp raft_apply_hook(%{instance_ctx: %{name: name}} = state) when is_atom(name) do
+    case current_raft_apply_hook(name) do
+      {:ok, hook} -> hook
+      :error -> raft_apply_hook_from_ctx(state)
+    end
+  end
+
+  defp raft_apply_hook(state) do
+    raft_apply_hook_from_ctx(state) || raft_apply_hook_for_instance(:default)
+  end
+
+  defp raft_apply_hook_from_ctx(%{instance_ctx: %{raft_apply_hook: fun}}) when is_function(fun),
+    do: fun
+
+  defp raft_apply_hook_from_ctx(_state), do: nil
+
+  defp current_raft_apply_hook(name) do
+    case FerricStore.Instance.get(name) do
+      %{raft_apply_hook: fun} when is_function(fun) -> {:ok, fun}
+      %{} -> {:ok, nil}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
 
   defp raft_apply_hook_for_instance(name) do
     try do

@@ -3,6 +3,7 @@ defmodule Ferricstore.OperationalGuardTest do
 
   alias Ferricstore.Flow.Admission
   alias Ferricstore.OperationalGuard
+  alias Ferricstore.Test.Utils
 
   setup do
     original_env =
@@ -132,7 +133,7 @@ defmodule Ferricstore.OperationalGuardTest do
     )
 
     assert_receive {:memory_pressure, :reject}
-    refute Admission.reject_new_creates?()
+    Utils.eventually(fn -> refute Admission.reject_new_creates?() end, 1_000, 10)
     assert OperationalGuard.reject_writes?()
     refute OperationalGuard.reject_flow_creates?()
   end
