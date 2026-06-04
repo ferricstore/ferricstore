@@ -43,7 +43,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         name: name,
         initial_delay_ms: 60_000,
         interval_ms: 60_000,
-        pressure_interval_ms: 5,
+        pressure_interval_ms: 60_000,
         limit: 5,
         pressure_limit: 20,
         pressure_compaction_interval_ms: 60_000,
