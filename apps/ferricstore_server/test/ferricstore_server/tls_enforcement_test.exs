@@ -11,6 +11,7 @@ defmodule FerricstoreServer.TlsEnforcementTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Acl
   alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------
@@ -63,11 +64,15 @@ defmodule FerricstoreServer.TlsEnforcementTest do
 
   describe "when require_tls is false" do
     setup do
+      Acl.reset!()
+
       # Ensure require_tls is false (the default)
       prev = Application.get_env(:ferricstore, :require_tls)
       Application.put_env(:ferricstore, :require_tls, false)
 
       on_exit(fn ->
+        Acl.reset!()
+
         if prev do
           Application.put_env(:ferricstore, :require_tls, prev)
         else
@@ -102,10 +107,14 @@ defmodule FerricstoreServer.TlsEnforcementTest do
 
   describe "when require_tls is true" do
     setup do
+      Acl.reset!()
+
       prev = Application.get_env(:ferricstore, :require_tls)
       Application.put_env(:ferricstore, :require_tls, true)
 
       on_exit(fn ->
+        Acl.reset!()
+
         if prev do
           Application.put_env(:ferricstore, :require_tls, prev)
         else
