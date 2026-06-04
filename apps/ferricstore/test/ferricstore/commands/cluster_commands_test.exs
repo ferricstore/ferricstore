@@ -10,8 +10,10 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.Cluster
+  alias Ferricstore.Test.ShardHelpers
 
   setup do
+    ShardHelpers.wait_default_pipeline_ready()
     store = Ferricstore.Test.MockStore.make()
     {:ok, store: store}
   end
