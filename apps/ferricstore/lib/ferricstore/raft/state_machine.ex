@@ -17616,7 +17616,7 @@ defmodule Ferricstore.Raft.StateMachine do
       unless standalone_staged_apply?() do
         track_keydir_binary_delta(state, key, value, expire_at_ms)
 
-        :ets.insert(
+        safe_ets_insert(
           state.ets,
           {key, value, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
         )

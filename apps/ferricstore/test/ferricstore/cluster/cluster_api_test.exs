@@ -7,6 +7,11 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
 
   alias Ferricstore.Raft.Cluster
 
+  setup do
+    Ferricstore.Test.ShardHelpers.wait_default_waraft_ready(10_000)
+    :ok
+  end
+
   describe "server ids" do
     test "shard_server_id_on/2 returns the WARaft partition identity" do
       assert Cluster.shard_server_id_on(0, :some_node@host) ==
@@ -74,7 +79,14 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
 
   describe "membership facade" do
     test "adding self as voter returns :ok" do
-      assert :ok = Cluster.add_member(0, Cluster.local_raft_node(), :voter)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          assert :ok = Cluster.add_member(0, Cluster.local_raft_node(), :voter)
+        end,
+        "shard 0 should accept membership changes",
+        20,
+        250
+      )
     end
 
     test "removing a non-member remote node is handled by the facade" do
@@ -83,7 +95,14 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
     end
 
     test "trigger_shard_elections_parallel/2 delegates to WARaft" do
-      assert :ok = Cluster.trigger_shard_elections_parallel(1, timeout: 5_000)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          assert :ok = Cluster.trigger_shard_elections_parallel(1, timeout: 5_000)
+        end,
+        "WARaft election trigger should be available",
+        20,
+        250
+      )
     end
   end
 end
