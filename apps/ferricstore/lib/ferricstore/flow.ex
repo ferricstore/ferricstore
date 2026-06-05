@@ -1582,51 +1582,7 @@ defmodule Ferricstore.Flow do
   def cancel_many(_ctx, _partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
-  def retention_cleanup(ctx, opts \\ [])
-
-  def retention_cleanup(ctx, opts) when is_list(opts) do
-    started = flow_start_time()
-
-    result =
-      with :ok <- validate_opts(opts),
-           {:ok, limit} <- optional_pos_integer(opts, :limit, 100),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-           :ok <- flush_lmdb_before_retention_cleanup(ctx),
-           :ok <- flush_history_before_retention_cleanup(ctx),
-           :ok <- flush_lmdb_before_retention_cleanup(ctx) do
-        Router.flow_retention_cleanup(ctx, %{limit: limit, now_ms: now})
-      end
-
-    FlowTelemetry.observe(:retention_cleanup, started, result, %{flow_id: nil})
-  end
-
-  def retention_cleanup(_ctx, _opts), do: {:error, "ERR flow opts must be a keyword list"}
-
-  defp flush_lmdb_before_retention_cleanup(%{name: name, shard_count: shard_count})
-       when is_atom(name) and is_integer(shard_count) and shard_count >= 0 do
-    case Ferricstore.Flow.LMDBWriter.flush_all(name, shard_count) do
-      :ok -> :ok
-      {:error, :writer_not_started} -> :ok
-      {:error, {:noproc, _}} -> :ok
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp flush_lmdb_before_retention_cleanup(_ctx), do: :ok
-
-  defp flush_history_before_retention_cleanup(%{shard_count: shard_count} = ctx)
-       when is_integer(shard_count) and shard_count >= 0 do
-    Enum.reduce_while(0..max(shard_count - 1, -1)//1, :ok, fn shard_index, :ok ->
-      case Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index, 120_000) do
-        :ok -> {:cont, :ok}
-        {:error, :not_started} -> {:cont, :ok}
-        {:error, {:noproc, _}} -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp flush_history_before_retention_cleanup(_ctx), do: :ok
+  defdelegate retention_cleanup(ctx, opts \\ []), to: Ferricstore.Flow.Retention, as: :cleanup
 
   def rewind(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
