@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.3.7"
+  @version "0.3.8"
 
   def project do
     [
@@ -64,7 +64,6 @@ defmodule Ferricstore.MixProject do
         "native/ferricstore_wal_nif/.cargo",
         "native/ferricstore_wal_nif/src",
         "native/ferricstore_wal_nif/Cargo*",
-        "native/resp_parser_nif/.cargo",
         "native/resp_parser_nif/src",
         "native/resp_parser_nif/Cargo*",
         "checksum-*.exs",
@@ -81,7 +80,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.37", optional: true},
-      {:wa_raft, "~> 0.1", hex: :ferricstore_waraft, manager: :rebar3},
+      {:wa_raft, "~> 0.1", hex: :ferricstore_waraft},
       {:libcluster, "3.3.3"},
       {:libcluster_consul, "1.3.0", optional: true},
       {:libcluster_etcd, "1.1.2", optional: true},

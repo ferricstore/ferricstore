@@ -230,7 +230,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.3.7"}
+{:ferricstore, "~> 0.3.8"}
 ```
 
 ```elixir
