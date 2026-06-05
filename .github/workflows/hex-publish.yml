@@ -3,6 +3,7 @@ name: Publish to Hex.pm
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   MIX_ENV: dev
@@ -50,7 +51,16 @@ jobs:
       - name: Extract version from tag
         if: steps.hex_creds.outputs.available == 'true'
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Hex publish must run from a v* tag ref, got: $GITHUB_REF"
+              exit 1
+              ;;
+          esac
 
       - name: Wait for all precompiled NIF artifacts
         if: steps.hex_creds.outputs.available == 'true'
