@@ -55,7 +55,7 @@ defmodule Ferricstore.MixProject do
   defp package do
     [
       description:
-        "Distributed persistent key-value cache with Redis wire protocol (RESP3), Raft consensus, and Bitcask storage engine.",
+        "FerricFlow durable workflows and queues with Redis-compatible storage, Raft durability, and Bitcask persistence.",
       files: [
         "lib",
         "native/ferricstore_bitcask/.cargo",
