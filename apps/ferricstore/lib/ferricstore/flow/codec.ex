@@ -1,0 +1,1304 @@
+defmodule Ferricstore.Flow.Codec do
+  @moduledoc false
+
+  import Bitwise
+
+  alias Ferricstore.Bitcask.NIF
+
+  @history_tag :flow_history_v1
+  @value_bin_magic "FSV2"
+
+  # Flow records and history are durable bytes. Before Flow is public, keep one
+  # current compact schema and change it directly. Once users can have persisted
+  # Flow data, incompatible field-order/type changes need explicit migration.
+  @record_bin_magic "FSF5"
+  @history_bin_magic "FSH2"
+  @record_value_refs_key "__value_refs__"
+  @history_value_refs_key "value_refs"
+
+  # FSF5 stores only the required mutable state fields inline. Optional fields
+  # are controlled by the flag word below so nil/default values do not repeat on
+  # every state record. Keep this layout in lockstep with the Rust NIF codec.
+  @record_flag_attempts 1 <<< 0
+  @record_flag_fencing_token 1 <<< 1
+  @record_flag_next_run_at_ms 1 <<< 2
+  @record_flag_priority 1 <<< 3
+  @record_flag_ttl_ms 1 <<< 4
+  @record_flag_history_hot_max_events 1 <<< 5
+  @record_flag_history_max_events 1 <<< 6
+  @record_flag_retention_ttl_ms 1 <<< 7
+  @record_flag_terminal_retention_until_ms 1 <<< 8
+  @record_flag_partition_key 1 <<< 9
+  @record_flag_payload_ref 1 <<< 10
+  @record_flag_parent_flow_id 1 <<< 11
+  @record_flag_parent_partition_key 1 <<< 12
+  @record_flag_root_flow_id 1 <<< 13
+  @record_flag_root_flow_id_self 1 <<< 14
+  @record_flag_correlation_id 1 <<< 15
+  @record_flag_result_ref 1 <<< 16
+  @record_flag_error_ref 1 <<< 17
+  @record_flag_lease_owner 1 <<< 18
+  @record_flag_lease_token 1 <<< 19
+  @record_flag_lease_deadline_ms 1 <<< 20
+  @record_flag_run_state 1 <<< 21
+  @record_flag_rewound_to_event_id 1 <<< 22
+  @record_flag_sidecar 1 <<< 23
+
+  # FSH2 stores per-event history only. Immutable workflow metadata such as id,
+  # type, parent/root, and correlation id is restored from the current/snapshot
+  # record when user-facing history is decoded.
+  @history_flag_priority 1 <<< 0
+  @history_flag_attempts 1 <<< 1
+  @history_flag_fencing_token 1 <<< 2
+  @history_flag_created_at_ms 1 <<< 3
+  @history_flag_updated_at_ms 1 <<< 4
+  @history_flag_next_run_at_ms 1 <<< 5
+  @history_flag_lease_deadline_ms 1 <<< 6
+  @history_flag_lease_owner 1 <<< 7
+  @history_flag_payload_ref 1 <<< 8
+  @history_flag_result_ref 1 <<< 9
+  @history_flag_error_ref 1 <<< 10
+  @history_flag_rewound_to_event_id 1 <<< 11
+  @history_flag_meta 1 <<< 12
+
+  @doc false
+  # Encodes the current Flow metadata schema. User payload bytes are not encoded
+  # here; only payload_ref/result_ref/error_ref metadata is stored. Flow records
+  # are not public-persisted yet, so this intentionally supports one current
+  # format.
+  def encode_record(record) when is_map(record) do
+    NIF.flow_record_encode(
+      Map.get(record, :id),
+      Map.get(record, :type),
+      Map.get(record, :state),
+      Map.get(record, :version),
+      Map.get(record, :attempts),
+      Map.get(record, :fencing_token),
+      Map.get(record, :created_at_ms),
+      Map.get(record, :updated_at_ms),
+      Map.get(record, :next_run_at_ms),
+      Map.get(record, :priority),
+      Map.get(record, :ttl_ms),
+      Map.get(record, :history_hot_max_events),
+      Map.get(record, :history_max_events),
+      Map.get(record, :retention_ttl_ms),
+      Map.get(record, :terminal_retention_until_ms),
+      Map.get(record, :partition_key),
+      Map.get(record, :payload_ref),
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :parent_partition_key),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref),
+      Map.get(record, :lease_owner),
+      Map.get(record, :lease_token),
+      Map.get(record, :lease_deadline_ms),
+      Map.get(record, :run_state),
+      Map.get(record, :rewound_to_event_id),
+      record |> encode_record_sidecar() |> IO.iodata_to_binary()
+    )
+  end
+
+  @doc false
+  def encode_record_elixir(record) when is_map(record) do
+    sidecar =
+      record
+      |> encode_record_sidecar()
+      |> IO.iodata_to_binary()
+
+    flags = encode_record_flags(record, sidecar)
+
+    # Wire order is part of the durable schema. Add new fields as flagged
+    # trailing data or bump @record_bin_magic and update the Rust NIF/test
+    # parity checks.
+    [
+      @record_bin_magic,
+      encode_int(flags),
+      encode_bin(Map.get(record, :id)),
+      encode_bin(Map.get(record, :type)),
+      encode_bin(Map.get(record, :state)),
+      encode_int(Map.get(record, :version)),
+      encode_int(Map.get(record, :created_at_ms)),
+      encode_int(Map.get(record, :updated_at_ms)),
+      encode_flagged_int(flags, @record_flag_attempts, Map.get(record, :attempts)),
+      encode_flagged_int(flags, @record_flag_fencing_token, Map.get(record, :fencing_token)),
+      encode_flagged_int(flags, @record_flag_next_run_at_ms, Map.get(record, :next_run_at_ms)),
+      encode_flagged_int(flags, @record_flag_priority, Map.get(record, :priority)),
+      encode_flagged_int(flags, @record_flag_ttl_ms, Map.get(record, :ttl_ms)),
+      encode_flagged_int(
+        flags,
+        @record_flag_history_hot_max_events,
+        Map.get(record, :history_hot_max_events)
+      ),
+      encode_flagged_int(
+        flags,
+        @record_flag_history_max_events,
+        Map.get(record, :history_max_events)
+      ),
+      encode_flagged_int(
+        flags,
+        @record_flag_retention_ttl_ms,
+        Map.get(record, :retention_ttl_ms)
+      ),
+      encode_flagged_int(
+        flags,
+        @record_flag_terminal_retention_until_ms,
+        Map.get(record, :terminal_retention_until_ms)
+      ),
+      encode_flagged_bin(flags, @record_flag_partition_key, Map.get(record, :partition_key)),
+      encode_flagged_bin(flags, @record_flag_payload_ref, Map.get(record, :payload_ref)),
+      encode_flagged_bin(flags, @record_flag_parent_flow_id, Map.get(record, :parent_flow_id)),
+      encode_flagged_bin(
+        flags,
+        @record_flag_parent_partition_key,
+        Map.get(record, :parent_partition_key)
+      ),
+      encode_flagged_bin(flags, @record_flag_root_flow_id, Map.get(record, :root_flow_id)),
+      encode_flagged_bin(flags, @record_flag_correlation_id, Map.get(record, :correlation_id)),
+      encode_flagged_bin(flags, @record_flag_result_ref, Map.get(record, :result_ref)),
+      encode_flagged_bin(flags, @record_flag_error_ref, Map.get(record, :error_ref)),
+      encode_flagged_bin(flags, @record_flag_lease_owner, Map.get(record, :lease_owner)),
+      encode_flagged_bin(flags, @record_flag_lease_token, Map.get(record, :lease_token)),
+      encode_flagged_int(
+        flags,
+        @record_flag_lease_deadline_ms,
+        Map.get(record, :lease_deadline_ms)
+      ),
+      encode_flagged_bin(flags, @record_flag_run_state, Map.get(record, :run_state)),
+      encode_flagged_bin(
+        flags,
+        @record_flag_rewound_to_event_id,
+        Map.get(record, :rewound_to_event_id)
+      ),
+      if((flags &&& @record_flag_sidecar) != 0, do: sidecar, else: [])
+    ]
+    |> IO.iodata_to_binary()
+  end
+
+  defp encode_record_flags(record, sidecar) do
+    0
+    |> record_flag_int(record, :attempts, @record_flag_attempts, 0)
+    |> record_flag_int(record, :fencing_token, @record_flag_fencing_token, 0)
+    |> record_flag_int(record, :next_run_at_ms, @record_flag_next_run_at_ms, nil)
+    |> record_flag_int(record, :priority, @record_flag_priority, 0)
+    |> record_flag_int(record, :ttl_ms, @record_flag_ttl_ms, nil)
+    |> record_flag_int(record, :history_hot_max_events, @record_flag_history_hot_max_events, nil)
+    |> record_flag_int(record, :history_max_events, @record_flag_history_max_events, nil)
+    |> record_flag_int(record, :retention_ttl_ms, @record_flag_retention_ttl_ms, nil)
+    |> record_flag_int(
+      record,
+      :terminal_retention_until_ms,
+      @record_flag_terminal_retention_until_ms,
+      nil
+    )
+    |> record_flag_bin(record, :partition_key, @record_flag_partition_key)
+    |> record_flag_bin(record, :payload_ref, @record_flag_payload_ref)
+    |> record_flag_bin(record, :parent_flow_id, @record_flag_parent_flow_id)
+    |> record_flag_bin(record, :parent_partition_key, @record_flag_parent_partition_key)
+    |> record_flag_root(record)
+    |> record_flag_bin(record, :correlation_id, @record_flag_correlation_id)
+    |> record_flag_bin(record, :result_ref, @record_flag_result_ref)
+    |> record_flag_bin(record, :error_ref, @record_flag_error_ref)
+    |> record_flag_bin(record, :lease_owner, @record_flag_lease_owner)
+    |> record_flag_bin(record, :lease_token, @record_flag_lease_token)
+    |> record_flag_int(record, :lease_deadline_ms, @record_flag_lease_deadline_ms, 0)
+    |> record_flag_bin(record, :run_state, @record_flag_run_state)
+    |> record_flag_bin(record, :rewound_to_event_id, @record_flag_rewound_to_event_id)
+    |> maybe_put_flag(@record_flag_sidecar, not record_empty_sidecar?(sidecar))
+  end
+
+  defp record_flag_int(flags, record, key, flag, omitted_default) do
+    value = Map.get(record, key)
+    maybe_put_flag(flags, flag, not is_nil(value) and value != omitted_default)
+  end
+
+  defp record_flag_bin(flags, record, key, flag) do
+    maybe_put_flag(flags, flag, is_binary(Map.get(record, key)))
+  end
+
+  defp record_flag_root(flags, record) do
+    root_flow_id = Map.get(record, :root_flow_id)
+    id = Map.get(record, :id)
+
+    # Most root flows point to themselves. Store that common case as a flag
+    # instead of repeating the id bytes in every state record.
+    cond do
+      is_binary(root_flow_id) and root_flow_id == id ->
+        flags ||| @record_flag_root_flow_id_self
+
+      is_binary(root_flow_id) ->
+        flags ||| @record_flag_root_flow_id
+
+      true ->
+        flags
+    end
+  end
+
+  defp maybe_put_flag(flags, flag, true), do: flags ||| flag
+  defp maybe_put_flag(flags, _flag, _false), do: flags
+
+  defp nonempty_binary?(value), do: is_binary(value) and value != ""
+
+  defp encode_flagged_int(flags, flag, value) do
+    if (flags &&& flag) != 0, do: encode_int(value), else: []
+  end
+
+  defp encode_flagged_bin(flags, flag, value) do
+    if (flags &&& flag) != 0, do: encode_bin(value), else: []
+  end
+
+  @doc false
+  def encode_value(@value_bin_magic <> _rest = value), do: @value_bin_magic <> <<1>> <> value
+
+  def encode_value(value) when is_binary(value), do: value
+  def encode_value(value), do: @value_bin_magic <> <<2>> <> :erlang.term_to_binary(value)
+
+  @doc false
+  def decode_value(@value_bin_magic <> <<1, encoded::binary>>), do: encoded
+
+  def decode_value(@value_bin_magic <> <<2, encoded::binary>>) do
+    :erlang.binary_to_term(encoded, [:safe])
+  rescue
+    _ -> encoded
+  end
+
+  def decode_value(value), do: value
+
+  def decode_value_with_user_size(@value_bin_magic <> <<1, encoded::binary>>) do
+    {encoded, byte_size(encoded)}
+  end
+
+  def decode_value_with_user_size(@value_bin_magic <> <<2, encoded::binary>>) do
+    {:erlang.binary_to_term(encoded, [:safe]), byte_size(encoded)}
+  rescue
+    _ -> {encoded, byte_size(encoded)}
+  end
+
+  def decode_value_with_user_size(value) when is_binary(value), do: {value, byte_size(value)}
+  def decode_value_with_user_size(value), do: {value, 0}
+
+  @doc false
+  # Flow has not shipped as a public durable format yet, so recovery accepts
+  # only the current compact record encoding.
+  def record_blob?(@record_bin_magic <> _rest), do: true
+  def record_blob?(_value), do: false
+
+  def decode_record(@record_bin_magic <> _rest = value) do
+    case NIF.flow_record_decode(value) do
+      {:ok, fields} -> decode_record_fields(fields)
+      _ -> raise(ArgumentError, "invalid flow record")
+    end
+  end
+
+  def decode_record(_value), do: raise(ArgumentError, "invalid flow record")
+
+  @doc false
+  def decode_record_elixir(@record_bin_magic <> rest), do: decode_record_bin(rest)
+
+  def decode_record_elixir(_value), do: raise(ArgumentError, "invalid flow record")
+
+  @doc false
+  # History entries have their own durable schema because they are retained for
+  # audit/debug and rewind.
+  def encode_history_fields(record, event, now_ms, meta \\ %{})
+      when is_map(record) and is_binary(event) and is_integer(now_ms) do
+    encode_history_parts(
+      event,
+      Map.get(record, :version),
+      now_ms,
+      Map.get(record, :id),
+      Map.get(record, :type),
+      Map.get(record, :state),
+      Map.get(record, :priority, 0),
+      Map.get(record, :attempts, 0),
+      Map.get(record, :fencing_token, 0),
+      Map.get(record, :created_at_ms, now_ms),
+      Map.get(record, :updated_at_ms, now_ms),
+      Map.get(record, :next_run_at_ms),
+      Map.get(record, :lease_deadline_ms),
+      Map.get(record, :lease_owner),
+      Map.get(record, :payload_ref),
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref),
+      Map.get(record, :rewound_to_event_id),
+      normalize_history_meta(record_history_meta(record, meta))
+    )
+  end
+
+  @doc false
+  def encode_history_fields_elixir(record, event, now_ms, meta \\ %{})
+      when is_map(record) and is_binary(event) and is_integer(now_ms) do
+    encode_history_parts_elixir(
+      event,
+      Map.get(record, :version),
+      now_ms,
+      Map.get(record, :id),
+      Map.get(record, :type),
+      Map.get(record, :state),
+      Map.get(record, :priority, 0),
+      Map.get(record, :attempts, 0),
+      Map.get(record, :fencing_token, 0),
+      Map.get(record, :created_at_ms, now_ms),
+      Map.get(record, :updated_at_ms, now_ms),
+      Map.get(record, :next_run_at_ms),
+      Map.get(record, :lease_deadline_ms),
+      Map.get(record, :lease_owner),
+      Map.get(record, :payload_ref),
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref),
+      Map.get(record, :rewound_to_event_id),
+      normalize_history_meta(record_history_meta(record, meta))
+    )
+  end
+
+  @doc false
+  def history_snapshot(record, event, now_ms, meta \\ %{})
+      when is_map(record) and is_binary(event) and is_integer(now_ms) do
+    {
+      event,
+      Map.get(record, :version),
+      now_ms,
+      Map.get(record, :id),
+      Map.get(record, :type),
+      Map.get(record, :state),
+      Map.get(record, :priority, 0),
+      Map.get(record, :attempts, 0),
+      Map.get(record, :fencing_token, 0),
+      Map.get(record, :created_at_ms, now_ms),
+      Map.get(record, :updated_at_ms, now_ms),
+      Map.get(record, :next_run_at_ms),
+      Map.get(record, :lease_deadline_ms),
+      Map.get(record, :lease_owner),
+      Map.get(record, :payload_ref),
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref),
+      Map.get(record, :rewound_to_event_id),
+      normalize_history_meta(record_history_meta(record, meta))
+    }
+  end
+
+  @doc false
+  def encode_history_snapshot({
+        event,
+        version,
+        now_ms,
+        id,
+        type,
+        state,
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id,
+        result_ref,
+        error_ref,
+        rewound_to_event_id,
+        meta_fields
+      }) do
+    encode_history_parts(
+      event,
+      version,
+      now_ms,
+      id,
+      type,
+      state,
+      priority,
+      attempts,
+      fencing_token,
+      created_at_ms,
+      updated_at_ms,
+      next_run_at_ms,
+      lease_deadline_ms,
+      lease_owner,
+      payload_ref,
+      parent_flow_id,
+      root_flow_id,
+      correlation_id,
+      result_ref,
+      error_ref,
+      rewound_to_event_id,
+      meta_fields
+    )
+  end
+
+  defp encode_history_parts(
+         event,
+         version,
+         now_ms,
+         id,
+         type,
+         state,
+         priority,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         lease_deadline_ms,
+         lease_owner,
+         payload_ref,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id,
+         result_ref,
+         error_ref,
+         rewound_to_event_id,
+         meta_fields
+       ) do
+    NIF.flow_history_encode(
+      event,
+      version,
+      now_ms,
+      id,
+      type,
+      state,
+      priority,
+      attempts,
+      fencing_token,
+      created_at_ms,
+      updated_at_ms,
+      next_run_at_ms,
+      lease_deadline_ms,
+      lease_owner,
+      payload_ref,
+      parent_flow_id,
+      root_flow_id,
+      correlation_id,
+      result_ref,
+      error_ref,
+      rewound_to_event_id,
+      meta_fields |> encode_history_meta() |> IO.iodata_to_binary()
+    )
+  end
+
+  defp encode_history_parts_elixir(
+         event,
+         version,
+         now_ms,
+         _id,
+         _type,
+         state,
+         priority,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         lease_deadline_ms,
+         lease_owner,
+         payload_ref,
+         _parent_flow_id,
+         _root_flow_id,
+         _correlation_id,
+         result_ref,
+         error_ref,
+         rewound_to_event_id,
+         meta_fields
+       ) do
+    flags =
+      encode_history_flags(
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        now_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        result_ref,
+        error_ref,
+        rewound_to_event_id,
+        meta_fields
+      )
+
+    # History entries intentionally omit immutable workflow identity fields.
+    # decode_history_fields/2 must get record context when callers need the full
+    # RESP-facing history shape.
+    [
+      @history_bin_magic,
+      encode_int(flags),
+      encode_bin(event),
+      encode_int(version),
+      encode_int(now_ms),
+      encode_bin(state),
+      encode_flagged_int(flags, @history_flag_priority, priority),
+      encode_flagged_int(flags, @history_flag_attempts, attempts),
+      encode_flagged_int(flags, @history_flag_fencing_token, fencing_token),
+      encode_flagged_int(flags, @history_flag_created_at_ms, created_at_ms),
+      encode_flagged_int(flags, @history_flag_updated_at_ms, updated_at_ms),
+      encode_flagged_int(flags, @history_flag_next_run_at_ms, next_run_at_ms),
+      encode_flagged_int(flags, @history_flag_lease_deadline_ms, lease_deadline_ms),
+      encode_flagged_bin(flags, @history_flag_lease_owner, lease_owner),
+      encode_flagged_bin(flags, @history_flag_payload_ref, payload_ref),
+      encode_flagged_bin(flags, @history_flag_result_ref, result_ref),
+      encode_flagged_bin(flags, @history_flag_error_ref, error_ref),
+      encode_flagged_bin(flags, @history_flag_rewound_to_event_id, rewound_to_event_id),
+      if((flags &&& @history_flag_meta) != 0, do: encode_history_meta(meta_fields), else: [])
+    ]
+    |> IO.iodata_to_binary()
+  end
+
+  defp encode_history_flags(
+         priority,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         now_ms,
+         next_run_at_ms,
+         lease_deadline_ms,
+         lease_owner,
+         payload_ref,
+         result_ref,
+         error_ref,
+         rewound_to_event_id,
+         meta_fields
+       ) do
+    0
+    |> maybe_put_flag(@history_flag_priority, is_integer(priority) and priority != 0)
+    |> maybe_put_flag(@history_flag_attempts, is_integer(attempts) and attempts != 0)
+    |> maybe_put_flag(
+      @history_flag_fencing_token,
+      is_integer(fencing_token) and fencing_token != 0
+    )
+    |> maybe_put_flag(
+      @history_flag_created_at_ms,
+      is_integer(created_at_ms) and created_at_ms != now_ms
+    )
+    |> maybe_put_flag(
+      @history_flag_updated_at_ms,
+      is_integer(updated_at_ms) and updated_at_ms != now_ms
+    )
+    |> maybe_put_flag(@history_flag_next_run_at_ms, is_integer(next_run_at_ms))
+    |> maybe_put_flag(
+      @history_flag_lease_deadline_ms,
+      is_integer(lease_deadline_ms) and lease_deadline_ms != 0
+    )
+    |> maybe_put_flag(@history_flag_lease_owner, nonempty_binary?(lease_owner))
+    |> maybe_put_flag(@history_flag_payload_ref, nonempty_binary?(payload_ref))
+    |> maybe_put_flag(@history_flag_result_ref, nonempty_binary?(result_ref))
+    |> maybe_put_flag(@history_flag_error_ref, nonempty_binary?(error_ref))
+    |> maybe_put_flag(@history_flag_rewound_to_event_id, nonempty_binary?(rewound_to_event_id))
+    |> maybe_put_flag(@history_flag_meta, is_list(meta_fields) and meta_fields != [])
+  end
+
+  @doc false
+  # Decode history into the current RESP-facing field list. FSH2 callers should
+  # pass the state record/context so omitted immutable fields can be restored.
+  def decode_history_fields(value, context \\ %{})
+
+  def decode_history_fields(@history_bin_magic <> rest, context),
+    do: decode_history_fields_bin(rest, context)
+
+  def decode_history_fields(_value, _context), do: []
+
+  @doc false
+  def decode_history_fields_elixir(value, context \\ %{})
+
+  def decode_history_fields_elixir(@history_bin_magic <> rest, context),
+    do: decode_history_fields_bin(rest, context)
+
+  def decode_history_fields_elixir(_value, _context), do: []
+
+  defp decode_history_fields_term(
+         {
+           @history_tag,
+           event,
+           version,
+           at,
+           id,
+           type,
+           state,
+           priority,
+           attempts,
+           fencing_token,
+           created_at_ms,
+           updated_at_ms,
+           next_run_at_ms,
+           lease_deadline_ms,
+           lease_owner,
+           payload_ref,
+           parent_flow_id,
+           root_flow_id,
+           correlation_id,
+           result_ref,
+           error_ref,
+           rewound_to_event_id,
+           meta_fields
+         },
+         context
+       ) do
+    id = history_context_string(context, :id, id)
+    type = history_context_string(context, :type, type)
+    parent_flow_id = history_context_string(context, :parent_flow_id, parent_flow_id)
+    root_flow_id = history_context_string(context, :root_flow_id, root_flow_id)
+    correlation_id = history_context_string(context, :correlation_id, correlation_id)
+
+    base_fields = [
+      "event",
+      event,
+      "version",
+      history_integer(version),
+      "at",
+      history_integer(at),
+      "id",
+      history_string(id),
+      "type",
+      history_string(type),
+      "state",
+      history_string(state),
+      "priority",
+      history_integer(priority),
+      "attempts",
+      history_integer(attempts),
+      "fencing_token",
+      history_integer(fencing_token),
+      "created_at_ms",
+      history_integer(created_at_ms),
+      "updated_at_ms",
+      history_integer(updated_at_ms),
+      "next_run_at_ms",
+      history_optional_integer(next_run_at_ms),
+      "lease_deadline_ms",
+      history_optional_integer(lease_deadline_ms),
+      "lease_owner",
+      history_string(lease_owner),
+      "payload_ref",
+      history_string(payload_ref),
+      "parent_flow_id",
+      history_string(parent_flow_id),
+      "root_flow_id",
+      history_string(root_flow_id),
+      "correlation_id",
+      history_string(correlation_id),
+      "result_ref",
+      history_string(result_ref),
+      "error_ref",
+      history_string(error_ref),
+      "rewound_to_event_id",
+      history_string(rewound_to_event_id)
+    ]
+
+    base_fields ++ normalize_history_decoded_meta(meta_fields)
+  end
+
+  defp decode_history_fields_term(_value, _context), do: []
+
+  defp decode_record_bin(rest) do
+    with {:ok, flags, rest} <- decode_int(rest),
+         flags when is_integer(flags) <- flags,
+         {:ok, id, rest} <- decode_bin(rest),
+         {:ok, type, rest} <- decode_bin(rest),
+         {:ok, state, rest} <- decode_bin(rest),
+         {:ok, version, rest} <- decode_int(rest),
+         {:ok, created_at_ms, rest} <- decode_int(rest),
+         {:ok, updated_at_ms, rest} <- decode_int(rest),
+         {:ok, attempts, rest} <- decode_flagged_int(flags, @record_flag_attempts, rest, 0),
+         {:ok, fencing_token, rest} <-
+           decode_flagged_int(flags, @record_flag_fencing_token, rest, 0),
+         {:ok, next_run_at_ms, rest} <-
+           decode_flagged_int(flags, @record_flag_next_run_at_ms, rest, nil),
+         {:ok, priority, rest} <- decode_flagged_int(flags, @record_flag_priority, rest, 0),
+         {:ok, ttl_ms, rest} <- decode_flagged_int(flags, @record_flag_ttl_ms, rest, nil),
+         {:ok, history_hot_max_events, rest} <-
+           decode_flagged_int(flags, @record_flag_history_hot_max_events, rest, nil),
+         {:ok, history_max_events, rest} <-
+           decode_flagged_int(flags, @record_flag_history_max_events, rest, nil),
+         {:ok, retention_ttl_ms, rest} <-
+           decode_flagged_int(flags, @record_flag_retention_ttl_ms, rest, nil),
+         {:ok, terminal_retention_until_ms, rest} <-
+           decode_flagged_int(flags, @record_flag_terminal_retention_until_ms, rest, nil),
+         {:ok, partition_key, rest} <-
+           decode_flagged_bin(flags, @record_flag_partition_key, rest, nil),
+         {:ok, payload_ref, rest} <-
+           decode_flagged_bin(flags, @record_flag_payload_ref, rest, nil),
+         {:ok, parent_flow_id, rest} <-
+           decode_flagged_bin(flags, @record_flag_parent_flow_id, rest, nil),
+         {:ok, parent_partition_key, rest} <-
+           decode_flagged_bin(flags, @record_flag_parent_partition_key, rest, nil),
+         {:ok, root_flow_id, rest} <- decode_record_root(flags, id, rest),
+         {:ok, correlation_id, rest} <-
+           decode_flagged_bin(flags, @record_flag_correlation_id, rest, nil),
+         {:ok, result_ref, rest} <- decode_flagged_bin(flags, @record_flag_result_ref, rest, nil),
+         {:ok, error_ref, rest} <- decode_flagged_bin(flags, @record_flag_error_ref, rest, nil),
+         {:ok, lease_owner, rest} <-
+           decode_flagged_bin(flags, @record_flag_lease_owner, rest, nil),
+         {:ok, lease_token, rest} <-
+           decode_flagged_bin(flags, @record_flag_lease_token, rest, nil),
+         {:ok, lease_deadline_ms, rest} <-
+           decode_flagged_int(flags, @record_flag_lease_deadline_ms, rest, 0),
+         {:ok, run_state, rest} <- decode_flagged_bin(flags, @record_flag_run_state, rest, nil),
+         {:ok, rewound_to_event_id, rest} <-
+           decode_flagged_bin(flags, @record_flag_rewound_to_event_id, rest, nil),
+         {:ok, child_groups, ""} <- decode_record_sidecar(flags, rest) do
+      {child_groups, value_refs} = split_record_sidecar(child_groups)
+
+      record =
+        %{
+          id: id,
+          type: type,
+          state: state,
+          version: version,
+          attempts: attempts,
+          fencing_token: fencing_token,
+          created_at_ms: created_at_ms,
+          updated_at_ms: updated_at_ms,
+          next_run_at_ms: next_run_at_ms,
+          priority: priority,
+          ttl_ms: ttl_ms,
+          history_hot_max_events: history_hot_max_events,
+          history_max_events: history_max_events,
+          retention_ttl_ms: retention_ttl_ms,
+          terminal_retention_until_ms: terminal_retention_until_ms,
+          partition_key: partition_key,
+          payload_ref: payload_ref,
+          parent_flow_id: parent_flow_id,
+          parent_partition_key: parent_partition_key,
+          root_flow_id: root_flow_id,
+          correlation_id: correlation_id,
+          result_ref: result_ref,
+          error_ref: error_ref,
+          lease_owner: lease_owner,
+          lease_token: lease_token,
+          lease_deadline_ms: lease_deadline_ms,
+          run_state: run_state,
+          child_groups: normalize_child_groups(child_groups)
+        }
+        |> maybe_put_decoded_value_refs(value_refs)
+
+      if is_nil(rewound_to_event_id) do
+        record
+      else
+        Map.put(record, :rewound_to_event_id, rewound_to_event_id)
+      end
+    else
+      _ -> raise ArgumentError, "invalid flow record"
+    end
+  end
+
+  defp decode_flagged_int(flags, flag, rest, default) do
+    if (flags &&& flag) != 0 do
+      decode_int(rest)
+    else
+      {:ok, default, rest}
+    end
+  end
+
+  defp decode_flagged_bin(flags, flag, rest, default) do
+    if (flags &&& flag) != 0 do
+      decode_bin(rest)
+    else
+      {:ok, default, rest}
+    end
+  end
+
+  defp decode_record_root(flags, id, rest) do
+    cond do
+      (flags &&& @record_flag_root_flow_id_self) != 0 ->
+        {:ok, id, rest}
+
+      (flags &&& @record_flag_root_flow_id) != 0 ->
+        decode_bin(rest)
+
+      true ->
+        {:ok, nil, rest}
+    end
+  end
+
+  defp decode_record_sidecar(flags, rest) do
+    if (flags &&& @record_flag_sidecar) != 0 do
+      decode_child_groups(rest)
+    else
+      empty = record_empty_sidecar()
+      {:ok, child_groups, ""} = decode_child_groups(empty)
+      {:ok, child_groups, rest}
+    end
+  end
+
+  defp decode_record_fields([
+         id,
+         type,
+         state,
+         version,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         priority,
+         ttl_ms,
+         history_hot_max_events,
+         history_max_events,
+         retention_ttl_ms,
+         terminal_retention_until_ms,
+         partition_key,
+         payload_ref,
+         parent_flow_id,
+         parent_partition_key,
+         root_flow_id,
+         correlation_id,
+         result_ref,
+         error_ref,
+         lease_owner,
+         lease_token,
+         lease_deadline_ms,
+         run_state,
+         rewound_to_event_id,
+         child_groups_encoded
+       ])
+       when is_binary(child_groups_encoded) do
+    with {:ok, child_groups, ""} <- decode_child_groups(child_groups_encoded) do
+      {child_groups, value_refs} = split_record_sidecar(child_groups)
+
+      record =
+        %{
+          id: id,
+          type: type,
+          state: state,
+          version: version,
+          attempts: attempts,
+          fencing_token: fencing_token,
+          created_at_ms: created_at_ms,
+          updated_at_ms: updated_at_ms,
+          next_run_at_ms: next_run_at_ms,
+          priority: priority,
+          ttl_ms: ttl_ms,
+          history_hot_max_events: history_hot_max_events,
+          history_max_events: history_max_events,
+          retention_ttl_ms: retention_ttl_ms,
+          terminal_retention_until_ms: terminal_retention_until_ms,
+          partition_key: partition_key,
+          payload_ref: payload_ref,
+          parent_flow_id: parent_flow_id,
+          parent_partition_key: parent_partition_key,
+          root_flow_id: root_flow_id,
+          correlation_id: correlation_id,
+          result_ref: result_ref,
+          error_ref: error_ref,
+          lease_owner: lease_owner,
+          lease_token: lease_token,
+          lease_deadline_ms: lease_deadline_ms,
+          run_state: run_state,
+          child_groups: normalize_child_groups(child_groups)
+        }
+        |> maybe_put_decoded_value_refs(value_refs)
+
+      if is_nil(rewound_to_event_id) do
+        record
+      else
+        Map.put(record, :rewound_to_event_id, rewound_to_event_id)
+      end
+    else
+      _ -> raise ArgumentError, "invalid flow record"
+    end
+  end
+
+  defp decode_record_fields(_fields), do: raise(ArgumentError, "invalid flow record")
+
+  defp maybe_put_decoded_value_refs(record, refs) when is_map(refs) and map_size(refs) > 0,
+    do: Map.put(record, :value_refs, refs)
+
+  defp maybe_put_decoded_value_refs(record, _refs), do: record
+
+  defp decode_history_fields_bin(rest, context) do
+    with {:ok, flags, rest} <- decode_int(rest),
+         flags when is_integer(flags) <- flags,
+         {:ok, event, rest} <- decode_bin(rest),
+         {:ok, version, rest} <- decode_int(rest),
+         {:ok, at, rest} <- decode_int(rest),
+         {:ok, state, rest} <- decode_bin(rest),
+         {:ok, priority, rest} <- decode_flagged_int(flags, @history_flag_priority, rest, 0),
+         {:ok, attempts, rest} <- decode_flagged_int(flags, @history_flag_attempts, rest, 0),
+         {:ok, fencing_token, rest} <-
+           decode_flagged_int(flags, @history_flag_fencing_token, rest, 0),
+         {:ok, created_at_ms, rest} <-
+           decode_flagged_int(flags, @history_flag_created_at_ms, rest, at),
+         {:ok, updated_at_ms, rest} <-
+           decode_flagged_int(flags, @history_flag_updated_at_ms, rest, at),
+         {:ok, next_run_at_ms, rest} <-
+           decode_flagged_int(flags, @history_flag_next_run_at_ms, rest, nil),
+         {:ok, lease_deadline_ms, rest} <-
+           decode_flagged_int(flags, @history_flag_lease_deadline_ms, rest, nil),
+         {:ok, lease_owner, rest} <-
+           decode_flagged_bin(flags, @history_flag_lease_owner, rest, nil),
+         {:ok, payload_ref, rest} <-
+           decode_flagged_bin(flags, @history_flag_payload_ref, rest, nil),
+         {:ok, result_ref, rest} <- decode_flagged_bin(flags, @history_flag_result_ref, rest, nil),
+         {:ok, error_ref, rest} <- decode_flagged_bin(flags, @history_flag_error_ref, rest, nil),
+         {:ok, rewound_to_event_id, rest} <-
+           decode_flagged_bin(flags, @history_flag_rewound_to_event_id, rest, nil),
+         {:ok, meta_fields, ""} <- decode_history_meta_for_flags(flags, rest) do
+      decode_history_fields_term(
+        {
+          @history_tag,
+          event,
+          version,
+          at,
+          nil,
+          nil,
+          state,
+          priority,
+          attempts,
+          fencing_token,
+          created_at_ms,
+          updated_at_ms,
+          next_run_at_ms,
+          lease_deadline_ms,
+          lease_owner,
+          payload_ref,
+          nil,
+          nil,
+          nil,
+          result_ref,
+          error_ref,
+          rewound_to_event_id,
+          meta_fields
+        },
+        context
+      )
+    else
+      _ -> []
+    end
+  end
+
+  defp decode_history_meta_for_flags(flags, rest) do
+    if (flags &&& @history_flag_meta) != 0 do
+      decode_history_meta(rest)
+    else
+      {:ok, [], rest}
+    end
+  end
+
+  defp normalize_history_meta(meta) when is_map(meta) do
+    meta
+    |> Enum.flat_map(fn
+      {key, value} when is_atom(key) -> history_meta_pair(Atom.to_string(key), value)
+      {key, value} when is_binary(key) -> history_meta_pair(key, value)
+      _other -> []
+    end)
+  end
+
+  defp normalize_history_meta(_meta), do: []
+
+  defp record_history_meta(record, meta) when is_map(record) and is_map(meta) do
+    refs = flow_record_value_refs(record)
+
+    if map_size(refs) == 0 do
+      meta
+    else
+      Map.put_new(meta, @history_value_refs_key, Jason.encode!(encode_value_refs(refs)))
+    end
+  end
+
+  defp record_history_meta(_record, meta), do: meta
+
+  defp history_meta_pair(key, nil), do: [{key, ""}]
+  defp history_meta_pair(key, value) when is_binary(value), do: [{key, value}]
+  defp history_meta_pair(key, value) when is_atom(value), do: [{key, Atom.to_string(value)}]
+  defp history_meta_pair(key, value) when is_integer(value), do: [{key, Integer.to_string(value)}]
+  defp history_meta_pair(key, value), do: [{key, to_string(value)}]
+
+  defp encode_history_meta([]), do: <<1>>
+
+  defp encode_history_meta(fields) do
+    [encode_int(length(fields)), Enum.map(fields, &encode_history_meta_pair/1)]
+  end
+
+  defp encode_history_meta_pair({key, value}), do: [encode_bin(key), encode_bin(value)]
+
+  defp decode_history_meta(rest) do
+    with {:ok, count, rest} <- decode_int(rest) do
+      decode_history_meta_pairs(count, rest, [])
+    end
+  end
+
+  defp decode_history_meta_pairs(0, rest, acc), do: {:ok, Enum.reverse(acc), rest}
+
+  defp decode_history_meta_pairs(count, rest, acc) when is_integer(count) and count > 0 do
+    with {:ok, key, rest} <- decode_bin(rest),
+         {:ok, value, rest} <- decode_bin(rest) do
+      decode_history_meta_pairs(count - 1, rest, [{key, value} | acc])
+    end
+  end
+
+  defp decode_history_meta_pairs(_count, _rest, _acc), do: :error
+
+  defp normalize_history_decoded_meta(fields) when is_list(fields) do
+    Enum.flat_map(fields, fn
+      {key, value} when is_binary(key) and is_binary(value) -> [key, value]
+      _other -> []
+    end)
+  end
+
+  defp normalize_history_decoded_meta(_fields), do: []
+
+  defp encode_int(value) when is_integer(value) and value >= 0 and value < 127,
+    do: <<value + 1>>
+
+  defp encode_int(value) when is_integer(value) and value >= 0, do: encode_varint(value + 1)
+
+  defp encode_int(_value), do: <<0>>
+
+  defp decode_int(<<0, rest::binary>>), do: {:ok, nil, rest}
+
+  defp decode_int(<<encoded, rest::binary>>) when encoded < 128,
+    do: {:ok, encoded - 1, rest}
+
+  defp decode_int(binary) do
+    with {:ok, encoded, rest} <- decode_varint(binary) do
+      case encoded do
+        0 -> {:ok, nil, rest}
+        value -> {:ok, value - 1, rest}
+      end
+    end
+  end
+
+  defp encode_bin(value) when is_binary(value) and byte_size(value) < 127,
+    do: [<<byte_size(value) + 1>>, value]
+
+  defp encode_bin(value) when is_binary(value),
+    do: [encode_varint(byte_size(value) + 1), value]
+
+  defp encode_bin(_value), do: <<0>>
+
+  defp decode_bin(<<0, rest::binary>>), do: {:ok, nil, rest}
+
+  defp decode_bin(<<encoded, rest::binary>>) when encoded < 128 do
+    len = encoded - 1
+
+    case rest do
+      <<value::binary-size(len), tail::binary>> -> {:ok, value, tail}
+      _ -> :error
+    end
+  end
+
+  defp decode_bin(binary) do
+    with {:ok, encoded, rest} <- decode_varint(binary) do
+      case encoded do
+        0 ->
+          {:ok, nil, rest}
+
+        size when size > 0 ->
+          len = size - 1
+
+          case rest do
+            <<value::binary-size(len), tail::binary>> -> {:ok, value, tail}
+            _ -> :error
+          end
+      end
+    end
+  end
+
+  defp encode_child_groups(groups) when is_map(groups) and map_size(groups) == 0,
+    do: encode_bin("J{}")
+
+  defp encode_child_groups(groups) when is_map(groups) do
+    ["J", Jason.encode!(groups)]
+    |> IO.iodata_to_binary()
+    |> encode_bin()
+  end
+
+  defp encode_child_groups(_groups), do: encode_bin("J{}")
+
+  defp encode_record_sidecar(record) when is_map(record) do
+    child_groups =
+      record
+      |> Map.get(:child_groups, %{})
+      |> normalize_child_groups()
+
+    refs = flow_record_value_refs(record)
+
+    if map_size(refs) == 0 do
+      encode_child_groups(child_groups)
+    else
+      child_groups
+      |> Map.put(@record_value_refs_key, encode_value_refs(refs))
+      |> encode_child_groups()
+    end
+  end
+
+  defp record_empty_sidecar do
+    %{}
+    |> encode_child_groups()
+    |> IO.iodata_to_binary()
+  end
+
+  defp record_empty_sidecar?(sidecar), do: sidecar == record_empty_sidecar()
+
+  defp split_record_sidecar(groups) when is_map(groups) do
+    {encoded_refs, child_groups} = Map.pop(groups, @record_value_refs_key, %{})
+    {child_groups, decode_value_refs(encoded_refs)}
+  end
+
+  defp split_record_sidecar(_groups), do: {%{}, %{}}
+
+  def flow_record_value_refs(record) when is_map(record) do
+    record
+    |> Map.get(:value_refs, %{})
+    |> decode_value_refs()
+  end
+
+  def flow_record_value_refs(_record), do: %{}
+
+  defp encode_value_refs(refs) when is_map(refs) do
+    refs
+    |> decode_value_refs()
+    |> Map.new(fn {name, entry} ->
+      {name,
+       %{
+         "ref" => Map.get(entry, :ref),
+         "version" => Map.get(entry, :version),
+         "digest" => Map.get(entry, :digest)
+       }}
+    end)
+  end
+
+  defp encode_value_refs(_refs), do: %{}
+
+  defp decode_value_refs(refs) when is_map(refs) do
+    refs
+    |> Enum.reduce(%{}, fn
+      {name, %{} = entry}, acc when is_binary(name) and name != "" ->
+        ref = Map.get(entry, :ref) || Map.get(entry, "ref")
+
+        if is_binary(ref) and ref != "" do
+          Map.put(acc, name, %{
+            ref: ref,
+            version: value_ref_integer(Map.get(entry, :version) || Map.get(entry, "version")),
+            digest: value_ref_binary(Map.get(entry, :digest) || Map.get(entry, "digest"))
+          })
+        else
+          acc
+        end
+
+      {name, ref}, acc when is_binary(name) and name != "" and is_binary(ref) and ref != "" ->
+        Map.put(acc, name, %{ref: ref, version: nil, digest: nil})
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp decode_value_refs(value) when is_binary(value) do
+    case Jason.decode(value) do
+      {:ok, decoded} -> decode_value_refs(decoded)
+      _ -> %{}
+    end
+  end
+
+  defp decode_value_refs(_refs), do: %{}
+
+  defp value_ref_integer(value) when is_integer(value), do: value
+
+  defp value_ref_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} -> parsed
+      _ -> nil
+    end
+  end
+
+  defp value_ref_integer(_value), do: nil
+
+  defp value_ref_binary(value) when is_binary(value) and value != "", do: value
+  defp value_ref_binary(_value), do: nil
+
+  defp decode_child_groups(binary) do
+    with {:ok, encoded, rest} <- decode_bin(binary),
+         {:ok, decoded} <- decode_child_groups_payload(encoded) do
+      {:ok, decoded, rest}
+    end
+  end
+
+  defp decode_child_groups_payload("J{}"), do: {:ok, %{}}
+  defp decode_child_groups_payload("J" <> json), do: Jason.decode(json)
+
+  defp decode_child_groups_payload(encoded) do
+    {:ok, :erlang.binary_to_term(encoded, [:safe])}
+  rescue
+    _ -> :error
+  end
+
+  defp normalize_child_groups(groups) when is_map(groups), do: groups
+  defp normalize_child_groups(_groups), do: %{}
+
+  defp encode_varint(value) when value < 128, do: <<value>>
+
+  defp encode_varint(value) when value < 16_384 do
+    <<(value &&& 0x7F) ||| 0x80, value >>> 7>>
+  end
+
+  defp encode_varint(value) when value < 2_097_152 do
+    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80, value >>> 14>>
+  end
+
+  defp encode_varint(value) when value < 268_435_456 do
+    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80,
+      (value >>> 14 &&& 0x7F) ||| 0x80, value >>> 21>>
+  end
+
+  defp encode_varint(value) when value < 34_359_738_368 do
+    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80,
+      (value >>> 14 &&& 0x7F) ||| 0x80, (value >>> 21 &&& 0x7F) ||| 0x80, value >>> 28>>
+  end
+
+  defp encode_varint(value) when value < 4_398_046_511_104 do
+    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80,
+      (value >>> 14 &&& 0x7F) ||| 0x80, (value >>> 21 &&& 0x7F) ||| 0x80,
+      (value >>> 28 &&& 0x7F) ||| 0x80, value >>> 35>>
+  end
+
+  defp encode_varint(value) when value >= 128 do
+    <<(value &&& 0x7F) ||| 0x80>> <> encode_varint(value >>> 7)
+  end
+
+  defp decode_varint(binary), do: decode_varint(binary, 0, 0)
+
+  defp decode_varint(<<byte, rest::binary>>, acc, shift) when shift < 70 do
+    value = acc ||| (byte &&& 0x7F) <<< shift
+
+    if (byte &&& 0x80) == 0 do
+      {:ok, value, rest}
+    else
+      decode_varint(rest, value, shift + 7)
+    end
+  end
+
+  defp decode_varint(_binary, _acc, _shift), do: :error
+
+  defp history_integer(value) when is_integer(value), do: Integer.to_string(value)
+  defp history_integer(_value), do: "0"
+
+  defp history_optional_integer(value) when is_integer(value), do: Integer.to_string(value)
+  defp history_optional_integer(_value), do: ""
+
+  defp history_string(value) when is_binary(value), do: value
+  defp history_string(_value), do: ""
+
+  defp history_context_string(context, key, fallback) when is_map(context) do
+    case Map.get(context, key) || Map.get(context, Atom.to_string(key)) do
+      value when is_binary(value) -> value
+      _ -> fallback
+    end
+  end
+
+  defp history_context_string(_context, _key, fallback), do: fallback
+end
