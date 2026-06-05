@@ -4,7 +4,7 @@ defmodule FerricstoreServer.MixProject do
   def project do
     [
       app: :ferricstore_server,
-      version: "0.3.8",
+      version: "0.4.0",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",

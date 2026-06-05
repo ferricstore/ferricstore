@@ -108,7 +108,7 @@ Add the dependency:
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.3.8"}
+    {:ferricstore, "~> 0.4.0"}
   ]
 end
 ```
