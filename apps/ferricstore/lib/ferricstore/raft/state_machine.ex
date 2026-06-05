@@ -7550,7 +7550,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_put_registry_marker(state, key, record) do
-    raw_put_cold(state, key, <<1>>, flow_record_expire_at(record), LFU.initial())
+    flow_put_hot(state, key, <<1>>, flow_record_expire_at(record))
   end
 
   defp flow_create_fast_staged_put_batch?(state) do

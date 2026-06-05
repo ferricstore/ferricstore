@@ -424,17 +424,28 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow registry markers use segment-keydir storage instead of apply projection" do
-    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+    storage_source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
 
-    [function_source] =
+    [storage_function_source] =
       Regex.run(
         ~r/defp segment_project_cold_flow_key\?\(key\).*?^  end/ms,
-        source
+        storage_source
       )
 
-    assert function_source =~ "FlowKeys.value_key?(key)"
-    assert function_source =~ "FlowKeys.history_key?(key)"
-    assert function_source =~ "FlowKeys.registry_key?(key)"
+    assert storage_function_source =~ "FlowKeys.value_key?(key)"
+    assert storage_function_source =~ "FlowKeys.history_key?(key)"
+    assert storage_function_source =~ "FlowKeys.registry_key?(key)"
+
+    state_machine_source = File.read!("lib/ferricstore/raft/state_machine.ex")
+
+    [registry_marker_source] =
+      Regex.run(
+        ~r/defp flow_put_registry_marker\(state, key, record\).*?^  end/ms,
+        state_machine_source
+      )
+
+    assert registry_marker_source =~ "flow_put_hot(state, key"
+    refute registry_marker_source =~ "raw_put_cold"
   end
 
   test "flow retry many history builds entries and next records in one traversal" do
