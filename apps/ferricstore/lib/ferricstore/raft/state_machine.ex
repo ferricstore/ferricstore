@@ -11768,22 +11768,18 @@ defmodule Ferricstore.Raft.StateMachine do
        do: []
 
   defp flow_retention_expired_lmdb_state_keys(state, now_ms, remaining, seen) do
-    if flow_lmdb_lagged_projection_enabled?() do
-      case Ferricstore.Flow.LMDB.expired_terminal_state_keys(
-             flow_lmdb_record_path(state),
-             now_ms,
-             remaining
-           ) do
-        {:ok, state_keys} ->
-          state_keys
-          |> Enum.reject(&MapSet.member?(seen, &1))
-          |> Enum.filter(&flow_retention_state_key_owned_by_shard?(state, &1))
+    case Ferricstore.Flow.LMDB.expired_terminal_state_keys(
+           flow_lmdb_record_path(state),
+           now_ms,
+           remaining
+         ) do
+      {:ok, state_keys} ->
+        state_keys
+        |> Enum.reject(&MapSet.member?(seen, &1))
+        |> Enum.filter(&flow_retention_state_key_owned_by_shard?(state, &1))
 
-        {:error, _reason} ->
-          []
-      end
-    else
-      []
+      {:error, _reason} ->
+        []
     end
   end
 
@@ -12273,36 +12269,32 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_retention_value_refs_used_by_other_lmdb_states(
          state,
-         owner_record,
-         target_refs,
-         referenced
-       ) do
-    if flow_lmdb_lagged_projection_enabled?() do
-      prefix = "f:{"
-      limit = flow_retention_value_lmdb_scan_limit()
-      path = flow_lmdb_record_path(state)
+       owner_record,
+       target_refs,
+       referenced
+     ) do
+    prefix = "f:{"
+    limit = flow_retention_value_lmdb_scan_limit()
+    path = flow_lmdb_record_path(state)
 
-      case flow_retention_lmdb_projection_state(state) do
-        :available ->
-          flow_retention_value_refs_used_by_lmdb_states_after(
-            path,
-            prefix,
-            <<>>,
-            limit,
-            state,
-            owner_record,
-            target_refs,
-            referenced
-          )
-
-        :empty ->
+    case flow_retention_lmdb_projection_state(state) do
+      :available ->
+        flow_retention_value_refs_used_by_lmdb_states_after(
+          path,
+          prefix,
+          <<>>,
+          limit,
+          state,
+          owner_record,
+          target_refs,
           referenced
+        )
 
-        :unavailable ->
-          MapSet.union(referenced, target_refs)
-      end
-    else
-      referenced
+      :empty ->
+        referenced
+
+      :unavailable ->
+        MapSet.union(referenced, target_refs)
     end
   end
 
@@ -12886,28 +12878,24 @@ defmodule Ferricstore.Raft.StateMachine do
     do: {[], false}
 
   defp flow_retention_lmdb_keys_with_prefix_page(state, prefix, limit) do
-    if flow_lmdb_lagged_projection_enabled?() do
-      path = flow_lmdb_record_path(state)
+    path = flow_lmdb_record_path(state)
 
-      case flow_retention_lmdb_projection_state(state) do
-        :available ->
-          case Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, <<>>, limit) do
-            {:ok, entries} ->
-              keys = Enum.map(entries, fn {key, _value} -> key end)
-              {keys, length(entries) < limit}
+    case flow_retention_lmdb_projection_state(state) do
+      :available ->
+        case Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, <<>>, limit) do
+          {:ok, entries} ->
+            keys = Enum.map(entries, fn {key, _value} -> key end)
+            {keys, length(entries) < limit}
 
-            {:error, _reason} ->
-              {[], false}
-          end
+          {:error, _reason} ->
+            {[], false}
+        end
 
-        :empty ->
-          {[], true}
+      :empty ->
+        {[], true}
 
-        :unavailable ->
-          {[], false}
-      end
-    else
-      {[], true}
+      :unavailable ->
+        {[], false}
     end
   end
 
@@ -12942,22 +12930,18 @@ defmodule Ferricstore.Raft.StateMachine do
     do: {:ok, [], false}
 
   defp flow_retention_lmdb_history_entries(state, history_key, remaining) do
-    if flow_lmdb_lagged_projection_enabled?() do
-      path = flow_lmdb_record_path(state)
-      prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+    path = flow_lmdb_record_path(state)
+    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
 
-      case flow_retention_lmdb_projection_state(state) do
-        :available ->
-          flow_retention_lmdb_history_entries_after(path, prefix, <<>>, remaining, [])
+    case flow_retention_lmdb_projection_state(state) do
+      :available ->
+        flow_retention_lmdb_history_entries_after(path, prefix, <<>>, remaining, [])
 
-        :empty ->
-          {:ok, [], true}
+      :empty ->
+        {:ok, [], true}
 
-        :unavailable ->
-          {:ok, [], false}
-      end
-    else
-      {:ok, [], true}
+      :unavailable ->
+        {:ok, [], false}
     end
   end
 
@@ -13018,14 +13002,12 @@ defmodule Ferricstore.Raft.StateMachine do
     event_ids = Enum.map(entries, &flow_retention_history_entry_event_id/1)
 
     with :ok <- flow_index_delete_members(state, history_key, event_ids) do
-      if flow_lmdb_lagged_projection_enabled?() do
-        with_lmdb_mirror_shard(state, fn ->
-          Enum.each(entries, fn entry ->
-            event_id = flow_retention_history_entry_event_id(entry)
-            queue_lmdb_history_index_delete(nil, history_key, event_id, flow_event_ms(event_id))
-          end)
+      with_lmdb_mirror_shard(state, fn ->
+        Enum.each(entries, fn entry ->
+          event_id = flow_retention_history_entry_event_id(entry)
+          queue_lmdb_history_index_delete(nil, history_key, event_id, flow_event_ms(event_id))
         end)
-      end
+      end)
 
       :ok
     end
@@ -15847,13 +15829,9 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
 
       :miss ->
-        if flow_lmdb_lagged_projection_enabled?() do
-          case flow_read_lmdb_record(state, key) do
-            {:ok, record} -> record
-            :miss -> nil
-          end
-        else
-          nil
+        case flow_read_lmdb_record(state, key) do
+          {:ok, record} -> record
+          :miss -> nil
         end
     end
   end
@@ -15886,7 +15864,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_state_keys_present(state, keys) do
     hot_results = Enum.map(keys, &flow_state_key_present_hot?(state, &1))
 
-    if flow_lmdb_lagged_projection_enabled?() and Enum.any?(hot_results, &(&1 == false)) do
+    if Enum.any?(hot_results, &(&1 == false)) do
       lmdb_reads =
         keys
         |> Enum.zip(hot_results)
@@ -15936,13 +15914,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_read_records_by_keys(state, keys) do
-    cond do
-      flow_lmdb_lagged_projection_enabled?() ->
-        flow_read_mirror_records(state, keys)
-
-      true ->
-        Enum.map(keys, &flow_read_hot_state_record(state, &1))
-    end
+    flow_read_mirror_records(state, keys)
   end
 
   defp flow_read_hot_state_record(state, key) do
@@ -19632,10 +19604,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_lmdb_projection_enabled?(_state) do
     :persistent_term.get({__MODULE__, :flow_lmdb_hot_projection_removed}, false)
-  end
-
-  defp flow_lmdb_lagged_projection_enabled? do
-    Ferricstore.Flow.LMDB.projection_enabled?()
   end
 
   defp flow_lmdb_record_path(state), do: Map.fetch!(state, :flow_lmdb_path)
