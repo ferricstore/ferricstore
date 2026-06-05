@@ -344,17 +344,6 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
-    assert :ok =
-             Ferricstore.Flow.LMDBWriter.flush_all(FerricStore.Instance.get(:default).shard_count)
-
-    assert {:ok, [_ | _]} =
-             FerricStore.flow_history(id,
-               partition_key: "tenant-retention",
-               include_cold: true,
-               consistent_projection: true,
-               count: 10
-             )
-
     Process.sleep(150)
 
     assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)

@@ -99,8 +99,16 @@ defmodule Ferricstore.FlowBackpressureTest do
 
     assert {:error, message} =
              Router.flow_create_many_independent(ctx, [
-               %{id: "flow-overload-many-a-#{System.unique_integer([:positive])}"},
-               %{id: "flow-overload-many-b-#{System.unique_integer([:positive])}"}
+               %{
+                 id: "flow-overload-many-a-#{System.unique_integer([:positive])}",
+                 type: "overload",
+                 state: "queued"
+               },
+               %{
+                 id: "flow-overload-many-b-#{System.unique_integer([:positive])}",
+                 type: "overload",
+                 state: "queued"
+               }
              ])
 
     assert message =~ "BUSY"
