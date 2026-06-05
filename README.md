@@ -286,32 +286,6 @@ Operations and reference:
 - [Security](guides/security.md) — ACL, TLS, protected mode.
 - [Best Practices](guides/best-practices.md) — pipelining, key design, partitioning.
 
-## Development
-
-Source builds require:
-
-- Elixir >= 1.19
-- Erlang/OTP 28+
-- Rust stable toolchain
-
-```bash
-mix deps.get
-mix compile
-mix test
-```
-
-Run from source:
-
-```bash
-MIX_ENV=prod FERRICSTORE_DATA_DIR=/tmp/ferricstore mix run --no-halt
-```
-
-Build a release:
-
-```bash
-MIX_ENV=prod mix release ferricstore
-```
-
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see [SECURITY.md](SECURITY.md).
