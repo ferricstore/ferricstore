@@ -78,9 +78,8 @@ The official image is published to GitHub Container Registry:
 docker pull ghcr.io/ferricstore/ferricstore:0.4.1
 ```
 
-Current release images are published for `linux/amd64`. Native `linux/arm64`
-images should be built on native arm64 runners or added through a future
-multi-arch manifest.
+Current release images are published as multi-arch images for `linux/amd64`
+and `linux/arm64`.
 
 ### Docker Production Notes
 

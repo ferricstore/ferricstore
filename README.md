@@ -67,9 +67,8 @@ The published container image is hosted on GitHub Container Registry:
 docker pull ghcr.io/ferricstore/ferricstore:0.4.1
 ```
 
-Current release images are published for `linux/amd64`. Native `linux/arm64`
-container images will be added in a later release; Apple Silicon can still run
-the amd64 image through Docker emulation for local development.
+Current release images are published as multi-arch images for `linux/amd64`
+and `linux/arm64`.
 
 ## First Flow Over RESP
 

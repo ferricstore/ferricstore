@@ -27,7 +27,7 @@ docker run -p 6379:6379 \
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
 
 The official container image is `ghcr.io/ferricstore/ferricstore`. The current
-release tag is `0.4.1` and is published for `linux/amd64`.
+release tag is `0.4.1` and is published for `linux/amd64` and `linux/arm64`.
 
 Smoke test with `redis-cli`:
 
