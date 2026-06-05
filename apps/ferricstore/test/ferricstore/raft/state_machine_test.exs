@@ -7,7 +7,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   be tested in isolation by constructing state manually.
   """
 
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.{BlobCommand, StateMachine}
