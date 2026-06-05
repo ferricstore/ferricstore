@@ -42,10 +42,16 @@ defmodule Ferricstore.MixProject do
         "../../guides/architecture.md",
         "../../guides/deployment.md",
         "../../guides/security.md",
-        "../../guides/best-practices.md"
+        "../../guides/best-practices.md",
+        "../../docs/flow-vs-temporal-usage.md",
+        "../../docs/benchmarks.md",
+        "../../docs/flow-production-readiness.md",
+        "../../docs/flow-retry-policy.md",
+        "../../docs/testing.md"
       ],
       groups_for_extras: [
-        Guides: Path.wildcard("../../guides/*.md")
+        Guides: Path.wildcard("../../guides/*.md"),
+        References: Path.wildcard("../../docs/*.md")
       ],
       source_url: "https://github.com/ferricstore/ferricstore",
       homepage_url: "https://github.com/ferricstore/ferricstore"
