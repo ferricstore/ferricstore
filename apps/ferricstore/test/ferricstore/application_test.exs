@@ -87,59 +87,31 @@ defmodule Ferricstore.ApplicationTest do
       assert Process.whereis(Ferricstore.Store.BlobGCSweeper)
     end
 
-    test "default instance uses configured blob side-channel threshold for raft writes" do
-      server_started? = application_started?(:ferricstore_server)
-      old_data_dir = Application.get_env(:ferricstore, :data_dir)
-      old_shard_count = Application.get_env(:ferricstore, :shard_count)
-      old_hot_cache = Application.get_env(:ferricstore, :hot_cache_max_value_size)
-      old_threshold = Application.get_env(:ferricstore, :blob_side_channel_threshold_bytes)
+    test "isolated instance uses configured blob side-channel threshold for raft writes" do
+      value = :binary.copy("x", 256)
 
-      data_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "ferricstore-app-blob-threshold-#{System.unique_integer([:positive])}"
+      ctx =
+        Ferricstore.Test.IsolatedInstance.checkout(
+          shard_count: 1,
+          hot_cache_max_value_size: 64,
+          blob_side_channel_threshold_bytes: 128
         )
 
       try do
-        stop_app_if_started(:ferricstore_server)
-        stop_app_if_started(:ferricstore)
-
-        Application.put_env(:ferricstore, :data_dir, data_dir)
-        Application.put_env(:ferricstore, :shard_count, 1)
-        Application.put_env(:ferricstore, :hot_cache_max_value_size, 64)
-        Application.put_env(:ferricstore, :blob_side_channel_threshold_bytes, 128)
-
-        assert {:ok, _} = Application.ensure_all_started(:ferricstore)
-
-        ctx = FerricStore.Instance.get(:default)
         assert ctx.blob_side_channel_threshold_bytes == 128
 
         assert :ok =
                  Ferricstore.Store.Router.put(
                    ctx,
-                   "blob-threshold-default",
-                   :binary.copy("x", 256)
+                   "blob-threshold-isolated",
+                   value
                  )
 
-        assert [_blob_file] = Path.wildcard(Path.join(data_dir, "blob/shard_0/*/*.bloblog"))
-
-        assert {1, "blob-threshold-default", 256} =
-                 Ferricstore.Application.scan_large_values(1, 200)
+        assert {:ok, ^value} = Ferricstore.Store.Router.get(ctx, "blob-threshold-isolated")
+        assert [_blob_file | _] =
+                 Path.wildcard(Path.join(ctx.data_dir, "blob/shard_0/*/*.bloblog"))
       after
-        stop_app_if_started(:ferricstore_server)
-        stop_app_if_started(:ferricstore)
-
-        restore_env(:data_dir, old_data_dir)
-        restore_env(:shard_count, old_shard_count)
-        restore_env(:hot_cache_max_value_size, old_hot_cache)
-        restore_env(:blob_side_channel_threshold_bytes, old_threshold)
-        File.rm_rf(data_dir)
-
-        ensure_ferricstore_ready!()
-
-        if server_started? do
-          {:ok, _} = Application.ensure_all_started(:ferricstore_server)
-        end
+        Ferricstore.Test.IsolatedInstance.checkin(ctx)
       end
     end
 

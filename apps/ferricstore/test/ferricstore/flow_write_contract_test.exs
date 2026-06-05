@@ -405,6 +405,7 @@ defmodule Ferricstore.FlowWriteContractTest do
         source
       )
 
+    assert function_source =~ "flow_registry_keys_present_hot_only"
     assert function_source =~ "flow_state_keys_present_hot_only"
 
     refute function_source =~ "flow_state_keys_present(state, keys)",

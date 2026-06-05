@@ -8629,6 +8629,16 @@ defmodule Ferricstore.Flow do
       "f:" <> tag(partition_key) <> ":s:" <> id
     end
 
+    def registry_key(id, partition_key \\ nil)
+
+    def registry_key(id, nil) when is_binary(id) do
+      "f:" <> tag(auto_partition_key(id)) <> ":r:" <> id
+    end
+
+    def registry_key(id, partition_key) do
+      "f:" <> tag(partition_key) <> ":r:" <> id
+    end
+
     def state_key_from_due_key(due_key, id) when is_binary(due_key) and is_binary(id) do
       case :binary.match(due_key, "}:d:") do
         {pos, _len} when pos >= 2 ->
@@ -8738,6 +8748,10 @@ defmodule Ferricstore.Flow do
     def state_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:s:") != :nomatch
 
     def state_key?(_key), do: false
+
+    def registry_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:r:") != :nomatch
+
+    def registry_key?(_key), do: false
 
     def tag(nil), do: @global_tag
     def tag(:global), do: @global_tag

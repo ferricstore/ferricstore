@@ -6288,6 +6288,7 @@ defmodule Ferricstore.Raft.StateMachine do
              state_key,
              record
            ),
+         :ok <- flow_create_put_registry_marker(state, record),
          :ok <- flow_due_put(state, record),
          :ok <- flow_index_put(state, record),
          :ok <- flow_history_put(state, record, "created", Map.get(record, :created_at_ms)),
@@ -6378,6 +6379,7 @@ defmodule Ferricstore.Raft.StateMachine do
         partition_key: partition_key,
         tag: tag,
         state_key: flow_state_key_with_tag(tag, id),
+        registry_key: flow_registry_key_with_tag(tag, id),
         shard_index: stamped_shard || Map.get(attrs, @flow_shard_marker)
       }
     end)
@@ -6385,11 +6387,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_create_fast_key_info(attrs, state_key) do
     partition_key = Map.get(attrs, :partition_key)
+    tag = FlowKeys.tag(partition_key)
 
     %{
       partition_key: partition_key,
-      tag: FlowKeys.tag(partition_key),
+      tag: tag,
       state_key: state_key,
+      registry_key: flow_registry_key_with_tag(tag, Map.fetch!(attrs, :id)),
       shard_index: Map.get(attrs, @flow_shard_marker)
     }
   end
@@ -6421,8 +6425,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_create_non_idempotent_many_prepare(state, attrs_list, key_infos) do
     keys = Enum.map(key_infos, & &1.state_key)
+    registry_keys = Enum.map(key_infos, & &1.registry_key)
 
-    if Enum.any?(flow_state_keys_present_hot_only(state, keys), & &1) do
+    if Enum.any?(flow_registry_keys_present_hot_only(state, registry_keys), & &1) or
+         Enum.any?(flow_state_keys_present_hot_only(state, keys), & &1) do
       {:error, "ERR flow already exists"}
     else
       attrs_list
@@ -6443,7 +6449,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_create_fast_plan(record, attrs, %{tag: tag, state_key: state_key}) do
+  defp flow_create_fast_plan(record, attrs, %{
+         tag: tag,
+         state_key: state_key,
+         registry_key: registry_key
+       }) do
     partition_key = Map.get(record, :partition_key)
     id = Map.fetch!(record, :id)
     type = Map.fetch!(record, :type)
@@ -6457,6 +6467,7 @@ defmodule Ferricstore.Raft.StateMachine do
       partition_key: partition_key,
       tag: tag,
       state_key: state_key,
+      registry_key: registry_key,
       history_key: history_key,
       state_index_key: flow_state_index_key_with_tag(tag, type, flow_state),
       state_index_score: score,
@@ -7481,6 +7492,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <- flow_create_put_record_values(state, plans),
          :ok <- flow_create_put_state_records(state, records),
+         :ok <- flow_create_put_registry_markers(state, records),
          :ok <- flow_due_put_many_new(state, records),
          :ok <- flow_index_put_many_new(state, records),
          :ok <- flow_create_put_history(state, records) do
@@ -7495,6 +7507,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <- flow_create_fast_put_record_values(state, plans),
          :ok <- flow_create_put_fast_state_records(state, plans),
+         :ok <- flow_create_put_fast_registry_markers(state, plans),
          :ok <- flow_create_put_fast_indexes(state, plans),
          :ok <- flow_create_put_fast_history(state, plans) do
       :ok
@@ -7508,6 +7521,36 @@ defmodule Ferricstore.Raft.StateMachine do
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+  end
+
+  defp flow_create_put_registry_markers(state, records) do
+    Enum.reduce_while(records, :ok, fn record, :ok ->
+      case flow_create_put_registry_marker(state, record) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_create_put_fast_registry_markers(state, plans) do
+    Enum.reduce_while(plans, :ok, fn %{registry_key: key, record: record}, :ok ->
+      case flow_put_registry_marker(state, key, record) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_create_put_registry_marker(state, %{id: id} = record) when is_binary(id) do
+    flow_put_registry_marker(
+      state,
+      FlowKeys.registry_key(id, Map.get(record, :partition_key)),
+      record
+    )
+  end
+
+  defp flow_put_registry_marker(state, key, record) do
+    raw_put_cold(state, key, <<1>>, flow_record_expire_at(record), LFU.initial())
   end
 
   defp flow_create_fast_staged_put_batch?(state) do
@@ -12039,11 +12082,13 @@ defmodule Ferricstore.Raft.StateMachine do
     if owned_values_complete? do
       shared_value_links = flow_retention_shared_value_links(state, record)
       shared_link_keys = Enum.map(shared_value_links, fn {key, _ref} -> key end)
+      registry_key = flow_retention_registry_key(record)
 
       with :ok <- flow_retention_delete_history_index(state, history_key, history_entries),
            {:ok, history_count} <- flow_retention_delete_keys(state, history_keys),
            {:ok, values_count} <- flow_retention_delete_keys(state, value_refs),
            {:ok, _shared_link_count} <- flow_retention_delete_keys(state, shared_link_keys),
+           {:ok, _registry_count} <- flow_retention_delete_keys(state, [registry_key]),
            :ok <- do_delete(state, state_key) do
         maybe_queue_terminal_lmdb_index_delete(state, record)
         queue_lmdb_metadata_index_deletes(state, record)
@@ -13262,6 +13307,12 @@ defmodule Ferricstore.Raft.StateMachine do
       end
     end)
   end
+
+  defp flow_retention_registry_key(%{id: id} = record) when is_binary(id) do
+    FlowKeys.registry_key(id, Map.get(record, :partition_key))
+  end
+
+  defp flow_retention_registry_key(_record), do: nil
 
   defp flow_retention_merge_counts(left, right) do
     %{
@@ -14732,6 +14783,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_state_key_with_tag(tag, id), do: "f:" <> tag <> ":s:" <> id
+  defp flow_registry_key_with_tag(tag, id), do: "f:" <> tag <> ":r:" <> id
   defp flow_history_key_with_tag(tag, id), do: "f:" <> tag <> ":h:" <> id
 
   defp flow_due_key_with_tag(tag, type, flow_state, priority) do
@@ -15898,6 +15950,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_state_keys_present_hot_only(state, keys) do
     Enum.map(keys, &flow_state_key_present_hot?(state, &1))
+  end
+
+  defp flow_registry_keys_present_hot_only(state, keys) do
+    Enum.map(keys, &:ets.member(state.ets, &1))
   end
 
   defp flow_state_key_present?(state, key) do
