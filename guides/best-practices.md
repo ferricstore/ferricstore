@@ -127,7 +127,7 @@ These commands are FerricStore-specific and are useful when they match your work
 | `FETCH_OR_COMPUTE` | Cache stampede protection. |
 | `LOCK` / `UNLOCK` / `EXTEND` | Explicit distributed lock operations. |
 | `RATELIMIT.ADD` | Namespace-aware rate limiting. |
-| `FLOW.*` | Durable execution: queues, workflows, signals, retries, leases, value refs. |
+| `FLOW.*` | Durable workflow state: queues, workflows, signals, retries, leases, value refs. |
 
 ## Prefer Compound Operations Over Multiple Round-Trips
 
