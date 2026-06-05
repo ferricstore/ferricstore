@@ -1,9 +1,6 @@
 ## FerricStore BEAM VM configuration
 ## Applied at release boot via `mix release`
 
-## Node name
--sname ferricstore
-
 ## Max processes (default 262144, need headroom for many connections)
 +P 1048576
 

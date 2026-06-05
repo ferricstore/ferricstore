@@ -17,13 +17,14 @@ WORKDIR /app
 RUN mix local.hex --force && mix local.rebar --force
 
 ENV MIX_ENV=prod
+ENV HEX_HTTP_TIMEOUT=120
+ENV HEX_HTTP_CONCURRENCY=2
 
 # Copy mix files (all apps needed for umbrella resolution)
 COPY mix.exs mix.lock ./
 COPY apps/ferricstore/mix.exs apps/ferricstore/mix.exs
 COPY apps/ferricstore_server/mix.exs apps/ferricstore_server/mix.exs
 COPY config/config.exs config/prod.exs config/runtime.exs config/
-COPY vendor vendor
 
 # Copy source for the standalone Docker image
 COPY apps/ferricstore/native apps/ferricstore/native
@@ -34,7 +35,7 @@ COPY apps/ferricstore_server/native apps/ferricstore_server/native
 COPY apps/ferricstore_server/lib apps/ferricstore_server/lib
 COPY rel rel
 
-RUN mix deps.get --only prod
+RUN mix deps.unlock --unused && mix deps.get --only prod
 
 # Compile everything (deps + app code)
 RUN mix compile
@@ -61,6 +62,9 @@ RUN mkdir -p /data
 ENV FERRICSTORE_DATA_DIR=/data
 ENV FERRICSTORE_PORT=6379
 ENV FERRICSTORE_HEALTH_PORT=6380
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV ELIXIR_ERL_OPTIONS="+fnu"
 
 EXPOSE 6379 6380
 

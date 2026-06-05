@@ -23,7 +23,7 @@ defmodule Ferricstore.Flow.Hibernation do
                                     :flow_hibernation_late_promote_window_ms,
                                     5 * 60 * 1_000
                                   )
-  @enabled Application.compile_env(:ferricstore, :flow_hibernation_enabled, true)
+  @enabled true
   @enabled_key {__MODULE__, :enabled}
 
   @type candidate :: %{
