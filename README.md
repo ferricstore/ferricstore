@@ -5,11 +5,11 @@
 [![CI](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml/badge.svg)](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-**FerricStore is a Redis-compatible durable server with FerricFlow durable execution built in.**
+**FerricStore is a durable server with Redis-compatible storage and FerricFlow workflow state built in.**
 
-FerricStore gives applications a durable key-value/data-structure store and a workflow layer for queues, explicit state machines, retries, leases, history, value refs, signals, and fanout.
+FerricStore gives applications a durable key-value/data-structure store and a workflow layer for worker queues, explicit state machines, retries, leases, history, observability, value refs, signals, and fanout.
 
-FerricFlow is the durable execution layer inside FerricStore. It stores workflow state as server-owned records instead of asking application code to rebuild leases, due indexes, retry state, history, and terminal records around a generic queue.
+FerricFlow keeps each workflow or job's state and history in one durable place. Applications keep running normal business code; FerricFlow records ownership, lease tokens, attempts, retry timing, history, terminal state, retention metadata, and repair data instead of asking application code to rebuild those pieces around a generic queue.
 
 ## Beta Status
 
@@ -18,6 +18,11 @@ commands, precompiled NIFs, Docker image, and SDKs are published and usable, but
 public APIs, command details, operational defaults, and storage/projection
 internals may still change before `1.0`.
 
+Beta does not mean lightly tested. The project is thoroughly tested across the
+durability path, FerricFlow workflow commands, Rust NIFs, storage behavior,
+security, dashboard/API surfaces, the embedded API, Python SDK, restart/recovery,
+cluster/quorum behavior, benchmarks, and longer soak runs.
+
 Use it today for development, benchmarks, pilots, and controlled production
 experiments. For critical production workloads, pin exact versions, test
 upgrades on your data model, and expect compatibility guarantees to harden with
@@ -25,7 +30,7 @@ the `1.0` release line.
 
 ## What Is A Flow?
 
-A Flow is one durable execution record:
+A Flow is one durable workflow record:
 
 | Field | Meaning |
 | --- | --- |
@@ -68,7 +73,7 @@ the amd64 image through Docker emulation for local development.
 
 ## First Flow Over RESP
 
-FerricFlow commands are available over the Redis-compatible protocol, so normal RESP clients can use pipelines, ACLs, TLS, and existing connection pools.
+FerricFlow commands are exposed over RESP, so clients can use pipelines, ACLs, TLS, and existing connection pools. Durability is the default contract: a workflow command returns success only after the state change is accepted through the quorum path and written to disk.
 
 Durable queue item:
 
@@ -88,7 +93,7 @@ FLOW.CLAIM_DUE order STATE charged WORKER worker-1 LIMIT 1
 FLOW.COMPLETE order-1 <lease-token> FENCING <fencing-token> RESULT "ok"
 ```
 
-Because this is RESP, Flow commands and normal Redis-compatible commands can be pipelined on the same connection.
+Because this is RESP, Flow commands and normal FerricStore commands can be pipelined on the same connection.
 
 ## Python SDK
 
@@ -272,7 +277,7 @@ Start here:
 
 FerricFlow:
 
-- [Flow command reference](guides/commands.md) — `FLOW.*` command syntax alongside Redis-compatible commands.
+- [Flow command reference](guides/commands.md) — `FLOW.*` command syntax and FerricStore command compatibility.
 - [Flow retry policy](docs/flow-retry-policy.md) — type/state retry policies and retry exhaustion behavior.
 - [Flow production readiness](docs/flow-production-readiness.md) — operational model, lagged projections, retention, reclaim, and production tuning.
 - [Elixir Flow SDK](guides/flow-elixir-sdk.md) — high-level embedded workflow/state-machine API over core Flow commands.
@@ -280,7 +285,7 @@ FerricFlow:
 Operations and reference:
 
 - [Architecture](guides/architecture.md) — write path, read path, storage, Raft consensus.
-- [Commands Reference](guides/commands.md) — Redis-compatible and FerricFlow command syntax.
+- [Commands Reference](guides/commands.md) — FerricStore command syntax, Redis compatibility, and FerricFlow commands.
 - [Configuration](guides/configuration.md) — server config and production defaults.
 - [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering.
 - [Security](guides/security.md) — ACL, TLS, protected mode.

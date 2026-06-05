@@ -9,7 +9,7 @@ FerricStore has two common ways to run:
 | Docker/server | You want a Redis-compatible TCP server for Python, Go, Node, Java, Elixir, or redis-cli clients. |
 | Embedded Elixir | You want FerricStore inside an Elixir application with direct `FerricStore.*` calls. |
 
-FerricFlow is available in both modes. It is the durable execution layer for queues, state-machine workflows, retries, leases, signals, value refs, and fanout.
+FerricFlow is available in both modes. It keeps workflow or job state and history in one durable place for queues, state-machine workflows, retries, leases, signals, value refs, observability, and fanout.
 
 > **Beta:** FerricStore is currently a `0.x` beta. It is published and usable,
 > but APIs, command details, and operational defaults may change before `1.0`.
@@ -39,7 +39,7 @@ redis-cli -p 6379 GET hello
 
 ## 2. Create Your First Flow
 
-A Flow is one durable execution record with a `type`, `id`, `state`, payload/value refs, lease, history, and terminal status.
+A Flow is one durable workflow record with a `type`, `id`, `state`, payload/value refs, lease, history, and terminal status. Flow commands return success only after the state change is accepted through the quorum path and written to disk.
 
 ```text
 FLOW.CREATE email-1 TYPE email STATE queued PAYLOAD "welcome:user-1"

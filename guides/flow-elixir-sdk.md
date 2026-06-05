@@ -7,7 +7,8 @@ FerricStore Flow already exposes low-level embedded commands such as
 The Elixir Flow SDK is the high-level embedded API for durable queues and
 state-machine workflows. It builds on `FerricStore.flow_*` commands. It does not
 add a replay engine, does not use RESP, and does not change Flow durability or
-atomicity.
+atomicity: successful Flow writes are accepted through the quorum path and
+written to disk.
 
 
 ## First Workflow

@@ -4,7 +4,7 @@ This is the command reference for the Redis-compatible server and FerricFlow.
 
 Start here if you need exact RESP syntax, return values, embedded API equivalents, or compatibility notes. For a first walkthrough, use [Getting Started](getting-started.md).
 
-FerricFlow commands use the `FLOW.*` prefix and model durable execution: create, claim due work, transition, retry, complete, fail, cancel, signal, value refs, and fanout.
+FerricFlow commands use the `FLOW.*` prefix and model durable workflow state: create, claim due work, transition, retry, complete, fail, cancel, signal, value refs, and fanout.
 
 ## Redis Compatibility Summary
 
@@ -35,7 +35,7 @@ CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELL
 
 ### FerricStore-Native Flow Commands
 
-Flow commands are FerricStore-native workflow primitives, not Redis
+Flow commands are FerricStore-native workflow commands, not Redis
 compatibility commands. They are exposed through RESP3 and the embedded API:
 
 `FLOW.CREATE`, `FLOW.CREATE_MANY`, `FLOW.VALUE.PUT`, `FLOW.SIGNAL`,

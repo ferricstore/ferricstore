@@ -14,7 +14,7 @@ Flow record: type + id + state + payload/value refs + lease + history + terminal
 Worker:      claim due state -> run handler -> transition/complete/fail/retry
 ```
 
-Handlers are normal application code. FerricFlow does not replay handler code to recover state.
+Handlers are normal application code. FerricFlow does not replay handler code to recover state. A Flow command returns success only after the state change is accepted through the quorum path and written to disk.
 
 ## Durable Queue Item
 

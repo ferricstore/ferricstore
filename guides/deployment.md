@@ -82,33 +82,17 @@ Current release images are published for `linux/amd64`. Native `linux/arm64`
 images should be built on native arm64 runners or added through a future
 multi-arch manifest.
 
-### Optimized for Production
+### Docker Production Notes
 
-For maximum write throughput, enable io_uring and use NVMe storage:
+For write-heavy workloads, prefer a direct data mount on durable fast storage and
+make sure the container runtime allows io_uring syscalls.
 
-```yaml
-# docker-compose.yml
-services:
-  ferricstore:
-    image: ghcr.io/ferricstore/ferricstore:0.4.1
-    ports:
-      - "6379:6379"
-    environment:
-      FERRICSTORE_PROTECTED_MODE: "false"
-
-    # Enable io_uring syscalls (blocked by Docker's default seccomp)
-    security_opt:
-      - seccomp:unconfined
-
-    # Mount NVMe directly (bypass Docker overlay filesystem)
-    volumes:
-      - /mnt/nvme/ferricstore:/data
-
-    # Pin to specific CPUs for consistent performance
-    cpuset: "0-7"
-
-    # Disable memory swap
-    mem_swappiness: 0
+```bash
+docker run -p 6379:6379 \
+  --security-opt seccomp=unconfined \
+  -e FERRICSTORE_PROTECTED_MODE=true \
+  -v /mnt/nvme/ferricstore:/data \
+  ghcr.io/ferricstore/ferricstore:0.4.1
 ```
 
 #### Why io_uring Matters
@@ -144,25 +128,19 @@ For a storage engine that does its own caching (ETS) and write-ahead logging
 (WARaft segment log + Bitcask), this overhead is pure waste.
 
 Mount the NVMe partition directly:
-```yaml
-volumes:
-  - /mnt/nvme/ferricstore:/data    # Direct mount, no overlay
+
+```bash
+-v /mnt/nvme/ferricstore:/data
 ```
 
 Or for maximum IOPS, use a RAM-backed tmpfs (data lost on restart):
-```yaml
-tmpfs:
-  - /data:size=8g
-```
-
-### 3-Node Cluster with HAProxy
 
 ```bash
-docker compose up -d
+docker run --tmpfs /data:size=8g ...
 ```
 
-See `docker-compose.yml` for the full configuration. HAProxy runs in TCP
-mode (`mode tcp`) for zero-overhead load balancing.
+Cluster container examples will be documented after that layout is tested as
+part of the release process.
 
 ## Kubernetes
 
