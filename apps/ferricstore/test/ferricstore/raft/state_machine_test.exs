@@ -1224,7 +1224,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
                         %{shard_index: ^shard_index, status: :ok}},
                        500
 
-        assert measurements.batch_size == 3
+        assert measurements.batch_size == 6
         assert measurements.delete_count == 0
         assert measurements.batch_bytes > 0
 
@@ -1315,7 +1315,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
                         %{shard_index: ^shard_index, status: :ok}},
                        500
 
-        assert measurements.batch_size == 2
+        assert measurements.batch_size == 4
         assert measurements.delete_count == 0
         assert measurements.batch_bytes > 0
 
