@@ -199,38 +199,8 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  def policy_set(ctx, type, opts) when is_binary(type) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_type(type),
-         :ok <- validate_key_size(__MODULE__.Keys.policy_key(type)),
-         {:ok, policy} <- RetryPolicy.normalize_flow_policy(type, opts) do
-      case Router.flow_policy_put_all(
-             ctx,
-             __MODULE__.Keys.policy_key(type),
-             RetryPolicy.encode_flow_policy(policy),
-             0
-           ) do
-        :ok -> {:ok, policy_response(type, policy, Keyword.get(opts, :state))}
-        {:error, _reason} = error -> error
-      end
-    end
-  end
-
-  def policy_set(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
-
-  def policy_get(ctx, type, opts \\ [])
-
-  def policy_get(ctx, type, opts) when is_binary(type) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_type(type),
-         {:ok, state} <- optional_binary_or_nil(opts, :state, nil),
-         :ok <- validate_key_size(__MODULE__.Keys.policy_key(type)),
-         {:ok, policy} <- flow_policy_read(ctx, type) do
-      {:ok, policy_response(type, policy, state)}
-    end
-  end
-
-  def policy_get(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+  defdelegate policy_set(ctx, type, opts), to: Ferricstore.Flow.Policy, as: :set
+  defdelegate policy_get(ctx, type, opts \\ []), to: Ferricstore.Flow.Policy, as: :get
 
   def claim_due(ctx, type, opts) when is_binary(type) and is_list(opts) do
     started = flow_start_time()
@@ -6804,57 +6774,6 @@ defmodule Ferricstore.Flow do
     |> maybe_put_flow_value_ref(opts, :value_refs)
     |> maybe_put_flow_value_ref(opts, :drop_values)
     |> maybe_put_flow_value_ref(opts, :override_values)
-  end
-
-  defp flow_policy_read(ctx, type) do
-    case Stats.with_cache_tracking_disabled(fn ->
-           Router.get(ctx, __MODULE__.Keys.policy_key(type))
-         end) do
-      nil ->
-        {:ok, nil}
-
-      value when is_binary(value) ->
-        case RetryPolicy.decode_flow_policy(value) do
-          {:ok, policy} -> {:ok, policy}
-          :error -> {:error, "ERR flow policy is corrupt"}
-        end
-
-      _other ->
-        {:error, "ERR flow policy is corrupt"}
-    end
-  end
-
-  defp policy_response(type, policy, nil) do
-    states = Map.get(policy || %{}, :states, %{})
-
-    %{
-      type: type,
-      retry: RetryPolicy.resolve(policy, nil, nil),
-      retention: policy_response_retention(policy, nil),
-      states:
-        Map.new(states, fn {state, _state_policy} ->
-          {state,
-           %{
-             retry: RetryPolicy.resolve(policy, state, nil),
-             retention: policy_response_retention(policy, state)
-           }}
-        end)
-    }
-  end
-
-  defp policy_response(type, policy, state) when is_binary(state) do
-    %{
-      type: type,
-      state: state,
-      retry: RetryPolicy.resolve(policy, state, nil),
-      retention: policy_response_retention(policy, state)
-    }
-  end
-
-  defp policy_response_retention(policy, state) do
-    policy
-    |> RetryPolicy.resolve_retention(state, nil)
-    |> Map.delete(:history_hot_max_events)
   end
 
   defp now_ms, do: CommandTime.now_ms()
