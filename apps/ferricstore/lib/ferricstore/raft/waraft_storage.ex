@@ -1447,7 +1447,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
     do: default_threshold
 
   defp segment_project_cold_flow_key?(key) when is_binary(key),
-    do: FlowKeys.value_key?(key) or FlowKeys.history_key?(key)
+    do: FlowKeys.value_key?(key) or FlowKeys.history_key?(key) or FlowKeys.registry_key?(key)
 
   defp segment_project_cold_flow_key?(_key), do: false
 

@@ -423,6 +423,20 @@ defmodule Ferricstore.FlowWriteContractTest do
            "hot-only helper must not delegate to the lagged LMDB presence path"
   end
 
+  test "flow registry markers use segment-keydir storage instead of apply projection" do
+    source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+
+    [function_source] =
+      Regex.run(
+        ~r/defp segment_project_cold_flow_key\?\(key\).*?^  end/ms,
+        source
+      )
+
+    assert function_source =~ "FlowKeys.value_key?(key)"
+    assert function_source =~ "FlowKeys.history_key?(key)"
+    assert function_source =~ "FlowKeys.registry_key?(key)"
+  end
+
   test "flow retry many history builds entries and next records in one traversal" do
     source = File.read!("lib/ferricstore/raft/state_machine.ex")
 
