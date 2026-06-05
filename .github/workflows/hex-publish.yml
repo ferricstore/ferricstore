@@ -15,13 +15,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check Hex credentials
+        id: hex_creds
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          if [ -n "$HEX_API_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "HEX_API_KEY is not configured; skipping Hex publish."
+          fi
+
       - name: Set up Elixir
+        if: steps.hex_creds.outputs.available == 'true'
         uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
           otp-version: "28"
 
       - name: Cache deps
+        if: steps.hex_creds.outputs.available == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -30,13 +44,16 @@ jobs:
           key: hex-publish-${{ hashFiles('mix.lock') }}
 
       - name: Install dependencies
+        if: steps.hex_creds.outputs.available == 'true'
         run: mix deps.get
 
       - name: Extract version from tag
+        if: steps.hex_creds.outputs.available == 'true'
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Wait for all precompiled NIF artifacts
+        if: steps.hex_creds.outputs.available == 'true'
         run: |
           # Three crates x six targets = 18 tarballs. The RESP parser NIF is
           # part of the core package because embedded and server paths share it.
@@ -62,6 +79,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate NIF checksum files
+        if: steps.hex_creds.outputs.available == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -113,6 +131,7 @@ jobs:
 
       # Publish core package
       - name: Publish ferricstore (core)
+        if: steps.hex_creds.outputs.available == 'true'
         run: |
           cd apps/ferricstore
           mix hex.publish --replace --yes
