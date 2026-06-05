@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow do
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.RetryPolicy
+  alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Stats
   alias Ferricstore.Store.{BlobValue, ColdRead, Router}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -54,7 +55,7 @@ defmodule Ferricstore.Flow do
         |> maybe_notify_claim_waiters(attrs, :state)
       end
 
-    observe_flow(:create, started, result, %{
+    FlowTelemetry.observe(:create, started, result, %{
       flow_id: id,
       flow_type: Keyword.get(opts, :type),
       _count: 1
@@ -100,7 +101,9 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:value_put, started, result, %{flow_id: Keyword.get(opts, :owner_flow_id)})
+    FlowTelemetry.observe(:value_put, started, result, %{
+      flow_id: Keyword.get(opts, :owner_flow_id)
+    })
   end
 
   def value_put(_ctx, _value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
@@ -400,7 +403,7 @@ defmodule Ferricstore.Flow do
         Router.flow_signal(ctx, attrs)
       end
 
-    observe_flow(:signal, started, result, %{flow_id: id, _count: 1})
+    FlowTelemetry.observe(:signal, started, result, %{flow_id: id, _count: 1})
   end
 
   def signal(_ctx, id, _opts) when not is_binary(id),
@@ -443,7 +446,7 @@ defmodule Ferricstore.Flow do
       |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
 
     results = for idx <- 0..(length(creates) - 1), do: Map.fetch!(indexed_results, idx)
-    observe_flow_batch(:create, started, results)
+    FlowTelemetry.observe_batch(:create, started, results)
     results
   end
 
@@ -473,7 +476,7 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:create, started, result, %{
+    FlowTelemetry.observe(:create, started, result, %{
       flow_id: nil,
       flow_type: Keyword.get(opts, :type),
       _count: length(items)
@@ -492,7 +495,7 @@ defmodule Ferricstore.Flow do
         Router.flow_spawn_children(ctx, attrs)
       end
 
-    observe_flow(:spawn_children, started, result, %{flow_id: parent_id, _count: 1})
+    FlowTelemetry.observe(:spawn_children, started, result, %{flow_id: parent_id, _count: 1})
   end
 
   def spawn_children(_ctx, parent_id, _children, _opts) when not is_binary(parent_id),
@@ -575,7 +578,7 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:claim_due, started, result, %{flow_type: type})
+    FlowTelemetry.observe(:claim_due, started, result, %{flow_type: type})
   end
 
   def reclaim(ctx, type, opts) when is_binary(type) and is_list(opts) do
@@ -587,7 +590,7 @@ defmodule Ferricstore.Flow do
       |> Keyword.put(:reclaim_expired, false)
       |> then(&claim_due_result(ctx, type, &1))
 
-    observe_flow(:reclaim, started, result, %{flow_type: type})
+    FlowTelemetry.observe(:reclaim, started, result, %{flow_type: type})
   end
 
   defp claim_due_result(ctx, type, opts), do: claim_due_result(ctx, type, opts, :allow)
@@ -1504,7 +1507,7 @@ defmodule Ferricstore.Flow do
         Router.flow_extend_lease(ctx, attrs)
       end
 
-    observe_flow(:extend_lease, started, result, %{flow_id: id, _count: 1})
+    FlowTelemetry.observe(:extend_lease, started, result, %{flow_id: id, _count: 1})
   end
 
   def complete(ctx, id, lease_token, opts \\ [])
@@ -1516,7 +1519,7 @@ defmodule Ferricstore.Flow do
         Router.flow_complete(ctx, attrs)
       end
 
-    observe_flow(:complete, started, result, %{flow_id: id, _count: 1})
+    FlowTelemetry.observe(:complete, started, result, %{flow_id: id, _count: 1})
   end
 
   def complete_many(ctx, partition_key, items, opts)
@@ -1537,7 +1540,7 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:complete, started, result, %{flow_id: nil, _count: length(items)})
+    FlowTelemetry.observe(:complete, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def complete_many(_ctx, _partition_key, _items, _opts),
@@ -1554,7 +1557,7 @@ defmodule Ferricstore.Flow do
         |> maybe_notify_claim_waiters(attrs, :to_state)
       end
 
-    observe_flow(:transition, started, result, %{
+    FlowTelemetry.observe(:transition, started, result, %{
       flow_id: id,
       from_state: from_state,
       to_state: to_state,
@@ -1586,7 +1589,7 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:transition, started, result, %{
+    FlowTelemetry.observe(:transition, started, result, %{
       flow_id: nil,
       from_state: from_state,
       to_state: to_state,
@@ -1630,7 +1633,7 @@ defmodule Ferricstore.Flow do
       |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
 
     results = for idx <- 0..(length(transitions) - 1), do: Map.fetch!(indexed_results, idx)
-    observe_flow_batch(:transition, started, results)
+    FlowTelemetry.observe_batch(:transition, started, results)
     results
   end
 
@@ -1653,7 +1656,7 @@ defmodule Ferricstore.Flow do
       end)
       |> pipeline_write_ordered_results(ctx, [])
 
-    observe_flow_batch(:pipeline_write, started, results)
+    FlowTelemetry.observe_batch(:pipeline_write, started, results)
     results
   end
 
@@ -1759,7 +1762,7 @@ defmodule Ferricstore.Flow do
 
     :telemetry.execute(
       [:ferricstore, :flow, :pipeline_claim_due_batch],
-      Map.merge(stats, %{commands: length(ops), duration_us: elapsed_us(started)}),
+      Map.merge(stats, %{commands: length(ops), duration_us: flow_elapsed_us(started)}),
       %{source: :resp_pipeline}
     )
 
@@ -1823,7 +1826,7 @@ defmodule Ferricstore.Flow do
 
     results = for idx <- 0..(length(ops) - 1), do: Map.fetch!(indexed_results, idx)
 
-    observe_pipeline_read_batch(started, ops)
+    FlowTelemetry.observe_pipeline_read_batch(started, ops)
     results
   end
 
@@ -1841,7 +1844,7 @@ defmodule Ferricstore.Flow do
         |> maybe_notify_retry_claim_waiters(ctx, attrs)
       end
 
-    observe_flow(:retry, started, result, %{flow_id: id, _count: 1})
+    FlowTelemetry.observe(:retry, started, result, %{flow_id: id, _count: 1})
   end
 
   def retry_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -1865,7 +1868,7 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:retry, started, result, %{flow_id: nil, _count: length(items)})
+    FlowTelemetry.observe(:retry, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def retry_many(_ctx, _partition_key, _items, _opts),
@@ -1880,7 +1883,7 @@ defmodule Ferricstore.Flow do
         Router.flow_fail(ctx, attrs)
       end
 
-    observe_flow(:fail, started, result, %{flow_id: id, _count: 1})
+    FlowTelemetry.observe(:fail, started, result, %{flow_id: id, _count: 1})
   end
 
   def fail_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -1900,7 +1903,7 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:fail, started, result, %{flow_id: nil, _count: length(items)})
+    FlowTelemetry.observe(:fail, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def fail_many(_ctx, _partition_key, _items, _opts),
@@ -1914,7 +1917,7 @@ defmodule Ferricstore.Flow do
         Router.flow_cancel(ctx, attrs)
       end
 
-    observe_flow(:cancel, started, result, %{flow_id: id, _count: 1})
+    FlowTelemetry.observe(:cancel, started, result, %{flow_id: id, _count: 1})
   end
 
   def cancel_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -1934,7 +1937,7 @@ defmodule Ferricstore.Flow do
         end
       end
 
-    observe_flow(:cancel, started, result, %{flow_id: nil, _count: length(items)})
+    FlowTelemetry.observe(:cancel, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def cancel_many(_ctx, _partition_key, _items, _opts),
@@ -1955,7 +1958,7 @@ defmodule Ferricstore.Flow do
         Router.flow_retention_cleanup(ctx, %{limit: limit, now_ms: now})
       end
 
-    observe_flow(:retention_cleanup, started, result, %{flow_id: nil})
+    FlowTelemetry.observe(:retention_cleanup, started, result, %{flow_id: nil})
   end
 
   def retention_cleanup(_ctx, _opts), do: {:error, "ERR flow opts must be a keyword list"}
@@ -1996,7 +1999,7 @@ defmodule Ferricstore.Flow do
         |> maybe_notify_claim_waiters(attrs, :any)
       end
 
-    observe_flow(:rewind, started, result, %{flow_id: id, _count: 1})
+    FlowTelemetry.observe(:rewind, started, result, %{flow_id: id, _count: 1})
   end
 
   def list(ctx, type, opts \\ [])
@@ -4237,171 +4240,8 @@ defmodule Ferricstore.Flow do
 
   defp flow_start_time, do: System.monotonic_time()
 
-  defp observe_flow(command, started, result, fallback_metadata) do
-    {attempt_count, fallback_metadata} = Map.pop(fallback_metadata, :_count)
-    measurements = flow_measurements(started, command, result, attempt_count)
-    metadata = flow_metadata(result, fallback_metadata)
-
-    observe_flow_create_attempt(command, measurements, metadata, attempt_count)
-    observe_flow_create_success(command, measurements, metadata)
-    :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
-
-    result
-  end
-
-  defp observe_flow_batch(command, started, results) do
-    {success_count, first_record} = flow_batch_success_count_and_first_record(results)
-    attempt_count = length(results)
-
-    measurements =
-      flow_measurements(started, command, {:ok, first_record}, success_count)
-
-    metadata = flow_metadata({:ok, first_record}, %{flow_id: nil})
-
-    observe_flow_create_attempt(command, measurements, metadata, attempt_count)
-    observe_flow_create_success(command, measurements, metadata)
-    :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
-    :ok
-  end
-
-  defp observe_flow_create_attempt(:create, measurements, metadata, count) do
-    :telemetry.execute(
-      [:ferricstore, :flow, :create, :attempt],
-      %{measurements | count: positive_count(count)},
-      metadata
-    )
-  end
-
-  defp observe_flow_create_attempt(_command, _measurements, _metadata, _count), do: :ok
-
-  defp observe_flow_create_success(:create, %{count: count} = measurements, metadata)
-       when is_integer(count) and count > 0 do
-    :telemetry.execute([:ferricstore, :flow, :create, :success], measurements, metadata)
-  end
-
-  defp observe_flow_create_success(_command, _measurements, _metadata), do: :ok
-
-  defp positive_count(count) when is_integer(count) and count > 0, do: count
-  defp positive_count(_count), do: 0
-
-  defp flow_batch_success_count_and_first_record(results) do
-    Enum.reduce(results, {0, nil}, fn
-      :ok, {count, first_record} ->
-        {count + 1, first_record}
-
-      {:ok, record}, {count, nil} when is_map(record) ->
-        {count + 1, record}
-
-      {:ok, _record}, {count, first_record} ->
-        {count + 1, first_record}
-
-      _other, acc ->
-        acc
-    end)
-  end
-
-  defp observe_pipeline_read_batch(started, ops) do
-    :telemetry.execute(
-      [:ferricstore, :flow, :pipeline_read_batch],
-      %{
-        count: length(ops),
-        gets: Enum.count(ops, &pipeline_read_get?/1),
-        histories: Enum.count(ops, &pipeline_read_history?/1),
-        duration: System.monotonic_time() - started
-      },
-      %{source: :pipeline}
-    )
-  end
-
-  defp pipeline_read_get?({:get, _id, _opts}), do: true
-  defp pipeline_read_get?({:flow_get, _id, _opts}), do: true
-  defp pipeline_read_get?(_op), do: false
-
-  defp pipeline_read_history?({:history, _id, _opts}), do: true
-  defp pipeline_read_history?({:flow_history, _id, _opts}), do: true
-  defp pipeline_read_history?(_op), do: false
-
-  defp flow_measurements(started, command, result, success_count) do
-    count = result_count(result, success_count)
-
-    %{
-      duration_ms:
-        System.convert_time_unit(System.monotonic_time() - started, :native, :millisecond),
-      count: count,
-      claimed: if(command == :claim_due, do: count, else: 0)
-    }
-  end
-
-  defp elapsed_us(started) do
+  defp flow_elapsed_us(started) do
     System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond)
-  end
-
-  defp result_count(:ok, count) when is_integer(count) and count >= 0, do: count
-  defp result_count({:ok, {:error, _reason}}, _count), do: 0
-  defp result_count({:ok, _value}, count) when is_integer(count) and count >= 0, do: count
-  defp result_count(result, _count), do: result_count(result)
-
-  defp result_count({:ok, records}) when is_list(records), do: length(records)
-  defp result_count({:ok, nil}), do: 0
-  defp result_count({:ok, _record}), do: 1
-  defp result_count(_result), do: 0
-
-  defp flow_metadata({:ok, records}, fallback) when is_list(records) do
-    records
-    |> List.first(%{})
-    |> flow_record_metadata()
-    |> Map.merge(fallback, fn _key, record_value, fallback_value ->
-      record_value || fallback_value
-    end)
-    |> Map.merge(%{result: :ok, reason: nil})
-  end
-
-  defp flow_metadata({:ok, record}, fallback) when is_map(record) do
-    record
-    |> flow_record_metadata()
-    |> Map.merge(fallback, fn _key, record_value, fallback_value ->
-      record_value || fallback_value
-    end)
-    |> Map.merge(%{result: :ok, reason: nil})
-  end
-
-  defp flow_metadata({:ok, {:error, reason}}, fallback) when is_binary(reason) do
-    Map.merge(fallback, %{result: :error, reason: flow_error_reason(reason)})
-  end
-
-  defp flow_metadata({:ok, _value}, fallback),
-    do: Map.merge(fallback, %{result: :ok, reason: nil})
-
-  defp flow_metadata(:ok, fallback),
-    do: Map.merge(fallback, %{result: :ok, reason: nil})
-
-  defp flow_metadata({:error, reason}, fallback) when is_binary(reason) do
-    Map.merge(fallback, %{result: :error, reason: flow_error_reason(reason)})
-  end
-
-  defp flow_metadata(_result, fallback),
-    do: Map.merge(fallback, %{result: :error, reason: :error})
-
-  defp flow_record_metadata(record) when is_map(record) do
-    %{
-      flow_id: Map.get(record, :id),
-      flow_type: Map.get(record, :type),
-      to_state: Map.get(record, :state),
-      worker_id: Map.get(record, :lease_owner),
-      fencing_token: Map.get(record, :fencing_token)
-    }
-  end
-
-  defp flow_record_metadata(_record), do: %{}
-
-  defp flow_error_reason(reason) do
-    cond do
-      String.contains?(reason, "wrong state") -> :wrong_state
-      String.contains?(reason, "stale flow lease") -> :stale_token
-      String.contains?(reason, "not found") -> :missing
-      String.contains?(reason, "already exists") -> :exists
-      true -> :error
-    end
   end
 
   defp validate_opts(opts, allowed \\ []) do
