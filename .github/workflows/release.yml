@@ -77,6 +77,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: ${{ steps.build.outputs.file-path }}
+          overwrite_files: true
 
   # -------------------------------------------------------------------------
   # macOS builds: native cargo build (no cross, no rustler-precompiled-action)
@@ -183,3 +184,4 @@ jobs:
           files: |
             ${{ env.ARCHIVE_FILE }}
             ${{ env.ARCHIVE_FILE }}.sha256
+          overwrite_files: true
