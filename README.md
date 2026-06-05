@@ -11,6 +11,18 @@ FerricStore gives applications a durable key-value/data-structure store and a wo
 
 FerricFlow is the durable execution layer inside FerricStore. It stores workflow state as server-owned records instead of asking application code to rebuild leases, due indexes, retry state, history, and terminal records around a generic queue.
 
+## Beta Status
+
+FerricStore is currently a `0.x` beta release. The core durability path, Flow
+commands, precompiled NIFs, Docker image, and SDKs are published and usable, but
+public APIs, command details, operational defaults, and storage/projection
+internals may still change before `1.0`.
+
+Use it today for development, benchmarks, pilots, and controlled production
+experiments. For critical production workloads, pin exact versions, test
+upgrades on your data model, and expect compatibility guarantees to harden with
+the `1.0` release line.
+
 ## What Is A Flow?
 
 A Flow is one durable execution record:

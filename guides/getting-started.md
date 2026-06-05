@@ -11,6 +11,10 @@ FerricStore has two common ways to run:
 
 FerricFlow is available in both modes. It is the durable execution layer for queues, state-machine workflows, retries, leases, signals, value refs, and fanout.
 
+> **Beta:** FerricStore is currently a `0.x` beta. It is published and usable,
+> but APIs, command details, and operational defaults may change before `1.0`.
+> Pin exact versions for pilots and production experiments.
+
 ## 1. Run The Server With Docker
 
 ```bash

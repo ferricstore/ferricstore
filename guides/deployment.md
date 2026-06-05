@@ -2,6 +2,10 @@
 
 This guide covers running FerricStore as a server: native release, Docker, Kubernetes, and cluster layouts. For local development, start with [Getting Started](getting-started.md). For production security, pair this guide with [Security](security.md).
 
+> **Beta:** FerricStore is currently a `0.x` beta. Use exact image/package
+> versions and validate upgrades before critical production use. Compatibility
+> guarantees will harden with the `1.0` release line.
+
 Recommended path:
 
 1. Use Docker for local smoke tests.
