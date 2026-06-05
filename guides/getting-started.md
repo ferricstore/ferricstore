@@ -17,10 +17,13 @@ FerricFlow is available in both modes. It is the durable execution layer for que
 docker run -p 6379:6379 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ferricstore/ferricstore
+  ghcr.io/ferricstore/ferricstore:0.4.1
 ```
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
+
+The official container image is `ghcr.io/ferricstore/ferricstore`. The current
+release tag is `0.4.1` and is published for `linux/amd64`.
 
 Smoke test with `redis-cli`:
 

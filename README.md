@@ -39,10 +39,20 @@ Queue workers usually process one state and complete/fail/retry. Workflow worker
 docker run -p 6379:6379 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ferricstore/ferricstore
+  ghcr.io/ferricstore/ferricstore:0.4.1
 ```
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
+
+The published container image is hosted on GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/ferricstore/ferricstore:0.4.1
+```
+
+Current release images are published for `linux/amd64`. Native `linux/arm64`
+container images will be added in a later release; Apple Silicon can still run
+the amd64 image through Docker emulation for local development.
 
 ## First Flow Over RESP
 

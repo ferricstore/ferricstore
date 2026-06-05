@@ -62,9 +62,21 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 ### Basic
 
 ```bash
-docker build -t ferricstore .
-docker run -p 6379:6379 -v ferricstore_data:/data ferricstore
+docker run -p 6379:6379 \
+  -e FERRICSTORE_PROTECTED_MODE=false \
+  -v ferricstore_data:/data \
+  ghcr.io/ferricstore/ferricstore:0.4.1
 ```
+
+The official image is published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/ferricstore/ferricstore:0.4.1
+```
+
+Current release images are published for `linux/amd64`. Native `linux/arm64`
+images should be built on native arm64 runners or added through a future
+multi-arch manifest.
 
 ### Optimized for Production
 
@@ -74,7 +86,7 @@ For maximum write throughput, enable io_uring and use NVMe storage:
 # docker-compose.yml
 services:
   ferricstore:
-    image: ferricstore:latest
+    image: ghcr.io/ferricstore/ferricstore:0.4.1
     ports:
       - "6379:6379"
     environment:
@@ -163,7 +175,7 @@ spec:
     spec:
       containers:
         - name: ferricstore
-          image: ferricstore:latest
+          image: ghcr.io/ferricstore/ferricstore:0.4.1
           ports:
             - containerPort: 6379
           env:
