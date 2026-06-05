@@ -64,21 +64,7 @@ defmodule Ferricstore.Flow do
   defdelegate value_put(ctx, value, opts \\ []), to: Ferricstore.Flow.ValueStore
   defdelegate value_mget(ctx, refs), to: Ferricstore.Flow.ValueStore
 
-  def signal(ctx, id, opts) when is_binary(id) and is_list(opts) do
-    started = flow_start_time()
-
-    result =
-      with {:ok, attrs} <- signal_attrs(id, opts) do
-        Router.flow_signal(ctx, attrs)
-      end
-
-    FlowTelemetry.observe(:signal, started, result, %{flow_id: id, _count: 1})
-  end
-
-  def signal(_ctx, id, _opts) when not is_binary(id),
-    do: {:error, "ERR flow id must be a non-empty string"}
-
-  def signal(_ctx, _id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+  defdelegate signal(ctx, id, opts), to: Ferricstore.Flow.Signal, as: :run
 
   @doc false
   def create_batch_independent(_ctx, []), do: []
@@ -4179,67 +4165,6 @@ defmodule Ferricstore.Flow do
       {:ok, attrs}
     end
   end
-
-  defp signal_attrs(id, opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         {:ok, signal} <- required_binary(opts, :signal),
-         {:ok, if_state} <- optional_signal_states(opts),
-         {:ok, transition_to} <- optional_binary_or_nil(opts, :transition_to, nil),
-         :ok <- reject_running_state_transition(transition_to),
-         {:ok, idempotency_key} <- optional_binary_or_nil(opts, :idempotency_key, nil),
-         :ok <- validate_ref_size(:idempotency_key, idempotency_key),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_now_ms(opts),
-         {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms) do
-      attrs =
-        %{
-          id: id,
-          signal: signal,
-          partition_key: partition_key
-        }
-        |> maybe_put_attr(:if_state, if_state)
-        |> maybe_put_attr(:transition_to, transition_to)
-        |> maybe_put_attr(:idempotency_key, idempotency_key)
-        |> maybe_put_named_value_opts(opts)
-        |> maybe_put_attr(:now_ms, now)
-        |> maybe_put_attr(:run_at_ms, run_at_ms)
-
-      {:ok, attrs}
-    end
-  end
-
-  defp optional_signal_states(opts) do
-    values = Keyword.get_values(opts, :if_state)
-
-    case values do
-      [] -> {:ok, nil}
-      [state] -> normalize_signal_states(state)
-      [_ | _] -> normalize_signal_states(values)
-    end
-  end
-
-  defp normalize_signal_states(state) when is_binary(state) and state != "", do: {:ok, state}
-
-  defp normalize_signal_states(states) when is_list(states) do
-    states
-    |> Enum.reduce_while({:ok, []}, fn
-      state, {:ok, acc} when is_binary(state) and state != "" ->
-        {:cont, {:ok, [state | acc]}}
-
-      _bad, {:ok, _acc} ->
-        {:halt, {:error, "ERR flow if_state must be a non-empty string"}}
-    end)
-    |> case do
-      {:ok, [single]} -> {:ok, single}
-      {:ok, values} -> {:ok, values |> Enum.reverse() |> Enum.uniq()}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp normalize_signal_states(_state),
-    do: {:error, "ERR flow if_state must be a non-empty string"}
 
   defp retry_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
