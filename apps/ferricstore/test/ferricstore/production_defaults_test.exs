@@ -53,9 +53,10 @@ defmodule Ferricstore.ProductionDefaultsTest do
     refute config_exs =~ "flow_lmdb_enabled"
     refute bench_exs =~ "flow_lmdb_mode"
     refute bench_exs =~ "flow_lmdb_enabled"
-    assert runtime_exs =~ "flow_lmdb_mode:"
-    assert runtime_exs =~ "FERRICSTORE_FLOW_LMDB_MODE"
-    assert runtime_exs =~ "FERRICSTORE_FLOW_LMDB_ENABLED"
+    refute runtime_exs =~ "flow_lmdb_mode"
+    refute runtime_exs =~ "flow_lmdb_enabled"
+    refute runtime_exs =~ "FERRICSTORE_FLOW_LMDB_MODE"
+    refute runtime_exs =~ "FERRICSTORE_FLOW_LMDB_ENABLED"
     refute runtime_exs =~ "FERRICSTORE_FLOW_ASYNC_HISTORY"
     refute runtime_exs =~ "write_through"
   end
@@ -321,6 +322,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
     assert Ferricstore.Flow.LMDB.projection_enabled?()
     refute function_exported?(Ferricstore.Flow.LMDB, :mirror?, 0)
     refute lmdb_source =~ ":mirror"
+    refute lmdb_source =~ ":off"
   end
 
   test "Flow LMDB background flushes stay serial by default" do

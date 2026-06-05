@@ -15919,7 +15919,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_state_keys_present_hot_only(state, keys) do
-    flow_state_keys_present(state, keys)
+    Enum.map(keys, &flow_state_key_present_hot?(state, &1))
   end
 
   defp flow_state_key_present?(state, key) do

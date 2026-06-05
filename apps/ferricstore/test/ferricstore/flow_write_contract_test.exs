@@ -409,6 +409,17 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     refute function_source =~ "flow_state_keys_present(state, keys)",
            "current Flow state is the hot authoritative row; LMDB is an async cold projection and must not be a create hot-path dependency"
+
+    [hot_only_source] =
+      Regex.run(
+        ~r/defp flow_state_keys_present_hot_only\(state, keys\).*?^  end/ms,
+        source
+      )
+
+    assert hot_only_source =~ "flow_state_key_present_hot?"
+
+    refute hot_only_source =~ "flow_state_keys_present(state, keys)",
+           "hot-only helper must not delegate to the lagged LMDB presence path"
   end
 
   test "flow retry many history builds entries and next records in one traversal" do

@@ -70,9 +70,9 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "key")
   end
 
-  test "mode parser supports explicit off lagged and legacy boolean values" do
-    assert Ferricstore.Flow.LMDB.normalize_mode("off") == :off
-    assert Ferricstore.Flow.LMDB.normalize_mode("false") == :off
+  test "mode parser normalizes every legacy value to lagged" do
+    assert Ferricstore.Flow.LMDB.normalize_mode("off") == :lagged
+    assert Ferricstore.Flow.LMDB.normalize_mode("false") == :lagged
     assert Ferricstore.Flow.LMDB.normalize_mode("mirror") == :lagged
     assert Ferricstore.Flow.LMDB.normalize_mode("lagged") == :lagged
     assert Ferricstore.Flow.LMDB.normalize_mode("true") == :lagged

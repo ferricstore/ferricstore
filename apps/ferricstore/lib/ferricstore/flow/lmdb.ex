@@ -7,46 +7,11 @@ defmodule Ferricstore.Flow.LMDB do
   @default_map_size 16 * 1024 * 1024 * 1024
   @terminal_count_cache :ferricstore_flow_lmdb_terminal_count_cache
   @u64_decimal_zero_pad "00000000000000000000"
-  @mode_key {__MODULE__, :mode}
 
-  def enabled?, do: mode() != :off
-  def projection_enabled?, do: mode() == :lagged
-
-  def mode do
-    case :persistent_term.get(@mode_key, :unset) do
-      :unset ->
-        mode =
-          :ferricstore
-          |> Application.get_env(:flow_lmdb_mode, default_mode())
-          |> normalize_mode()
-
-        :persistent_term.put(@mode_key, mode)
-        mode
-
-      mode ->
-        mode
-    end
-  end
-
-  def refresh_config! do
-    :persistent_term.erase(@mode_key)
-    mode()
-  end
-
-  defp default_mode do
-    if Application.get_env(:ferricstore, :flow_lmdb_enabled, true), do: :lagged, else: :off
-  end
-
-  def normalize_mode(value) when value in [:off, :lagged], do: value
-
-  def normalize_mode(value) when is_binary(value) do
-    case String.downcase(String.trim(value)) do
-      value when value in ["off", "false", "0", "disabled"] -> :off
-      value when value in ["lagged", "async", "true", "1", "enabled"] -> :lagged
-      _other -> :lagged
-    end
-  end
-
+  def enabled?, do: true
+  def projection_enabled?, do: true
+  def mode, do: :lagged
+  def refresh_config!, do: :lagged
   def normalize_mode(_value), do: :lagged
 
   def map_size do

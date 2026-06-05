@@ -186,11 +186,6 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS", "600000")),
     max_active_file_size:
       String.to_integer(System.get_env("FERRICSTORE_MAX_ACTIVE_FILE_SIZE", "8589934592")),
-    flow_lmdb_mode:
-      System.get_env(
-        "FERRICSTORE_FLOW_LMDB_MODE",
-        if(boolean_env.("FERRICSTORE_FLOW_LMDB_ENABLED", true), do: "lagged", else: "off")
-      ),
     flow_lmdb_map_size:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
     flow_lmdb_flush_interval_ms:
