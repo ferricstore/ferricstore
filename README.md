@@ -11,6 +11,8 @@ FerricStore gives applications a durable key-value/data-structure store and a wo
 
 FerricFlow keeps each workflow or job's state and history in one durable place. Applications keep running normal business code; FerricFlow records ownership, lease tokens, attempts, retry timing, history, terminal state, retention metadata, and repair data instead of asking application code to rebuild those pieces around a generic queue.
 
+FerricFlow can replace queue glue for many workflow-shaped workloads: independent services in different languages claim the states they handle, while FerricFlow stores the durable queue/workflow state, leases, retries, history, and repair data in one place.
+
 ## Beta Status
 
 FerricStore is currently a `0.x` beta release. The core durability path, Flow
@@ -49,6 +51,8 @@ FLOW.CREATE -> FLOW.CLAIM_DUE -> handler -> FLOW.TRANSITION / COMPLETE / FAIL / 
 ```
 
 Queue workers usually process one state and complete/fail/retry. Workflow workers process multiple named states and return explicit transitions.
+
+A long workflow does not need to live in one codebase or one workflow runtime. One service can claim `fraud_check`, another can claim `charge_card`, and another can claim `send_email`; the work moves by durable state transition instead of ad hoc queue messages, retry tables, and status tables.
 
 ## Run Locally
 
@@ -154,6 +158,8 @@ Python SDK links:
 - Repository: <https://github.com/ferricstore/ferricstore-python>
 
 ## Core FerricFlow Primitives
+
+- **Queue-to-workflow upgrade** — Python, Elixir, Java, Go, Node, or any RESP-capable service can claim specific Flow states, transition work forward, and share one durable record for retries, leases, history, and terminal status.
 
 ### Signals
 
