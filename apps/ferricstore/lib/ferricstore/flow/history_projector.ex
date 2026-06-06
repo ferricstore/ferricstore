@@ -7,14 +7,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.HistoryProjector.Config
+  alias Ferricstore.Flow.HistoryProjector.PendingRegistry
   alias Ferricstore.Flow.HistoryProjectedIndex
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Store.{BlobRef, DiskPressure, LFU, WriteVersion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @retry_interval_ms 50
-  @pending_registry :ferricstore_flow_history_projector_pending_registry
-  @replay_reservation_registry :ferricstore_flow_history_projector_replay_reservations
 
   @type entry :: %{
           required(:key) => binary(),
@@ -410,7 +409,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
     do: reserve_pending_counter(counter, count, max_pending)
 
   defp reserve_pending(projector, count) when is_atom(projector) do
-    case lookup_pending_counter(projector) do
+    case PendingRegistry.lookup(projector) do
       {:ok, counter, max_pending} -> reserve_pending_counter(counter, count, max_pending)
       :error -> :ok
     end
@@ -450,88 +449,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp register_pending_counter(projector, counter, max_pending) when is_atom(projector) do
-    @pending_registry
-    |> ensure_pending_registry()
-    |> :ets.insert({projector, counter, max_pending})
-
-    :ok
+    PendingRegistry.register(projector, counter, max_pending)
   end
 
-  defp unregister_pending_counter(nil), do: :ok
-
-  defp unregister_pending_counter(projector) when is_atom(projector) do
-    case :ets.whereis(@pending_registry) do
-      :undefined -> :ok
-      table -> :ets.delete(table, projector)
-    end
-
-    :ok
-  rescue
-    _ -> :ok
-  end
-
-  defp lookup_pending_counter(projector) when is_atom(projector) do
-    table = ensure_pending_registry(@pending_registry)
-
-    case :ets.lookup(table, projector) do
-      [{^projector, counter, max_pending}] -> {:ok, counter, max_pending}
-      _ -> :error
-    end
-  rescue
-    _ -> :error
-  end
-
-  defp ensure_pending_registry(name) do
-    ensure_registry(
-      name,
-      [:named_table, :public, :set, read_concurrency: true],
-      :pending_registry_unavailable
-    )
-  end
-
-  defp ensure_replay_reservation_registry do
-    ensure_registry(
-      @replay_reservation_registry,
-      [
-        :named_table,
-        :public,
-        :set,
-        read_concurrency: true,
-        write_concurrency: true
-      ],
-      :replay_reservation_registry_unavailable
-    )
-  end
-
-  defp ensure_registry(name, opts, unavailable_reason) do
-    case :ets.whereis(name) do
-      :undefined ->
-        ensure_registry_slow(name, opts, unavailable_reason)
-
-      table ->
-        table
-    end
-  end
-
-  defp ensure_registry_slow(name, opts, unavailable_reason) do
-    Ferricstore.Flow.HistoryProjector.TableOwner.ensure_tables()
-
-    case :ets.whereis(name) do
-      :undefined ->
-        try do
-          :ets.new(name, opts)
-        rescue
-          ArgumentError ->
-            case :ets.whereis(name) do
-              :undefined -> :erlang.error(unavailable_reason)
-              table -> table
-            end
-        end
-
-      table ->
-        table
-    end
-  end
+  defp unregister_pending_counter(projector), do: PendingRegistry.unregister(projector)
 
   defp reserve_replay_range(projector, entries) do
     case entry_index_range(entries) do
@@ -539,7 +460,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
         :ok
 
       {min_index, max_index} ->
-        table = ensure_replay_reservation_registry()
+        table = PendingRegistry.replay_table()
 
         case :ets.lookup(table, projector) do
           [{^projector, old_min, old_max, flushed_index}] ->
@@ -561,7 +482,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defp mark_replay_range_flushed(_projector, nil), do: :ok
 
   defp mark_replay_range_flushed(projector, index) when is_integer(index) and index >= 0 do
-    table = ensure_replay_reservation_registry()
+    table = PendingRegistry.replay_table()
 
     case :ets.lookup(table, projector) do
       [{^projector, min_index, max_index, flushed_index}] ->
@@ -579,7 +500,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   defp trim_replay_reservation(_projector, nil), do: :ok
 
   defp trim_replay_reservation(projector, index) when is_integer(index) and index >= 0 do
-    table = ensure_replay_reservation_registry()
+    table = PendingRegistry.replay_table()
 
     case :ets.lookup(table, projector) do
       [{^projector, _min_index, max_index, _flushed_index}] when index >= max_index ->
@@ -598,7 +519,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp replay_reservation_flushed_index(projector) do
-    table = ensure_replay_reservation_registry()
+    table = PendingRegistry.replay_table()
 
     case :ets.lookup(table, projector) do
       [{^projector, _min_index, _max_index, flushed_index}] when is_integer(flushed_index) ->
