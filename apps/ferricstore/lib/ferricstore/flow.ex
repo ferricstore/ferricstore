@@ -30,7 +30,6 @@ defmodule Ferricstore.Flow do
                                         24 * 60 * 60 * 1_000
                                       )
   @terminal_states ["completed", "failed", "cancelled"]
-  @u64_decimal_zero_pad "00000000000000000000"
   @value_bin_magic "FSV2"
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
@@ -2852,39 +2851,13 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_lmdb_time_seek_key(prefix, ms) when is_binary(prefix) and is_integer(ms),
-    do: prefix <> flow_lmdb_pad_u64(ms)
+    do: Ferricstore.Flow.LMDBQueryWindow.time_seek_key(prefix, ms)
 
   defp flow_lmdb_time_upper_seek_key(prefix, ms) when is_binary(prefix) and is_integer(ms),
-    do: prefix <> flow_lmdb_pad_u64(ms) <> <<255>>
-
-  defp flow_lmdb_pad_u64(value) when is_integer(value) and value >= 0 do
-    encoded = Integer.to_string(value)
-
-    case byte_size(encoded) do
-      size when size < 20 -> binary_part(@u64_decimal_zero_pad, 0, 20 - size) <> encoded
-      _size -> encoded
-    end
-  end
+    do: Ferricstore.Flow.LMDBQueryWindow.time_upper_seek_key(prefix, ms)
 
   defp flow_lmdb_query_scan_count(count) when is_integer(count) and count > 0 do
-    max_scan =
-      Application.get_env(
-        :ferricstore,
-        :flow_lmdb_query_scan_limit,
-        @default_lmdb_query_scan_limit
-      )
-
-    max_scan =
-      case max_scan do
-        value when is_integer(value) and value > 0 -> value
-        _ -> @default_lmdb_query_scan_limit
-      end
-
-    count
-    |> Kernel.+(64)
-    |> max(count * 4)
-    |> min(max_scan)
-    |> max(count)
+    Ferricstore.Flow.LMDBQueryWindow.query_scan_count(count, @default_lmdb_query_scan_limit)
   end
 
   if Mix.env() == :test do
@@ -2893,27 +2866,14 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_history_lmdb_query_scan_count(count, true) when is_integer(count) and count > 0,
-    do: count
+    do: Ferricstore.Flow.LMDBQueryWindow.history_query_scan_count(count, true, 0)
 
   defp flow_history_lmdb_query_scan_count(count, false) when is_integer(count) and count > 0 do
-    max_scan =
-      Application.get_env(
-        :ferricstore,
-        :flow_lmdb_history_query_scan_limit,
-        flow_max_history_max_events()
-      )
-
-    max_scan =
-      case max_scan do
-        value when is_integer(value) and value > 0 -> min(value, flow_max_history_max_events())
-        _ -> flow_max_history_max_events()
-      end
-
-    count
-    |> Kernel.+(64)
-    |> max(count * 4)
-    |> min(max_scan)
-    |> max(count)
+    Ferricstore.Flow.LMDBQueryWindow.history_query_scan_count(
+      count,
+      false,
+      flow_max_history_max_events()
+    )
   end
 
   defp flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
