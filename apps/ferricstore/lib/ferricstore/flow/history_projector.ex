@@ -6,15 +6,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
   require Logger
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+  alias Ferricstore.Flow.HistoryProjector.Config
   alias Ferricstore.Flow.HistoryProjectedIndex
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Store.{BlobRef, DiskPressure, LFU, WriteVersion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
-  @default_batch_size 25_000
-  @default_flush_interval_ms 1_000
-  @default_chunk_interval_ms 1
-  @default_max_pending_entries 100_000
   @retry_interval_ms 50
   @pending_registry :ferricstore_flow_history_projector_pending_registry
   @replay_reservation_registry :ferricstore_flow_history_projector_replay_reservations
@@ -277,7 +274,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
     max_pending_entries =
       Ferricstore.MemoryBudget.limit(
         :flow_history_projector_max_pending_entries,
-        @default_max_pending_entries
+        Config.default_max_pending_entries()
       )
 
     pending_counter = :atomics.new(1, signed: true)
@@ -286,25 +283,15 @@ defmodule Ferricstore.Flow.HistoryProjector do
     flushed_index = max(projected_index, replay_reservation_flushed_index(projector_name))
 
     {:ok,
-     %{
-       projector_name: projector_name,
-       shard_index: shard_index,
-       shard_data_path: shard_data_path,
-       instance_ctx: instance_ctx,
-       pending_counter: pending_counter,
-       pending: [],
-       pending_count: 0,
-       first_pending_at: nil,
-       flush_timer: nil,
-       requested_index: nil,
-       flushed_index: flushed_index,
-       batch_size: app_env(:flow_history_projector_batch_size, @default_batch_size),
-       max_pending_entries: max_pending_entries,
-       flush_interval_ms:
-         app_env(:flow_history_projector_flush_interval_ms, @default_flush_interval_ms),
-       chunk_interval_ms:
-         app_env(:flow_history_projector_chunk_interval_ms, @default_chunk_interval_ms)
-     }}
+     Config.initial_state(
+       projector_name,
+       shard_index,
+       shard_data_path,
+       instance_ctx,
+       pending_counter,
+       max_pending_entries,
+       flushed_index
+     )}
   end
 
   @impl true
@@ -2776,10 +2763,4 @@ defmodule Ferricstore.Flow.HistoryProjector do
     ArgumentError -> :ok
   end
 
-  defp app_env(key, default) do
-    case Application.get_env(:ferricstore, key, default) do
-      value when is_integer(value) and value > 0 -> value
-      _ -> default
-    end
-  end
 end
