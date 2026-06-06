@@ -7,19 +7,16 @@ defmodule Ferricstore.Flow.LMDBWriter do
   alias Ferricstore.Flow.Hibernation
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
+  alias Ferricstore.Flow.LMDBWriter.Config
   alias Ferricstore.Flow.LMDBWriter.Shards
   alias Ferricstore.Flow.Locator
   alias Ferricstore.Raft.WARaftSegmentReader
 
   require Logger
 
-  @default_lagged_flush_interval_ms 500
-  @default_lagged_flush_jitter_ms 250
   @default_lagged_flush_quiet_ms 250
   @default_lagged_flush_max_lag_ms 30_000
-  @default_lagged_max_ops 25_000
   @default_flush_chunk_ops 5_000
-  @default_lagged_flush_chunk_pause_ms 1
   @default_source_pending_retries 100
   @default_source_pending_sleep_ms 1
   @default_max_mailbox_messages 50_000
@@ -36,7 +33,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def start_link(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
-    instance_name = instance_name_from_opts(opts)
+    instance_name = Config.instance_name_from_opts(opts)
     GenServer.start_link(__MODULE__, opts, name: name(instance_name, shard_index))
   end
 
@@ -240,7 +237,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def request(instance_ctx, shard_index, shard_data_path, index)
       when is_integer(index) and index >= 0 do
-    instance_name = instance_name_from_ctx(instance_ctx)
+    instance_name = Config.instance_name_from_ctx(instance_ctx)
     publish_requested(instance_ctx, shard_index, index)
 
     cond do
@@ -487,7 +484,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   def init(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
     data_dir = Keyword.fetch!(opts, :data_dir)
-    instance_name = instance_name_from_opts(opts)
+    instance_name = Config.instance_name_from_opts(opts)
     _outbox = ensure_projection_outbox!(instance_name, shard_index)
 
     if shard_index == 0 do
@@ -529,13 +526,13 @@ defmodule Ferricstore.Flow.LMDBWriter do
         Application.get_env(
           :ferricstore,
           :flow_lmdb_flush_interval_ms,
-          default_flush_interval_ms()
+          Config.default_flush_interval_ms()
         ),
       flush_jitter_ms:
         Application.get_env(
           :ferricstore,
           :flow_lmdb_flush_jitter_ms,
-          default_flush_jitter_ms()
+          Config.default_flush_jitter_ms()
         ),
       flush_quiet_ms:
         Application.get_env(
@@ -549,12 +546,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
           :flow_lmdb_flush_max_lag_ms,
           @default_lagged_flush_max_lag_ms
         ),
-      max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, default_max_ops()),
+      max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, Config.default_max_ops()),
       flush_on_max_ops?:
         Application.get_env(
           :ferricstore,
           :flow_lmdb_flush_on_max_ops,
-          default_flush_on_max_ops(Ferricstore.Flow.LMDB.mode())
+          Config.default_flush_on_max_ops(Ferricstore.Flow.LMDB.mode())
         ),
       flush_chunk_ops:
         Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops, @default_flush_chunk_ops),
@@ -562,7 +559,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         Application.get_env(
           :ferricstore,
           :flow_lmdb_flush_chunk_pause_ms,
-          default_flush_chunk_pause_ms()
+          Config.default_flush_chunk_pause_ms()
         )
     }
 
@@ -604,32 +601,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp maybe_mark_lost_enqueue(instance_ctx, shard_index, reason) do
     mark_mirror_degraded(instance_ctx, shard_index, reason)
-  end
-
-  defp instance_name_from_opts(opts) do
-    case {Keyword.get(opts, :instance_name), Keyword.get(opts, :instance_ctx)} do
-      {name, _ctx} when is_atom(name) and not is_nil(name) -> name
-      {_name, %{name: name}} when is_atom(name) and not is_nil(name) -> name
-      _ -> :default
-    end
-  end
-
-  defp default_flush_interval_ms do
-    @default_lagged_flush_interval_ms
-  end
-
-  defp default_max_ops do
-    @default_lagged_max_ops
-  end
-
-  defp default_flush_on_max_ops(_mode), do: false
-
-  defp default_flush_jitter_ms do
-    @default_lagged_flush_jitter_ms
-  end
-
-  defp default_flush_chunk_pause_ms do
-    @default_lagged_flush_chunk_pause_ms
   end
 
   defp enqueue_guard(pid, op_count) do
@@ -699,9 +670,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
   rescue
     _ -> :ok
   end
-
-  defp instance_name_from_ctx(%{name: name}) when is_atom(name) and not is_nil(name), do: name
-  defp instance_name_from_ctx(_ctx), do: :default
 
   @impl true
   def handle_cast({:enqueue, seq, ops, after_flush}, state)
