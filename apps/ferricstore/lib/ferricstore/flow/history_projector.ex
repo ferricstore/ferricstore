@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.HistoryProjector.Config
+  alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.HistoryProjector.PendingRegistry
   alias Ferricstore.Flow.HistoryProjector.Telemetry
   alias Ferricstore.Flow.HistoryProjectedIndex
@@ -2125,7 +2126,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
     {entries, locations, _caps} =
       Enum.reduce(live_records, {[], [], %{}}, fn {key, {offset, value_size, expire_at_ms}},
                                                   {entries, locations, caps} ->
-        case parse_history_entry_key(key) do
+        case KeyCodec.parse_history_entry_key(key) do
           {:ok, history_key, event_id, event_ms} ->
             {history_hot_max_events, caps} =
               recovered_history_hot_cap(history_key, keydir, shard_data_path, caps)
@@ -2164,7 +2165,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   defp recovered_history_event_version(event_id) do
-    case parse_event_version(event_id) do
+    case KeyCodec.parse_event_version(event_id) do
       {:ok, version} -> version
       :error -> 1
     end
@@ -2355,21 +2356,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
     _ -> :ok
   end
 
-  defp parse_history_entry_key("X:" <> rest) do
-    case :binary.split(rest, <<0>>) do
-      [history_key, event_id] ->
-        case parse_event_ms(event_id) do
-          {:ok, event_ms} -> {:ok, history_key, event_id, event_ms}
-          :error -> :error
-        end
-
-      _ ->
-        :error
-    end
-  end
-
-  defp parse_history_entry_key(_key), do: :error
-
   defp history_entry_key(history_key, event_id), do: "X:" <> history_key <> <<0>> <> event_id
 
   defp parse_event_ms(event_id) do
@@ -2377,19 +2363,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
       [ms, _version] ->
         case Integer.parse(ms) do
           {event_ms, ""} -> {:ok, event_ms}
-          _ -> :error
-        end
-
-      _ ->
-        :error
-    end
-  end
-
-  defp parse_event_version(event_id) do
-    case :binary.split(event_id, "-") do
-      [_ms, version] ->
-        case Integer.parse(version) do
-          {parsed, ""} -> {:ok, parsed}
           _ -> :error
         end
 
