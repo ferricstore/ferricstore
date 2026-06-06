@@ -49,6 +49,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   @behaviour :ranch_protocol
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Health.Endpoint.Login
   alias FerricstoreServer.Health.Endpoint.Request
   alias FerricstoreServer.Health.Endpoint.Response
   alias FerricstoreServer.Health.Endpoint.Session
@@ -165,7 +166,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/login", _peer, _headers, _body) do
-    send_html_response(socket, transport, 200, "OK", render_login_page("", nil))
+    send_html_response(socket, transport, 200, "OK", Login.render_page("", nil))
   end
 
   defp dispatch_request(
@@ -184,7 +185,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       transport,
       200,
       "OK",
-      render_login_page(Map.get(params, "next", ""), nil)
+      Login.render_page(Map.get(params, "next", ""), nil)
     )
   end
 
@@ -200,7 +201,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     params = decode_form_body(body)
     username = params |> Map.get("username", "") |> String.trim()
     password = Map.get(params, "password", "")
-    next = sanitize_dashboard_next(Map.get(params, "next", ""))
+    next = Login.sanitize_next(Map.get(params, "next", ""))
 
     case Acl.authenticate(username, password) do
       {:ok, user} ->
@@ -214,7 +215,7 @@ defmodule FerricstoreServer.Health.Endpoint do
           transport,
           401,
           "Unauthorized",
-          render_login_page(next, reason)
+          Login.render_page(next, reason)
         )
     end
   end
@@ -1276,7 +1277,7 @@ defmodule FerricstoreServer.Health.Endpoint do
         if dashboard_api_path?(path) do
           {:unauthorized, "login required"}
         else
-          {:redirect_login, dashboard_login_location(path)}
+          {:redirect_login, Login.location(path)}
         end
     end
   end
@@ -1286,7 +1287,7 @@ defmodule FerricstoreServer.Health.Endpoint do
       {:ok, :open} -> :ok
       {:ok, {:acl, username}} -> authorize_acl_requirement(username, requirement)
       :error when response_kind == :json -> {:unauthorized, "login required"}
-      :error -> {:redirect_login, dashboard_login_location("/dashboard")}
+      :error -> {:redirect_login, Login.location("/dashboard")}
     end
   end
 
@@ -1698,69 +1699,6 @@ defmodule FerricstoreServer.Health.Endpoint do
       [clean_path, query] -> {clean_path, query}
       [clean_path] -> {clean_path, ""}
     end
-  end
-
-  defp dashboard_login_location(path) do
-    "/dashboard/login?" <> URI.encode_query(%{"next" => sanitize_dashboard_next(path)})
-  end
-
-  defp sanitize_dashboard_next(path) when is_binary(path) do
-    cond do
-      path == "" -> "/dashboard"
-      has_control_byte?(path) -> "/dashboard"
-      String.starts_with?(path, "//") -> "/dashboard"
-      String.starts_with?(path, "/dashboard/login") -> "/dashboard"
-      String.starts_with?(path, "/dashboard") -> path
-      true -> "/dashboard"
-    end
-  end
-
-  defp sanitize_dashboard_next(_path), do: "/dashboard"
-
-  defp has_control_byte?(path) do
-    :binary.match(path, [<<"\r">>, <<"\n">>]) != :nomatch or
-      :binary.match(path, for(byte <- 0..31, byte not in [?\r, ?\n], do: <<byte>>)) != :nomatch or
-      :binary.match(path, <<127>>) != :nomatch
-  end
-
-  defp render_login_page(next, error) do
-    safe_next = sanitize_dashboard_next(next)
-    error_html = if is_binary(error), do: "<p class=\"error\">#{html_escape(error)}</p>", else: ""
-
-    """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <title>FerricStore Dashboard Login</title>
-      <style>
-        body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        main{width:min(420px,calc(100vw - 32px));border:1px solid #30363d;background:#161b22;padding:24px}
-        h1{font-size:22px;margin:0 0 8px}
-        p{color:#8b949e;margin:0 0 18px}
-        label{display:block;margin:14px 0 6px;color:#c9d1d9;font-size:13px}
-        input{box-sizing:border-box;width:100%;border:1px solid #30363d;background:#0d1117;color:#e6edf3;padding:10px 12px;font:inherit}
-        button{margin-top:18px;width:100%;border:0;background:#238636;color:white;padding:11px 12px;font:inherit;cursor:pointer}
-        .error{border:1px solid #f85149;color:#ffb4ae;background:#2d1215;padding:10px 12px}
-      </style>
-    </head>
-    <body>
-      <main>
-        <h1>FerricStore Dashboard</h1>
-        <p>Sign in with a Redis ACL user. Page access follows that user's command and key permissions.</p>
-        #{error_html}
-        <form method="post" action="/dashboard/login">
-          <input type="hidden" name="next" value="#{html_escape(safe_next)}">
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" autofocus>
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password">
-          <button type="submit">Sign in</button>
-        </form>
-      </main>
-    </body>
-    </html>
-    """
   end
 
   defp send_forbidden_response(socket, transport, path, requirement, reason) do
