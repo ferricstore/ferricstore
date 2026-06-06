@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   alias Ferricstore.Flow.Hibernation
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
+  alias Ferricstore.Flow.LMDBWriter.Shards
   alias Ferricstore.Flow.Locator
   alias Ferricstore.Raft.WARaftSegmentReader
 
@@ -288,15 +289,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
       when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 and
              is_integer(timeout) do
     shard_count
-    |> shard_indexes()
+    |> Shards.indexes()
     |> Task.async_stream(
       fn shard_index -> {shard_index, flush(instance_name, shard_index, timeout)} end,
-      max_concurrency: flush_all_concurrency(shard_count),
+      max_concurrency: Shards.flush_all_concurrency(shard_count),
       on_timeout: :kill_task,
       ordered: false,
-      timeout: flush_all_task_timeout(timeout)
+      timeout: Shards.flush_all_task_timeout(timeout)
     )
-    |> Enum.reduce(:ok, &merge_flush_all_result/2)
+    |> Enum.reduce(:ok, &Shards.merge_flush_all_result/2)
   end
 
   def flush(shard_index) when is_integer(shard_index) and shard_index >= 0 do
@@ -353,7 +354,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     mark_instance_suspended(instance_name)
     flush? = Keyword.get(opts, :flush, true)
 
-    Enum.each(shard_indexes(shard_count), fn shard_index ->
+    Enum.each(Shards.indexes(shard_count), fn shard_index ->
       _ =
         if flush? do
           suspend(instance_name, shard_index)
@@ -402,7 +403,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
     clear_instance_suspended(instance_name)
 
-    Enum.each(shard_indexes(shard_count), fn shard_index ->
+    Enum.each(Shards.indexes(shard_count), fn shard_index ->
       case Process.whereis(name(instance_name, shard_index)) do
         pid when is_pid(pid) -> GenServer.cast(pid, :resume)
         nil -> :ok
@@ -418,7 +419,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def discard_all(instance_name, shard_count)
       when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
-    Enum.each(shard_indexes(shard_count), fn shard_index ->
+    Enum.each(Shards.indexes(shard_count), fn shard_index ->
       _ = discard(instance_name, shard_index)
     end)
 
@@ -2564,28 +2565,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp normalize_delay_ms(delay_ms) when is_integer(delay_ms) and delay_ms >= 0, do: delay_ms
   defp normalize_delay_ms(_delay_ms), do: 0
-
-  defp shard_indexes(0), do: []
-  defp shard_indexes(shard_count), do: 0..(shard_count - 1)
-
-  defp flush_all_concurrency(0), do: 1
-
-  defp flush_all_concurrency(shard_count) do
-    min(shard_count, max(1, min(System.schedulers_online(), 16)))
-  end
-
-  defp flush_all_task_timeout(timeout), do: timeout + 1_000
-
-  defp merge_flush_all_result({:ok, {_shard_index, :ok}}, acc), do: acc
-
-  defp merge_flush_all_result({:ok, {_shard_index, {:error, _reason} = error}}, :ok),
-    do: error
-
-  defp merge_flush_all_result({:ok, {_shard_index, {:error, _reason}}}, acc), do: acc
-
-  defp merge_flush_all_result({:exit, reason}, :ok), do: {:error, {:flush_task_exit, reason}}
-
-  defp merge_flush_all_result({:exit, _reason}, acc), do: acc
 
   defp normalize_non_negative_integer(value, _default) when is_integer(value) and value >= 0,
     do: value
