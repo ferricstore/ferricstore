@@ -1650,7 +1650,7 @@ defmodule Ferricstore.Flow do
 
     {:ok,
      entries
-     |> Enum.map(&flow_history_entry_to_tuple/1)
+     |> Enum.map(&Ferricstore.Flow.HistoryEntry.to_tuple/1)
      |> hydrate_history_values(ctx, value_return)}
   end
 
@@ -1803,7 +1803,7 @@ defmodule Ferricstore.Flow do
 
     events =
       entries
-      |> Enum.map(&flow_history_entry_to_tuple/1)
+      |> Enum.map(&Ferricstore.Flow.HistoryEntry.to_tuple/1)
       |> hydrate_history_values(ctx, value_return)
 
     {:ok, flow_history_apply_query(events, query)}
@@ -2896,14 +2896,6 @@ defmodule Ferricstore.Flow do
 
   defp flow_decode_history_index_entries(entries, path, now_ms) do
     Ferricstore.Flow.LMDBIndexDecode.history_entries(entries, path, now_ms)
-  end
-
-  defp flow_history_entry_to_tuple({event_id, fields}) when is_list(fields) do
-    Ferricstore.Flow.HistoryEntry.to_tuple({event_id, fields})
-  end
-
-  defp flow_history_entry_to_tuple([event_id | fields]) when is_list(fields) do
-    Ferricstore.Flow.HistoryEntry.to_tuple([event_id | fields])
   end
 
   defp hydrate_history_values(history, _ctx, %{enabled?: false}), do: history
