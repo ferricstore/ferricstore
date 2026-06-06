@@ -643,84 +643,31 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/slowlog", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_slowlog_page()
-      body = FerricstoreServer.Health.Dashboard.render_slowlog_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_slowlog_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/merge", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_merge_page()
-      body = FerricstoreServer.Health.Dashboard.render_merge_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_merge_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/config", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_config_page()
-      body = FerricstoreServer.Health.Dashboard.render_config_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_config_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/raft", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      try do
-        data = FerricstoreServer.Health.Dashboard.collect_raft_page()
-        body = FerricstoreServer.Health.Dashboard.render_raft_page(data)
-        send_html_response(socket, transport, 200, "OK", body)
-      catch
-        kind, reason ->
-          log_dashboard_page_error("/dashboard/raft", kind, reason)
-
-          send_html_response(
-            socket,
-            transport,
-            200,
-            "OK",
-            dashboard_internal_error_body("Consensus")
-          )
-      end
-    end
+    DashboardHandlers.handle_raft_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/consensus", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      send_redirect_response(socket, transport, "/dashboard/raft")
-    end
+    DashboardHandlers.handle_consensus_redirect(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/clients", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_clients_page()
-      body = FerricstoreServer.Health.Dashboard.render_clients_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_clients_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/storage", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_storage_page()
-      body = FerricstoreServer.Health.Dashboard.render_storage_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_storage_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/doctor", peer, headers) do
@@ -747,33 +694,15 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/commands", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_commands_page()
-      body = FerricstoreServer.Health.Dashboard.render_commands_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_commands_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/reads", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_reads_page()
-      body = FerricstoreServer.Health.Dashboard.render_reads_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_reads_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/prefixes", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect_prefixes_page()
-      body = FerricstoreServer.Health.Dashboard.render_prefixes_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_prefixes_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow", peer, headers) do
@@ -815,31 +744,11 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/workers", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        peer
-        |> Auth.dashboard_flow_collect_opts(headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_workers_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_workers_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_flow_workers_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/due", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        peer
-        |> Auth.dashboard_flow_collect_opts(headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_due_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_due_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
+    DashboardHandlers.handle_flow_due_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/failures", peer, headers) do
@@ -984,22 +893,6 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   defp send_forbidden_response(socket, transport, path, requirement, reason) do
     Forbidden.send_response(socket, transport, path, requirement, reason)
-  end
-
-  defp log_dashboard_page_error(path, kind, reason) do
-    Logger.error(fn ->
-      "FerricStore dashboard page error at #{path}: #{inspect({kind, reason}, limit: 20)}"
-    end)
-  end
-
-  defp dashboard_internal_error_body(page_name) do
-    """
-    <html><body style="background:#0d1117;color:#f85149;padding:20px;font-family:monospace;">
-    <h2>#{page_name} Page Error</h2>
-    <pre>Internal dashboard error. See server logs.</pre>
-    <a href="/dashboard" style="color:#58a6ff;">← Dashboard</a>
-    </body></html>
-    """
   end
 
   # ---------------------------------------------------------------------------

@@ -68,6 +68,22 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlersTest do
     assert response =~ ~s({"error":"forbidden"})
   end
 
+  test "consensus handler redirects to raft page" do
+    Application.put_env(:ferricstore, :protected_mode, false)
+
+    assert :ok =
+             DashboardHandlers.handle_consensus_redirect(
+               self(),
+               __MODULE__.CaptureTransport,
+               {10, 0, 0, 1},
+               %{}
+             )
+
+    assert_receive {:response, response}
+    assert response =~ "HTTP/1.1 302 Found"
+    assert response =~ "Location: /dashboard/raft\r\n"
+  end
+
   defmodule CaptureTransport do
     def send(pid, iodata) do
       Kernel.send(pid, {:response, IO.iodata_to_binary(iodata)})

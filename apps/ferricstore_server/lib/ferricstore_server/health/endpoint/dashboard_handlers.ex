@@ -6,6 +6,141 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
   alias FerricstoreServer.Health.Endpoint.FlowPaths
   alias FerricstoreServer.Health.Endpoint.Response
 
+  def handle_slowlog_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_slowlog_page/0,
+      &Dashboard.render_slowlog_page/1
+    )
+  end
+
+  def handle_merge_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_merge_page/0,
+      &Dashboard.render_merge_page/1
+    )
+  end
+
+  def handle_config_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_config_page/0,
+      &Dashboard.render_config_page/1
+    )
+  end
+
+  def handle_raft_page(socket, transport, peer, headers) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      try do
+        data = Dashboard.collect_raft_page()
+        body = Dashboard.render_raft_page(data)
+        Response.send_html_response(socket, transport, 200, "OK", body)
+      catch
+        kind, reason ->
+          log_dashboard_page_error("/dashboard/raft", kind, reason)
+          body = dashboard_internal_error_body("Consensus")
+          Response.send_html_response(socket, transport, 200, "OK", body)
+      end
+    end
+  end
+
+  def handle_consensus_redirect(socket, transport, peer, headers) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      Response.send_redirect_response(socket, transport, "/dashboard/raft")
+    end
+  end
+
+  def handle_clients_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_clients_page/0,
+      &Dashboard.render_clients_page/1
+    )
+  end
+
+  def handle_storage_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_storage_page/0,
+      &Dashboard.render_storage_page/1
+    )
+  end
+
+  def handle_commands_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_commands_page/0,
+      &Dashboard.render_commands_page/1
+    )
+  end
+
+  def handle_reads_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_reads_page/0,
+      &Dashboard.render_reads_page/1
+    )
+  end
+
+  def handle_prefixes_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_prefixes_page/0,
+      &Dashboard.render_prefixes_page/1
+    )
+  end
+
+  def handle_flow_workers_page(socket, transport, peer, headers) do
+    render_flow_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_flow_workers_page/1,
+      &Dashboard.render_flow_workers_page/1
+    )
+  end
+
+  def handle_flow_due_page(socket, transport, peer, headers) do
+    render_flow_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_flow_due_page/1,
+      &Dashboard.render_flow_due_page/1
+    )
+  end
+
   def handle_keyspace_page(socket, transport, peer, headers, query) do
     unless Auth.observability_authorized?(peer, headers) do
       Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
@@ -206,5 +341,47 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
 
       Response.send_redirect_response(socket, transport, location)
     end
+  end
+
+  defp render_static_page(socket, transport, peer, headers, collect_fun, render_fun) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = collect_fun.()
+      body = render_fun.(data)
+      Response.send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  defp render_flow_static_page(socket, transport, peer, headers, collect_fun, render_fun) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data =
+        peer
+        |> Auth.dashboard_flow_collect_opts(headers)
+        |> collect_fun.()
+
+      body = render_fun.(data)
+      Response.send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  defp log_dashboard_page_error(path, kind, reason) do
+    require Logger
+
+    Logger.error(fn ->
+      "FerricStore dashboard page error at #{path}: #{inspect({kind, reason}, limit: 20)}"
+    end)
+  end
+
+  defp dashboard_internal_error_body(page_name) do
+    """
+    <html><body style="background:#0d1117;color:#f85149;padding:20px;font-family:monospace;">
+    <h2>#{page_name} Page Error</h2>
+    <pre>Internal dashboard error. See server logs.</pre>
+    <a href="/dashboard" style="color:#58a6ff;">← Dashboard</a>
+    </body></html>
+    """
   end
 end
