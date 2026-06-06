@@ -1621,7 +1621,7 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_require_lmdb_mirror_healthy_shard(ctx, index_key, shard_index) do
-    if flow_lmdb_mirror_degraded_shard?(ctx, shard_index) do
+    if Ferricstore.Flow.LMDBMirror.degraded_shard?(ctx, shard_index) do
       {:error, "ERR flow LMDB projection unavailable for #{index_key}"}
     else
       :ok
@@ -2877,81 +2877,15 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
-    if flow_lmdb_mirror_degraded?(ctx, index_key, partition_key) do
-      {:error, "ERR flow LMDB mirror degraded"}
-    else
-      :ok
-    end
-  end
-
-  defp flow_lmdb_mirror_degraded?(ctx, index_key, partition_key) do
-    ctx
-    |> flow_lmdb_index_shards(index_key, partition_key)
-    |> Enum.any?(&flow_lmdb_mirror_degraded_shard?(ctx, &1))
-  end
-
-  defp flow_lmdb_index_shards(ctx, _index_key, nil) do
-    if is_integer(ctx.shard_count) and ctx.shard_count > 0 do
-      Enum.to_list(0..(ctx.shard_count - 1))
-    else
-      []
-    end
-  end
-
-  defp flow_lmdb_index_shards(ctx, index_key, _partition_key),
-    do: [Router.shard_for(ctx, index_key)]
-
-  defp flow_lmdb_mirror_degraded_shard?(ctx, shard_index) do
-    flow_lmdb_mirror_degraded_flag?(ctx, shard_index) or
-      flow_lmdb_flush_in_progress_shard?(ctx, shard_index)
-  end
-
-  defp flow_lmdb_mirror_degraded_flag?(ctx, shard_index) do
-    flag_idx = shard_index + 1
-
-    case Map.get(ctx, :flow_lmdb_mirror_degraded) do
-      ref when is_reference(ref) ->
-        flag_idx <= :atomics.info(ref).size and :atomics.get(ref, flag_idx) == 1
-
-      _ ->
-        false
-    end
-  rescue
-    _ -> false
-  end
-
-  defp flow_lmdb_flush_in_progress_shard?(%{data_dir: data_dir}, shard_index)
-       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
-    data_dir
-    |> Ferricstore.DataDir.shard_data_path(shard_index)
-    |> Ferricstore.Flow.LMDB.path()
-    |> Ferricstore.Flow.LMDB.flush_in_progress?()
-  rescue
-    _ -> false
-  end
-
-  defp flow_lmdb_flush_in_progress_shard?(_ctx, _shard_index), do: false
-
-  defp flow_lmdb_shard_paths(data_dir, shard_count) do
-    Enum.map(0..(shard_count - 1), fn shard_index ->
-      data_dir
-      |> Ferricstore.DataDir.shard_data_path(shard_index)
-      |> Ferricstore.Flow.LMDB.path()
-    end)
+    Ferricstore.Flow.LMDBMirror.require_healthy(ctx, index_key, partition_key)
   end
 
   defp flow_lmdb_paths_for_index(ctx, _index_key, nil) do
-    flow_lmdb_shard_paths(ctx.data_dir, ctx.shard_count)
+    Ferricstore.Flow.LMDBMirror.paths_for_index(ctx, nil, nil)
   end
 
   defp flow_lmdb_paths_for_index(ctx, index_key, partition_key) when is_binary(partition_key) do
-    shard_index = Router.shard_for(ctx, index_key)
-
-    [
-      ctx.data_dir
-      |> Ferricstore.DataDir.shard_data_path(shard_index)
-      |> Ferricstore.Flow.LMDB.path()
-    ]
+    Ferricstore.Flow.LMDBMirror.paths_for_index(ctx, index_key, partition_key)
   end
 
   defp flow_terminal_lmdb_sweep_limit do
