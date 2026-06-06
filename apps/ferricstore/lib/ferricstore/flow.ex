@@ -1683,7 +1683,7 @@ defmodule Ferricstore.Flow do
           Ferricstore.Flow.LMDB.history_index_key(
             history_key,
             event_id,
-            flow_history_event_ms(event_id)
+            Ferricstore.Flow.HistoryEvent.ms(event_id)
           )
         end)
 
@@ -1798,7 +1798,7 @@ defmodule Ferricstore.Flow do
         _other ->
           []
       end)
-      |> Enum.sort_by(fn {event_id, _fields} -> {flow_history_event_ms(event_id), event_id} end)
+      |> Enum.sort_by(fn {event_id, _fields} -> {Ferricstore.Flow.HistoryEvent.ms(event_id), event_id} end)
       |> Enum.take(-fetch_count)
 
     events =
@@ -1846,7 +1846,7 @@ defmodule Ferricstore.Flow do
   defp flow_history_query_filtering?(query), do: Ferricstore.Flow.HistoryQuery.filtering?(query)
 
   defp flow_history_apply_query(events, query) do
-    Ferricstore.Flow.HistoryQuery.apply(events, query, &flow_history_event_ms/1)
+    Ferricstore.Flow.HistoryQuery.apply(events, query, &Ferricstore.Flow.HistoryEvent.ms/1)
   end
 
   defp flow_ms_after?(_event_ms, nil), do: true
@@ -1866,7 +1866,7 @@ defmodule Ferricstore.Flow do
       Ferricstore.Flow.HistoryQuery.validate_event_range(
         from_event,
         to_event,
-        &flow_history_event_ms/1
+        &Ferricstore.Flow.HistoryEvent.ms/1
       )
 
   defp flow_time_filter_fetch_count(count, nil, nil), do: count
@@ -2021,16 +2021,6 @@ defmodule Ferricstore.Flow do
       {:ok, ids}
     end
   end
-
-  defp flow_history_event_ms(event_id) when is_binary(event_id) do
-    case Integer.parse(event_id) do
-      {ms, "-" <> _rest} -> ms
-      {ms, ""} -> ms
-      _ -> 0
-    end
-  end
-
-  defp flow_history_event_ms(_event_id), do: 0
 
   @doc false
   # Encodes the current Flow metadata schema. User payload bytes are not encoded
