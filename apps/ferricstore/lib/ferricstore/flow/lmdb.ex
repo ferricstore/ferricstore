@@ -4,7 +4,6 @@ defmodule Ferricstore.Flow.LMDB do
   alias Ferricstore.Bitcask.NIF
 
   @default_map_size 16 * 1024 * 1024 * 1024
-  @terminal_count_cache :ferricstore_flow_lmdb_terminal_count_cache
 
   def enabled?, do: true
   def projection_enabled?, do: true
@@ -533,169 +532,26 @@ defmodule Ferricstore.Flow.LMDB do
 
   def decode_count(blob), do: Ferricstore.Flow.LMDB.IndexCodec.decode_count(blob)
 
-  def terminal_count(path, state_index_key) when is_binary(path) and is_binary(state_index_key) do
-    count_key = terminal_count_key(state_index_key)
+  def terminal_count(path, state_index_key),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.terminal_count(path, state_index_key)
 
-    case cached_terminal_count_key(path, count_key) do
-      {:ok, count} -> {:ok, count}
-      :miss -> terminal_count_key_uncached(path, count_key)
-    end
-  end
+  def terminal_counts(path, state_index_keys),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.terminal_counts(path, state_index_keys)
 
-  def terminal_counts(path, state_index_keys)
-      when is_binary(path) and is_list(state_index_keys) do
-    count_keys = Enum.map(state_index_keys, &terminal_count_key/1)
+  def refresh_terminal_count_key(path, count_key),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.refresh_count_key(path, count_key)
 
-    if count_keys == [] do
-      {:ok, []}
-    else
-      {cached, missing} =
-        count_keys
-        |> Enum.with_index()
-        |> Enum.reduce({%{}, []}, fn {count_key, index}, {cached_acc, missing_acc} ->
-          case cached_terminal_count_key(path, count_key) do
-            {:ok, count} -> {Map.put(cached_acc, index, count), missing_acc}
-            :miss -> {cached_acc, [{index, count_key} | missing_acc]}
-          end
-        end)
+  def put_cached_terminal_count_key(path, count_key, count),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.put_cached_count_key(path, count_key, count)
 
-      missing = Enum.reverse(missing)
+  def delete_cached_terminal_count_key(path, count_key),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.delete_cached_count_key(path, count_key)
 
-      with {:ok, fetched} <- terminal_count_keys_uncached(path, Enum.map(missing, &elem(&1, 1))) do
-        counts =
-          missing
-          |> Enum.zip(fetched)
-          |> Enum.reduce(cached, fn
-            {{index, count_key}, {:cache, count}}, acc ->
-              put_cached_terminal_count_key(path, count_key, count)
-              Map.put(acc, index, count)
+  def clear_cached_terminal_counts_for_path(path),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.clear_cached_for_path(path)
 
-            {{index, _count_key}, :missing}, acc ->
-              Map.put(acc, index, 0)
-          end)
-
-        {:ok, Enum.map(0..(length(count_keys) - 1)//1, &Map.fetch!(counts, &1))}
-      end
-    end
-  end
-
-  def refresh_terminal_count_key(path, count_key) when is_binary(path) and is_binary(count_key) do
-    case terminal_count_key_uncached(path, count_key) do
-      {:ok, count} ->
-        put_cached_terminal_count_key(path, count_key, count)
-        {:ok, count}
-
-      :not_found ->
-        delete_cached_terminal_count_key(path, count_key)
-        :not_found
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  def put_cached_terminal_count_key(path, count_key, count)
-      when is_binary(path) and is_binary(count_key) and is_integer(count) and count >= 0 do
-    ensure_terminal_count_cache()
-    :ets.insert(@terminal_count_cache, {{path, count_key}, count})
-    :ok
-  end
-
-  def delete_cached_terminal_count_key(path, count_key)
-      when is_binary(path) and is_binary(count_key) do
-    ensure_terminal_count_cache()
-    :ets.delete(@terminal_count_cache, {path, count_key})
-    :ok
-  end
-
-  def clear_cached_terminal_counts_for_path(path) when is_binary(path) do
-    ensure_terminal_count_cache()
-    :ets.match_delete(@terminal_count_cache, {{path, :_}, :_})
-    :ok
-  end
-
-  defp terminal_count_key_uncached(path, count_key) do
-    case get(path, count_key) do
-      {:ok, blob} ->
-        case decode_count(blob) do
-          {:ok, count} -> {:ok, count}
-          :error -> :not_found
-        end
-
-      :not_found ->
-        :not_found
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp terminal_count_keys_uncached(_path, []), do: {:ok, []}
-
-  defp terminal_count_keys_uncached(path, count_keys) do
-    case get_many(path, count_keys) do
-      {:ok, results} ->
-        counts =
-          Enum.map(results, fn
-            {:ok, blob} ->
-              case decode_count(blob) do
-                {:ok, count} -> {:cache, count}
-                :error -> :missing
-              end
-
-            :not_found ->
-              :missing
-          end)
-
-        {:ok, counts}
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp cached_terminal_count_key(path, count_key) do
-    ensure_terminal_count_cache()
-
-    case :ets.lookup(@terminal_count_cache, {path, count_key}) do
-      [{{^path, ^count_key}, count}] when is_integer(count) and count >= 0 -> {:ok, count}
-      _ -> :miss
-    end
-  end
-
-  defp ensure_terminal_count_cache do
-    case :ets.whereis(@terminal_count_cache) do
-      :undefined ->
-        try do
-          :ets.new(@terminal_count_cache, [
-            :named_table,
-            :public,
-            :set,
-            read_concurrency: true,
-            write_concurrency: true
-          ])
-        rescue
-          ArgumentError -> @terminal_count_cache
-        end
-
-      _table ->
-        @terminal_count_cache
-    end
-  end
-
-  def put_terminal_count(path, state_index_key, count)
-      when is_binary(path) and is_binary(state_index_key) and is_integer(count) and count >= 0 do
-    count_key = terminal_count_key(state_index_key)
-
-    case write_batch(path, [{:put, count_key, encode_count(count)}]) do
-      :ok ->
-        put_cached_terminal_count_key(path, count_key, count)
-        :ok
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
+  def put_terminal_count(path, state_index_key, count),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.put_terminal_count(path, state_index_key, count)
 
   def sweep_expired_terminal(path, now_ms, limit)
       when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
@@ -869,14 +725,11 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   defp refresh_terminal_count_cache_after_delete(path, {:ok, count_key}) do
-    case terminal_count_key_uncached(path, count_key) do
-      {:ok, count} -> put_cached_terminal_count_key(path, count_key, count)
-      :not_found -> put_cached_terminal_count_key(path, count_key, 0)
-      {:error, _reason} -> delete_cached_terminal_count_key(path, count_key)
-    end
+    Ferricstore.Flow.LMDB.TerminalCounts.refresh_after_delete(path, {:ok, count_key})
   end
 
-  defp refresh_terminal_count_cache_after_delete(_path, :missing), do: :ok
+  defp refresh_terminal_count_cache_after_delete(path, :missing),
+    do: Ferricstore.Flow.LMDB.TerminalCounts.refresh_after_delete(path, :missing)
 
   defp expired_terminal_sweep_ops(path, entries, now_ms) do
     Enum.reduce_while(entries, {[], %{}, 0}, fn {expire_key, expire_value},
