@@ -889,46 +889,24 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp ensure_timer(%{timer_ref: nil, flush_interval_ms: interval} = state) do
-    delay = interval + timer_jitter_ms(Map.get(state, :flush_jitter_ms, 0))
-    %{state | timer_ref: Process.send_after(self(), :flush, delay)}
+    Ferricstore.Flow.LMDBWriter.Timer.ensure_timer(%{state | flush_interval_ms: interval})
   end
 
-  defp ensure_timer(state), do: state
+  defp ensure_timer(state), do: Ferricstore.Flow.LMDBWriter.Timer.ensure_timer(state)
 
   defp ensure_projection_outbox_timer(%{timer_ref: nil} = state) do
-    delay =
-      state
-      |> Map.get(:flush_max_lag_ms, @default_lagged_flush_max_lag_ms)
-      |> max(1)
-
-    %{state | timer_ref: Process.send_after(self(), :flush, delay)}
+    Ferricstore.Flow.LMDBWriter.Timer.ensure_projection_outbox_timer(state)
   end
 
-  defp ensure_projection_outbox_timer(state), do: state
+  defp ensure_projection_outbox_timer(state),
+    do: Ferricstore.Flow.LMDBWriter.Timer.ensure_projection_outbox_timer(state)
 
   defp ensure_enqueue_timer(state), do: ensure_timer(state)
 
-  defp flush_on_max_ops?(%{flush_on_max_ops?: true} = state), do: state.count >= state.max_ops
-  defp flush_on_max_ops?(_state), do: false
+  defp flush_on_max_ops?(state), do: Ferricstore.Flow.LMDBWriter.Timer.flush_on_max_ops?(state)
 
-  defp maybe_defer_timer_flush(%{pending: [], pending_after_flush: []}), do: :flush
-
-  defp maybe_defer_timer_flush(%{flush_on_max_ops?: true, count: count, max_ops: max_ops})
-       when is_integer(count) and is_integer(max_ops) and count >= max_ops,
-       do: :flush
-
-  defp maybe_defer_timer_flush(%{last_enqueue_at: nil}), do: :flush
-  defp maybe_defer_timer_flush(%{first_pending_at: nil}), do: :flush
-
-  defp maybe_defer_timer_flush(state) do
-    case timer_flush_decision(state) do
-      {:defer, delay_ms} ->
-        {:defer, %{state | timer_ref: Process.send_after(self(), :flush, delay_ms)}}
-
-      :flush ->
-        :flush
-    end
-  end
+  defp maybe_defer_timer_flush(state),
+    do: Ferricstore.Flow.LMDBWriter.Timer.maybe_defer_timer_flush(state)
 
   defp maybe_flush_replay_safe_request(state) do
     case timer_flush_decision(state) do
@@ -940,59 +918,18 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp timer_flush_decision(%{pending: [], pending_after_flush: []}), do: :flush
+  defp timer_flush_decision(state), do: Ferricstore.Flow.LMDBWriter.Timer.timer_flush_decision(state)
 
-  defp timer_flush_decision(%{flush_on_max_ops?: true, count: count, max_ops: max_ops})
-       when is_integer(count) and is_integer(max_ops) and count >= max_ops,
-       do: :flush
-
-  defp timer_flush_decision(%{last_enqueue_at: nil}), do: :flush
-  defp timer_flush_decision(%{first_pending_at: nil}), do: :flush
-
-  defp timer_flush_decision(state), do: timer_flush_decision(state, System.monotonic_time())
-
-  defp timer_flush_decision(%{pending: [], pending_after_flush: []}, _now), do: :flush
-
-  defp timer_flush_decision(%{flush_on_max_ops?: true, count: count, max_ops: max_ops}, _now)
-       when is_integer(count) and is_integer(max_ops) and count >= max_ops,
-       do: :flush
-
-  defp timer_flush_decision(%{last_enqueue_at: nil}, _now), do: :flush
-  defp timer_flush_decision(%{first_pending_at: nil}, _now), do: :flush
-
-  defp timer_flush_decision(state, now) do
-    quiet_ms =
-      normalize_non_negative_integer(state.flush_quiet_ms, @default_lagged_flush_quiet_ms)
-
-    max_lag_ms =
-      normalize_non_negative_integer(state.flush_max_lag_ms, @default_lagged_flush_max_lag_ms)
-
-    cond do
-      quiet_ms == 0 or max_lag_ms == 0 ->
-        :flush
-
-      true ->
-        idle_ms = elapsed_ms(state.last_enqueue_at, now)
-        pending_age_ms = elapsed_ms(state.first_pending_at, now)
-
-        if idle_ms < quiet_ms and pending_age_ms < max_lag_ms do
-          {:defer, max(1, min(quiet_ms - idle_ms, max_lag_ms - pending_age_ms))}
-        else
-          :flush
-        end
-    end
-  end
+  defp timer_flush_decision(state, now),
+    do: Ferricstore.Flow.LMDBWriter.Timer.timer_flush_decision(state, now)
 
   defp ensure_timer_with_delay(%{timer_ref: nil} = state, delay_ms)
        when is_integer(delay_ms) and delay_ms > 0 do
-    %{state | timer_ref: Process.send_after(self(), :flush, delay_ms)}
+    Ferricstore.Flow.LMDBWriter.Timer.ensure_timer_with_delay(state, delay_ms)
   end
 
-  defp ensure_timer_with_delay(state, _delay_ms), do: state
-
-  defp elapsed_ms(started_at, now) when is_integer(started_at) and is_integer(now) do
-    max(System.convert_time_unit(now - started_at, :native, :millisecond), 0)
-  end
+  defp ensure_timer_with_delay(state, delay_ms),
+    do: Ferricstore.Flow.LMDBWriter.Timer.ensure_timer_with_delay(state, delay_ms)
 
   defp enqueue_seq_target(%{enqueue_seq: ref}) when is_reference(ref) do
     :atomics.get(ref, @enqueue_seq_queued)
@@ -2649,16 +2586,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp merge_flush_all_result({:exit, reason}, :ok), do: {:error, {:flush_task_exit, reason}}
 
   defp merge_flush_all_result({:exit, _reason}, acc), do: acc
-
-  defp timer_jitter_ms(jitter_ms) do
-    jitter_ms = normalize_non_negative_integer(jitter_ms, 0)
-
-    if jitter_ms == 0 do
-      0
-    else
-      :erlang.phash2({self(), System.unique_integer([:monotonic])}, jitter_ms + 1)
-    end
-  end
 
   defp normalize_non_negative_integer(value, _default) when is_integer(value) and value >= 0,
     do: value
