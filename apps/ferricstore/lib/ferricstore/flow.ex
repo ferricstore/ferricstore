@@ -1840,69 +1840,15 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_history_query_fetch_count(%{count: count} = query) do
-    if flow_history_query_filtering?(query) do
-      flow_history_lmdb_query_scan_count(count, Map.get(query, :rev?, false))
-    else
-      count
-    end
+  defp flow_history_query_fetch_count(query) do
+    Ferricstore.Flow.HistoryQuery.fetch_count(query, &flow_history_lmdb_query_scan_count/2)
   end
 
-  defp flow_history_query_filtering?(%{
-         from_event: nil,
-         to_event: nil,
-         from_ms: nil,
-         to_ms: nil,
-         from_version: nil,
-         to_version: nil,
-         event: nil,
-         worker: nil
-       }),
-       do: false
-
-  defp flow_history_query_filtering?(_query), do: true
+  defp flow_history_query_filtering?(query), do: Ferricstore.Flow.HistoryQuery.filtering?(query)
 
   defp flow_history_apply_query(events, query) do
-    filtered = Enum.filter(events, &flow_history_event_matches?(&1, query))
-
-    cond do
-      query.rev? ->
-        filtered
-        |> Enum.reverse()
-        |> Enum.take(query.count)
-
-      flow_history_query_filtering?(query) ->
-        Enum.take(filtered, -query.count)
-
-      true ->
-        Enum.take(filtered, query.count)
-    end
+    Ferricstore.Flow.HistoryQuery.apply(events, query, &flow_history_event_ms/1)
   end
-
-  defp flow_history_event_matches?({event_id, fields}, query) do
-    event_ms = flow_history_event_ms(event_id)
-    event_key = {event_ms, event_id}
-    version = flow_history_field_int(fields, "version")
-
-    flow_event_after?(event_key, query.from_event) and
-      flow_event_before?(event_key, query.to_event) and
-      flow_ms_after?(event_ms, query.from_ms) and
-      flow_ms_before?(event_ms, query.to_ms) and
-      flow_version_after?(version, query.from_version) and
-      flow_version_before?(version, query.to_version) and
-      flow_field_matches?(fields, "event", query.event) and
-      flow_field_matches?(fields, "lease_owner", query.worker)
-  end
-
-  defp flow_event_after?(_event_key, nil), do: true
-
-  defp flow_event_after?(event_key, from_event),
-    do: event_key >= flow_history_event_key(from_event)
-
-  defp flow_event_before?(_event_key, nil), do: true
-  defp flow_event_before?(event_key, to_event), do: event_key <= flow_history_event_key(to_event)
-
-  defp flow_history_event_key(event_id), do: {flow_history_event_ms(event_id), event_id}
 
   defp flow_ms_after?(_event_ms, nil), do: true
   defp flow_ms_after?(event_ms, from_ms), do: event_ms >= from_ms
@@ -1910,55 +1856,19 @@ defmodule Ferricstore.Flow do
   defp flow_ms_before?(_event_ms, nil), do: true
   defp flow_ms_before?(event_ms, to_ms), do: event_ms <= to_ms
 
-  defp flow_version_after?(_version, nil), do: true
-  defp flow_version_after?(version, from_version), do: version >= from_version
+  defp validate_ms_range(from_ms, to_ms),
+    do: Ferricstore.Flow.HistoryQuery.validate_ms_range(from_ms, to_ms)
 
-  defp flow_version_before?(_version, nil), do: true
-  defp flow_version_before?(version, to_version), do: version <= to_version
+  defp validate_version_range(from_version, to_version),
+    do: Ferricstore.Flow.HistoryQuery.validate_version_range(from_version, to_version)
 
-  defp flow_history_field_int(fields, key) do
-    case Map.get(fields, key) do
-      value when is_integer(value) ->
-        value
-
-      value when is_binary(value) ->
-        case Integer.parse(value) do
-          {int, ""} -> int
-          _ -> 0
-        end
-
-      _ ->
-        0
-    end
-  end
-
-  defp flow_field_matches?(_fields, _key, nil), do: true
-  defp flow_field_matches?(fields, key, value), do: Map.get(fields, key) == value
-
-  defp validate_ms_range(nil, _to_ms), do: :ok
-  defp validate_ms_range(_from_ms, nil), do: :ok
-
-  defp validate_ms_range(from_ms, to_ms) when from_ms <= to_ms, do: :ok
-  defp validate_ms_range(_from_ms, _to_ms), do: {:error, "ERR flow from_ms must be <= to_ms"}
-
-  defp validate_version_range(nil, _to_version), do: :ok
-  defp validate_version_range(_from_version, nil), do: :ok
-
-  defp validate_version_range(from_version, to_version) when from_version <= to_version, do: :ok
-
-  defp validate_version_range(_from_version, _to_version),
-    do: {:error, "ERR flow from_version must be <= to_version"}
-
-  defp validate_event_range(nil, _to_event), do: :ok
-  defp validate_event_range(_from_event, nil), do: :ok
-
-  defp validate_event_range(from_event, to_event) do
-    if flow_history_event_key(from_event) <= flow_history_event_key(to_event) do
-      :ok
-    else
-      {:error, "ERR flow from_event must be <= to_event"}
-    end
-  end
+  defp validate_event_range(from_event, to_event),
+    do:
+      Ferricstore.Flow.HistoryQuery.validate_event_range(
+        from_event,
+        to_event,
+        &flow_history_event_ms/1
+      )
 
   defp flow_time_filter_fetch_count(count, nil, nil), do: count
 
@@ -3211,7 +3121,10 @@ defmodule Ferricstore.Flow do
 
     values =
       ctx
-      |> Ferricstore.Flow.ValueStore.raw_mget_with_file_refs(refs, file_ref_payload_threshold(max_bytes))
+      |> Ferricstore.Flow.ValueStore.raw_mget_with_file_refs(
+        refs,
+        file_ref_payload_threshold(max_bytes)
+      )
       |> Enum.zip(refs)
       |> Map.new(fn {value, ref} -> {ref, value} end)
 
@@ -4588,7 +4501,10 @@ defmodule Ferricstore.Flow do
 
     values =
       ctx
-      |> Ferricstore.Flow.ValueStore.raw_mget_with_file_refs(fetchable_refs, file_ref_payload_threshold(max_bytes))
+      |> Ferricstore.Flow.ValueStore.raw_mget_with_file_refs(
+        fetchable_refs,
+        file_ref_payload_threshold(max_bytes)
+      )
       |> Enum.zip(fetchable_refs)
       |> Map.new(fn {value, ref} -> {ref, value} end)
 
@@ -6164,5 +6080,4 @@ defmodule Ferricstore.Flow do
   end
 
   defp now_ms, do: CommandTime.now_ms()
-
 end
