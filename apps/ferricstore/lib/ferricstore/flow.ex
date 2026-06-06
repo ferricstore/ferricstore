@@ -3057,11 +3057,11 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_history_entry_to_tuple({event_id, fields}) when is_list(fields) do
-    {event_id, flow_fields_to_map(fields)}
+    Ferricstore.Flow.HistoryEntry.to_tuple({event_id, fields})
   end
 
   defp flow_history_entry_to_tuple([event_id | fields]) when is_list(fields) do
-    {event_id, flow_fields_to_map(fields)}
+    Ferricstore.Flow.HistoryEntry.to_tuple([event_id | fields])
   end
 
   defp hydrate_history_values(history, _ctx, %{enabled?: false}), do: history
@@ -3145,12 +3145,6 @@ defmodule Ferricstore.Flow do
   end
 
   defp apply_history_value_result_for_valid_ref(fields, _kind, _value, _max_bytes), do: fields
-
-  defp flow_fields_to_map(fields) when is_list(fields) do
-    fields
-    |> Enum.chunk_every(2)
-    |> Map.new(fn [key, value] -> {key, value} end)
-  end
 
   defp flow_zcard(ctx, key) do
     Ferricstore.Flow.IndexZSet.card(ctx, key)
