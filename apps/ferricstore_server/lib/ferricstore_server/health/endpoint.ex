@@ -50,6 +50,7 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Health.Endpoint.Auth
+  alias FerricstoreServer.Health.Endpoint.DashboardHandlers
   alias FerricstoreServer.Health.Endpoint.Forbidden
   alias FerricstoreServer.Health.Endpoint.Login
   alias FerricstoreServer.Health.Endpoint.FlowPaths
@@ -610,11 +611,11 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/api/flow", peer, headers) do
-    handle_flow_api(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_api(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/api/flow?" <> query, peer, headers) do
-    handle_flow_api(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_api(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/api/" <> api_path, peer, headers) do
@@ -723,15 +724,15 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/doctor", peer, headers) do
-    handle_doctor_page(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_doctor_page(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/doctor?" <> query, peer, headers) do
-    handle_doctor_page(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_doctor_page(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/keyspace", peer, headers) do
-    handle_keyspace_page(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_keyspace_page(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -742,7 +743,7 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_keyspace_page(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_keyspace_page(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/commands", peer, headers) do
@@ -776,15 +777,15 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow", peer, headers) do
-    handle_flow_overview(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_overview(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow?" <> query, peer, headers) do
-    handle_flow_overview(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_overview(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/lookup", peer, headers) do
-    handle_flow_lookup(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_lookup(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -795,11 +796,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_lookup(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_lookup(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/states", peer, headers) do
-    handle_flow_states(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_states(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -810,7 +811,7 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_states(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_states(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/workers", peer, headers) do
@@ -842,7 +843,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/failures", peer, headers) do
-    handle_flow_failures(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_failures(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -853,11 +854,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_failures(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_failures(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/lineage", peer, headers) do
-    handle_flow_lineage(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_lineage(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -868,11 +869,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_lineage(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_lineage(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/query", peer, headers) do
-    handle_flow_query(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_query(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -883,11 +884,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_query(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_query(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/signals", peer, headers) do
-    handle_flow_signals(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_signals(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -898,11 +899,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_signals(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_signals(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/policies", peer, headers) do
-    handle_flow_policies(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_policies(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -913,11 +914,11 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_policies(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_policies(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/retention", peer, headers) do
-    handle_flow_retention(socket, transport, peer, headers, "")
+    DashboardHandlers.handle_flow_retention(socket, transport, peer, headers, "")
   end
 
   defp dispatch_request(
@@ -928,7 +929,7 @@ defmodule FerricstoreServer.Health.Endpoint do
          peer,
          headers
        ) do
-    handle_flow_retention(socket, transport, peer, headers, query)
+    DashboardHandlers.handle_flow_retention(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/config", peer, headers) do
@@ -979,208 +980,6 @@ defmodule FerricstoreServer.Health.Endpoint do
       "Method Not Allowed",
       ~s({"error":"method not allowed"})
     )
-  end
-
-  defp handle_keyspace_page(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        query
-        |> URI.decode_query()
-        |> Map.merge(Auth.dashboard_collect_opts(peer, headers))
-        |> FerricstoreServer.Health.Dashboard.collect_keyspace_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_keyspace_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_doctor_page(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        query
-        |> URI.decode_query()
-        |> FerricstoreServer.Health.Dashboard.collect_doctor_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_doctor_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_api(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        query
-        |> FerricstoreServer.Health.Dashboard.flow_opts_from_query()
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_page()
-
-      body = data |> FerricstoreServer.Health.Dashboard.live_flow_payload() |> Jason.encode!()
-      send_response(socket, transport, 200, "OK", "application/json; charset=utf-8", body)
-    end
-  end
-
-  defp handle_flow_overview(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        query
-        |> FerricstoreServer.Health.Dashboard.flow_opts_from_query()
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_states(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      opts =
-        query
-        |> FerricstoreServer.Health.Dashboard.flow_states_opts_from_query()
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-
-      data = FerricstoreServer.Health.Dashboard.collect_flow_states_page(opts)
-      body = FerricstoreServer.Health.Dashboard.render_flow_states_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_signals(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      opts =
-        query
-        |> FerricstoreServer.Health.Dashboard.flow_signals_opts_from_query()
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-
-      data = FerricstoreServer.Health.Dashboard.collect_flow_signals_page(opts)
-      body = FerricstoreServer.Health.Dashboard.render_flow_signals_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_policies(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(query)
-
-      data =
-        FerricstoreServer.Health.Dashboard.collect_flow_policies_page(
-          flash: FerricstoreServer.Health.Dashboard.flow_policy_flash_from_query(query),
-          edit_type: Map.get(params, "edit", "")
-        )
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_policies_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_retention(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(query)
-
-      data =
-        [
-          flash: FerricstoreServer.Health.Dashboard.flow_retention_flash_from_query(query),
-          limit: Map.get(params, "limit", "")
-        ]
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_retention_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_retention_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_failures(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        query
-        |> FerricstoreServer.Health.Dashboard.flow_failures_opts_from_query()
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_failures_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_failures_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_lineage(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        query
-        |> FerricstoreServer.Health.Dashboard.flow_lineage_opts_from_query()
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_lineage_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_lineage_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_query(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data =
-        query
-        |> FerricstoreServer.Health.Dashboard.flow_query_opts_from_query()
-        |> Auth.dashboard_flow_collect_opts(peer, headers)
-        |> FerricstoreServer.Health.Dashboard.collect_flow_query_page()
-
-      body = FerricstoreServer.Health.Dashboard.render_flow_query_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
-    end
-  end
-
-  defp handle_flow_lookup(socket, transport, peer, headers, query) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      decoded_query = URI.decode_query(query)
-
-      id =
-        decoded_query
-        |> Map.get("id", "")
-        |> String.trim()
-
-      partition_key =
-        decoded_query
-        |> Map.get("partition_key", "")
-        |> String.trim()
-
-      location =
-        case {id, partition_key} do
-          {"", ""} ->
-            "/dashboard/flow"
-
-          {"", partition_key} ->
-            "/dashboard/flow?" <> URI.encode_query(%{"partition_key" => partition_key})
-
-          {id, partition_key} ->
-            FlowPaths.flow_detail_location(id, partition_key)
-        end
-
-      send_redirect_response(socket, transport, location)
-    end
   end
 
   defp send_forbidden_response(socket, transport, path, requirement, reason) do
