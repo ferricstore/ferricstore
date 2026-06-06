@@ -51,6 +51,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Health.Endpoint.Forbidden
   alias FerricstoreServer.Health.Endpoint.Login
+  alias FerricstoreServer.Health.Endpoint.FlowPaths
   alias FerricstoreServer.Health.Endpoint.Request
   alias FerricstoreServer.Health.Endpoint.Response
   alias FerricstoreServer.Health.Endpoint.Session
@@ -199,7 +200,7 @@ defmodule FerricstoreServer.Health.Endpoint do
          _headers,
          body
        ) do
-    params = decode_form_body(body)
+    params = FlowPaths.decode_form_body(body)
     username = params |> Map.get("username", "") |> String.trim()
     password = Map.get(params, "password", "")
     next = Login.sanitize_next(Map.get(params, "next", ""))
@@ -247,7 +248,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      params = decode_form_body(body)
+      params = FlowPaths.decode_form_body(body)
 
       case authorize_command_request(peer, headers, {"FERRICSTORE.DOCTOR", []}, :html) do
         :ok ->
@@ -295,7 +296,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      params = decode_form_body(body)
+      params = FlowPaths.decode_form_body(body)
 
       case authorize_command_request(
              peer,
@@ -356,7 +357,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      params = decode_form_body(body)
+      params = FlowPaths.decode_form_body(body)
 
       case authorize_command_request(
              peer,
@@ -428,7 +429,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      params = decode_form_body(body)
+      params = FlowPaths.decode_form_body(body)
 
       case authorize_command_request(
              peer,
@@ -491,11 +492,11 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      case decode_flow_rewind_action(encoded_action) do
+      case FlowPaths.decode_flow_rewind_action(encoded_action) do
         {:ok, id} ->
           params =
             body
-            |> decode_form_body()
+            |> FlowPaths.decode_form_body()
             |> Map.put_new("id", id)
 
           case authorize_command_request(
@@ -508,12 +509,12 @@ defmodule FerricstoreServer.Health.Endpoint do
               location =
                 case FerricstoreServer.Health.Dashboard.apply_flow_rewind_form(params) do
                   {:ok, id, partition_key} ->
-                    flow_detail_location(id, partition_key, %{"status" => "rewound"})
+                    FlowPaths.flow_detail_location(id, partition_key, %{"status" => "rewound"})
 
                   {:error, reason} ->
                     partition_key = Map.get(params, "partition_key", "")
 
-                    flow_detail_location(id, partition_key, %{
+                    FlowPaths.flow_detail_location(id, partition_key, %{
                       "status" => "error",
                       "message" => reason
                     })
@@ -948,7 +949,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      {id, opts} = decode_flow_detail_request(encoded_id)
+      {id, opts} = FlowPaths.decode_flow_detail_request(encoded_id)
       data = FerricstoreServer.Health.Dashboard.collect_flow_detail_page(id, opts)
       body = FerricstoreServer.Health.Dashboard.render_flow_detail_page(data)
       send_html_response(socket, transport, 200, "OK", body)
@@ -1071,7 +1072,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      params = decode_form_body(query)
+      params = FlowPaths.decode_form_body(query)
 
       data =
         FerricstoreServer.Health.Dashboard.collect_flow_policies_page(
@@ -1088,7 +1089,7 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      params = decode_form_body(query)
+      params = FlowPaths.decode_form_body(query)
 
       data =
         [
@@ -1173,71 +1174,11 @@ defmodule FerricstoreServer.Health.Endpoint do
             "/dashboard/flow?" <> URI.encode_query(%{"partition_key" => partition_key})
 
           {id, partition_key} ->
-            flow_detail_location(id, partition_key)
+            FlowPaths.flow_detail_location(id, partition_key)
         end
 
       send_redirect_response(socket, transport, location)
     end
-  end
-
-  defp decode_form_body(body) when is_binary(body) do
-    URI.decode_query(body)
-  rescue
-    _ -> %{}
-  end
-
-  defp decode_flow_detail_request(encoded_id_with_query) do
-    {encoded_id, query} =
-      case String.split(encoded_id_with_query, "?", parts: 2) do
-        [encoded_id, query] -> {encoded_id, query}
-        [encoded_id] -> {encoded_id, ""}
-      end
-
-    opts = FerricstoreServer.Health.Dashboard.flow_detail_opts_from_query(query)
-
-    {URI.decode(encoded_id), opts}
-  end
-
-  defp decode_flow_rewind_action(encoded_action) do
-    suffix = "/rewind"
-
-    if String.ends_with?(encoded_action, suffix) do
-      encoded_id =
-        binary_part(encoded_action, 0, byte_size(encoded_action) - byte_size(suffix))
-
-      {:ok, URI.decode(encoded_id)}
-    else
-      :not_found
-    end
-  end
-
-  defp flow_detail_location(id, ""),
-    do: "/dashboard/flow/" <> URI.encode(id, &URI.char_unreserved?/1)
-
-  defp flow_detail_location(id, nil),
-    do: "/dashboard/flow/" <> URI.encode(id, &URI.char_unreserved?/1)
-
-  defp flow_detail_location(id, partition_key) do
-    "/dashboard/flow/" <>
-      URI.encode(id, &URI.char_unreserved?/1) <>
-      "?" <> URI.encode_query(%{"partition_key" => partition_key})
-  end
-
-  defp flow_detail_location(id, partition_key, extra_params) when is_map(extra_params) do
-    params =
-      extra_params
-      |> Enum.reject(fn {_key, value} -> is_nil(value) or value == "" end)
-      |> Map.new()
-
-    params =
-      case partition_key do
-        key when is_binary(key) and key != "" -> Map.put(params, "partition_key", key)
-        _ -> params
-      end
-
-    path = "/dashboard/flow/" <> URI.encode(id, &URI.char_unreserved?/1)
-
-    if map_size(params) == 0, do: path, else: path <> "?" <> URI.encode_query(params)
   end
 
   @doc false
@@ -1623,7 +1564,7 @@ defmodule FerricstoreServer.Health.Endpoint do
   defp flow_query_command_requirement(_kind), do: "FLOW.LIST"
 
   defp flow_rewind_or_default_requirement("/dashboard/flow/" <> encoded_action) do
-    case decode_flow_rewind_action(encoded_action) do
+    case FlowPaths.decode_flow_rewind_action(encoded_action) do
       {:ok, _id} -> {"FLOW.REWIND", []}
       :not_found -> {"FLOW.REWIND", []}
     end
