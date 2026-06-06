@@ -14,9 +14,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   require Logger
 
-  @default_lagged_flush_quiet_ms 250
-  @default_lagged_flush_max_lag_ms 30_000
-  @default_flush_chunk_ops 5_000
   @default_source_pending_retries 100
   @default_source_pending_sleep_ms 1
   @default_max_mailbox_messages 50_000
@@ -495,73 +492,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     enqueue_seq = :atomics.new(2, signed: false)
     publish_enqueue_seq(instance_name, shard_index, enqueue_seq)
 
-    state = %{
-      instance_name: instance_name,
-      mode: Ferricstore.Flow.LMDB.mode(),
-      shard_index: shard_index,
-      data_dir: data_dir,
-      shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, shard_index),
-      path:
-        data_dir
-        |> Ferricstore.DataDir.shard_data_path(shard_index)
-        |> Ferricstore.Flow.LMDB.path(),
-      instance_ctx: Keyword.get(opts, :instance_ctx),
-      pending: [],
-      pending_after_flush: [],
-      count: 0,
-      first_pending_at: nil,
-      last_enqueue_at: nil,
-      timer_ref: nil,
-      durable_index: 0,
-      requested_index: 0,
-      terminal_count_inits: MapSet.new(),
-      lmdb_ready: false,
-      suspended?: false,
-      projection_dirty?: false,
-      enqueue_seq: enqueue_seq,
-      processed_enqueue_seq: 0,
-      processed_enqueue_gaps: MapSet.new(),
-      flush_waiters: [],
-      flush_interval_ms:
-        Application.get_env(
-          :ferricstore,
-          :flow_lmdb_flush_interval_ms,
-          Config.default_flush_interval_ms()
-        ),
-      flush_jitter_ms:
-        Application.get_env(
-          :ferricstore,
-          :flow_lmdb_flush_jitter_ms,
-          Config.default_flush_jitter_ms()
-        ),
-      flush_quiet_ms:
-        Application.get_env(
-          :ferricstore,
-          :flow_lmdb_flush_quiet_ms,
-          @default_lagged_flush_quiet_ms
-        ),
-      flush_max_lag_ms:
-        Application.get_env(
-          :ferricstore,
-          :flow_lmdb_flush_max_lag_ms,
-          @default_lagged_flush_max_lag_ms
-        ),
-      max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, Config.default_max_ops()),
-      flush_on_max_ops?:
-        Application.get_env(
-          :ferricstore,
-          :flow_lmdb_flush_on_max_ops,
-          Config.default_flush_on_max_ops(Ferricstore.Flow.LMDB.mode())
-        ),
-      flush_chunk_ops:
-        Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops, @default_flush_chunk_ops),
-      flush_chunk_pause_ms:
-        Application.get_env(
-          :ferricstore,
-          :flow_lmdb_flush_chunk_pause_ms,
-          Config.default_flush_chunk_pause_ms()
-        )
-    }
+    state = Config.initial_state(opts, instance_name, shard_index, data_dir, enqueue_seq)
 
     durable_index = LMDBReplaySafeIndex.read(state.shard_data_path)
     publish_durable(state.instance_ctx, shard_index, durable_index)
@@ -1128,7 +1059,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
        when is_integer(chunk_ops) and chunk_ops > 0,
        do: chunk_ops
 
-  defp flush_chunk_ops(_state), do: @default_flush_chunk_ops
+  defp flush_chunk_ops(_state), do: Config.default_flush_chunk_ops()
 
   defp terminal_count_cache_empty?(%{puts: puts, refresh: refresh}) do
     map_size(puts) == 0 and MapSet.size(refresh) == 0
