@@ -435,80 +435,51 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :exit, _reason -> :ok
   end
 
-  def name(shard_index), do: :"Ferricstore.Flow.LMDBWriter.#{shard_index}"
+  def name(shard_index), do: Ferricstore.Flow.LMDBWriter.Registry.name(shard_index)
 
-  def name(:default, shard_index), do: name(shard_index)
+  def name(:default, shard_index), do: Ferricstore.Flow.LMDBWriter.Registry.name(:default, shard_index)
 
   def name(instance_name, shard_index) do
-    :"Ferricstore.Flow.LMDBWriter.#{instance_name}.#{shard_index}"
+    Ferricstore.Flow.LMDBWriter.Registry.name(instance_name, shard_index)
   end
 
   defp projection_outbox_name(instance_name, shard_index) do
-    :"Ferricstore.Flow.LMDBWriter.ProjectionOutbox.#{instance_name}.#{shard_index}"
+    Ferricstore.Flow.LMDBWriter.Registry.projection_outbox_name(instance_name, shard_index)
   end
 
   defp ensure_projection_outbox!(instance_name, shard_index) do
-    table = projection_outbox_name(instance_name, shard_index)
-
-    case :ets.whereis(table) do
-      :undefined ->
-        :ets.new(table, [
-          :ordered_set,
-          :public,
-          :named_table,
-          {:read_concurrency, true},
-          {:write_concurrency, true}
-        ])
-
-      tid ->
-        tid
-    end
+    Ferricstore.Flow.LMDBWriter.Registry.ensure_projection_outbox!(instance_name, shard_index)
   end
 
   defp normalize_projection_outbox_entries(entries) do
-    Enum.flat_map(entries, fn
-      {state_key, version} when is_binary(state_key) and is_integer(version) -> [{state_key, version}]
-      _other -> []
-    end)
+    Ferricstore.Flow.LMDBWriter.Registry.normalize_projection_outbox_entries(entries)
   end
 
   defp projection_outbox_rows(entries) do
-    Enum.map(entries, fn {state_key, version} ->
-      {System.unique_integer([:monotonic, :positive]), state_key, version}
-    end)
+    Ferricstore.Flow.LMDBWriter.Registry.projection_outbox_rows(entries)
   end
 
   defp mark_instance_suspended(instance_name) when is_atom(instance_name) do
-    :persistent_term.put(suspend_key(instance_name), true)
-    :ok
+    Ferricstore.Flow.LMDBWriter.Registry.mark_instance_suspended(instance_name)
   end
 
   defp clear_instance_suspended(instance_name) when is_atom(instance_name) do
-    :persistent_term.erase(suspend_key(instance_name))
-    :ok
-  rescue
-    ArgumentError -> :ok
+    Ferricstore.Flow.LMDBWriter.Registry.clear_instance_suspended(instance_name)
   end
 
   defp instance_suspended?(instance_name) when is_atom(instance_name),
-    do: :persistent_term.get(suspend_key(instance_name), false)
-
-  defp suspend_key(instance_name), do: {__MODULE__, :suspended, instance_name}
-
-  defp enqueue_seq_key(instance_name, shard_index),
-    do: {__MODULE__, :enqueue_seq, instance_name, shard_index}
+    do: Ferricstore.Flow.LMDBWriter.Registry.instance_suspended?(instance_name)
 
   defp publish_enqueue_seq(instance_name, shard_index, ref) when is_reference(ref) do
-    :persistent_term.put(enqueue_seq_key(instance_name, shard_index), ref)
+    Ferricstore.Flow.LMDBWriter.Registry.publish_enqueue_seq(instance_name, shard_index, ref)
+  end
+
+  defp enqueue_seq_key(instance_name, shard_index) do
+    Ferricstore.Flow.LMDBWriter.Registry.enqueue_seq_key(instance_name, shard_index)
   end
 
   defp reserve_enqueue_seq(instance_name, shard_index) do
-    case :persistent_term.get(enqueue_seq_key(instance_name, shard_index), nil) do
-      ref when is_reference(ref) -> :atomics.add_get(ref, @enqueue_seq_queued, 1)
-      _ -> 0
-    end
-  rescue
-    _ -> 0
+    Ferricstore.Flow.LMDBWriter.Registry.reserve_enqueue_seq(instance_name, shard_index)
   end
 
   @impl true
