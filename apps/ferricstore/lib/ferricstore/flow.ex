@@ -1895,11 +1895,7 @@ defmodule Ferricstore.Flow do
   defp flatten_flow_chunks(chunks), do: Enum.flat_map(chunks, & &1)
 
   defp flow_terminal_state(opts) do
-    case Keyword.get(opts, :state, "any") do
-      "any" -> {:ok, "any"}
-      state when state in @terminal_states -> {:ok, state}
-      _ -> {:error, "ERR flow terminal state must be failed, completed, cancelled, or any"}
-    end
+    Ferricstore.Flow.TerminalQuery.state(opts, @terminal_states)
   end
 
   defp flow_terminal_records(
@@ -1962,14 +1958,10 @@ defmodule Ferricstore.Flow do
     end)
     |> case do
       {:ok, chunks} ->
-        ids =
-          chunks
-          |> flatten_flow_chunks()
-          |> Enum.uniq()
-          |> Enum.take(count * length(@terminal_states))
+        ids = Ferricstore.Flow.TerminalQuery.ids_from_chunks(chunks, count, @terminal_states)
 
         with {:ok, records} <- flow_records_for_ids(ctx, ids, partition_key) do
-          {:ok, Enum.filter(records, &(Map.get(&1, :state) in @terminal_states))}
+          {:ok, Ferricstore.Flow.TerminalQuery.filter_any(records, @terminal_states)}
         end
 
       {:error, _reason} = error ->
@@ -1999,7 +1991,7 @@ defmodule Ferricstore.Flow do
              query
            ),
          {:ok, records} <- flow_records_for_ids(ctx, ids, partition_key) do
-      {:ok, Enum.filter(records, &(Map.get(&1, :state) == state))}
+      {:ok, Ferricstore.Flow.TerminalQuery.filter_state(records, state)}
     end
   end
 
