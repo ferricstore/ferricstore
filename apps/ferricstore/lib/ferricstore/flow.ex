@@ -3153,35 +3153,16 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_zcard(ctx, key) do
-    case Router.flow_index_count_all(ctx, key) do
-      {:ok, count} -> {:ok, count}
-      :unavailable -> {:error, "ERR flow index unavailable"}
-    end
+    Ferricstore.Flow.IndexZSet.card(ctx, key)
   end
 
   defp flow_zrange(ctx, key, start, stop) do
-    case Router.flow_index_rank_range(ctx, key, start, stop, false) do
-      {:ok, members} -> {:ok, Enum.map(members, fn {member, _score} -> member end)}
-      :unavailable -> {:error, "ERR flow index unavailable"}
-    end
+    Ferricstore.Flow.IndexZSet.range(ctx, key, start, stop)
   end
 
   defp flow_zrangebyscore(ctx, key, min, max) do
-    case Router.flow_index_score_range_slice(
-           ctx,
-           key,
-           parse_zbound(min),
-           parse_zbound(max),
-           false,
-           0,
-           :all
-         ) do
-      {:ok, members} -> {:ok, Enum.map(members, fn {member, _score} -> member end)}
-      :unavailable -> {:error, "ERR flow index unavailable"}
-    end
+    Ferricstore.Flow.IndexZSet.range_by_score(ctx, key, min, max)
   end
-
-  defp parse_zbound(value), do: Ferricstore.Flow.ScoreBound.parse(value)
 
   defp flow_start_time, do: System.monotonic_time()
 
