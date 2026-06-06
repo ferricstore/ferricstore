@@ -2897,57 +2897,15 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_decode_terminal_index_entries(entries, path, now_ms) do
-    entries
-    |> Enum.flat_map(fn {key, value} ->
-      case Ferricstore.Flow.LMDB.decode_terminal_index_value(value) do
-        {:ok, {id, updated_at_ms, expire_at_ms, _state_key}}
-        when expire_at_ms <= 0 or expire_at_ms > now_ms ->
-          [{id, updated_at_ms}]
-
-        {:ok, {_id, _updated_at_ms, _expire_at_ms, state_key}} ->
-          Ferricstore.Flow.LMDB.delete_terminal_index_entry(path, key, state_key)
-          []
-
-        :error ->
-          []
-      end
-    end)
+    Ferricstore.Flow.LMDBIndexDecode.terminal_entries(entries, path, now_ms)
   end
 
   defp flow_decode_query_index_entries(entries, path, now_ms) do
-    entries
-    |> Enum.flat_map(fn {key, value} ->
-      case Ferricstore.Flow.LMDB.decode_query_index_value(value) do
-        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
-        when expire_at_ms <= 0 or expire_at_ms > now_ms ->
-          [{id, updated_at_ms, state_key}]
-
-        {:ok, {_id, _updated_at_ms, _expire_at_ms, _state_key}} ->
-          Ferricstore.Flow.LMDB.write_batch(path, [{:delete, key}])
-          []
-
-        :error ->
-          []
-      end
-    end)
+    Ferricstore.Flow.LMDBIndexDecode.query_entries(entries, path, now_ms)
   end
 
   defp flow_decode_history_index_entries(entries, path, now_ms) do
-    entries
-    |> Enum.flat_map(fn {key, value} ->
-      case Ferricstore.Flow.LMDB.decode_history_index_value(value) do
-        {:ok, {event_id, event_ms, expire_at_ms, _compound_key}}
-        when expire_at_ms <= 0 or expire_at_ms > now_ms ->
-          [{event_id, event_ms}]
-
-        {:ok, {_event_id, _event_ms, _expire_at_ms, _compound_key}} ->
-          Ferricstore.Flow.LMDB.delete_history_index_entry(path, key)
-          []
-
-        :error ->
-          []
-      end
-    end)
+    Ferricstore.Flow.LMDBIndexDecode.history_entries(entries, path, now_ms)
   end
 
   defp flow_history_entry_to_tuple({event_id, fields}) when is_list(fields) do
