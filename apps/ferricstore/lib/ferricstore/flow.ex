@@ -2250,49 +2250,17 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_index_query_fetch_count(%{count: count} = query) do
-    if flow_index_query_filtering?(query) do
-      flow_lmdb_query_scan_count(count)
-    else
-      count
-    end
+  defp flow_index_query_fetch_count(query) do
+    Ferricstore.Flow.IndexQuery.fetch_count(query, &flow_lmdb_query_scan_count/1)
   end
-
-  defp flow_index_query_filtering?(%{
-         from_ms: nil,
-         to_ms: nil,
-         rev?: false,
-         state: nil,
-         terminal_only?: false
-       }),
-       do: false
-
-  defp flow_index_query_filtering?(_query), do: true
 
   defp filter_flow_index_records(records, field, value, query) do
     records
-    |> Enum.filter(&(Map.get(&1, field) == value))
-    |> Enum.filter(&flow_index_record_matches?(&1, query))
+    |> Ferricstore.Flow.IndexQuery.filter_records(field, value, query, @terminal_states)
     |> sort_flow_records_by_update()
     |> maybe_reverse_flow_records(query.rev?)
     |> Enum.take(query.count)
   end
-
-  defp flow_index_record_matches?(record, query) do
-    updated_at_ms = Map.get(record, :updated_at_ms, 0)
-    state = Map.get(record, :state)
-
-    flow_ms_after?(updated_at_ms, query.from_ms) and
-      flow_ms_before?(updated_at_ms, query.to_ms) and
-      flow_index_state_matches?(state, query.state) and
-      flow_index_terminal_matches?(state, query.terminal_only?)
-  end
-
-  defp flow_index_state_matches?(_state, nil), do: true
-  defp flow_index_state_matches?(state, expected), do: state == expected
-
-  defp flow_index_terminal_matches?(_state, false), do: true
-  defp flow_index_terminal_matches?(state, true), do: state in @terminal_states
 
   defp maybe_reverse_flow_index_entries(entries, true), do: Enum.reverse(entries)
   defp maybe_reverse_flow_index_entries(entries, false), do: entries
