@@ -3181,22 +3181,7 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp parse_zbound("-inf"), do: :neg_inf
-  defp parse_zbound("+inf"), do: :pos_inf
-
-  defp parse_zbound("(" <> rest) do
-    case Float.parse(rest) do
-      {score, ""} -> {:exclusive, score}
-      _ -> {:error, "ERR min or max is not a float"}
-    end
-  end
-
-  defp parse_zbound(value) when is_binary(value) do
-    case Float.parse(value) do
-      {score, ""} -> {:inclusive, score}
-      _ -> {:error, "ERR min or max is not a float"}
-    end
-  end
+  defp parse_zbound(value), do: Ferricstore.Flow.ScoreBound.parse(value)
 
   defp flow_start_time, do: System.monotonic_time()
 
