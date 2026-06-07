@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.CompoundBatchColdGuardTest do
   use ExUnit.Case, async: true
 
   @compound_path Path.expand(
-                   "../../../lib/ferricstore/store/shard/compound.ex",
+                   "../../../lib/ferricstore/store/shard/compound/read.ex",
                    __DIR__
                  )
 

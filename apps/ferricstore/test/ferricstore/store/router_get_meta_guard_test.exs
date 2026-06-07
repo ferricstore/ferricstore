@@ -1,15 +1,9 @@
 defmodule Ferricstore.Store.RouterGetMetaGuardTest do
   use ExUnit.Case, async: true
 
-  @router_path Path.expand(
-                 "../../../lib/ferricstore/store/router.ex",
-                 __DIR__
-               )
-
   test "get_meta reads value and expiry from the same ETS row" do
     {:ok, ast} =
-      @router_path
-      |> File.read!()
+      Ferricstore.Test.SourceFiles.router_source()
       |> Code.string_to_quoted()
 
     get_meta_body = function_body(ast, :get_meta, 2)
@@ -20,7 +14,7 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
   end
 
   test "batch_get cold reads use the shared async batch cold reader" do
-    source = File.read!(@router_path)
+    source = Ferricstore.Test.SourceFiles.router_source()
 
     # Cold values are the main product path for large values. batch_get/2 must
     # submit all cold disk reads together so one request does not serialize N
@@ -31,8 +25,7 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
 
   test "batch_get cold reads dedupe duplicate locations with one pass" do
     {:ok, ast} =
-      @router_path
-      |> File.read!()
+      Ferricstore.Test.SourceFiles.router_source()
       |> Code.string_to_quoted()
 
     bodies = function_bodies(ast, :read_cold_batch_async, 2)
@@ -45,7 +38,7 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
   end
 
   test "direct cold get and get_meta use the shared async cold reader" do
-    source = File.read!(@router_path)
+    source = Ferricstore.Test.SourceFiles.router_source()
 
     # High-volume cold reads must not call blocking pread on a Normal scheduler.
     assert source =~ "ColdRead.pread_keyed",

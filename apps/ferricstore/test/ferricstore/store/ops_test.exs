@@ -12,6 +12,8 @@ defmodule Ferricstore.Store.OpsTest do
   alias Ferricstore.Bitcask.NIF
 
   @ops_path Path.expand("../../../lib/ferricstore/store/ops.ex", __DIR__)
+  @local_read_path Path.expand("../../../lib/ferricstore/store/ops/local_read.ex", __DIR__)
+  @compound_ops_path Path.expand("../../../lib/ferricstore/store/ops/compound.ex", __DIR__)
 
   describe "prob_dir/2" do
     test "prefers key-specific directory callback over generic prob_dir callback" do
@@ -125,14 +127,14 @@ defmodule Ferricstore.Store.OpsTest do
     end
 
     test "local cold batch reads deduplicate repeated physical locations" do
-      source = File.read!(@ops_path)
+      source = File.read!(@local_read_path)
 
       assert source =~ "dedupe_local_batch_cold_reads",
              "LocalTxStore batch reads should pread each repeated cold {path, offset, key} once and fan out the result"
     end
 
     test "local cold batch reads materialize blob refs with the batch helper" do
-      source = File.read!(@ops_path)
+      source = File.read!(@local_read_path)
       [_before, section] = String.split(source, "defp read_unique_local_batch_cold", parts: 2)
 
       [read_body, helper_section] =
@@ -287,7 +289,7 @@ defmodule Ferricstore.Store.OpsTest do
 
   describe "LocalTxStore promoted compound reads" do
     test "local compound batch reads use one cold pread batch" do
-      source = File.read!(@ops_path)
+      source = File.read!(@local_read_path)
 
       assert source =~ "ColdRead.pread_batch_keyed",
              "LocalTxStore compound_batch_get must batch keyed cold reads instead of one waiter per field"
@@ -523,7 +525,7 @@ defmodule Ferricstore.Store.OpsTest do
 
   describe "LocalTxStore remote compound writes" do
     test "remote writes route through Router instead of direct shard calls" do
-      source = File.read!(@ops_path)
+      source = File.read!(@compound_ops_path)
 
       for request <- [
             "{:compound_put, redis_key, compound_key, value, expire_at_ms}",
@@ -544,9 +546,9 @@ defmodule Ferricstore.Store.OpsTest do
 
   describe "LocalTxStore compound scan performance guards" do
     test "pending prefix merge reads HLC once per scan, not once per pending key" do
-      source = File.read!(@ops_path)
-      [_before, section] = String.split(source, "defp merge_tx_pending_prefix", parts: 2)
-      [function_body | _after] = String.split(section, "defp read_promoted_cold_value", parts: 2)
+      source = File.read!(@local_read_path)
+      [_before, section] = String.split(source, "def merge_tx_pending_prefix", parts: 2)
+      [function_body | _after] = String.split(section, "defp local_zset_index_state", parts: 2)
 
       assert function_body =~ "now_ms = HLC.now_ms()"
       assert String.replace(function_body, "now_ms = HLC.now_ms()", "") =~ "exp > now_ms"

@@ -1,4 +1,5 @@
 defmodule Ferricstore.Raft.WARaftSegmentReader do
+  alias Ferricstore.Raft.WARaftSegmentReader.CommandValues
   @moduledoc false
 
   @table_prefix "raft_log_ferricstore_waraft_backend_"
@@ -256,7 +257,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       when is_integer(index) and index > 0 and is_list(keys) do
     case read_main_log_entry(ctx, shard_index, index) do
       {:ok, entry} ->
-        {:ok, values_from_entry(entry, keys)}
+        {:ok, CommandValues.values_from_entry(entry, keys)}
 
       {:error, :segment_entry_not_found} ->
         {:error, :segment_entry_not_found}
@@ -371,7 +372,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
 
   defp read_main_log_value(ctx, shard_index, index, key) do
     with {:ok, entry} <- read_main_log_entry(ctx, shard_index, index) do
-      case value_from_entry(entry, key) do
+      case CommandValues.value_from_entry(entry, key) do
         {:ok, value} -> {:ok, value}
         :deleted -> :not_found
         :not_found -> {:error, :key_not_in_segment_entry}
@@ -512,7 +513,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       table ->
         case :ets.lookup(table, {root, index, key}) do
           [{{^root, ^index, ^key}, value, expire_at_ms}] ->
-            if live_expire_at?(expire_at_ms), do: {:ok, value}, else: :not_found
+            if CommandValues.live_expire_at?(expire_at_ms), do: {:ok, value}, else: :not_found
 
           [] ->
             :not_found
@@ -801,257 +802,6 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end
   end
 
-  defp live_expire_at?(0), do: true
-  defp live_expire_at?(expire_at_ms) when is_integer(expire_at_ms), do: expire_at_ms > now_ms()
-  defp live_expire_at?(_expire_at_ms), do: false
-
-  defp now_ms, do: System.system_time(:millisecond)
-
-  defp value_from_entry(entry, key) do
-    case command_from_entry(entry) do
-      {:ok, command} -> value_from_command(decode_replay_command(command), key)
-      :skip -> :not_found
-    end
-  end
-
-  defp values_from_entry(entry, keys) do
-    case command_from_entry(entry) do
-      {:ok, command} -> values_from_command(decode_replay_command(command), keys)
-      :skip -> %{}
-    end
-  end
-
-  defp command_from_entry({_term, {:default, {corr, command}}}) when is_reference(corr),
-    do: {:ok, command}
-
-  defp command_from_entry({_term, {corr, command}}) when is_reference(corr),
-    do: {:ok, command}
-
-  defp command_from_entry({_term, command}) when is_tuple(command), do: {:ok, command}
-  defp command_from_entry(_entry), do: :skip
-
-  defp decode_replay_command({:ttb, binary}) when is_binary(binary) do
-    try do
-      binary
-      |> :erlang.binary_to_term([:safe])
-      |> decode_replay_command()
-    rescue
-      _ -> {:ttb, binary}
-    end
-  end
-
-  defp decode_replay_command({inner_command, %{hlc_ts: {physical_ms, logical}}})
-       when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(logical) do
-    decode_replay_command(inner_command)
-  end
-
-  defp decode_replay_command(command), do: command
-
-  defp value_from_command({:put, key, value, _expire_at_ms}, key) when is_binary(value),
-    do: {:ok, value}
-
-  defp value_from_command({:put_blob_ref, key, encoded_ref, _expire_at_ms}, key)
-       when is_binary(encoded_ref),
-       do: {:ok, encoded_ref}
-
-  defp value_from_command({:set, key, value, _expire_at_ms, _opts}, key) when is_binary(value),
-    do: {:ok, value}
-
-  defp value_from_command({:delete, key}, key), do: :deleted
-
-  defp value_from_command({:compound_put, key, value, _expire_at_ms}, key)
-       when is_binary(value),
-       do: {:ok, value}
-
-  defp value_from_command({:compound_put_blob_ref, key, encoded_ref, _expire_at_ms}, key)
-       when is_binary(encoded_ref),
-       do: {:ok, encoded_ref}
-
-  defp value_from_command({:compound_delete, key}, key), do: :deleted
-
-  defp value_from_command({:put_batch, entries}, key) when is_list(entries) do
-    Enum.reduce(entries, :not_found, fn
-      {^key, value, _expire_at_ms}, _acc when is_binary(value) -> {:ok, value}
-      _entry, acc -> acc
-    end)
-  end
-
-  defp value_from_command({:put_blob_batch, entries}, key) when is_list(entries) do
-    Enum.reduce(entries, :not_found, fn
-      {^key, value, _expire_at_ms, :value}, _acc when is_binary(value) ->
-        {:ok, value}
-
-      {^key, encoded_ref, _expire_at_ms, :blob_ref}, _acc when is_binary(encoded_ref) ->
-        {:ok, encoded_ref}
-
-      _entry, acc ->
-        acc
-    end)
-  end
-
-  defp value_from_command({:compound_batch_put, _redis_key, entries}, key)
-       when is_list(entries) do
-    Enum.reduce(entries, :not_found, fn
-      {^key, value, _expire_at_ms}, _acc when is_binary(value) -> {:ok, value}
-      _entry, acc -> acc
-    end)
-  end
-
-  defp value_from_command({:compound_blob_batch_put, _redis_key, entries}, key)
-       when is_list(entries) do
-    Enum.reduce(entries, :not_found, fn
-      {^key, value, _expire_at_ms, :value}, _acc when is_binary(value) ->
-        {:ok, value}
-
-      {^key, encoded_ref, _expire_at_ms, :blob_ref}, _acc when is_binary(encoded_ref) ->
-        {:ok, encoded_ref}
-
-      _entry, acc ->
-        acc
-    end)
-  end
-
-  defp value_from_command({:delete_batch, keys}, key) when is_list(keys) do
-    if key in keys, do: :deleted, else: :not_found
-  end
-
-  defp value_from_command({:compound_batch_delete, _redis_key, keys}, key) when is_list(keys) do
-    if key in keys, do: :deleted, else: :not_found
-  end
-
-  defp value_from_command({:compound_delete_prefix, prefix}, key) when is_binary(prefix) do
-    if String.starts_with?(key, prefix), do: :deleted, else: :not_found
-  end
-
-  defp value_from_command({:batch, commands}, key) when is_list(commands) do
-    Enum.reduce(commands, :not_found, fn command, acc ->
-      case value_from_command(decode_replay_command(command), key) do
-        :not_found -> acc
-        result -> result
-      end
-    end)
-  end
-
-  defp value_from_command(_command, _key), do: :not_found
-
-  defp values_from_command(command, keys) do
-    keyset = MapSet.new(keys)
-    collect_values_from_command(command, keyset, %{})
-  end
-
-  defp collect_values_from_command({:put, key, value, _expire_at_ms}, keyset, acc)
-       when is_binary(value),
-       do: put_requested_value(acc, keyset, key, value)
-
-  defp collect_values_from_command({:put_blob_ref, key, encoded_ref, _expire_at_ms}, keyset, acc)
-       when is_binary(encoded_ref),
-       do: put_requested_value(acc, keyset, key, encoded_ref)
-
-  defp collect_values_from_command({:set, key, value, _expire_at_ms, _opts}, keyset, acc)
-       when is_binary(value),
-       do: put_requested_value(acc, keyset, key, value)
-
-  defp collect_values_from_command({:delete, key}, _keyset, acc), do: Map.delete(acc, key)
-
-  defp collect_values_from_command({:compound_put, key, value, _expire_at_ms}, keyset, acc)
-       when is_binary(value),
-       do: put_requested_value(acc, keyset, key, value)
-
-  defp collect_values_from_command(
-         {:compound_put_blob_ref, key, encoded_ref, _expire_at_ms},
-         keyset,
-         acc
-       )
-       when is_binary(encoded_ref),
-       do: put_requested_value(acc, keyset, key, encoded_ref)
-
-  defp collect_values_from_command({:compound_delete, key}, _keyset, acc),
-    do: Map.delete(acc, key)
-
-  defp collect_values_from_command({:put_batch, entries}, keyset, acc) when is_list(entries) do
-    Enum.reduce(entries, acc, fn
-      {key, value, _expire_at_ms}, values when is_binary(value) ->
-        put_requested_value(values, keyset, key, value)
-
-      _entry, values ->
-        values
-    end)
-  end
-
-  defp collect_values_from_command({:put_blob_batch, entries}, keyset, acc)
-       when is_list(entries) do
-    Enum.reduce(entries, acc, fn
-      {key, value, _expire_at_ms, :value}, values when is_binary(value) ->
-        put_requested_value(values, keyset, key, value)
-
-      {key, encoded_ref, _expire_at_ms, :blob_ref}, values when is_binary(encoded_ref) ->
-        put_requested_value(values, keyset, key, encoded_ref)
-
-      _entry, values ->
-        values
-    end)
-  end
-
-  defp collect_values_from_command({:compound_batch_put, _redis_key, entries}, keyset, acc)
-       when is_list(entries) do
-    Enum.reduce(entries, acc, fn
-      {key, value, _expire_at_ms}, values when is_binary(value) ->
-        put_requested_value(values, keyset, key, value)
-
-      _entry, values ->
-        values
-    end)
-  end
-
-  defp collect_values_from_command({:compound_blob_batch_put, _redis_key, entries}, keyset, acc)
-       when is_list(entries) do
-    Enum.reduce(entries, acc, fn
-      {key, value, _expire_at_ms, :value}, values when is_binary(value) ->
-        put_requested_value(values, keyset, key, value)
-
-      {key, encoded_ref, _expire_at_ms, :blob_ref}, values when is_binary(encoded_ref) ->
-        put_requested_value(values, keyset, key, encoded_ref)
-
-      _entry, values ->
-        values
-    end)
-  end
-
-  defp collect_values_from_command({:delete_batch, keys}, keyset, acc) when is_list(keys),
-    do: delete_requested_keys(acc, keyset, keys)
-
-  defp collect_values_from_command({:compound_batch_delete, _redis_key, keys}, keyset, acc)
-       when is_list(keys),
-       do: delete_requested_keys(acc, keyset, keys)
-
-  defp collect_values_from_command({:compound_delete_prefix, prefix}, keyset, acc)
-       when is_binary(prefix) do
-    Enum.reduce(keyset, acc, fn
-      key, values when is_binary(key) ->
-        if String.starts_with?(key, prefix), do: Map.delete(values, key), else: values
-
-      _key, values ->
-        values
-    end)
-  end
-
-  defp collect_values_from_command({:batch, commands}, keyset, acc) when is_list(commands) do
-    Enum.reduce(commands, acc, fn command, values ->
-      collect_values_from_command(decode_replay_command(command), keyset, values)
-    end)
-  end
-
-  defp collect_values_from_command(_command, _keyset, acc), do: acc
-
-  defp put_requested_value(acc, keyset, key, value) do
-    if MapSet.member?(keyset, key), do: Map.put(acc, key, value), else: acc
-  end
-
-  defp delete_requested_keys(acc, keyset, keys) do
-    Enum.reduce(keys, acc, fn key, values ->
-      if MapSet.member?(keyset, key), do: Map.delete(values, key), else: values
-    end)
-  end
 
   defp storage_root(%{data_dir: data_dir}, shard_index) do
     Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"])

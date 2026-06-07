@@ -35,6 +35,7 @@ defmodule Ferricstore.Commands.Json do
     * `JSON.MGET key [key ...] path` -- get value at path from multiple keys
   """
 
+  alias Ferricstore.Commands.Json.Path, as: JsonPath
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.TypeRegistry
@@ -366,7 +367,7 @@ defmodule Ferricstore.Commands.Json do
   def handle("JSON.MGET", args, store) when length(args) >= 2 do
     {keys, [path]} = Enum.split(args, length(args) - 1)
 
-    case parse_path(path) do
+    case JsonPath.parse(path) do
       :error -> {:error, "ERR invalid JSONPath syntax"}
       segments -> mget_many(keys, segments, store)
     end
@@ -395,12 +396,12 @@ defmodule Ferricstore.Commands.Json do
     case read_json(key, store) do
       nil -> nil
       {:error, _} = err -> err
-      {:ok, root} -> apply_at_path(root, parse_path(path), fun, default_on_miss)
+      {:ok, root} -> apply_at_path(root, JsonPath.parse(path), fun, default_on_miss)
     end
   end
 
   defp apply_at_path(root, segments, fun, default_on_miss) do
-    case get_at_path(root, segments) do
+    case JsonPath.get(root, segments) do
       {:ok, val} -> fun.(val)
       :not_found -> default_on_miss
     end
@@ -433,7 +434,7 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp do_delete_path(root, key, path, store) do
-    case delete_at_path(root, parse_path(path)) do
+    case JsonPath.delete(root, JsonPath.parse(path)) do
       {:ok, new_root} ->
         write_json_result(key, new_root, store, 1)
 
@@ -447,12 +448,12 @@ defmodule Ferricstore.Commands.Json do
 
   # Performs NUMINCRBY on a loaded root document.
   defp do_numincrby(root, key, path, incr, store) do
-    segments = parse_path(path)
+    segments = JsonPath.parse(path)
 
-    case get_at_path(root, segments) do
+    case JsonPath.get(root, segments) do
       {:ok, current} when is_number(current) ->
         new_val = current + incr
-        {:ok, new_root} = set_at_path(root, segments, new_val)
+        {:ok, new_root} = JsonPath.set(root, segments, new_val)
         write_json_result(key, new_root, store, Jason.encode!(new_val))
 
       {:ok, _} ->
@@ -468,12 +469,12 @@ defmodule Ferricstore.Commands.Json do
 
   # Performs ARRAPPEND on a loaded root document.
   defp do_arrappend(root, key, path, new_values, store) do
-    segments = parse_path(path)
+    segments = JsonPath.parse(path)
 
-    case get_at_path(root, segments) do
+    case JsonPath.get(root, segments) do
       {:ok, arr} when is_list(arr) ->
         new_arr = arr ++ new_values
-        {:ok, new_root} = set_at_path(root, segments, new_arr)
+        {:ok, new_root} = JsonPath.set(root, segments, new_arr)
         write_json_result(key, new_root, store, length(new_arr))
 
       {:ok, _} ->
@@ -489,12 +490,12 @@ defmodule Ferricstore.Commands.Json do
 
   # Performs TOGGLE on a loaded root document.
   defp do_toggle(root, key, path, store) do
-    segments = parse_path(path)
+    segments = JsonPath.parse(path)
 
-    case get_at_path(root, segments) do
+    case JsonPath.get(root, segments) do
       {:ok, val} when is_boolean(val) ->
         new_val = not val
-        {:ok, new_root} = set_at_path(root, segments, new_val)
+        {:ok, new_root} = JsonPath.set(root, segments, new_val)
         write_json_result(key, new_root, store, Jason.encode!(new_val))
 
       {:ok, _} ->
@@ -518,11 +519,11 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp clear_path_in_root(root, key, path, store) do
-    segments = parse_path(path)
+    segments = JsonPath.parse(path)
 
-    case get_at_path(root, segments) do
+    case JsonPath.get(root, segments) do
       {:ok, val} ->
-        {:ok, new_root} = set_at_path(root, segments, clear_value(val))
+        {:ok, new_root} = JsonPath.set(root, segments, clear_value(val))
         write_json_result(key, new_root, store, 1)
 
       :not_found ->
@@ -549,7 +550,7 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp mget_encode(root, segments) do
-    case get_at_path(root, segments) do
+    case JsonPath.get(root, segments) do
       {:ok, val} -> Jason.encode!(val)
       :not_found -> nil
     end
@@ -586,28 +587,28 @@ defmodule Ferricstore.Commands.Json do
   defp set_on_missing_key(_key, _path, _new_value, true = _xx?, _store), do: nil
 
   defp set_on_missing_key(key, path, new_value, _xx?, store) do
-    case parse_path(path) do
+    case JsonPath.parse(path) do
       :error -> {:error, "ERR invalid JSONPath syntax"}
       segments -> build_missing_json_path(key, segments, new_value, store)
     end
   end
 
   defp build_missing_json_path(key, segments, new_value, store) do
-    case build_from_path(segments, new_value) do
+    case JsonPath.build(segments, new_value) do
       {:ok, root} -> write_json(key, root, store)
       :error -> {:error, "ERR cannot create path in empty document"}
     end
   end
 
   defp set_on_existing_key(root, key, path, new_value, nx?, xx?, store) do
-    case parse_path(path) do
+    case JsonPath.parse(path) do
       :error -> {:error, "ERR invalid JSONPath syntax"}
       segments -> do_set_on_existing(root, key, segments, new_value, nx?, xx?, store)
     end
   end
 
   defp do_set_on_existing(root, key, segments, new_value, nx?, xx?, store) do
-    path_exists? = get_at_path(root, segments) != :not_found
+    path_exists? = JsonPath.get(root, segments) != :not_found
 
     if blocked_by_flags?(nx?, xx?, path_exists?) do
       nil
@@ -617,7 +618,7 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp apply_set_at_path(root, segments, key, new_value, store) do
-    case set_at_path(root, segments, new_value) do
+    case JsonPath.set(root, segments, new_value) do
       {:ok, new_root} -> write_json(key, new_root, store)
       :not_found -> {:error, "ERR path does not exist in the JSON value"}
     end
@@ -659,7 +660,7 @@ defmodule Ferricstore.Commands.Json do
   # ===========================================================================
 
   defp do_json_get(root, [path]) do
-    case get_at_path(root, parse_path(path)) do
+    case JsonPath.get(root, JsonPath.parse(path)) do
       {:ok, val} -> Jason.encode!(val)
       :not_found -> nil
       {:error, _} = err -> err
@@ -674,7 +675,7 @@ defmodule Ferricstore.Commands.Json do
   defp do_json_get_specs(root, []), do: Jason.encode!(root)
 
   defp do_json_get_specs(root, [{_raw_path, segments}]) do
-    case get_at_path(root, segments) do
+    case JsonPath.get(root, segments) do
       {:ok, val} -> Jason.encode!(val)
       :not_found -> nil
       {:error, _} = err -> err
@@ -684,7 +685,7 @@ defmodule Ferricstore.Commands.Json do
   defp do_json_get_specs(root, path_specs) do
     result =
       Map.new(path_specs, fn {raw_path, segments} ->
-        case get_at_path(root, segments) do
+        case JsonPath.get(root, segments) do
           {:ok, val} -> {raw_path, val}
           :not_found -> {raw_path, nil}
         end
@@ -694,7 +695,7 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp path_to_kv(root, path) do
-    case get_at_path(root, parse_path(path)) do
+    case JsonPath.get(root, JsonPath.parse(path)) do
       {:ok, val} -> {path, val}
       :not_found -> {path, nil}
     end
@@ -800,229 +801,6 @@ defmodule Ferricstore.Commands.Json do
       error -> error
     end
   end
-
-  # ===========================================================================
-  # Private — JSONPath parser
-  # ===========================================================================
-
-  # Parses a JSONPath string into a list of path segments.
-  # Supports: $, $.field, $.field.subfield, $[0], $.field[0].name
-  @spec parse_path(binary()) :: [binary() | non_neg_integer()] | :error
-  defp parse_path(segments) when is_list(segments), do: segments
-  defp parse_path("$"), do: []
-  defp parse_path(<<"$", rest::binary>>), do: parse_path_segments(rest, [])
-  defp parse_path(_), do: :error
-
-  defp parse_path_segments(<<>>, acc), do: Enum.reverse(acc)
-
-  defp parse_path_segments(<<".", rest::binary>>, acc) do
-    case read_field(rest) do
-      {:ok, field, remainder} -> parse_path_segments(remainder, [field | acc])
-      :error -> :error
-    end
-  end
-
-  defp parse_path_segments(<<"[", rest::binary>>, acc) do
-    case read_bracket(rest) do
-      {:ok, segment, remainder} -> parse_path_segments(remainder, [segment | acc])
-      :error -> :error
-    end
-  end
-
-  defp parse_path_segments(_, _acc), do: :error
-
-  # Reads a field name up to the next `.`, `[`, or end of string.
-  defp read_field(str) do
-    case :binary.match(str, [<<".">>, <<"[">>]) do
-      {pos, _len} ->
-        field = binary_part(str, 0, pos)
-
-        if field == "" do
-          :error
-        else
-          {:ok, field, binary_part(str, pos, byte_size(str) - pos)}
-        end
-
-      :nomatch ->
-        if str == "", do: :error, else: {:ok, str, <<>>}
-    end
-  end
-
-  # Reads a bracket expression: integer index or quoted string key.
-  defp read_bracket(str) do
-    case :binary.match(str, <<"]">>) do
-      {pos, 1} -> parse_bracket_inner(str, pos)
-      _ -> :error
-    end
-  end
-
-  defp parse_bracket_inner(str, pos) do
-    inner = binary_part(str, 0, pos)
-    remainder = binary_part(str, pos + 1, byte_size(str) - pos - 1)
-    parse_bracket_content(inner, remainder)
-  end
-
-  defp parse_bracket_content(<<"\"", _::binary>> = inner, remainder) do
-    if byte_size(inner) >= 2 and String.ends_with?(inner, "\"") do
-      {:ok, String.slice(inner, 1..-2//1), remainder}
-    else
-      :error
-    end
-  end
-
-  defp parse_bracket_content(<<"'", _::binary>> = inner, remainder) do
-    if byte_size(inner) >= 2 and String.ends_with?(inner, "'") do
-      {:ok, String.slice(inner, 1..-2//1), remainder}
-    else
-      :error
-    end
-  end
-
-  defp parse_bracket_content(inner, remainder) do
-    case Integer.parse(inner) do
-      {idx, ""} -> {:ok, idx, remainder}
-      _ -> :error
-    end
-  end
-
-  # ===========================================================================
-  # Private — JSONPath traversal
-  # ===========================================================================
-
-  # Gets a value at a parsed path within a decoded JSON structure.
-  @spec get_at_path(term(), [binary() | non_neg_integer()]) ::
-          {:ok, term()} | :not_found
-  defp get_at_path(_value, :error), do: {:error, "ERR invalid JSONPath syntax"}
-  defp get_at_path(value, []), do: {:ok, value}
-
-  defp get_at_path(map, [key | rest]) when is_map(map) and is_binary(key) do
-    case Map.fetch(map, key) do
-      {:ok, val} -> get_at_path(val, rest)
-      :error -> :not_found
-    end
-  end
-
-  defp get_at_path(list, [idx | rest]) when is_list(list) and is_integer(idx) do
-    actual_idx = normalize_index(idx, length(list))
-
-    if valid_index?(actual_idx, length(list)) do
-      get_at_path(Enum.at(list, actual_idx), rest)
-    else
-      :not_found
-    end
-  end
-
-  defp get_at_path(_value, [_ | _rest]), do: :not_found
-
-  # Sets a value at a parsed path within a decoded JSON structure.
-  @spec set_at_path(term(), [binary() | non_neg_integer()], term()) ::
-          {:ok, term()} | :not_found
-  defp set_at_path(_current, [], new_value), do: {:ok, new_value}
-
-  defp set_at_path(map, [key | rest], new_value) when is_map(map) and is_binary(key) do
-    case set_at_path(Map.get(map, key), rest, new_value) do
-      {:ok, updated} -> {:ok, Map.put(map, key, updated)}
-      :not_found -> :not_found
-    end
-  end
-
-  defp set_at_path(list, [idx | rest], new_value) when is_list(list) and is_integer(idx) do
-    set_at_list_index(list, idx, rest, new_value)
-  end
-
-  # Setting a field on nil creates a new map (auto-vivification for root-level set)
-  defp set_at_path(nil, [key | rest], new_value) when is_binary(key) do
-    set_at_path(%{}, [key | rest], new_value)
-  end
-
-  defp set_at_path(_value, [_ | _rest], _new_value), do: :not_found
-
-  defp set_at_list_index(list, idx, rest, new_value) do
-    actual_idx = normalize_index(idx, length(list))
-
-    if valid_index?(actual_idx, length(list)) do
-      case set_at_path(Enum.at(list, actual_idx), rest, new_value) do
-        {:ok, updated} -> {:ok, List.replace_at(list, actual_idx, updated)}
-        :not_found -> :not_found
-      end
-    else
-      :not_found
-    end
-  end
-
-  # Deletes a value at a parsed path within a decoded JSON structure.
-  @spec delete_at_path(term(), [binary() | non_neg_integer()] | :error) ::
-          {:ok, term()} | :not_found | {:error, binary()}
-  defp delete_at_path(_value, :error), do: {:error, "ERR invalid JSONPath syntax"}
-  defp delete_at_path(_value, []), do: :not_found
-
-  defp delete_at_path(map, [key]) when is_map(map) and is_binary(key) do
-    if Map.has_key?(map, key), do: {:ok, Map.delete(map, key)}, else: :not_found
-  end
-
-  defp delete_at_path(list, [idx]) when is_list(list) and is_integer(idx) do
-    actual_idx = normalize_index(idx, length(list))
-
-    if valid_index?(actual_idx, length(list)),
-      do: {:ok, List.delete_at(list, actual_idx)},
-      else: :not_found
-  end
-
-  defp delete_at_path(map, [key | rest]) when is_map(map) and is_binary(key) do
-    with {:ok, child} <- Map.fetch(map, key),
-         {:ok, updated_child} <- delete_at_path(child, rest) do
-      {:ok, Map.put(map, key, updated_child)}
-    else
-      _ -> :not_found
-    end
-  end
-
-  defp delete_at_path(list, [idx | rest]) when is_list(list) and is_integer(idx) do
-    delete_at_list_index(list, idx, rest)
-  end
-
-  defp delete_at_path(_value, [_ | _rest]), do: :not_found
-
-  defp delete_at_list_index(list, idx, rest) do
-    actual_idx = normalize_index(idx, length(list))
-
-    if valid_index?(actual_idx, length(list)) do
-      case delete_at_path(Enum.at(list, actual_idx), rest) do
-        {:ok, updated_child} -> {:ok, List.replace_at(list, actual_idx, updated_child)}
-        :not_found -> :not_found
-      end
-    else
-      :not_found
-    end
-  end
-
-  # ===========================================================================
-  # Private — index helpers
-  # ===========================================================================
-
-  defp normalize_index(idx, len) when idx < 0, do: len + idx
-  defp normalize_index(idx, _len), do: idx
-
-  defp valid_index?(idx, len), do: idx >= 0 and idx < len
-
-  # ===========================================================================
-  # Private — path construction for new documents
-  # ===========================================================================
-
-  # Builds a nested JSON structure from path segments and a value.
-  # E.g., ["a", "b"] with value 1 => %{"a" => %{"b" => 1}}
-  @spec build_from_path([binary() | non_neg_integer()], term()) :: {:ok, term()} | :error
-  defp build_from_path([], value), do: {:ok, value}
-
-  defp build_from_path([key | rest], value) when is_binary(key) do
-    case build_from_path(rest, value) do
-      {:ok, inner} -> {:ok, %{key => inner}}
-      :error -> :error
-    end
-  end
-
-  # Cannot auto-create array indices on empty documents
-  defp build_from_path([_ | _], _value), do: :error
 
   # ===========================================================================
   # Private — type helpers

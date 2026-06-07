@@ -8,14 +8,9 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
     assert source =~ "Application.get_env(:ferricstore, :flow_lmdb_release_cursor_poke_enabled, false)"
   end
 
-  @source_path Path.expand("../../../lib/ferricstore/raft/waraft_storage.ex", __DIR__)
-  @segment_log_source_path Path.expand(
-                             "../../../src/ferricstore_waraft_spike_segment_log.erl",
-                             __DIR__
-                           )
 
   test "segment projection registration caches expanded root path on the storage handle" do
-    source = File.read!(@source_path)
+    source = Ferricstore.Test.SourceFiles.waraft_storage_source()
 
     [function_source] =
       Regex.run(
@@ -31,7 +26,7 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
   end
 
   test "segment writer hot-path registry keys avoid repeated absolute path expansion" do
-    source = File.read!(@segment_log_source_path)
+    source = Ferricstore.Test.SourceFiles.waraft_segment_log_source()
 
     for function <- ["writer_key", "writer_dir_from_dir", "offset_dir_key"] do
       [function_source] =
@@ -49,7 +44,7 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
   end
 
   test "segment append validates file path only when opening a writer" do
-    source = File.read!(@segment_log_source_path)
+    source = Ferricstore.Test.SourceFiles.waraft_segment_log_source()
 
     [nosync_append_source] =
       Regex.run(
@@ -84,19 +79,17 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
     # keydir rows. :ets.tab2list/1 makes one large BEAM list of every row before
     # the code can skip expired/non-projectable entries, creating avoidable
     # memory spikes and scheduler latency. Use ETS folding/streaming instead.
-    assert tab2list_calls(@source_path) == []
+    assert tab2list_calls(Ferricstore.Test.SourceFiles.waraft_storage_source()) == []
   end
 
-  defp tab2list_calls(path) do
+  defp tab2list_calls(source) do
     {:ok, ast} =
-      path
-      |> File.read!()
-      |> Code.string_to_quoted(columns: true)
+      Code.string_to_quoted(source, columns: true)
 
     {_ast, calls} =
       Macro.prewalk(ast, [], fn
         {{:., meta, [:ets, :tab2list]}, _call_meta, _args} = node, acc ->
-          {node, [{path, meta[:line], meta[:column]} | acc]}
+          {node, [{meta[:line], meta[:column]} | acc]}
 
         node, acc ->
           {node, acc}

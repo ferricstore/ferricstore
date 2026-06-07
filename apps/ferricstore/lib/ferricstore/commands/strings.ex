@@ -1,8 +1,7 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
   alias Ferricstore.CommandTime
-  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
-  alias Ferricstore.CrossShardOp
+  alias Ferricstore.Commands.Strings.{Delete, GetEx, MSet, Range, SetOptions}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
@@ -81,7 +80,7 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle("SET", ["", _value | _opts], _store), do: {:error, "ERR empty key"}
 
-  def handle("SET", [key, _value | _opts], _store) when byte_size(key) > 65_535,
+  def handle("SET", [key, _value | _opts], _store) when byte_size(key) > @max_key_bytes,
     do: {:error, "ERR key too large"}
 
   def handle("SET", [key, value | opts], store), do: do_set(key, value, opts, store)
@@ -397,19 +396,19 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  def handle_ast({:getex, key, :persist}, store), do: getex_parsed(key, 0, store)
+  def handle_ast({:getex, key, :persist}, store), do: GetEx.getex_parsed(key, 0, store)
 
   def handle_ast({:getex, key, {:ex, secs}}, store) when is_integer(secs),
-    do: getex_parsed(key, CommandTime.now_ms() + secs * 1_000, store)
+    do: GetEx.getex_parsed(key, CommandTime.now_ms() + secs * 1_000, store)
 
   def handle_ast({:getex, key, {:px, ms}}, store) when is_integer(ms),
-    do: getex_parsed(key, CommandTime.now_ms() + ms, store)
+    do: GetEx.getex_parsed(key, CommandTime.now_ms() + ms, store)
 
   def handle_ast({:getex, key, {:exat, ts}}, store) when is_integer(ts),
-    do: getex_parsed(key, ts * 1_000, store)
+    do: GetEx.getex_parsed(key, ts * 1_000, store)
 
   def handle_ast({:getex, key, {:pxat, ts}}, store) when is_integer(ts),
-    do: getex_parsed(key, ts, store)
+    do: GetEx.getex_parsed(key, ts, store)
 
   def handle_ast({:setex, key, seconds, value}, store) when is_integer(seconds) do
     if seconds > 0 do
@@ -444,10 +443,10 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  def handle_ast({:set, key, _value}, _store) when byte_size(key) > 65_535,
+  def handle_ast({:set, key, _value}, _store) when byte_size(key) > @max_key_bytes,
     do: {:error, "ERR key too large"}
 
-  def handle_ast({:set, key, _value, _opts}, _store) when byte_size(key) > 65_535,
+  def handle_ast({:set, key, _value, _opts}, _store) when byte_size(key) > @max_key_bytes,
     do: {:error, "ERR key too large"}
 
   def handle_ast({:set, key, value}, store),
@@ -457,7 +456,7 @@ defmodule Ferricstore.Commands.Strings do
     do: {:error, reason}
 
   def handle_ast({:set, key, value, opts}, store) when is_list(opts) do
-    with {:ok, parsed} <- set_opts_from_ast(opts) do
+    with {:ok, parsed} <- SetOptions.from_ast(opts, @set_opts_default) do
       do_set_parsed(key, value, parsed, store)
     end
   end
@@ -465,7 +464,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle_ast(_ast, _store), do: {:error, "ERR wrong number of arguments for 'set' command"}
 
   defp get_key("", _store), do: {:error, "ERR empty key"}
-  defp get_key(key, _store) when byte_size(key) > 65_535, do: {:error, "ERR key too large"}
+  defp get_key(key, _store) when byte_size(key) > @max_key_bytes, do: {:error, "ERR key too large"}
 
   defp get_key(key, store) do
     case read_string_value(key, store) do
@@ -478,7 +477,7 @@ defmodule Ferricstore.Commands.Strings do
   defp del_keys(keys, store) do
     keys
     |> Enum.reduce_while({:ok, 0}, fn key, {:ok, acc} ->
-      case do_del_key(key, store) do
+      case Delete.do_del_key(key, store) do
         true -> {:cont, {:ok, acc + 1}}
         false -> {:cont, {:ok, acc}}
         {:error, _reason} = error -> {:halt, error}
@@ -505,18 +504,7 @@ defmodule Ferricstore.Commands.Strings do
 
   defp mget_keys(keys, store), do: Ops.batch_get(store, keys)
 
-  defp mset_args([], _store), do: {:error, "ERR wrong number of arguments for 'mset' command"}
-
-  defp mset_args(args, store) do
-    if even_length?(args) do
-      case mset_validate(args) do
-        :ok -> mset_exec(args, store)
-        {:error, _} = err -> err
-      end
-    else
-      {:error, "ERR wrong number of arguments for 'mset' command"}
-    end
-  end
+  defp mset_args(args, store), do: MSet.mset_args(args, store)
 
   defp incr_key(key, store), do: incr_string_key(key, 1, store)
   defp decr_key(key, store), do: incr_string_key(key, -1, store)
@@ -570,53 +558,13 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp msetnx_args([], _store), do: {:error, "ERR wrong number of arguments for 'msetnx' command"}
-
-  defp msetnx_args(args, store) do
-    if even_length?(args) do
-      case mset_validate(args) do
-        :ok -> msetnx_validated_args(args, store)
-        {:error, _} = err -> err
-      end
-    else
-      {:error, "ERR wrong number of arguments for 'msetnx' command"}
-    end
-  end
-
-  defp msetnx_validated_args(args, store) do
-    keys = extract_keys(args)
-
-    CrossShardOp.execute(
-      Enum.map(keys, &{&1, :write}),
-      fn unified_store ->
-        if msetnx_any_exists?(args, unified_store) do
-          0
-        else
-          case mset_exec(args, unified_store) do
-            :ok -> 1
-            {:error, _} = err -> err
-          end
-        end
-      end,
-      intent: %{command: :msetnx, keys: %{targets: keys}},
-      tx_entry: {"MSETNX", args, {:msetnx, args}},
-      store: store
-    )
-  end
+  defp msetnx_args(args, store), do: MSet.msetnx_args(args, store)
 
   # ---------------------------------------------------------------------------
   # Private — GETEX option parsing and execution
   # ---------------------------------------------------------------------------
 
-  defp do_getex(key, opts, store) do
-    case parse_getex_opts(opts) do
-      {:ok, expire_at_ms} ->
-        getex_parsed(key, expire_at_ms, store)
-
-      {:error, _} = err ->
-        err
-    end
-  end
+  defp do_getex(key, opts, store), do: GetEx.do_getex(key, opts, store)
 
   defp incr_string_key(key, delta, store) do
     case ensure_string_key(key, store) do
@@ -644,125 +592,12 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp getex_parsed(key, expire_at_ms, store) do
-    case ensure_string_key(key, store) do
-      :ok -> Ops.getex(store, key, expire_at_ms)
-      @wrongtype_error -> @wrongtype_error
-    end
-  end
-
-  defp parse_getex_opts(["PERSIST"]), do: {:ok, 0}
-
-  defp parse_getex_opts(["EX", secs_str]) do
-    case Integer.parse(secs_str) do
-      {secs, ""} when secs > 0 ->
-        {:ok, CommandTime.now_ms() + secs * 1_000}
-
-      {_secs, ""} ->
-        {:error, "ERR invalid expire time in 'getex' command"}
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  defp parse_getex_opts(["PX", ms_str]) do
-    case Integer.parse(ms_str) do
-      {ms, ""} when ms > 0 ->
-        {:ok, CommandTime.now_ms() + ms}
-
-      {_ms, ""} ->
-        {:error, "ERR invalid expire time in 'getex' command"}
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  defp parse_getex_opts(["EXAT", ts_str]) do
-    case Integer.parse(ts_str) do
-      {ts, ""} when ts > 0 ->
-        {:ok, ts * 1_000}
-
-      {_ts, ""} ->
-        {:error, "ERR invalid expire time in 'getex' command"}
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  defp parse_getex_opts(["PXAT", ts_str]) do
-    case Integer.parse(ts_str) do
-      {ts, ""} when ts > 0 ->
-        {:ok, ts}
-
-      {_ts, ""} ->
-        {:error, "ERR invalid expire time in 'getex' command"}
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  defp parse_getex_opts([opt | rest]) when is_binary(opt) do
-    case String.upcase(opt) do
-      ^opt -> {:error, "ERR syntax error"}
-      normalized -> parse_getex_opts([normalized | rest])
-    end
-  end
-
-  defp parse_getex_opts(_) do
-    {:error, "ERR syntax error"}
-  end
-
   # ---------------------------------------------------------------------------
   # Private — GETRANGE substring extraction
   # ---------------------------------------------------------------------------
 
-  defp metadata_value_size(%FerricStore.Instance{} = store, key), do: Ops.value_size(store, key)
-
-  defp metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key),
-    do: Ops.value_size(store, key)
-
-  defp metadata_value_size(%{value_size: value_size}, key) when is_function(value_size, 1),
-    do: value_size.(key)
-
-  defp metadata_value_size(_store, _key), do: :unknown
-
-  defp getrange_parsed(key, start_idx, end_idx, store) do
-    case metadata_value_size(store, key) do
-      size when is_integer(size) ->
-        if getrange_empty_for_size?(size, start_idx, end_idx) do
-          if compound_data_structure_key?(key, store), do: @wrongtype_error, else: ""
-        else
-          read_getrange_value(key, start_idx, end_idx, store)
-        end
-
-      _unknown_or_missing ->
-        read_getrange_value(key, start_idx, end_idx, store)
-    end
-  end
-
-  defp read_getrange_value(key, start_idx, end_idx, store) do
-    case Ops.getrange(store, key, start_idx, end_idx) do
-      nil ->
-        if compound_data_structure_key?(key, store), do: @wrongtype_error, else: ""
-
-      value ->
-        value
-    end
-  end
-
-  defp getrange_empty_for_size?(size, start_idx, end_idx) do
-    start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
-    end_norm = if end_idx < 0, do: size + end_idx, else: end_idx
-
-    start_clamped = min(start_norm, size)
-    end_clamped = min(end_norm, size - 1)
-
-    start_clamped > end_clamped
-  end
+  defp getrange_parsed(key, start_idx, end_idx, store),
+    do: Range.getrange_parsed(key, start_idx, end_idx, store)
 
   # ---------------------------------------------------------------------------
   # Private — float argument parsing
@@ -794,8 +629,10 @@ defmodule Ferricstore.Commands.Strings do
   # Private — SET option parsing and execution
   # ---------------------------------------------------------------------------
 
+  defp do_set(key, value, [], store), do: do_set_parsed(key, value, @set_opts_default, store)
+
   defp do_set(key, value, opts, store) do
-    with {:ok, parsed} <- parse_set_opts(opts) do
+    with {:ok, parsed} <- SetOptions.parse(opts, @set_opts_default) do
       do_set_parsed(key, value, parsed, store)
     end
   end
@@ -842,304 +679,9 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp parse_set_opts(opts), do: parse_set_opts(opts, @set_opts_default)
-
-  defp parse_set_opts([], acc) do
-    if acc.nx and acc.xx do
-      {:error, "ERR XX and NX options at the same time are not compatible"}
-    else
-      {:ok, acc}
-    end
-  end
-
-  defp parse_set_opts(["NX" | rest], acc) do
-    parse_set_opts(rest, %{acc | nx: true})
-  end
-
-  defp parse_set_opts(["XX" | rest], acc) do
-    parse_set_opts(rest, %{acc | xx: true})
-  end
-
-  defp parse_set_opts(["GET" | rest], acc) do
-    parse_set_opts(rest, %{acc | get: true})
-  end
-
-  defp parse_set_opts(["KEEPTTL" | rest], acc) do
-    if acc.has_expiry do
-      {:error, "ERR syntax error"}
-    else
-      parse_set_opts(rest, %{acc | keepttl: true, has_expiry: true})
-    end
-  end
-
-  defp parse_set_opts(["EX", secs_str | rest], acc) do
-    if acc.has_expiry do
-      {:error, "ERR syntax error"}
-    else
-      with {secs, ""} <- Integer.parse(secs_str),
-           true <- secs > 0 do
-        parse_set_opts(rest, %{
-          acc
-          | expire_at_ms: CommandTime.now_ms() + secs * 1000,
-            has_expiry: true
-        })
-      else
-        false -> {:error, "ERR invalid expire time in 'set' command"}
-        _ -> {:error, "ERR value is not an integer or out of range"}
-      end
-    end
-  end
-
-  defp parse_set_opts(["PX", ms_str | rest], acc) do
-    if acc.has_expiry do
-      {:error, "ERR syntax error"}
-    else
-      with {ms, ""} <- Integer.parse(ms_str),
-           true <- ms > 0 do
-        parse_set_opts(rest, %{acc | expire_at_ms: CommandTime.now_ms() + ms, has_expiry: true})
-      else
-        false -> {:error, "ERR invalid expire time in 'set' command"}
-        _ -> {:error, "ERR value is not an integer or out of range"}
-      end
-    end
-  end
-
-  defp parse_set_opts(["EXAT", ts_str | rest], acc) do
-    if acc.has_expiry do
-      {:error, "ERR syntax error"}
-    else
-      with {ts, ""} <- Integer.parse(ts_str),
-           true <- ts > 0 do
-        parse_set_opts(rest, %{acc | expire_at_ms: ts * 1000, has_expiry: true})
-      else
-        false -> {:error, "ERR invalid expire time in 'set' command"}
-        _ -> {:error, "ERR value is not an integer or out of range"}
-      end
-    end
-  end
-
-  defp parse_set_opts(["PXAT", ts_str | rest], acc) do
-    if acc.has_expiry do
-      {:error, "ERR syntax error"}
-    else
-      with {ts, ""} <- Integer.parse(ts_str),
-           true <- ts > 0 do
-        parse_set_opts(rest, %{acc | expire_at_ms: ts, has_expiry: true})
-      else
-        false -> {:error, "ERR invalid expire time in 'set' command"}
-        _ -> {:error, "ERR value is not an integer or out of range"}
-      end
-    end
-  end
-
-  defp parse_set_opts([unknown | rest], acc) when is_binary(unknown) do
-    case String.upcase(unknown) do
-      ^unknown -> {:error, "ERR syntax error, option '#{unknown}' not recognized"}
-      normalized -> parse_set_opts([normalized | rest], acc)
-    end
-  end
-
-  defp set_opts_from_ast(opts), do: set_opts_from_ast(opts, @set_opts_default)
-
-  defp set_opts_from_ast([], acc), do: {:ok, acc}
-  defp set_opts_from_ast([:nx | rest], acc), do: set_opts_from_ast(rest, %{acc | nx: true})
-  defp set_opts_from_ast([:xx | rest], acc), do: set_opts_from_ast(rest, %{acc | xx: true})
-  defp set_opts_from_ast([:get | rest], acc), do: set_opts_from_ast(rest, %{acc | get: true})
-
-  defp set_opts_from_ast([:keepttl | rest], acc) do
-    set_opts_from_ast(rest, %{acc | keepttl: true, has_expiry: true})
-  end
-
-  defp set_opts_from_ast([{:ex, seconds} | rest], acc) when is_integer(seconds) do
-    set_opts_from_ast(rest, %{
-      acc
-      | expire_at_ms: CommandTime.now_ms() + seconds * 1000,
-        has_expiry: true
-    })
-  end
-
-  defp set_opts_from_ast([{:px, ms} | rest], acc) when is_integer(ms) do
-    set_opts_from_ast(rest, %{acc | expire_at_ms: CommandTime.now_ms() + ms, has_expiry: true})
-  end
-
-  defp set_opts_from_ast([{:exat, seconds} | rest], acc) when is_integer(seconds) do
-    set_opts_from_ast(rest, %{acc | expire_at_ms: seconds * 1000, has_expiry: true})
-  end
-
-  defp set_opts_from_ast([{:pxat, ms} | rest], acc) when is_integer(ms) do
-    set_opts_from_ast(rest, %{acc | expire_at_ms: ms, has_expiry: true})
-  end
-
-  defp set_opts_from_ast(_opts, _acc), do: {:error, "ERR syntax error"}
-
   # ---------------------------------------------------------------------------
   # Private — MSET/MSETNX helpers (direct recursion, no chunked enumeration)
   # ---------------------------------------------------------------------------
-
-  # Validates all keys in a flat [k, v, k, v, ...] list without creating
-  # intermediate chunk lists.
-  defp mset_validate([]), do: :ok
-
-  defp mset_validate([k, _v | rest]) do
-    if k == "" or byte_size(k) > @max_key_bytes do
-      {:error, "ERR key too large or empty"}
-    else
-      mset_validate(rest)
-    end
-  end
-
-  defp mset_exec([], _store), do: :ok
-
-  defp mset_exec(args, %FerricStore.Instance{} = store) do
-    Ops.batch_put(store, mset_pairs(args))
-  end
-
-  defp mset_exec(args, store) do
-    if mset_needs_compound_cleanup?(args, store) do
-      mset_exec_sequential(args, store)
-    else
-      Ops.batch_put(store, mset_pairs(args))
-    end
-  end
-
-  defp mset_needs_compound_cleanup?([], _store), do: false
-
-  defp mset_needs_compound_cleanup?([k, _v | rest], store) do
-    compound_data_structure_key?(k, store) or mset_needs_compound_cleanup?(rest, store)
-  end
-
-  defp mset_pairs([]), do: []
-  defp mset_pairs([k, v | rest]), do: [{k, v} | mset_pairs(rest)]
-
-  # Fallback path preserves per-key compound cleanup for stores that cannot
-  # provide string-batch replacement semantics themselves.
-  defp mset_exec_sequential(args, store) do
-    backups =
-      args
-      |> backup_mset_originals(store)
-      |> Map.new(fn {key, _plain, _compound} = backup -> {key, backup} end)
-
-    case mset_exec_sequential_replace(args, store, []) do
-      :ok ->
-        :ok
-
-      {{:error, _} = err, replaced_keys} ->
-        case restore_mset_originals(replaced_keys, backups, store) do
-          :ok -> err
-          {:error, _} = rollback_error -> {:error, {:mset_rollback_failed, err, rollback_error}}
-        end
-    end
-  end
-
-  defp mset_exec_sequential_replace([], _store, _replaced_keys), do: :ok
-
-  defp mset_exec_sequential_replace([k, v | rest], store, replaced_keys) do
-    case replace_string_key(k, v, 0, store) do
-      :ok -> mset_exec_sequential_replace(rest, store, [k | replaced_keys])
-      {:error, _} = err -> {err, replaced_keys}
-    end
-  end
-
-  defp backup_mset_originals(args, store) do
-    args
-    |> extract_keys()
-    |> Enum.uniq()
-    |> Enum.map(&backup_string_key(&1, store))
-  end
-
-  defp backup_string_key(key, store) do
-    {key, Ops.get_meta(store, key), backup_compound_data_structure(key, store)}
-  end
-
-  defp backup_compound_data_structure(key, store) do
-    if Ops.has_compound?(store) do
-      type_key = CompoundKey.type_key(key)
-
-      case Ops.compound_get_meta(store, key, type_key) do
-        nil ->
-          nil
-
-        {type, type_expire_at_ms} ->
-          %{
-            type: {type_key, type, type_expire_at_ms},
-            entries: backup_compound_entries(key, type, store)
-          }
-      end
-    end
-  end
-
-  defp backup_compound_entries(key, type, store) do
-    entries =
-      key
-      |> compound_prefixes_for_type(type)
-      |> Enum.flat_map(&scan_compound_entries(&1, key, store))
-
-    maybe_add_list_meta_entry(entries, key, type, store)
-  end
-
-  defp scan_compound_entries(prefix, key, store) do
-    store
-    |> Ops.compound_scan(key, prefix)
-    |> Enum.flat_map(fn {field, _value} ->
-      compound_key = prefix <> field
-
-      case Ops.compound_get_meta(store, key, compound_key) do
-        nil -> []
-        {value, expire_at_ms} -> [{compound_key, value, expire_at_ms}]
-      end
-    end)
-  end
-
-  defp maybe_add_list_meta_entry(entries, key, "list", store) do
-    meta_key = CompoundKey.list_meta_key(key)
-
-    case Ops.compound_get_meta(store, key, meta_key) do
-      nil -> entries
-      {value, expire_at_ms} -> [{meta_key, value, expire_at_ms} | entries]
-    end
-  end
-
-  defp maybe_add_list_meta_entry(entries, _key, _type, _store), do: entries
-
-  defp restore_mset_originals(replaced_keys, backups, store) do
-    replaced_keys
-    |> Enum.uniq()
-    |> Enum.reduce_while(:ok, fn key, :ok ->
-      backup = Map.fetch!(backups, key)
-
-      case restore_string_key_backup(backup, store) do
-        :ok -> {:cont, :ok}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-  end
-
-  defp restore_string_key_backup({key, plain_meta, compound_backup}, store) do
-    with :ok <- clear_compound_data_structure(key, store),
-         :ok <- restore_plain_string_backup(key, plain_meta, store),
-         :ok <- restore_compound_backup(key, compound_backup, store) do
-      :ok
-    end
-  end
-
-  defp restore_plain_string_backup(key, nil, store), do: Ops.delete(store, key)
-
-  defp restore_plain_string_backup(key, {value, expire_at_ms}, store) do
-    Ops.put(store, key, value, expire_at_ms)
-  end
-
-  defp restore_compound_backup(_key, nil, _store), do: :ok
-
-  defp restore_compound_backup(
-         key,
-         %{type: {type_key, type, type_expire_at_ms}, entries: entries},
-         store
-       ) do
-    with :ok <- Ops.compound_put(store, key, type_key, type, type_expire_at_ms),
-         :ok <- Ops.compound_batch_put(store, key, entries) do
-      :ok
-    end
-  end
 
   defp compound_prefix_for_type(key, "hash"), do: CompoundKey.hash_prefix(key)
   defp compound_prefix_for_type(key, "list"), do: CompoundKey.list_prefix(key)
@@ -1148,33 +690,15 @@ defmodule Ferricstore.Commands.Strings do
   defp compound_prefix_for_type(key, "stream"), do: CompoundKey.stream_prefix(key)
   defp compound_prefix_for_type(_key, _type), do: nil
 
-  defp compound_prefixes_for_type(key, "stream"),
+  def compound_prefixes_for_type(key, "stream"),
     do: [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]
 
-  defp compound_prefixes_for_type(key, type) do
+  def compound_prefixes_for_type(key, type) do
     case compound_prefix_for_type(key, type) do
       nil -> []
       prefix -> [prefix]
     end
   end
-
-  # Checks if any key in a flat [k, v, k, v, ...] list already exists.
-  defp msetnx_any_exists?([], _store), do: false
-
-  defp msetnx_any_exists?([k, _v | rest], store) do
-    if Ops.exists?(store, k) or compound_data_structure_key?(k, store),
-      do: true,
-      else: msetnx_any_exists?(rest, store)
-  end
-
-  # Extracts keys from a flat [k, v, k, v, ...] list.
-  defp extract_keys([]), do: []
-  defp extract_keys([k, _v | rest]), do: [k | extract_keys(rest)]
-
-  # O(n/2) parity check without computing full length.
-  defp even_length?([]), do: true
-  defp even_length?([_, _ | rest]), do: even_length?(rest)
-  defp even_length?(_), do: false
 
   # ---------------------------------------------------------------------------
   # Private — type checking for GET
@@ -1193,7 +717,7 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp ensure_string_key(key, store) do
+  def ensure_string_key(key, store) do
     if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :ok
   end
 
@@ -1207,13 +731,13 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp replace_string_key(key, value, expire_at_ms, store) do
+  def replace_string_key(key, value, expire_at_ms, store) do
     with :ok <- clear_compound_data_structure(key, store) do
       Ops.put(store, key, value, expire_at_ms)
     end
   end
 
-  defp compound_data_structure_key?(key, store) do
+  def compound_data_structure_key?(key, store) do
     Ops.has_compound?(store) and
       compound_type_marker?(key, store) and
       TypeRegistry.get_type(key, store) != "none"
@@ -1225,7 +749,7 @@ defmodule Ferricstore.Commands.Strings do
     Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil
   end
 
-  defp clear_compound_data_structure(key, store) do
+  def clear_compound_data_structure(key, store) do
     if Ops.has_compound?(store) do
       type_key = CompoundKey.type_key(key)
 
@@ -1249,7 +773,7 @@ defmodule Ferricstore.Commands.Strings do
   defp delete_compound_data_for_replacement(key, type, type_key, store) do
     with :ok <- clear_compound_prefix(key, type, store),
          :ok <- Ops.compound_delete(store, key, type_key) do
-      if type == "stream", do: cleanup_stream_metadata(key)
+      if type == "stream", do: Delete.cleanup_stream_metadata(key)
       :ok
     end
   end
@@ -1378,219 +902,7 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp scanned_compound_key(prefix, key) do
+  def scanned_compound_key(prefix, key) do
     if String.starts_with?(key, prefix), do: key, else: prefix <> key
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private — DEL key deletion (plain + compound)
-  # ---------------------------------------------------------------------------
-
-  # Deletes a single key, handling both plain string keys and data structure
-  # keys that use compound sub-keys. Returns `true` if the key existed and
-  # was deleted, `false` otherwise.
-  defp do_del_key(key, store) do
-    alias Ferricstore.Store.{CompoundKey, TypeRegistry}
-
-    # Check for data structure type metadata when compound operations are
-    # available (the store has compound_get). When they are not available
-    # (e.g. raw Router-based store without data structure support), fall
-    # through to plain key deletion.
-    has_compound? = Ops.has_compound?(store)
-
-    if has_compound? do
-      type_key = CompoundKey.type_key(key)
-
-      case Ops.compound_get(store, key, type_key) do
-        nil ->
-          # No type metadata -- plain string key, or a stream that only has
-          # X:<key>\0 compound entries plus local ETS metadata.
-          case maybe_delete_stream_key(key, store) do
-            true -> true
-            false -> delete_plain_key_if_exists(key, store)
-            {:error, _reason} = error -> error
-          end
-
-        type_str ->
-          # Data structure key -- delete compound sub-keys, then type metadata.
-          # Lists store data as serialized Erlang terms in the plain key store,
-          # so we must also delete the plain key for list types.
-          prefix =
-            case type_str do
-              "hash" -> CompoundKey.hash_prefix(key)
-              "list" -> CompoundKey.list_prefix(key)
-              "set" -> CompoundKey.set_prefix(key)
-              "zset" -> CompoundKey.zset_prefix(key)
-              "stream" -> CompoundKey.stream_prefix(key)
-              _unknown -> nil
-            end
-
-          case delete_compound_key_data(key, type_str, prefix, store) do
-            :ok -> true
-            {:error, _reason} = error -> error
-          end
-      end
-    else
-      if Ops.exists?(store, key) do
-        case Ops.delete(store, key) do
-          :ok -> true
-          {:error, _reason} = error -> error
-        end
-      else
-        false
-      end
-    end
-  end
-
-  defp delete_plain_key_if_exists(key, store) do
-    if Ops.exists?(store, key) do
-      case maybe_delete_prob_file(key, store) do
-        :ok ->
-          case Ops.delete(store, key) do
-            :ok -> true
-            {:error, _reason} = error -> error
-          end
-
-        {:error, _reason} = error ->
-          error
-      end
-    else
-      false
-    end
-  end
-
-  defp delete_compound_key_data(key, type_str, prefix, store) do
-    with :ok <- delete_compound_prefix_if_present(key, prefix, store),
-         :ok <- delete_stream_groups_if_needed(key, type_str, store),
-         :ok <- delete_stream_durable_meta_if_needed(key, type_str, store),
-         :ok <- delete_list_meta_if_needed(key, type_str, store),
-         :ok <- delete_stream_metadata_if_needed(key, type_str),
-         :ok <- TypeRegistry.delete_type(key, store) do
-      :ok
-    end
-  end
-
-  defp delete_compound_prefix_if_present(_key, nil, _store), do: :ok
-
-  defp delete_compound_prefix_if_present(key, prefix, store) do
-    Ops.compound_delete_prefix(store, key, prefix)
-  end
-
-  defp delete_list_meta_if_needed(key, "list", store) do
-    Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
-  end
-
-  defp delete_list_meta_if_needed(_key, _type_str, _store), do: :ok
-
-  defp delete_stream_groups_if_needed(key, "stream", store) do
-    Ops.compound_delete_prefix(store, key, CompoundKey.stream_group_prefix(key))
-  end
-
-  defp delete_stream_groups_if_needed(_key, _type_str, _store), do: :ok
-
-  defp delete_stream_durable_meta_if_needed(key, "stream", store) do
-    Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key))
-  end
-
-  defp delete_stream_durable_meta_if_needed(_key, _type_str, _store), do: :ok
-
-  defp delete_stream_metadata_if_needed(key, "stream") do
-    cleanup_stream_metadata(key)
-    :ok
-  end
-
-  defp delete_stream_metadata_if_needed(_key, _type_str), do: :ok
-
-  defp maybe_delete_prob_file(_key, %FerricStore.Instance{}), do: :ok
-  defp maybe_delete_prob_file(_key, %Ferricstore.Store.LocalTxStore{}), do: :ok
-  defp maybe_delete_prob_file(_key, %{prob_write: write_fn}) when is_function(write_fn), do: :ok
-
-  defp maybe_delete_prob_file(key, store) when is_map(store) do
-    case prob_type(key, store) do
-      :bloom -> Bloom.nif_delete(key, store)
-      :cms -> CMS.nif_delete(key, store)
-      :cuckoo -> Cuckoo.nif_delete(key, store)
-      :topk -> TopK.nif_delete(key, store)
-      nil -> :ok
-    end
-  end
-
-  defp maybe_delete_prob_file(_key, _store), do: :ok
-
-  defp prob_type(key, store) do
-    store
-    |> Ops.get(key)
-    |> decode_prob_meta()
-  rescue
-    _ -> nil
-  end
-
-  defp decode_prob_meta(value) when is_binary(value) do
-    try do
-      value
-      |> :erlang.binary_to_term([:safe])
-      |> decode_prob_meta()
-    rescue
-      _ -> nil
-    end
-  end
-
-  defp decode_prob_meta({:bloom_meta, _}), do: :bloom
-  defp decode_prob_meta({:cms_meta, _}), do: :cms
-  defp decode_prob_meta({:cuckoo_meta, _}), do: :cuckoo
-  defp decode_prob_meta({:topk_meta, _}), do: :topk
-  defp decode_prob_meta({:topk_path, _}), do: :topk
-  defp decode_prob_meta(_), do: nil
-
-  defp maybe_delete_stream_key(key, store) do
-    prefix = CompoundKey.stream_prefix(key)
-    group_prefix = CompoundKey.stream_group_prefix(key)
-    meta_key = CompoundKey.stream_meta_key(key)
-
-    if Ops.compound_scan(store, key, prefix) != [] or
-         Ops.compound_scan(store, key, group_prefix) != [] or
-         Ops.compound_get(store, key, meta_key) != nil or stream_metadata_exists?(key) do
-      with :ok <- Ops.compound_delete_prefix(store, key, prefix),
-           :ok <- Ops.compound_delete_prefix(store, key, group_prefix),
-           :ok <- Ops.compound_delete(store, key, meta_key) do
-        cleanup_stream_metadata(key)
-        true
-      else
-        {:error, _reason} = error -> error
-      end
-    else
-      false
-    end
-  end
-
-  defp stream_metadata_exists?(key) do
-    table = Ferricstore.Stream.Meta
-    :ets.whereis(table) != :undefined and :ets.lookup(table, key) != []
-  end
-
-  defp cleanup_stream_metadata(key) do
-    meta_table = Ferricstore.Stream.Meta
-    groups_table = Ferricstore.Stream.Groups
-    index_table = Ferricstore.Stream.Index
-    waiters_table = :ferricstore_stream_waiters
-
-    if :ets.whereis(meta_table) != :undefined do
-      :ets.delete(meta_table, key)
-    end
-
-    if :ets.whereis(groups_table) != :undefined do
-      :ets.match_delete(groups_table, {{key, :_}, :_, :_, :_})
-    end
-
-    if :ets.whereis(index_table) != :undefined do
-      :ets.select_delete(index_table, [{{{key, :_, :_}, :_, :_}, [], [true]}])
-      :ets.delete(index_table, {:ready, key})
-    end
-
-    if :ets.whereis(waiters_table) != :undefined do
-      :ets.match_delete(waiters_table, {key, :_, :_, :_})
-    end
-
-    :ok
   end
 end

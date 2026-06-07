@@ -1,13 +1,8 @@
 defmodule Ferricstore.Raft.StateMachineColdScanGuardTest do
   use ExUnit.Case, async: true
 
-  @state_machine_path Path.expand(
-                        "../../../lib/ferricstore/raft/state_machine.ex",
-                        __DIR__
-                      )
-
   test "cross-shard prefix scans batch cold Bitcask reads" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
     [_, section] =
       String.split(source, "defp cross_shard_read_cold_bitcask_values(acc, entries) do",
         parts: 2

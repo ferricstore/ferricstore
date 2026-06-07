@@ -1,10 +1,8 @@
 defmodule Ferricstore.Store.RouterBlobRangeGuardTest do
   use ExUnit.Case, async: true
 
-  @source Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
-
   test "blob-backed GETRANGE does not materialize the full blob" do
-    source = File.read!(@source)
+    source = Ferricstore.Test.SourceFiles.router_source()
 
     cold_blob_range =
       source

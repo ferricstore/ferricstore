@@ -190,7 +190,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
 
   test "WARaft storage has no selectable apply mode branch" do
     source =
-      File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/raft/waraft_storage.ex"))
+      Ferricstore.Test.SourceFiles.waraft_storage_source()
 
     # The segment/keydir apply path is now the storage contract. Keeping a
     # boolean helper here would invite benchmarks and deploys to drift again.
@@ -199,7 +199,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
 
   test "Flow create_many uses the optimized create planner before generic fallback" do
     source =
-      File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/raft/state_machine.ex"))
+      Ferricstore.Test.SourceFiles.state_machine_source()
 
     [_prefix, create_many_clause] =
       String.split(
@@ -282,10 +282,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
   end
 
   test "segment log production code has no alternate I/O mode selectors" do
-    source =
-      File.read!(
-        Path.join(@repo_root, "apps/ferricstore/src/ferricstore_waraft_spike_segment_log.erl")
-      )
+    source = Ferricstore.Test.SourceFiles.waraft_segment_log_source()
 
     for token <- [
           "waraft_segment_log_io_mode",
@@ -306,7 +303,17 @@ defmodule Ferricstore.ProductionDefaultsTest do
     ]
 
     for path <- paths do
-      source = File.read!(Path.join(@repo_root, path))
+      source =
+        case path do
+          "apps/ferricstore/lib/ferricstore/raft/state_machine.ex" ->
+            Ferricstore.Test.SourceFiles.state_machine_source()
+
+          "apps/ferricstore/lib/ferricstore/store/shard.ex" ->
+            Ferricstore.Test.SourceFiles.shard_source()
+
+          _ ->
+            File.read!(Path.join(@repo_root, path))
+        end
 
       assert source =~ ":flow_async_history"
       refute source =~ "System.get_env(\"FLOW_ASYNC_HISTORY\""
@@ -337,10 +344,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
   end
 
   test "Flow history projector production defaults avoid tiny background fsync batches" do
-    source =
-      File.read!(
-        Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/flow/history_projector.ex")
-      )
+    source = Ferricstore.Test.SourceFiles.flow_source()
 
     # The history projector is cold/lagged, but its fsyncs share the same disk as
     # WARaft commits. Small defaults create p99 write stalls under Flow soak.
@@ -369,8 +373,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
     bench_exs = File.read!(Path.join(@repo_root, "config/bench.exs"))
     runtime_exs = File.read!(Path.join(@repo_root, "config/runtime.exs"))
 
-    backend_source =
-      File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/raft/waraft_backend.ex"))
+    backend_source = Ferricstore.Test.SourceFiles.waraft_backend_source()
 
     assert config_exs =~ "waraft_apply_log_batch_size: 4_096"
     assert bench_exs =~ "waraft_apply_log_batch_size: 4_096"

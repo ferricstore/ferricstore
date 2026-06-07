@@ -82,10 +82,8 @@ defmodule FerricstoreServer.Acl do
 
   require Logger
 
-  alias Ferricstore.AuditLog
-  alias FerricstoreServer.Acl.CommandCategories
+  alias FerricstoreServer.Acl.{CommandCategories, Formatter, Password, Persistence, Rules, Tables, Patterns, Protection}
 
-  @table :ferricstore_acl
 
   # ---------------------------------------------------------------------------
   # Types
@@ -118,20 +116,7 @@ defmodule FerricstoreServer.Acl do
   # Constants -- file persistence
   # ---------------------------------------------------------------------------
 
-  @acl_filename "acl.conf"
-  @max_line_length 1_048_576
-  @max_file_size 50_000_000
   @auto_save_debounce_ms 1_000
-  @active_table_key :ferricstore_acl_active_table
-  @swap_old_table :ferricstore_acl_old_swap
-  @swap_new_table :ferricstore_acl_new_swap
-  @retired_table_grace_ms 5_000
-  @retired_swap_tables [
-    @swap_old_table,
-    :ferricstore_acl_old_swap_2,
-    :ferricstore_acl_old_swap_3,
-    :ferricstore_acl_old_swap_4
-  ]
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -239,7 +224,7 @@ defmodule FerricstoreServer.Acl do
   """
   @spec get_user(binary()) :: user() | nil
   def get_user(username) do
-    case :ets.lookup(active_table(), username) do
+    case :ets.lookup(Tables.active_table(), username) do
       [{^username, user}] -> user
       [] -> nil
     end
@@ -257,10 +242,10 @@ defmodule FerricstoreServer.Acl do
   """
   @spec list_users() :: [binary()]
   def list_users do
-    active_table()
+    Tables.active_table()
     |> :ets.tab2list()
     |> Enum.sort_by(fn {name, _} -> name end)
-    |> Enum.map(&format_user_rule/1)
+    |> Enum.map(&Formatter.format_user_rule/1)
   end
 
   @doc """
@@ -287,11 +272,11 @@ defmodule FerricstoreServer.Acl do
         flags = if user.enabled, do: ["on"], else: ["off"]
 
         passwords =
-          if user.password, do: [hash_for_display(user.password)], else: []
+          if user.password, do: [Password.hash_for_display(user.password)], else: []
 
-        commands = format_user_commands(user)
-        keys = format_keys(user.keys)
-        channels = format_channels(user_channels(user))
+        commands = Formatter.format_user_commands(user)
+        keys = Formatter.format_keys(user.keys)
+        channels = Formatter.format_channels(Rules.user_channels(user))
 
         [
           "flags",
@@ -342,7 +327,7 @@ defmodule FerricstoreServer.Acl do
         {:ok, username}
 
       %{password: stored_hash} ->
-        if verify_password(password, stored_hash) do
+        if Password.verify(password, stored_hash) do
           {:ok, username}
         else
           {:error, "WRONGPASS invalid username-password pair or user is disabled."}
@@ -413,7 +398,7 @@ defmodule FerricstoreServer.Acl do
   """
   @spec check_command(binary(), binary()) :: :ok | {:error, binary()}
   def check_command(username, command) do
-    cmd = normalize_acl_command_name(command)
+    cmd = Rules.normalize_acl_command_name(command)
 
     case get_user(username) do
       nil ->
@@ -425,7 +410,7 @@ defmodule FerricstoreServer.Acl do
          "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
       %{commands: :all, denied_commands: denied} ->
-        if command_denied?(denied, cmd) do
+        if Rules.command_denied?(denied, cmd) do
           {:error,
            "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
         else
@@ -434,11 +419,11 @@ defmodule FerricstoreServer.Acl do
 
       %{commands: cmds, denied_commands: denied} ->
         cond do
-          command_denied?(denied, cmd) ->
+          Rules.command_denied?(denied, cmd) ->
             {:error,
              "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
-          command_allowed?(cmds, cmd) ->
+          Rules.command_allowed?(cmds, cmd) ->
             :ok
 
           true ->
@@ -509,91 +494,19 @@ defmodule FerricstoreServer.Acl do
     - `false` otherwise
   """
   @spec key_matches_any?(binary(), :read | :write, [key_pattern()]) :: boolean()
-  def key_matches_any?(_key, _access_type, []), do: false
-
-  def key_matches_any?(key, access_type, [{_glob, mode, regex} | rest]) do
-    if access_permitted?(mode, access_type) and Regex.match?(regex, key) do
-      true
-    else
-      key_matches_any?(key, access_type, rest)
-    end
-  end
-
-  # Check if the pattern's access mode permits the requested access type.
-  @spec access_permitted?(:rw | :read | :write, :read | :write) :: boolean()
-  defp access_permitted?(:rw, _access_type), do: true
-  defp access_permitted?(:read, :read), do: true
-  defp access_permitted?(:write, :write), do: true
-  defp access_permitted?(_, _), do: false
+  def key_matches_any?(key, access_type, patterns), do: Patterns.key_matches_any?(key, access_type, patterns)
 
   @doc """
-  Checks if a Pub/Sub channel matches any compiled ACL channel pattern.
+  Returns true if the Pub/Sub channel matches any ACL channel pattern.
   """
   @spec channel_matches_any?(binary(), [channel_pattern()]) :: boolean()
-  def channel_matches_any?(_channel, []), do: false
-
-  def channel_matches_any?(channel, [{_glob, regex} | rest]) do
-    if Regex.match?(regex, channel) do
-      true
-    else
-      channel_matches_any?(channel, rest)
-    end
-  end
+  def channel_matches_any?(channel, patterns), do: Patterns.channel_matches_any?(channel, patterns)
 
   @doc """
-  Compiles a glob pattern string into a `Regex`.
-
-  Supports:
-    - `*` -- matches any sequence of characters
-    - `?` -- matches any single character
-    - `[abc]` -- matches any character in the set
-
-  All other characters are escaped for literal matching.
-
-  ## Examples
-
-      FerricstoreServer.Acl.compile_glob("cache:*")
-      #=> ~r/\\Acache:.*\\z/s
-
-      FerricstoreServer.Acl.compile_glob("user:?:profile")
-      #=> ~r/\\Auser:..:profile\\z/s
+  Compiles a Redis ACL glob pattern into a regular expression.
   """
   @spec compile_glob(binary()) :: Regex.t()
-  def compile_glob(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> compile_glob_chars([])
-      |> IO.iodata_to_binary()
-
-    # The \\A and \\z anchors ensure full-string match. The 's' flag makes
-    # '.' match newlines (though keys shouldn't contain them).
-    case Regex.compile("\\A" <> regex_str <> "\\z", "s") do
-      {:ok, regex} ->
-        regex
-
-      {:error, _} ->
-        Regex.compile!("\\A" <> Regex.escape(pattern) <> "\\z", "s")
-    end
-  end
-
-  defp compile_glob_chars([], acc), do: Enum.reverse(acc)
-  defp compile_glob_chars(["*" | rest], acc), do: compile_glob_chars(rest, [".*" | acc])
-  defp compile_glob_chars(["?" | rest], acc), do: compile_glob_chars(rest, ["." | acc])
-
-  defp compile_glob_chars(["[" | rest], acc) do
-    # Pass through character class: collect until ']'
-    {class_chars, remaining} = collect_char_class(rest, [])
-    compile_glob_chars(remaining, [["[", class_chars, "]"] | acc])
-  end
-
-  defp compile_glob_chars([ch | rest], acc) do
-    compile_glob_chars(rest, [Regex.escape(ch) | acc])
-  end
-
-  defp collect_char_class([], acc), do: {Enum.reverse(acc), []}
-  defp collect_char_class(["]" | rest], acc), do: {Enum.reverse(acc), rest}
-  defp collect_char_class([ch | rest], acc), do: collect_char_class(rest, [ch | acc])
+  def compile_glob(pattern), do: Patterns.compile_glob(pattern)
 
   @doc """
   Returns the map of command categories.
@@ -764,8 +677,8 @@ defmodule FerricstoreServer.Acl do
   """
   @spec load_file_contents(binary()) :: {:ok, binary()} | {:error, binary()}
   def load_file_contents(data_dir) do
-    with {:ok, contents} <- read_acl_file_contents(data_dir),
-         :ok <- validate_acl_contents(contents) do
+    with {:ok, contents} <- Persistence.read_file_contents(data_dir),
+         :ok <- Persistence.validate_contents(contents) do
       {:ok, contents}
     end
   end
@@ -783,7 +696,7 @@ defmodule FerricstoreServer.Acl do
   """
   @spec acl_file_path(binary()) :: binary()
   def acl_file_path(data_dir) do
-    Path.join(data_dir, @acl_filename)
+    Persistence.acl_file_path(data_dir)
   end
 
   # ---------------------------------------------------------------------------
@@ -804,124 +717,19 @@ defmodule FerricstoreServer.Acl do
       #=> true
   """
   @spec protected_mode?() :: boolean()
-  def protected_mode? do
-    Application.get_env(:ferricstore, :protected_mode, true)
-  end
+  def protected_mode?, do: Protection.protected_mode?()
 
-  @doc """
-  Returns whether the server has an enabled authentication path.
-
-  Used by the protected mode check to determine whether the server has been
-  configured with real authentication. A password on the default user and
-  Redis-compatible `requirepass` are both valid single-user deployments.
-
-  ## Examples
-
-      FerricstoreServer.Acl.has_configured_users?()
-      #=> false
-  """
   @spec has_configured_users?() :: boolean()
-  def has_configured_users? do
-    requirepass_configured?() or
-      active_table()
-      |> :ets.tab2list()
-      |> Enum.any?(fn {_name, user} -> user.password != nil and user.enabled end)
-  end
+  def has_configured_users?, do: Protection.has_configured_users?()
 
-  defp requirepass_configured? do
-    Ferricstore.Config.get_value("requirepass") not in [nil, ""]
-  end
-
-  @doc """
-  Returns whether the given peer address is a localhost address.
-
-  Recognizes IPv4 `127.0.0.1` and IPv6 `::1`.
-
-  ## Parameters
-
-    - `peer` -- a `{ip_tuple, port}` tuple or `nil`
-
-  ## Examples
-
-      FerricstoreServer.Acl.localhost?({{127, 0, 0, 1}, 12345})
-      #=> true
-
-      FerricstoreServer.Acl.localhost?({{192, 168, 1, 1}, 12345})
-      #=> false
-  """
   @spec localhost?({:inet.ip_address(), :inet.port_number()} | nil) :: boolean()
-  def localhost?(nil), do: false
-  def localhost?({{127, 0, 0, 1}, _port}), do: true
-  def localhost?({{0, 0, 0, 0, 0, 0, 0, 1}, _port}), do: true
-  def localhost?(_peer), do: false
+  def localhost?(peer), do: Protection.localhost?(peer)
 
-  @doc """
-  Checks whether a connection from the given peer should be allowed under
-  protected mode rules.
+  @spec check_protected_mode({:inet.ip_address(), :inet.port_number()} | nil) :: :ok | {:error, binary()}
+  def check_protected_mode(peer), do: Protection.check_protected_mode(peer)
 
-  Returns `:ok` if the connection is allowed, or `{:error, message}` if the
-  connection should be rejected.
-
-  A connection is rejected when ALL of:
-    1. Protected mode is active
-    2. No non-default ACL user with a password exists
-    3. The connection is not from localhost
-
-  ## Parameters
-
-    - `peer` -- a `{ip_tuple, port}` tuple or `nil`
-
-  ## Examples
-
-      FerricstoreServer.Acl.check_protected_mode({{127, 0, 0, 1}, 12345})
-      #=> :ok
-
-      FerricstoreServer.Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
-      #=> {:error, "DENIED FerricStore is in protected mode..."}
-  """
-  @spec check_protected_mode({:inet.ip_address(), :inet.port_number()} | nil) ::
-          :ok | {:error, binary()}
-  def check_protected_mode(peer) do
-    if protected_mode?() and not has_configured_users?() and not localhost?(peer) do
-      {:error,
-       "DENIED FerricStore is in protected mode. " <>
-         "Configure ACL users or set protected-mode false."}
-    else
-      :ok
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # ACL LOG denial helper (Fix 5)
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Logs a command denial to the audit log.
-
-  Called by the connection handler when `check_command/2` returns an error.
-  This is a convenience wrapper around `AuditLog.log/2` that uses the
-  `:command_denied` event type.
-
-  ## Parameters
-
-    - `username`  -- the username that was denied
-    - `command`   -- the command that was denied
-    - `client_ip` -- formatted client IP string
-    - `client_id` -- the connection's client ID
-
-  ## Examples
-
-      FerricstoreServer.Acl.log_command_denied("alice", "SET", "127.0.0.1:1234", 42)
-  """
   @spec log_command_denied(binary(), binary(), binary(), term()) :: :ok
-  def log_command_denied(username, command, client_ip, client_id) do
-    AuditLog.log(:command_denied, %{
-      username: username,
-      command: command,
-      client_ip: client_ip,
-      client_id: client_id
-    })
-  end
+  def log_command_denied(username, command, client_ip, client_id), do: Protection.log_command_denied(username, command, client_ip, client_id)
 
   # ---------------------------------------------------------------------------
   # GenServer callbacks
@@ -929,19 +737,18 @@ defmodule FerricstoreServer.Acl do
 
   @impl true
   def init(_opts) do
-    cleanup_retired_tables()
-    cleanup_named_table(@swap_new_table)
+    Tables.cleanup_retired_tables()
+    Tables.cleanup_new_swap_table()
 
-    table = :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
-    :persistent_term.put(@active_table_key, table)
-    insert_default_user()
+    table = Tables.new_active_table()
+    Tables.insert_default_user()
 
     # Auto-load from file on startup (design doc section 7 startup sequence)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     state = %{table: table, save_timer: nil}
 
     state =
-      case auto_load_from_file(data_dir) do
+      case Persistence.auto_load_from_file(data_dir) do
         :ok ->
           Logger.info("ACL loaded from #{acl_file_path(data_dir)}")
           state
@@ -961,7 +768,7 @@ defmodule FerricstoreServer.Acl do
   @impl true
   def handle_call({:set_user, username, rules}, _from, state) do
     existing = get_user(username)
-    table = active_table()
+    table = Tables.active_table()
 
     # Fix 4: max_acl_users -- check limit before creating a new user.
     max = Application.get_env(:ferricstore, :max_acl_users, 10_000)
@@ -983,7 +790,7 @@ defmodule FerricstoreServer.Acl do
           }
         end
 
-      case apply_rules(base, rules) do
+      case Rules.apply_rules(base, rules) do
         {:ok, updated} ->
           :ets.insert(table, {username, updated})
           {:reply, :ok, maybe_schedule_auto_save(state)}
@@ -999,7 +806,7 @@ defmodule FerricstoreServer.Acl do
   end
 
   def handle_call({:del_user, username}, _from, state) do
-    table = active_table()
+    table = Tables.active_table()
 
     case :ets.lookup(table, username) do
       [] ->
@@ -1014,7 +821,7 @@ defmodule FerricstoreServer.Acl do
   def handle_call({:del_users, usernames}, _from, state) do
     case validate_del_users(usernames) do
       :ok ->
-        table = active_table()
+        table = Tables.active_table()
 
         usernames
         |> Enum.uniq()
@@ -1028,8 +835,8 @@ defmodule FerricstoreServer.Acl do
   end
 
   def handle_call(:reset, _from, state) do
-    :ets.delete_all_objects(active_table())
-    insert_default_user()
+    :ets.delete_all_objects(Tables.active_table())
+    Tables.insert_default_user()
     {:reply, :ok, state}
   end
 
@@ -1037,33 +844,33 @@ defmodule FerricstoreServer.Acl do
 
   def handle_call(:acl_save, _from, state) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    {:reply, do_save(data_dir), state}
+    {:reply, Persistence.save(data_dir), state}
   end
 
   def handle_call({:acl_save, data_dir}, _from, state) do
-    {:reply, do_save(data_dir), state}
+    {:reply, Persistence.save(data_dir), state}
   end
 
   # --- ACL LOAD ---
 
   def handle_call(:acl_load, _from, state) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    {:reply, do_load(data_dir), state}
+    {:reply, Persistence.load(data_dir), state}
   end
 
   def handle_call({:acl_load, data_dir}, _from, state) do
-    {:reply, do_load(data_dir), state}
+    {:reply, Persistence.load(data_dir), state}
   end
 
   def handle_call({:acl_load_contents, contents}, _from, state) do
-    {:reply, do_load_contents(contents), state}
+    {:reply, Persistence.load_contents(contents), state}
   end
 
   @impl true
   def handle_info(:auto_save, state) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
 
-    case do_save(data_dir) do
+    case Persistence.save(data_dir) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("ACL auto-save failed: #{reason}")
     end
@@ -1072,8 +879,8 @@ defmodule FerricstoreServer.Acl do
   end
 
   def handle_info({:cleanup_acl_retired_table, table_name}, state) do
-    if table_name in @retired_swap_tables do
-      cleanup_named_table(table_name)
+    if Tables.retired_table?(table_name) do
+      Tables.cleanup_named_table(table_name)
     end
 
     {:noreply, state}
@@ -1085,602 +892,7 @@ defmodule FerricstoreServer.Acl do
   # Private -- password hashing (Fix 1)
   # ---------------------------------------------------------------------------
 
-  @spec hash_password(binary()) :: binary()
-  # PBKDF2-SHA256 with 100K iterations. Makes brute-force of leaked acl.conf
-  # impractical: ~100ms per guess vs nanoseconds with plain SHA-256.
-  # Salt is 16 random bytes, unique per password.
-  @pbkdf2_iterations 100_000
-  @pbkdf2_key_length 32
 
-  defp hash_password(password) do
-    salt = :crypto.strong_rand_bytes(16)
-    hash = :crypto.pbkdf2_hmac(:sha256, password, salt, @pbkdf2_iterations, @pbkdf2_key_length)
-    Base.encode64(salt <> hash)
-  end
-
-  # Verifies a plaintext password against a stored PBKDF2 hash.
-  # Extracts the 16-byte salt, recomputes PBKDF2, constant-time compares.
-  # Also accepts legacy SHA-256 hashes (32 bytes after salt) for backward
-  # compatibility with acl.conf files created before the PBKDF2 upgrade.
-  @spec verify_password(binary(), binary()) :: boolean()
-  defp verify_password(password, stored_hash) do
-    case Base.decode64(stored_hash) do
-      {:ok, <<salt::binary-16, hash::binary-32>>} ->
-        # Try PBKDF2 first (new format)
-        pbkdf2 =
-          :crypto.pbkdf2_hmac(:sha256, password, salt, @pbkdf2_iterations, @pbkdf2_key_length)
-
-        if :crypto.hash_equals(pbkdf2, hash) do
-          true
-        else
-          # Fallback: legacy SHA-256 (for old acl.conf files)
-          legacy = :crypto.hash(:sha256, salt <> password)
-          :crypto.hash_equals(legacy, hash)
-        end
-
-      _ ->
-        false
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private -- rule parsing
-  # ---------------------------------------------------------------------------
-
-  @spec apply_rules(user(), [binary()]) :: {:ok, user()} | {:error, binary()}
-  defp apply_rules(user, rules), do: apply_rules(user, rules, [])
-
-  defp apply_rules(user, [], pending_key_patterns),
-    do: {:ok, flush_pending_key_patterns(user, pending_key_patterns)}
-
-  defp apply_rules(user, [rule | rest], pending_key_patterns) do
-    case parse_key_rule(user, rule, pending_key_patterns) do
-      {:ok, updated, next_pending} ->
-        apply_rules(updated, rest, next_pending)
-
-      :not_key_rule ->
-        case parse_rule(user, rule) do
-          {:ok, updated} -> apply_rules(updated, rest, pending_key_patterns)
-          {:error, _} = err -> err
-        end
-    end
-  end
-
-  @spec parse_rule(user(), binary()) :: {:ok, user()} | {:error, binary()}
-  defp parse_rule(user, "on"), do: {:ok, %{user | enabled: true}}
-  defp parse_rule(user, "off"), do: {:ok, %{user | enabled: false}}
-
-  # Fix 1: Hash the password before storing.
-  defp parse_rule(user, ">" <> password) do
-    {:ok, %{user | password: hash_password(password)}}
-  end
-
-  defp parse_rule(user, "nopass"), do: {:ok, %{user | password: nil}}
-  defp parse_rule(user, "resetpass"), do: {:ok, %{user | password: nil}}
-
-  defp parse_rule(user, "allcommands") do
-    {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
-  end
-
-  defp parse_rule(user, "allchannels"), do: {:ok, Map.put(user, :channels, :all)}
-  defp parse_rule(user, "resetchannels"), do: {:ok, Map.put(user, :channels, [])}
-
-  defp parse_rule(user, "&" <> pattern) do
-    {:ok, add_channel_pattern(user, pattern)}
-  end
-
-  defp parse_rule(user, "+@all") do
-    {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
-  end
-
-  defp parse_rule(user, "-@all"),
-    do: {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
-
-  # +@category -- expand the category to individual commands and add them all.
-  # When commands is :all, also remove the category commands from denied_commands.
-  defp parse_rule(user, "+@" <> category) do
-    cat = String.upcase(category)
-
-    case CommandCategories.category_commands(cat) do
-      {:ok, cat_cmds} ->
-        case user.commands do
-          :all ->
-            # Remove from denied_commands if they were explicitly denied
-            new_denied = MapSet.difference(user.denied_commands, cat_cmds)
-            {:ok, %{user | denied_commands: new_denied}}
-
-          cmds ->
-            {:ok, %{user | commands: MapSet.union(cmds, cat_cmds)}}
-        end
-
-      :error ->
-        {:error,
-         "ERR Error in ACL SETUSER modifier '+@#{category}': Unknown command category '#{category}'"}
-    end
-  end
-
-  # -@category -- deny all commands in the category.
-  # Fix 2: When commands is :all, add to denied_commands instead of ignoring.
-  defp parse_rule(user, "-@" <> category) do
-    cat = String.upcase(category)
-
-    case CommandCategories.category_commands(cat) do
-      {:ok, cat_cmds} ->
-        case user.commands do
-          :all ->
-            new_denied = MapSet.union(user.denied_commands, cat_cmds)
-            {:ok, %{user | denied_commands: new_denied}}
-
-          cmds ->
-            {:ok, %{user | commands: MapSet.difference(cmds, cat_cmds)}}
-        end
-
-      :error ->
-        {:error,
-         "ERR Error in ACL SETUSER modifier '-@#{category}': Unknown command category '#{category}'"}
-    end
-  end
-
-  # +command -- allow a specific command.
-  # When commands is :all, remove from denied_commands if present.
-  defp parse_rule(user, "+" <> command) do
-    cmd = normalize_acl_command_name(command)
-
-    with :ok <- validate_acl_command_rule("+" <> command, command, cmd) do
-      case user.commands do
-        :all ->
-          new_denied = MapSet.delete(user.denied_commands, cmd)
-          {:ok, %{user | denied_commands: new_denied}}
-
-        cmds ->
-          {:ok, %{user | commands: MapSet.put(cmds, cmd)}}
-      end
-    end
-  end
-
-  # -command -- deny a specific command.
-  # Fix 2: When commands is :all, add to denied_commands instead of ignoring.
-  defp parse_rule(user, "-" <> command) do
-    cmd = normalize_acl_command_name(command)
-
-    with :ok <- validate_acl_command_rule("-" <> command, command, cmd) do
-      case user.commands do
-        :all ->
-          new_denied = MapSet.put(user.denied_commands, cmd)
-          {:ok, %{user | denied_commands: new_denied}}
-
-        cmds ->
-          {:ok, %{user | commands: MapSet.delete(cmds, cmd)}}
-      end
-    end
-  end
-
-  defp parse_rule(_user, rule) do
-    {:error, "ERR Error in ACL SETUSER modifier '#{rule}': Syntax error"}
-  end
-
-  defp validate_acl_command_rule(rule, original_command, upper_command) do
-    if MapSet.member?(CommandCategories.acl_supported_commands(), upper_command) do
-      :ok
-    else
-      {:error,
-       "ERR Error in ACL SETUSER modifier '#{rule}': Unknown command '#{original_command}'"}
-    end
-  end
-
-  defp normalize_acl_command_name(command) when is_binary(command) do
-    command
-    |> String.upcase()
-    |> String.replace("|", ".")
-  end
-
-  defp command_denied?(commands, cmd) do
-    MapSet.member?(commands, cmd) or
-      (command_parent_supported?(cmd) and MapSet.member?(commands, command_parent(cmd)))
-  end
-
-  defp command_allowed?(commands, cmd) do
-    MapSet.member?(commands, cmd) or
-      (command_parent_supported?(cmd) and MapSet.member?(commands, command_parent(cmd)))
-  end
-
-  defp command_parent_supported?(cmd) do
-    case command_parent(cmd) do
-      nil -> false
-      parent -> MapSet.member?(CommandCategories.acl_supported_commands(), parent)
-    end
-  end
-
-  defp command_parent(cmd) do
-    case String.split(cmd, ".", parts: 2) do
-      [parent, _subcommand] -> parent
-      _ -> nil
-    end
-  end
-
-  defp parse_key_rule(user, "%R~" <> pattern, pending_key_patterns) do
-    queue_key_pattern(user, {pattern, :read, compile_glob(pattern)}, pending_key_patterns)
-  end
-
-  defp parse_key_rule(user, "%W~" <> pattern, pending_key_patterns) do
-    queue_key_pattern(user, {pattern, :write, compile_glob(pattern)}, pending_key_patterns)
-  end
-
-  defp parse_key_rule(user, "~" <> pattern, pending_key_patterns) do
-    queue_key_pattern(user, {pattern, :rw, compile_glob(pattern)}, pending_key_patterns)
-  end
-
-  defp parse_key_rule(user, "resetkeys", _pending_key_patterns),
-    do: {:ok, %{user | keys: []}, []}
-
-  defp parse_key_rule(user, "allkeys", _pending_key_patterns),
-    do: {:ok, %{user | keys: :all}, []}
-
-  defp parse_key_rule(_user, _rule, _pending_key_patterns), do: :not_key_rule
-
-  defp add_channel_pattern(user, "*"), do: Map.put(user, :channels, :all)
-
-  defp add_channel_pattern(%{channels: :all} = user, _pattern), do: user
-
-  defp add_channel_pattern(user, pattern) do
-    case user_channels(user) do
-      :all -> user
-      channels -> Map.put(user, :channels, channels ++ [{pattern, compile_glob(pattern)}])
-    end
-  end
-
-  defp queue_key_pattern(%{keys: :all} = user, compiled_pattern, pending_key_patterns) do
-    {:ok, %{user | keys: []}, [compiled_pattern | pending_key_patterns]}
-  end
-
-  defp queue_key_pattern(user, compiled_pattern, pending_key_patterns) do
-    {:ok, user, [compiled_pattern | pending_key_patterns]}
-  end
-
-  defp flush_pending_key_patterns(user, []), do: user
-
-  defp flush_pending_key_patterns(%{keys: []} = user, pending_key_patterns) do
-    %{user | keys: Enum.reverse(pending_key_patterns)}
-  end
-
-  defp flush_pending_key_patterns(user, pending_key_patterns) do
-    %{user | keys: user.keys ++ Enum.reverse(pending_key_patterns)}
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private -- formatting (for ACL LIST display)
-  # ---------------------------------------------------------------------------
-
-  @spec format_user_rule({binary(), user()}) :: binary()
-  defp format_user_rule({name, user}) do
-    flag = if user.enabled, do: "on", else: "off"
-    keys = format_keys(user.keys)
-    channels = format_channels(user_channels(user))
-    cmds = format_user_commands(user)
-    "user #{name} #{flag} #{keys} #{channels} #{cmds}"
-  end
-
-  @spec format_user_commands(user()) :: binary()
-  defp format_user_commands(%{commands: :all, denied_commands: denied}) do
-    denied_parts =
-      denied
-      |> MapSet.to_list()
-      |> Enum.sort()
-      |> Enum.map(&"-#{format_acl_command_rule_name(&1)}")
-
-    Enum.join(["+@all" | denied_parts], " ")
-  end
-
-  defp format_user_commands(%{commands: cmds}), do: format_commands(cmds)
-
-  @spec format_commands(:all | MapSet.t(binary())) :: binary()
-  defp format_commands(:all), do: "+@all"
-
-  defp format_commands(cmds) when is_struct(cmds, MapSet) do
-    cmds
-    |> MapSet.to_list()
-    |> Enum.sort()
-    |> Enum.map_join(" ", &"+#{format_acl_command_rule_name(&1)}")
-  end
-
-  @spec format_keys(:all | [key_pattern()]) :: binary()
-  defp format_keys(:all), do: "~*"
-
-  defp format_keys(patterns) when is_list(patterns) do
-    Enum.map_join(patterns, " ", fn
-      {glob, :rw, _regex} -> "~#{glob}"
-      {glob, :read, _regex} -> "%R~#{glob}"
-      {glob, :write, _regex} -> "%W~#{glob}"
-    end)
-  end
-
-  @spec format_channels(:all | [channel_pattern()]) :: binary()
-  defp format_channels(:all), do: "&*"
-  defp format_channels([]), do: "resetchannels"
-
-  defp format_channels(patterns) when is_list(patterns) do
-    Enum.map_join(patterns, " ", fn {glob, _regex} -> "&#{glob}" end)
-  end
-
-  defp user_channels(%{channels: channels}) when channels == :all or is_list(channels),
-    do: channels
-
-  defp user_channels(_user), do: :all
-
-  defp format_acl_command_rule_name(cmd) do
-    case String.split(cmd, ".", parts: 2) do
-      [parent, subcommand] when parent in ["ACL", "CLIENT"] ->
-        "#{String.downcase(parent)}|#{String.downcase(subcommand)}"
-
-      _ ->
-        String.downcase(cmd)
-    end
-  end
-
-  # Displays the stored password hash as a SHA-256 hex digest (for ACL GETUSER).
-  # The stored value is already a base64-encoded salt+hash, so we hash that
-  # representation to produce a stable display value.
-  @spec hash_for_display(binary()) :: binary()
-  defp hash_for_display(stored_hash) do
-    :crypto.hash(:sha256, stored_hash) |> Base.encode16(case: :lower)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private -- default user
-  # ---------------------------------------------------------------------------
-
-  @spec insert_default_user() :: true
-  defp insert_default_user do
-    :ets.insert(
-      active_table(),
-      {"default",
-       %{
-         enabled: true,
-         password: nil,
-         commands: :all,
-         denied_commands: MapSet.new(),
-         keys: :all,
-         channels: :all
-       }}
-    )
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private -- file persistence (ACL SAVE / LOAD)
-  # ---------------------------------------------------------------------------
-
-  # Performs the actual save to disk. Called inside GenServer to serialize
-  # concurrent SAVE requests.
-  #
-  # Security: atomic write (tmp + fsync + rename), 0600 permissions,
-  # path traversal validation, never writes plaintext passwords.
-  @spec do_save(binary()) :: :ok | {:error, binary()}
-  defp do_save(data_dir) do
-    path = acl_file_path(data_dir)
-    tmp = path <> ".tmp.#{System.unique_integer([:positive])}"
-
-    case validate_acl_path(path, data_dir) do
-      :ok -> :ok
-      {:error, _} = err -> throw(err)
-    end
-
-    header =
-      "# FerricStore ACL configuration\n" <>
-        "# Generated by ACL SAVE at #{DateTime.utc_now() |> DateTime.to_iso8601()}\n\n"
-
-    lines =
-      active_table()
-      |> :ets.tab2list()
-      |> Enum.sort_by(fn {name, _} -> name end)
-      |> Enum.map_join("\n", &format_user_for_file/1)
-
-    contents = header <> lines <> "\n"
-
-    with :ok <- Ferricstore.FS.mkdir_p(data_dir),
-         :ok <- File.write(tmp, contents),
-         :ok <- File.chmod(tmp, 0o600),
-         :ok <- fsync_file(tmp),
-         :ok <- Ferricstore.FS.rename(tmp, path),
-         _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir) do
-      :ok
-    else
-      {:error, reason} ->
-        _ = Ferricstore.FS.rm(tmp)
-        {:error, "ERR ACL save failed: #{inspect(reason)}"}
-    end
-  catch
-    {:error, _} = err -> err
-  end
-
-  # Performs the actual load from disk. Called inside GenServer to serialize
-  # concurrent LOAD requests and prevent race conditions with in-flight
-  # commands. All-or-nothing: current state is preserved on any error.
-  @spec do_load(binary()) :: :ok | {:error, binary()}
-  defp do_load(data_dir) do
-    with {:ok, contents} <- read_acl_file_contents(data_dir) do
-      do_load_contents(contents)
-    end
-  catch
-    {:error, _} = err -> err
-  end
-
-  @spec read_acl_file_contents(binary()) :: {:ok, binary()} | {:error, binary()}
-  defp read_acl_file_contents(data_dir) do
-    path = acl_file_path(data_dir)
-
-    case validate_acl_path(path, data_dir) do
-      :ok -> :ok
-      {:error, _} = err -> throw(err)
-    end
-
-    case File.read(path) do
-      {:ok, contents} ->
-        if byte_size(contents) > @max_file_size do
-          {:error, "ERR ACL file too large (#{byte_size(contents)} bytes, max #{@max_file_size})"}
-        else
-          {:ok, contents}
-        end
-
-      {:error, :enoent} ->
-        {:error, "ERR There is no ACL file to load"}
-
-      {:error, :eacces} ->
-        {:error, "ERR Permission denied reading ACL file"}
-
-      {:error, reason} ->
-        {:error, "ERR Cannot read ACL file: #{inspect(reason)}"}
-    end
-  catch
-    {:error, _} = err -> err
-  end
-
-  @spec validate_acl_contents(binary()) :: :ok | {:error, binary()}
-  defp validate_acl_contents(contents) do
-    case parse_acl_file(contents) do
-      {:ok, users} ->
-        if Enum.any?(users, fn {name, _} -> name == "default" end) do
-          :ok
-        else
-          {:error, "ERR ACL file must contain a 'default' user definition"}
-        end
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp maybe_run_load_swap_hook do
-    case :persistent_term.get(:ferricstore_acl_before_load_swap_hook, nil) do
-      nil -> :ok
-      fun when is_function(fun, 0) -> fun.()
-    end
-  end
-
-  @spec active_table() :: :ets.tid() | atom()
-  defp active_table do
-    table = :persistent_term.get(@active_table_key, @table)
-
-    case :ets.info(table) do
-      :undefined -> @table
-      _info -> table
-    end
-  rescue
-    ArgumentError -> @table
-  end
-
-  @spec replace_acl_snapshot([{binary(), user()}]) :: :ok
-  defp replace_acl_snapshot(users) do
-    cleanup_named_table(@swap_new_table)
-    new_table = :ets.new(@swap_new_table, [:set, :public, :named_table, read_concurrency: true])
-    :ets.insert(new_table, users)
-
-    # Test hook only. Readers must still see the previous snapshot here.
-    maybe_run_load_swap_hook()
-    swap_active_table(new_table)
-  end
-
-  @spec swap_active_table(:ets.tid()) :: :ok
-  defp swap_active_table(new_table) do
-    case :ets.whereis(@table) do
-      :undefined ->
-        :ets.rename(new_table, @table)
-
-      _tid ->
-        retired_table = next_retired_table_name()
-        :ets.rename(@table, retired_table)
-        :ets.rename(new_table, @table)
-        schedule_retired_table_cleanup(retired_table)
-    end
-
-    new_active = :ets.whereis(@table)
-    :persistent_term.put(@active_table_key, new_active)
-    :ok
-  end
-
-  defp next_retired_table_name do
-    case Enum.find(@retired_swap_tables, &(:ets.whereis(&1) == :undefined)) do
-      nil ->
-        # ACL LOAD is rare; if more swaps than retire slots happen inside the
-        # grace window, recycle the oldest slot rather than allocating atoms.
-        table_name = hd(@retired_swap_tables)
-        cleanup_named_table(table_name)
-        table_name
-
-      table_name ->
-        table_name
-    end
-  end
-
-  defp schedule_retired_table_cleanup(table_name) do
-    Process.send_after(self(), {:cleanup_acl_retired_table, table_name}, @retired_table_grace_ms)
-    :ok
-  end
-
-  defp cleanup_retired_tables do
-    Enum.each(@retired_swap_tables, &cleanup_named_table/1)
-  end
-
-  defp cleanup_named_table(name) do
-    case :ets.whereis(name) do
-      :undefined -> :ok
-      _tid -> :ets.delete(name)
-    end
-  end
-
-  @spec do_load_contents(binary()) :: :ok | {:error, binary()}
-  defp do_load_contents(contents) do
-    if byte_size(contents) > @max_file_size do
-      {:error, "ERR ACL file too large (#{byte_size(contents)} bytes, max #{@max_file_size})"}
-    else
-      case parse_acl_file(contents) do
-        {:ok, users} ->
-          unless Enum.any?(users, fn {name, _} -> name == "default" end) do
-            throw({:error, "ERR ACL file must contain a 'default' user definition"})
-          end
-
-          replace_acl_snapshot(users)
-
-        {:error, _} = err ->
-          err
-      end
-    end
-  catch
-    {:error, _} = err -> err
-  end
-
-  # Auto-load from file on startup. Returns :ok, {:error, :enoent}, or
-  # {:error, reason}. Called directly from init (not through GenServer call).
-  @spec auto_load_from_file(binary()) :: :ok | {:error, :enoent} | {:error, binary()}
-  defp auto_load_from_file(data_dir) do
-    path = acl_file_path(data_dir)
-
-    case File.read(path) do
-      {:ok, contents} ->
-        if byte_size(contents) > @max_file_size do
-          {:error, "ACL file too large"}
-        else
-          case parse_acl_file(contents) do
-            {:ok, users} ->
-              if Enum.any?(users, fn {name, _} -> name == "default" end) do
-                replace_acl_snapshot(users)
-              else
-                {:error, "ACL file missing 'default' user"}
-              end
-
-            {:error, reason} ->
-              {:error, reason}
-          end
-        end
-
-      {:error, :enoent} ->
-        {:error, :enoent}
-
-      {:error, reason} ->
-        {:error, "Cannot read ACL file: #{inspect(reason)}"}
-    end
-  end
-
-  # Schedules a debounced auto-save if :acl_auto_save is enabled.
   @spec maybe_schedule_auto_save(map()) :: map()
   defp maybe_schedule_auto_save(state) do
     if Application.get_env(:ferricstore, :acl_auto_save, false) do
@@ -1694,7 +906,7 @@ defmodule FerricstoreServer.Acl do
 
   @spec validate_del_users([binary()]) :: :ok | {:error, binary()}
   defp validate_del_users(usernames) do
-    table = active_table()
+    table = Tables.active_table()
 
     Enum.reduce_while(usernames, :ok, fn
       "default", :ok ->
@@ -1707,374 +919,4 @@ defmodule FerricstoreServer.Acl do
         end
     end)
   end
-
-  # Validates that the ACL file path stays within the data directory.
-  # Prevents path traversal (CVE-2023-45145 pattern).
-  @spec validate_acl_path(binary(), binary()) :: :ok | {:error, binary()}
-  defp validate_acl_path(path, data_dir) do
-    abs_path = Path.expand(path)
-    abs_dir = Path.expand(data_dir)
-
-    cond do
-      not (String.starts_with?(abs_path, abs_dir <> "/") or abs_path == abs_dir) ->
-        {:error, "ERR ACL file path escapes data directory"}
-
-      symlink?(path) ->
-        {:error, "ERR ACL file path is a symlink, refusing for security"}
-
-      true ->
-        :ok
-    end
-  end
-
-  # Checks if a path is a symlink. Returns false if the path does not exist.
-  @spec symlink?(binary()) :: boolean()
-  defp symlink?(path) do
-    case File.lstat(path) do
-      {:ok, %{type: :symlink}} -> true
-      _ -> false
-    end
-  end
-
-  # Fsyncs a file to ensure data is flushed to disk before rename.
-  @spec fsync_file(binary()) :: :ok | {:error, term()}
-  defp fsync_file(path) do
-    case :file.open(String.to_charlist(path), [:read, :write]) do
-      {:ok, fd} ->
-        result = :file.sync(fd)
-        :file.close(fd)
-        result
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private -- ACL file serialization (SAVE)
-  # ---------------------------------------------------------------------------
-
-  # Formats a single user for file output. Password hashes use # prefix.
-  # Denied commands are serialized as -command after +@all.
-  @spec format_user_for_file({binary(), user()}) :: binary()
-  defp format_user_for_file({name, user}) do
-    parts = ["user", name]
-    parts = parts ++ [if(user.enabled, do: "on", else: "off")]
-
-    # Password: nopass or #<hash> (never plaintext)
-    parts =
-      case user.password do
-        nil -> parts ++ ["nopass"]
-        hash -> parts ++ ["#" <> hash]
-      end
-
-    # Key patterns with access mode prefixes
-    parts =
-      case user.keys do
-        :all ->
-          parts ++ ["~*"]
-
-        patterns ->
-          parts ++
-            Enum.map(patterns, fn
-              {glob, :rw, _regex} -> "~#{glob}"
-              {glob, :read, _regex} -> "%R~#{glob}"
-              {glob, :write, _regex} -> "%W~#{glob}"
-            end)
-      end
-
-    parts = parts ++ format_channel_rule_tokens(user_channels(user))
-
-    # Commands and denied commands
-    parts =
-      case user.commands do
-        :all ->
-          denied = user.denied_commands
-
-          if MapSet.size(denied) == 0 do
-            parts ++ ["+@all"]
-          else
-            parts ++
-              ["+@all"] ++
-              (denied
-               |> MapSet.to_list()
-               |> Enum.sort()
-               |> Enum.map(&"-#{format_acl_command_rule_name(&1)}"))
-          end
-
-        cmds ->
-          if MapSet.size(cmds) == 0 do
-            parts
-          else
-            parts ++
-              (cmds
-               |> MapSet.to_list()
-               |> Enum.sort()
-               |> Enum.map(&"+#{format_acl_command_rule_name(&1)}"))
-          end
-      end
-
-    Enum.join(parts, " ")
-  end
-
-  defp format_channel_rule_tokens(:all), do: ["&*"]
-  defp format_channel_rule_tokens([]), do: ["resetchannels"]
-
-  defp format_channel_rule_tokens(patterns) when is_list(patterns) do
-    Enum.map(patterns, fn {glob, _regex} -> "&#{glob}" end)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private -- ACL file parsing (LOAD)
-  # ---------------------------------------------------------------------------
-
-  # Parses an ACL file's contents into a list of {username, user_map} tuples.
-  # All-or-nothing: returns {:ok, users} or {:error, reason} with line number.
-  # Duplicate usernames: last definition wins (matches Redis behavior).
-  @spec parse_acl_file(binary()) :: {:ok, [{binary(), user()}]} | {:error, binary()}
-  defp parse_acl_file(contents) do
-    contents = strip_bom(contents)
-
-    lines =
-      contents
-      |> String.split(~r/\r?\n/)
-      |> Enum.with_index(1)
-
-    result =
-      Enum.reduce_while(lines, {:ok, %{}}, fn {line, line_num}, {:ok, acc} ->
-        line = String.trim_trailing(line)
-
-        cond do
-          line == "" ->
-            {:cont, {:ok, acc}}
-
-          String.starts_with?(line, "#") ->
-            {:cont, {:ok, acc}}
-
-          byte_size(line) > @max_line_length ->
-            {:halt, {:error, "ERR Invalid ACL line #{line_num}: line exceeds maximum length"}}
-
-          true ->
-            case parse_acl_line(line, line_num) do
-              {:ok, {username, user_map}} ->
-                {:cont, {:ok, Map.put(acc, username, user_map)}}
-
-              {:error, _} = err ->
-                {:halt, err}
-            end
-        end
-      end)
-
-    case result do
-      {:ok, users_map} -> {:ok, Enum.to_list(users_map)}
-      {:error, _} = err -> err
-    end
-  end
-
-  # Parses a single "user <name> <rules...>" line.
-  @spec parse_acl_line(binary(), pos_integer()) ::
-          {:ok, {binary(), user()}} | {:error, binary()}
-  defp parse_acl_line(line, line_num) do
-    tokens = String.split(line, ~r/\s+/, trim: true)
-
-    case tokens do
-      ["user", username | rule_tokens] ->
-        # Security: reject plaintext passwords in file (>password)
-        if Enum.any?(rule_tokens, &String.starts_with?(&1, ">")) do
-          {:error,
-           "ERR Invalid ACL line #{line_num}: plaintext passwords (>) are not allowed in ACL files, use #<hash>"}
-        else
-          parse_file_rules(username, rule_tokens, line_num)
-        end
-
-      _ ->
-        {:error, "ERR Invalid ACL line #{line_num}: expected 'user <username> <rules...>'"}
-    end
-  end
-
-  # Parses file-format rules into a user map.
-  @spec parse_file_rules(binary(), [binary()], pos_integer()) ::
-          {:ok, {binary(), user()}} | {:error, binary()}
-  defp parse_file_rules(username, tokens, line_num) do
-    base = %{
-      enabled: false,
-      password: nil,
-      commands: MapSet.new(),
-      denied_commands: MapSet.new(),
-      keys: [],
-      channels: []
-    }
-
-    result = parse_file_rules(tokens, line_num, base, [])
-
-    case result do
-      {:ok, user_map} -> {:ok, {username, user_map}}
-      {:error, _} = err -> err
-    end
-  end
-
-  defp parse_file_rules([], _line_num, user, pending_key_patterns) do
-    {:ok, flush_pending_key_patterns(user, pending_key_patterns)}
-  end
-
-  defp parse_file_rules([token | rest], line_num, user, pending_key_patterns) do
-    case parse_file_key_token(user, token, pending_key_patterns) do
-      {:ok, updated, next_pending} ->
-        parse_file_rules(rest, line_num, updated, next_pending)
-
-      :not_key_token ->
-        case parse_file_token(user, token) do
-          {:ok, updated} ->
-            parse_file_rules(rest, line_num, updated, pending_key_patterns)
-
-          {:error, reason} ->
-            {:error, "ERR Invalid ACL line #{line_num}: #{reason}"}
-        end
-    end
-  end
-
-  # Token parsers for ACL file format. Similar to parse_rule/2 but uses
-  # #<hash> for passwords instead of ><plaintext>.
-  @spec parse_file_token(user(), binary()) :: {:ok, user()} | {:error, binary()}
-  defp parse_file_token(user, "on"), do: {:ok, %{user | enabled: true}}
-  defp parse_file_token(user, "off"), do: {:ok, %{user | enabled: false}}
-  defp parse_file_token(user, "nopass"), do: {:ok, %{user | password: nil}}
-  defp parse_file_token(user, "resetpass"), do: {:ok, %{user | password: nil}}
-
-  # Pre-hashed password from file (#<base64_hash>)
-  defp parse_file_token(user, "#" <> hash) do
-    case Base.decode64(hash) do
-      {:ok, decoded} when byte_size(decoded) == 48 ->
-        {:ok, %{user | password: hash}}
-
-      {:ok, _} ->
-        {:error, "invalid password hash length"}
-
-      :error ->
-        {:error, "invalid password hash encoding"}
-    end
-  end
-
-  defp parse_file_token(user, "allchannels"), do: {:ok, Map.put(user, :channels, :all)}
-  defp parse_file_token(user, "resetchannels"), do: {:ok, Map.put(user, :channels, [])}
-  defp parse_file_token(user, "&" <> pattern), do: {:ok, add_channel_pattern(user, pattern)}
-
-  defp parse_file_token(user, "allcommands") do
-    {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
-  end
-
-  defp parse_file_token(user, "nocommands") do
-    {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
-  end
-
-  defp parse_file_token(user, "+@all") do
-    {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
-  end
-
-  defp parse_file_token(user, "-@all") do
-    {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
-  end
-
-  defp parse_file_token(user, "+@" <> category) do
-    cat = String.upcase(category)
-
-    case CommandCategories.category_commands(cat) do
-      {:ok, cat_cmds} ->
-        case user.commands do
-          :all ->
-            new_denied = MapSet.difference(user.denied_commands, cat_cmds)
-            {:ok, %{user | denied_commands: new_denied}}
-
-          cmds ->
-            {:ok, %{user | commands: MapSet.union(cmds, cat_cmds)}}
-        end
-
-      :error ->
-        {:error, "unknown command category '@#{category}'"}
-    end
-  end
-
-  defp parse_file_token(user, "-@" <> category) do
-    cat = String.upcase(category)
-
-    case CommandCategories.category_commands(cat) do
-      {:ok, cat_cmds} ->
-        case user.commands do
-          :all ->
-            new_denied = MapSet.union(user.denied_commands, cat_cmds)
-            {:ok, %{user | denied_commands: new_denied}}
-
-          cmds ->
-            {:ok, %{user | commands: MapSet.difference(cmds, cat_cmds)}}
-        end
-
-      :error ->
-        {:error, "unknown command category '@#{category}'"}
-    end
-  end
-
-  defp parse_file_token(user, "+" <> command) do
-    cmd = normalize_acl_command_name(command)
-
-    case user.commands do
-      :all ->
-        new_denied = MapSet.delete(user.denied_commands, cmd)
-        {:ok, %{user | denied_commands: new_denied}}
-
-      cmds ->
-        {:ok, %{user | commands: MapSet.put(cmds, cmd)}}
-    end
-  end
-
-  defp parse_file_token(user, "-" <> command) do
-    cmd = normalize_acl_command_name(command)
-
-    case user.commands do
-      :all ->
-        new_denied = MapSet.put(user.denied_commands, cmd)
-        {:ok, %{user | denied_commands: new_denied}}
-
-      cmds ->
-        {:ok, %{user | commands: MapSet.delete(cmds, cmd)}}
-    end
-  end
-
-  defp parse_file_token(_user, token) do
-    {:error, "unknown token '#{token}'"}
-  end
-
-  defp parse_file_key_token(user, "~*", _pending_key_patterns),
-    do: {:ok, %{user | keys: :all}, []}
-
-  defp parse_file_key_token(user, "allkeys", _pending_key_patterns),
-    do: {:ok, %{user | keys: :all}, []}
-
-  defp parse_file_key_token(user, "resetkeys", _pending_key_patterns),
-    do: {:ok, %{user | keys: []}, []}
-
-  defp parse_file_key_token(user, "%R~" <> pattern, pending_key_patterns) do
-    queue_file_key_pattern(user, {pattern, :read, compile_glob(pattern)}, pending_key_patterns)
-  end
-
-  defp parse_file_key_token(user, "%W~" <> pattern, pending_key_patterns) do
-    queue_file_key_pattern(user, {pattern, :write, compile_glob(pattern)}, pending_key_patterns)
-  end
-
-  defp parse_file_key_token(user, "~" <> pattern, pending_key_patterns) do
-    queue_file_key_pattern(user, {pattern, :rw, compile_glob(pattern)}, pending_key_patterns)
-  end
-
-  defp parse_file_key_token(_user, _token, _pending_key_patterns), do: :not_key_token
-
-  defp queue_file_key_pattern(user, compiled_pattern, pending_key_patterns) do
-    case user.keys do
-      :all -> {:ok, user, pending_key_patterns}
-      _patterns -> {:ok, user, [compiled_pattern | pending_key_patterns]}
-    end
-  end
-
-  # Strips UTF-8 BOM from the beginning of a string.
-  @spec strip_bom(binary()) :: binary()
-  defp strip_bom(<<0xEF, 0xBB, 0xBF, rest::binary>>), do: rest
-  defp strip_bom(contents), do: contents
 end

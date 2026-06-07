@@ -14,14 +14,14 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow create has a no-values fast path for named value refs" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_attrs_named_value_refs_empty?(attrs)"
     assert source =~ "defp flow_empty_named_ref_input?(nil), do: true"
   end
 
   test "flow named value refs do not scan whole flow records on the no-value hot path" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_named_value_refs_empty_fast_path"
 
@@ -30,7 +30,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow no-value transition fast path avoids value_ref map lookup for normal records" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert [_, fast_path_source] =
              String.split(source, "  defp flow_named_value_refs_empty_fast_path", parts: 2)
@@ -43,55 +43,56 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "router flow many batches use fixed shard buckets" do
-    source = File.read!("lib/ferricstore/store/router.ex")
+    source = Ferricstore.Test.SourceFiles.router_source()
 
     assert source =~ "flow_fixed_shard_buckets(ctx.shard_count)"
     assert source =~ "put_elem(buckets, shard_idx"
   end
 
   test "router flow pipeline results use ordered tuples instead of index maps" do
-    source = File.read!("lib/ferricstore/store/router.ex")
+    source = Ferricstore.Test.SourceFiles.router_source()
 
     assert source =~ "flow_result_tuple(count)"
     assert source =~ "put_elem(results, index, result)"
   end
 
   test "flow create fast apply inserts due lifecycle indexes once" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     refute source =~ "flow_create_put_fast_due(state, plans)",
            "fast create already includes due/due-any rows in flow_create_put_fast_indexes/2; a separate due pass duplicates lifecycle index work"
   end
 
   test "flow claim partition-key aggregation is not quadratic" do
-    source = File.read!("lib/ferricstore/store/router.ex")
+    source = Ferricstore.Test.SourceFiles.router_source()
 
     refute source =~ "acc ++ records",
            "multi-shard claim_due must append records with reverse accumulation, not repeated list concatenation"
   end
 
   test "flow pipeline write result assembly is tuple based" do
-    source = File.read!("lib/ferricstore/flow.ex")
+    source = Ferricstore.Test.SourceFiles.flow_source()
 
-    assert source =~ "pipeline_write_ordered_results(ctx, [])"
+    assert source =~ "def ordered_results([], _ctx, _callbacks, results_rev)"
+    assert source =~ "Enum.reverse(results_rev)"
 
     refute source =~ "pipeline_write_indexed_results(ctx, %{})",
            "pipeline writes are ordered; result assembly should not hash every command index through a map"
   end
 
   test "flow pipeline transitions avoid oversized transition batch apply" do
-    source = File.read!("lib/ferricstore/flow.ex")
-    router_source = File.read!("lib/ferricstore/store/router.ex")
-    state_machine_source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.flow_source()
+    router_source = Ferricstore.Test.SourceFiles.router_source()
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
-        ~r/defp pipeline_write_state_run_results\(ctx, keyed_commands\).*?^  end/ms,
+        ~r/defp state_run_results\(ctx, keyed_commands, callbacks\).*?^  end/ms,
         source
       )
 
-    assert function_source =~ "pipeline_write_transition_run_results(ctx, keyed_commands)"
-    assert source =~ "pipeline_transition_attrs(keyed_commands"
+    assert function_source =~ "transition_run_results(ctx, keyed_commands, callbacks)"
+    assert source =~ "defp transition_run_results(ctx, keyed_commands, callbacks)"
     assert source =~ "Router.flow_transition_batch(attrs_list)"
 
     [router_function_source] =
@@ -107,19 +108,19 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow claim_due adjacent pipeline prepends run results without list concatenation" do
-    source = File.read!("lib/ferricstore/flow.ex")
+    source = Ferricstore.Test.SourceFiles.flow_source()
 
     [function_source] =
-      Regex.run(~r/defp pipeline_claim_due_adjacent_results\(\[{:ok, claim}.*?^  end/ms, source)
+      Regex.run(~r/defp adjacent_results\(\[{:ok, claim}.*?^  end/ms, source)
 
-    assert function_source =~ "prepend_claim_due_results"
+    assert function_source =~ "prepend_results(results, acc)"
 
     refute function_source =~ "++ acc",
            "claim_due pipeline result assembly should not copy each coalesced run with list concatenation"
   end
 
   test "flow claim_due state normalization avoids generic Enum.uniq hot path" do
-    source = File.read!("lib/ferricstore/flow.ex")
+    source = Ferricstore.Test.SourceFiles.flow_source()
 
     [function_source] =
       Regex.run(
@@ -171,9 +172,8 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow query aggregators accumulate chunks without repeated list concatenation" do
-    source = File.read!("lib/ferricstore/flow.ex")
+    source = Ferricstore.Test.SourceFiles.flow_source()
 
-    assert source =~ "flatten_flow_chunks"
     refute source =~ "records ++ acc"
     refute source =~ "ids ++ acc"
     refute source =~ "flow_decode_terminal_index_entries(entries, path, now_ms) ++ acc"
@@ -181,7 +181,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow history projection avoids grouping when pending entries stay on the apply shard" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_history_projection_same_shard?"
 
@@ -190,7 +190,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow LMDB mirror enqueue stays async on the state-machine hot path" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(~r/defp enqueue_lmdb_mirror_group\(state, shard_index.*?^  end/ms, source)
@@ -202,7 +202,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow claim_due native planner owns history-ready planning without LMDB sync" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "NativeFlowIndex.plan_claims_with_history(",
            "claim_due should use the native planner for state/index/history-ready mutation plans"
@@ -218,7 +218,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow history hot path skips after-history pass when records need no trim or terminal mirror" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_after_history_put_records_batch(state, records)"
     assert source =~ "defp flow_after_history_fast_record?"
@@ -226,7 +226,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow transition due-index moves cache repeated batch keys" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
@@ -242,7 +242,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow claim_due native multi-key path does not sort due keys before the NIF scan" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
@@ -255,7 +255,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow apply key-size validation does not call Router on the hot path" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "@flow_max_key_size 65_535"
 
@@ -269,7 +269,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow small values skip blob externalization dispatch on apply hot path" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(~r/defp maybe_externalize_apply_value\(state, value\).*?^  end/ms, source)
@@ -284,8 +284,8 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow many router stamps per-shard batches so apply does not rehash each item" do
-    router_source = File.read!("lib/ferricstore/store/router.ex")
-    state_machine_source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    router_source = Ferricstore.Test.SourceFiles.router_source()
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert router_source =~ "@flow_shard_marker :__flow_shard_index__"
     assert router_source =~ "flow_stamp_shard(command_attrs, shard_idx)"
@@ -315,7 +315,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow many apply uses the command-level shard stamp before per-record rehash fallback" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~
              "flow_many_partitions_valid?(state, attrs_list, Map.get(attrs, @flow_shard_marker))"
@@ -340,7 +340,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow claim_due validates due-index key size without building every due key" do
-    source = File.read!("lib/ferricstore/flow.ex")
+    source = Ferricstore.Test.SourceFiles.flow_source()
 
     [function_source] =
       Regex.run(
@@ -355,7 +355,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow claim_due fast index path avoids generic per-plan tuple dispatch" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
@@ -370,7 +370,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow terminal transition skips empty due and metadata index passes" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_transition_plans_due_index_empty?(plans)"
     assert source =~ "flow_transition_move_due_indexes_nonempty(state, plans)"
@@ -379,7 +379,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow terminal transition caches repeated lifecycle index keys" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [state_index_source] =
       Regex.run(~r/defp flow_transition_move_state_indexes\(state, plans\).*?^  end/ms, source)
@@ -397,7 +397,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow non-idempotent create fast path does not synchronously query LMDB for existence" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
@@ -424,7 +424,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow registry markers use segment-keydir storage instead of apply projection" do
-    storage_source = File.read!("lib/ferricstore/raft/waraft_storage.ex")
+    storage_source = Ferricstore.Test.SourceFiles.waraft_storage_source()
 
     [storage_function_source] =
       Regex.run(
@@ -436,7 +436,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert storage_function_source =~ "FlowKeys.history_key?(key)"
     assert storage_function_source =~ "FlowKeys.registry_key?(key)"
 
-    state_machine_source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [registry_marker_source] =
       Regex.run(
@@ -449,14 +449,14 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow retry many history builds entries and next records in one traversal" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_retry_projection_entries_and_records(state, plans, [], [])"
     assert source =~ "defp flow_retry_projection_entries_and_records("
   end
 
   test "flow multi-row history queues async projection once per apply batch" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_many_projection_entries_and_records("
     assert source =~ "flow_create_projection_entries_and_records("
@@ -479,7 +479,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow fast create history builds entries and records in one traversal" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_create_fast_projection_entries_and_records(state, plans, [], [])"
     assert source =~ "defp flow_create_fast_projection_entries_and_records("
@@ -487,7 +487,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow secondary indexes are native-only on the replicated apply hot path" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     refute source =~ ~r/(?<!Native)FlowIndex\.put_/
     refute source =~ ~r/(?<!Native)FlowIndex\.move_/
@@ -503,14 +503,17 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow secondary indexes are not backed by ETS tables at boot or rebuild" do
     sources =
       [
-        "lib/ferricstore/store/shard.ex",
-        "lib/ferricstore/raft/waraft_storage.ex",
-        "lib/ferricstore/flow/lmdb_rebuilder.ex",
-        "lib/ferricstore/flow/lmdb_writer.ex",
-        "lib/ferricstore/flow/history_projector.ex",
-        "lib/ferricstore/store/router.ex"
+        {"lib/ferricstore/store/shard*", Ferricstore.Test.SourceFiles.shard_source()},
+        {"lib/ferricstore/raft/waraft_storage.ex",
+         Ferricstore.Test.SourceFiles.waraft_storage_source()},
+        {"lib/ferricstore/flow/lmdb_rebuilder.ex",
+         File.read!("lib/ferricstore/flow/lmdb_rebuilder.ex")},
+        {"lib/ferricstore/flow/lmdb_writer.ex",
+         File.read!("lib/ferricstore/flow/lmdb_writer.ex")},
+        {"lib/ferricstore/flow/history_projector.ex",
+         File.read!("lib/ferricstore/flow/history_projector.ex")},
+        {"lib/ferricstore/store/router*", Ferricstore.Test.SourceFiles.router_source()}
       ]
-      |> Enum.map(&{&1, File.read!(&1)})
 
     Enum.each(sources, fn {path, source} ->
       refute source =~ ~r/(?<!Native)FlowIndex\./,
@@ -558,7 +561,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow native claim key construction validates generated keys in one fast path" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
@@ -573,7 +576,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow native claim hydration reuses precomputed state-key prefix" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
@@ -589,10 +592,10 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow history projector computes initial LFU once per published batch" do
-    source = File.read!("lib/ferricstore/flow/history_projector.ex")
+    source = File.read!("lib/ferricstore/flow/history_projector/storage.ex")
 
     [function_source] =
-      Regex.run(~r/defp publish_keydir_entries\(instance_ctx.*?^  end/ms, source)
+      Regex.run(~r/def publish_keydir_entries\(instance_ctx.*?^  end/ms, source)
 
     assert function_source =~ "initial_lfu = LFU.initial()"
 
@@ -601,7 +604,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow blob-ref writes compute initial LFU once per value" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(
@@ -616,7 +619,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow state-record blob staging reuses LFU for the ETS row and cold write" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [function_source] =
       Regex.run(~r/defp flow_stage_state_record_batch_entry\(.*?^  end/ms, source)
@@ -627,7 +630,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow fast create state records use known-new pending originals without ETS lookups" do
-    source = File.read!("lib/ferricstore/raft/state_machine.ex")
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "flow_put_new_state_records_batch(state, key_records)"
     assert source =~ "track_keydir_binary_delta_from_missing("

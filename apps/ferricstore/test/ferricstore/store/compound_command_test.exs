@@ -7,8 +7,6 @@ defmodule Ferricstore.Store.CompoundCommandTest do
                       "../../../lib/ferricstore/cross_shard_op.ex",
                       __DIR__
                     )
-  @router_path Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
-
   test "builds the single default Raft compound write contract" do
     redis_key = "hash"
     compound_key = "H:" <> redis_key <> <<0>> <> "field"
@@ -52,7 +50,7 @@ defmodule Ferricstore.Store.CompoundCommandTest do
   end
 
   test "Router default compound writes use the central command builder" do
-    source = File.read!(@router_path)
+    source = Ferricstore.Test.SourceFiles.router_source()
 
     assert source =~ "CompoundCommand.put(compound_key, value, expire_at_ms)"
     assert source =~ "CompoundCommand.batch_put(redis_key, entries)"

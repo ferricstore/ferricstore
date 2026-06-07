@@ -1171,7 +1171,8 @@ Repair notes:
 - `START REPAIR PROJECTIONS SCOPE FLOW_LMDB` repairs the cold/query projection
   only. It does not mutate hot Flow indexes or rewrite user state.
 - Flow command durability does not depend on LMDB projection being current; the
-  durable source of truth remains the WARaft/Bitcask Flow records.
+  durable source of truth remains FerricStore-managed WARaft segment/apply-projection
+  storage.
 - Use this repair when `FLOW_LMDB` reports degraded shards or projection lag that
   does not drain after the underlying disk/LMDB issue is fixed.
 

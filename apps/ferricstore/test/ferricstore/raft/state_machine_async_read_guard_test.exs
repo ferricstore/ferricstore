@@ -1,10 +1,8 @@
 defmodule Ferricstore.Raft.StateMachineAsyncReadGuardTest do
   use ExUnit.Case, async: true
 
-  @state_machine_path Path.expand("../../../lib/ferricstore/raft/state_machine.ex", __DIR__)
-
   test "Raft apply cold-read fallbacks use async pread" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     # Cross-shard command apply can read cold large values. Keep the disk I/O
     # behind the ColdRead async helper while still waiting synchronously for

@@ -9,7 +9,15 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
   alias FerricstoreServer.Connection.Pipeline
 
   @ns "pipeline_quorum_fast_path"
-  @pipeline_source Path.expand("../../../lib/ferricstore_server/connection/pipeline.ex", __DIR__)
+  @pipeline_sources [
+                      "../../../lib/ferricstore_server/connection/pipeline.ex",
+                      "../../../lib/ferricstore_server/connection/pipeline/fast_paths.ex",
+                      "../../../lib/ferricstore_server/connection/pipeline/flow.ex",
+                      "../../../lib/ferricstore_server/connection/pipeline/pure_batch.ex",
+                      "../../../lib/ferricstore_server/connection/pipeline/streaming.ex",
+                      "../../../lib/ferricstore_server/connection/pipeline/fallback.ex"
+                    ]
+                    |> Enum.map(&Path.expand(&1, __DIR__))
 
   setup do
     ClientTracking.init_tables()
@@ -547,8 +555,7 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
 
   test "mixed GET and SET fast path assembles replies without index maps" do
     body =
-      @pipeline_source
-      |> File.read!()
+      pipeline_source()
       |> String.split("  defp do_mixed_fast_path", parts: 2)
       |> List.last()
       |> String.split("  defp mixed_set_results", parts: 2)
@@ -671,4 +678,9 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     Router.shard_for(ctx, key)
   end
 
+  defp pipeline_source do
+    @pipeline_sources
+    |> Enum.map_join("\n", &File.read!/1)
+    |> String.replace("\n    ", "\n  ")
+  end
 end

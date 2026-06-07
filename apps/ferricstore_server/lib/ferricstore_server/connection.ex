@@ -65,8 +65,10 @@ defmodule FerricstoreServer.Connection do
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
+  alias FerricstoreServer.Connection.Commands, as: ConnCommands
+  alias FerricstoreServer.Connection.Dashboard, as: ConnDashboard
   alias FerricstoreServer.Connection.Pipeline, as: ConnPipeline
-  alias FerricstoreServer.Connection.PubSub, as: ConnPubSub
+  alias FerricstoreServer.Connection.PubSubSession, as: ConnPubSubSession
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Connection.Send, as: ConnSend
   alias FerricstoreServer.Connection.Sendfile, as: ConnSendfile
@@ -242,7 +244,7 @@ defmodule FerricstoreServer.Connection do
               client_ip: format_peer(peer)
             })
 
-            ConnRegistry.register(state.client_id, self(), connection_dashboard_summary(state))
+            ConnRegistry.register(state.client_id, self(), ConnDashboard.summary(state))
             loop(state)
           end
       end
@@ -260,7 +262,7 @@ defmodule FerricstoreServer.Connection do
   #
   # Pubsub mode uses a separate loop (pubsub_loop) to avoid checking
   # a mode flag on every iteration of the hot path.
-  defp loop(%__MODULE__{socket: socket, transport: transport, active_mode: active_mode} = state) do
+  def loop(%__MODULE__{socket: socket, transport: transport, active_mode: active_mode} = state) do
     # Re-arm socket for :once mode. For true/N modes, kernel delivers
     # continuously — no re-arm needed (N mode re-arms on {:tcp_passive}).
     if active_mode == :once do
@@ -317,7 +319,7 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  defp handle_data(%__MODULE__{socket: socket, transport: transport} = state, data) do
+  def handle_data(%__MODULE__{socket: socket, transport: transport} = state, data) do
     # Avoid binary concatenation when buffer is empty (common case for
     # non-pipelined workloads). Saves one binary allocation + copy per TCP frame.
     buffer = if state.buffer == "", do: data, else: state.buffer <> data
@@ -527,136 +529,6 @@ defmodule FerricstoreServer.Connection do
   # Dispatch helpers (called from dispatch table above)
   # ---------------------------------------------------------------------------
 
-  defp dispatch_client_parts(subcmd, rest, state) do
-    store =
-      if state.sandbox_namespace,
-        do: ConnStore.build_store(state.instance_ctx, state.sandbox_namespace),
-        else: state.instance_ctx
-
-    conn_state = %{
-      client_id: state.client_id,
-      client_name: state.client_name,
-      created_at: state.created_at,
-      peer: state.peer,
-      conn_pid: self(),
-      tracking: state.tracking
-    }
-
-    {result, updated_conn_state} =
-      try do
-        FerricstoreServer.Commands.Client.handle(subcmd, rest, conn_state, store)
-      catch
-        :exit, {:noproc, _} ->
-          {{:error, "ERR server not ready, shard process unavailable"}, conn_state}
-
-        :exit, {reason, _} ->
-          {internal_error(:exit, reason), conn_state}
-
-        kind, reason ->
-          {internal_error(kind, reason), conn_state}
-      end
-
-    updated_state = %{
-      state
-      | client_name: updated_conn_state[:client_name] || state.client_name,
-        tracking: updated_conn_state[:tracking] || state.tracking
-    }
-
-    {:continue, Encoder.encode(result), updated_state}
-  end
-
-  defp dispatch_reset(state) do
-    cleanup_pubsub(state)
-    ClientTracking.cleanup(self())
-
-    new_state = %{
-      state
-      | multi_state: :none,
-        multi_queue: [],
-        multi_queue_count: 0,
-        multi_error: false,
-        watched_keys: %{},
-        sandbox_namespace: nil,
-        tracking: ClientTracking.new_config(),
-        authenticated: false,
-        username: "default",
-        pubsub_channels: nil,
-        pubsub_patterns: nil,
-        require_auth: ConnAuth.user_requires_auth?("default"),
-        acl_cache: ConnAuth.build_acl_cache("default")
-    }
-
-    {:continue, Encoder.encode({:simple, "RESET"}), new_state}
-  end
-
-  defp dispatch_sandbox([subcmd | rest], state) do
-    sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
-    sandbox_enabled? = sandbox_mode in ["local", "enabled"]
-
-    case {subcmd, sandbox_enabled?} do
-      {"START", true} ->
-        sandbox_start(state)
-
-      {"JOIN", true} ->
-        sandbox_join(rest, state)
-
-      {"END", true} ->
-        sandbox_end(state)
-
-      {"TOKEN", true} ->
-        {:continue, Encoder.encode(state.sandbox_namespace), state}
-
-      {cmd, false} when cmd in ~w(START JOIN END TOKEN) ->
-        {:continue,
-         Encoder.encode({:error, "ERR SANDBOX commands are not enabled on this server"}), state}
-
-      _ ->
-        {:continue, Encoder.encode({:error, "ERR unknown SANDBOX subcommand"}), state}
-    end
-  end
-
-  defp dispatch_sandbox(_args, state) do
-    sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
-
-    if sandbox_mode in ["local", "enabled"] do
-      {:continue, Encoder.encode({:error, "ERR unknown SANDBOX subcommand"}), state}
-    else
-      {:continue, Encoder.encode({:error, "ERR SANDBOX commands are not enabled on this server"}),
-       state}
-    end
-  end
-
-  defp sandbox_start(state) do
-    ns = "test_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
-    {:continue, Encoder.encode(ns), %{state | sandbox_namespace: ns}}
-  end
-
-  defp sandbox_join([token | _], state) do
-    {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: token}}
-  end
-
-  defp sandbox_join([], state) do
-    {:continue, Encoder.encode({:error, "ERR SANDBOX JOIN requires a namespace token"}), state}
-  end
-
-  defp sandbox_end(%{sandbox_namespace: nil} = state) do
-    {:continue, Encoder.encode({:error, "ERR no active sandbox session"}), state}
-  end
-
-  defp sandbox_end(state) do
-    ns = state.sandbox_namespace
-
-    try do
-      ctx = state.instance_ctx
-      keys = Router.keys(ctx)
-      Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(ctx, k) end)
-    catch
-      :exit, _ -> :ok
-    end
-
-    {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: nil}}
-  end
-
   defp dispatch_normal(cmd, args, ast, state) do
     # Hot path: pass ctx directly (no closure allocation).
     # Ops and Router handle Instance structs natively.
@@ -798,7 +670,7 @@ defmodule FerricstoreServer.Connection do
   defp namespace_keys(namespace, keys) when is_binary(namespace),
     do: Enum.map(keys, &(namespace <> &1))
 
-  defp internal_error(kind, reason) do
+  def internal_error(kind, reason) do
     Logger.error(fn ->
       "FerricStore connection internal error: #{inspect({kind, reason}, limit: 20)}"
     end)
@@ -887,146 +759,10 @@ defmodule FerricstoreServer.Connection do
 
   defp pubsub_allowed_connection_ast?(_ast), do: false
 
-  defp dispatch_connection_command("HELLO", args, ast, state),
-    do: dispatch_hello(args, ast, state)
+  defp dispatch_connection_command(cmd, args, ast, state),
+    do: ConnCommands.dispatch_connection_command(cmd, args, ast, state)
 
-  defp dispatch_connection_command("CLIENT", ["HELLO" | args], ast, state),
-    do: dispatch_hello(args, ast, state)
-
-  defp dispatch_connection_command(_cmd, _args, ast, state),
-    do: dispatch_connection_ast(ast, state)
-
-  defp dispatch_hello(_args, {:hello, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_hello(args, ast, state) when ast in [:hello, {:hello, 3}] do
-    case hello_auth_args(args) do
-      {:ok, nil} ->
-        {:continue, Encoder.encode(greeting_map(state)), state}
-
-      {:ok, {username, password}} ->
-        case ConnAuth.dispatch_auth([username, password], state) do
-          {:continue, _auth_reply, %{authenticated: true} = auth_state} ->
-            {:continue, Encoder.encode(greeting_map(auth_state)), auth_state}
-
-          other ->
-            other
-        end
-
-      {:error, reason} ->
-        {:continue, Encoder.encode({:error, reason}), state}
-    end
-  end
-
-  defp dispatch_hello(_args, ast, state), do: dispatch_connection_ast(ast, state)
-
-  defp hello_auth_args([]), do: {:ok, nil}
-  defp hello_auth_args(["3"]), do: {:ok, nil}
-
-  defp hello_auth_args(["3" | rest]), do: hello_auth_args_after_version(rest, nil)
-
-  defp hello_auth_args(_args),
-    do: {:error, "NOPROTO this server does not support the requested protocol version"}
-
-  defp hello_auth_args_after_version([], auth), do: {:ok, auth}
-
-  defp hello_auth_args_after_version([option, username, password | rest], _auth)
-       when is_binary(option) and is_binary(username) and is_binary(password) do
-    case String.upcase(option) do
-      "AUTH" -> hello_auth_args_after_version(rest, {username, password})
-      _other -> {:error, "ERR Syntax error in HELLO option '#{option}'"}
-    end
-  end
-
-  defp hello_auth_args_after_version([option | _rest], _auth) when is_binary(option),
-    do: {:error, "ERR Syntax error in HELLO option '#{option}'"}
-
-  defp dispatch_connection_ast(:hello, state),
-    do: {:continue, Encoder.encode(greeting_map(state)), state}
-
-  defp dispatch_connection_ast({:hello, 3}, state),
-    do: {:continue, Encoder.encode(greeting_map(state)), state}
-
-  defp dispatch_connection_ast({:hello, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:auth, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:auth, username, password}, state),
-    do: ConnAuth.dispatch_auth([username, password], state)
-
-  defp dispatch_connection_ast({:acl, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:acl, subcmd, rest}, state),
-    do: ConnAuth.dispatch_acl(subcmd, rest, state)
-
-  defp dispatch_connection_ast({:client, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:client, subcmd, rest}, state),
-    do: dispatch_client_parts(subcmd, rest, state)
-
-  defp dispatch_connection_ast(:quit, state), do: {:quit, Encoder.encode(:ok), state}
-
-  defp dispatch_connection_ast({:quit, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast(:reset, state), do: dispatch_reset(state)
-
-  defp dispatch_connection_ast({:reset, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:sandbox, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:sandbox, subcmd, rest}, state),
-    do: dispatch_sandbox([subcmd | rest], state)
-
-  defp dispatch_connection_ast({:subscribe, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:subscribe, channels}, state),
-    do: ConnPubSub.dispatch_subscribe(channels, state)
-
-  defp dispatch_connection_ast({:unsubscribe, channels}, state),
-    do: ConnPubSub.dispatch_unsubscribe(channels, state)
-
-  defp dispatch_connection_ast({:psubscribe, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:psubscribe, patterns}, state),
-    do: ConnPubSub.dispatch_psubscribe(patterns, state)
-
-  defp dispatch_connection_ast({:punsubscribe, patterns}, state),
-    do: ConnPubSub.dispatch_punsubscribe(patterns, state)
-
-  defp dispatch_connection_ast(:multi, state), do: ConnTransaction.dispatch_multi([], state)
-
-  defp dispatch_connection_ast({:multi, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast(:exec, state), do: ConnTransaction.dispatch_exec([], state)
-
-  defp dispatch_connection_ast({:exec, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast(:discard, state), do: ConnTransaction.dispatch_discard([], state)
-
-  defp dispatch_connection_ast({:discard, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:watch, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
-
-  defp dispatch_connection_ast({:watch, keys}, state),
-    do: ConnTransaction.dispatch_watch(keys, state)
-
-  defp dispatch_connection_ast(:unwatch, state), do: ConnTransaction.dispatch_unwatch([], state)
-
-  defp dispatch_connection_ast({:unwatch, {:error, _} = err}, state),
-    do: {:continue, Encoder.encode(err), state}
+  defp dispatch_connection_ast(ast, state), do: ConnCommands.dispatch_connection_ast(ast, state)
 
   defp blocking_ast?({tag, _}) when tag in ~w(blpop brpop blmove blmpop)a, do: true
   defp blocking_ast?({tag, _, _}) when tag in ~w(blpop brpop)a, do: true
@@ -1111,7 +847,7 @@ defmodule FerricstoreServer.Connection do
   # Greeting map
   # ---------------------------------------------------------------------------
 
-  defp greeting_map(state) do
+  def greeting_map(state) do
     %{
       "server" => "ferricstore",
       "version" => "0.1.0",
@@ -1135,7 +871,7 @@ defmodule FerricstoreServer.Connection do
     ConnSend.send(socket, transport, iodata, :response)
   end
 
-  defp send_tracked(%__MODULE__{socket: socket, transport: transport} = state, iodata, phase) do
+  def send_tracked(%__MODULE__{socket: socket, transport: transport} = state, iodata, phase) do
     metadata = %{client_id: state.client_id}
 
     case ConnSend.send(socket, transport, iodata, phase, metadata) do
@@ -1153,133 +889,12 @@ defmodule FerricstoreServer.Connection do
   # Pub/Sub mode loop
   # ---------------------------------------------------------------------------
 
-  defp pubsub_loop(
-         %__MODULE__{socket: socket, transport: transport, active_mode: active_mode} = state
-       ) do
-    # No setopts needed — active mode (true/N/:once) is maintained from
-    # the main loop. TCP data keeps arriving and is handled below.
-    if active_mode == :once do
-      transport.setopts(socket, active: :once)
-    end
+  defp pubsub_loop(state), do: ConnPubSubSession.pubsub_loop(state)
 
-    receive do
-      {:tcp, ^socket, data} ->
-        handle_data(state, data)
+  defp in_pubsub_mode?(state), do: ConnPubSubSession.in_pubsub_mode?(state)
 
-      {:ssl, ^socket, data} ->
-        handle_data(state, data)
-
-      {:tcp_passive, ^socket} ->
-        transport.setopts(socket, active: active_mode)
-        pubsub_loop(state)
-
-      {:ssl_passive, ^socket} ->
-        transport.setopts(socket, active: active_mode)
-        pubsub_loop(state)
-
-      {:tcp_closed, ^socket} ->
-        cleanup_connection(state)
-
-      {:tcp_error, ^socket, _reason} ->
-        cleanup_connection(state)
-        transport.close(socket)
-
-      {:ssl_closed, ^socket} ->
-        cleanup_connection(state)
-
-      {:ssl_error, ^socket, _reason} ->
-        cleanup_connection(state)
-        transport.close(socket)
-
-      {:pubsub_message, channel, message} ->
-        push = {:push, ["message", channel, message]}
-
-        case send_tracked(state, Encoder.encode(push), :pubsub_message) do
-          :ok -> pubsub_loop(state)
-          {:error, _reason} -> :ok
-        end
-
-      {:pubsub_pmessage, pattern, channel, message} ->
-        push = {:push, ["pmessage", pattern, channel, message]}
-
-        case send_tracked(state, Encoder.encode(push), :pubsub_pmessage) do
-          :ok -> pubsub_loop(state)
-          {:error, _reason} -> :ok
-        end
-
-      {:tracking_invalidation, iodata, _keys} ->
-        case send_tracked(state, iodata, :tracking_invalidation) do
-          :ok -> pubsub_loop(state)
-          {:error, _reason} -> :ok
-        end
-
-      :client_kill ->
-        cleanup_connection(state)
-        transport.close(socket)
-
-      {:acl_invalidate, username} ->
-        refreshed_state =
-          state
-          |> ConnAuth.maybe_refresh_acl_cache(username)
-          |> enforce_pubsub_acl_after_refresh()
-
-        refreshed_state = maybe_sync_connection_registry(state, refreshed_state)
-
-        if in_pubsub_mode?(refreshed_state) do
-          pubsub_loop(refreshed_state)
-        else
-          loop(refreshed_state)
-        end
-    end
-  end
-
-  defp in_pubsub_mode?(%{pubsub_channels: nil}), do: false
-
-  defp in_pubsub_mode?(state),
-    do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
-
-  defp enforce_pubsub_acl_after_refresh(%{pubsub_channels: nil} = state), do: state
-
-  defp enforce_pubsub_acl_after_refresh(state) do
-    if pubsub_acl_still_allowed?(state) do
-      state
-    else
-      # ACL changes are rare; removing the subscription here keeps PUBLISH hot
-      # path free of per-message permission checks while still failing closed.
-      cleanup_pubsub(state)
-      %{state | pubsub_channels: nil, pubsub_patterns: nil}
-    end
-  end
-
-  defp pubsub_acl_still_allowed?(state) do
-    exact_channels = MapSet.to_list(state.pubsub_channels)
-    patterns = MapSet.to_list(state.pubsub_patterns)
-
-    pubsub_exact_acl_allowed?(state.acl_cache, exact_channels) and
-      pubsub_pattern_acl_allowed?(state.acl_cache, patterns)
-  end
-
-  defp pubsub_exact_acl_allowed?(_cache, []), do: true
-
-  defp pubsub_exact_acl_allowed?(cache, channels) do
-    with :ok <- ConnAuth.check_command_cached(cache, "SUBSCRIBE"),
-         :ok <- ConnAuth.check_channels_cached(cache, channels) do
-      true
-    else
-      _ -> false
-    end
-  end
-
-  defp pubsub_pattern_acl_allowed?(_cache, []), do: true
-
-  defp pubsub_pattern_acl_allowed?(cache, patterns) do
-    with :ok <- ConnAuth.check_command_cached(cache, "PSUBSCRIBE"),
-         :ok <- ConnAuth.check_channels_cached(cache, patterns) do
-      true
-    else
-      _ -> false
-    end
-  end
+  defp enforce_pubsub_acl_after_refresh(state),
+    do: ConnPubSubSession.enforce_pubsub_acl_after_refresh(state)
 
   defp acl_key_args(cmd, _keys)
        when cmd in ~w(PUBLISH SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE),
@@ -1291,7 +906,7 @@ defmodule FerricstoreServer.Connection do
   defp acl_channel_args(cmd, args) when cmd in ~w(SUBSCRIBE PSUBSCRIBE), do: args
   defp acl_channel_args(_cmd, _args), do: []
 
-  defp cleanup_connection(state) do
+  def cleanup_connection(state) do
     duration_ms = System.monotonic_time(:millisecond) - state.created_at
 
     AuditLog.log(:connection_close, %{
@@ -1308,49 +923,20 @@ defmodule FerricstoreServer.Connection do
     Stats.decr_connections()
   end
 
-  defp cleanup_pubsub(state) do
+  def cleanup_pubsub(state) do
     if state.pubsub_channels != nil or state.pubsub_patterns != nil do
       PS.cleanup(self())
     end
   end
 
-  defp maybe_sync_connection_registry(old_state, new_state) do
-    if connection_dashboard_summary(old_state) != connection_dashboard_summary(new_state) do
-      ConnRegistry.update(new_state.client_id, self(), connection_dashboard_summary(new_state))
+  def maybe_sync_connection_registry(old_state, new_state) do
+    if ConnDashboard.summary(old_state) != ConnDashboard.summary(new_state) do
+      ConnRegistry.update(new_state.client_id, self(), ConnDashboard.summary(new_state))
     end
 
     new_state
   end
 
-  defp connection_dashboard_summary(state) do
-    %{
-      client_id: state.client_id,
-      client_name: state.client_name,
-      username: state.username,
-      peer: format_peer(state.peer),
-      created_at_ms: state.created_at,
-      flags: connection_dashboard_flags(state)
-    }
-  end
-
-  defp connection_dashboard_flags(state) do
-    []
-    |> maybe_connection_dashboard_flag(state.multi_state == :queuing, "M")
-    |> maybe_connection_dashboard_flag(in_pubsub_mode?(state), "S")
-    |> maybe_connection_dashboard_flag(connection_tracking_enabled?(state), "T")
-    |> Enum.reverse()
-    |> Enum.join()
-  end
-
-  defp maybe_connection_dashboard_flag(flags, true, flag), do: [flag | flags]
-  defp maybe_connection_dashboard_flag(flags, false, _flag), do: flags
-
-  defp connection_tracking_enabled?(%{tracking: nil}), do: false
-
-  defp connection_tracking_enabled?(%{tracking: tracking}) when is_map(tracking),
-    do: Map.get(tracking, :enabled, false)
-
-  defp connection_tracking_enabled?(_state), do: false
 
   # ---------------------------------------------------------------------------
   # Instance context helpers

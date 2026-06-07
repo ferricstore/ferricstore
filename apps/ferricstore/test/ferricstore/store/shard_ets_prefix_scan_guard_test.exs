@@ -1,10 +1,10 @@
 defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
   use ExUnit.Case, async: true
 
-  @ets_path Path.expand("../../../lib/ferricstore/store/shard/ets.ex", __DIR__)
+  @prefix_scan_path Path.expand("../../../lib/ferricstore/store/shard/ets/prefix_scan.ex", __DIR__)
 
   test "prefix scans batch cold disk reads" do
-    source = File.read!(@ets_path)
+    source = File.read!(@prefix_scan_path)
 
     # HGETALL and related compound scans can touch many cold large values.
     # Keep the scan path from regressing to one blocking pread per cold entry.
@@ -19,11 +19,11 @@ defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
   end
 
   test "prefix scans batch-materialize blob refs" do
-    source = File.read!(@ets_path)
-    [_before, section] = String.split(source, "defp prefix_read_cold_batch_async", parts: 2)
+    source = File.read!(@prefix_scan_path)
+    [_before, section] = String.split(source, "def prefix_read_cold_batch_async", parts: 2)
 
     [read_body, helper_section] =
-      String.split(section, "defp prefix_materialize_blob_values", parts: 2)
+      String.split(section, "def prefix_materialize_blob_values", parts: 2)
 
     assert read_body =~ "prefix_materialize_blob_values",
            "expected prefix scans to materialize duplicate blob refs once per batch"

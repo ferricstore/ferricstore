@@ -1,8 +1,6 @@
 defmodule Ferricstore.Store.RouterStatsSamplingTest do
   use ExUnit.Case, async: false
 
-  @router_source Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
-
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.IsolatedInstance
@@ -110,8 +108,7 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
 
   test "batch read functions do not advance hit sampling one key at a time" do
     ast =
-      @router_source
-      |> File.read!()
+      Ferricstore.Test.SourceFiles.router_source()
       |> Code.string_to_quoted!()
 
     for {name, arity} <- [

@@ -4,20 +4,20 @@ This guide describes the operational model for FerricFlow in production: durabil
 
 ## Production Mental Model
 
-FerricFlow stores current workflow state as durable Flow records. A command succeeds only after the state change is accepted through the quorum path and written to disk. Hot indexes are rebuildable. LMDB/history projections are query surfaces and may lag briefly.
+FerricFlow stores current workflow state through FerricStore's own WARaft-backed storage path. A command succeeds only after the state change is accepted through the quorum path and written to disk. Hot keydir/native indexes serve current state. LMDB/history projections are query surfaces and may lag briefly.
 
 ```text
-Raft + Bitcask Flow records = durable truth
-Hot indexes = rebuildable serving layer
+WARaft segment/apply projection = durable Flow write path
+Hot keydir/native Flow indexes = authoritative serving state
 LMDB/history = lagged query projection
-Payload/value bytes = separate Flow values
+Payload/value bytes = Flow values or blob side-channel files
 ```
 
 ## Durability Boundary
 
 - `FLOW.CREATE`, transition, retry, complete, fail, cancel, and signal commands wait for quorum-backed disk durability before success.
 - Current Flow state wins over query projections.
-- On restart, hot indexes and projections rebuild or resume from durable Flow records.
+- On restart, hot indexes and projections rebuild or resume from FerricStore-managed WARaft segment/apply-projection storage.
 - History/projection queries can be made consistent by waiting for projection catch-up when the command supports it.
 
 ## Failure Model

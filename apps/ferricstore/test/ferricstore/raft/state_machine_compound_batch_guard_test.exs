@@ -2,10 +2,8 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  @state_machine_path Path.expand("../../../lib/ferricstore/raft/state_machine.ex", __DIR__)
-
   test "state-machine command stores expose compound batch reads" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     # Hash/set/zset command handlers call Ops.compound_batch_get/3 for HMGET,
     # SMISMEMBER, ZMSCORE, and friends. During Raft apply the command store is
@@ -19,7 +17,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "state-machine command stores expose compound batch writes" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
     cross_shard_store = function_body(source, "build_cross_shard_store")
 
     # List push/pop and similar data-primitive mutations can touch many
@@ -40,7 +38,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "state-machine command stores expose plain batch reads" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     # MGET, JSON.MGET, PFCOUNT, PFMERGE, and BITOP call Ops.batch_get/2.
     # During Raft apply the store is a map, so missing batch_get callbacks
@@ -53,7 +51,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "state-machine compound batch metadata reads use keyed batched cold path" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
     body = function_body(source, "cross_shard_read_cold_meta_bitcask_batch")
 
     # HGETEX/HEXPIRE-style logic reads value+TTL for many fields. If this
@@ -64,7 +62,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "state-machine pop commands remove empty type markers without stale ETS counts" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     # SPOP/ZPOP bypass the public command store and run as deterministic
     # single-key Raft commands. Shared batch deletes are publish-after-append,
@@ -89,7 +87,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "state-machine applies compact compound batch terms directly" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "def apply(meta, {:compound_batch_put, redis_key, entries}, state)",
            "compound batch writes should not replay through generic {:batch, compound_put...}"
@@ -105,10 +103,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "shard raft path submits compact compound batch terms" do
-    shard_compound_path =
-      Path.expand("../../../lib/ferricstore/store/shard/compound.ex", __DIR__)
-
-    source = File.read!(shard_compound_path)
+    source = Ferricstore.Test.SourceFiles.shard_compound_source()
     put_body = function_body(source, "handle_compound_batch_put_raft")
     delete_body = function_body(source, "handle_compound_batch_delete_raft")
 
@@ -122,7 +117,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "state-machine promoted compound batch tombstones keep sync durability" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
     body = function_body(source, "do_promoted_compound_batch_delete")
 
     # The old single promoted tombstone path used v2_append_tombstone/2, which
@@ -133,7 +128,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   end
 
   test "WARaft standalone staged apply keeps Bitcask sync boundary until unified segments exist" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
     dispatcher = function_body(source, "append_pending_batch")
     sync_body = function_body(source, "do_append_pending_batch_sync")
 

@@ -1,13 +1,21 @@
 defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   use ExUnit.Case, async: true
 
-  @source Path.expand("../../../lib/ferricstore/store/blob_store.ex", __DIR__)
+  @sources [
+             "../../../lib/ferricstore/store/blob_store.ex",
+             "../../../lib/ferricstore/store/blob_store/write.ex",
+             "../../../lib/ferricstore/store/blob_store/protection.ex",
+             "../../../lib/ferricstore/store/blob_store/read.ex",
+             "../../../lib/ferricstore/store/blob_store/gc.ex",
+             "../../../lib/ferricstore/store/blob_store/io.ex"
+           ]
+           |> Enum.map(&Path.expand(&1, __DIR__))
 
   test "blob store uses a local shard latch instead of global locking" do
     # Blob files are shard-local and the lock key is scoped to this BEAM node.
     # Keep this path off :global.trans/3; it adds distributed-lock machinery
     # without improving correctness for blob append segments.
-    ast = @source |> File.read!() |> Code.string_to_quoted!()
+    ast = raw_source() |> Code.string_to_quoted!()
 
     {_ast, calls} =
       Macro.prewalk(ast, [], fn
@@ -25,7 +33,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "active segment cache avoids per-append file stat" do
-    source = File.read!(@source)
+    source = source()
 
     cached_active_segment =
       source
@@ -40,7 +48,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "blob append does not mkdir the segment directory on every write" do
-    source = File.read!(@source)
+    source = source()
 
     do_put_many =
       source
@@ -55,7 +63,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "put_many does not walk payloads only to validate binaries" do
-    source = File.read!(@source)
+    source = source()
 
     put_many =
       source
@@ -70,7 +78,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "single put avoids the batch dedupe preparation path" do
-    source = File.read!(@source)
+    source = source()
 
     put =
       source
@@ -85,7 +93,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "single-entry put_many uses the single append preparation path" do
-    source = File.read!(@source)
+    source = source()
 
     assert source =~ "def put_many(data_dir, shard_index, [payload])",
            "BlobStore.put_many/3 should special-case one payload; Raft batch prep often has " <>
@@ -93,7 +101,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "segment_path uses the segment filename directly" do
-    source = File.read!(@source)
+    source = source()
 
     segment_path =
       source
@@ -108,7 +116,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "batched segment reads group by segment id before building paths" do
-    source = File.read!(@source)
+    source = source()
 
     for {name, start_marker, end_marker} <- [
           {"verify_many segment refs", "  defp verify_segment_refs(data_dir, shard_index, refs)",
@@ -129,7 +137,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "file_refs_many validates segment headers with one batched pread" do
-    source = File.read!(@source)
+    source = source()
 
     section =
       source
@@ -148,7 +156,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "verify_many validates segment headers with one batched pread while hashing payloads" do
-    source = File.read!(@source)
+    source = source()
 
     section =
       source
@@ -168,7 +176,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
   end
 
   test "get_many validates and reads segment refs with batched preads" do
-    source = File.read!(@source)
+    source = source()
 
     section =
       source
@@ -185,6 +193,18 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
 
     refute section =~ "get_open_segment_ref(",
            "get_many/3 should not fall back to one full header+payload read per blob ref"
+  end
+
+  defp raw_source do
+    Enum.map_join(@sources, "\n", &File.read!/1)
+  end
+
+  defp source do
+    @sources
+    |> Enum.map_join("\n", &File.read!/1)
+    |> String.replace("\n    ", "\n  ")
+    |> String.replace("\n    Stores", "\n  Stores")
+    |> String.replace("\n    Returns", "\n  Returns")
   end
 
   defp source_section!(source, start_marker, end_marker) do

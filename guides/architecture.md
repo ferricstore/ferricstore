@@ -5,10 +5,12 @@ This guide explains how FerricStore works internally. Read it after [Getting Sta
 Quick model:
 
 ```text
-client command -> shard router -> Raft log -> state machine -> Bitcask/Flow records -> hot indexes/projections
+client command -> shard router -> WARaft segment log -> state/apply projection -> hot keydir/indexes
 ```
 
-FerricFlow current state is durable truth. Hot indexes are rebuildable serving structures. LMDB/history projections are query surfaces that can lag briefly.
+FerricStore owns the storage path itself; workflow state is not written through an external Postgres, Cassandra, or Redis database. The committed WARaft segment log is the durable command boundary. Committed commands are projected into per-shard ETS keydirs and native Flow indexes for the hot serving path. LMDB/history are query projections that can lag briefly.
+
+For FerricFlow, command correctness uses the current Flow state in the hot keydir/native indexes. That state is recoverable from FerricStore-managed WARaft segment/apply-projection storage. LMDB/history projection freshness affects query surfaces, not whether a Flow command committed.
 
 FerricStore is built around three core design principles: (1) all mutable state lives in Elixir where it is observable and debuggable, (2) Rust NIFs are pure stateless functions for I/O and CPU-intensive work, and (3) data is stored in the tier best suited to its access pattern.
 
@@ -45,14 +47,21 @@ FerricStore is built around three core design principles: (1) all mutable state 
 │    │   Read Path      │  │    Write Path        │                          │
 │    │   ETS direct     │  │    GenServer call    │                          │
 │    │   (no GenServer) │  │    → ETS immediate   │                          │
-│    │                  │  │    → Raft Batcher    │                          │
+│    │                  │  │    → WARaft Batcher  │                          │
 │    └──────┬───────────┘  │    → ra consensus    │                          │
-│           │              │    → Bitcask append  │                          │
+│           │              │    → segment/apply   │                          │
+│           │              │      projection       │                          │
 │           │              └────────────┬─────────┘                          │
 │           │                           │                                    │
 │  ┌────────┴───────────────────────────┴──────────────────────────┐        │
 │  │                    Storage Tiers                                │        │
 │  │                                                                 │        │
+│  │  ┌─────────────────────────────────────────────────────────┐   │        │
+│  │  │  Tier 0: WARaft segment/apply projection storage         │   │        │
+│  │  │  Durable command log plus projected value locations      │   │        │
+│  │  │  Source for restart/replay of committed writes           │   │        │
+│  │  └────────────────────────────┬────────────────────────────┘   │        │
+│  │                               │ hot serving state               │        │
 │  │  ┌─────────────────────────────────────────────────────────┐   │        │
 │  │  │  Tier 1: ETS keydir (hot data)                          │   │        │
 │  │  │  {key, value|nil, expire, lfu, file_id, offset, vsize}  │   │        │
@@ -61,8 +70,8 @@ FerricStore is built around three core design principles: (1) all mutable state 
 │  │  └────────────────────────────┬────────────────────────────┘   │        │
 │  │                               │ cold read (value=nil)           │        │
 │  │  ┌────────────────────────────▼────────────────────────────┐   │        │
-│  │  │  Tier 2: Bitcask data files (cold data)                  │   │        │
-│  │  │  Append-only log files, 256 MB rotation                  │   │        │
+│  │  │  Tier 2: Bitcask/blob files (cold and large values)      │   │        │
+│  │  │  Append-only files, dedicated collections, blob refs     │   │        │
 │  │  │  Rust NIF: v2_pread_at(path, offset)                     │   │        │
 │  │  │  Background merge/compaction                             │   │        │
 │  │  └─────────────────────────────────────────────────────────┘   │        │
@@ -211,12 +220,12 @@ The ETS keydir is the single source of truth for all key-value data in RAM. Each
 ## Write Path
 
 ```
-Client                Router              Shard GenServer         Raft Batcher
+Client                Router              Shard GenServer         WARaft Batcher
   |                     |                      |                       |
   |-- put(key, val) -->|                      |                       |
   |                     |-- GenServer.call -->|                       |
   |                     |                      |                       |
-  |                     |  [Raft path]         |                       |
+  |                     |  [WARaft path]       |                       |
   |                     |                      |-- Batcher.write() -->|
   |                     |                      |                       |-- extract namespace
   |                     |                      |                       |   prefix from key
@@ -230,8 +239,9 @@ Client                Router              Shard GenServer         Raft Batcher
   |                     |                      |                       |   (blocks until quorum)
   |                     |                      |                       |
   |                     |                      |  StateMachine.apply:  |
-  |                     |                      |   NIF.v2_append_batch |
-  |                     |                      |   :ets.insert(keydir) |
+  |                     |                      |   segment/apply       |
+  |                     |                      |   projection          |
+  |                     |                      |   keydir/index publish|
   |                     |                      |                       |
   |<-- :ok ------------|<-- :ok --------------|<-- result ------------|
   |                     |                      |                       |
@@ -239,13 +249,13 @@ Client                Router              Shard GenServer         Raft Batcher
 
 ### Write Path Details
 
-**Raft write path (always active)**:
+**WARaft write path (always active)**:
 
 1. `Router.put/3` validates key/value size limits (max key: 64KB, max value: 512MB) and checks `keydir_full?()` via `persistent_term` (~5ns).
 2. `Shard.handle_call({:put, key, value, expire_at_ms})` calls `Batcher.write(shard_index, {:put, key, value, expire_at_ms})`.
 3. The Batcher extracts the namespace prefix from the key (text before the first `:`; keys without `:` go to `"_root"`). It looks up the namespace config for `window_ms` (commit window).
 4. The command and caller are appended to the namespace's slot buffer. On the first write to an empty slot, a timer is started with `window_ms` (default: 1ms). If the slot reaches `max_batch_size` (default: 1000), it flushes immediately.
-5. When the timer fires or the slot is full, the batch is submitted through `WARaftBackend`. `StateMachine.apply/3` runs after the WARaft entry is committed: it stages Bitcask/segment records, fsyncs through the segment log path, then publishes keydir updates. Each caller receives its individual result after the applied notification arrives.
+5. When the timer fires or the slot is full, the batch is submitted through `WARaftBackend`. `StateMachine.apply/3` runs after the WARaft entry is committed. Fast segment-projectable commands use the committed WARaft segment as the stored value location and publish ETS rows with `{:waraft_segment, index}` locations. Full state-machine commands stage an apply-projection batch and publish rows with `{:waraft_apply_projection, index}` locations; large values may go through the blob side channel. Each caller receives its individual result after the applied notification arrives.
 
 **Direct write path (embedded custom instances and sandbox test shards)**:
 
@@ -347,20 +357,34 @@ The rule for adding the next specialized term is strict:
 
 1. Only specialize homogeneous write-only commands, or a deterministic bulk operation with identical semantics to the generic path.
 2. Preserve the logical command count separately from the compact term so callers still receive one reply per input command.
-3. Batch Bitcask work once and verify NIF result length/order before publishing public state.
-4. For pure writes, stage disk records only, then publish ETS once after append succeeds.
-5. Do not create temporary pending ETS rows or fill pending read maps unless later commands inside the same Ra entry must read intermediate state.
-6. On append failure, no new public ETS state should remain visible. Tests must cover rollback of overwritten keys and absence of new keys.
+3. Batch storage/projection work once and verify result length/order before publishing public state.
+4. For pure writes, stage segment/apply-projection records only, then publish ETS once after the durable projection succeeds.
+5. Do not create temporary pending ETS rows or fill pending read maps unless later commands inside the same WARaft entry must read intermediate state.
+6. On projection failure, no new public ETS state should remain visible. Tests must cover rollback of overwritten keys and absence of new keys.
 7. Keep a runtime perf toggle while proving a new term, and benchmark it against the generic `{:batch, commands}` path plus any dedicated fast apply path disabled.
 
-The `put_batch` profiling lesson was that the compact wire term was good, but the first apply implementation did too much extra pending-state work. The matching `delete_batch` fast path follows the same rule for tombstones: stage the Bitcask delete records first, then remove ETS rows only after append success. Future terms need both halves: compact log shape and compact state-machine apply.
+The `put_batch` profiling lesson was that the compact wire term was good, but the first apply implementation did too much extra pending-state work. The matching `delete_batch` fast path follows the same rule for tombstones: stage the durable projection first, then remove ETS rows only after projection success. Future terms need both halves: compact log shape and compact state-machine apply.
+
+### Future KV Native-Batch Work
+
+The highest-value KV native optimization is durable batched SET, not hot GET. Hot GET already routes through `Router.get/2` to a direct ETS lookup for resident values, and a per-command NIF call would likely give back much of the gain. Durable SET still pays per-entry BEAM costs in routing, compact term handling, state-machine staging, segment/apply-projection validation, and ETS/keydir publishing.
+
+The next native experiment should keep the current Elixir-owned ETS keydir model and move only the batch apply/publish work behind a single Rust NIF boundary:
+
+1. Accept the already-routed `{:put_batch, entries}` shape for one shard.
+2. Convert values to the durable segment/apply-projection representation and persist the whole batch once.
+3. Validate projection result count, order, offsets, and value sizes before publishing.
+4. Return enough compact location data for the state machine to publish final ETS rows with no visible partial writes, or publish through a carefully audited native helper that preserves the same ETS tuple contract.
+5. Keep Flow policy/value mirror hooks, blob externalization, large-value hot-cache thresholds, and rollback semantics equivalent to the current path.
+
+A Rust-owned KV keydir should be treated as a larger architecture change, not a first optimization step. It must prove that it beats ETS for concurrent hot reads, avoids one mutex bottleneck per shard, preserves lazy expiry and LFU bookkeeping semantics, and does not weaken crash recovery. Benchmarks should compare the current path, the native batch path, and any Rust-keydir prototype under the public memtier shape from `docs/benchmarks.md` before replacing the ETS-backed design.
 
 ### State Machine
 
 `Ferricstore.Raft.StateMachine` is the deterministic WARaft apply module. Key callbacks:
 
 - **`init/1`**: Receives shard config (paths, ETS table name, active file info). Stores `release_cursor_interval` (default: 1000) in machine state for deterministic cursor emission.
-- **`apply/3`**: Deterministic command application. Supports `:put`, `:put_batch`, `:delete`, `:delete_batch`, `:batch`, `:list_op`, `:compound_put`, `:compound_delete`, `:compound_delete_prefix`, `:incr_float`, `:append`, `:getset`, `:getdel`, `:getex`, `:setrange`, `:cas`, `:lock`, `:unlock`, `:extend`, `:ratelimit_add`. Writes are appended to Bitcask before public ETS state is updated. Values exceeding `hot_cache_max_value_size` are stored as `nil` in ETS.
+- **`apply/3`**: Deterministic command application. Supports `:put`, `:put_batch`, `:delete`, `:delete_batch`, `:batch`, `:list_op`, `:compound_put`, `:compound_delete`, `:compound_delete_prefix`, `:incr_float`, `:append`, `:getset`, `:getdel`, `:getex`, `:setrange`, `:cas`, `:lock`, `:unlock`, `:extend`, `:ratelimit_add`. In the standalone WARaft path, segment-projected commands use WARaft segment locations and full apply commands use apply-projection locations before public ETS state is updated. Direct embedded/test paths can still append through Bitcask before publishing ETS. Values exceeding `hot_cache_max_value_size` are stored as `nil` in ETS.
 - **`state_enter/2`**: On becoming leader, calls `HLC.now()` to advance the local clock.
 - **`overview/1`**: Returns debugging info: shard index, keydir size, applied count, cursor interval.
 
@@ -479,10 +503,10 @@ This guide explains how FerricStore works internally. Read it after [Getting Sta
 Quick model:
 
 ```text
-client command -> shard router -> Raft log -> state machine -> Bitcask/Flow records -> hot indexes/projections
+client command -> shard router -> WARaft segment log -> state/apply projection -> hot keydir/indexes
 ```
 
-FerricFlow current state is durable truth. Hot indexes are rebuildable serving structures. LMDB/history projections are query surfaces that can lag briefly.
+FerricFlow current state is served from hot keydir/native indexes and is recoverable from FerricStore-managed WARaft segment/apply-projection storage. LMDB/history projections are query surfaces that can lag briefly.
 
 ```
 Ferricstore.Merge.Supervisor (:one_for_one)

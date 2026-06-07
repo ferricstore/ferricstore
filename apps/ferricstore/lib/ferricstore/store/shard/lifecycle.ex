@@ -7,6 +7,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Store.Shard.Lifecycle.ProbMigration
+  alias Ferricstore.Store.Shard.Lifecycle.Shutdown
 
   require Logger
 
@@ -355,173 +357,42 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Prob file migration
   # -------------------------------------------------------------------
 
-  @spec migrate_prob_files(binary(), :ets.tid(), non_neg_integer(), term()) :: :ok
-  @doc false
-  def migrate_prob_files(shard_data_path, keydir, index, instance_ctx \\ nil) do
-    prob_dir = Path.join(shard_data_path, "prob")
+@spec migrate_prob_files(binary(), :ets.tid(), non_neg_integer(), term()) :: :ok
+@doc false
+def migrate_prob_files(shard_data_path, keydir, index, instance_ctx \\ nil) do
+  ProbMigration.migrate_prob_files(shard_data_path, keydir, index, instance_ctx)
+end
 
-    case Ferricstore.FS.ls(prob_dir) do
-      {:ok, files} ->
-        migrated =
-          Enum.reduce(files, 0, fn filename, count ->
-            migrate_prob_file(prob_dir, filename, keydir, index, count, instance_ctx)
-          end)
+@spec migrate_prob_file(
+        binary(),
+        binary(),
+        :ets.tid(),
+        non_neg_integer(),
+        non_neg_integer(),
+        term()
+      ) :: non_neg_integer()
+@doc false
+def migrate_prob_file(prob_dir, filename, keydir, shard_index, count, instance_ctx \\ nil) do
+  ProbMigration.migrate_prob_file(prob_dir, filename, keydir, shard_index, count, instance_ctx)
+end
 
-        if migrated > 0 do
-          Logger.info("Shard: migrated #{migrated} existing prob file(s) to Raft metadata")
-        end
+@spec migrate_if_missing(
+        :ets.tid(),
+        non_neg_integer(),
+        binary(),
+        binary(),
+        atom(),
+        non_neg_integer()
+      ) :: non_neg_integer()
+@doc false
+def migrate_if_missing(keydir, shard_index, filename_key, path, type, count, instance_ctx \\ nil) do
+  ProbMigration.migrate_if_missing(keydir, shard_index, filename_key, path, type, count, instance_ctx)
+end
 
-      {:error, {:not_found, _}} ->
-        :ok
+@spec build_prob_meta(atom(), binary(), binary()) :: {atom(), map()}
+@doc false
+def build_prob_meta(type, path, key), do: ProbMigration.build_prob_meta(type, path, key)
 
-      {:error, reason} ->
-        Logger.error(
-          "Shard #{index}: migrate_prob_files failed to list #{prob_dir}: #{inspect(reason)}"
-        )
-
-        raise "migrate_prob_files failed to list #{prob_dir}: #{inspect(reason)}"
-    end
-  end
-
-  @spec migrate_prob_file(
-          binary(),
-          binary(),
-          :ets.tid(),
-          non_neg_integer(),
-          non_neg_integer(),
-          term()
-        ) ::
-          non_neg_integer()
-  @doc false
-  def migrate_prob_file(prob_dir, filename, keydir, shard_index, count, instance_ctx \\ nil) do
-    path = Path.join(prob_dir, filename)
-
-    cond do
-      String.ends_with?(filename, ".bloom") ->
-        key = filename |> String.trim_trailing(".bloom")
-        migrate_if_missing(keydir, shard_index, key, path, :bloom_meta, count, instance_ctx)
-
-      String.ends_with?(filename, ".cms") ->
-        key = filename |> String.trim_trailing(".cms")
-        migrate_if_missing(keydir, shard_index, key, path, :cms_meta, count, instance_ctx)
-
-      String.ends_with?(filename, ".cuckoo") ->
-        key = filename |> String.trim_trailing(".cuckoo")
-        migrate_if_missing(keydir, shard_index, key, path, :cuckoo_meta, count, instance_ctx)
-
-      String.ends_with?(filename, ".topk") ->
-        key = filename |> String.trim_trailing(".topk")
-        migrate_if_missing(keydir, shard_index, key, path, :topk_meta, count, instance_ctx)
-
-      true ->
-        count
-    end
-  end
-
-  # Writes a metadata marker into ETS if the key doesn't already have one.
-  # The key in the filename may be Base64-encoded (new) or sanitized (old).
-  # We try to decode as Base64 first; if that fails, treat the filename
-  # stem as the literal key.
-  @spec migrate_if_missing(
-          :ets.tid(),
-          non_neg_integer(),
-          binary(),
-          binary(),
-          atom(),
-          non_neg_integer()
-        ) :: non_neg_integer()
-  @doc false
-  def migrate_if_missing(
-        keydir,
-        shard_index,
-        filename_key,
-        path,
-        type,
-        count,
-        instance_ctx \\ nil
-      ) do
-    key =
-      case Base.url_decode64(filename_key, padding: false) do
-        {:ok, decoded} -> decoded
-        :error -> filename_key
-      end
-
-    case :ets.lookup(keydir, key) do
-      [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
-        # Already has an ETS entry — no migration needed
-        count
-
-      [] ->
-        # No ETS entry — write a metadata marker
-        meta = build_prob_meta(type, path, key)
-        meta_bin = :erlang.term_to_binary(meta)
-        track_binary_add(shard_index, key, meta_bin, instance_ctx)
-        :ets.insert(keydir, {key, meta_bin, 0, 0, 0, 0, byte_size(meta_bin)})
-        count + 1
-    end
-  rescue
-    ArgumentError -> count
-  end
-
-  @spec build_prob_meta(atom(), binary(), binary()) :: {atom(), map()}
-  @doc false
-  def build_prob_meta(:bloom_meta, path, _key) do
-    # Try to read bloom header for capacity/error_rate derivation
-    case NIF.bloom_file_info(path) do
-      {:ok, {num_bits, _count, num_hashes}} ->
-        capacity =
-          if num_hashes > 0,
-            do: max(1, round(num_bits * :math.log(2) / num_hashes)),
-            else: 100
-
-        error_rate =
-          if capacity > 0,
-            do: :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity),
-            else: 0.01
-
-        {:bloom_meta,
-         %{
-           path: path,
-           num_bits: num_bits,
-           num_hashes: num_hashes,
-           capacity: capacity,
-           error_rate: error_rate
-         }}
-
-      _ ->
-        {:bloom_meta, %{path: path}}
-    end
-  end
-
-  def build_prob_meta(:cms_meta, path, _key) do
-    case NIF.cms_file_info(path) do
-      {:ok, {width, depth, _count}} ->
-        {:cms_meta, %{width: width, depth: depth}}
-
-      _ ->
-        {:cms_meta, %{path: path}}
-    end
-  end
-
-  def build_prob_meta(:cuckoo_meta, path, _key) do
-    case NIF.cuckoo_file_info(path) do
-      {:ok, {num_buckets, _bs, _fp, _ni, _nd, _ts, _mk}} ->
-        {:cuckoo_meta, %{capacity: num_buckets}}
-
-      _ ->
-        {:cuckoo_meta, %{path: path}}
-    end
-  end
-
-  def build_prob_meta(:topk_meta, path, _key) do
-    case NIF.topk_file_info_v2(path) do
-      {k, width, depth, decay} ->
-        {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
-
-      _ ->
-        {:topk_meta, %{path: path}}
-    end
-  end
 
   # -------------------------------------------------------------------
   # Raft startup
@@ -557,78 +428,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Terminate
   # -------------------------------------------------------------------
 
-  @spec do_terminate(term(), map()) :: :ok
-  @doc false
-  def do_terminate(_reason, state) do
-    t0 = System.monotonic_time(:microsecond)
+@spec do_terminate(term(), map()) :: :ok
+@doc false
+def do_terminate(reason, state), do: Shutdown.do_terminate(reason, state)
 
-    # Step 1: drain any in-flight async flush and flush remaining pending
-    # writes synchronously to guarantee all data hits disk before exit.
-    state = ShardFlush.await_in_flight(state)
-    state = ShardFlush.flush_pending_sync(state)
-
-    t_flush = System.monotonic_time(:microsecond)
-
-    # Step 2: write v2 hint file for the active file so the next startup
-    # can rebuild the keydir from hints instead of replaying the full log.
-    hint_result = ShardFlush.write_hint_for_file(state, state.active_file_id)
-
-    hint_dir_fsync_result =
-      if hint_result == :ok do
-        NIF.v2_fsync_dir(state.shard_data_path)
-      end
-
-    fsync_result = NIF.v2_fsync(state.active_file_path)
-    shutdown_errors = shutdown_errors(hint_result, hint_dir_fsync_result, fsync_result)
-    shutdown_status = if shutdown_errors == [], do: :ok, else: :warning
-
-    t_hint = System.monotonic_time(:microsecond)
-
-    # Step 3: emit shutdown telemetry for operator visibility.
-    :telemetry.execute(
-      [:ferricstore, :shard, :shutdown],
-      %{
-        flush_duration_us: t_flush - t0,
-        hint_duration_us: t_hint - t_flush,
-        total_duration_us: t_hint - t0
-      },
-      %{shard_index: state.index, status: shutdown_status, errors: shutdown_errors}
-    )
-
-    log_shutdown_result(state.index, t_flush - t0, t_hint - t_flush, shutdown_errors)
-
-    :ok
-  end
-
-  defp shutdown_errors(hint_result, hint_dir_fsync_result, fsync_result) do
-    []
-    |> maybe_shutdown_error(:hint_write, hint_result)
-    |> maybe_shutdown_error(:hint_dir_fsync, hint_dir_fsync_result)
-    |> maybe_shutdown_error(:active_fsync, fsync_result)
-    |> Enum.reverse()
-  end
-
-  defp maybe_shutdown_error(errors, _operation, result) when result in [:ok, nil], do: errors
-
-  defp maybe_shutdown_error(errors, operation, {:error, reason}),
-    do: [{operation, reason} | errors]
-
-  defp maybe_shutdown_error(errors, operation, other),
-    do: [{operation, {:unexpected_result, other}} | errors]
-
-  defp log_shutdown_result(index, flush_us, hint_us, []) do
-    Logger.info(
-      "Shard #{index}: shutdown complete " <>
-        "(flush=#{flush_us}us, hint=#{hint_us}us)"
-    )
-  end
-
-  defp log_shutdown_result(index, flush_us, hint_us, errors) do
-    Logger.warning(
-      "Shard #{index}: shutdown complete with warnings " <>
-        "(flush=#{flush_us}us, hint=#{hint_us}us, errors=#{inspect(errors)})"
-    )
-  end
 
   defp cleanup_compact_temps(shard_path, files) do
     Enum.each(files, fn name ->
@@ -1167,7 +970,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   # Tracks bytes added for a fresh insert (no existing entry expected, or replaces).
-  defp track_binary_add(shard_index, key, value, instance_ctx) do
+  def track_binary_add(shard_index, key, value, instance_ctx) do
     ref = keydir_binary_ref(instance_ctx, shard_index)
 
     if ref do

@@ -2724,3 +2724,15 @@ mod tests {
         );
     }
 }
+// This file is intentionally kept as a single fused Rust source unit even
+// though it is larger than the normal module-size target.
+//
+// Flow index/codec/claim planning sits directly on the FerricFlow hot path:
+// FLOW.CREATE, FLOW.CLAIM_DUE, terminal commands, and DBOS-style queue
+// throughput all pass through this code. A mechanical split was tested and
+// rejected because DBOS 1M benchmark samples fell outside the 5% performance
+// gate, while restoring the monolithic file recovered the baseline range.
+//
+// Do not split this file into normal Rust modules only for readability. If it
+// must be reorganized, preserve the fused compilation shape first and prove it
+// with the DBOS + memtier benchmark gate.

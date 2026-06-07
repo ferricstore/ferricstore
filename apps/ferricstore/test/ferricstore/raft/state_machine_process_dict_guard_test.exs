@@ -1,13 +1,8 @@
 defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   use ExUnit.Case, async: true
 
-  @state_machine_path Path.expand(
-                        "../../../lib/ferricstore/raft/state_machine.ex",
-                        __DIR__
-                      )
-
   test "apply entry clears consolidated apply process state" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [_match, body] =
       Regex.run(
@@ -20,7 +15,7 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   end
 
   test "release cursor apply state uses one process dictionary key" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     refute source =~ ":sm_pending_state"
     refute source =~ ":sm_checkpoint_dependencies_clean_before_write"
@@ -32,7 +27,7 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   end
 
   test "pending write apply state declares and clears one key set" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [_match, with_pending_body] =
       Regex.run(
@@ -59,7 +54,7 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   end
 
   test "delete_batch fast path stages tombstones and publishes ETS after append" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "defp apply_delete_batch_keys_fast",
            "delete_batch should have a dedicated pure-delete fast path"
@@ -84,7 +79,7 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   end
 
   test "no-meta apply path clears consolidated apply process state" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     [_match, body] =
       Regex.run(
@@ -97,7 +92,7 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   end
 
   test "checkpoint clean does not fail open for unresolved instance context" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     refute source =~ "defp checkpoint_clean?(%{instance_ctx: nil}), do: true",
            "unresolved instance checkpoint context must not be treated as clean; only :default may use the legacy carve-out"

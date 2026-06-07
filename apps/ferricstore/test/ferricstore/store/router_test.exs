@@ -101,7 +101,7 @@ defmodule Ferricstore.Store.RouterTest do
 
   describe "direct batch grouping allocation guard" do
     test "put/delete direct batch paths keep one per-shard grouping structure" do
-      source = File.read!("lib/ferricstore/store/router.ex")
+      source = Ferricstore.Test.SourceFiles.router_source()
       {:ok, ast} = Code.string_to_quoted(source)
 
       put_vars = private_function_var_names(ast, :do_batch_quorum_put_entries, 3)
@@ -114,7 +114,7 @@ defmodule Ferricstore.Store.RouterTest do
     end
 
     test "WARaft batch routing does not fall back to legacy Batcher for forwarded writes" do
-      source = File.read!("lib/ferricstore/store/router.ex")
+      source = Ferricstore.Test.SourceFiles.router_source()
       {:ok, ast} = Code.string_to_quoted(source)
 
       for function_name <- [
@@ -141,7 +141,7 @@ defmodule Ferricstore.Store.RouterTest do
     end
 
     test "WARaft hot batch routing uses fixed buckets and ordered result tuples" do
-      source = File.read!("lib/ferricstore/store/router.ex")
+      source = Ferricstore.Test.SourceFiles.router_source()
 
       assert source =~ "new_waraft_batch_buckets(ctx.shard_count)"
       assert source =~ "put_elem(results, index, value)"
@@ -152,7 +152,7 @@ defmodule Ferricstore.Store.RouterTest do
 
   describe "default quorum write ingress" do
     test "remote forwarding does not use shard forwarded_quorum calls" do
-      source = File.read!("lib/ferricstore/store/router.ex")
+      source = Ferricstore.Test.SourceFiles.router_source()
 
       refute source =~ "{:forwarded_quorum,",
              "default write forwarding must go through Router/Batcher, not Shard GenServer"
@@ -203,7 +203,7 @@ defmodule Ferricstore.Store.RouterTest do
 
   describe "async list timeout classification" do
     test "list worker timeout is reported as unknown outcome" do
-      source = File.read!("lib/ferricstore/store/router.ex")
+      source = Ferricstore.Test.SourceFiles.router_source()
 
       refute source =~ ~s({:error, "ERR list_op timeout"}),
              "list mutations may still complete after the worker call times out; classify as unknown outcome"

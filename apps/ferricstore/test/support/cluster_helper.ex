@@ -108,7 +108,7 @@ defmodule Ferricstore.Test.ClusterHelper do
       end)
 
     node_names = Enum.map(nodes, & &1.name)
-    normalize_cluster_cookies(nodes)
+    Ferricstore.Test.ClusterHelper.Partition.normalize_cluster_cookies(nodes)
 
     # Phase 2: Connect all nodes to each other for Erlang distribution.
     # Must happen before app startup so that WARaft servers can communicate
@@ -441,201 +441,13 @@ defmodule Ferricstore.Test.ClusterHelper do
     result || raise "Could not find leader for shard #{shard}"
   end
 
-  @doc """
-  Simulates a network partition by disconnecting a node from all others.
-
-  Disconnects in both directions to create a symmetric partition. The node
-  process stays alive but cannot communicate with the rest of the cluster.
-  """
+  @doc "Simulates a network partition by disconnecting a node from all others."
   @spec partition_node(map(), [map()]) :: :ok
-  def partition_node(node, all_nodes) do
-    others = Enum.reject(all_nodes, &(&1.name == node.name))
-    _other_names = Enum.map(others, & &1.name)
+  def partition_node(node, all_nodes), do: Ferricstore.Test.ClusterHelper.Partition.partition_node(node, all_nodes)
 
-    # Suspend ClusterManager on ALL nodes to prevent auto-reconnect
-    Enum.each(all_nodes, fn n ->
-      cm_pid = :rpc.call(n.name, Process, :whereis, [Ferricstore.Cluster.Manager])
-      if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :suspend, [cm_pid])
-    end)
-
-    # Stop the isolated node's consensus runtime. Majority-side nodes keep
-    # running so quorum writes continue while the node is unavailable.
-    stop_consensus(node.name)
-
-    # Block only peer-to-peer reconnection. Do not change the partitioned
-    # node's own cookie: the test runner still needs RPC access in order to
-    # heal the partition deterministically.
-    cookie_state =
-      Enum.flat_map(others, fn other ->
-        node_to_other = :rpc.call(node.name, :erlang, :get_cookie, [other.name])
-        other_to_node = :rpc.call(other.name, :erlang, :get_cookie, [node.name])
-        nonce = :erlang.unique_integer([:positive])
-        blocked_from_node = :"partitioned_node_blocked_#{nonce}_a"
-        blocked_from_other = :"partitioned_node_blocked_#{nonce}_b"
-
-        :rpc.call(node.name, :erlang, :set_cookie, [other.name, blocked_from_node])
-        :rpc.call(other.name, :erlang, :set_cookie, [node.name, blocked_from_other])
-
-        [
-          {node.name, other.name, node_to_other},
-          {other.name, node.name, other_to_node}
-        ]
-      end)
-
-    # Disconnect and wait until both sides observe the split. Erlang
-    # distribution disconnect is asynchronous, and ra/ClusterManager monitors
-    # can briefly race by reconnecting before the poisoned peer cookies take
-    # effect.
-    Ferricstore.Test.ShardHelpers.eventually(
-      fn ->
-        Enum.each(others, fn other ->
-          :rpc.call(node.name, :erlang, :disconnect_node, [other.name])
-          :rpc.call(other.name, :erlang, :disconnect_node, [node.name])
-        end)
-
-        Process.sleep(100)
-        assert_partition_disconnected!(node, others)
-      end,
-      "partition should disconnect #{node.name}",
-      50,
-      100
-    )
-
-    # Stash state for the heal path.
-    Process.put({:partition_cookies, node.name}, cookie_state)
-
-    # Wait for majority side to elect leaders (2-of-3 quorum)
-    shards = :rpc.call(hd(others).name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    wait_for_leaders(others, shards, timeout: 10_000)
-
-    :ok
-  end
-
-  @doc """
-  Heals a network partition by reconnecting a node to the cluster.
-
-  Reconnects in both directions.
-  """
+  @doc "Heals a network partition by reconnecting a node to the cluster."
   @spec heal_partition(map(), [map()]) :: :ok
-  def heal_partition(node, all_nodes) do
-    others = Enum.reject(all_nodes, &(&1.name == node.name))
-
-    # Restore every peer-to-peer cookie we poisoned in partition_node/2.
-    node.name
-    |> restored_partition_cookies()
-    |> Enum.each(fn {from, to, cookie} ->
-      :rpc.call(from, :erlang, :set_cookie, [to, cookie])
-    end)
-
-    normalize_cluster_cookies(all_nodes)
-
-    # Reconnect from both sides — use erpc with short timeout to avoid blocking
-    connect = fn from, to ->
-      try do
-        :erpc.call(from, Node, :connect, [to], 2_000)
-      catch
-        _, _ -> false
-      end
-    end
-
-    Ferricstore.Test.ShardHelpers.eventually(
-      fn ->
-        Enum.each(others, fn other ->
-          connect.(other.name, node.name)
-          connect.(node.name, other.name)
-        end)
-
-        Process.sleep(200)
-        other_names = Enum.map(others, & &1.name)
-
-        node_peers =
-          case :rpc.call(node.name, :erlang, :nodes, [], 2_000) do
-            peers when is_list(peers) -> MapSet.new(peers)
-            _ -> MapSet.new()
-          end
-
-        peers_see_node? =
-          Enum.all?(others, fn other ->
-            case :rpc.call(other.name, :erlang, :nodes, [], 2_000) do
-              peers when is_list(peers) -> node.name in peers
-              _ -> false
-            end
-          end)
-
-        unless Enum.all?(other_names, &MapSet.member?(node_peers, &1)) and peers_see_node? do
-          seen = Enum.count(other_names, &MapSet.member?(node_peers, &1))
-          raise "#{node.name} sees #{seen}/#{length(others)} peers"
-        end
-
-        true
-      end,
-      "heal should reconnect #{node.name}",
-      40,
-      500
-    )
-
-    # Restart consensus on the healed node.
-    start_consensus(node.name)
-
-    # Resume ClusterManager on ALL nodes
-    Enum.each(all_nodes, fn n ->
-      cm_pid = :rpc.call(n.name, Process, :whereis, [Ferricstore.Cluster.Manager])
-      if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :resume, [cm_pid])
-    end)
-
-    :ok
-  end
-
-  defp assert_partition_disconnected!(node, others) do
-    other_names = Enum.map(others, & &1.name)
-
-    node_peers =
-      case :rpc.call(node.name, :erlang, :nodes, [], 2_000) do
-        peers when is_list(peers) -> peers
-        other -> raise "#{node.name} peer list unavailable: #{inspect(other)}"
-      end
-
-    if Enum.any?(other_names, &(&1 in node_peers)) do
-      raise "#{node.name} still sees partition peers #{inspect(node_peers)}"
-    end
-
-    Enum.each(others, fn other ->
-      peers =
-        case :rpc.call(other.name, :erlang, :nodes, [], 2_000) do
-          peers when is_list(peers) -> peers
-          value -> raise "#{other.name} peer list unavailable: #{inspect(value)}"
-        end
-
-      if node.name in peers do
-        raise "#{other.name} still sees partitioned node #{node.name}"
-      end
-    end)
-  end
-
-  defp restored_partition_cookies(node_name) do
-    case Process.get({:partition_cookies, node_name}) do
-      cookies when is_list(cookies) ->
-        cookies
-
-      _ ->
-        # Compatibility for failures left behind by older helper versions.
-        case Process.get({:partition_cookie, node_name}) do
-          cookie when is_atom(cookie) -> [{node_name, node_name, cookie}]
-          _ -> []
-        end
-    end
-  end
-
-  defp normalize_cluster_cookies(nodes) do
-    cookie = Node.get_cookie()
-
-    Enum.each(nodes, fn from ->
-      Enum.each(nodes, fn to ->
-        :rpc.call(from.name, :erlang, :set_cookie, [to.name, cookie])
-      end)
-    end)
-  end
-
+  def heal_partition(node, all_nodes), do: Ferricstore.Test.ClusterHelper.Partition.heal_partition(node, all_nodes)
   @doc """
   Runs a function on a specific FerricStore node via RPC.
 

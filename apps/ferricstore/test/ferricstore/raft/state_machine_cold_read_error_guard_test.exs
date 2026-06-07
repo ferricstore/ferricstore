@@ -1,10 +1,8 @@
 defmodule Ferricstore.Raft.StateMachineColdReadErrorGuardTest do
   use ExUnit.Case, async: true
 
-  @state_machine_path "lib/ferricstore/raft/state_machine.ex"
-
   test "state-machine batch cold reads report per-index NIF errors" do
-    source = File.read!(@state_machine_path)
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     for function <- [
           "cross_shard_read_cold_bitcask_values",

@@ -23,6 +23,7 @@ defmodule Ferricstore.Commands.Geo do
     * `GEOSEARCHSTORE destination source [same GEOSEARCH options]`
   """
 
+  alias Ferricstore.Commands.Geo.Parsing
   alias Ferricstore.Store.{CompoundKey, Ops, TypeRegistry}
 
   # Earth radius in meters (WGS-84 mean radius)
@@ -133,8 +134,8 @@ defmodule Ferricstore.Commands.Geo do
   # ---------------------------------------------------------------------------
 
   def handle("GEOADD", [key | rest], store) when rest != [] do
-    with {:ok, flags, coord_args} <- parse_geoadd_flags(rest),
-         {:ok, pairs} <- parse_lng_lat_members(coord_args) do
+    with {:ok, flags, coord_args} <- Parsing.parse_geoadd_flags(rest),
+         {:ok, pairs} <- Parsing.parse_lng_lat_members(coord_args) do
       do_geoadd(store, key, pairs, flags)
     end
   end
@@ -200,7 +201,7 @@ defmodule Ferricstore.Commands.Geo do
   # ---------------------------------------------------------------------------
 
   def handle("GEOSEARCH", [key | rest], store) do
-    with {:ok, opts} <- parse_geosearch_opts(rest),
+    with {:ok, opts} <- Parsing.parse_geosearch_opts(rest),
          {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
          {:ok, zset} <- read_zset(store, key) do
       do_geosearch(zset, center_lng, center_lat, opts)
@@ -216,7 +217,7 @@ defmodule Ferricstore.Commands.Geo do
   # ---------------------------------------------------------------------------
 
   def handle("GEOSEARCHSTORE", [destination, source | rest], store) do
-    with {:ok, opts} <- parse_geosearch_opts(rest),
+    with {:ok, opts} <- Parsing.parse_geosearch_opts(rest),
          {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
          {:ok, zset} <- read_zset(store, source) do
       matches = find_matching_members(zset, center_lng, center_lat, opts)
@@ -717,229 +718,6 @@ defmodule Ferricstore.Commands.Geo do
   defp deg_to_rad(deg), do: deg * :math.pi() / 180.0
 
   # ===========================================================================
-  # Private -- GEOADD parsing
-  # ===========================================================================
-
-  defp parse_geoadd_flags(args) do
-    {flags, rest} = take_geoadd_flags(args, [])
-
-    if :nx in flags and :xx in flags do
-      {:error, "ERR XX and NX options at the same time are not compatible"}
-    else
-      {:ok, flags, rest}
-    end
-  end
-
-  defp take_geoadd_flags(["NX" | rest], acc), do: take_geoadd_flags(rest, [:nx | acc])
-  defp take_geoadd_flags(["XX" | rest], acc), do: take_geoadd_flags(rest, [:xx | acc])
-  defp take_geoadd_flags(["CH" | rest], acc), do: take_geoadd_flags(rest, [:ch | acc])
-
-  defp take_geoadd_flags([opt | rest] = args, acc) when is_binary(opt) do
-    case String.upcase(opt) do
-      "NX" -> take_geoadd_flags(rest, [:nx | acc])
-      "XX" -> take_geoadd_flags(rest, [:xx | acc])
-      "CH" -> take_geoadd_flags(rest, [:ch | acc])
-      _not_option -> {acc, args}
-    end
-  end
-
-  defp take_geoadd_flags(rest, acc), do: {acc, rest}
-
-  defp parse_lng_lat_members(args), do: parse_lng_lat_members(args, [])
-
-  defp parse_lng_lat_members([], []) do
-    {:error, "ERR wrong number of arguments for 'geoadd' command"}
-  end
-
-  defp parse_lng_lat_members([], acc), do: {:ok, Enum.reverse(acc)}
-
-  defp parse_lng_lat_members([lng_str, lat_str, member | rest], acc) do
-    with {:ok, lng} <- parse_float(lng_str),
-         {:ok, lat} <- parse_float(lat_str) do
-      if valid_coordinates?(lng, lat) do
-        parse_lng_lat_members(rest, [{lng, lat, member} | acc])
-      else
-        {:error, "ERR invalid longitude,latitude pair #{lng_str},#{lat_str}"}
-      end
-    end
-  end
-
-  defp parse_lng_lat_members([_, _], _acc) do
-    {:error, "ERR wrong number of arguments for 'geoadd' command"}
-  end
-
-  defp parse_lng_lat_members([_], _acc) do
-    {:error, "ERR wrong number of arguments for 'geoadd' command"}
-  end
-
-  defp valid_coordinates?(lng, lat) do
-    lng >= -180.0 and lng <= 180.0 and lat >= -85.05112878 and lat <= 85.05112878
-  end
-
-  # ===========================================================================
-  # Private -- GEOSEARCH option parsing
-  # ===========================================================================
-
-  defp parse_geosearch_opts(args) do
-    parse_geosearch_opts(args, %{})
-  end
-
-  defp parse_geosearch_opts([], opts) do
-    cond do
-      not Map.has_key?(opts, :center) ->
-        {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
-
-      not Map.has_key?(opts, :shape) ->
-        {:error, "ERR exactly one of BYRADIUS or BYBOX must be provided"}
-
-      true ->
-        {:ok, opts}
-    end
-  end
-
-  defp parse_geosearch_opts([opt | rest], opts) do
-    case String.upcase(opt) do
-      "FROMLONLAT" ->
-        case rest do
-          [lng_str, lat_str | rest] ->
-            if Map.has_key?(opts, :center) do
-              {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
-            else
-              with {:ok, lng} <- parse_float(lng_str),
-                   {:ok, lat} <- parse_float(lat_str) do
-                parse_geosearch_opts(rest, Map.put(opts, :center, {:lonlat, lng, lat}))
-              end
-            end
-
-          _ ->
-            {:error, "ERR syntax error"}
-        end
-
-      "FROMMEMBER" ->
-        case rest do
-          [member | rest] ->
-            if Map.has_key?(opts, :center) do
-              {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
-            else
-              parse_geosearch_opts(rest, Map.put(opts, :center, {:member, member}))
-            end
-
-          _ ->
-            {:error, "ERR syntax error"}
-        end
-
-      "BYRADIUS" ->
-        case rest do
-          [radius_str, unit_str | rest] ->
-            parse_geosearch_radius(radius_str, unit_str, rest, opts)
-
-          _ ->
-            {:error, "ERR syntax error"}
-        end
-
-      "BYBOX" ->
-        case rest do
-          [width_str, height_str, unit_str | rest] ->
-            parse_geosearch_box(width_str, height_str, unit_str, rest, opts)
-
-          _ ->
-            {:error, "ERR syntax error"}
-        end
-
-      "ASC" ->
-        parse_geosearch_opts(rest, Map.put(opts, :sort, :asc))
-
-      "DESC" ->
-        parse_geosearch_opts(rest, Map.put(opts, :sort, :desc))
-
-      "COUNT" ->
-        case rest do
-          [count_str | rest] ->
-            parse_geosearch_count(count_str, rest, opts)
-
-          _ ->
-            {:error, "ERR syntax error"}
-        end
-
-      "WITHCOORD" ->
-        parse_geosearch_opts(rest, Map.put(opts, :withcoord, true))
-
-      "WITHDIST" ->
-        parse_geosearch_opts(rest, Map.put(opts, :withdist, true))
-
-      "WITHHASH" ->
-        parse_geosearch_opts(rest, Map.put(opts, :withhash, true))
-
-      _unknown ->
-        {:error, "ERR syntax error, unexpected '#{opt}'"}
-    end
-  end
-
-  defp parse_geosearch_radius(radius_str, unit_str, rest, opts) do
-    if Map.has_key?(opts, :shape) do
-      {:error, "ERR exactly one of BYRADIUS or BYBOX must be provided"}
-    else
-      unit = String.upcase(unit_str)
-
-      with {:ok, radius} <- parse_float(radius_str),
-           true <- unit in Map.keys(@unit_conversions) do
-        radius_m = radius * @unit_conversions[unit]
-
-        opts =
-          Map.merge(opts, %{shape: {:radius, radius_m}, unit: unit, raw_radius: radius})
-
-        parse_geosearch_opts(rest, opts)
-      else
-        false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
-        err -> err
-      end
-    end
-  end
-
-  defp parse_geosearch_box(width_str, height_str, unit_str, rest, opts) do
-    if Map.has_key?(opts, :shape) do
-      {:error, "ERR exactly one of BYRADIUS or BYBOX must be provided"}
-    else
-      unit = String.upcase(unit_str)
-
-      with {:ok, width} <- parse_float(width_str),
-           {:ok, height} <- parse_float(height_str),
-           true <- unit in Map.keys(@unit_conversions) do
-        width_m = width * @unit_conversions[unit]
-        height_m = height * @unit_conversions[unit]
-
-        opts =
-          Map.merge(opts, %{shape: {:box, width_m, height_m}, unit: unit})
-
-        parse_geosearch_opts(rest, opts)
-      else
-        false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
-        err -> err
-      end
-    end
-  end
-
-  defp parse_geosearch_count(count_str, rest, opts) do
-    case Integer.parse(count_str) do
-      {count, ""} when count > 0 ->
-        case rest do
-          [any | rest] when is_binary(any) ->
-            if String.upcase(any) == "ANY" do
-              parse_geosearch_opts(rest, Map.merge(opts, %{count: count, any: true}))
-            else
-              parse_geosearch_opts([any | rest], Map.merge(opts, %{count: count, any: false}))
-            end
-
-          _ ->
-            parse_geosearch_opts(rest, Map.merge(opts, %{count: count, any: false}))
-        end
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  # ===========================================================================
   # Private -- GEOSEARCH execution
   # ===========================================================================
 
@@ -1064,16 +842,4 @@ defmodule Ferricstore.Commands.Geo do
     :erlang.float_to_binary(dist * 1.0, [:compact, decimals: 4])
   end
 
-  defp parse_float(str) do
-    case Float.parse(str) do
-      {val, ""} ->
-        {:ok, val}
-
-      _ ->
-        case Integer.parse(str) do
-          {val, ""} -> {:ok, val * 1.0}
-          _ -> {:error, "ERR value is not a valid float"}
-        end
-    end
-  end
 end

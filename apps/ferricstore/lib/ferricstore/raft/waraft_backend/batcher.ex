@@ -11,6 +11,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   use GenServer
 
   alias Ferricstore.Raft.WARaftBackend.SyncGate
+  alias Ferricstore.Raft.WARaftBackend.Batcher.Telemetry
 
   @call_timeout 30_000
   @default_max_batch_size 10_000
@@ -591,7 +592,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
             Enum.zip(froms, replies)
             |> Enum.each(fn {from, reply} -> GenServer.reply(from, reply) end)
 
-            emit_flush_telemetry(state, prefix, slot, result, flush_started, flush_finished)
+            Telemetry.emit_flush_telemetry(state, prefix, slot, result, flush_started, flush_finished)
           end
 
           state
@@ -674,7 +675,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         result = safe_backend_call(:__commit_batch_direct__, [state.shard_index, commands])
         flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
-        emit_hot_flush_telemetry(state, :batch, slot, result, flush_started, flush_finished)
+        Telemetry.emit_hot_flush_telemetry(state, :batch, slot, result, flush_started, flush_finished)
       end
 
       %{state | batch_slot: nil}
@@ -698,7 +699,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         result = safe_backend_call(:__commit_put_batch_direct__, [state.shard_index, entries])
         flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
-        emit_hot_flush_telemetry(state, :put_batch, slot, result, flush_started, flush_finished)
+        Telemetry.emit_hot_flush_telemetry(state, :put_batch, slot, result, flush_started, flush_finished)
       end
 
       %{state | put_slot: nil}
@@ -723,7 +724,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
 
-        emit_hot_flush_telemetry(
+        Telemetry.emit_hot_flush_telemetry(
           state,
           :delete_batch,
           slot,
@@ -923,88 +924,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     end
   end
 
-  defp emit_flush_telemetry(state, prefix, slot, result, flush_started, flush_finished) do
-    measurements = flush_measurements(slot, flush_started, flush_finished, slot.count)
-    result = result_shape(result)
-
-    :telemetry.execute(
-      [:ferricstore, :waraft, :batcher, :slot_flush],
-      measurements,
-      %{
-        shard_index: state.shard_index,
-        prefix: prefix,
-        window_ms: slot.window_ms,
-        result: result
-      }
-    )
-
-    emit_quorum_submit_telemetry(state, measurements, result, slot.count)
-  end
-
-  defp result_shape({:ok, _replies}), do: :ok
-  defp result_shape({:error, reason}), do: {:error, reason}
-  defp result_shape(_other), do: :other
-
-  defp emit_hot_flush_telemetry(state, kind, slot, result, flush_started, flush_finished) do
-    measurements =
-      slot
-      |> flush_measurements(flush_started, flush_finished, slot.count)
-      |> Map.put(:group_count, length(slot.groups))
-
-    result = result_shape(result)
-
-    :telemetry.execute(
-      [:ferricstore, :waraft, :batcher, :hot_flush],
-      measurements,
-      %{
-        shard_index: state.shard_index,
-        kind: kind,
-        window_ms: slot.window_ms,
-        result: result
-      }
-    )
-
-    emit_quorum_submit_telemetry(state, measurements, result, length(slot.groups))
-  end
-
-  defp emit_quorum_submit_telemetry(state, measurements, result, caller_count) do
-    # Keep the product-level quorum metric stable while WARaft owns the backend.
-    # This fires once per flushed batch, so it preserves observability without
-    # adding per-command telemetry on the hot path.
-    :telemetry.execute(
-      [:ferricstore, :batcher, :quorum_submit],
-      measurements
-      |> Map.put(:caller_count, caller_count)
-      |> Map.put_new(:command_bytes, 0),
-      %{
-        backend: :waraft,
-        shard_index: state.shard_index,
-        kind: :batch,
-        status: quorum_submit_status(result)
-      }
-    )
-  end
-
-  defp quorum_submit_status(:ok), do: :ok
-  defp quorum_submit_status({:error, _reason}), do: :error
-  defp quorum_submit_status(_other), do: :unknown
-
-  defp flush_measurements(slot, flush_started, flush_finished, batch_size) do
-    queue_age_us = native_to_us(flush_started - slot.created_mono)
-    flush_duration_us = native_to_us(flush_finished - flush_started)
-    total_duration_us = native_to_us(flush_finished - slot.created_mono)
-
-    %{
-      batch_size: batch_size,
-      duration_us: total_duration_us,
-      queue_wait_us: queue_age_us,
-      queue_age_us: queue_age_us,
-      flush_duration_us: flush_duration_us,
-      total_duration_us: total_duration_us
-    }
-  end
-
-  defp native_to_us(value), do: System.convert_time_unit(value, :native, :microsecond)
 
   defp hot_batch_window_ms do
     Application.get_env(:ferricstore, :waraft_hot_batch_window_ms, @default_hot_batch_window_ms)
