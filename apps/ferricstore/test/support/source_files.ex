@@ -32,11 +32,11 @@ defmodule Ferricstore.Test.SourceFiles do
 
   @waraft_backend_sources [
     "../../lib/ferricstore/raft/waraft_backend.ex",
-    "../../lib/ferricstore/raft/waraft_backend/sections/part_01.ex",
-    "../../lib/ferricstore/raft/waraft_backend/sections/part_02.ex",
-    "../../lib/ferricstore/raft/waraft_backend/sections/part_03.ex",
-    "../../lib/ferricstore/raft/waraft_backend/sections/part_04.ex",
-    "../../lib/ferricstore/raft/waraft_backend/sections/part_05.ex"
+    "../../lib/ferricstore/raft/waraft_backend/sections/public_api.ex",
+    "../../lib/ferricstore/raft/waraft_backend/sections/commit_path.ex",
+    "../../lib/ferricstore/raft/waraft_backend/sections/startup.ex",
+    "../../lib/ferricstore/raft/waraft_backend/sections/leader_wait.ex",
+    "../../lib/ferricstore/raft/waraft_backend/sections/telemetry.ex"
   ]
 
   @waraft_segment_log_sources [
@@ -51,15 +51,15 @@ defmodule Ferricstore.Test.SourceFiles do
 
   @waraft_storage_sources [
     "../../lib/ferricstore/raft/waraft_storage.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_01.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_02.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_03.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_04.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_05.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_06.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_07.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_08.ex",
-    "../../lib/ferricstore/raft/waraft_storage/sections/part_09.ex"
+    "../../lib/ferricstore/raft/waraft_storage/sections/lifecycle.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/segment_project_commands.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/segment_projection.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/apply_result.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/recovery.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/metadata.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/projection_snapshot.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/snapshot_metadata.ex",
+    "../../lib/ferricstore/raft/waraft_storage/sections/snapshot_install.ex"
   ]
 
   @shard_compound_sources [
@@ -72,33 +72,33 @@ defmodule Ferricstore.Test.SourceFiles do
 
   @state_machine_sources [
     "../../lib/ferricstore/raft/state_machine.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_01.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_02.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_03.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_04.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_05.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_06.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_07.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_08.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_09.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_10.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_11.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_12.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_13.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_14.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_15.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_16.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_17.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_18.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_19.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_20.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_21.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_22.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_23.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_24.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_25.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_26.ex",
-    "../../lib/ferricstore/raft/state_machine/sections/part_27.ex"
+    "../../lib/ferricstore/raft/state_machine/sections/init.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/apply_dispatch.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/raft_callbacks.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/cross_shard_dispatch.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/cross_shard_reads.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/async_apply.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/compound_apply.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/cross_shard_pending.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_create.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_claim_due.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_claim_scan.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_claim_native_plan.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_transition.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_terminal.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_retention_state.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_retention_values.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_claim_indexes.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_claim_state_writes.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_history_writes.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_history_reads.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/flow_values.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/pending_writes.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/pending_locations.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/lmdb_projection.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/data_mutations.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/read_warm.ex",
+    "../../lib/ferricstore/raft/state_machine/sections/compound_indexes.ex"
   ]
 
   def router_source do

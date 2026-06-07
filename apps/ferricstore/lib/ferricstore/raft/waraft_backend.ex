@@ -56,9 +56,9 @@ defmodule Ferricstore.Raft.WARaftBackend do
   ]
 
 
-  use Ferricstore.Raft.WARaftBackend.Sections.Part01
-  use Ferricstore.Raft.WARaftBackend.Sections.Part02
-  use Ferricstore.Raft.WARaftBackend.Sections.Part03
-  use Ferricstore.Raft.WARaftBackend.Sections.Part04
-  use Ferricstore.Raft.WARaftBackend.Sections.Part05
+  use Ferricstore.Raft.WARaftBackend.Sections.PublicApi
+  use Ferricstore.Raft.WARaftBackend.Sections.CommitPath
+  use Ferricstore.Raft.WARaftBackend.Sections.Startup
+  use Ferricstore.Raft.WARaftBackend.Sections.LeaderWait
+  use Ferricstore.Raft.WARaftBackend.Sections.Telemetry
 end

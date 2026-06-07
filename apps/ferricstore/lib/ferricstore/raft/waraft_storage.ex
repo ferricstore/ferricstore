@@ -55,13 +55,13 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @type handle :: map()
 
 
-  use Ferricstore.Raft.WARaftStorage.Sections.Part01
-  use Ferricstore.Raft.WARaftStorage.Sections.Part02
-  use Ferricstore.Raft.WARaftStorage.Sections.Part03
-  use Ferricstore.Raft.WARaftStorage.Sections.Part04
-  use Ferricstore.Raft.WARaftStorage.Sections.Part05
-  use Ferricstore.Raft.WARaftStorage.Sections.Part06
-  use Ferricstore.Raft.WARaftStorage.Sections.Part07
-  use Ferricstore.Raft.WARaftStorage.Sections.Part08
-  use Ferricstore.Raft.WARaftStorage.Sections.Part09
+  use Ferricstore.Raft.WARaftStorage.Sections.Lifecycle
+  use Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands
+  use Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection
+  use Ferricstore.Raft.WARaftStorage.Sections.ApplyResult
+  use Ferricstore.Raft.WARaftStorage.Sections.Recovery
+  use Ferricstore.Raft.WARaftStorage.Sections.Metadata
+  use Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot
+  use Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata
+  use Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall
 end
