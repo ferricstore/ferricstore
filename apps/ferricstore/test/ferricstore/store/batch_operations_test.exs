@@ -2,9 +2,15 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Test.ShardHelpers
 
   @ns_batch "batch_test_batch"
   @ns_quorum "batch_test_quorum"
+
+  setup_all do
+    ShardHelpers.wait_default_pipeline_ready()
+    :ok
+  end
 
   setup do
     ctx = Ferricstore.Test.IsolatedInstance.checkout()

@@ -258,7 +258,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
   end
 
   test "Flow soak benchmark uses its memory guard budget without a required env flag" do
-    source = File.read!(Path.join(@repo_root, "bench/flow_state_lmdb_soak.exs"))
+    source = Ferricstore.Test.SourceFiles.flow_state_lmdb_soak_source()
 
     assert source =~ "app_memory_budget_bytes(max_total_mem_mb)"
     assert source =~ "FERRICSTORE_MAX_MEMORY"
@@ -266,7 +266,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
   end
 
   test "Flow soak benchmark defaults to product worker claim shape" do
-    source = File.read!(Path.join(@repo_root, "bench/flow_state_lmdb_soak.exs"))
+    source = Ferricstore.Test.SourceFiles.flow_state_lmdb_soak_source()
 
     # The production SDK worker path uses server-side BLOCK claims. A clean soak
     # run should exercise that same path instead of requiring NORMAL_* flags to
@@ -353,7 +353,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
   end
 
   test "Flow soak benchmark reports hidden WARaft batching and segment flags" do
-    source = File.read!(Path.join(@repo_root, "bench/flow_state_lmdb_soak.exs"))
+    source = Ferricstore.Test.SourceFiles.flow_state_lmdb_soak_source()
 
     assert source =~ "WARAFT_HOT_BATCH_WINDOW_MS"
     assert source =~ "FERRICSTORE_WARAFT_HOT_BATCH_WINDOW_MS"

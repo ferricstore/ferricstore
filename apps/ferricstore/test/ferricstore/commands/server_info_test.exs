@@ -5,15 +5,13 @@ defmodule Ferricstore.Commands.ServerInfoTest do
   alias Ferricstore.Commands.Server
   alias Ferricstore.Test.MockStore
 
-  @server_path Path.expand("../../../lib/ferricstore/commands/server.ex", __DIR__)
-
   # ---------------------------------------------------------------------------
   # INFO — default (all sections)
   # ---------------------------------------------------------------------------
 
   describe "INFO (all sections)" do
     test "keyspace expiry stats use the same HLC clock as expiry decisions" do
-      source = File.read!(@server_path)
+      source = Ferricstore.Test.SourceFiles.commands_server_source()
       [_before, rest] = String.split(source, "defp compute_expiry_stats", parts: 2)
       [body | _after] = String.split(rest, "\n  # INFO formatting helpers", parts: 2)
 

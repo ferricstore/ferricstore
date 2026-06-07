@@ -1,13 +1,10 @@
 defmodule Ferricstore.Store.PromotedCompactionColdGuardTest do
   use ExUnit.Case, async: true
 
-  @compound_path Path.expand(
-                   "../../../lib/ferricstore/store/shard/compound.ex",
-                   __DIR__
-                 )
+  @promoted_path Path.expand("../../../lib/ferricstore/store/shard/compound/promoted.ex", __DIR__)
 
   test "promoted compaction batches cold dedicated reads" do
-    source = File.read!(@compound_path)
+    source = File.read!(@promoted_path)
     [_before, section] = String.split(source, "def compact_dedicated", parts: 2)
     [compaction_section | _after] = String.split(section, "  @spec maybe_promote", parts: 2)
 

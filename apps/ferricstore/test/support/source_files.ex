@@ -30,6 +30,21 @@ defmodule Ferricstore.Test.SourceFiles do
     "../../lib/ferricstore/flow.ex"
   ]
 
+  @public_api_sources [
+    "../../lib/ferricstore.ex",
+    "../../lib/ferricstore/impl.ex"
+  ]
+
+  @commands_server_sources [
+    "../../lib/ferricstore/commands/server.ex",
+    "../../lib/ferricstore/commands/server/info.ex"
+  ]
+
+  @shard_ets_sources [
+    "../../lib/ferricstore/store/shard/ets.ex",
+    "../../lib/ferricstore/store/shard/ets/prefix_scan.ex"
+  ]
+
   @waraft_backend_sources [
     "../../lib/ferricstore/raft/waraft_backend.ex",
     "../../lib/ferricstore/raft/waraft_backend/sections/public_api.ex",
@@ -70,6 +85,14 @@ defmodule Ferricstore.Test.SourceFiles do
     "../../lib/ferricstore/store/shard/compound/support.ex"
   ]
 
+  @store_ops_sources [
+    "../../lib/ferricstore/store/ops.ex",
+    "../../lib/ferricstore/store/ops/compound.ex",
+    "../../lib/ferricstore/store/ops/flush.ex",
+    "../../lib/ferricstore/store/ops/local_read.ex",
+    "../../lib/ferricstore/store/ops/map_store.ex"
+  ]
+
   @state_machine_sources [
     "../../lib/ferricstore/raft/state_machine.ex",
     "../../lib/ferricstore/raft/state_machine/sections/init.ex",
@@ -106,11 +129,32 @@ defmodule Ferricstore.Test.SourceFiles do
   end
 
   def shard_source do
-    joined_source(@shard_sources)
+    joined_source_with_wildcards(@shard_sources, [
+      "../../lib/ferricstore/store/shard/*.ex",
+      "../../lib/ferricstore/store/shard/**/*.ex"
+    ])
   end
 
   def shard_compound_source do
     joined_source(@shard_compound_sources)
+  end
+
+  def shard_ets_source do
+    joined_source(@shard_ets_sources)
+  end
+
+  def store_ops_source do
+    joined_source(@store_ops_sources)
+  end
+
+  def public_api_source do
+    joined_source_with_wildcards(@public_api_sources, [
+      "../../lib/ferricstore/api/*.ex"
+    ])
+  end
+
+  def commands_server_source do
+    joined_source(@commands_server_sources)
   end
 
   def flow_source do
@@ -126,6 +170,24 @@ defmodule Ferricstore.Test.SourceFiles do
     |> Kernel.++(flow_paths)
     |> Enum.uniq()
     |> Enum.map_join("\n", &File.read!/1)
+  end
+
+  def flow_state_lmdb_soak_source do
+    joined_source_with_wildcards(["../../../../bench/flow_state_lmdb_soak.exs"], [
+      "../../../../bench/flow_state_lmdb_soak/**/*.exs"
+    ])
+  end
+
+  def bitcask_native_source do
+    joined_source_with_wildcards(["../../native/ferricstore_bitcask/src/lib.rs"], [
+      "../../native/ferricstore_bitcask/src/sections/*.rs"
+    ])
+  end
+
+  def resp_parser_source do
+    joined_source_with_wildcards(["../../native/resp_parser_nif/src/lib.rs"], [
+      "../../native/resp_parser_nif/src/sections/part_*.rs"
+    ])
   end
 
   def waraft_backend_source do
@@ -150,5 +212,22 @@ defmodule Ferricstore.Test.SourceFiles do
       |> Path.expand(__DIR__)
       |> File.read!()
     end)
+  end
+
+  defp joined_source_with_wildcards(paths, globs) do
+    explicit_paths = Enum.map(paths, &Path.expand(&1, __DIR__))
+
+    wildcard_paths =
+      globs
+      |> Enum.flat_map(fn glob ->
+        glob
+        |> Path.expand(__DIR__)
+        |> Path.wildcard()
+      end)
+      |> Enum.sort()
+
+    (explicit_paths ++ wildcard_paths)
+    |> Enum.uniq()
+    |> Enum.map_join("\n", &File.read!/1)
   end
 end

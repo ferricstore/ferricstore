@@ -156,10 +156,7 @@ defmodule Ferricstore.FlowWriteContractTest do
   end
 
   test "flow soak latency metrics are sampled without extra hot event counters" do
-    source =
-      "../../../../bench/flow_state_lmdb_soak.exs"
-      |> Path.expand(__DIR__)
-      |> File.read!()
+    source = Ferricstore.Test.SourceFiles.flow_state_lmdb_soak_source()
 
     assert source =~ "int_env(\"FLOW_LATENCY_SAMPLE_RATE\", 10)"
 

@@ -77,13 +77,7 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   end
 
   defp parser_supported_commands do
-    parser_path =
-      Path.expand(
-        "../../../../ferricstore/native/resp_parser_nif/src/lib.rs",
-        __DIR__
-      )
-
-    parser_source = File.read!(parser_path)
+    parser_source = Ferricstore.Test.SourceFiles.resp_parser_source()
 
     parser_ast_commands =
       parser_source

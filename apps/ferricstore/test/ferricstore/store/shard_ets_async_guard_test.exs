@@ -1,10 +1,8 @@
 defmodule Ferricstore.Store.ShardETSAsyncGuardTest do
   use ExUnit.Case, async: true
 
-  @ets_path Path.expand("../../../lib/ferricstore/store/shard/ets.ex", __DIR__)
-
   test "Shard ETS warm helpers use async cold reads" do
-    source = File.read!(@ets_path)
+    source = Ferricstore.Test.SourceFiles.shard_ets_source()
 
     # RMW and compound read helpers use these warm paths. Keep disk reads on the
     # async NIF path so a cold value does not block a Normal scheduler.

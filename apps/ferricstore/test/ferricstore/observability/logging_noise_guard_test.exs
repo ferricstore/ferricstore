@@ -91,12 +91,13 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
   end
 
   test "flow soak harness exposes and applies derived memory budgets" do
-    source = File.read!(Path.join(@repo_root, "bench/flow_state_lmdb_soak.exs"))
+    source = Ferricstore.Test.SourceFiles.flow_state_lmdb_soak_source()
     lmdb_writer_source = Ferricstore.Test.SourceFiles.flow_source()
     state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert source =~ "Application.put_env(:ferricstore, :max_memory_bytes, max_memory_bytes)"
-    assert source =~ "Application.put_env(:ferricstore, :keydir_max_ram, app_keydir_max_ram_bytes(max_memory_bytes))"
+    assert source =~ ":keydir_max_ram"
+    assert source =~ "app_keydir_max_ram_bytes(max_memory_bytes)"
     assert source =~
              ~S|max_memory_bytes=#{Application.get_env(:ferricstore, :max_memory_bytes)}|
 

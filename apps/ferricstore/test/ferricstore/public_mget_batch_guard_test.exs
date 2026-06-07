@@ -2,11 +2,10 @@ defmodule Ferricstore.PublicBatchReadGuardTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  @api_path Path.expand("../../lib/ferricstore.ex", __DIR__)
   @impl_path Path.expand("../../lib/ferricstore/impl.ex", __DIR__)
 
   test "public plain and compound multi-read APIs use router batch paths" do
-    api_source = File.read!(@api_path)
+    api_source = Ferricstore.Test.SourceFiles.public_api_source()
     impl_source = File.read!(@impl_path)
 
     # Public MGET is often used for cold large values. It must hit the

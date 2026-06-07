@@ -107,6 +107,10 @@ defmodule FerricstoreServer.Health.Endpoint do
     )
   end
 
+  @doc false
+  @spec observability_authorized?(term(), map()) :: boolean()
+  defdelegate observability_authorized?(peer, headers), to: Auth
+
   # ---------------------------------------------------------------------------
   # Ranch protocol callbacks
   # ---------------------------------------------------------------------------

@@ -4,8 +4,6 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
   @moduletag :guard
 
   @native_src Path.expand("../../native/ferricstore_bitcask/src", __DIR__)
-  @source Path.join(@native_src, "lib.rs")
-
   test "Bitcask Rust NIFs do not use dirty schedulers" do
     offenders =
       @native_src
@@ -29,7 +27,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
   end
 
   test "blocking Bitcask write/fsync NIFs stay on normal schedulers" do
-    source = File.read!(@source)
+    source = Ferricstore.Test.SourceFiles.bitcask_native_source()
 
     for function <- [
           "v2_append_record",
@@ -49,7 +47,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
   end
 
   test "blocking Bitcask cold-read and scan NIFs stay on normal schedulers" do
-    source = File.read!(@source)
+    source = Ferricstore.Test.SourceFiles.bitcask_native_source()
 
     for function <- [
           "v2_pread_at",
@@ -64,7 +62,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
   end
 
   test "async batch append does record encoding on Tokio blocking workers" do
-    source = File.read!(@source)
+    source = Ferricstore.Test.SourceFiles.bitcask_native_source()
     body = function_body(source, "v2_append_batch_async")
 
     [normal_scheduler_prefix, _blocking_worker_suffix] =
@@ -75,13 +73,13 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
   end
 
   test "async batch append submit stays on normal schedulers" do
-    source = File.read!(@source)
+    source = Ferricstore.Test.SourceFiles.bitcask_native_source()
 
     assert_nif_schedule(source, "v2_append_batch_async", "Normal")
   end
 
   test "async batch cold-read submit stays on normal schedulers" do
-    source = File.read!(@source)
+    source = Ferricstore.Test.SourceFiles.bitcask_native_source()
 
     for function <- [
           "v2_pread_batch_path_async",
@@ -93,7 +91,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
   end
 
   test "hot nosync batch append NIFs use small short-lived writer buffers" do
-    source = File.read!(@source)
+    source = Ferricstore.Test.SourceFiles.bitcask_native_source()
 
     for function <- [
           "v2_append_batch_nosync",

@@ -1,10 +1,8 @@
 defmodule Ferricstore.Store.CompactionTombstoneScanGuardTest do
   use ExUnit.Case, async: true
 
-  @shard_path "lib/ferricstore/store/shard.ex"
-
   test "lower tombstone dependency scan is newest-first and bounded by unresolved keys" do
-    source = File.read!(@shard_path)
+    source = Ferricstore.Test.SourceFiles.shard_source()
     [_before, section] = String.split(source, "defp scan_lower_tombstone_key_states", parts: 2)
     [function_source | _after] = String.split(section, "\n  defp tombstone_offsets", parts: 2)
 
@@ -19,7 +17,7 @@ defmodule Ferricstore.Store.CompactionTombstoneScanGuardTest do
   end
 
   test "lower tombstone dependency scan uses key-state metadata scan" do
-    source = File.read!(@shard_path)
+    source = Ferricstore.Test.SourceFiles.shard_source()
     [_before, section] = String.split(source, "defp scan_lower_tombstone_key_states", parts: 2)
     [function_source | _after] = String.split(section, "\n  defp tombstone_offsets", parts: 2)
 

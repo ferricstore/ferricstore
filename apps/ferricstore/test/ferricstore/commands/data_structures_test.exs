@@ -83,7 +83,8 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       checks = [
         {"lib/ferricstore/store/type_registry.ex", ~r/def get_type.*?case Ops\.get/s},
         {"lib/ferricstore/commands/json.ex", ~r/defp compound_type_marker\?.*?end/s},
-        {"lib/ferricstore/commands/bitmap.ex", ~r/defp compound_type_marker\?.*?end/s},
+        {"lib/ferricstore/commands/bitmap/destination.ex",
+         ~r/defp compound_type_marker\?.*?end/s},
         {"lib/ferricstore/commands/hyperloglog.ex", ~r/defp compound_type_marker\?.*?end/s}
       ]
 

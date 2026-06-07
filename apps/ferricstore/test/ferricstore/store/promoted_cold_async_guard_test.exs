@@ -1,11 +1,8 @@
 defmodule Ferricstore.Store.PromotedColdAsyncGuardTest do
   use ExUnit.Case, async: true
 
-  @compound_path Path.expand("../../../lib/ferricstore/store/shard/compound.ex", __DIR__)
-  @ops_path Path.expand("../../../lib/ferricstore/store/ops.ex", __DIR__)
-
   test "promoted compound cold reads use async pread" do
-    source = File.read!(@compound_path)
+    source = Ferricstore.Test.SourceFiles.shard_compound_source()
 
     # Promoted hashes/sets/zsets are the large-collection path. Their cold read
     # fallbacks must stay async and include the expected key, so stale ETS
@@ -18,7 +15,7 @@ defmodule Ferricstore.Store.PromotedColdAsyncGuardTest do
   end
 
   test "transaction promoted cold reads use async pread" do
-    source = File.read!(@ops_path)
+    source = Ferricstore.Test.SourceFiles.store_ops_source()
 
     assert source =~ "ColdRead.pread_keyed(path, off, key,",
            "expected transaction promoted cold reads to use keyed ColdRead.pread_keyed/4"
