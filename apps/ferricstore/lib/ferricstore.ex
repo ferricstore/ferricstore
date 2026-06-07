@@ -206,6 +206,7 @@ defmodule FerricStore do
   alias FerricStore.API.HyperLogLog, as: HyperLogLogAPI
   alias FerricStore.API.System, as: SystemAPI
 
+  @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | write_error()
   defdelegate set(key, value, opts \\ []), to: StringsAPI
   defdelegate get(key, opts \\ []), to: StringsAPI
   defdelegate del(key), to: StringsAPI
@@ -393,6 +394,7 @@ defmodule FerricStore do
   defdelegate pipeline(fun), to: SystemAPI
   defdelegate batch_get(keys), to: SystemAPI
   defdelegate packed_batch_get(packed_keys), to: SystemAPI
+  @spec batch_set([{binary(), binary()}]) :: [:ok | write_error()]
   defdelegate batch_set(kv_pairs), to: SystemAPI
   # ---------------------------------------------------------------------------
   # Flow API

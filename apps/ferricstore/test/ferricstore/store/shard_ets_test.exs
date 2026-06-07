@@ -9,6 +9,12 @@ defmodule Ferricstore.Store.ShardETSTest do
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
+  alias Ferricstore.Test.ShardHelpers
+
+  setup do
+    ShardHelpers.reset_memory_guard_pressure()
+    :ok
+  end
 
   test "fresh no-ttl location batch inserts records and batches binary accounting" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
