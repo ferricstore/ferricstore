@@ -222,8 +222,12 @@ defmodule Ferricstore.OperationalGuardTest do
     )
 
     assert_receive {:memory_pressure, :pressure}
-    assert Admission.reject_new_creates?()
-    assert Admission.status().reason == :rss_pressure
+
+    Utils.eventually(fn ->
+      assert Admission.reject_new_creates?()
+      assert Admission.status().reason == :rss_pressure
+    end, 1_000, 10)
+
     refute OperationalGuard.reject_flow_creates?()
   end
 
