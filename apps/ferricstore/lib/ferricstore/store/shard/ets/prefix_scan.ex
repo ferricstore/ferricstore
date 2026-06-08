@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
 
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BlobValue, ColdRead}
-  alias Ferricstore.Store.Shard.ETS
+  alias Ferricstore.Store.Shard.ETS.Accounting
 
   @cold_batch_read_timeout_ms 10_000
 
@@ -71,7 +71,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
 
           value == nil and shard_data_path != nil ->
             field = prefix_field(key)
-            file_path = ETS.file_path(shard_data_path, fid)
+            file_path = file_path(shard_data_path, fid)
             entry = {field, key, file_path, off}
             {[{:cold, cold_count} | tokens], {[entry | cold_entries], cold_count + 1}}
 
@@ -166,9 +166,9 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   def flow_history_cold_location?({:flow_history, file_id}, offset, value_size)
-       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
-              is_integer(value_size) and value_size >= 0,
-       do: true
+      when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+             is_integer(value_size) and value_size >= 0,
+      do: true
 
   def flow_history_cold_location?(_file_id, _offset, _value_size), do: false
 
@@ -392,8 +392,16 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
     do: delete_prefix_entry(state, keydir, key)
 
   def delete_prefix_entry(state, keydir, key) do
-    ETS.track_binary_delete(state, key)
+    Accounting.track_binary_delete(state, key)
     :ets.delete(keydir, key)
+  end
+
+  defp file_path(shard_path, {:flow_history, file_id}) do
+    Ferricstore.Flow.HistoryProjector.history_file_path(shard_path, file_id)
+  end
+
+  defp file_path(shard_path, file_id) do
+    Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
   end
 
   @doc false

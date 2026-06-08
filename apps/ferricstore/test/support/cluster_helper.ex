@@ -443,11 +443,14 @@ defmodule Ferricstore.Test.ClusterHelper do
 
   @doc "Simulates a network partition by disconnecting a node from all others."
   @spec partition_node(map(), [map()]) :: :ok
-  def partition_node(node, all_nodes), do: Ferricstore.Test.ClusterHelper.Partition.partition_node(node, all_nodes)
+  def partition_node(node, all_nodes),
+    do: Ferricstore.Test.ClusterHelper.Partition.partition_node(node, all_nodes)
 
   @doc "Heals a network partition by reconnecting a node to the cluster."
   @spec heal_partition(map(), [map()]) :: :ok
-  def heal_partition(node, all_nodes), do: Ferricstore.Test.ClusterHelper.Partition.heal_partition(node, all_nodes)
+  def heal_partition(node, all_nodes),
+    do: Ferricstore.Test.ClusterHelper.Partition.heal_partition(node, all_nodes)
+
   @doc """
   Runs a function on a specific FerricStore node via RPC.
 
@@ -468,7 +471,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec stop_consensus(atom()) :: :ok | term()
   def stop_consensus(node_name) do
-    :rpc.call(node_name, Ferricstore.Raft.WARaftBackend, :stop, [])
+    Ferricstore.Test.ClusterHelper.Consensus.stop_consensus(node_name)
   end
 
   @doc """
@@ -476,13 +479,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec start_consensus(atom()) :: :ok | term()
   def start_consensus(node_name) do
-    case :rpc.call(node_name, FerricStore.Instance, :get, [:default]) do
-      %FerricStore.Instance{} = ctx ->
-        :rpc.call(node_name, Ferricstore.Raft.WARaftBackend, :start, [ctx, []])
-
-      other ->
-        {:error, {:default_instance_unavailable, other}}
-    end
+    Ferricstore.Test.ClusterHelper.Consensus.start_consensus(node_name)
   end
 
   @doc """
@@ -502,13 +499,11 @@ defmodule Ferricstore.Test.ClusterHelper do
   def wait_for_leaders(nodes, shards, opts \\ [])
 
   def wait_for_leaders(nodes, shards, opts) when is_integer(shards) do
-    wait_for_leaders(nodes, 0..(shards - 1), opts)
+    Ferricstore.Test.ClusterHelper.Consensus.wait_for_leaders(nodes, shards, opts)
   end
 
   def wait_for_leaders(nodes, shard_range, opts) do
-    timeout = Keyword.get(opts, :timeout, 15_000)
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_leaders(nodes, shard_range, deadline)
+    Ferricstore.Test.ClusterHelper.Consensus.wait_for_leaders(nodes, shard_range, opts)
   end
 
   @doc """
@@ -519,9 +514,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   @spec wait_for_node_leaders(atom(), pos_integer(), keyword()) ::
           :ok | {:error, :timeout_waiting_for_leaders}
   def wait_for_node_leaders(node_name, shards, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, 15_000)
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_node_leaders(node_name, 0..(shards - 1), deadline)
+    Ferricstore.Test.ClusterHelper.Consensus.wait_for_node_leaders(node_name, shards, opts)
   end
 
   # ---------------------------------------------------------------------------
@@ -640,28 +633,6 @@ defmodule Ferricstore.Test.ClusterHelper do
       true ->
         Process.sleep(100)
         do_wait_leaders(nodes, shard_range, deadline)
-    end
-  end
-
-  defp do_wait_node_leaders(node_name, shard_range, deadline) do
-    all_ready =
-      Enum.all?(shard_range, fn shard ->
-        case members_on_node(node_name, shard) do
-          {:ok, _members, _leader} -> true
-          _ -> false
-        end
-      end)
-
-    cond do
-      all_ready ->
-        :ok
-
-      System.monotonic_time(:millisecond) > deadline ->
-        {:error, :timeout_waiting_for_leaders}
-
-      true ->
-        Process.sleep(100)
-        do_wait_node_leaders(node_name, shard_range, deadline)
     end
   end
 

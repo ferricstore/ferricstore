@@ -140,8 +140,7 @@ defmodule Ferricstore.Waiters do
   """
   @spec cleanup(pid()) :: :ok
   def cleanup(pid) do
-    :ets.match_delete(@table, {:_, pid, :_, :_})
-    :ok
+    Ferricstore.Waiters.Cleanup.cleanup(pid)
   end
 
   @doc """

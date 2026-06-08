@@ -198,8 +198,7 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS", "1")),
     flow_lmdb_flush_jitter_ms:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS", "250")),
-    flow_lmdb_flush_on_max_ops:
-      boolean_env.("FERRICSTORE_FLOW_LMDB_FLUSH_ON_MAX_OPS", false),
+    flow_lmdb_flush_on_max_ops: boolean_env.("FERRICSTORE_FLOW_LMDB_FLUSH_ON_MAX_OPS", false),
     flow_lmdb_max_concurrent_flushes:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
     flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),

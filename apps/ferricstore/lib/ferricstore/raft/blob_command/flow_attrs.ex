@@ -2,7 +2,7 @@ defmodule Ferricstore.Raft.BlobCommand.FlowAttrs do
   @moduledoc false
 
   alias Ferricstore.Flow
-  alias Ferricstore.Raft.BlobCommand
+  alias Ferricstore.Raft.BlobCommand.PayloadWriter
   alias Ferricstore.Store.BlobRef
 
   @flow_blob_value_ref_tag :ferricstore_flow_blob_value_ref
@@ -35,7 +35,11 @@ defmodule Ferricstore.Raft.BlobCommand.FlowAttrs do
 
         [_ | _] ->
           with {:ok, refs} <-
-                 BlobCommand.put_blob_payloads(data_dir, shard_index, Enum.reverse(external_payloads)) do
+                 PayloadWriter.put_blob_payloads(
+                   data_dir,
+                   shard_index,
+                   Enum.reverse(external_payloads)
+                 ) do
             {inflated_attrs, []} = inflate_flow_attrs_with_rest(prepared_attrs, refs)
             {:ok, inflated_attrs, true}
           end
@@ -52,7 +56,11 @@ defmodule Ferricstore.Raft.BlobCommand.FlowAttrs do
 
         [_ | _] ->
           with {:ok, refs} <-
-                 BlobCommand.put_blob_payloads(data_dir, shard_index, Enum.reverse(external_payloads)) do
+                 PayloadWriter.put_blob_payloads(
+                   data_dir,
+                   shard_index,
+                   Enum.reverse(external_payloads)
+                 ) do
             {inflated_attrs, []} = inflate_flow_named_value_attrs_with_rest(prepared_attrs, refs)
             {:ok, inflated_attrs, true}
           end
@@ -75,7 +83,7 @@ defmodule Ferricstore.Raft.BlobCommand.FlowAttrs do
   end
 
   def prepare_flow_attrs_placeholders(%{records: records} = attrs, threshold)
-       when is_list(records) do
+      when is_list(records) do
     with {:ok, prepared_shared, shared_external_payloads} <-
            prepare_flow_shared_attrs_placeholders(Map.get(attrs, :shared), threshold),
          {:ok, prepared_records, record_external_payloads} <-

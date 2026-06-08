@@ -23,11 +23,7 @@ defmodule Ferricstore.Commands.Stream.Waiters do
 
   @spec cleanup(pid()) :: :ok
   def cleanup(pid) do
-    if :ets.whereis(@stream_waiters_table) != :undefined do
-      :ets.match_delete(@stream_waiters_table, {:_, pid, :_, :_})
-    end
-
-    :ok
+    Ferricstore.Commands.Stream.WaiterCleanup.cleanup(pid)
   end
 
   @spec count(binary()) :: non_neg_integer()

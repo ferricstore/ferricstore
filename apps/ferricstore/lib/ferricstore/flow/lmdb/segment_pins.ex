@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.LMDB.SegmentPins do
   @moduledoc false
 
+  alias Ferricstore.Flow.LMDB.{Access, ValueLocator}
+
   @u64_decimal_zero_pad "00000000000000000000"
 
   def prefix, do: "flow-segment-value-pin:"
@@ -37,8 +39,7 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
                                 offset: offset,
                                 value_size: value_size
                               } ->
-        {:put, key,
-         Ferricstore.Flow.LMDB.encode_value_locator(expire_at_ms, file_id, offset, value_size)}
+        {:put, key, ValueLocator.encode(expire_at_ms, file_id, offset, value_size)}
       end)
 
     pin_ops =
@@ -159,9 +160,9 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
     |> Enum.reduce_while({:ok, []}, fn tag, {:ok, acc} ->
       result =
         if after_key == <<>> do
-          Ferricstore.Flow.LMDB.prefix_entries(path, prefix(tag), limit)
+          Access.prefix_entries(path, prefix(tag), limit)
         else
-          Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix(tag), after_key, limit)
+          Access.prefix_entries_after(path, prefix(tag), after_key, limit)
         end
 
       case result do

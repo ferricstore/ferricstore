@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.Codec do
   import Bitwise
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.Codec.Primitives
   alias Ferricstore.Flow.Codec.Support
 
   @history_tag :flow_history_v1
@@ -120,8 +121,16 @@ defmodule Ferricstore.Flow.Codec do
       encode_int(Map.get(record, :created_at_ms)),
       encode_int(Map.get(record, :updated_at_ms)),
       Support.encode_flagged_int(flags, @record_flag_attempts, Map.get(record, :attempts)),
-      Support.encode_flagged_int(flags, @record_flag_fencing_token, Map.get(record, :fencing_token)),
-      Support.encode_flagged_int(flags, @record_flag_next_run_at_ms, Map.get(record, :next_run_at_ms)),
+      Support.encode_flagged_int(
+        flags,
+        @record_flag_fencing_token,
+        Map.get(record, :fencing_token)
+      ),
+      Support.encode_flagged_int(
+        flags,
+        @record_flag_next_run_at_ms,
+        Map.get(record, :next_run_at_ms)
+      ),
       Support.encode_flagged_int(flags, @record_flag_priority, Map.get(record, :priority)),
       Support.encode_flagged_int(flags, @record_flag_ttl_ms, Map.get(record, :ttl_ms)),
       Support.encode_flagged_int(
@@ -144,16 +153,32 @@ defmodule Ferricstore.Flow.Codec do
         @record_flag_terminal_retention_until_ms,
         Map.get(record, :terminal_retention_until_ms)
       ),
-      Support.encode_flagged_bin(flags, @record_flag_partition_key, Map.get(record, :partition_key)),
+      Support.encode_flagged_bin(
+        flags,
+        @record_flag_partition_key,
+        Map.get(record, :partition_key)
+      ),
       Support.encode_flagged_bin(flags, @record_flag_payload_ref, Map.get(record, :payload_ref)),
-      Support.encode_flagged_bin(flags, @record_flag_parent_flow_id, Map.get(record, :parent_flow_id)),
+      Support.encode_flagged_bin(
+        flags,
+        @record_flag_parent_flow_id,
+        Map.get(record, :parent_flow_id)
+      ),
       Support.encode_flagged_bin(
         flags,
         @record_flag_parent_partition_key,
         Map.get(record, :parent_partition_key)
       ),
-      Support.encode_flagged_bin(flags, @record_flag_root_flow_id, Map.get(record, :root_flow_id)),
-      Support.encode_flagged_bin(flags, @record_flag_correlation_id, Map.get(record, :correlation_id)),
+      Support.encode_flagged_bin(
+        flags,
+        @record_flag_root_flow_id,
+        Map.get(record, :root_flow_id)
+      ),
+      Support.encode_flagged_bin(
+        flags,
+        @record_flag_correlation_id,
+        Map.get(record, :correlation_id)
+      ),
       Support.encode_flagged_bin(flags, @record_flag_result_ref, Map.get(record, :result_ref)),
       Support.encode_flagged_bin(flags, @record_flag_error_ref, Map.get(record, :error_ref)),
       Support.encode_flagged_bin(flags, @record_flag_lease_owner, Map.get(record, :lease_owner)),
@@ -174,14 +199,14 @@ defmodule Ferricstore.Flow.Codec do
     |> IO.iodata_to_binary()
   end
 
-@doc false
-def encode_value(value), do: Support.encode_value(value)
+  @doc false
+  def encode_value(value), do: Support.encode_value(value)
 
-@doc false
-def decode_value(value), do: Support.decode_value(value)
+  @doc false
+  def decode_value(value), do: Support.decode_value(value)
 
-@doc false
-def decode_value_with_user_size(value), do: Support.decode_value_with_user_size(value)
+  @doc false
+  def decode_value_with_user_size(value), do: Support.decode_value_with_user_size(value)
 
   @doc false
   # Flow has not shipped as a public durable format yet, so recovery accepts
@@ -457,7 +482,10 @@ def decode_value_with_user_size(value), do: Support.decode_value_with_user_size(
       Support.encode_flagged_bin(flags, @history_flag_result_ref, result_ref),
       Support.encode_flagged_bin(flags, @history_flag_error_ref, error_ref),
       Support.encode_flagged_bin(flags, @history_flag_rewound_to_event_id, rewound_to_event_id),
-      if((flags &&& @history_flag_meta) != 0, do: Support.encode_history_meta(meta_fields), else: [])
+      if((flags &&& @history_flag_meta) != 0,
+        do: Support.encode_history_meta(meta_fields),
+        else: []
+      )
     ]
     |> IO.iodata_to_binary()
   end
@@ -502,7 +530,10 @@ def decode_value_with_user_size(value), do: Support.decode_value_with_user_size(
     |> Support.maybe_put_flag(@history_flag_payload_ref, Support.nonempty_binary?(payload_ref))
     |> Support.maybe_put_flag(@history_flag_result_ref, Support.nonempty_binary?(result_ref))
     |> Support.maybe_put_flag(@history_flag_error_ref, Support.nonempty_binary?(error_ref))
-    |> Support.maybe_put_flag(@history_flag_rewound_to_event_id, Support.nonempty_binary?(rewound_to_event_id))
+    |> Support.maybe_put_flag(
+      @history_flag_rewound_to_event_id,
+      Support.nonempty_binary?(rewound_to_event_id)
+    )
     |> Support.maybe_put_flag(@history_flag_meta, is_list(meta_fields) and meta_fields != [])
   end
 
@@ -885,107 +916,10 @@ def decode_value_with_user_size(value), do: Support.decode_value_with_user_size(
     end
   end
 
-  def encode_int(value) when is_integer(value) and value >= 0 and value < 127,
-    do: <<value + 1>>
-
-  def encode_int(value) when is_integer(value) and value >= 0, do: encode_varint(value + 1)
-
-  def encode_int(_value), do: <<0>>
-
-  def decode_int(<<0, rest::binary>>), do: {:ok, nil, rest}
-
-  def decode_int(<<encoded, rest::binary>>) when encoded < 128,
-    do: {:ok, encoded - 1, rest}
-
-  def decode_int(binary) do
-    with {:ok, encoded, rest} <- decode_varint(binary) do
-      case encoded do
-        0 -> {:ok, nil, rest}
-        value -> {:ok, value - 1, rest}
-      end
-    end
-  end
-
-  def encode_bin(value) when is_binary(value) and byte_size(value) < 127,
-    do: [<<byte_size(value) + 1>>, value]
-
-  def encode_bin(value) when is_binary(value),
-    do: [encode_varint(byte_size(value) + 1), value]
-
-  def encode_bin(_value), do: <<0>>
-
-  def decode_bin(<<0, rest::binary>>), do: {:ok, nil, rest}
-
-  def decode_bin(<<encoded, rest::binary>>) when encoded < 128 do
-    len = encoded - 1
-
-    case rest do
-      <<value::binary-size(len), tail::binary>> -> {:ok, value, tail}
-      _ -> :error
-    end
-  end
-
-  def decode_bin(binary) do
-    with {:ok, encoded, rest} <- decode_varint(binary) do
-      case encoded do
-        0 ->
-          {:ok, nil, rest}
-
-        size when size > 0 ->
-          len = size - 1
-
-          case rest do
-            <<value::binary-size(len), tail::binary>> -> {:ok, value, tail}
-            _ -> :error
-          end
-      end
-    end
-  end
+  def encode_int(value), do: Primitives.encode_int(value)
+  def decode_int(value), do: Primitives.decode_int(value)
+  def encode_bin(value), do: Primitives.encode_bin(value)
+  def decode_bin(value), do: Primitives.decode_bin(value)
 
   def flow_record_value_refs(record), do: Support.flow_record_value_refs(record)
-
-  defp encode_varint(value) when value < 128, do: <<value>>
-
-  defp encode_varint(value) when value < 16_384 do
-    <<(value &&& 0x7F) ||| 0x80, value >>> 7>>
-  end
-
-  defp encode_varint(value) when value < 2_097_152 do
-    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80, value >>> 14>>
-  end
-
-  defp encode_varint(value) when value < 268_435_456 do
-    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80,
-      (value >>> 14 &&& 0x7F) ||| 0x80, value >>> 21>>
-  end
-
-  defp encode_varint(value) when value < 34_359_738_368 do
-    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80,
-      (value >>> 14 &&& 0x7F) ||| 0x80, (value >>> 21 &&& 0x7F) ||| 0x80, value >>> 28>>
-  end
-
-  defp encode_varint(value) when value < 4_398_046_511_104 do
-    <<(value &&& 0x7F) ||| 0x80, (value >>> 7 &&& 0x7F) ||| 0x80,
-      (value >>> 14 &&& 0x7F) ||| 0x80, (value >>> 21 &&& 0x7F) ||| 0x80,
-      (value >>> 28 &&& 0x7F) ||| 0x80, value >>> 35>>
-  end
-
-  defp encode_varint(value) when value >= 128 do
-    <<(value &&& 0x7F) ||| 0x80>> <> encode_varint(value >>> 7)
-  end
-
-  defp decode_varint(binary), do: decode_varint(binary, 0, 0)
-
-  defp decode_varint(<<byte, rest::binary>>, acc, shift) when shift < 70 do
-    value = acc ||| (byte &&& 0x7F) <<< shift
-
-    if (byte &&& 0x80) == 0 do
-      {:ok, value, rest}
-    else
-      decode_varint(rest, value, shift + 7)
-    end
-  end
-
-  defp decode_varint(_binary, _acc, _shift), do: :error
-
 end

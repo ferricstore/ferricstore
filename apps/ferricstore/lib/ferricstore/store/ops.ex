@@ -17,7 +17,7 @@ defmodule Ferricstore.Store.Ops do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
   alias Ferricstore.Store.Ops.Compound, as: CompoundOps
-  alias Ferricstore.Store.Ops.{Flush, LocalRead, MapStore}
+  alias Ferricstore.Store.Ops.{Delete, Flush, LocalRead, MapStore}
 
   @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
   @max_int64 9_223_372_036_854_775_807
@@ -155,9 +155,14 @@ defmodule Ferricstore.Store.Ops do
 
           nil ->
             case ShardETS.ets_lookup(tx.shard_state, key) do
-              {:hit, value, _exp} -> LocalRead.stored_value_size(value)
-              {:cold, fid, off, vsize, _exp} -> LocalRead.local_cold_value_size(tx, key, fid, off, vsize)
-              _ -> nil
+              {:hit, value, _exp} ->
+                LocalRead.stored_value_size(value)
+
+              {:cold, fid, off, vsize, _exp} ->
+                LocalRead.local_cold_value_size(tx, key, fid, off, vsize)
+
+              _ ->
+                nil
             end
         end
     end
@@ -304,21 +309,7 @@ defmodule Ferricstore.Store.Ops do
   end
 
   @spec delete(store(), binary()) :: :ok
-  def delete(%FerricStore.Instance{} = ctx, key), do: Router.delete(ctx, key)
-
-  def delete(%LocalTxStore{} = tx, key) do
-    if LocalRead.local?(tx, key) do
-      ShardETS.ets_delete_key(tx.shard_state, key)
-      LocalRead.tx_drop_pending(key)
-      LocalRead.tx_mark_deleted(key)
-      send(self(), {:tx_pending_delete, key})
-      :ok
-    else
-      Router.delete(tx.instance_ctx, key)
-    end
-  end
-
-  def delete(store, key) when is_map(store), do: store.delete.(key)
+  def delete(store, key), do: Delete.delete(store, key)
 
   @spec exists?(store(), binary()) :: boolean()
   def exists?(%FerricStore.Instance{} = ctx, key), do: Router.exists?(ctx, key)
@@ -604,58 +595,67 @@ defmodule Ferricstore.Store.Ops do
   def has_compound?(%LocalTxStore{}), do: true
   def has_compound?(store) when is_map(store), do: is_map_key(store, :compound_get)
 
-# --- Compound key operations ---
+  # --- Compound key operations ---
 
-def compound_get(store, redis_key, compound_key),
-  do: CompoundOps.compound_get(store, redis_key, compound_key)
+  def compound_get(store, redis_key, compound_key),
+    do: CompoundOps.compound_get(store, redis_key, compound_key)
 
-def compound_batch_get(store, redis_key, compound_keys),
-  do: CompoundOps.compound_batch_get(store, redis_key, compound_keys)
+  def compound_batch_get(store, redis_key, compound_keys),
+    do: CompoundOps.compound_batch_get(store, redis_key, compound_keys)
 
-def compound_get_meta(store, redis_key, compound_key),
-  do: CompoundOps.compound_get_meta(store, redis_key, compound_key)
+  def compound_get_meta(store, redis_key, compound_key),
+    do: CompoundOps.compound_get_meta(store, redis_key, compound_key)
 
-def compound_batch_get_meta(store, redis_key, compound_keys),
-  do: CompoundOps.compound_batch_get_meta(store, redis_key, compound_keys)
+  def compound_batch_get_meta(store, redis_key, compound_keys),
+    do: CompoundOps.compound_batch_get_meta(store, redis_key, compound_keys)
 
-def compound_put(store, redis_key, compound_key, value, exp),
-  do: CompoundOps.compound_put(store, redis_key, compound_key, value, exp)
+  def compound_put(store, redis_key, compound_key, value, exp),
+    do: CompoundOps.compound_put(store, redis_key, compound_key, value, exp)
 
-def compound_batch_put(store, redis_key, entries),
-  do: CompoundOps.compound_batch_put(store, redis_key, entries)
+  def compound_batch_put(store, redis_key, entries),
+    do: CompoundOps.compound_batch_put(store, redis_key, entries)
 
-def compound_delete(store, redis_key, compound_key),
-  do: CompoundOps.compound_delete(store, redis_key, compound_key)
+  def compound_delete(store, redis_key, compound_key),
+    do: CompoundOps.compound_delete(store, redis_key, compound_key)
 
-def compound_batch_delete(store, redis_key, compound_keys),
-  do: CompoundOps.compound_batch_delete(store, redis_key, compound_keys)
+  def compound_batch_delete(store, redis_key, compound_keys),
+    do: CompoundOps.compound_batch_delete(store, redis_key, compound_keys)
 
-def compound_scan(store, redis_key, prefix),
-  do: CompoundOps.compound_scan(store, redis_key, prefix)
+  def compound_scan(store, redis_key, prefix),
+    do: CompoundOps.compound_scan(store, redis_key, prefix)
 
-def compound_fields(store, redis_key, prefix),
-  do: CompoundOps.compound_fields(store, redis_key, prefix)
+  def compound_fields(store, redis_key, prefix),
+    do: CompoundOps.compound_fields(store, redis_key, prefix)
 
-def compound_count(store, redis_key, prefix),
-  do: CompoundOps.compound_count(store, redis_key, prefix)
+  def compound_count(store, redis_key, prefix),
+    do: CompoundOps.compound_count(store, redis_key, prefix)
 
-def zset_score_range(store, redis_key, min_bound, max_bound, reverse?),
-  do: CompoundOps.zset_score_range(store, redis_key, min_bound, max_bound, reverse?)
+  def zset_score_range(store, redis_key, min_bound, max_bound, reverse?),
+    do: CompoundOps.zset_score_range(store, redis_key, min_bound, max_bound, reverse?)
 
-def zset_score_range_slice(store, redis_key, min_bound, max_bound, reverse?, offset, count),
-  do: CompoundOps.zset_score_range_slice(store, redis_key, min_bound, max_bound, reverse?, offset, count)
+  def zset_score_range_slice(store, redis_key, min_bound, max_bound, reverse?, offset, count),
+    do:
+      CompoundOps.zset_score_range_slice(
+        store,
+        redis_key,
+        min_bound,
+        max_bound,
+        reverse?,
+        offset,
+        count
+      )
 
-def zset_score_count(store, redis_key, min_bound, max_bound),
-  do: CompoundOps.zset_score_count(store, redis_key, min_bound, max_bound)
+  def zset_score_count(store, redis_key, min_bound, max_bound),
+    do: CompoundOps.zset_score_count(store, redis_key, min_bound, max_bound)
 
-def zset_rank_range(store, redis_key, start_idx, stop_idx, reverse?),
-  do: CompoundOps.zset_rank_range(store, redis_key, start_idx, stop_idx, reverse?)
+  def zset_rank_range(store, redis_key, start_idx, stop_idx, reverse?),
+    do: CompoundOps.zset_rank_range(store, redis_key, start_idx, stop_idx, reverse?)
 
-def zset_member_rank(store, redis_key, member, reverse?),
-  do: CompoundOps.zset_member_rank(store, redis_key, member, reverse?)
+  def zset_member_rank(store, redis_key, member, reverse?),
+    do: CompoundOps.zset_member_rank(store, redis_key, member, reverse?)
 
-def compound_delete_prefix(store, redis_key, prefix),
-  do: CompoundOps.compound_delete_prefix(store, redis_key, prefix)
+  def compound_delete_prefix(store, redis_key, prefix),
+    do: CompoundOps.compound_delete_prefix(store, redis_key, prefix)
 
   # --- Prob operations ---
 
@@ -694,8 +694,12 @@ def compound_delete_prefix(store, redis_key, prefix),
   @spec on_push(store(), binary(), non_neg_integer()) :: [pid()] | pid() | nil
   def on_push(store, key, count \\ 1) do
     case store do
-      %FerricStore.Instance{} -> Ferricstore.Waiters.notify_push(key, count)
-      %LocalTxStore{} -> Ferricstore.Waiters.notify_push(key, count)
+      %FerricStore.Instance{} ->
+        Ferricstore.Waiters.notify_push(key, count)
+
+      %LocalTxStore{} ->
+        Ferricstore.Waiters.notify_push(key, count)
+
       store when is_map(store) ->
         case store[:on_push] do
           fun when is_function(fun, 2) -> fun.(key, count)
@@ -704,5 +708,4 @@ def compound_delete_prefix(store, redis_key, prefix),
         end
     end
   end
-
 end

@@ -3,7 +3,7 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   import Bitwise
 
-  alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.Codec.Primitives
 
   @value_bin_magic "FSV2"
   @record_value_refs_key "__value_refs__"
@@ -99,11 +99,11 @@ defmodule Ferricstore.Flow.Codec.Support do
   def nonempty_binary?(value), do: is_binary(value) and value != ""
 
   def encode_flagged_int(flags, flag, value) do
-    if (flags &&& flag) != 0, do: Codec.encode_int(value), else: []
+    if (flags &&& flag) != 0, do: Primitives.encode_int(value), else: []
   end
 
   def encode_flagged_bin(flags, flag, value) do
-    if (flags &&& flag) != 0, do: Codec.encode_bin(value), else: []
+    if (flags &&& flag) != 0, do: Primitives.encode_bin(value), else: []
   end
 
   @doc false
@@ -176,13 +176,14 @@ defmodule Ferricstore.Flow.Codec.Support do
   def encode_history_meta([]), do: <<1>>
 
   def encode_history_meta(fields) do
-    [Codec.encode_int(length(fields)), Enum.map(fields, &encode_history_meta_pair/1)]
+    [Primitives.encode_int(length(fields)), Enum.map(fields, &encode_history_meta_pair/1)]
   end
 
-  def encode_history_meta_pair({key, value}), do: [Codec.encode_bin(key), Codec.encode_bin(value)]
+  def encode_history_meta_pair({key, value}),
+    do: [Primitives.encode_bin(key), Primitives.encode_bin(value)]
 
   def decode_history_meta(rest) do
-    with {:ok, count, rest} <- Codec.decode_int(rest) do
+    with {:ok, count, rest} <- Primitives.decode_int(rest) do
       decode_history_meta_pairs(count, rest, [])
     end
   end
@@ -190,8 +191,8 @@ defmodule Ferricstore.Flow.Codec.Support do
   def decode_history_meta_pairs(0, rest, acc), do: {:ok, Enum.reverse(acc), rest}
 
   def decode_history_meta_pairs(count, rest, acc) when is_integer(count) and count > 0 do
-    with {:ok, key, rest} <- Codec.decode_bin(rest),
-         {:ok, value, rest} <- Codec.decode_bin(rest) do
+    with {:ok, key, rest} <- Primitives.decode_bin(rest),
+         {:ok, value, rest} <- Primitives.decode_bin(rest) do
       decode_history_meta_pairs(count - 1, rest, [{key, value} | acc])
     end
   end
@@ -208,15 +209,15 @@ defmodule Ferricstore.Flow.Codec.Support do
   def normalize_history_decoded_meta(_fields), do: []
 
   def encode_child_groups(groups) when is_map(groups) and map_size(groups) == 0,
-    do: Codec.encode_bin("J{}")
+    do: Primitives.encode_bin("J{}")
 
   def encode_child_groups(groups) when is_map(groups) do
     ["J", Jason.encode!(groups)]
     |> IO.iodata_to_binary()
-    |> Codec.encode_bin()
+    |> Primitives.encode_bin()
   end
 
-  def encode_child_groups(_groups), do: Codec.encode_bin("J{}")
+  def encode_child_groups(_groups), do: Primitives.encode_bin("J{}")
 
   def encode_record_sidecar(record) when is_map(record) do
     child_groups =
@@ -321,7 +322,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   def value_ref_binary(_value), do: nil
 
   def decode_child_groups(binary) do
-    with {:ok, encoded, rest} <- Codec.decode_bin(binary),
+    with {:ok, encoded, rest} <- Primitives.decode_bin(binary),
          {:ok, decoded} <- decode_child_groups_payload(encoded) do
       {:ok, decoded, rest}
     end

@@ -1,13 +1,10 @@
 defmodule Ferricstore.Commands.Stream.Info do
   @moduledoc false
 
-  alias Ferricstore.Commands.Stream
   alias Ferricstore.Commands.Stream.{Entries, Groups, Meta}
 
   @spec stream(binary(), map()) :: map() | {:error, binary()}
   def stream(key, store) do
-    Stream.ensure_meta_table()
-
     with :ok <- Meta.ensure_read_type(key, store) do
       case Meta.entries(key, store) do
         [] ->
@@ -34,7 +31,9 @@ defmodule Ferricstore.Commands.Stream.Info do
 
     {first_raw, last_raw} =
       if first != "0-0" do
-        [first_raw, last_raw] = Entries.batch_get(store, key, [Entries.entry_key(key, first), last_key])
+        [first_raw, last_raw] =
+          Entries.batch_get(store, key, [Entries.entry_key(key, first), last_key])
+
         {first_raw, last_raw}
       else
         [last_raw] = Entries.batch_get(store, key, [last_key])

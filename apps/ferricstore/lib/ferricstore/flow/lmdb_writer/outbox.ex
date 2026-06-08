@@ -41,10 +41,10 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
         |> :ets.tab2list()
         |> Enum.flat_map(fn
           {seq, _state_key, _version} ->
-          case :ets.take(tid, seq) do
-            [entry] -> [entry]
-            _ -> []
-          end
+            case :ets.take(tid, seq) do
+              [entry] -> [entry]
+              _ -> []
+            end
 
           _marker ->
             []

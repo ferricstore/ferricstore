@@ -65,4 +65,3 @@ config :junit_formatter,
   print_report_file: true,
   include_filename?: true,
   use_project_subdirectory?: true
-

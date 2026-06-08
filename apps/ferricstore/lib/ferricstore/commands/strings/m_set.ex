@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.Strings.MSet do
   @moduledoc false
 
-  alias Ferricstore.Commands.Strings
+  alias Ferricstore.Commands.Strings.Compound
   alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
@@ -82,7 +82,7 @@ defmodule Ferricstore.Commands.Strings.MSet do
   defp mset_needs_compound_cleanup?([], _store), do: false
 
   defp mset_needs_compound_cleanup?([k, _v | rest], store) do
-    Strings.compound_data_structure_key?(k, store) or mset_needs_compound_cleanup?(rest, store)
+    Compound.data_structure_key?(k, store) or mset_needs_compound_cleanup?(rest, store)
   end
 
   defp mset_pairs([]), do: []
@@ -109,7 +109,7 @@ defmodule Ferricstore.Commands.Strings.MSet do
   defp mset_exec_sequential_replace([], _store, _replaced_keys), do: :ok
 
   defp mset_exec_sequential_replace([k, v | rest], store, replaced_keys) do
-    case Strings.replace_string_key(k, v, 0, store) do
+    case Compound.replace_string_key(k, v, 0, store) do
       :ok -> mset_exec_sequential_replace(rest, store, [k | replaced_keys])
       {:error, _} = err -> {err, replaced_keys}
     end
@@ -146,7 +146,7 @@ defmodule Ferricstore.Commands.Strings.MSet do
   defp backup_compound_entries(key, type, store) do
     entries =
       key
-      |> Strings.compound_prefixes_for_type(type)
+      |> Compound.prefixes_for_type(type)
       |> Enum.flat_map(&scan_compound_entries(&1, key, store))
 
     maybe_add_list_meta_entry(entries, key, type, store)
@@ -190,7 +190,7 @@ defmodule Ferricstore.Commands.Strings.MSet do
   end
 
   defp restore_string_key_backup({key, plain_meta, compound_backup}, store) do
-    with :ok <- Strings.clear_compound_data_structure(key, store),
+    with :ok <- Compound.clear_data_structure(key, store),
          :ok <- restore_plain_string_backup(key, plain_meta, store),
          :ok <- restore_compound_backup(key, compound_backup, store) do
       :ok
@@ -219,7 +219,7 @@ defmodule Ferricstore.Commands.Strings.MSet do
   defp msetnx_any_exists?([], _store), do: false
 
   defp msetnx_any_exists?([k, _v | rest], store) do
-    if Ops.exists?(store, k) or Strings.compound_data_structure_key?(k, store),
+    if Ops.exists?(store, k) or Compound.data_structure_key?(k, store),
       do: true,
       else: msetnx_any_exists?(rest, store)
   end

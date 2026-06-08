@@ -8,7 +8,7 @@ defmodule Ferricstore.Raft.BlobCommand do
   protocol before followers can apply refs without the original payload.
   """
 
-  alias Ferricstore.Raft.BlobCommand.FlowAttrs
+  alias Ferricstore.Raft.BlobCommand.{FlowAttrs, PayloadWriter}
   alias Ferricstore.Store.{BlobRef, BlobStore, BlobValue, CompoundKey}
 
   @flow_blob_value_ref_tag :ferricstore_flow_blob_value_ref
@@ -394,9 +394,14 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp command_candidate?({command, _key, attrs}, threshold)
        when is_atom(command) and is_map(attrs) do
     cond do
-      FlowAttrs.flow_named_value_command?(command) -> FlowAttrs.flow_named_value_attrs_candidate?(attrs, threshold)
-      FlowAttrs.flow_value_command?(command) -> FlowAttrs.flow_attrs_candidate?(attrs, threshold)
-      true -> false
+      FlowAttrs.flow_named_value_command?(command) ->
+        FlowAttrs.flow_named_value_attrs_candidate?(attrs, threshold)
+
+      FlowAttrs.flow_value_command?(command) ->
+        FlowAttrs.flow_attrs_candidate?(attrs, threshold)
+
+      true ->
+        false
     end
   end
 
@@ -552,7 +557,11 @@ defmodule Ferricstore.Raft.BlobCommand do
       when is_atom(command) and is_map(attrs) ->
         cond do
           FlowAttrs.flow_named_value_command?(command) ->
-            case FlowAttrs.prepare_generic_flow_named_value_attrs(attrs, threshold, external_payloads) do
+            case FlowAttrs.prepare_generic_flow_named_value_attrs(
+                   attrs,
+                   threshold,
+                   external_payloads
+                 ) do
               {:ok, prepared_attrs, external_payloads} ->
                 {:cont, {:ok, [{command, key, prepared_attrs} | acc], external_payloads}}
 
@@ -710,7 +719,9 @@ defmodule Ferricstore.Raft.BlobCommand do
         {command, key, attrs}, refs when is_atom(command) and is_map(attrs) ->
           cond do
             FlowAttrs.flow_named_value_command?(command) ->
-              {inflated_attrs, refs} = FlowAttrs.inflate_flow_named_value_attrs_with_rest(attrs, refs)
+              {inflated_attrs, refs} =
+                FlowAttrs.inflate_flow_named_value_attrs_with_rest(attrs, refs)
+
               {{command, key, inflated_attrs}, refs}
 
             FlowAttrs.flow_value_command?(command) ->
@@ -745,14 +756,13 @@ defmodule Ferricstore.Raft.BlobCommand do
 
   defp prepare_value(data_dir, shard_index, threshold, value) do
     if externalize?(value, threshold) do
-      with {:ok, ref} <- put_blob_payload(data_dir, shard_index, value) do
+      with {:ok, ref} <- PayloadWriter.put_blob_payload(data_dir, shard_index, value) do
         {:ok, {BlobRef.encode!(ref), :blob_ref}}
       end
     else
       {:ok, {value, :value}}
     end
   end
-
 
   defp externalize?(value, threshold) do
     byte_size(value) >= threshold or BlobRef.ref?(value)
@@ -778,43 +788,8 @@ defmodule Ferricstore.Raft.BlobCommand do
     :ok
   end
 
-  defp put_blob_payload(data_dir, shard_index, payload) do
-    if collect_protection?(data_dir, shard_index) do
-      with {:ok, ref, token} <- BlobStore.put_protected(data_dir, shard_index, payload) do
-        collect_protection(token)
-        {:ok, ref}
-      end
-    else
-      BlobStore.put(data_dir, shard_index, payload)
-    end
-  end
-
   def put_blob_payloads(data_dir, shard_index, payloads) do
-    if collect_protection?(data_dir, shard_index) do
-      with {:ok, refs, token} <- BlobStore.put_many_protected(data_dir, shard_index, payloads) do
-        collect_protection(token)
-        {:ok, refs}
-      end
-    else
-      BlobStore.put_many(data_dir, shard_index, payloads)
-    end
-  end
-
-  defp collect_protection?(data_dir, shard_index) do
-    match?({^data_dir, ^shard_index, _tokens}, Process.get(@protection_key))
-  end
-
-  defp collect_protection(nil), do: :ok
-
-  defp collect_protection(token) do
-    case Process.get(@protection_key) do
-      {data_dir, shard_index, tokens} ->
-        Process.put(@protection_key, {data_dir, shard_index, [token | tokens]})
-        :ok
-
-      _other ->
-        BlobStore.unprotect(token)
-    end
+    PayloadWriter.put_blob_payloads(data_dir, shard_index, payloads)
   end
 
   defp compound_blob_side_channel_key?(<<"H:", _rest::binary>>), do: true

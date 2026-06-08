@@ -105,8 +105,8 @@ defmodule Ferricstore.Waiters.Monitor do
   end
 
   defp cleanup_waiters(pid) do
-    Ferricstore.Waiters.cleanup(pid)
-    Ferricstore.Commands.Stream.cleanup_stream_waiters(pid)
-    Ferricstore.Flow.ClaimWaiters.cleanup(pid)
+    Ferricstore.Waiters.Cleanup.cleanup(pid)
+    Ferricstore.Commands.Stream.WaiterCleanup.cleanup(pid)
+    Ferricstore.Flow.ClaimWaiters.Cleanup.cleanup(pid)
   end
 end

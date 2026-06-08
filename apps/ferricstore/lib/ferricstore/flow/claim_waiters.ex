@@ -104,14 +104,7 @@ defmodule Ferricstore.Flow.ClaimWaiters do
 
   @spec cleanup(pid()) :: :ok
   def cleanup(pid) when is_pid(pid) do
-    if :ets.whereis(@table) != :undefined do
-      :ets.match_delete(@table, {:_, pid, :_, :_, :_})
-      :ets.match_delete(@table, {:_, pid, :_, :_})
-    end
-
-    prune_scheduled_ready_without_waiters()
-
-    :ok
+    Ferricstore.Flow.ClaimWaiters.Cleanup.cleanup(pid)
   end
 
   @spec notify_ready(binary(), term(), term(), term(), pos_integer()) :: non_neg_integer()

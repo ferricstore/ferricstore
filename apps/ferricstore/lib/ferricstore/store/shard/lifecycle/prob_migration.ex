@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbMigration do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.Shard.Lifecycle
+  alias Ferricstore.Store.Shard.ETS.Accounting
 
   require Logger
 
@@ -106,7 +106,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbMigration do
         # No ETS entry — write a metadata marker
         meta = build_prob_meta(type, path, key)
         meta_bin = :erlang.term_to_binary(meta)
-        Lifecycle.track_binary_add(shard_index, key, meta_bin, instance_ctx)
+        Accounting.track_binary_add(shard_index, key, meta_bin, instance_ctx)
         :ets.insert(keydir, {key, meta_bin, 0, 0, 0, 0, byte_size(meta_bin)})
         count + 1
     end

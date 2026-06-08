@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
   alias Ferricstore.HLC
+  alias Ferricstore.Store.Shard.ETS.Accounting
   alias Ferricstore.Store.Shard.ETS.PrefixScan
 
   alias Ferricstore.Store.{
@@ -559,26 +560,25 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Prefix-based ETS helpers (replaces O(N) :ets.foldl full-table scans)
   # -------------------------------------------------------------------
 
-@spec prefix_scan_entries(map() | :ets.tid(), binary(), binary() | nil) :: [
-        {binary(), binary()}
-      ]
-@doc false
-def prefix_scan_entries(state_or_keydir, prefix, shard_data_path),
-  do: PrefixScan.prefix_scan_entries(state_or_keydir, prefix, shard_data_path)
+  @spec prefix_scan_entries(map() | :ets.tid(), binary(), binary() | nil) :: [
+          {binary(), binary()}
+        ]
+  @doc false
+  def prefix_scan_entries(state_or_keydir, prefix, shard_data_path),
+    do: PrefixScan.prefix_scan_entries(state_or_keydir, prefix, shard_data_path)
 
-@spec prefix_scan_fields(map() | :ets.tid(), binary()) :: [binary()]
-@doc false
-def prefix_scan_fields(state_or_keydir, prefix),
-  do: PrefixScan.prefix_scan_fields(state_or_keydir, prefix)
+  @spec prefix_scan_fields(map() | :ets.tid(), binary()) :: [binary()]
+  @doc false
+  def prefix_scan_fields(state_or_keydir, prefix),
+    do: PrefixScan.prefix_scan_fields(state_or_keydir, prefix)
 
-@spec prefix_count_entries(map() | :ets.tid(), binary()) :: non_neg_integer()
-@doc false
-def prefix_count_entries(state_or_keydir, prefix),
-  do: PrefixScan.prefix_count_entries(state_or_keydir, prefix)
+  @spec prefix_count_entries(map() | :ets.tid(), binary()) :: non_neg_integer()
+  @doc false
+  def prefix_count_entries(state_or_keydir, prefix),
+    do: PrefixScan.prefix_count_entries(state_or_keydir, prefix)
 
-@doc false
-def prefix_collect_keys(keydir, prefix), do: PrefixScan.prefix_collect_keys(keydir, prefix)
-
+  @doc false
+  def prefix_collect_keys(keydir, prefix), do: PrefixScan.prefix_collect_keys(keydir, prefix)
 
   # -------------------------------------------------------------------
   # Integer / float coercion — delegates to shared ValueCodec
@@ -741,37 +741,11 @@ def prefix_collect_keys(keydir, prefix), do: PrefixScan.prefix_collect_keys(keyd
   end
 
   # Tracks bytes removed for delete. Must be called BEFORE :ets.delete.
-  def track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state, key)
-       when ref != nil do
-    previous = :ets.lookup(state.keydir, key)
-    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), 0)
-
-    bytes =
-      case previous do
-        [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
-        _ -> 0
-      end
-
-    if bytes > 0, do: :atomics.sub(ref, idx + 1, bytes)
-  end
-
-  def track_binary_delete(_, _), do: :ok
+  def track_binary_delete(state, key), do: Accounting.track_binary_delete(state, key)
 
   # Tracks bytes removed for delete when value is already known (avoids extra lookup).
-  def track_binary_delete(
-         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state,
-         key,
-         value
-       )
-       when ref != nil do
-    previous = :ets.lookup(state.keydir, key)
-    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), 0)
-
-    bytes = offheap_size(key) + offheap_size(value)
-    if bytes > 0, do: :atomics.sub(ref, idx + 1, bytes)
-  end
-
-  def track_binary_delete(_, _, _), do: :ok
+  def track_binary_delete(state, key, value),
+    do: Accounting.track_binary_delete(state, key, value)
 
   # Tracks bytes added when warming a cold key (nil -> value).
   defp track_binary_cold_to_warm(

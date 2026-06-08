@@ -1,10 +1,12 @@
 defmodule Ferricstore.Flow.LMDB.TerminalCounts do
   @moduledoc false
 
+  alias Ferricstore.Flow.LMDB.{Access, IndexCodec}
+
   @terminal_count_cache :ferricstore_flow_lmdb_terminal_count_cache
 
   def terminal_count(path, state_index_key) when is_binary(path) and is_binary(state_index_key) do
-    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+    count_key = IndexCodec.terminal_count_key(state_index_key)
 
     case cached_count_key(path, count_key) do
       {:ok, count} -> {:ok, count}
@@ -14,7 +16,7 @@ defmodule Ferricstore.Flow.LMDB.TerminalCounts do
 
   def terminal_counts(path, state_index_keys)
       when is_binary(path) and is_list(state_index_keys) do
-    count_keys = Enum.map(state_index_keys, &Ferricstore.Flow.LMDB.terminal_count_key/1)
+    count_keys = Enum.map(state_index_keys, &IndexCodec.terminal_count_key/1)
 
     if count_keys == [] do
       {:ok, []}
@@ -96,11 +98,11 @@ defmodule Ferricstore.Flow.LMDB.TerminalCounts do
 
   def put_terminal_count(path, state_index_key, count)
       when is_binary(path) and is_binary(state_index_key) and is_integer(count) and count >= 0 do
-    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+    count_key = IndexCodec.terminal_count_key(state_index_key)
 
-    case Ferricstore.Flow.LMDB.write_batch(
+    case Access.write_batch(
            path,
-           [{:put, count_key, Ferricstore.Flow.LMDB.encode_count(count)}]
+           [{:put, count_key, IndexCodec.encode_count(count)}]
          ) do
       :ok ->
         put_cached_count_key(path, count_key, count)
@@ -112,9 +114,9 @@ defmodule Ferricstore.Flow.LMDB.TerminalCounts do
   end
 
   def read_count_key(path, count_key) do
-    case Ferricstore.Flow.LMDB.get(path, count_key) do
+    case Access.get(path, count_key) do
       {:ok, blob} ->
-        case Ferricstore.Flow.LMDB.decode_count(blob) do
+        case IndexCodec.decode_count(blob) do
           {:ok, count} -> count
           :error -> 0
         end
@@ -125,9 +127,9 @@ defmodule Ferricstore.Flow.LMDB.TerminalCounts do
   end
 
   defp count_key_uncached(path, count_key) do
-    case Ferricstore.Flow.LMDB.get(path, count_key) do
+    case Access.get(path, count_key) do
       {:ok, blob} ->
-        case Ferricstore.Flow.LMDB.decode_count(blob) do
+        case IndexCodec.decode_count(blob) do
           {:ok, count} -> {:ok, count}
           :error -> :not_found
         end
@@ -143,12 +145,12 @@ defmodule Ferricstore.Flow.LMDB.TerminalCounts do
   defp count_keys_uncached(_path, []), do: {:ok, []}
 
   defp count_keys_uncached(path, count_keys) do
-    case Ferricstore.Flow.LMDB.get_many(path, count_keys) do
+    case Access.get_many(path, count_keys) do
       {:ok, results} ->
         counts =
           Enum.map(results, fn
             {:ok, blob} ->
-              case Ferricstore.Flow.LMDB.decode_count(blob) do
+              case IndexCodec.decode_count(blob) do
                 {:ok, count} -> {:cache, count}
                 :error -> :missing
               end

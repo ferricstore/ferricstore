@@ -240,10 +240,9 @@ defmodule Ferricstore.Flow.RecordRead do
   end
 
   def root_record(ctx, root_flow_id, partition_key) do
-    case Ferricstore.Flow.get(ctx, root_flow_id, partition_key: partition_key) do
-      {:ok, %{root_flow_id: ^root_flow_id} = record} -> {:ok, record}
-      {:ok, nil} -> {:ok, nil}
-      {:ok, _record} -> {:ok, nil}
+    case RecordLoader.records_for_ids(ctx, [root_flow_id], partition_key) do
+      {:ok, [%{root_flow_id: ^root_flow_id} = record | _rest]} -> {:ok, record}
+      {:ok, _records} -> {:ok, nil}
       {:error, _reason} = error -> error
     end
   end

@@ -425,7 +425,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def name(shard_index), do: Ferricstore.Flow.LMDBWriter.Registry.name(shard_index)
 
-  def name(:default, shard_index), do: Ferricstore.Flow.LMDBWriter.Registry.name(:default, shard_index)
+  def name(:default, shard_index),
+    do: Ferricstore.Flow.LMDBWriter.Registry.name(:default, shard_index)
 
   def name(instance_name, shard_index) do
     Ferricstore.Flow.LMDBWriter.Registry.name(instance_name, shard_index)
@@ -480,11 +481,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
     state = %{state | durable_index: durable_index, requested_index: durable_index}
 
-    # Do not create the LMDB directory here. The default supervisor starts these
-    # writers before WARaft publishes initial storage metadata, and even an empty
-    # directory makes WARaft treat fresh storage as non-empty. Application start
-    # creates idle LMDB dirs after WARaft is ready; real writes also create/open
-    # LMDB lazily through the NIF path.
     EnqueueControl.maybe_mark_lost_enqueue(state.instance_ctx, shard_index, lost_enqueue)
 
     {:ok, state}
@@ -708,7 +704,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  defp timer_flush_decision(state), do: Ferricstore.Flow.LMDBWriter.Timer.timer_flush_decision(state)
+  defp timer_flush_decision(state),
+    do: Ferricstore.Flow.LMDBWriter.Timer.timer_flush_decision(state)
 
   defp timer_flush_decision(state, now),
     do: Ferricstore.Flow.LMDBWriter.Timer.timer_flush_decision(state, now)
@@ -962,7 +959,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
     do: Ferricstore.Flow.LMDBWriter.Telemetry.record_flush_failure(instance_ctx, shard_index)
 
   def mark_mirror_degraded(instance_ctx, shard_index, reason),
-    do: Ferricstore.Flow.LMDBWriter.Telemetry.mark_mirror_degraded(instance_ctx, shard_index, reason)
+    do:
+      Ferricstore.Flow.LMDBWriter.Telemetry.mark_mirror_degraded(
+        instance_ctx,
+        shard_index,
+        reason
+      )
 
   def emit_backlog(state, now), do: Ferricstore.Flow.LMDBWriter.Telemetry.emit_backlog(state, now)
 
@@ -993,5 +995,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
         op_count
       )
 
-  defp pending_age_us(state, now), do: Ferricstore.Flow.LMDBWriter.Telemetry.pending_age_us(state, now)
+  defp pending_age_us(state, now),
+    do: Ferricstore.Flow.LMDBWriter.Telemetry.pending_age_us(state, now)
 end

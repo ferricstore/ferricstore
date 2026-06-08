@@ -1,7 +1,7 @@
 defmodule Ferricstore.Test.ClusterHelper.Partition do
   @moduledoc false
 
-  alias Ferricstore.Test.ClusterHelper
+  alias Ferricstore.Test.ClusterHelper.Consensus
 
   @spec partition_node(map(), [map()]) :: :ok
   def partition_node(node, all_nodes) do
@@ -12,7 +12,7 @@ defmodule Ferricstore.Test.ClusterHelper.Partition do
       if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :suspend, [cm_pid])
     end)
 
-    ClusterHelper.stop_consensus(node.name)
+    Consensus.stop_consensus(node.name)
 
     cookie_state =
       Enum.flat_map(others, fn other ->
@@ -49,7 +49,7 @@ defmodule Ferricstore.Test.ClusterHelper.Partition do
     Process.put({:partition_cookies, node.name}, cookie_state)
 
     shards = :rpc.call(hd(others).name, Application, :get_env, [:ferricstore, :shard_count, 4])
-    ClusterHelper.wait_for_leaders(others, shards, timeout: 10_000)
+    Consensus.wait_for_leaders(others, shards, timeout: 10_000)
 
     :ok
   end
@@ -110,7 +110,7 @@ defmodule Ferricstore.Test.ClusterHelper.Partition do
       500
     )
 
-    ClusterHelper.start_consensus(node.name)
+    Consensus.start_consensus(node.name)
 
     Enum.each(all_nodes, fn n ->
       cm_pid = :rpc.call(n.name, Process, :whereis, [Ferricstore.Cluster.Manager])

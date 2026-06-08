@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.Strings.GetEx do
   @moduledoc false
 
   alias Ferricstore.CommandTime
-  alias Ferricstore.Commands.Strings
+  alias Ferricstore.Commands.Strings.Compound
   alias Ferricstore.Store.Ops
 
   def do_getex(key, opts, store) do
@@ -13,7 +13,7 @@ defmodule Ferricstore.Commands.Strings.GetEx do
   end
 
   def getex_parsed(key, expire_at_ms, store) do
-    case Strings.ensure_string_key(key, store) do
+    case Compound.ensure_string_key(key, store) do
       :ok -> Ops.getex(store, key, expire_at_ms)
       {:error, _} = error -> error
     end

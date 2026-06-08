@@ -3,7 +3,8 @@ defmodule Ferricstore.Store.Ops.Flush do
 
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.Ops.Compound, as: CompoundOps
+  alias Ferricstore.Store.Ops.Delete, as: DeleteOps
   alias Ferricstore.Store.Router
 
   def flush(ctx) do
@@ -77,49 +78,51 @@ defmodule Ferricstore.Store.Ops.Flush do
   defp flush_key(store, key) do
     type_key = CompoundKey.type_key(key)
 
-    case Ops.compound_get(store, key, type_key) do
+    case CompoundOps.compound_get(store, key, type_key) do
       "hash" ->
         run_flush_steps(key, [
-          fn -> Ops.compound_delete_prefix(store, key, CompoundKey.hash_prefix(key)) end,
-          fn -> Ops.compound_delete(store, key, type_key) end
+          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.hash_prefix(key)) end,
+          fn -> CompoundOps.compound_delete(store, key, type_key) end
         ])
 
       "list" ->
         run_flush_steps(key, [
-          fn -> Ops.compound_delete_prefix(store, key, CompoundKey.list_prefix(key)) end,
-          fn -> Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)) end,
-          fn -> Ops.compound_delete(store, key, type_key) end,
-          fn -> Ops.delete(store, key) end
+          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.list_prefix(key)) end,
+          fn -> CompoundOps.compound_delete(store, key, CompoundKey.list_meta_key(key)) end,
+          fn -> CompoundOps.compound_delete(store, key, type_key) end,
+          fn -> DeleteOps.delete(store, key) end
         ])
 
       "set" ->
         run_flush_steps(key, [
-          fn -> Ops.compound_delete_prefix(store, key, CompoundKey.set_prefix(key)) end,
-          fn -> Ops.compound_delete(store, key, type_key) end
+          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.set_prefix(key)) end,
+          fn -> CompoundOps.compound_delete(store, key, type_key) end
         ])
 
       "zset" ->
         run_flush_steps(key, [
-          fn -> Ops.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key)) end,
-          fn -> Ops.compound_delete(store, key, type_key) end
+          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key)) end,
+          fn -> CompoundOps.compound_delete(store, key, type_key) end
         ])
 
       "stream" ->
         run_flush_steps(key, [
-          fn -> Ops.compound_delete_prefix(store, key, "X:" <> key <> <<0>>) end,
-          fn -> Ops.compound_delete_prefix(store, key, CompoundKey.stream_group_prefix(key)) end,
-          fn -> Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key)) end,
-          fn -> Ops.compound_delete(store, key, type_key) end,
-          fn -> Ops.delete(store, key) end
+          fn -> CompoundOps.compound_delete_prefix(store, key, "X:" <> key <> <<0>>) end,
+          fn ->
+            CompoundOps.compound_delete_prefix(store, key, CompoundKey.stream_group_prefix(key))
+          end,
+          fn -> CompoundOps.compound_delete(store, key, CompoundKey.stream_meta_key(key)) end,
+          fn -> CompoundOps.compound_delete(store, key, type_key) end,
+          fn -> DeleteOps.delete(store, key) end
         ])
 
       nil ->
-        Ops.delete(store, key)
+        DeleteOps.delete(store, key)
 
       _unknown ->
         run_flush_steps(key, [
-          fn -> Ops.compound_delete(store, key, type_key) end,
-          fn -> Ops.delete(store, key) end
+          fn -> CompoundOps.compound_delete(store, key, type_key) end,
+          fn -> DeleteOps.delete(store, key) end
         ])
     end
   end

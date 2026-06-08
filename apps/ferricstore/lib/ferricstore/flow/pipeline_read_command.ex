@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
   @moduledoc false
 
   alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.{InfoAPI, ReadAPI}
   alias Ferricstore.Store.Router
 
   @default_max_count 10_000
@@ -33,21 +34,21 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
   end
 
   def command(ctx, {:list, type, opts}) when is_binary(type) and is_list(opts),
-    do: read_result(fn -> Ferricstore.Flow.list(ctx, type, opts) end)
+    do: read_result(fn -> ReadAPI.list(ctx, type, opts) end)
 
   def command(ctx, {:flow_list, type, opts}) do
     command(ctx, {:list, type, opts})
   end
 
   def command(ctx, {:terminals, type, opts}) when is_binary(type) and is_list(opts),
-    do: read_result(fn -> Ferricstore.Flow.terminals(ctx, type, opts) end)
+    do: read_result(fn -> ReadAPI.terminals(ctx, type, opts) end)
 
   def command(ctx, {:flow_terminals, type, opts}) do
     command(ctx, {:terminals, type, opts})
   end
 
   def command(ctx, {:failures, type, opts}) when is_binary(type) and is_list(opts),
-    do: read_result(fn -> Ferricstore.Flow.failures(ctx, type, opts) end)
+    do: read_result(fn -> ReadAPI.failures(ctx, type, opts) end)
 
   def command(ctx, {:flow_failures, type, opts}) do
     command(ctx, {:failures, type, opts})
@@ -55,7 +56,7 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
 
   def command(ctx, {:by_parent, parent_flow_id, opts})
       when is_binary(parent_flow_id) and is_list(opts),
-      do: read_result(fn -> Ferricstore.Flow.by_parent(ctx, parent_flow_id, opts) end)
+      do: read_result(fn -> ReadAPI.by_parent(ctx, parent_flow_id, opts) end)
 
   def command(ctx, {:flow_by_parent, parent_flow_id, opts}) do
     command(ctx, {:by_parent, parent_flow_id, opts})
@@ -63,7 +64,7 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
 
   def command(ctx, {:by_root, root_flow_id, opts})
       when is_binary(root_flow_id) and is_list(opts),
-      do: read_result(fn -> Ferricstore.Flow.by_root(ctx, root_flow_id, opts) end)
+      do: read_result(fn -> ReadAPI.by_root(ctx, root_flow_id, opts) end)
 
   def command(ctx, {:flow_by_root, root_flow_id, opts}) do
     command(ctx, {:by_root, root_flow_id, opts})
@@ -71,21 +72,21 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
 
   def command(ctx, {:by_correlation, correlation_id, opts})
       when is_binary(correlation_id) and is_list(opts),
-      do: read_result(fn -> Ferricstore.Flow.by_correlation(ctx, correlation_id, opts) end)
+      do: read_result(fn -> ReadAPI.by_correlation(ctx, correlation_id, opts) end)
 
   def command(ctx, {:flow_by_correlation, correlation_id, opts}) do
     command(ctx, {:by_correlation, correlation_id, opts})
   end
 
   def command(ctx, {:info, type, opts}) when is_binary(type) and is_list(opts),
-    do: read_result(fn -> Ferricstore.Flow.info(ctx, type, opts) end)
+    do: read_result(fn -> InfoAPI.info(ctx, type, opts) end)
 
   def command(ctx, {:flow_info, type, opts}) do
     command(ctx, {:info, type, opts})
   end
 
   def command(ctx, {:stuck, type, opts}) when is_binary(type) and is_list(opts),
-    do: read_result(fn -> Ferricstore.Flow.stuck(ctx, type, opts) end)
+    do: read_result(fn -> ReadAPI.stuck(ctx, type, opts) end)
 
   def command(ctx, {:flow_stuck, type, opts}) do
     command(ctx, {:stuck, type, opts})

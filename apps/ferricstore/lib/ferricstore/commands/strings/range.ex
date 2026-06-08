@@ -1,14 +1,14 @@
 defmodule Ferricstore.Commands.Strings.Range do
   @moduledoc false
 
-  alias Ferricstore.Commands.Strings
+  alias Ferricstore.Commands.Strings.Compound
   alias Ferricstore.Store.Ops
 
   def getrange_parsed(key, start_idx, end_idx, store) do
     case metadata_value_size(store, key) do
       size when is_integer(size) ->
         if getrange_empty_for_size?(size, start_idx, end_idx) do
-          if Strings.compound_data_structure_key?(key, store),
+          if Compound.data_structure_key?(key, store),
             do: {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
             else: ""
         else
@@ -33,7 +33,7 @@ defmodule Ferricstore.Commands.Strings.Range do
   defp read_getrange_value(key, start_idx, end_idx, store) do
     case Ops.getrange(store, key, start_idx, end_idx) do
       nil ->
-        if Strings.compound_data_structure_key?(key, store),
+        if Compound.data_structure_key?(key, store),
           do: {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
           else: ""
 

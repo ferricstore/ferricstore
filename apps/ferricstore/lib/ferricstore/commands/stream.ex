@@ -44,6 +44,7 @@ defmodule Ferricstore.Commands.Stream do
   alias Ferricstore.Commands.Stream.Index
   alias Ferricstore.Commands.Stream.Meta
   alias Ferricstore.Commands.Stream.Mutations
+  alias Ferricstore.Commands.Stream.Tables
   alias Ferricstore.Commands.Stream.Waiters
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
@@ -55,10 +56,6 @@ defmodule Ferricstore.Commands.Stream do
   @type entry :: {binary(), [binary()]}
 
   @meta_table Ferricstore.Stream.Meta
-  @groups_table Ferricstore.Stream.Groups
-  @group_locks_table Ferricstore.Stream.GroupLocks
-  @index_table Ferricstore.Stream.Index
-  @stream_waiters_table :ferricstore_stream_waiters
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -392,75 +389,7 @@ defmodule Ferricstore.Commands.Stream do
   called at application startup, this is a cheap no-op.
   """
   @spec ensure_meta_table() :: :ok
-  def ensure_meta_table do
-    case :ets.whereis(@meta_table) do
-      :undefined ->
-        try do
-          :ets.new(@meta_table, [:set, :public, :named_table])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _ref ->
-        :ok
-    end
-
-    case :ets.whereis(@groups_table) do
-      :undefined ->
-        try do
-          :ets.new(@groups_table, [:set, :public, :named_table])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _ref ->
-        :ok
-    end
-
-    case :ets.whereis(@group_locks_table) do
-      :undefined ->
-        try do
-          :ets.new(@group_locks_table, [:set, :public, :named_table])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _ref ->
-        :ok
-    end
-
-    case :ets.whereis(@stream_waiters_table) do
-      :undefined ->
-        try do
-          :ets.new(@stream_waiters_table, [:duplicate_bag, :public, :named_table])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _ref ->
-        :ok
-    end
-
-    case :ets.whereis(@index_table) do
-      :undefined ->
-        try do
-          :ets.new(@index_table, [
-            :ordered_set,
-            :public,
-            :named_table,
-            {:read_concurrency, true},
-            {:write_concurrency, true}
-          ])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _ref ->
-        :ok
-    end
-
-    :ok
-  end
+  def ensure_meta_table, do: Tables.ensure_all()
 
   # ---------------------------------------------------------------------------
   # Stream waiter management (for XREAD BLOCK)
@@ -971,5 +900,4 @@ defmodule Ferricstore.Commands.Stream do
 
   defp maybe_take_tuples(entries, :infinity), do: entries
   defp maybe_take_tuples(entries, n), do: Enum.take(entries, n)
-
 end

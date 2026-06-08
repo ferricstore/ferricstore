@@ -1,22 +1,25 @@
 defmodule Ferricstore.Flow.LMDB.Retention do
   @moduledoc false
 
+  alias Ferricstore.Flow.LMDB.Access
+  alias Ferricstore.Flow.LMDB.IndexCodec
+
   def sweep_expired_terminal(path, now_ms, limit)
       when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
     with {:ok, entries} <-
-           Ferricstore.Flow.LMDB.prefix_entries(
+           Access.prefix_entries(
              path,
-             Ferricstore.Flow.LMDB.terminal_expire_prefix(),
+             IndexCodec.terminal_expire_prefix(),
              limit
            ) do
       {ops, counts, swept} = expired_terminal_sweep_ops(path, entries, now_ms)
 
       count_ops =
         Enum.map(counts, fn {count_key, count} ->
-          {:put, count_key, Ferricstore.Flow.LMDB.encode_count(count)}
+          {:put, count_key, IndexCodec.encode_count(count)}
         end)
 
-      case Ferricstore.Flow.LMDB.write_batch(path, count_ops ++ ops) do
+      case Access.write_batch(path, count_ops ++ ops) do
         :ok ->
           Enum.each(counts, fn {count_key, count} ->
             Ferricstore.Flow.LMDB.TerminalCounts.put_cached_count_key(path, count_key, count)
@@ -35,9 +38,9 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   def expired_terminal_state_keys(path, now_ms, limit)
       when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
     with {:ok, entries} <-
-           Ferricstore.Flow.LMDB.prefix_entries(
+           Access.prefix_entries(
              path,
-             Ferricstore.Flow.LMDB.terminal_expire_prefix(),
+             IndexCodec.terminal_expire_prefix(),
              limit
            ) do
       keys =
@@ -66,21 +69,21 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   def sweep_expired_history(path, now_ms, limit)
       when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
     with {:ok, entries} <-
-           Ferricstore.Flow.LMDB.prefix_entries(
+           Access.prefix_entries(
              path,
-             Ferricstore.Flow.LMDB.history_expire_prefix(),
+             IndexCodec.history_expire_prefix(),
              limit
            ),
          {:ok, flow_entries} <-
-           Ferricstore.Flow.LMDB.prefix_entries(
+           Access.prefix_entries(
              path,
-             Ferricstore.Flow.LMDB.history_flow_expire_prefix(),
+             IndexCodec.history_flow_expire_prefix(),
              limit
            ) do
       {ops, swept} = expired_history_sweep_ops(path, entries, now_ms)
       {flow_ops, flow_swept} = expired_history_flow_sweep_ops(path, flow_entries, now_ms, limit)
 
-      case Ferricstore.Flow.LMDB.write_batch(path, flow_ops ++ ops) do
+      case Access.write_batch(path, flow_ops ++ ops) do
         :ok -> {:ok, swept + flow_swept}
         {:error, _reason} = error -> error
       end
@@ -110,7 +113,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
 
   defp expired_history_sweep_ops(path, entries, now_ms) do
     Enum.reduce_while(entries, {[], 0}, fn {expire_key, expire_value}, {ops, swept} ->
-      case expire_key_time(expire_key, Ferricstore.Flow.LMDB.history_expire_prefix()) do
+      case expire_key_time(expire_key, IndexCodec.history_expire_prefix()) do
         {:ok, expire_at_ms} when expire_at_ms > now_ms ->
           {:halt, {ops, swept}}
 
@@ -128,7 +131,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
 
   defp expired_history_flow_sweep_ops(path, entries, now_ms, limit) do
     Enum.reduce_while(entries, {[], 0}, fn {expire_key, expire_value}, {ops, swept} ->
-      case expire_key_time(expire_key, Ferricstore.Flow.LMDB.history_flow_expire_prefix()) do
+      case expire_key_time(expire_key, IndexCodec.history_flow_expire_prefix()) do
         {:ok, expire_at_ms} when expire_at_ms > now_ms ->
           {:halt, {ops, swept}}
 
@@ -145,12 +148,12 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp expired_history_flow_entry_ops(path, expire_key, expire_value, now_ms, limit) do
-    case Ferricstore.Flow.LMDB.decode_history_flow_expire_value(expire_value) do
+    case IndexCodec.decode_history_flow_expire_value(expire_value) do
       {:ok, {history_key, history_cutoff_ms}} ->
-        prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+        prefix = IndexCodec.history_index_prefix(history_key)
         read_limit = max(limit, 1) + 1
 
-        case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, read_limit) do
+        case Access.prefix_entries(path, prefix, read_limit) do
           {:ok, entries} ->
             {entries, keep_marker?} =
               if length(entries) > limit do
@@ -164,7 +167,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
             {ops, swept} =
               Enum.reduce(entries, {base_ops, 0}, fn {history_index_key, history_value},
                                                      {ops_acc, swept_acc} ->
-                case Ferricstore.Flow.LMDB.decode_history_index_value(history_value) do
+                case IndexCodec.decode_history_index_value(history_value) do
                   {:ok, {_event_id, event_ms, expire_at_ms, _compound_key}}
                   when expire_at_ms <= 0 or expire_at_ms <= now_ms ->
                     if history_event_before_cutoff?(event_ms, history_cutoff_ms) do
@@ -213,9 +216,9 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   defp history_event_before_cutoff?(_event_ms, _cutoff_ms), do: false
 
   defp expired_history_entry_ops(path, expire_key, expire_value, now_ms) do
-    case Ferricstore.Flow.LMDB.decode_history_expire_value(expire_value) do
+    case IndexCodec.decode_history_expire_value(expire_value) do
       {:ok, history_index_key} ->
-        case Ferricstore.Flow.LMDB.get(path, history_index_key) do
+        case Access.get(path, history_index_key) do
           {:ok, history_value} ->
             expired_live_history_ops(expire_key, history_index_key, history_value, now_ms)
 
@@ -232,7 +235,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp expired_live_history_ops(expire_key, history_index_key, history_value, now_ms) do
-    case Ferricstore.Flow.LMDB.decode_history_index_value(history_value) do
+    case IndexCodec.decode_history_index_value(history_value) do
       {:ok, {_event_id, _event_ms, expire_at_ms, _compound_key}}
       when expire_at_ms > 0 and expire_at_ms <= now_ms ->
         {[{:delete, expire_key}, {:delete, history_index_key}], 1}
@@ -243,9 +246,9 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp expired_terminal_entry_ops(path, expire_key, expire_value, counts, now_ms) do
-    case Ferricstore.Flow.LMDB.decode_terminal_expire_value(expire_value) do
+    case IndexCodec.decode_terminal_expire_value(expire_value) do
       {:ok, {terminal_key, state_key, count_key}} ->
-        case Ferricstore.Flow.LMDB.get(path, terminal_key) do
+        case Access.get(path, terminal_key) do
           {:ok, terminal_value} ->
             expired_live_terminal_ops(
               path,
@@ -272,15 +275,15 @@ defmodule Ferricstore.Flow.LMDB.Retention do
 
   defp expired_terminal_state_key(path, expire_value, now_ms) do
     with {:ok, {terminal_key, state_key, _count_key}} <-
-           Ferricstore.Flow.LMDB.decode_terminal_expire_value(expire_value),
-         {:ok, terminal_value} <- Ferricstore.Flow.LMDB.get(path, terminal_key),
+           IndexCodec.decode_terminal_expire_value(expire_value),
+         {:ok, terminal_value} <- Access.get(path, terminal_key),
          {:ok, {_id, _updated_at_ms, expire_at_ms, decoded_state_key}} <-
-           Ferricstore.Flow.LMDB.decode_terminal_index_value(terminal_value),
+           IndexCodec.decode_terminal_index_value(terminal_value),
          true <- expire_at_ms > 0 and expire_at_ms <= now_ms do
       decoded_state_key || state_key
     else
       :not_found ->
-        case Ferricstore.Flow.LMDB.decode_terminal_expire_value(expire_value) do
+        case IndexCodec.decode_terminal_expire_value(expire_value) do
           {:ok, {_terminal_key, state_key, _count_key}} -> state_key
           :error -> nil
         end
@@ -300,13 +303,14 @@ defmodule Ferricstore.Flow.LMDB.Retention do
          counts,
          now_ms
        ) do
-    case Ferricstore.Flow.LMDB.decode_terminal_index_value(terminal_value) do
+    case IndexCodec.decode_terminal_index_value(terminal_value) do
       {:ok, {_id, _updated_at_ms, expire_at_ms, decoded_state_key}}
       when expire_at_ms > 0 and expire_at_ms <= now_ms ->
         state_key = decoded_state_key || state_key
+
         reverse_key =
           if is_binary(state_key),
-            do: Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key),
+            do: IndexCodec.terminal_by_state_key_key(state_key),
             else: nil
 
         current_count =
@@ -334,7 +338,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp expired_missing_terminal_ops(path, expire_key, state_key, counts) do
-    case Ferricstore.Flow.LMDB.get(path, state_key) do
+    case Access.get(path, state_key) do
       {:ok, _state_value} ->
         {[], counts, 0}
 
@@ -347,12 +351,12 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp terminal_expire_key_time(key) do
-    expire_key_time(key, Ferricstore.Flow.LMDB.terminal_expire_prefix())
+    expire_key_time(key, IndexCodec.terminal_expire_prefix())
   end
 
   defp maybe_delete_expire_key(ops, path, expire_key, state_key)
        when is_binary(expire_key) and is_binary(state_key) do
-    case Ferricstore.Flow.LMDB.get(path, state_key) do
+    case Access.get(path, state_key) do
       :not_found -> [{:delete, expire_key} | ops]
       {:ok, _state_value} -> ops
       {:error, _reason} -> ops
@@ -387,9 +391,9 @@ defmodule Ferricstore.Flow.LMDB.Retention do
   end
 
   defp maybe_delete_history_expire_key(ops, history_index_key, history_value) do
-    case Ferricstore.Flow.LMDB.decode_history_index_value(history_value) do
+    case IndexCodec.decode_history_index_value(history_value) do
       {:ok, {_event_id, _event_ms, expire_at_ms, _compound_key}} when expire_at_ms > 0 ->
-        [{:delete, Ferricstore.Flow.LMDB.history_expire_key(expire_at_ms, history_index_key)} | ops]
+        [{:delete, IndexCodec.history_expire_key(expire_at_ms, history_index_key)} | ops]
 
       _ ->
         ops

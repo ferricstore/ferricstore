@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   @moduledoc false
 
-  alias Ferricstore.Flow
+  alias Ferricstore.Flow.Codec
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
@@ -56,7 +56,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   def decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx) do
     case materialize_rebuilt_value(value, shard_index, instance_ctx) do
       {:ok, materialized_value} ->
-        case Flow.decode_record(materialized_value) do
+        case Codec.decode_record(materialized_value) do
           %{id: id, type: type, state: state} = record
           when is_binary(id) and is_binary(type) and is_binary(state) ->
             [{key, materialized_value, expire_at_ms, record}]

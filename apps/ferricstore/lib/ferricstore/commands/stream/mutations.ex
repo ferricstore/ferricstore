@@ -1,15 +1,14 @@
 defmodule Ferricstore.Commands.Stream.Mutations do
   @moduledoc false
 
-  alias Ferricstore.Commands.Stream
-  alias Ferricstore.Commands.Stream.{Entries, ID, Index, Meta}
+  alias Ferricstore.Commands.Stream.{Entries, ID, Index, Meta, Tables}
   alias Ferricstore.Store.Ops
 
   @meta_table Ferricstore.Stream.Meta
 
   @spec trim(binary(), term(), map()) :: non_neg_integer() | {:error, term()}
   def trim(key, trim_opts, store) do
-    Stream.ensure_meta_table()
+    Tables.ensure_all()
 
     case :ets.lookup(@meta_table, key) do
       [] -> 0
@@ -27,7 +26,7 @@ defmodule Ferricstore.Commands.Stream.Mutations do
 
   @spec xdel(binary(), [binary()], map()) :: non_neg_integer() | {:error, term()}
   def xdel(key, ids, store) do
-    Stream.ensure_meta_table()
+    Tables.ensure_all()
 
     unique_ids = Enum.uniq(ids)
     compound_keys = Entries.delete_keys(key, unique_ids)
