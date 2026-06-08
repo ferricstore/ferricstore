@@ -5,14 +5,19 @@ defmodule Ferricstore.Commands.ClusterTest do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.MockStore
+  alias Ferricstore.Test.ShardHelpers
+
+  setup do
+    ShardHelpers.wait_default_pipeline_ready()
+    {:ok, store: MockStore.make()}
+  end
 
   # ---------------------------------------------------------------------------
   # CLUSTER.HEALTH
   # ---------------------------------------------------------------------------
 
   describe "CLUSTER.HEALTH" do
-    test "returns a string containing per-shard info" do
-      store = MockStore.make()
+    test "returns a string containing per-shard info", %{store: store} do
       result = Dispatcher.dispatch("CLUSTER.HEALTH", [], store)
 
       assert is_binary(result)
@@ -23,8 +28,7 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert result =~ "memory_bytes:"
     end
 
-    test "includes all 4 shards" do
-      store = MockStore.make()
+    test "includes all 4 shards", %{store: store} do
       result = Dispatcher.dispatch("CLUSTER.HEALTH", [], store)
 
       assert result =~ "shard_0:"
@@ -33,12 +37,11 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert result =~ "shard_3:"
     end
 
-    test "reflects keys stored in shards" do
+    test "reflects keys stored in shards", %{store: store} do
       # Write some keys to the live store
       Router.put(FerricStore.Instance.get(:default), "cluster_health_key_a", "v1", 0)
       Router.put(FerricStore.Instance.get(:default), "cluster_health_key_b", "v2", 0)
 
-      store = MockStore.make()
       result = Dispatcher.dispatch("CLUSTER.HEALTH", [], store)
 
       assert is_binary(result)
@@ -51,8 +54,7 @@ defmodule Ferricstore.Commands.ClusterTest do
       Router.delete(FerricStore.Instance.get(:default), "cluster_health_key_b")
     end
 
-    test "returns error with extra arguments" do
-      store = MockStore.make()
+    test "returns error with extra arguments", %{store: store} do
       assert {:error, _msg} = Dispatcher.dispatch("CLUSTER.HEALTH", ["extra"], store)
     end
   end
@@ -62,8 +64,7 @@ defmodule Ferricstore.Commands.ClusterTest do
   # ---------------------------------------------------------------------------
 
   describe "CLUSTER.STATS" do
-    test "returns a string containing per-shard stats and totals" do
-      store = MockStore.make()
+    test "returns a string containing per-shard stats and totals", %{store: store} do
       result = Dispatcher.dispatch("CLUSTER.STATS", [], store)
 
       assert is_binary(result)
@@ -74,8 +75,7 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert result =~ "total_memory_bytes:"
     end
 
-    test "includes all shards" do
-      store = MockStore.make()
+    test "includes all shards", %{store: store} do
       result = Dispatcher.dispatch("CLUSTER.STATS", [], store)
 
       assert result =~ "shard_0:"
@@ -84,13 +84,12 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert result =~ "shard_3:"
     end
 
-    test "total_keys is sum of per-shard keys" do
+    test "total_keys is sum of per-shard keys", %{store: store} do
       # Write known keys
       Router.put(FerricStore.Instance.get(:default), "cluster_stats_a", "v1", 0)
       Router.put(FerricStore.Instance.get(:default), "cluster_stats_b", "v2", 0)
       Router.put(FerricStore.Instance.get(:default), "cluster_stats_c", "v3", 0)
 
-      store = MockStore.make()
       result = Dispatcher.dispatch("CLUSTER.STATS", [], store)
 
       # Extract total_keys value
@@ -109,8 +108,7 @@ defmodule Ferricstore.Commands.ClusterTest do
       Router.delete(FerricStore.Instance.get(:default), "cluster_stats_c")
     end
 
-    test "returns error with extra arguments" do
-      store = MockStore.make()
+    test "returns error with extra arguments", %{store: store} do
       assert {:error, _msg} = Dispatcher.dispatch("CLUSTER.STATS", ["extra"], store)
     end
   end
@@ -125,8 +123,7 @@ defmodule Ferricstore.Commands.ClusterTest do
       :ok
     end
 
-    test "returns a list of key-value pairs with header fields" do
-      store = MockStore.make()
+    test "returns a list of key-value pairs with header fields", %{store: store} do
       result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", [], store)
 
       assert is_list(result)
@@ -137,11 +134,10 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert "top_n" in result
     end
 
-    test "includes per-prefix data after reads" do
+    test "includes per-prefix data after reads", %{store: store} do
       Ferricstore.Stats.record_hot_read("user:1")
       Ferricstore.Stats.record_cold_read("session:1")
 
-      store = MockStore.make()
       result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", [], store)
 
       assert is_list(result)
