@@ -198,6 +198,44 @@ jobs:
           key: build-macOS-${{ github.sha }}
 
   # ===========================================================================
+  # Architecture tests (visible guardrail)
+  # ===========================================================================
+  architecture-tests:
+    name: "Architecture tests"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            _build
+            deps
+            apps/ferricstore/priv/native
+          key: build-Linux-${{ github.sha }}
+
+      - name: Run architecture tests
+        run: |
+          mix test \
+            apps/ferricstore/test/ferricstore/arch_test.exs \
+            apps/ferricstore_server/test/ferricstore_server/arch_test.exs \
+            --timeout 120000
+
+      - name: Upload architecture test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-architecture
+          path: test-results/
+          retention-days: 30
+
+  # ===========================================================================
   # Core tests (parallel per OS, independent)
   # ===========================================================================
   test-core-ubuntu:

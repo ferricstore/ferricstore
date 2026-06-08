@@ -96,7 +96,7 @@ defmodule Ferricstore.MixProject do
       {:plug, "~> 1.16", optional: true},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:arch_test, "~> 0.1.2", only: [:dev, :test], runtime: false}
+      {:arch_test, "~> 0.3.1", only: [:dev, :test], runtime: false}
     ]
   end
 end

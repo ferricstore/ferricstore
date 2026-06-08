@@ -31,7 +31,8 @@ defmodule FerricstoreServer.MixProject do
       {:ferricstore, in_umbrella: true},
       {:ranch, "~> 2.2"},
       {:jason, "~> 1.4"},
-      {:telemetry, "~> 1.4"}
+      {:telemetry, "~> 1.4"},
+      {:arch_test, "~> 0.3.1", only: [:dev, :test], runtime: false}
     ]
   end
 end
