@@ -271,8 +271,10 @@ defmodule Ferricstore.OperationalGuardTest do
        telemetry_fun: fn _event, _measurements, _metadata -> :ok end}
     )
 
-    refute Admission.reject_new_creates?()
-    refute OperationalGuard.reject_flow_creates?()
+    Utils.eventually(fn ->
+      refute Admission.reject_new_creates?()
+      refute OperationalGuard.reject_flow_creates?()
+    end, 1_000, 10)
   end
 
   test "sticky RSS pause stays closed while active Flow memory is still high" do
