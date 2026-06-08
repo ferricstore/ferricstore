@@ -13,6 +13,11 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
   alias Ferricstore.FetchOrCompute
   alias Ferricstore.Store.Router
 
+  setup_all do
+    Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
+    :ok
+  end
+
   # Generates a unique key to prevent cross-test interference.
   defp ukey(base), do: "foc_#{base}_#{:rand.uniform(9_999_999)}"
 
