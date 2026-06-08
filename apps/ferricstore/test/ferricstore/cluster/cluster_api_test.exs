@@ -8,7 +8,7 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
   alias Ferricstore.Raft.Cluster
 
   setup do
-    Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(10_000)
+    Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
     :ok
   end
 

@@ -488,9 +488,13 @@ defmodule Ferricstore.Commands.ConfigTest do
     end
 
     test "CONFIG RESETSTAT resets slowlog" do
-      # Add a slow log entry via cast, then send a synchronous :ping to the
-      # GenServer to guarantee the preceding cast has been processed.
-      Ferricstore.SlowLog.maybe_log(["SET", "key", "val"], 999_999_999)
+      Ferricstore.SlowLog.set_threshold(0)
+      Ferricstore.SlowLog.set_max_len(8)
+      Ferricstore.SlowLog.reset()
+
+      # Add a deterministic slow log entry via cast, then send a synchronous
+      # :ping to the GenServer to guarantee the preceding cast has processed.
+      Ferricstore.SlowLog.maybe_log(["SET", "key", "val"], 1)
       GenServer.call(Ferricstore.SlowLog, :ping)
 
       assert Ferricstore.SlowLog.len() > 0

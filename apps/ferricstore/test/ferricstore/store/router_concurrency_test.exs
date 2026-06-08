@@ -109,6 +109,11 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
   # -------------------------------------------------------------------
 
   describe "router dispatch through live shards" do
+    setup do
+      Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
+      :ok
+    end
+
     test "put and get through router succeeds" do
       key = "router_conc_test_#{:rand.uniform(999_999)}"
       :ok = Router.put(FerricStore.Instance.get(:default), key, "hello")
