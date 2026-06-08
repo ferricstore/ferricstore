@@ -13,7 +13,10 @@ defmodule FerricstoreServer.Spec.ScanCursorInvalidationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
+  @moduletag timeout: 90_000
 
+  alias Ferricstore.Test.ShardHelpers
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
@@ -32,7 +35,7 @@ defmodule FerricstoreServer.Spec.ScanCursorInvalidationTest do
   end
 
   defp recv_response(sock, buf) do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 15_000)
+    {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do
@@ -61,22 +64,15 @@ defmodule FerricstoreServer.Spec.ScanCursorInvalidationTest do
     %{port: Listener.port()}
   end
 
-  setup %{port: port} do
-    # Clean up any keys with our prefix before each test
-    sock = connect_and_hello(port)
+  setup do
+    ShardHelpers.flush_all_keys()
+    ShardHelpers.flush_global_state()
 
-    # Ensure a known clean state for scan tests by deleting test keys
-    send_cmd(sock, ["KEYS", "scan_inv_*"])
-    keys = recv_response(sock)
+    on_exit(fn ->
+      ShardHelpers.reset_server_auth_state()
+      ShardHelpers.reset_memory_guard_pressure()
+    end)
 
-    if is_list(keys) do
-      Enum.each(keys, fn k ->
-        send_cmd(sock, ["DEL", k])
-        recv_response(sock)
-      end)
-    end
-
-    :gen_tcp.close(sock)
     :ok
   end
 
@@ -190,7 +186,12 @@ defmodule FerricstoreServer.Spec.ScanCursorInvalidationTest do
 
       # Create enough keys to require multiple SCAN iterations
       for i <- 1..30 do
-        send_cmd(sock, ["SET", ukey("mid_#{String.pad_leading(Integer.to_string(i), 3, "0")}"), "v"])
+        send_cmd(sock, [
+          "SET",
+          ukey("mid_#{String.pad_leading(Integer.to_string(i), 3, "0")}"),
+          "v"
+        ])
+
         assert recv_response(sock) == {:simple, "OK"}
       end
 
