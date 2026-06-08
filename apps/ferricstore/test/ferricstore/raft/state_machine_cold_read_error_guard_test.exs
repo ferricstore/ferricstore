@@ -10,13 +10,21 @@ defmodule Ferricstore.Raft.StateMachineColdReadErrorGuardTest do
           "cross_shard_read_cold_meta_bitcask_batch",
           "sm_store_read_bitcask_cold_batch"
         ] do
-      [_, body] = Regex.run(~r/defp #{function}\([^\n]*\) do(.*?)(?=\n  defp )/s, source)
+      bodies = private_function_bodies(source, function)
 
-      assert body =~ "normalize_state_machine_batch_values",
+      assert Enum.any?(bodies, &String.contains?(&1, "normalize_state_machine_batch_values")),
              "#{function}/... must preserve per-index batch errors instead of converting them to nil"
 
-      assert body =~ "emit_state_machine_batch_cold_errors",
+      assert Enum.any?(bodies, &String.contains?(&1, "emit_state_machine_batch_cold_errors")),
              "#{function}/... must emit telemetry for corrupt/missing cold records"
     end
+  end
+
+  defp private_function_bodies(source, function) do
+    pattern = ~r/^\s*defp #{function}\b.*?(?=^\s*defp\s+|\z)/ms
+
+    pattern
+    |> Regex.scan(source)
+    |> List.flatten()
   end
 end
