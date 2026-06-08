@@ -11,19 +11,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
       require Logger
 
       alias Ferricstore.Bitcask.NIF
-      alias Ferricstore.CommandTime
+      alias Ferricstore.{CommandTime, Flow, HLC}
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
-      alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.RetryPolicy
-      alias Ferricstore.HLC
 
       alias Ferricstore.Store.{
         BitcaskWriter,

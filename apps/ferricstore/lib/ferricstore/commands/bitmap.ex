@@ -6,7 +6,6 @@ defmodule Ferricstore.Commands.Bitmap do
 
   @moduledoc """
   Handles Redis bitmap commands: SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP.
-
   Each handler takes the uppercased command name, a list of string arguments,
   and an injected store map. Returns plain Elixir terms — the connection layer
   handles RESP encoding.

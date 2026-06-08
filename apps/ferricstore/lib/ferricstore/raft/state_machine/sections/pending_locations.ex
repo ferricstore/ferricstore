@@ -612,9 +612,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
         end
       end
 
-      # Flow history projection entries are created inside one shard apply and are
-      # stamped there. That lets the hot path skip re-hashing every generated
-      # history key before enqueueing the async projection batch.
       defp flow_history_projection_same_shard?(_ctx, %{shard_index: shard_index}, [
              %{shard_index: shard_index} | _
            ])
@@ -654,8 +651,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
            ) do
         result =
           if sync_flow_history_projection?() do
-            # WARaft storage metadata is the replay boundary. A staged standalone
-            # apply cannot advance that position after merely enqueueing async
             # history projection, otherwise crash recovery can skip committed
             # commands whose Flow history was still only in projector memory.
             HistoryProjector.write_entries_sync(
