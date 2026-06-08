@@ -217,6 +217,8 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     ctx = FerricStore.Instance.get(:default)
     key = "async_removed_batch:#{System.unique_integer([:positive])}"
 
+    Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
+
     assert :ok == Router.batch_put(ctx, [{key, "value"}])
     assert_receive {:quorum_submit, %{status: :ok}}, 1_000
     assert "value" == Router.get(FerricStore.Instance.get(:default), key)
