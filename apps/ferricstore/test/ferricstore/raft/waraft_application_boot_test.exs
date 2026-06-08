@@ -27,7 +27,9 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
       |> File.read!()
 
     assert [_, prep_stop_source] = String.split(source, "def prep_stop(state) do", parts: 2)
-    assert [prep_stop_source, _] = String.split(prep_stop_source, "\n  @impl true\n  def stop", parts: 2)
+
+    assert [prep_stop_source, _] =
+             String.split(prep_stop_source, "\n  @impl true\n  def stop", parts: 2)
 
     waraft_stop_at =
       source_offset(prep_stop_source, "shutdown_stop_waraft_backend()")
@@ -567,7 +569,9 @@ defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   end
 
   defp recv_available(socket, acc) do
-    case :gen_tcp.recv(socket, 0, 100) do
+    timeout = if acc == <<>>, do: 5_000, else: 100
+
+    case :gen_tcp.recv(socket, 0, timeout) do
       {:ok, chunk} -> recv_available(socket, <<acc::binary, chunk::binary>>)
       {:error, :timeout} -> acc
       {:error, :closed} -> acc

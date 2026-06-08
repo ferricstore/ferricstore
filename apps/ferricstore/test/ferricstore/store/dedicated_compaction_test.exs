@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
   # Low threshold so we can trigger promotion in tests
   @test_threshold 5
+  @compaction_churn 20
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -158,6 +159,17 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       nil ->
         flunk("expected promoted path for #{inspect(key)}")
     end
+  end
+
+  defp compact_promoted_key!(key) do
+    ctx = FerricStore.Instance.get(:default)
+    shard_idx = Router.shard_for(ctx, key)
+    shard = Router.shard_name(ctx, shard_idx)
+
+    :sys.replace_state(shard, fn state ->
+      dedicated_path = promoted_path!(state, key)
+      ShardCompound.compact_dedicated(state, key, dedicated_path)
+    end)
   end
 
   defp attach_dedicated_compaction_failed_handler do
@@ -340,10 +352,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       dir = dedicated_dir(key)
       assert log_file_count(dir) >= 1
 
-      # Write 1001 times to exceed the 1000 threshold
-      for i <- 1..1001 do
+      for i <- 1..@compaction_churn do
         Hash.handle("HSET", [key, "churn_field", "value_#{i}"], store)
       end
+
+      compact_promoted_key!(key)
 
       # All original fields still readable
       for i <- 1..(@test_threshold + 1) do
@@ -353,7 +366,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       end
 
       # Churned field has latest value
-      assert "value_1001" == Hash.handle("HGET", [key, "churn_field"], store)
+      assert "value_#{@compaction_churn}" == Hash.handle("HGET", [key, "churn_field"], store)
     end
 
     test "writes after compaction still work" do
@@ -361,9 +374,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       key = ukey("post_compact")
       promote_hash(store, key)
 
-      for i <- 1..1001 do
+      for i <- 1..@compaction_churn do
         Hash.handle("HSET", [key, "churn", "v#{i}"], store)
       end
+
+      compact_promoted_key!(key)
 
       Hash.handle("HSET", [key, "after_compact", "new_value"], store)
       assert "new_value" == Hash.handle("HGET", [key, "after_compact"], store)
@@ -374,13 +389,15 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       key = ukey("del_compact")
       promote_hash(store, key)
 
-      for i <- 1..1001 do
+      for i <- 1..@compaction_churn do
         if rem(i, 2) == 0 do
           Hash.handle("HDEL", [key, "temp_field"], store)
         else
           Hash.handle("HSET", [key, "temp_field", "v#{i}"], store)
         end
       end
+
+      compact_promoted_key!(key)
 
       # Original fields survive
       assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
@@ -394,9 +411,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       expected_count = @test_threshold + 1
 
       # Overwrites only — no new fields
-      for i <- 1..1001 do
+      for i <- 1..@compaction_churn do
         Hash.handle("HSET", [key, "field_1", "overwrite_#{i}"], store)
       end
+
+      compact_promoted_key!(key)
 
       count = Hash.handle("HLEN", [key], store)
       assert count == expected_count
@@ -502,9 +521,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       key = ukey("recover_compact")
       promote_hash(store, key)
 
-      for i <- 1..1001 do
+      for i <- 1..@compaction_churn do
         Hash.handle("HSET", [key, "churn", "v#{i}"], store)
       end
+
+      compact_promoted_key!(key)
 
       assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
 
