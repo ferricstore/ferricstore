@@ -25,6 +25,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -122,6 +125,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -211,6 +217,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
         with:
@@ -253,6 +262,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
         with:
@@ -286,6 +298,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
         with:
@@ -317,6 +332,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
         with:
@@ -344,6 +362,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
         with:
@@ -374,6 +395,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
         with:
@@ -442,6 +466,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
         with:

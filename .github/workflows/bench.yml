@@ -29,6 +29,9 @@ jobs:
         with:
           elixir-version: "1.19"
           otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
 
       - name: Set up Rust (stable)
         uses: dtolnay/rust-toolchain@stable
