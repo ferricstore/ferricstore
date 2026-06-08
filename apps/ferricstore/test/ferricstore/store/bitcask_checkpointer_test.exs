@@ -83,6 +83,15 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     ctx: ctx,
     active_path: active_path
   } do
+    parent = self()
+
+    ctx =
+      Map.put(ctx, :fsync_async, fn caller, corr_id, path ->
+        send(parent, {:test_fsync_async, path})
+        send(caller, {:tokio_complete, corr_id, :ok, nil})
+        :ok
+      end)
+
     # Start checkpointer with a fast 20ms tick so we don't wait long.
     {:ok, pid} =
       BitcaskCheckpointer.start_link(
@@ -95,12 +104,12 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     on_exit(fn -> safe_stop(pid) end)
 
     # No flag set → no checkpoint should fire over three ticks.
-    refute_receive {:checkpoint, _meas, %{status: :ok}}, 100
+    refute_receive {:test_fsync_async, _path}, 100
 
     # Raise the dirty flag (simulates a writer batch).
     :atomics.put(ctx.checkpoint_flags, 1, 1)
 
-    assert_receive {:checkpoint, _meas, %{status: :ok}}, 2000
+    assert_receive {:test_fsync_async, ^active_path}, 2000
 
     # After the fsync fires, the flag must have been cleared.
     assert :atomics.get(ctx.checkpoint_flags, 1) == 0

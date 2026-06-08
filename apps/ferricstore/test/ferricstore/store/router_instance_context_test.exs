@@ -118,12 +118,11 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     :ets.insert(elem(ctx.keydir_refs, idx), {marker, "hash", marker_expire_at, 1, 0, 0, 0})
     :atomics.put(ctx.disk_pressure, idx + 1, 1)
 
-    routed_ctx = %{ctx | name: :default}
     field_key = CompoundKey.hash_field(key, "field")
 
     assert :ok =
              CommandTime.with_now_ms(stamped_now, fn ->
-               Router.compound_put(routed_ctx, key, field_key, "value", 0)
+               Router.compound_put(ctx, key, field_key, "value", 0)
              end)
   end
 
