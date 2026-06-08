@@ -26,11 +26,22 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
   @moduletag :integration
   @moduletag :global_state
 
+  alias Ferricstore.Test.ShardHelpers
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
 
   @moduletag timeout: 60_000
+
+  setup do
+    ShardHelpers.reset_server_auth_state()
+
+    on_exit(fn ->
+      ShardHelpers.reset_server_auth_state()
+    end)
+
+    :ok
+  end
 
   # ---------------------------------------------------------------------------
   # Helpers
