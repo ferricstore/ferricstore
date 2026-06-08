@@ -4,10 +4,11 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag timeout: 120_000
 
   alias Ferricstore.Raft.Cluster
 
-  setup do
+  setup_all do
     Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
     :ok
   end
