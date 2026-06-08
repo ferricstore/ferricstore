@@ -66,8 +66,16 @@ defmodule Ferricstore.FlowBackpressureTest do
 
     results =
       Router.flow_create_pipeline_batch(ctx, [
-        %{id: "flow-overload-batch-a-#{System.unique_integer([:positive])}"},
-        %{id: "flow-overload-batch-b-#{System.unique_integer([:positive])}"}
+        %{
+          id: "flow-overload-batch-a-#{System.unique_integer([:positive])}",
+          type: "overload",
+          state: "queued"
+        },
+        %{
+          id: "flow-overload-batch-b-#{System.unique_integer([:positive])}",
+          type: "overload",
+          state: "queued"
+        }
       ])
 
     assert [{:error, msg_a}, {:error, msg_b}] = results
