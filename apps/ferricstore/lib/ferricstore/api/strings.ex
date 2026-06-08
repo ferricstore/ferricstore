@@ -2,8 +2,8 @@ defmodule FerricStore.API.Strings do
   @moduledoc false
 
   import FerricStore.API.Store
-  alias Ferricstore.HLC
   alias Ferricstore.Commands.Strings
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
 
   @type key :: FerricStore.key()

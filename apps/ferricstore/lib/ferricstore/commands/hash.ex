@@ -25,9 +25,9 @@ defmodule Ferricstore.Commands.Hash do
   WRONGTYPE error is returned.
   """
 
-  alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Hash.FieldOps
   alias Ferricstore.Commands.Hash.Helpers
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry

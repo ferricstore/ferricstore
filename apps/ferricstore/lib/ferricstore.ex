@@ -189,19 +189,19 @@ defmodule FerricStore do
   # Embedded Redis-compatible API
   # ---------------------------------------------------------------------------
 
-  alias FerricStore.API.Strings, as: StringsAPI
+  alias FerricStore.API.Bitmap, as: BitmapAPI
+  alias FerricStore.API.Generic, as: GenericAPI
+  alias FerricStore.API.Geo, as: GeoAPI
   alias FerricStore.API.Hashes, as: HashesAPI
+  alias FerricStore.API.HyperLogLog, as: HyperLogLogAPI
+  alias FerricStore.API.Json, as: JsonAPI
   alias FerricStore.API.Lists, as: ListsAPI
+  alias FerricStore.API.Locks, as: LocksAPI
+  alias FerricStore.API.Probabilistic, as: ProbabilisticAPI
   alias FerricStore.API.Sets, as: SetsAPI
   alias FerricStore.API.SortedSets, as: SortedSetsAPI
-  alias FerricStore.API.Generic, as: GenericAPI
-  alias FerricStore.API.Bitmap, as: BitmapAPI
   alias FerricStore.API.Streams, as: StreamsAPI
-  alias FerricStore.API.Probabilistic, as: ProbabilisticAPI
-  alias FerricStore.API.Geo, as: GeoAPI
-  alias FerricStore.API.Json, as: JsonAPI
-  alias FerricStore.API.Locks, as: LocksAPI
-  alias FerricStore.API.HyperLogLog, as: HyperLogLogAPI
+  alias FerricStore.API.Strings, as: StringsAPI
   alias FerricStore.API.System, as: SystemAPI
 
   @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | write_error()

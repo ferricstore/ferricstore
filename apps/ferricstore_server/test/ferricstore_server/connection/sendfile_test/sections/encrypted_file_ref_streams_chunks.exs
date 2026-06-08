@@ -1,4 +1,4 @@
-defmodule FerricstoreServer.Connection.SendfileTest.Sections.EncryptedFileRefResponseStreamsBoundedChunksInsteadOneLargeBin do
+defmodule FerricstoreServer.Connection.SendfileTest.Sections.EncryptedFileRefStreamsChunks do
   @moduledoc false
 
   defmacro __using__(_opts) do

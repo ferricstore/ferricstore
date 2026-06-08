@@ -1,7 +1,7 @@
 Code.require_file("acl_permissions_test/sections/acl_check_command_2_all.exs", __DIR__)
 
 Code.require_file(
-  "acl_permissions_test/sections/tcp_global_keyspace_enumeration_restricted_key_patterns.exs",
+  "acl_permissions_test/sections/tcp_acl_key_patterns.exs",
   __DIR__
 )
 
@@ -40,7 +40,7 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
 
   use FerricstoreServer.Spec.AclPermissionsTest.Sections.AclCheckCommand2All
 
-  use FerricstoreServer.Spec.AclPermissionsTest.Sections.TcpGlobalKeyspaceEnumerationRestrictedKeyPatterns
+  use FerricstoreServer.Spec.AclPermissionsTest.Sections.TcpAclKeyPatterns
 
   defp send_cmd(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))

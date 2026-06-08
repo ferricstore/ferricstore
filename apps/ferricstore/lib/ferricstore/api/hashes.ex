@@ -2,8 +2,8 @@ defmodule FerricStore.API.Hashes do
   @moduledoc false
 
   import FerricStore.API.Store
-  alias Ferricstore.Store.Router
   alias Ferricstore.Commands.Hash
+  alias Ferricstore.Store.Router
 
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()

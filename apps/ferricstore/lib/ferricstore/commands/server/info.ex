@@ -4,8 +4,8 @@ defmodule Ferricstore.Commands.Server.Info do
   alias Ferricstore.HLC
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
-  alias Ferricstore.Store.Ops
   alias Ferricstore.Stats
+  alias Ferricstore.Store.Ops
 
   @last_save_key {Ferricstore.Commands.Server, :last_save_unix_seconds}
 

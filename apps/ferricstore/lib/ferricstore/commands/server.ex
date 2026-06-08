@@ -1,7 +1,5 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Server do
-  alias Ferricstore.Store.Ops
-
   @moduledoc """
   Handles Redis server commands: PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL,
   INFO, COMMAND, SELECT, LOLWUT, and DEBUG.
@@ -33,8 +31,9 @@ defmodule Ferricstore.Commands.Server do
   alias Ferricstore.AuditLog
   alias Ferricstore.Commands.Catalog
   alias Ferricstore.Raft.WARaftBackend
-  alias Ferricstore.Store.Router
   alias Ferricstore.Stats
+  alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.Router
 
   @waraft_table :ferricstore_waraft_backend
 

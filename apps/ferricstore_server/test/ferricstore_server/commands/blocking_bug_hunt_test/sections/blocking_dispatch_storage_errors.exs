@@ -1,4 +1,4 @@
-defmodule FerricstoreServer.Commands.BlockingBugHuntTest.Sections.BlockingListDispatchConvertsStorageRaisesIntoErrorReplies do
+defmodule FerricstoreServer.Commands.BlockingBugHuntTest.Sections.BlockingDispatchStorageErrors do
   @moduledoc false
 
   defmacro __using__(_opts) do

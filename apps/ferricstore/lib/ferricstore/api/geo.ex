@@ -2,8 +2,8 @@ defmodule FerricStore.API.Geo do
   @moduledoc false
 
   import FerricStore.API.Store
-  alias Ferricstore.Store.Router
   alias Ferricstore.Commands.Geo
+  alias Ferricstore.Store.Router
 
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()

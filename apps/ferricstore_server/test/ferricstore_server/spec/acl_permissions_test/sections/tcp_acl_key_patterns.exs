@@ -1,4 +1,4 @@
-defmodule FerricstoreServer.Spec.AclPermissionsTest.Sections.TcpGlobalKeyspaceEnumerationRestrictedKeyPatterns do
+defmodule FerricstoreServer.Spec.AclPermissionsTest.Sections.TcpAclKeyPatterns do
   @moduledoc false
 
   defmacro __using__(_opts) do

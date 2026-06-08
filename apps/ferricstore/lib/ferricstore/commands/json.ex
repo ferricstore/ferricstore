@@ -36,8 +36,8 @@ defmodule Ferricstore.Commands.Json do
   """
 
   alias Ferricstore.Commands.Json.Path, as: JsonPath
-  alias Ferricstore.Store.Ops
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
 
   @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"

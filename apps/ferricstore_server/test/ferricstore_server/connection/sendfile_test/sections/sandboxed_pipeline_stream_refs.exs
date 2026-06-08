@@ -1,4 +1,4 @@
-defmodule FerricstoreServer.Connection.SendfileTest.Sections.SandboxedMixedGetSetPipelineValidatesStreamRefsInternalLookupK do
+defmodule FerricstoreServer.Connection.SendfileTest.Sections.SandboxedPipelineStreamRefs do
   @moduledoc false
 
   defmacro __using__(_opts) do

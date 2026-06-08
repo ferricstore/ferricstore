@@ -1,5 +1,5 @@
 Code.require_file(
-  "blocking_bug_hunt_test/sections/blocking_list_dispatch_converts_storage_raises_into_error_replies.exs",
+  "blocking_bug_hunt_test/sections/blocking_dispatch_storage_errors.exs",
   __DIR__
 )
 
@@ -139,7 +139,7 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   # TCP helpers
   # ===========================================================================
 
-  use FerricstoreServer.Commands.BlockingBugHuntTest.Sections.BlockingListDispatchConvertsStorageRaisesIntoErrorReplies
+  use FerricstoreServer.Commands.BlockingBugHuntTest.Sections.BlockingDispatchStorageErrors
 
   defp send_cmd_raw(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))

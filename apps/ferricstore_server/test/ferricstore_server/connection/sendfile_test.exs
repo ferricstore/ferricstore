@@ -1,10 +1,10 @@
 Code.require_file(
-  "sendfile_test/sections/encrypted_file_ref_response_streams_bounded_chunks_instead_one_large_bin.exs",
+  "sendfile_test/sections/encrypted_file_ref_streams_chunks.exs",
   __DIR__
 )
 
 Code.require_file(
-  "sendfile_test/sections/sandboxed_mixed_get_set_pipeline_validates_stream_refs_internal_lookup_k.exs",
+  "sendfile_test/sections/sandboxed_pipeline_stream_refs.exs",
   __DIR__
 )
 
@@ -51,9 +51,9 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     {:ok, ctx: ctx}
   end
 
-  use FerricstoreServer.Connection.SendfileTest.Sections.EncryptedFileRefResponseStreamsBoundedChunksInsteadOneLargeBin
+  use FerricstoreServer.Connection.SendfileTest.Sections.EncryptedFileRefStreamsChunks
 
-  use FerricstoreServer.Connection.SendfileTest.Sections.SandboxedMixedGetSetPipelineValidatesStreamRefsInternalLookupK
+  use FerricstoreServer.Connection.SendfileTest.Sections.SandboxedPipelineStreamRefs
 
   defp tcp_pair do
     {:ok, listen} =
