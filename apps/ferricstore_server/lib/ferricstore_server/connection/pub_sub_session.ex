@@ -6,8 +6,8 @@ defmodule FerricstoreServer.Connection.PubSubSession do
   alias FerricstoreServer.Resp.Encoder
 
   def pubsub_loop(
-         %Connection{socket: socket, transport: transport, active_mode: active_mode} = state
-       ) do
+        %Connection{socket: socket, transport: transport, active_mode: active_mode} = state
+      ) do
     # No setopts needed — active mode (true/N/:once) is maintained from
     # the main loop. TCP data keeps arriving and is handled below.
     if active_mode == :once do

@@ -562,5 +562,4 @@ defmodule FerricStore.API.Flow do
     do: {:error, "ERR flow id must be a non-empty string"}
 
   def flow_history(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
-
 end

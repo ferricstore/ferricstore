@@ -53,7 +53,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
         if Recovery.skip_history_log_recover?(shard_data_path, projected) do
           :ok
         else
-          case Recovery.recover_history_log(instance_ctx, shard_index, shard_data_path, keydir_override) do
+          case Recovery.recover_history_log(
+                 instance_ctx,
+                 shard_index,
+                 shard_data_path,
+                 keydir_override
+               ) do
             :ok ->
               :ok
 
@@ -408,7 +413,6 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-
   defp flush_pending(state, mode \\ :all)
 
   defp flush_pending(%{pending_count: 0, requested_index: nil} = state, _mode),
@@ -437,10 +441,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
         next_state =
           state
           |> Map.merge(%{
-          pending: Enum.reverse(rest),
-          pending_count: length(rest),
-          first_pending_at: first_pending_at,
-          flushed_index: flushed_index
+            pending: Enum.reverse(rest),
+            pending_count: length(rest),
+            first_pending_at: first_pending_at,
+            flushed_index: flushed_index
           })
           |> publish_backlog_state()
 
@@ -472,7 +476,11 @@ defmodule Ferricstore.Flow.HistoryProjector do
         :ok ->
           Pending.trim_replay_reservation(state.projector_name, requested_index)
 
-          %{state | requested_index: nil, flushed_index: max(state.flushed_index, requested_index)}
+          %{
+            state
+            | requested_index: nil,
+              flushed_index: max(state.flushed_index, requested_index)
+          }
           |> publish_backlog_state()
 
         {:error, reason} ->
@@ -567,7 +575,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
       clear_disk_pressure(instance_ctx, shard_index)
 
       with :ok <-
-             Storage.publish_lmdb_history_locations(shard_data_path, file_id, encoded_entries, locations),
+             Storage.publish_lmdb_history_locations(
+               shard_data_path,
+               file_id,
+               encoded_entries,
+               locations
+             ),
            :ok <-
              Storage.publish_keydir_entries(
                instance_ctx,
@@ -620,88 +633,97 @@ defmodule Ferricstore.Flow.HistoryProjector do
     end
   end
 
-defdelegate history_dir(shard_data_path), to: Storage
-defdelegate history_file_path(shard_data_path, file_id), to: Storage
-defdelegate read_value(shard_data_path, file_id, offset), to: Ferricstore.Flow.HistoryProjector.Log
-defdelegate scan_event_value(shard_data_path, target_key), to: Ferricstore.Flow.HistoryProjector.Log
+  defdelegate history_dir(shard_data_path), to: Storage
+  defdelegate history_file_path(shard_data_path, file_id), to: Storage
 
-def ensure_history_file(shard_data_path), do: Storage.ensure_history_file(shard_data_path)
-def append_batch(file_path, batch), do: Storage.append_batch(file_path, batch)
+  defdelegate read_value(shard_data_path, file_id, offset),
+    to: Ferricstore.Flow.HistoryProjector.Log
 
-def sync_history_log_before_publish(file_path),
-  do: Storage.sync_history_log_before_publish(file_path)
+  defdelegate scan_event_value(shard_data_path, target_key),
+    to: Ferricstore.Flow.HistoryProjector.Log
 
-def write_lmdb_ops(shard_data_path, ops), do: Storage.write_lmdb_ops(shard_data_path, ops)
-def flow_call(function, args), do: Storage.flow_call(function, args)
+  def ensure_history_file(shard_data_path), do: Storage.ensure_history_file(shard_data_path)
+  def append_batch(file_path, batch), do: Storage.append_batch(file_path, batch)
 
-def publish_keydir_entries(instance_ctx, shard_index, keydir, file_id, entries, locations) do
-  Storage.publish_keydir_entries(instance_ctx, shard_index, keydir, file_id, entries, locations)
-end
+  def sync_history_log_before_publish(file_path),
+    do: Storage.sync_history_log_before_publish(file_path)
 
-def publish_history_index(instance_ctx, shard_index, entries),
-  do: Storage.publish_history_index(instance_ctx, shard_index, entries)
+  def write_lmdb_ops(shard_data_path, ops), do: Storage.write_lmdb_ops(shard_data_path, ops)
+  def flow_call(function, args), do: Storage.flow_call(function, args)
 
-def publish_lmdb_history_locations(shard_data_path, file_id, entries, locations) do
-  Storage.publish_lmdb_history_locations(shard_data_path, file_id, entries, locations)
-end
+  def publish_keydir_entries(instance_ctx, shard_index, keydir, file_id, entries, locations) do
+    Storage.publish_keydir_entries(instance_ctx, shard_index, keydir, file_id, entries, locations)
+  end
 
-@doc false
-def __history_index_entries_for_test__(entries), do: Storage.history_index_entries(entries)
+  def publish_history_index(instance_ctx, shard_index, entries),
+    do: Storage.publish_history_index(instance_ctx, shard_index, entries)
 
+  def publish_lmdb_history_locations(shard_data_path, file_id, entries, locations) do
+    Storage.publish_lmdb_history_locations(shard_data_path, file_id, entries, locations)
+  end
 
-defp compact_projected_flow_values(
-       instance_ctx,
-       shard_index,
-       shard_data_path,
-       keydir,
-       file_path,
-       file_id,
-       entries
-     ) do
-  ValueProjection.compact_projected_flow_values(
-    instance_ctx,
-    shard_index,
-    shard_data_path,
-    keydir,
-    file_path,
-    file_id,
-    entries
-  )
-end
+  @doc false
+  def __history_index_entries_for_test__(entries), do: Storage.history_index_entries(entries)
 
-@doc false
-def __projected_flow_value_keydir_refs_for_test__(keydir, refs) do
-  ValueProjection.projected_flow_value_keydir_refs(keydir, refs)
-end
+  defp compact_projected_flow_values(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         file_path,
+         file_id,
+         entries
+       ) do
+    ValueProjection.compact_projected_flow_values(
+      instance_ctx,
+      shard_index,
+      shard_data_path,
+      keydir,
+      file_path,
+      file_id,
+      entries
+    )
+  end
 
-@doc false
-def __projected_flow_value_refs_for_test__(entries) do
-  ValueProjection.projected_flow_value_refs(entries)
-end
+  @doc false
+  def __projected_flow_value_keydir_refs_for_test__(keydir, refs) do
+    ValueProjection.projected_flow_value_keydir_refs(keydir, refs)
+  end
 
+  @doc false
+  def __projected_flow_value_refs_for_test__(entries) do
+    ValueProjection.projected_flow_value_refs(entries)
+  end
 
-defp trim_history_caps(instance_ctx, shard_index, shard_data_path, keydir, file_path, entries) do
-  Trim.trim_history_caps(
-    instance_ctx,
-    shard_index,
-    shard_data_path,
-    keydir,
-    file_path,
-    entries,
-    history_trim_callbacks()
-  )
-end
+  defp trim_history_caps(instance_ctx, shard_index, shard_data_path, keydir, file_path, entries) do
+    Trim.trim_history_caps(
+      instance_ctx,
+      shard_index,
+      shard_data_path,
+      keydir,
+      file_path,
+      entries,
+      history_trim_callbacks()
+    )
+  end
+
   def trim_history_hot_cache(instance_ctx, shard_index, keydir, entries) do
-  Trim.trim_history_hot_cache(instance_ctx, shard_index, keydir, entries, history_trim_callbacks())
-end
+    Trim.trim_history_hot_cache(
+      instance_ctx,
+      shard_index,
+      keydir,
+      entries,
+      history_trim_callbacks()
+    )
+  end
 
-defp history_trim_callbacks do
-  %{
-    delete_keydir_row: &delete_keydir_row/4,
-    load_history_max_cap: &load_history_max_cap/3,
-    sync_history_log: &sync_history_log_before_publish/1
-  }
-end
+  defp history_trim_callbacks do
+    %{
+      delete_keydir_row: &delete_keydir_row/4,
+      load_history_max_cap: &load_history_max_cap/3,
+      sync_history_log: &sync_history_log_before_publish/1
+    }
+  end
 
   defp load_history_max_cap(history_key, keydir, shard_data_path) do
     with {:ok, state_key} <- Recovery.history_state_key(history_key),
@@ -713,8 +735,6 @@ end
       _ -> nil
     end
   end
-
-
 
   defp emit_recover_error(instance_ctx, shard_index, reason) do
     Telemetry.emit_recover_error(instance_ctx, shard_index, reason)
@@ -801,9 +821,11 @@ end
   defp projected_index(_instance_ctx, _shard_index, shard_data_path) do
     HistoryProjectedIndex.read(shard_data_path)
   end
+
   def publish_projected_index(_instance_ctx, _shard_index, _shard_data_path, nil), do: :ok
+
   def publish_projected_index(instance_ctx, shard_index, shard_data_path, index)
-       when is_integer(index) and index >= 0 do
+      when is_integer(index) and index >= 0 do
     index = max(index, projected_index(instance_ctx, shard_index, shard_data_path))
 
     with :ok <- HistoryProjectedIndex.persist(shard_data_path, index) do
@@ -862,7 +884,7 @@ end
   defp mark_flush_failure(_instance_ctx, _shard_index), do: :ok
 
   def track_keydir_binary_delta(%{keydir_binary_bytes: ref}, keydir, shard_index, key, new_value)
-       when is_reference(ref) do
+      when is_reference(ref) do
     old_bytes =
       case safe_ets_lookup(keydir, key) do
         [{^key, old_value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}] ->
@@ -883,7 +905,7 @@ end
   def track_keydir_binary_delta(_instance_ctx, _keydir, _shard_index, _key, _new_value), do: :ok
 
   def track_keydir_binary_remove_row(%{keydir_binary_bytes: ref}, shard_index, row)
-       when is_reference(ref) do
+      when is_reference(ref) do
     bytes = keydir_row_binary_bytes(row)
     if bytes > 0, do: :atomics.sub(ref, shard_index + 1, bytes)
     :ok
@@ -906,13 +928,13 @@ end
   end
 
   def delete_apply_projection_cache_for_row(
-         %{data_dir: data_dir},
-         shard_index,
-         {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
-          _value_size}
-       )
-       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
-              is_binary(key) and is_integer(index) and index > 0 do
+        %{data_dir: data_dir},
+        shard_index,
+        {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+         _value_size}
+      )
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_binary(key) and is_integer(index) and index > 0 do
     Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(data_dir, shard_index, [
       {index, key}
     ])
@@ -921,10 +943,12 @@ end
   end
 
   def delete_apply_projection_cache_for_row(_instance_ctx, _shard_index, _row), do: :ok
+
   def keydir_row_binary_bytes(
-         {key, old_value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}
-       ),
-       do: binary_bytes(key) + binary_bytes(old_value)
+        {key, old_value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}
+      ),
+      do: binary_bytes(key) + binary_bytes(old_value)
+
   def keydir_row_binary_bytes(_row), do: 0
 
   def binary_bytes(value) when is_binary(value) and byte_size(value) > 64, do: byte_size(value)
@@ -987,5 +1011,4 @@ end
   rescue
     ArgumentError -> :ok
   end
-
 end

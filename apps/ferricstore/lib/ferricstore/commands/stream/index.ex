@@ -45,7 +45,13 @@ defmodule Ferricstore.Commands.Stream.Index do
     end)
   end
 
-  @spec slice(binary(), :min | ID.stream_id(), :max | ID.stream_id(), non_neg_integer() | :infinity, boolean()) ::
+  @spec slice(
+          binary(),
+          :min | ID.stream_id(),
+          :max | ID.stream_id(),
+          non_neg_integer() | :infinity,
+          boolean()
+        ) ::
           [{binary(), binary()}]
   def slice(_stream_key, _range_start, _range_end, 0, _reverse?), do: []
 

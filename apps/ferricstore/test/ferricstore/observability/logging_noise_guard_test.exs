@@ -99,6 +99,7 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
     assert source =~ "Application.put_env(:ferricstore, :max_memory_bytes, max_memory_bytes)"
     assert source =~ ":keydir_max_ram"
     assert source =~ "app_keydir_max_ram_bytes(max_memory_bytes)"
+
     assert source =~
              ~S|max_memory_bytes=#{Application.get_env(:ferricstore, :max_memory_bytes)}|
 

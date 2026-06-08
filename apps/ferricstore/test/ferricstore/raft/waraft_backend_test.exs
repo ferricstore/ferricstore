@@ -1,25 +1,103 @@
-Code.require_file("waraft_backend_test/sections/rejects_volatile_waraft_ets_log_module.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/unified_segment_trim_prunes_flow_apply_projection_value_cache.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/invalid_waraft_in_flight_bytes_config_does_not_partially_publish_backend.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/acked_writes_survive_waraft_server_kill_during_active_write_load.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/segment_log_rejects_records_stored_under_wrong_segment_ordinal.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/waraft_generic_batches_coalesce_behind_in_flight_flush_default.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/storage_metadata_hot_writes_fsync_journal_rewriting_current_metadata.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/waraft_storage_recovery_reuses_segment_locations_flow_replay.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/restart_recovers_missing_current_storage_metadata_using_previous_durable.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/storage_rejects_snapshot_payload_dir_removed_after_verification.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/startup_finalizes_interrupted_snapshot_swap_after_metadata_persisted.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/snapshot_transfer_wraps_waraft_transport_exits.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/waraft_storage_close_flushes_async_flow_history_before_persisting_replay.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/flow_retention_cleanup_scans_all_waraft_shards.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/advanced_zset_range_pop_mutations_survive_waraft_restart.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/numeric_append_expiring_string_commands_survive_waraft_restart.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/three_peer_backend_cluster_recovers_after_leader_os_process_kill_during.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/three_peer_backend_cluster_removes_member_through_backend_api.exs", __DIR__)
-Code.require_file("waraft_backend_test/sections/backend_add_member_retries_staged_participant_after_failed_transfer.exs", __DIR__)
+Code.require_file(
+  "waraft_backend_test/sections/rejects_volatile_waraft_ets_log_module.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/unified_segment_trim_prunes_flow_apply_projection_value_cache.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/invalid_waraft_in_flight_bytes_config_does_not_partially_publish_backend.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/acked_writes_survive_waraft_server_kill_during_active_write_load.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/segment_log_rejects_records_stored_under_wrong_segment_ordinal.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/waraft_generic_batches_coalesce_behind_in_flight_flush_default.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/storage_metadata_hot_writes_fsync_journal_rewriting_current_metadata.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/waraft_storage_recovery_reuses_segment_locations_flow_replay.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/restart_recovers_missing_current_storage_metadata_using_previous_durable.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/storage_rejects_snapshot_payload_dir_removed_after_verification.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/startup_finalizes_interrupted_snapshot_swap_after_metadata_persisted.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/snapshot_transfer_wraps_waraft_transport_exits.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/waraft_storage_close_flushes_async_flow_history_before_persisting_replay.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/flow_retention_cleanup_scans_all_waraft_shards.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/advanced_zset_range_pop_mutations_survive_waraft_restart.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/numeric_append_expiring_string_commands_survive_waraft_restart.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/three_peer_backend_cluster_recovers_after_leader_os_process_kill_during.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/three_peer_backend_cluster_removes_member_through_backend_api.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_backend_test/sections/backend_add_member_retries_staged_participant_after_failed_transfer.exs",
+  __DIR__
+)
 
 for part <- 1..2 do
-  Code.require_file("waraft_backend_test/sections/helpers_part_#{part |> Integer.to_string() |> String.pad_leading(2, "0")}.exs", __DIR__)
+  Code.require_file(
+    "waraft_backend_test/sections/helpers_part_#{part |> Integer.to_string() |> String.pad_leading(2, "0")}.exs",
+    __DIR__
+  )
 end
 
 defmodule Ferricstore.Raft.WARaftBackendTest do
@@ -116,25 +194,42 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     %{root: root, ctx: ctx}
   end
 
-
   use Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLogModule
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFlowApplyProjectionValueCache
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytesConfigDoesNotPartiallyPublishBackend
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftServerKillDuringActiveWriteLoad
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.SegmentLogRejectsRecordsStoredUnderWrongSegmentOrdinal
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoalesceBehindInFlightFlushDefault
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFsyncJournalRewritingCurrentMetadata
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReusesSegmentLocationsFlowReplay
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurrentStorageMetadataUsingPreviousDurable
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayloadDirRemovedAfterVerification
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterruptedSnapshotSwapAfterMetadataPersisted
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraftTransportExits
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesAsyncFlowHistoryBeforePersistingReplay
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansAllWaraftShards
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutationsSurviveWaraftRestart
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.NumericAppendExpiringStringCommandsSurviveWaraftRestart
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRecoversAfterLeaderOsProcessKillDuring
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRemovesMemberThroughBackendApi
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.BackendAddMemberRetriesStagedParticipantAfterFailedTransfer
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01

@@ -10,6 +10,7 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
     for i <- 1..10_000 do
       FerricStore.set("#{prefix}:#{i}", String.duplicate("v", 100))
     end
+
     Process.sleep(300)
 
     pipeline = 50
@@ -20,26 +21,40 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
       stop = :atomics.new(1, [])
       counter = :counters.new(1, [:atomics])
 
-      workers = for _ <- 1..num_conn do
-        Task.async(fn ->
-          {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw, buffer: 1_048_576])
-          :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
-          {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
+      workers =
+        for _ <- 1..num_conn do
+          Task.async(fn ->
+            {:ok, sock} =
+              :gen_tcp.connect(~c"127.0.0.1", port, [
+                :binary,
+                active: false,
+                packet: :raw,
+                buffer: 1_048_576
+              ])
 
-          batch = build_pipeline(prefix, pipeline)
-          resp_size = pipeline * 108
+            :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+            {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
 
-          l = fn l ->
-            if :atomics.get(stop, 1) == 1, do: throw(:stop)
-            :gen_tcp.send(sock, batch)
-            drain_bytes(sock, resp_size)
-            :counters.add(counter, 1, pipeline)
-            l.(l)
-          end
-          try do l.(l) catch :throw, :stop -> :ok end
-          :gen_tcp.close(sock)
-        end)
-      end
+            batch = build_pipeline(prefix, pipeline)
+            resp_size = pipeline * 108
+
+            l = fn l ->
+              if :atomics.get(stop, 1) == 1, do: throw(:stop)
+              :gen_tcp.send(sock, batch)
+              drain_bytes(sock, resp_size)
+              :counters.add(counter, 1, pipeline)
+              l.(l)
+            end
+
+            try do
+              l.(l)
+            catch
+              :throw, :stop -> :ok
+            end
+
+            :gen_tcp.close(sock)
+          end)
+        end
 
       # Warm up 1s
       Process.sleep(1_000)
@@ -60,16 +75,20 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
       {_total, top_modules} = :cprof.analyse()
 
       IO.puts("  Top 20 modules by call count:\n")
+
       top_modules
       |> Enum.sort_by(fn {_mod, count, _} -> -count end)
       |> Enum.take(20)
       |> Enum.each(fn {mod, count, funcs} ->
-        top_func = funcs
+        top_func =
+          funcs
           |> Enum.sort_by(fn {_mfa, c} -> -c end)
           |> Enum.take(3)
           |> Enum.map_join(", ", fn {{_m, f, a}, c} -> "#{f}/#{a}=#{c}" end)
 
-        IO.puts("    #{String.pad_trailing(inspect(mod), 50)} #{String.pad_leading("#{count}", 10)}  (#{top_func})")
+        IO.puts(
+          "    #{String.pad_trailing(inspect(mod), 50)} #{String.pad_leading("#{count}", 10)}  (#{top_func})"
+        )
       end)
 
       :cprof.stop()
@@ -84,6 +103,7 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
     for i <- 1..10_000 do
       FerricStore.set("#{prefix}:#{i}", String.duplicate("v", 100))
     end
+
     Process.sleep(300)
 
     pipeline = 50
@@ -94,26 +114,40 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
       stop = :atomics.new(1, [])
       counter = :counters.new(1, [:atomics])
 
-      workers = for _ <- 1..num_conn do
-        Task.async(fn ->
-          {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw, buffer: 1_048_576])
-          :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
-          {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
+      workers =
+        for _ <- 1..num_conn do
+          Task.async(fn ->
+            {:ok, sock} =
+              :gen_tcp.connect(~c"127.0.0.1", port, [
+                :binary,
+                active: false,
+                packet: :raw,
+                buffer: 1_048_576
+              ])
 
-          batch = build_pipeline(prefix, pipeline)
-          resp_size = pipeline * 108
+            :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+            {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
 
-          l = fn l ->
-            if :atomics.get(stop, 1) == 1, do: throw(:stop)
-            :gen_tcp.send(sock, batch)
-            drain_bytes(sock, resp_size)
-            :counters.add(counter, 1, pipeline)
-            l.(l)
-          end
-          try do l.(l) catch :throw, :stop -> :ok end
-          :gen_tcp.close(sock)
-        end)
-      end
+            batch = build_pipeline(prefix, pipeline)
+            resp_size = pipeline * 108
+
+            l = fn l ->
+              if :atomics.get(stop, 1) == 1, do: throw(:stop)
+              :gen_tcp.send(sock, batch)
+              drain_bytes(sock, resp_size)
+              :counters.add(counter, 1, pipeline)
+              l.(l)
+            end
+
+            try do
+              l.(l)
+            catch
+              :throw, :stop -> :ok
+            end
+
+            :gen_tcp.close(sock)
+          end)
+        end
 
       Process.sleep(500)
 
@@ -121,9 +155,10 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
       samples = :ets.new(:samples, [:bag, :public])
       sample_stop = :atomics.new(1, [])
 
-      sampler = Task.async(fn ->
-        sample_loop(samples, sample_stop, 0)
-      end)
+      sampler =
+        Task.async(fn ->
+          sample_loop(samples, sample_stop, 0)
+        end)
 
       Process.sleep(2_000)
 
@@ -143,18 +178,23 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
       running = Enum.filter(all, fn {status, _} -> status == :running end)
 
       if running != [] do
-        funcs = running
-        |> Enum.map(fn {_, {m, f, a}} -> "#{inspect(m)}.#{f}/#{a}" end)
-        |> Enum.frequencies()
-        |> Enum.sort_by(fn {_, c} -> -c end)
+        funcs =
+          running
+          |> Enum.map(fn {_, {m, f, a}} -> "#{inspect(m)}.#{f}/#{a}" end)
+          |> Enum.frequencies()
+          |> Enum.sort_by(fn {_, c} -> -c end)
 
         total_running = length(running)
         IO.puts("  Top functions by CPU time (#{total_running} running samples):\n")
 
-        Enum.take(funcs, 15) |> Enum.each(fn {func, count} ->
+        Enum.take(funcs, 15)
+        |> Enum.each(fn {func, count} ->
           pct = Float.round(count / total_running * 100, 1)
           bar = String.duplicate("█", min(round(pct / 2), 40))
-          IO.puts("    #{String.pad_trailing(func, 55)} #{String.pad_leading("#{pct}%", 6)} #{bar}")
+
+          IO.puts(
+            "    #{String.pad_trailing(func, 55)} #{String.pad_leading("#{pct}%", 6)} #{bar}"
+          )
         end)
       end
 
@@ -171,9 +211,12 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
         case Process.info(pid, [:status, :current_function]) do
           [status: :running, current_function: {m, f, a}] ->
             :ets.insert(tab, {:running, {m, f, a}})
+
           [status: :runnable, current_function: {m, f, a}] ->
             :ets.insert(tab, {:runnable, {m, f, a}})
-          _ -> :ok
+
+          _ ->
+            :ok
         end
       end
 
@@ -197,6 +240,7 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
   end
 
   defp drain_bytes(_sock, remaining) when remaining <= 0, do: :ok
+
   defp drain_bytes(sock, remaining) do
     {:ok, data} = :gen_tcp.recv(sock, 0, 10_000)
     drain_bytes(sock, remaining - byte_size(data))

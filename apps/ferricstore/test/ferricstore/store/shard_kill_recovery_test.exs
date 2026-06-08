@@ -45,7 +45,9 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
   defp ukey_for_shard(shard_idx) do
     Enum.find_value(0..200_000, fn i ->
       candidate = "skr_shard#{shard_idx}_#{System.unique_integer([:positive])}_#{i}"
-      if Router.shard_for(FerricStore.Instance.get(:default), candidate) == shard_idx, do: candidate
+
+      if Router.shard_for(FerricStore.Instance.get(:default), candidate) == shard_idx,
+        do: candidate
     end)
   end
 
@@ -87,10 +89,13 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.kill_shard_safely(shard_idx)
       ShardHelpers.wait_shards_alive(30_000)
 
-      eventually(fn ->
-        {:ok, m} = FerricStore.hgetall(key)
-        m == %{"field1" => "val1", "field2" => "val2"}
-      end, "hash data should survive shard kill")
+      eventually(
+        fn ->
+          {:ok, m} = FerricStore.hgetall(key)
+          m == %{"field1" => "val1", "field2" => "val2"}
+        end,
+        "hash data should survive shard kill"
+      )
     end
 
     test "3. kill shard, list data survives" do
@@ -103,10 +108,13 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.kill_shard_safely(shard_idx)
       ShardHelpers.wait_shards_alive(30_000)
 
-      eventually(fn ->
-        {:ok, elems} = FerricStore.lrange(key, 0, -1)
-        elems == ["a", "b", "c"]
-      end, "list data should survive shard kill")
+      eventually(
+        fn ->
+          {:ok, elems} = FerricStore.lrange(key, 0, -1)
+          elems == ["a", "b", "c"]
+        end,
+        "list data should survive shard kill"
+      )
     end
 
     test "4. kill shard, set data survives" do
@@ -119,10 +127,13 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.kill_shard_safely(shard_idx)
       ShardHelpers.wait_shards_alive(30_000)
 
-      eventually(fn ->
-        {:ok, members} = FerricStore.smembers(key)
-        Enum.sort(members) == ["x", "y", "z"]
-      end, "set data should survive shard kill")
+      eventually(
+        fn ->
+          {:ok, members} = FerricStore.smembers(key)
+          Enum.sort(members) == ["x", "y", "z"]
+        end,
+        "set data should survive shard kill"
+      )
     end
 
     test "5. kill shard twice in a row, data survives both" do
@@ -216,10 +227,13 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       # Data may or may not survive (the WARaft segment log has the command, so
       # replay during init should recover it). The critical requirement
       # is that the shard recovers without crashing.
-      eventually(fn ->
-        result = Router.get(FerricStore.Instance.get(:default), key)
-        result == "maybe_lost" or result == nil
-      end, "shard should recover after kill without flush")
+      eventually(
+        fn ->
+          result = Router.get(FerricStore.Instance.get(:default), key)
+          result == "maybe_lost" or result == nil
+        end,
+        "shard should recover after kill without flush"
+      )
     end
 
     test "9. kill shard during active writes — no crash, writers get errors gracefully" do
@@ -274,10 +288,13 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
       # After wait_shards_alive, init/1 has completed and the keydir is
       # rebuilt from Bitcask. The key we wrote should be in the keydir.
-      eventually(fn ->
-        info = :ets.info(:keydir_0, :size)
-        is_integer(info) and info > 0
-      end, "ETS keydir should be rebuilt with size > 0 after shard recovery")
+      eventually(
+        fn ->
+          info = :ets.info(:keydir_0, :size)
+          is_integer(info) and info > 0
+        end,
+        "ETS keydir should be rebuilt with size > 0 after shard recovery"
+      )
     end
 
     test "11. kill BitcaskWriter, shard still serves reads" do
@@ -300,7 +317,9 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
       # Shard should still serve reads even with BitcaskWriter dead
       eventually(
-        fn -> Router.get(FerricStore.Instance.get(:default), key) == "readable_after_writer_kill" end,
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), key) == "readable_after_writer_kill"
+        end,
         "shard should serve reads after BitcaskWriter kill"
       )
     end
@@ -324,10 +343,13 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       end
 
       # Wait for batcher to restart
-      eventually(fn ->
-        new_pid = Process.whereis(batcher_name)
-        is_pid(new_pid) and Process.alive?(new_pid)
-      end, "Batcher should restart after kill")
+      eventually(
+        fn ->
+          new_pid = Process.whereis(batcher_name)
+          is_pid(new_pid) and Process.alive?(new_pid)
+        end,
+        "Batcher should restart after kill"
+      )
 
       # Data written before kill should survive
       eventually(

@@ -126,6 +126,7 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
         # Verify the scheduler is still alive after the check.
         name = Scheduler.scheduler_name(i)
         pid = Process.whereis(name)
+
         assert is_pid(pid) and Process.alive?(pid),
                "Scheduler #{name} should still be alive after trigger_check"
       end

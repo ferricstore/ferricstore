@@ -19,7 +19,8 @@ defmodule Ferricstore.Flow.HistoryProjector.KeyCodec do
 
   def parse_history_entry_key(_key), do: :error
 
-  def history_entry_key(history_key, event_id), do: @prefix <> history_key <> @separator <> event_id
+  def history_entry_key(history_key, event_id),
+    do: @prefix <> history_key <> @separator <> event_id
 
   def parse_event_ms(event_id) do
     case :binary.split(event_id, "-") do

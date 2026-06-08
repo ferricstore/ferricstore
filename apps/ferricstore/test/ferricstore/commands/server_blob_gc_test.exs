@@ -60,7 +60,8 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
     assert result["hardened_protections_blocked"] == 0
   end
 
-  defp blob_gc_result(fields), do: fields |> Enum.chunk_every(2) |> Map.new(fn [k, v] -> {k, v} end)
+  defp blob_gc_result(fields),
+    do: fields |> Enum.chunk_every(2) |> Map.new(fn [k, v] -> {k, v} end)
 
   defp blob_segment_file_count(ctx) do
     Path.join([ctx.data_dir, "blob", "shard_*", "segments", "*.bloblog"])

@@ -1,5 +1,16 @@
 defmodule FerricstoreServer.Connection.Pipeline do
-  @moduledoc "Pipeline dispatcher with batch fast paths for GET, SET, mixed GET+SET, and Flow workloads."
+  @moduledoc """
+  Pipeline dispatcher with batch fast paths for GET, SET, mixed GET+SET, and
+  Flow workloads.
+
+  ## Performance boundary
+
+  This is a server hot path. It owns Redis-style pipeline coalescing and decides
+  whether commands can use batch fast paths or must cross stateful barriers.
+  Avoid behaviours/protocols, new per-command allocations, and extra tasks in
+  this module. Any refactor needs before/after DBOS Flow and memtier pipeline
+  benchmarks.
+  """
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher

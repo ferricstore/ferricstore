@@ -1,8 +1,6 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
-
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.QueryParams
-
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.QueryParams
 
   def render_flow_overview(summary, total_sampled, sample_limit) do
     """
@@ -135,5 +133,4 @@ import FerricstoreServer.Health.Dashboard.QueryParams
   def flow_recovery_source_command(:failures), do: "FLOW.FAILURES"
   def flow_recovery_source_command(:stuck), do: "FLOW.STUCK"
   def flow_recovery_source_command(source), do: source |> to_string() |> String.upcase()
-
 end

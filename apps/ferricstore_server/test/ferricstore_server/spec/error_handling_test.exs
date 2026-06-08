@@ -234,6 +234,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
       response = recv_response(sock)
 
       assert {:error, msg} = response
+
       assert String.starts_with?(msg, "WRONGPASS"),
              "Expected WRONGPASS prefix, got: #{inspect(msg)}"
 
@@ -249,6 +250,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
       response = recv_response(sock)
 
       assert {:error, msg} = response
+
       assert String.starts_with?(msg, "WRONGPASS"),
              "Expected WRONGPASS prefix, got: #{inspect(msg)}"
 
@@ -333,6 +335,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
       send_cmd(sock, ["XGROUP", "CREATE", k, "mygroup", "0"])
       response = recv_response(sock)
       assert {:error, msg} = response
+
       assert String.starts_with?(msg, "BUSYGROUP"),
              "Expected BUSYGROUP prefix, got: #{inspect(msg)}"
 
@@ -363,6 +366,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
         )
 
       assert {:error, msg} = result
+
       assert String.starts_with?(msg, "NOGROUP"),
              "Expected NOGROUP prefix, got: #{inspect(msg)}"
     end
@@ -380,6 +384,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
       response = recv_response(sock)
 
       assert {:error, msg} = response
+
       assert String.starts_with?(msg, "NOGROUP"),
              "Expected NOGROUP prefix, got: #{inspect(msg)}"
 

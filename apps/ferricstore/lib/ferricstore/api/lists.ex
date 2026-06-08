@@ -169,7 +169,6 @@ defmodule FerricStore.API.Lists do
   # Sets
   # ---------------------------------------------------------------------------
 
-
   @doc """
   Returns the element at `index` in the list stored at `key`.
 

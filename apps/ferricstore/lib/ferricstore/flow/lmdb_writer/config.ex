@@ -58,7 +58,11 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
       processed_enqueue_gaps: MapSet.new(),
       flush_waiters: [],
       flush_interval_ms:
-        Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms, default_flush_interval_ms()),
+        Application.get_env(
+          :ferricstore,
+          :flow_lmdb_flush_interval_ms,
+          default_flush_interval_ms()
+        ),
       flush_jitter_ms:
         Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms, default_flush_jitter_ms()),
       flush_quiet_ms:
@@ -67,7 +71,11 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
         Application.get_env(:ferricstore, :flow_lmdb_flush_max_lag_ms, default_flush_max_lag_ms()),
       max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, default_max_ops()),
       flush_on_max_ops?:
-        Application.get_env(:ferricstore, :flow_lmdb_flush_on_max_ops, default_flush_on_max_ops(mode)),
+        Application.get_env(
+          :ferricstore,
+          :flow_lmdb_flush_on_max_ops,
+          default_flush_on_max_ops(mode)
+        ),
       flush_chunk_ops:
         Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops, default_flush_chunk_ops()),
       flush_chunk_pause_ms:

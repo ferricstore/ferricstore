@@ -1,6 +1,17 @@
-Code.require_file("history_projector_test/sections/sync_projection_writes_dedicated_history_log_updates_index_advances_wate.exs", __DIR__)
-Code.require_file("history_projector_test/sections/sync_projection_hydrates_spilled_waraft_apply_projection_values_batch.exs", __DIR__)
-Code.require_file("history_projector_test/sections/async_enqueue_rejects_above_configured_pending_cap_so_apply_fall_back_sy.exs", __DIR__)
+Code.require_file(
+  "history_projector_test/sections/sync_projection_writes_dedicated_history_log_updates_index_advances_wate.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "history_projector_test/sections/sync_projection_hydrates_spilled_waraft_apply_projection_values_batch.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "history_projector_test/sections/async_enqueue_rejects_above_configured_pending_cap_so_apply_fall_back_sy.exs",
+  __DIR__
+)
 
 defmodule Ferricstore.Flow.HistoryProjectorTest do
   use ExUnit.Case, async: false

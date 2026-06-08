@@ -133,8 +133,11 @@ defmodule FerricstoreServer.Acl.FileParser do
     case CommandCategories.category_commands(cat) do
       {:ok, cat_cmds} ->
         case user.commands do
-          :all -> {:ok, %{user | denied_commands: MapSet.difference(user.denied_commands, cat_cmds)}}
-          cmds -> {:ok, %{user | commands: MapSet.union(cmds, cat_cmds)}}
+          :all ->
+            {:ok, %{user | denied_commands: MapSet.difference(user.denied_commands, cat_cmds)}}
+
+          cmds ->
+            {:ok, %{user | commands: MapSet.union(cmds, cat_cmds)}}
         end
 
       :error ->
@@ -177,20 +180,37 @@ defmodule FerricstoreServer.Acl.FileParser do
 
   defp parse_file_token(_user, token), do: {:error, "unknown token '#{token}'"}
 
-  defp parse_file_key_token(user, "~*", _pending_key_patterns), do: {:ok, %{user | keys: :all}, []}
-  defp parse_file_key_token(user, "allkeys", _pending_key_patterns), do: {:ok, %{user | keys: :all}, []}
-  defp parse_file_key_token(user, "resetkeys", _pending_key_patterns), do: {:ok, %{user | keys: []}, []}
+  defp parse_file_key_token(user, "~*", _pending_key_patterns),
+    do: {:ok, %{user | keys: :all}, []}
+
+  defp parse_file_key_token(user, "allkeys", _pending_key_patterns),
+    do: {:ok, %{user | keys: :all}, []}
+
+  defp parse_file_key_token(user, "resetkeys", _pending_key_patterns),
+    do: {:ok, %{user | keys: []}, []}
 
   defp parse_file_key_token(user, "%R~" <> pattern, pending_key_patterns) do
-    queue_file_key_pattern(user, {pattern, :read, FerricstoreServer.Acl.compile_glob(pattern)}, pending_key_patterns)
+    queue_file_key_pattern(
+      user,
+      {pattern, :read, FerricstoreServer.Acl.compile_glob(pattern)},
+      pending_key_patterns
+    )
   end
 
   defp parse_file_key_token(user, "%W~" <> pattern, pending_key_patterns) do
-    queue_file_key_pattern(user, {pattern, :write, FerricstoreServer.Acl.compile_glob(pattern)}, pending_key_patterns)
+    queue_file_key_pattern(
+      user,
+      {pattern, :write, FerricstoreServer.Acl.compile_glob(pattern)},
+      pending_key_patterns
+    )
   end
 
   defp parse_file_key_token(user, "~" <> pattern, pending_key_patterns) do
-    queue_file_key_pattern(user, {pattern, :rw, FerricstoreServer.Acl.compile_glob(pattern)}, pending_key_patterns)
+    queue_file_key_pattern(
+      user,
+      {pattern, :rw, FerricstoreServer.Acl.compile_glob(pattern)},
+      pending_key_patterns
+    )
   end
 
   defp parse_file_key_token(_user, _token, _pending_key_patterns), do: :not_key_token

@@ -29,4 +29,3 @@ defmodule Ferricstore.Test.FlowCase do
     end
   end
 end
-

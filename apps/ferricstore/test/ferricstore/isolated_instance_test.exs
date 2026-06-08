@@ -73,19 +73,20 @@ defmodule Ferricstore.IsolatedInstanceTest do
 
     test "concurrent isolated instances (async: true proof)" do
       # This test runs async: true — proving instances don't interfere
-      tasks = for i <- 1..5 do
-        Task.async(fn ->
-          ctx = IsolatedInstance.checkout()
+      tasks =
+        for i <- 1..5 do
+          Task.async(fn ->
+            ctx = IsolatedInstance.checkout()
 
-          FerricStore.Impl.set(ctx, "key", "value_#{i}")
-          Process.sleep(10)
-          {:ok, val} = FerricStore.Impl.get(ctx, "key")
-          assert val == "value_#{i}"
+            FerricStore.Impl.set(ctx, "key", "value_#{i}")
+            Process.sleep(10)
+            {:ok, val} = FerricStore.Impl.get(ctx, "key")
+            assert val == "value_#{i}"
 
-          IsolatedInstance.checkin(ctx)
-          :ok
-        end)
-      end
+            IsolatedInstance.checkin(ctx)
+            :ok
+          end)
+        end
 
       results = Task.await_many(tasks, 30_000)
       assert Enum.all?(results, &(&1 == :ok))

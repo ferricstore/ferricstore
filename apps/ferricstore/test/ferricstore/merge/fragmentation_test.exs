@@ -65,9 +65,14 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       GenServer.cast(pid, {:fragmentation, [1, 2], 5})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).file_count == 5
-      end, "fragmentation notification not processed", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).file_count == 5
+        end,
+        "fragmentation notification not processed",
+        20,
+        10
+      )
 
       status = GenServer.call(pid, :status)
       # Cooldown should block the merge, preserving the candidates
@@ -96,9 +101,14 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       GenServer.cast(pid, {:fragmentation, [1], 3})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).fragmentation_candidates == []
-      end, "fragmentation candidates not cleared after merge attempt", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).fragmentation_candidates == []
+        end,
+        "fragmentation candidates not cleared after merge attempt",
+        20,
+        10
+      )
 
       status = GenServer.call(pid, :status)
       # Candidates should be cleared after merge attempt
@@ -138,9 +148,14 @@ defmodule Ferricstore.Merge.FragmentationTest do
       # Send file rotation that would normally trigger merge
       GenServer.cast(pid, {:file_rotated, 10})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).file_count == 10
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).file_count == 10
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       status = GenServer.call(pid, :status)
       assert status.merging == false
@@ -174,9 +189,14 @@ defmodule Ferricstore.Merge.FragmentationTest do
       # Send file rotation
       GenServer.cast(pid, {:file_rotated, 10})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).file_count == 10
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).file_count == 10
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       # Merge should have been attempted (cooldown didn't block it).
       # The attempt may fail (not enough actual files) but that's fine —
@@ -280,9 +300,14 @@ defmodule Ferricstore.Merge.FragmentationTest do
       # Send fragmentation with candidates but only 2 total files
       GenServer.cast(pid, {:fragmentation, [0], 2})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).fragmentation_candidates == []
-      end, "fragmentation candidates not cleared", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).fragmentation_candidates == []
+        end,
+        "fragmentation candidates not cleared",
+        20,
+        10
+      )
 
       # The merge should have been attempted (candidates cleared)
       status = GenServer.call(pid, :status)
@@ -302,13 +327,23 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       # Write some data to ensure the shard has content
       for i <- 1..5 do
-        Router.put(FerricStore.Instance.get(:default), "stats_check_#{i}_#{:rand.uniform(10_000_000)}", "value", 0)
+        Router.put(
+          FerricStore.Instance.get(:default),
+          "stats_check_#{i}_#{:rand.uniform(10_000_000)}",
+          "value",
+          0
+        )
       end
 
-      ShardHelpers.eventually(fn ->
-        state = :sys.get_state(shard_name)
-        is_map(state.file_stats) and map_size(state.file_stats) > 0
-      end, "file_stats not populated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          state = :sys.get_state(shard_name)
+          is_map(state.file_stats) and map_size(state.file_stats) > 0
+        end,
+        "file_stats not populated",
+        20,
+        10
+      )
 
       state = :sys.get_state(shard_name)
       assert is_map(state.file_stats)
@@ -329,7 +364,10 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       Enum.each(state.file_stats, fn {fid, {total, dead}} ->
         assert is_integer(fid), "Expected integer file_id, got #{inspect(fid)}"
-        assert is_number(total), "Expected number total_bytes for fid #{fid}, got #{inspect(total)}"
+
+        assert is_number(total),
+               "Expected number total_bytes for fid #{fid}, got #{inspect(total)}"
+
         assert is_number(dead), "Expected number dead_bytes for fid #{fid}, got #{inspect(dead)}"
         assert total >= 0, "Expected non-negative total_bytes for fid #{fid}"
         assert dead >= 0, "Expected non-negative dead_bytes for fid #{fid}"
@@ -370,6 +408,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
       # Write enough entries to trigger promotion via compound_put
       for i <- 1..6 do
         compound_key = "H:#{redis_key}\0field#{i}"
+
         assert :ok =
                  Router.compound_put(
                    FerricStore.Instance.get(:default),
@@ -380,10 +419,15 @@ defmodule Ferricstore.Merge.FragmentationTest do
                  )
       end
 
-      ShardHelpers.eventually(fn ->
-        state = :sys.get_state(shard_name)
-        Map.has_key?(state.promoted_instances, redis_key)
-      end, "promoted instance not created", 30, 50)
+      ShardHelpers.eventually(
+        fn ->
+          state = :sys.get_state(shard_name)
+          Map.has_key?(state.promoted_instances, redis_key)
+        end,
+        "promoted instance not created",
+        30,
+        50
+      )
 
       state = :sys.get_state(shard_name)
 
@@ -436,10 +480,15 @@ defmodule Ferricstore.Merge.FragmentationTest do
       # Trigger merge — should get :busy and schedule a retry
       GenServer.cast(pid, {:file_rotated, 10})
 
-      ShardHelpers.eventually(fn ->
-        state = :sys.get_state(pid)
-        state.retry_ref != nil
-      end, "retry not scheduled after semaphore busy", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          state = :sys.get_state(pid)
+          state.retry_ref != nil
+        end,
+        "retry not scheduled after semaphore busy",
+        20,
+        10
+      )
 
       # Verify retry is pending
       state = :sys.get_state(pid)
@@ -449,10 +498,15 @@ defmodule Ferricstore.Merge.FragmentationTest do
       # Release the semaphore — the retry should fire and attempt merge
       Ferricstore.Merge.Semaphore.release(99, real_sem)
 
-      ShardHelpers.eventually(fn ->
-        state = :sys.get_state(pid)
-        state.retry_ref == nil
-      end, "retry_ref not cleared after semaphore release", 30, 50)
+      ShardHelpers.eventually(
+        fn ->
+          state = :sys.get_state(pid)
+          state.retry_ref == nil
+        end,
+        "retry_ref not cleared after semaphore release",
+        30,
+        50
+      )
 
       # After retry, retry_ref should be cleared
       state = :sys.get_state(pid)
@@ -484,10 +538,15 @@ defmodule Ferricstore.Merge.FragmentationTest do
         GenServer.cast(pid, {:file_rotated, 10 + i})
       end
 
-      ShardHelpers.eventually(fn ->
-        state = :sys.get_state(pid)
-        state.retry_ref != nil
-      end, "retry not scheduled", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          state = :sys.get_state(pid)
+          state.retry_ref != nil
+        end,
+        "retry not scheduled",
+        20,
+        10
+      )
 
       # Should have exactly one retry pending, not five
       state = :sys.get_state(pid)

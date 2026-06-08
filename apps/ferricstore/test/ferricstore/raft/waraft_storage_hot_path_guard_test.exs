@@ -6,9 +6,10 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
     source = File.read!(Path.expand("../../../lib/ferricstore/flow/lmdb_writer.ex", __DIR__))
 
     assert source =~ ":flow_lmdb_release_cursor_poke_enabled"
-    assert source =~ "Application.get_env(:ferricstore, :flow_lmdb_release_cursor_poke_enabled, false)"
-  end
 
+    assert source =~
+             "Application.get_env(:ferricstore, :flow_lmdb_release_cursor_poke_enabled, false)"
+  end
 
   test "segment projection registration caches expanded root path on the storage handle" do
     source = Ferricstore.Test.SourceFiles.waraft_storage_source()

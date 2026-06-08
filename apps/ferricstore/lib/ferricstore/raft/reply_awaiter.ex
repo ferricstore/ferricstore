@@ -96,7 +96,13 @@ defmodule Ferricstore.Raft.ReplyAwaiter do
 
           {{{alias_ref, ^tag}, meta}, next_pending} ->
             cleanup(alias_ref, tag)
-            collect_tagged_pending(next_pending, [{meta, reply} | replies], started_at, timeout_ms)
+
+            collect_tagged_pending(
+              next_pending,
+              [{meta, reply} | replies],
+              started_at,
+              timeout_ms
+            )
         end
     after
       remaining_timeout ->

@@ -17,14 +17,14 @@ defmodule FerricstoreServer.Connection.Blocking.WaitLoop do
   end
 
   def generic_wait_loop_buffered(
-         state,
-         deadline,
-         notify_fn,
-         opts,
-         buffered_chunks,
-         buffered_bytes,
-         buffer_max
-       ) do
+        state,
+        deadline,
+        notify_fn,
+        opts,
+        buffered_chunks,
+        buffered_bytes,
+        buffer_max
+      ) do
     rearm_blocked_socket_if_once(state)
     remaining = block_remaining(deadline)
     waiter_msg = Keyword.get(opts, :waiter_msg, :waiter_notify)
@@ -194,15 +194,15 @@ defmodule FerricstoreServer.Connection.Blocking.WaitLoop do
   end
 
   def handle_generic_idle_wait(
-         state,
-         deadline,
-         notify_fn,
-         opts,
-         buffered_chunks,
-         buffered_bytes,
-         buffer_max,
-         idle_fn
-       ) do
+        state,
+        deadline,
+        notify_fn,
+        opts,
+        buffered_chunks,
+        buffered_bytes,
+        buffer_max,
+        idle_fn
+      ) do
     cond do
       not is_function(idle_fn, 0) or block_expired?(deadline) ->
         {nil, append_buffered_data(state, buffered_chunks)}
@@ -304,7 +304,6 @@ defmodule FerricstoreServer.Connection.Blocking.WaitLoop do
       %{state | buffer: state.buffer <> buffered}
     end
   end
-
 
   defp acl_refresh(opts, state) do
     Keyword.fetch!(opts, :acl_refresh_fn).(

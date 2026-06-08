@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   alias Ferricstore.Raft.WARaftBackend
 
   import FerricstoreServer.Health.Dashboard.Format, only: [safe_ets_size: 1]
+
   import FerricstoreServer.Health.Dashboard.Render.Admin,
     only: [config_command_reference: 0, runtime_config_parameter_reference: 0]
 
@@ -99,7 +100,12 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
         try do
           keys = :ets.info(keydir, :size)
           keydir_words = :ets.info(keydir, :memory)
-          mem_bytes = if is_integer(keydir_words), do: keydir_words * :erlang.system_info(:wordsize), else: 0
+
+          mem_bytes =
+            if is_integer(keydir_words),
+              do: keydir_words * :erlang.system_info(:wordsize),
+              else: 0
+
           ctx = FerricStore.Instance.get(:default)
           shard_name = Ferricstore.Store.Router.shard_name(ctx, index)
 
@@ -117,7 +123,13 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
       shard_dir = DataDir.shard_data_path(data_dir, index)
       {disk_bytes, _, _} = scan_shard_dir(shard_dir)
 
-      %{index: index, status: status, keys: keys, ets_memory_bytes: ets_mem, disk_bytes: disk_bytes}
+      %{
+        index: index,
+        status: status,
+        keys: keys,
+        ets_memory_bytes: ets_mem,
+        disk_bytes: disk_bytes
+      }
     end)
   end
 
@@ -141,9 +153,11 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
       total_hits: total_hits,
       total_misses: misses_est,
       total_lookups: total_lookups,
-      hit_ratio: if(total_lookups > 0, do: Float.round(total_hits / total_lookups * 100, 1), else: 0.0),
+      hit_ratio:
+        if(total_lookups > 0, do: Float.round(total_hits / total_lookups * 100, 1), else: 0.0),
       ram_ratio: if(total_hits > 0, do: Float.round(hot_est / total_hits * 100, 1), else: 0.0),
-      disk_ratio: if(total_hits > 0, do: Float.round(cold_exact / total_hits * 100, 1), else: 0.0),
+      disk_ratio:
+        if(total_hits > 0, do: Float.round(cold_exact / total_hits * 100, 1), else: 0.0),
       sample_rate: rate,
       hits_per_sec: Float.round(total_hits / uptime, 1),
       misses_per_sec: Float.round(misses_est / uptime, 1),
@@ -166,7 +180,14 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
       }
     catch
       :exit, _ ->
-        %{total_bytes: 0, max_bytes: 0, ratio: 0.0, pressure_level: :ok, eviction_policy: :volatile_lru, shards: %{}}
+        %{
+          total_bytes: 0,
+          max_bytes: 0,
+          ratio: 0.0,
+          pressure_level: :ok,
+          eviction_policy: :volatile_lru,
+          shards: %{}
+        }
     end
   end
 
@@ -206,7 +227,14 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
         }
       catch
         :exit, _ ->
-          %{shard_index: index, mode: :unknown, merging: false, last_merge_at: nil, merge_count: 0, total_bytes_reclaimed: 0}
+          %{
+            shard_index: index,
+            mode: :unknown,
+            merging: false,
+            last_merge_at: nil,
+            merge_count: 0,
+            total_bytes_reclaimed: 0
+          }
       end
     end)
   end
@@ -266,7 +294,9 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     case File.stat(path) do
       {:ok, %{type: :regular, size: size}} ->
         file = Path.basename(path)
-        {size, if(String.ends_with?(file, ".log"), do: 1, else: 0), if(String.ends_with?(file, ".hint"), do: 1, else: 0)}
+
+        {size, if(String.ends_with?(file, ".log"), do: 1, else: 0),
+         if(String.ends_with?(file, ".hint"), do: 1, else: 0)}
 
       {:ok, %{type: :directory}} ->
         case Ferricstore.FS.ls(path) do
@@ -297,14 +327,24 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
       {:ok, members, leader} ->
         {last_applied, term} =
           case WARaftBackend.storage_position(i) do
-            {:ok, {:raft_log_pos, index, position_term}} when is_integer(index) and is_integer(position_term) ->
+            {:ok, {:raft_log_pos, index, position_term}}
+            when is_integer(index) and is_integer(position_term) ->
               {index, position_term}
 
             _other ->
               {0, 0}
           end
 
-        %{shard: i, status: :ok, leader: leader, current_term: term, commit_index: last_applied, last_applied: last_applied, log_size: 0, members: members}
+        %{
+          shard: i,
+          status: :ok,
+          leader: leader,
+          current_term: term,
+          commit_index: last_applied,
+          last_applied: last_applied,
+          log_size: 0,
+          members: members
+        }
 
       _error ->
         unavailable_raft_shard(i)
@@ -331,7 +371,10 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     now = System.monotonic_time(:millisecond)
 
     Enum.map(summaries, fn summary ->
-      created = if is_integer(Map.get(summary, :created_at_ms)), do: Map.get(summary, :created_at_ms), else: now
+      created =
+        if is_integer(Map.get(summary, :created_at_ms)),
+          do: Map.get(summary, :created_at_ms),
+          else: now
 
       %{
         pid: Map.get(summary, :pid, self()),
@@ -376,9 +419,17 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
 
               flag_list =
                 []
-                |> then(fn f -> if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f end)
-                |> then(fn f -> if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f end)
-                |> then(fn f -> if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled), do: ["T" | f], else: f end)
+                |> then(fn f ->
+                  if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f
+                end)
+                |> then(fn f ->
+                  if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f
+                end)
+                |> then(fn f ->
+                  if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled),
+                    do: ["T" | f],
+                    else: f
+                end)
 
               {peer_str, max(0, div(now - created, 1000)), Enum.join(flag_list)}
           end
@@ -391,7 +442,16 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   end
 
   defp unavailable_raft_shard(i) do
-    %{shard: i, status: :unavailable, leader: nil, current_term: 0, commit_index: 0, last_applied: 0, log_size: 0, members: []}
+    %{
+      shard: i,
+      status: :unavailable,
+      leader: nil,
+      current_term: 0,
+      commit_index: 0,
+      last_applied: 0,
+      log_size: 0,
+      members: []
+    }
   end
 
   defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)

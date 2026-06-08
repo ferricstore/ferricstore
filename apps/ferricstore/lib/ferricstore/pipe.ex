@@ -397,4 +397,3 @@ defmodule FerricStore.Pipe do
     if Keyword.get(opts, flag, false), do: [flag | acc], else: acc
   end
 end
-

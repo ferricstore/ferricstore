@@ -4,10 +4,9 @@ defmodule Ferricstore.Raft.StateMachineColdScanGuardTest do
 
   test "cross-shard prefix scans batch cold Bitcask reads" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
+
     [_, section] =
-      String.split(source, "defp cross_shard_read_cold_bitcask_values(acc, entries) do",
-        parts: 2
-      )
+      String.split(source, "defp cross_shard_read_cold_bitcask_values(acc, entries) do", parts: 2)
 
     section =
       section |> String.split("defp cross_shard_read_cold_waraft_values", parts: 2) |> hd()

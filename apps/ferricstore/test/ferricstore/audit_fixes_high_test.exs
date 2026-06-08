@@ -8,7 +8,6 @@ defmodule Ferricstore.AuditFixesHighTest do
 
   alias Ferricstore.Commands.{Hash, Set, Server, Generic}
 
-
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map
   # ---------------------------------------------------------------------------
@@ -25,7 +24,9 @@ defmodule Ferricstore.AuditFixesHighTest do
       put: fn _key, _val, _exp -> :ok end,
       delete: fn _key -> :ok end,
       exists?: fn key -> Map.has_key?(data, key) end,
-      keys: fn -> Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1) end,
+      keys: fn ->
+        Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1)
+      end,
       flush: fn -> :ok end,
       dbsize: fn -> map_size(data) end,
       incr: fn _key, _delta -> {:ok, 1} end,
@@ -62,7 +63,9 @@ defmodule Ferricstore.AuditFixesHighTest do
       end
 
       test "push encoding correct" do
-        result = FerricstoreServer.Resp.Encoder.encode({:push, ["a", "b"]}) |> IO.iodata_to_binary()
+        result =
+          FerricstoreServer.Resp.Encoder.encode({:push, ["a", "b"]}) |> IO.iodata_to_binary()
+
         assert result == ">2\r\n$1\r\na\r\n$1\r\nb\r\n"
       end
 
@@ -204,7 +207,6 @@ defmodule Ferricstore.AuditFixesHighTest do
     end
 
     defp hscan_mock_store_from(hash_data) do
-
       mock_store()
       |> Map.put(:compound_get, fn _rk, _ck -> nil end)
       |> Map.put(:compound_put, fn _rk, _ck, _v, _e -> :ok end)
@@ -282,7 +284,6 @@ defmodule Ferricstore.AuditFixesHighTest do
     end
 
     defp sscan_mock_store_from(members) do
-
       mock_store()
       |> Map.put(:compound_get, fn _rk, _ck -> nil end)
       |> Map.put(:compound_put, fn _rk, _ck, _v, _e -> :ok end)
@@ -479,7 +480,9 @@ defmodule Ferricstore.AuditFixesHighTest do
     end
 
     test "SCAN full iteration collects all keys" do
-      data = for i <- 1..10, into: %{}, do: {"key_#{String.pad_leading("#{i}", 3, "0")}", {"v", 0}}
+      data =
+        for i <- 1..10, into: %{}, do: {"key_#{String.pad_leading("#{i}", 3, "0")}", {"v", 0}}
+
       store = mock_store(data)
 
       all_keys = collect_scan_keys(store, "0", 3, [])

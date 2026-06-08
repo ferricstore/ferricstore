@@ -155,7 +155,6 @@ defmodule FerricStore.API.Strings do
     end
   end
 
-
   @doc """
   Deletes one or more keys from the store.
 

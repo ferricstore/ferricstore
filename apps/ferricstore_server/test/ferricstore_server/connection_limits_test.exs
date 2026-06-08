@@ -119,7 +119,8 @@ defmodule FerricstoreServer.ConnectionLimitsTest do
         assert data =~ "value too large"
         assert data =~ "max 100 bytes"
       after
-        if original, do: Application.put_env(:ferricstore, :max_value_size, original),
+        if original,
+          do: Application.put_env(:ferricstore, :max_value_size, original),
           else: Application.delete_env(:ferricstore, :max_value_size)
       end
     end

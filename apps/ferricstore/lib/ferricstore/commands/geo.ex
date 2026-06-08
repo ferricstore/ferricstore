@@ -841,5 +841,4 @@ defmodule Ferricstore.Commands.Geo do
   defp format_distance(dist) do
     :erlang.float_to_binary(dist * 1.0, [:compact, decimals: 4])
   end
-
 end

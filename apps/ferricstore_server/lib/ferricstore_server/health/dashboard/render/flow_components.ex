@@ -1,5 +1,4 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowComponents do
-
   require EEx
 
   alias FerricstoreServer.Health.Dashboard.Flow.Recovery

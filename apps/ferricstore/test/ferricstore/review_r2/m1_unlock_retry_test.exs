@@ -23,20 +23,34 @@ defmodule Ferricstore.ReviewR2.M1UnlockRetryTest do
       expire_at = System.os_time(:millisecond) + 30_000
 
       # Lock
-      {:ok, {:applied_at, _, :ok}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [key], owner_ref, expire_at})
+      {:ok, {:applied_at, _, :ok}, _} =
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:lock_keys, [key], owner_ref, expire_at}
+        )
 
       # Unlock via CrossShardOp (which uses parallel_unlock internally)
       # We call it through a cross-shard RENAME that acquires and releases locks
-      [_key_other] = ShardHelpers.keys_on_different_shards(2) |> Enum.reject(fn k ->
-        Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k) == 0
-      end) |> Enum.take(1)
+      [_key_other] =
+        ShardHelpers.keys_on_different_shards(2)
+        |> Enum.reject(fn k ->
+          Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k) == 0
+        end)
+        |> Enum.take(1)
 
       # Just directly unlock via Raft to test the mechanism
-      {:ok, {:applied_at, _, :ok}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [key], owner_ref})
+      {:ok, {:applied_at, _, :ok}, _} =
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:unlock_keys, [key], owner_ref})
 
       # Another owner should be able to lock immediately
       other_ref = make_ref()
-      {:ok, {:applied_at, _, result}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id, {:lock_keys, [key], other_ref, expire_at})
+
+      {:ok, {:applied_at, _, result}, _} =
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id,
+          {:lock_keys, [key], other_ref, expire_at}
+        )
+
       assert result == :ok
 
       # Cleanup
@@ -61,8 +75,17 @@ defmodule Ferricstore.ReviewR2.M1UnlockRetryTest do
       ref2 = make_ref()
       expire = System.os_time(:millisecond) + 5000
 
-      {:ok, {:applied_at, _, r1}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id_0, {:lock_keys, [k1], ref1, expire})
-      {:ok, {:applied_at, _, r2}, _} = Ferricstore.Raft.CommandClock.process_command(shard_id_1, {:lock_keys, [k2], ref2, expire})
+      {:ok, {:applied_at, _, r1}, _} =
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id_0,
+          {:lock_keys, [k1], ref1, expire}
+        )
+
+      {:ok, {:applied_at, _, r2}, _} =
+        Ferricstore.Raft.CommandClock.process_command(
+          shard_id_1,
+          {:lock_keys, [k2], ref2, expire}
+        )
 
       assert r1 == :ok, "Shard 0 should be unlocked after RENAME, got: #{inspect(r1)}"
       assert r2 == :ok, "Shard 1 should be unlocked after RENAME, got: #{inspect(r2)}"

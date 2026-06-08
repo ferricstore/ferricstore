@@ -77,9 +77,12 @@ defmodule Ferricstore.Store.CompactTempCleanupTest do
       ShardHelpers.kill_shard_safely(0)
 
       # Original data still readable after restart
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), key) == "original_data"
-      end, "original data should survive cleanup of compact temp files")
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), key) == "original_data"
+        end,
+        "original data should survive cleanup of compact temp files"
+      )
     end
   end
 end

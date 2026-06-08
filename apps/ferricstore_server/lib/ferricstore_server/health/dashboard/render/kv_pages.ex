@@ -1,7 +1,6 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
-
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.Render.Overview
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.Render.Overview
 
   @keyspace_dashboard_default_limit 50
   @keyspace_dashboard_max_limit 500
@@ -300,5 +299,4 @@ import FerricstoreServer.Health.Dashboard.Render.Overview
   # ---------------------------------------------------------------------------
   # HTML rendering -- Doctor Sub-page
   # ---------------------------------------------------------------------------
-
 end

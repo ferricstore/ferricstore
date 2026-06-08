@@ -143,7 +143,7 @@ defmodule Ferricstore.ProbDurabilityTest do
 
       assert found >= 32,
              "expected at least 32 of 100 added elements to remain findable " <>
-             "after eviction-chain inserts; got #{found}"
+               "after eviction-chain inserts; got #{found}"
     end
   end
 
@@ -161,6 +161,7 @@ defmodule Ferricstore.ProbDurabilityTest do
       end
 
       {:ok, [result]} = FerricStore.cms_query(key, ["target"])
+
       assert result >= 25,
              "CMS over-counts by design; expected >= 25 after 25 incrby(1), got #{result}"
     end
@@ -230,6 +231,7 @@ defmodule Ferricstore.ProbDurabilityTest do
         end)
 
       {:ok, card} = FerricStore.bf_card(key)
+
       assert card == expected_card,
              "expected CARD == #{expected_card} for reported-new adds, got #{card}"
     end

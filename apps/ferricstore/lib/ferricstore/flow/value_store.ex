@@ -343,8 +343,6 @@ defmodule Ferricstore.Flow.ValueStore do
 
   defp flow_generated_payload_value_ref?(_ref), do: false
 
-
-
   defp validate_opts(opts) do
     if Keyword.keyword?(opts), do: :ok, else: {:error, "ERR flow opts must be a keyword list"}
   end
@@ -424,5 +422,4 @@ defmodule Ferricstore.Flow.ValueStore do
   defp maybe_put_attr(attrs, key, value), do: Map.put(attrs, key, value)
 
   defp now_ms, do: CommandTime.now_ms()
-
 end

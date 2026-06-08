@@ -109,6 +109,7 @@ defmodule Ferricstore.ApplicationTest do
                  )
 
         assert ^value = Ferricstore.Store.Router.get(ctx, "blob-threshold-isolated")
+
         assert [_blob_file | _] =
                  Path.wildcard(Path.join(ctx.data_dir, "blob/shard_0/*/*.bloblog"))
       after

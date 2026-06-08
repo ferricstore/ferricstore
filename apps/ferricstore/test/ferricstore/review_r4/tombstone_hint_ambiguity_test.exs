@@ -63,13 +63,13 @@ defmodule Ferricstore.ReviewR4.TombstoneHintAmbiguityTest do
       assert {:ok, read_entries} = NIF.v2_read_hint_file(hint_path)
 
       assert length(read_entries) == 2,
-        "v2_read_hint_file must return ALL entries including value_size=0, got #{length(read_entries)}"
+             "v2_read_hint_file must return ALL entries including value_size=0, got #{length(read_entries)}"
 
       # Find the empty-value entry
       empty_entry = Enum.find(read_entries, fn {key, _, _, _, _} -> key == "live_empty" end)
 
       assert empty_entry != nil,
-        "entry with value_size=0 must be present in v2_read_hint_file output"
+             "entry with value_size=0 must be present in v2_read_hint_file output"
 
       {_key, _fid, _offset, value_size, _expire} = empty_entry
       assert value_size == 0, "value_size must be 0 for the empty-value entry"
@@ -201,10 +201,10 @@ defmodule Ferricstore.ReviewR4.TombstoneHintAmbiguityTest do
 
       # Both entries must exist in ETS
       assert :ets.lookup(keydir, "alive_empty") != [],
-        "empty-value key must survive Elixir hint recovery"
+             "empty-value key must survive Elixir hint recovery"
 
       assert :ets.lookup(keydir, "alive_normal") != [],
-        "normal-value key must survive Elixir hint recovery"
+             "normal-value key must survive Elixir hint recovery"
 
       [{_, _, _, _, _, _, vs}] = :ets.lookup(keydir, "alive_empty")
       assert vs == 0, "value_size must be 0 in ETS for empty-value key"

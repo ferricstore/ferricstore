@@ -34,8 +34,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Config do
       flushed_index: flushed_index,
       batch_size: app_env(:flow_history_projector_batch_size, @default_batch_size),
       max_pending_entries: max_pending_entries,
-      flush_interval_ms: app_env(:flow_history_projector_flush_interval_ms, @default_flush_interval_ms),
-      chunk_interval_ms: app_env(:flow_history_projector_chunk_interval_ms, @default_chunk_interval_ms)
+      flush_interval_ms:
+        app_env(:flow_history_projector_flush_interval_ms, @default_flush_interval_ms),
+      chunk_interval_ms:
+        app_env(:flow_history_projector_chunk_interval_ms, @default_chunk_interval_ms)
     }
   end
 

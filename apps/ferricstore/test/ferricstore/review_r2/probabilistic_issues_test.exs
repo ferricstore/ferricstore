@@ -156,14 +156,18 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
 
       # First add should return 1 (new element)
       result1 = Bloom.handle("BF.ADD", [key, "hello"], store)
+
       assert result1 in [0, 1],
-        "BF.ADD should return 0 or 1, got: #{inspect(result1)}"
+             "BF.ADD should return 0 or 1, got: #{inspect(result1)}"
+
       assert result1 == 1
 
       # Second add of same element should return 0 (already present)
       result2 = Bloom.handle("BF.ADD", [key, "hello"], store)
+
       assert result2 in [0, 1],
-        "BF.ADD should return 0 or 1, got: #{inspect(result2)}"
+             "BF.ADD should return 0 or 1, got: #{inspect(result2)}"
+
       assert result2 == 0
     end
 
@@ -174,8 +178,10 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
 
       # Auto-create path (no BF.RESERVE)
       result = Bloom.handle("BF.ADD", [key, "world"], store)
+
       assert is_integer(result),
-        "BF.ADD auto-create should return integer, got: #{inspect(result)}"
+             "BF.ADD auto-create should return integer, got: #{inspect(result)}"
+
       assert result == 1
     end
 
@@ -192,7 +198,7 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
 
       for {r, elem} <- Enum.zip(result, ["a", "b", "c"]) do
         assert r in [0, 1],
-          "BF.MADD result for '#{elem}' should be 0 or 1, got: #{inspect(r)}"
+               "BF.MADD result for '#{elem}' should be 0 or 1, got: #{inspect(r)}"
       end
     end
   end
@@ -221,27 +227,30 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
       TopK.handle("TOPK.INCRBY", [key, "z", "30"], store)
 
       result = TopK.handle("TOPK.LIST", [key, "WITHCOUNT"], store)
+
       assert is_list(result),
-        "TOPK.LIST WITHCOUNT should return a list, got: #{inspect(result)}"
+             "TOPK.LIST WITHCOUNT should return a list, got: #{inspect(result)}"
 
       # Should be 6 elements: [elem, count, elem, count, elem, count]
       assert length(result) == 6,
-        "Expected 6 elements, got #{length(result)}: #{inspect(result)}"
+             "Expected 6 elements, got #{length(result)}: #{inspect(result)}"
 
       # Parse into pairs and validate types
       pairs = Enum.chunk_every(result, 2)
 
       for [elem, count] <- pairs do
         assert is_binary(elem),
-          "Element name should be binary, got: #{inspect(elem)}"
+               "Element name should be binary, got: #{inspect(elem)}"
+
         assert is_integer(count) and count > 0,
-          "Count should be a positive integer, got: #{inspect(count)}"
+               "Count should be a positive integer, got: #{inspect(count)}"
       end
 
       # Verify descending order by count
       counts = Enum.map(pairs, fn [_, c] -> c end)
+
       assert counts == Enum.sort(counts, :desc),
-        "Counts should be in descending order, got: #{inspect(counts)}"
+             "Counts should be in descending order, got: #{inspect(counts)}"
     end
 
     @tag :review_r2
@@ -252,8 +261,9 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
       :ok = TopK.handle("TOPK.RESERVE", [key, "3"], store)
 
       result = TopK.handle("TOPK.LIST", [key, "WITHCOUNT"], store)
+
       assert result == [],
-        "TOPK.LIST WITHCOUNT on empty TopK should return [], got: #{inspect(result)}"
+             "TOPK.LIST WITHCOUNT on empty TopK should return [], got: #{inspect(result)}"
     end
 
     @tag :review_r2
@@ -267,8 +277,9 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
 
       result = TopK.handle("TOPK.LIST", [key], store)
       assert is_list(result)
+
       assert Enum.all?(result, &is_binary/1),
-        "TOPK.LIST should return only strings, got: #{inspect(result)}"
+             "TOPK.LIST should return only strings, got: #{inspect(result)}"
     end
   end
 

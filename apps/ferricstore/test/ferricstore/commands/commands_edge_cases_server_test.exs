@@ -310,5 +310,4 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesServerTest do
       assert 0 == Dispatcher.dispatch("DBSIZE", [], store)
     end
   end
-
 end

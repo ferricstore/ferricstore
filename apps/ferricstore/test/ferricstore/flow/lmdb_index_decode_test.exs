@@ -16,7 +16,11 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
     key = LMDB.query_index_key("parent:p1", "flow-1", 100)
     value = LMDB.encode_query_index_value("flow-1", 100, 0, "state-key")
 
-    assert LMDBIndexDecode.query_entries([{key, value}, {"bad", "not-a-valid-index"}], "unused", 999) ==
+    assert LMDBIndexDecode.query_entries(
+             [{key, value}, {"bad", "not-a-valid-index"}],
+             "unused",
+             999
+           ) ==
              [{"flow-1", 100, "state-key"}]
   end
 

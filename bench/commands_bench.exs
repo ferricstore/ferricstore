@@ -78,31 +78,25 @@ Benchee.run(
     "Dispatch GET: key present" => fn ->
       _val = Dispatcher.dispatch("GET", ["cmd_key_1"], store)
     end,
-
     "Dispatch GET: key absent" => fn ->
       _val = Dispatcher.dispatch("GET", ["nonexistent_key"], store)
     end,
-
     "Dispatch SET: simple" => fn ->
       idx = :counters.get(counter, 1)
       :counters.add(counter, 1, 1)
       Dispatcher.dispatch("SET", ["set_bench_#{idx}", "value"], store)
     end,
-
     "Dispatch SET: with EX 100" => fn ->
       idx = :counters.get(counter, 1)
       :counters.add(counter, 1, 1)
       Dispatcher.dispatch("SET", ["set_ex_bench_#{idx}", "value", "EX", "100"], store)
     end,
-
     "Dispatch MGET: 100 keys" => fn ->
       Dispatcher.dispatch("MGET", keys_100, store)
     end,
-
     "Dispatch MSET: 100 pairs" => fn ->
       Dispatcher.dispatch("MSET", kv_pairs_100, store)
     end,
-
     "Dispatch KEYS: * (1000 keys)" => fn ->
       Dispatcher.dispatch("KEYS", ["*"], store)
     end

@@ -173,12 +173,14 @@ defmodule Ferricstore.AuditFixesMemoryTest do
   describe "decentralized_counters on write_concurrency tables" do
     test "keydir table has decentralized_counters" do
       # Create a table with the same options as shard.ex keydir
-      table = :ets.new(:dc_test_keydir, [
-        :set, :public,
-        {:read_concurrency, true},
-        {:write_concurrency, true},
-        {:decentralized_counters, true}
-      ])
+      table =
+        :ets.new(:dc_test_keydir, [
+          :set,
+          :public,
+          {:read_concurrency, true},
+          {:write_concurrency, true},
+          {:decentralized_counters, true}
+        ])
 
       info = :ets.info(table)
       assert Keyword.get(info, :decentralized_counters) == true
@@ -187,12 +189,14 @@ defmodule Ferricstore.AuditFixesMemoryTest do
     end
 
     test "concurrent inserts with decentralized_counters" do
-      table = :ets.new(:dc_test_concurrent, [
-        :set, :public,
-        {:read_concurrency, true},
-        {:write_concurrency, true},
-        {:decentralized_counters, true}
-      ])
+      table =
+        :ets.new(:dc_test_concurrent, [
+          :set,
+          :public,
+          {:read_concurrency, true},
+          {:write_concurrency, true},
+          {:decentralized_counters, true}
+        ])
 
       tasks =
         for i <- 1..100 do

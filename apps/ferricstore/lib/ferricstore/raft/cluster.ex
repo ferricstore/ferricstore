@@ -94,7 +94,8 @@ defmodule Ferricstore.Raft.Cluster do
     end
   end
 
-  def add_member(shard_index, node, membership, opts) when membership in [:promotable, :non_voter] do
+  def add_member(shard_index, node, membership, opts)
+      when membership in [:promotable, :non_voter] do
     case WARaftBackend.adjust_membership(shard_index, :remove_membership, node) do
       {:ok, _position} -> :ok
       {:error, :not_a_member} -> add_participant(shard_index, node, opts)

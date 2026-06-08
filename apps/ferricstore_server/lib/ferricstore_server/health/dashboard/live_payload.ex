@@ -6,7 +6,10 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   alias FerricstoreServer.Health.Dashboard.Flow.{Browse, Detail, Projection, Query}
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
-  import FerricstoreServer.Health.Dashboard.Format, only: [dashboard_internal_error: 2, dashboard_internal_error: 3]
+
+  import FerricstoreServer.Health.Dashboard.Format,
+    only: [dashboard_internal_error: 2, dashboard_internal_error: 3]
+
   import FerricstoreServer.Health.Dashboard.Layout
   import FerricstoreServer.Health.Dashboard.Render.Admin
   import FerricstoreServer.Health.Dashboard.Render.FlowCharts
@@ -198,7 +201,12 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     live_component_payload(%{
       "flow_detail" => render_flow_detail(data),
       "flow_debug" => render_flow_debug(data),
-      "flow_history" => render_flow_history_timeline(data.history, data.history_status, Map.get(data, :history_page)),
+      "flow_history" =>
+        render_flow_history_timeline(
+          data.history,
+          data.history_status,
+          Map.get(data, :history_page)
+        ),
       "flow_timeline_chart" => render_flow_timeline_chart(data.history)
     })
   end
@@ -217,9 +225,15 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   defp live_flow_due_payload(data) do
     live_component_payload(%{
       "flow_due_chart" => render_flow_due_chart(data.due_now, data.scheduled),
-      "flow_due_now" => render_flow_due_records("Due Now", data.due_now, data.total_sampled, data.sample_limit),
+      "flow_due_now" =>
+        render_flow_due_records("Due Now", data.due_now, data.total_sampled, data.sample_limit),
       "flow_scheduled" =>
-        render_flow_due_records("Scheduled Future", data.scheduled, data.total_sampled, data.sample_limit)
+        render_flow_due_records(
+          "Scheduled Future",
+          data.scheduled,
+          data.total_sampled,
+          data.sample_limit
+        )
     })
   end
 
@@ -237,7 +251,11 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
         {:ok, live_flow_value_error(ref, "missing flow id")}
 
       true ->
-        opts = if partition_key == "", do: [values: false], else: [values: false, partition_key: partition_key]
+        opts =
+          if partition_key == "",
+            do: [values: false],
+            else: [values: false, partition_key: partition_key]
+
         data = Detail.collect_page(flow_id, opts)
         visible_refs = flow_detail_value_refs(data.record, data.history) |> MapSet.new(& &1.ref)
 
@@ -252,15 +270,26 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
       {:ok, live_flow_value_error("", dashboard_internal_error("value lookup failed", error))}
   catch
     :exit, error ->
-      {:ok, live_flow_value_error("", dashboard_internal_error("value lookup exited", :exit, error))}
+      {:ok,
+       live_flow_value_error("", dashboard_internal_error("value lookup exited", :exit, error))}
   end
 
   defp live_flow_value_payload_from_ref(ref) do
     timeout_ms = flow_dashboard_detail_fetch_timeout_ms()
 
-    case bounded_dashboard_call(fn -> flow_dashboard_flow_value_mget([ref]) end, timeout_ms, :value) do
+    case bounded_dashboard_call(
+           fn -> flow_dashboard_flow_value_mget([ref]) end,
+           timeout_ms,
+           :value
+         ) do
       {:ok, {:ok, [value]}} ->
-        {:ok, %{generated_at_ms: System.system_time(:millisecond), status: "ok", ref: ref, value: flow_value_preview(value)}}
+        {:ok,
+         %{
+           generated_at_ms: System.system_time(:millisecond),
+           status: "ok",
+           ref: ref,
+           value: flow_value_preview(value)
+         }}
 
       {:ok, {:ok, _values}} ->
         {:ok, live_flow_value_error(ref, "unexpected value result count")}
@@ -280,7 +309,13 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   end
 
   defp live_flow_value_error(ref, message) do
-    %{generated_at_ms: System.system_time(:millisecond), status: "error", ref: ref, error: message, value: message}
+    %{
+      generated_at_ms: System.system_time(:millisecond),
+      status: "error",
+      ref: ref,
+      error: message,
+      value: message
+    }
   end
 
   defp live_flow_signals_payload(query, opts \\ []) do
@@ -292,7 +327,13 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
     live_component_payload(%{
       "flow_signals_table" =>
-        render_flow_signals_table(data.signals, data.total_sampled, data.filtered_sampled, data.sample_limit, data.filters)
+        render_flow_signals_table(
+          data.signals,
+          data.total_sampled,
+          data.filtered_sampled,
+          data.sample_limit,
+          data.filters
+        )
     })
   end
 
@@ -305,7 +346,14 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
     live_component_payload(%{
       "flow_states_chart" => render_flow_states_chart(data.states),
-      "flow_states_table" => render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, data.filters),
+      "flow_states_table" =>
+        render_flow_states_table(
+          data.states,
+          data.total_sampled,
+          data.filtered_sampled,
+          data.sample_limit,
+          data.filters
+        ),
       "flow_recent_records" => render_flow_recent_records(data.records, data.limit)
     })
   end
@@ -336,9 +384,11 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   defp render_flow_live_components(data) do
     %{
-      "flow_overview" => render_flow_overview(data.summary, data.filtered_sampled, data.sample_limit),
+      "flow_overview" =>
+        render_flow_overview(data.summary, data.filtered_sampled, data.sample_limit),
       "flow_issue_cards" => render_flow_issue_cards(data.summary),
-      "flow_projection_health" => render_flow_projection_health(Map.get(data, :projection, Projection.default_health())),
+      "flow_projection_health" =>
+        render_flow_projection_health(Map.get(data, :projection, Projection.default_health())),
       "flow_state_breakdown" => render_flow_state_breakdown(data.types),
       "flow_workers" => render_flow_workers(data.workers),
       "flow_recent_records" => render_flow_recent_records(data.records)

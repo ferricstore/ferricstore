@@ -80,7 +80,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_op(state, {:project_flow_state, key, value, expire_at_ms}, acc)
-       when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
+      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
     expand_flow_state_value(state.path, key, value, expire_at_ms, acc)
   end
 
@@ -236,7 +236,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def source_keydir(%{instance_ctx: ctx, shard_index: shard_index})
-       when is_map(ctx) and is_integer(shard_index) do
+      when is_map(ctx) and is_integer(shard_index) do
     case Map.get(ctx, :keydir_refs) do
       refs when is_tuple(refs) and shard_index >= 0 and shard_index < tuple_size(refs) ->
         elem(refs, shard_index)
@@ -249,7 +249,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def source_keydir(_state), do: nil
 
   def read_source_location(state, _key, _cached_value, expire_at_ms, file_id, offset)
-       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 do
+      when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 do
     state.shard_data_path
     |> bitcask_file_path(file_id)
     |> NIF.v2_pread_at(offset)
@@ -260,27 +260,27 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     do: :not_found
 
   def read_source_location(
-         %{instance_ctx: ctx, shard_index: shard_index},
-         key,
-         _cached_value,
-         expire_at_ms,
-         {:waraft_segment, _index} = file_id,
-         _offset
-       ) do
+        %{instance_ctx: ctx, shard_index: shard_index},
+        key,
+        _cached_value,
+        expire_at_ms,
+        {:waraft_segment, _index} = file_id,
+        _offset
+      ) do
     ctx
     |> WARaftSegmentReader.read_value_from_location(shard_index, file_id, key)
     |> source_segment_read_result(expire_at_ms)
   end
 
   def read_source_location(
-         %{instance_ctx: ctx, shard_index: shard_index},
-         key,
-         _cached_value,
-         expire_at_ms,
-         {kind, _index} = file_id,
-         _offset
-       )
-       when kind in [:waraft_projection, :waraft_apply_projection] do
+        %{instance_ctx: ctx, shard_index: shard_index},
+        key,
+        _cached_value,
+        expire_at_ms,
+        {kind, _index} = file_id,
+        _offset
+      )
+      when kind in [:waraft_projection, :waraft_apply_projection] do
     ctx
     |> WARaftSegmentReader.read_value_from_location(shard_index, file_id, key)
     |> source_segment_read_result(expire_at_ms)
@@ -307,8 +307,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_path_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc)
-       when is_binary(terminal_key) and is_binary(value) and is_binary(state_key) and
-              is_binary(count_key) do
+      when is_binary(terminal_key) and is_binary(value) and is_binary(state_key) and
+             is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
          {:ok, count, acc} <- terminal_count(path, count_key, acc) do
       existed? = is_binary(old_value)
@@ -337,7 +337,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_path_op(path, {:terminal_put, terminal_key, value, nil, count_key}, acc)
-       when is_binary(terminal_key) and is_binary(value) and is_binary(count_key) do
+      when is_binary(terminal_key) and is_binary(value) and is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
          {:ok, count, acc} <- terminal_count(path, count_key, acc) do
       existed? = is_binary(old_value)
@@ -364,13 +364,13 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_path_op(
-         path,
-         {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
-          expire_at_ms, parent_flow_id, root_flow_id, correlation_id},
-         acc
-       )
-       when is_binary(id) and is_binary(type) and is_binary(terminal_state) and
-              is_integer(updated_at_ms) and is_binary(state_key) and is_integer(expire_at_ms) do
+        path,
+        {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
+         expire_at_ms, parent_flow_id, root_flow_id, correlation_id},
+        acc
+      )
+      when is_binary(id) and is_binary(type) and is_binary(terminal_state) and
+             is_integer(updated_at_ms) and is_binary(state_key) and is_integer(expire_at_ms) do
     state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
     terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, id, updated_at_ms)
     count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
@@ -404,17 +404,17 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_path_op(_path, {:query_put, query_key, value}, acc)
-       when is_binary(query_key) and is_binary(value) do
+      when is_binary(query_key) and is_binary(value) do
     {:ok, prepend_ops(acc, [{:put, query_key, value}])}
   end
 
   def expand_path_op(
-         path,
-         {:history_project_from_index, flow_index, flow_lookup, id, partition_key, history_key,
-          expire_at_ms},
-         acc
-       )
-       when is_binary(id) and is_binary(history_key) and is_integer(expire_at_ms) do
+        path,
+        {:history_project_from_index, flow_index, flow_lookup, id, partition_key, history_key,
+         expire_at_ms},
+        acc
+      )
+      when is_binary(id) and is_binary(history_key) and is_integer(expire_at_ms) do
     entries = history_project_from_index_entries(flow_index, flow_lookup, history_key)
 
     {:ok,
@@ -425,12 +425,12 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_path_op(
-         path,
-         {:history_put_many, id, partition_key, history_key, expire_at_ms, entries},
-         acc
-       )
-       when is_binary(id) and is_binary(history_key) and is_integer(expire_at_ms) and
-              is_list(entries) do
+        path,
+        {:history_put_many, id, partition_key, history_key, expire_at_ms, entries},
+        acc
+      )
+      when is_binary(id) and is_binary(history_key) and is_integer(expire_at_ms) and
+             is_list(entries) do
     {:ok,
      prepend_ops(
        acc,
@@ -443,19 +443,19 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_path_op(path, {:history_delete, history_index_key}, acc)
-       when is_binary(history_index_key) do
+      when is_binary(history_index_key) do
     {:ok,
      prepend_ops(acc, Ferricstore.Flow.LMDB.history_index_delete_ops(path, history_index_key))}
   end
 
   def expand_path_op(_path, {put_mode, key, value} = op, acc)
-       when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
+      when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
     acc = maybe_init_terminal_counts_for_active_record(value, acc)
     {:ok, prepend_ops(acc, [op])}
   end
 
   def expand_path_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
-       when is_binary(terminal_key) and is_binary(state_key) and is_binary(count_key) do
+      when is_binary(terminal_key) and is_binary(state_key) and is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
          {:ok, count, acc} <- terminal_count(path, count_key, acc) do
       existed? = is_binary(old_value)
@@ -487,7 +487,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_path_op(path, {:terminal_delete, terminal_key, nil, count_key}, acc)
-       when is_binary(terminal_key) and is_binary(count_key) do
+      when is_binary(terminal_key) and is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
          {:ok, count, acc} <- terminal_count(path, count_key, acc) do
       existed? = is_binary(old_value)
@@ -709,15 +709,15 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def terminal_project_metadata_ops(
-         id,
-         partition_key,
-         score,
-         expire_at_ms,
-         state_key,
-         parent_flow_id,
-         root_flow_id,
-         correlation_id
-       ) do
+        id,
+        partition_key,
+        score,
+        expire_at_ms,
+        state_key,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id
+      ) do
     []
     |> terminal_project_metadata_op(
       :parent,
@@ -749,52 +749,52 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def terminal_project_metadata_op(
-         ops,
-         :root,
-         nil,
-         _partition_key,
-         _id,
-         _score,
-         _expire_at_ms,
-         _state_key
-       ),
-       do: ops
+        ops,
+        :root,
+        nil,
+        _partition_key,
+        _id,
+        _score,
+        _expire_at_ms,
+        _state_key
+      ),
+      do: ops
 
   def terminal_project_metadata_op(
-         ops,
-         :root,
-         "",
-         _partition_key,
-         _id,
-         _score,
-         _expire_at_ms,
-         _state_key
-       ),
-       do: ops
+        ops,
+        :root,
+        "",
+        _partition_key,
+        _id,
+        _score,
+        _expire_at_ms,
+        _state_key
+      ),
+      do: ops
 
   def terminal_project_metadata_op(
-         ops,
-         :root,
-         id,
-         _partition_key,
-         id,
-         _score,
-         _expire_at_ms,
-         _state_key
-       ),
-       do: ops
+        ops,
+        :root,
+        id,
+        _partition_key,
+        id,
+        _score,
+        _expire_at_ms,
+        _state_key
+      ),
+      do: ops
 
   def terminal_project_metadata_op(
-         ops,
-         kind,
-         value,
-         partition_key,
-         id,
-         score,
-         expire_at_ms,
-         state_key
-       )
-       when is_binary(value) and value != "" do
+        ops,
+        kind,
+        value,
+        partition_key,
+        id,
+        score,
+        expire_at_ms,
+        state_key
+      )
+      when is_binary(value) and value != "" do
     index_key =
       case kind do
         :parent -> Ferricstore.Flow.Keys.parent_index_key(value, partition_key)
@@ -809,24 +809,24 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def terminal_project_metadata_op(
-         ops,
-         _kind,
-         _value,
-         _partition_key,
-         _id,
-         _score,
-         _expire_at_ms,
-         _state_key
-       ),
-       do: ops
+        ops,
+        _kind,
+        _value,
+        _partition_key,
+        _id,
+        _score,
+        _expire_at_ms,
+        _state_key
+      ),
+      do: ops
 
   def terminal_project_metadata_index_keys(
-         id,
-         partition_key,
-         parent_flow_id,
-         root_flow_id,
-         correlation_id
-       ) do
+        id,
+        partition_key,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id
+      ) do
     []
     |> terminal_project_metadata_index_key(:parent, parent_flow_id, partition_key, id)
     |> terminal_project_metadata_index_key(:root, root_flow_id, partition_key, id)
@@ -838,7 +838,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def terminal_project_metadata_index_key(keys, :root, id, _partition_key, id), do: keys
 
   def terminal_project_metadata_index_key(keys, kind, value, partition_key, _id)
-       when is_binary(value) and value != "" do
+      when is_binary(value) and value != "" do
     key =
       case kind do
         :parent -> Ferricstore.Flow.Keys.parent_index_key(value, partition_key)
@@ -877,13 +877,13 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def history_index_value(
-         path,
-         history_index_key,
-         event_id,
-         event_ms,
-         compound_key,
-         expire_at_ms
-       ) do
+        path,
+        history_index_key,
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms
+      ) do
     case existing_history_index_location(path, history_index_key) do
       {{:flow_history, _file_id} = file_ref, offset, value_size} ->
         Ferricstore.Flow.LMDB.encode_history_index_value(

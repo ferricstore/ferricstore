@@ -41,7 +41,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   end
 
   def decode_replay_command({inner_command, %{hlc_ts: {physical_ms, logical}}})
-       when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(logical) do
+      when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(logical) do
     decode_replay_command(inner_command)
   end
 
@@ -51,8 +51,8 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
     do: {:ok, value}
 
   def value_from_command({:put_blob_ref, key, encoded_ref, _expire_at_ms}, key)
-       when is_binary(encoded_ref),
-       do: {:ok, encoded_ref}
+      when is_binary(encoded_ref),
+      do: {:ok, encoded_ref}
 
   def value_from_command({:set, key, value, _expire_at_ms, _opts}, key) when is_binary(value),
     do: {:ok, value}
@@ -60,12 +60,12 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   def value_from_command({:delete, key}, key), do: :deleted
 
   def value_from_command({:compound_put, key, value, _expire_at_ms}, key)
-       when is_binary(value),
-       do: {:ok, value}
+      when is_binary(value),
+      do: {:ok, value}
 
   def value_from_command({:compound_put_blob_ref, key, encoded_ref, _expire_at_ms}, key)
-       when is_binary(encoded_ref),
-       do: {:ok, encoded_ref}
+      when is_binary(encoded_ref),
+      do: {:ok, encoded_ref}
 
   def value_from_command({:compound_delete, key}, key), do: :deleted
 
@@ -90,7 +90,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   end
 
   def value_from_command({:compound_batch_put, _redis_key, entries}, key)
-       when is_list(entries) do
+      when is_list(entries) do
     Enum.reduce(entries, :not_found, fn
       {^key, value, _expire_at_ms}, _acc when is_binary(value) -> {:ok, value}
       _entry, acc -> acc
@@ -98,7 +98,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   end
 
   def value_from_command({:compound_blob_batch_put, _redis_key, entries}, key)
-       when is_list(entries) do
+      when is_list(entries) do
     Enum.reduce(entries, :not_found, fn
       {^key, value, _expire_at_ms, :value}, _acc when is_binary(value) ->
         {:ok, value}
@@ -140,30 +140,30 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   end
 
   def collect_values_from_command({:put, key, value, _expire_at_ms}, keyset, acc)
-       when is_binary(value),
-       do: put_requested_value(acc, keyset, key, value)
+      when is_binary(value),
+      do: put_requested_value(acc, keyset, key, value)
 
   def collect_values_from_command({:put_blob_ref, key, encoded_ref, _expire_at_ms}, keyset, acc)
-       when is_binary(encoded_ref),
-       do: put_requested_value(acc, keyset, key, encoded_ref)
+      when is_binary(encoded_ref),
+      do: put_requested_value(acc, keyset, key, encoded_ref)
 
   def collect_values_from_command({:set, key, value, _expire_at_ms, _opts}, keyset, acc)
-       when is_binary(value),
-       do: put_requested_value(acc, keyset, key, value)
+      when is_binary(value),
+      do: put_requested_value(acc, keyset, key, value)
 
   def collect_values_from_command({:delete, key}, _keyset, acc), do: Map.delete(acc, key)
 
   def collect_values_from_command({:compound_put, key, value, _expire_at_ms}, keyset, acc)
-       when is_binary(value),
-       do: put_requested_value(acc, keyset, key, value)
+      when is_binary(value),
+      do: put_requested_value(acc, keyset, key, value)
 
   def collect_values_from_command(
-         {:compound_put_blob_ref, key, encoded_ref, _expire_at_ms},
-         keyset,
-         acc
-       )
-       when is_binary(encoded_ref),
-       do: put_requested_value(acc, keyset, key, encoded_ref)
+        {:compound_put_blob_ref, key, encoded_ref, _expire_at_ms},
+        keyset,
+        acc
+      )
+      when is_binary(encoded_ref),
+      do: put_requested_value(acc, keyset, key, encoded_ref)
 
   def collect_values_from_command({:compound_delete, key}, _keyset, acc),
     do: Map.delete(acc, key)
@@ -179,7 +179,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   end
 
   def collect_values_from_command({:put_blob_batch, entries}, keyset, acc)
-       when is_list(entries) do
+      when is_list(entries) do
     Enum.reduce(entries, acc, fn
       {key, value, _expire_at_ms, :value}, values when is_binary(value) ->
         put_requested_value(values, keyset, key, value)
@@ -193,7 +193,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   end
 
   def collect_values_from_command({:compound_batch_put, _redis_key, entries}, keyset, acc)
-       when is_list(entries) do
+      when is_list(entries) do
     Enum.reduce(entries, acc, fn
       {key, value, _expire_at_ms}, values when is_binary(value) ->
         put_requested_value(values, keyset, key, value)
@@ -204,7 +204,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   end
 
   def collect_values_from_command({:compound_blob_batch_put, _redis_key, entries}, keyset, acc)
-       when is_list(entries) do
+      when is_list(entries) do
     Enum.reduce(entries, acc, fn
       {key, value, _expire_at_ms, :value}, values when is_binary(value) ->
         put_requested_value(values, keyset, key, value)
@@ -221,11 +221,11 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
     do: delete_requested_keys(acc, keyset, keys)
 
   def collect_values_from_command({:compound_batch_delete, _redis_key, keys}, keyset, acc)
-       when is_list(keys),
-       do: delete_requested_keys(acc, keyset, keys)
+      when is_list(keys),
+      do: delete_requested_keys(acc, keyset, keys)
 
   def collect_values_from_command({:compound_delete_prefix, prefix}, keyset, acc)
-       when is_binary(prefix) do
+      when is_binary(prefix) do
     Enum.reduce(keyset, acc, fn
       key, values when is_binary(key) ->
         if String.starts_with?(key, prefix), do: Map.delete(values, key), else: values

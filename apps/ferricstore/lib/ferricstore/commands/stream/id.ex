@@ -5,7 +5,11 @@ defmodule Ferricstore.Commands.Stream.ID do
 
   @type stream_id :: {integer(), integer()}
 
-  @spec resolve(:auto | {:explicit, integer(), integer()} | {:partial, integer()}, integer(), integer()) ::
+  @spec resolve(
+          :auto | {:explicit, integer(), integer()} | {:partial, integer()},
+          integer(),
+          integer()
+        ) ::
           {:ok, stream_id()} | {:error, binary()}
   def resolve(:auto, last_ms, last_seq) do
     # CommandTime uses HLC outside Raft and stamped log-entry time inside Raft,
@@ -76,7 +80,8 @@ defmodule Ferricstore.Commands.Stream.ID do
     end
   end
 
-  @spec parse_range_id(binary(), :min | :max) :: {:ok, :min | :max | stream_id()} | {:error, binary()}
+  @spec parse_range_id(binary(), :min | :max) ::
+          {:ok, :min | :max | stream_id()} | {:error, binary()}
   def parse_range_id("-", :min), do: {:ok, :min}
   def parse_range_id("+", :max), do: {:ok, :max}
   def parse_range_id(id_str, _default), do: parse_full_id(id_str)
@@ -86,7 +91,9 @@ defmodule Ferricstore.Commands.Stream.ID do
   def normalize_ast_range_id(:min, _default), do: {:ok, :min}
   def normalize_ast_range_id(:max, _default), do: {:ok, :max}
   def normalize_ast_range_id({_ms, _seq} = id, _default), do: {:ok, id}
-  def normalize_ast_range_id(id_str, default) when is_binary(id_str), do: parse_range_id(id_str, default)
+
+  def normalize_ast_range_id(id_str, default) when is_binary(id_str),
+    do: parse_range_id(id_str, default)
 
   @spec parse_exclusive_start(binary()) :: {:ok, :min | stream_id()} | {:error, binary()}
   def parse_exclusive_start("0"), do: {:ok, :min}

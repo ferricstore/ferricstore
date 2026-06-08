@@ -40,7 +40,11 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
   # Build the store map that routes through the Shard GenServer,
   # which in turn routes writes through Raft.
   defp build_store(redis_key) do
-    shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+    shard =
+      Router.shard_name(
+        FerricStore.Instance.get(:default),
+        Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+      )
 
     %{
       get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
@@ -89,31 +93,66 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }
@@ -644,7 +683,11 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
       key = ukey("zrange_sub")
       store = build_store(key)
 
-      SortedSet.handle("ZADD", [key, "1.0", "a", "2.0", "b", "3.0", "c", "4.0", "d", "5.0", "e"], store)
+      SortedSet.handle(
+        "ZADD",
+        [key, "1.0", "a", "2.0", "b", "3.0", "c", "4.0", "d", "5.0", "e"],
+        store
+      )
 
       assert SortedSet.handle("ZRANGE", [key, "1", "3"], store) == ["b", "c", "d"]
     end

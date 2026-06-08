@@ -802,7 +802,6 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end
   end
 
-
   defp storage_root(%{data_dir: data_dir}, shard_index) do
     Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"])
   end

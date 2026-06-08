@@ -104,7 +104,9 @@ defmodule Ferricstore.Commands.Strings.Delete do
   end
 
   defp delete_compound_prefix_if_present(_key, nil, _store), do: :ok
-  defp delete_compound_prefix_if_present(key, prefix, store), do: Ops.compound_delete_prefix(store, key, prefix)
+
+  defp delete_compound_prefix_if_present(key, prefix, store),
+    do: Ops.compound_delete_prefix(store, key, prefix)
 
   defp delete_list_meta_if_needed(key, "list", store) do
     Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))

@@ -50,7 +50,6 @@ defmodule FerricStore do
     end
   end
 
-
   # ---------------------------------------------------------------------------
   # Readiness
   # ---------------------------------------------------------------------------
@@ -185,7 +184,6 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
   # Strings
   # ---------------------------------------------------------------------------
-
 
   # ---------------------------------------------------------------------------
   # Embedded Redis-compatible API
@@ -417,7 +415,10 @@ defmodule FerricStore do
   defdelegate flow_complete(id, lease_token, opts \\ []), to: FlowAPI
   defdelegate flow_complete_many(partition_key, items, opts \\ []), to: FlowAPI
   defdelegate flow_transition(id, from_state, to_state, opts \\ []), to: FlowAPI
-  defdelegate flow_transition_many(partition_key, from_state, to_state, items, opts \\ []), to: FlowAPI
+
+  defdelegate flow_transition_many(partition_key, from_state, to_state, items, opts \\ []),
+    to: FlowAPI
+
   defdelegate flow_retry(id, lease_token, opts), to: FlowAPI
   defdelegate flow_retry_many(partition_key, items, opts \\ []), to: FlowAPI
   defdelegate flow_fail(id, lease_token, opts \\ []), to: FlowAPI
@@ -435,5 +436,4 @@ defmodule FerricStore do
   defdelegate flow_info(type, opts \\ []), to: FlowAPI
   defdelegate flow_stuck(type, opts \\ []), to: FlowAPI
   defdelegate flow_history(id, opts \\ []), to: FlowAPI
-
 end

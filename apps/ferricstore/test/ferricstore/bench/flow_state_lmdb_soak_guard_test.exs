@@ -6,9 +6,7 @@ defmodule Ferricstore.Bench.FlowStateLMDBSoakGuardTest do
 
   test "production soak reports projection, blob protection, and release cursor health" do
     source =
-      File.read!(
-        Path.expand("../../../../../bench/flow_state_lmdb_soak.exs", __DIR__)
-      )
+      File.read!(Path.expand("../../../../../bench/flow_state_lmdb_soak.exs", __DIR__))
 
     assert source =~ "history_pending="
     assert source =~ "history_oldest_lag_ms="

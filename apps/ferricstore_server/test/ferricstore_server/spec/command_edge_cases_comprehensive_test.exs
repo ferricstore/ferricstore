@@ -1,5 +1,13 @@
-Code.require_file("command_edge_cases_comprehensive_test/sections/wrongtype_cross_type_access.exs", __DIR__)
-Code.require_file("command_edge_cases_comprehensive_test/sections/wrong_arity_rejection_sweep.exs", __DIR__)
+Code.require_file(
+  "command_edge_cases_comprehensive_test/sections/wrongtype_cross_type_access.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "command_edge_cases_comprehensive_test/sections/wrong_arity_rejection_sweep.exs",
+  __DIR__
+)
+
 defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
   @moduledoc """
   Comprehensive edge-case tests for EVERY FerricStore command category.
@@ -160,36 +168,29 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
   # WRONGTYPE CROSS-TYPE ERRORS
   # ===========================================================================
 
-
   # ===========================================================================
   # TTL / EXPIRY EDGE CASES
   # ===========================================================================
-
 
   # ===========================================================================
   # GENERIC COMMANDS EDGE CASES
   # ===========================================================================
 
-
   # ===========================================================================
   # SERVER COMMANDS EDGE CASES
   # ===========================================================================
-
 
   # ===========================================================================
   # TRANSACTION EDGE CASES
   # ===========================================================================
 
-
   # ===========================================================================
   # PIPELINE EDGE CASES
   # ===========================================================================
 
-
   # ===========================================================================
   # SCAN EDGE CASES
   # ===========================================================================
-
 
   # Helper: collects all keys from SCAN iterations
   defp scan_all(sock, opt_key, opt_value) do
@@ -211,29 +212,23 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
   # BITMAP EDGE CASES
   # ===========================================================================
 
-
   # ===========================================================================
   # HYPERLOGLOG EDGE CASES
   # ===========================================================================
-
 
   # ===========================================================================
   # CONNECTION / CLIENT EDGE CASES
   # ===========================================================================
 
-
   # ===========================================================================
   # BINARY SAFETY EDGE CASES
   # ===========================================================================
-
 
   # ===========================================================================
   # WRONG ARITY SWEEP: Ensure every command rejects wrong arg counts
   # ===========================================================================
 
-
   # ===========================================================================
   # STRESS: Rapid key creation and deletion
   # ===========================================================================
-
 end

@@ -60,8 +60,7 @@ defmodule Ferricstore.AuditLog do
 
   @typedoc "A single audit log entry."
   @type entry ::
-          {id :: non_neg_integer(), timestamp_us :: integer(), event_type(),
-           details()}
+          {id :: non_neg_integer(), timestamp_us :: integer(), event_type(), details()}
 
   # -------------------------------------------------------------------------
   # Public API

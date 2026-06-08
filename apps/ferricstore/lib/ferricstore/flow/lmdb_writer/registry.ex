@@ -36,8 +36,11 @@ defmodule Ferricstore.Flow.LMDBWriter.Registry do
 
   def normalize_projection_outbox_entries(entries) do
     Enum.flat_map(entries, fn
-      {state_key, version} when is_binary(state_key) and is_integer(version) -> [{state_key, version}]
-      _other -> []
+      {state_key, version} when is_binary(state_key) and is_integer(version) ->
+        [{state_key, version}]
+
+      _other ->
+        []
     end)
   end
 

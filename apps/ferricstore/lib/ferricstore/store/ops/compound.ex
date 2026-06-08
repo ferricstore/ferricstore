@@ -168,7 +168,12 @@ defmodule Ferricstore.Store.Ops.Compound do
       ShardETS.ets_insert(tx.shard_state, compound_key, value, expire_at_ms)
       LocalRead.tx_put_pending(compound_key, value, expire_at_ms)
       LocalRead.tx_undelete(compound_key)
-      send(self(), LocalRead.tx_compound_write_message(tx, redis_key, compound_key, value, expire_at_ms))
+
+      send(
+        self(),
+        LocalRead.tx_compound_write_message(tx, redis_key, compound_key, value, expire_at_ms)
+      )
+
       :ok
     else
       Router.compound_put(tx.instance_ctx, redis_key, compound_key, value, expire_at_ms)
@@ -190,7 +195,11 @@ defmodule Ferricstore.Store.Ops.Compound do
         ShardETS.ets_insert(tx.shard_state, compound_key, value, expire_at_ms)
         LocalRead.tx_put_pending(compound_key, value, expire_at_ms)
         LocalRead.tx_undelete(compound_key)
-        send(self(), LocalRead.tx_compound_write_message(tx, redis_key, compound_key, value, expire_at_ms))
+
+        send(
+          self(),
+          LocalRead.tx_compound_write_message(tx, redis_key, compound_key, value, expire_at_ms)
+        )
       end)
 
       :ok
@@ -513,5 +522,4 @@ defmodule Ferricstore.Store.Ops.Compound do
 
   def compound_delete_prefix(store, redis_key, prefix) when is_map(store),
     do: store.compound_delete_prefix.(redis_key, prefix)
-
 end

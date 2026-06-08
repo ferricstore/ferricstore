@@ -180,7 +180,12 @@ defmodule Ferricstore.WalNifIntegrationTest do
     end
 
     test "raw append handle is exported and usable for segment logs" do
-      path = Path.join(System.tmp_dir!(), "ferricstore-wal-raw-#{System.unique_integer([:positive])}.log")
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-wal-raw-#{System.unique_integer([:positive])}.log"
+        )
+
       File.rm(path)
 
       try do
@@ -189,7 +194,11 @@ defmodule Ferricstore.WalNifIntegrationTest do
 
         ref = make_ref()
         assert :ok = :ferricstore_wal_nif.sync_with_delay(handle, self(), ref, 0)
-        assert_receive {synced, ^ref, position} when synced in [:wal_sync_complete, :wal_sync_error], 5_000
+
+        assert_receive {synced, ^ref, position}
+                       when synced in [:wal_sync_complete, :wal_sync_error],
+                       5_000
+
         assert synced == :wal_sync_complete
         assert position >= 6
         assert {:ok, 6} = :ferricstore_wal_nif.position(handle)
@@ -216,7 +225,6 @@ defmodule Ferricstore.WalNifIntegrationTest do
       big_key = String.duplicate("k", 65_537)
       assert {:error, _} = Router.put(ctx(), big_key, "val", 0)
     end
-
   end
 
   # ---------------------------------------------------------------------------

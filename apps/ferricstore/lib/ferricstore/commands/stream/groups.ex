@@ -66,7 +66,7 @@ defmodule Ferricstore.Commands.Stream.Groups do
     :ets.match_delete(@groups_table, {{stream_key, :_}, :_, :_, :_})
   end
 
-  @spec with_lock(binary(), binary(), (() -> result)) :: result when result: term()
+  @spec with_lock(binary(), binary(), (-> result)) :: result when result: term()
   def with_lock(key, group, fun) when is_function(fun, 0) do
     lock = {key, group}
     acquire_lock(lock)

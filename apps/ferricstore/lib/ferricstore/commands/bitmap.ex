@@ -527,8 +527,11 @@ defmodule Ferricstore.Commands.Bitmap do
         case Destination.clear_compound_data_structure(destkey, store) do
           :ok ->
             case Ops.put(store, destkey, result, 0) do
-              :ok -> byte_size(result)
-              {:error, _} = error -> Destination.restore_bitop_destination(store, destkey, backup, error)
+              :ok ->
+                byte_size(result)
+
+              {:error, _} = error ->
+                Destination.restore_bitop_destination(store, destkey, backup, error)
             end
 
           {:error, _} = error ->
@@ -995,5 +998,4 @@ defmodule Ferricstore.Commands.Bitmap do
       @wrongtype_error -> @wrongtype_error
     end
   end
-
 end

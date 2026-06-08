@@ -9,17 +9,23 @@ defmodule Ferricstore.Bench.QuickWriteBenchTest do
 
     counter = :counters.new(1, [:atomics])
 
-    writers = for i <- 1..50 do
-      Task.async(fn ->
-        l = fn l, n ->
-          if :atomics.get(stop, 1) == 1, do: throw(:stop)
-          FerricStore.set("#{prefix}:#{i}:#{n}", "value")
-          :counters.add(counter, 1, 1)
-          l.(l, n + 1)
-        end
-        try do l.(l, 0) catch :throw, :stop -> :ok end
-      end)
-    end
+    writers =
+      for i <- 1..50 do
+        Task.async(fn ->
+          l = fn l, n ->
+            if :atomics.get(stop, 1) == 1, do: throw(:stop)
+            FerricStore.set("#{prefix}:#{i}:#{n}", "value")
+            :counters.add(counter, 1, 1)
+            l.(l, n + 1)
+          end
+
+          try do
+            l.(l, 0)
+          catch
+            :throw, :stop -> :ok
+          end
+        end)
+      end
 
     Process.sleep(10_000)
     :atomics.put(stop, 1, 1)

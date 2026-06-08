@@ -1,4 +1,8 @@
-Code.require_file("blocking_bug_hunt_test/sections/blocking_list_dispatch_converts_storage_raises_into_error_replies.exs", __DIR__)
+Code.require_file(
+  "blocking_bug_hunt_test/sections/blocking_list_dispatch_converts_storage_raises_into_error_replies.exs",
+  __DIR__
+)
+
 Code.require_file("blocking_bug_hunt_test/sections/blpop_float_timeout_0_5.exs", __DIR__)
 
 defmodule FerricstoreServer.Commands.BlockingBugHuntTest do

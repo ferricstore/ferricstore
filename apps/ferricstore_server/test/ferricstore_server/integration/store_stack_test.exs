@@ -50,7 +50,12 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name =
+      Router.shard_name(
+        FerricStore.Instance.get(:default),
+        Router.shard_for(FerricStore.Instance.get(:default), key)
+      )
+
     Process.whereis(name)
   end
 
@@ -122,7 +127,9 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
           k
         end
 
-      shard_indices = Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end) |> Enum.uniq()
+      shard_indices =
+        Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
+        |> Enum.uniq()
 
       # With 100 keys and 4 shards, at least 2 shards should be used
       assert length(shard_indices) >= 2,
@@ -130,7 +137,9 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
       # Verify every key is retrievable through shard GenServer calls
       for i <- 0..3 do
-        shard_keys = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), i), :keys)
+        shard_keys =
+          GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), i), :keys)
+
         matching = Enum.filter(keys, fn k -> k in shard_keys end)
 
         for k <- matching do
@@ -380,7 +389,8 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
         end
 
       for k <- keys do
-        assert Router.get(FerricStore.Instance.get(:default), k) != nil, "Key #{k} should be retrievable"
+        assert Router.get(FerricStore.Instance.get(:default), k) != nil,
+               "Key #{k} should be retrievable"
       end
     end
   end
@@ -418,8 +428,10 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       assert new_pid != pid, "Expected a new process after restart"
 
       # Data persisted in Bitcask should survive the restart
-      ShardHelpers.eventually(fn -> "persistent_value" == Router.get(FerricStore.Instance.get(:default), k) end,
-        "Data should survive shard restart")
+      ShardHelpers.eventually(
+        fn -> "persistent_value" == Router.get(FerricStore.Instance.get(:default), k) end,
+        "Data should survive shard restart"
+      )
     end
 
     test "ETS cache is rebuilt on warm after shard restart" do
@@ -441,8 +453,11 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       ShardHelpers.wait_shards_alive()
 
       # New ETS table is empty (fresh shard), but GET should warm it from Bitcask
-      ShardHelpers.eventually(fn -> "rebuild_val" == Router.get(FerricStore.Instance.get(:default), k) end,
-        "Value should be recovered from Bitcask after shard restart")
+      ShardHelpers.eventually(
+        fn -> "rebuild_val" == Router.get(FerricStore.Instance.get(:default), k) end,
+        "Value should be recovered from Bitcask after shard restart"
+      )
+
       assert [{^k, "rebuild_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
     end
 
@@ -473,8 +488,10 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
       # All keys should survive
       for k <- same_shard_keys do
-        ShardHelpers.eventually(fn -> "val_#{k}" == Router.get(FerricStore.Instance.get(:default), k) end,
-          "Key #{k} should survive shard restart")
+        ShardHelpers.eventually(
+          fn -> "val_#{k}" == Router.get(FerricStore.Instance.get(:default), k) end,
+          "Key #{k} should survive shard restart"
+        )
       end
     end
   end

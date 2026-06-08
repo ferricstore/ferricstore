@@ -709,7 +709,16 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       {:ok, value} ->
         case local_materialize_blob_value(tx, value) do
           {:ok, materialized} ->
-            ShardETS.cold_read_warm_ets(tx.shard_state, compound_key, materialized, exp, fid, off, vsize)
+            ShardETS.cold_read_warm_ets(
+              tx.shard_state,
+              compound_key,
+              materialized,
+              exp,
+              fid,
+              off,
+              vsize
+            )
+
             {materialized, exp}
 
           {:error, reason} ->

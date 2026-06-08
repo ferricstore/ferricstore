@@ -17,6 +17,12 @@ defmodule Ferricstore.Store.Router do
 
   All public functions take a `ctx` (`FerricStore.Instance.t()`) as the first
   argument, replacing all persistent_term lookups with instance-local state.
+
+  ## Performance boundary
+
+  Router helpers sit on GET/SET/Flow hot paths. Refactors here need memtier
+  SET/GET and DBOS Flow benchmark comparison. Avoid new allocations, dynamic
+  dispatch, or extra process calls in keyed request paths.
   """
 
   alias Ferricstore.CommandTime
@@ -48,7 +54,6 @@ defmodule Ferricstore.Store.Router do
   @flow_claim_due_any_window_multiplier 8
   @flow_claim_due_precheck_slack_ms 5
   @flow_shard_marker :__flow_shard_index__
-
 
   use Ferricstore.Store.Router.Part01
   use Ferricstore.Store.Router.Part02

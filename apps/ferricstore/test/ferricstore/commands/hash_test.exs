@@ -23,7 +23,7 @@ defmodule Ferricstore.Commands.HashTest do
   use Ferricstore.Commands.HashTest.Sections.Hexpire
   use Ferricstore.Commands.HashTest.Sections.WrongtypeEnforcementEdgeCases
 
-defp collect_hscan_fields(store, key, cursor, count) do
+  defp collect_hscan_fields(store, key, cursor, count) do
     collect_hscan_fields(store, key, cursor, count, [])
   end
 
@@ -56,4 +56,3 @@ defp collect_hscan_fields(store, key, cursor, count) do
     }
   end
 end
-

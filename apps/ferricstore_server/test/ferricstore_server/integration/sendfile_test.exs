@@ -344,6 +344,7 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       sock = connect_and_hello(port)
       keys = Enum.map(1..3, fn i -> ukey("true_pipe_large_#{i}") end)
+
       values =
         Enum.map(1..3, fn i ->
           :binary.copy(<<i>>, @blob_side_channel_threshold + i * 4096)

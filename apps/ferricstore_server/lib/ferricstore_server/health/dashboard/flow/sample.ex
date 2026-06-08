@@ -15,8 +15,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   def collect_flow_records_sample(limit), do: collect_records_sample(limit)
   def flow_type_summaries(records), do: type_summaries(records)
   def flow_available_types(records), do: available_types(records)
-  def filter_flow_records_by_type(records, type_filter), do: filter_records_by_type(records, type_filter)
-  def filter_flow_records_by_partition(records, partition_key), do: filter_records_by_partition(records, partition_key)
+
+  def filter_flow_records_by_type(records, type_filter),
+    do: filter_records_by_type(records, type_filter)
+
+  def filter_flow_records_by_partition(records, partition_key),
+    do: filter_records_by_partition(records, partition_key)
+
   def filter_flow_records_by_name(records, query), do: filter_records_by_name(records, query)
   def flow_overview_filters_from_opts(opts), do: overview_filters_from_opts(opts)
   def filter_flow_records(records, filters), do: filter_records(records, filters)
@@ -198,7 +203,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
 
   def normalize_history_cursor(_cursor), do: nil
 
-  def normalize_history_after_cursor(%{"history_before" => before, "history_after" => after_cursor})
+  def normalize_history_after_cursor(%{
+        "history_before" => before,
+        "history_after" => after_cursor
+      })
       when is_binary(before) do
     case normalize_history_cursor(before) do
       nil -> normalize_history_cursor(after_cursor)
@@ -335,7 +343,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
       }
     end)
     |> Enum.sort_by(fn state ->
-      {-state.due_now, -state.expired_leases, -state.failed, -state.retrying, state.type, state.state}
+      {-state.due_now, -state.expired_leases, -state.failed, -state.retrying, state.type,
+       state.state}
     end)
   end
 
@@ -384,12 +393,23 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
 
     case :ets.select(keydir, match_spec, @flow_dashboard_keydir_select_batch) do
-      :"$end_of_table" -> []
-      {keys, continuation} -> collect_records_from_keydir_continue(keys, continuation, wanted, scan_limit, [], 0, 0)
+      :"$end_of_table" ->
+        []
+
+      {keys, continuation} ->
+        collect_records_from_keydir_continue(keys, continuation, wanted, scan_limit, [], 0, 0)
     end
   end
 
-  defp collect_records_from_keydir_continue(keys, continuation, wanted, scan_limit, records, record_count, scanned) do
+  defp collect_records_from_keydir_continue(
+         keys,
+         continuation,
+         wanted,
+         scan_limit,
+         records,
+         record_count,
+         scanned
+       ) do
     {records, record_count} =
       Enum.reduce_while(keys, {records, record_count}, fn key, {acc, count} ->
         cond do
@@ -410,8 +430,19 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
 
       true ->
         case :ets.select(continuation) do
-          :"$end_of_table" -> Enum.reverse(records)
-          {next_keys, next_continuation} -> collect_records_from_keydir_continue(next_keys, next_continuation, wanted, scan_limit, records, record_count, scanned)
+          :"$end_of_table" ->
+            Enum.reverse(records)
+
+          {next_keys, next_continuation} ->
+            collect_records_from_keydir_continue(
+              next_keys,
+              next_continuation,
+              wanted,
+              scan_limit,
+              records,
+              record_count,
+              scanned
+            )
         end
     end
   end
@@ -595,8 +626,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     else
       _ ->
         case NaiveDateTime.from_iso8601(value) do
-          {:ok, naive} -> naive |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_unix(:millisecond)
-          _ -> nil
+          {:ok, naive} ->
+            naive |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_unix(:millisecond)
+
+          _ ->
+            nil
         end
     end
   end

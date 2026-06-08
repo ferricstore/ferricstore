@@ -1,6 +1,17 @@
-Code.require_file("router_cold_empty_test/sections/get_file_ref_treats_cold_empty_values_as_valid_file_refs.exs", __DIR__)
-Code.require_file("router_cold_empty_test/sections/get_meta_waits_through_delayed_compaction_ets_update.exs", __DIR__)
-Code.require_file("router_cold_empty_test/sections/exists_rejects_cold_rows_invalid_offsets.exs", __DIR__)
+Code.require_file(
+  "router_cold_empty_test/sections/get_file_ref_treats_cold_empty_values_as_valid_file_refs.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "router_cold_empty_test/sections/get_meta_waits_through_delayed_compaction_ets_update.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "router_cold_empty_test/sections/exists_rejects_cold_rows_invalid_offsets.exs",
+  __DIR__
+)
 
 defmodule Ferricstore.Store.RouterColdEmptyTest do
   @moduledoc false

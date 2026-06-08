@@ -995,5 +995,4 @@ defmodule Ferricstore.Commands.Set do
         {:error, {:set_delete_rollback_failed, write_error, rollback_error}}
     end
   end
-
 end

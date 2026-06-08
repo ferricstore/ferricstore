@@ -108,13 +108,15 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
     parse_resp(data)
   end
 
-  defp parse_resp(<<"+" , rest::binary>>), do: {:ok, String.trim(rest)}
-  defp parse_resp(<<"-" , rest::binary>>), do: {:error, String.trim(rest)}
-  defp parse_resp(<<":" , rest::binary>>), do: {:ok, rest |> String.trim() |> String.to_integer()}
+  defp parse_resp(<<"+", rest::binary>>), do: {:ok, String.trim(rest)}
+  defp parse_resp(<<"-", rest::binary>>), do: {:error, String.trim(rest)}
+  defp parse_resp(<<":", rest::binary>>), do: {:ok, rest |> String.trim() |> String.to_integer()}
 
   defp parse_resp(<<"$", rest::binary>>) do
     case String.split(rest, "\r\n", parts: 2) do
-      ["-1" | _] -> {:ok, nil}
+      ["-1" | _] ->
+        {:ok, nil}
+
       [len_str, remainder] ->
         len = String.to_integer(len_str)
         {:ok, binary_part(remainder, 0, len)}
@@ -123,7 +125,9 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
 
   defp parse_resp(<<"*", rest::binary>>) do
     case String.split(rest, "\r\n", parts: 2) do
-      ["-1" | _] -> {:ok, nil}
+      ["-1" | _] ->
+        {:ok, nil}
+
       [count_str, remainder] ->
         count = String.to_integer(count_str)
         {elements, _rest} = parse_array_elements(remainder, count, [])
@@ -319,7 +323,8 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
 
       {:ok, query} = redis(sock, ["TOPK.QUERY", "tk1", "a", "b", "zzz"])
       assert is_list(query)
-      assert hd(query) == 1  # 'a' in top-K
+      # 'a' in top-K
+      assert hd(query) == 1
 
       {:ok, items} = redis(sock, ["TOPK.LIST", "tk1"])
       assert is_list(items)
@@ -421,7 +426,9 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
       sock = connect(ctx)
       k = td_key("td_cdf")
       assert {:ok, "OK"} = redis(sock, ["TDIGEST.CREATE", k])
-      assert {:ok, "OK"} = redis(sock, ["TDIGEST.ADD", k, "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+
+      assert {:ok, "OK"} =
+               redis(sock, ["TDIGEST.ADD", k, "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
 
       :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.CDF", k, "5"]))
       {:ok, cdf_raw} = :gen_tcp.recv(sock, 0, 5000)

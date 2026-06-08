@@ -1,5 +1,18 @@
 defmodule Ferricstore.Flow.ClaimDueAPI do
-  @moduledoc false
+  @moduledoc """
+  Public Flow claim path.
+
+  This module validates `FLOW.CLAIM_DUE` / reclaim options, chooses the hot due
+  index keys, coordinates blocking waiters, and delegates the actual mutation to
+  the shard/Raft path. Returned payload/value hydration is capped and explicit.
+
+  ## Performance boundary
+
+  Claiming is a primary hot path. Avoid new maps/lists in per-candidate loops,
+  behaviours/protocol dispatch, or extra GenServer calls. Any structural change
+  here should be benchmarked with queued DBOS-style workers and focused
+  `claim_due` tests.
+  """
 
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry

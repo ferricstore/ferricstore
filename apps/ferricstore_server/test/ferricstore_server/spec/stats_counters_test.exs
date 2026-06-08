@@ -35,9 +35,12 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
 
   defp clear_pressure_flags(ctx) do
     ref = ctx.pressure_flags
-    :atomics.put(ref, 1, 0)  # keydir_full
-    :atomics.put(ref, 2, 0)  # reject_writes
-    :atomics.put(ref, 3, 0)  # skip_promotion
+    # keydir_full
+    :atomics.put(ref, 1, 0)
+    # reject_writes
+    :atomics.put(ref, 2, 0)
+    # skip_promotion
+    :atomics.put(ref, 3, 0)
   end
 
   # Puts a key and ensures it's readable. Router.put in quorum mode is
@@ -131,9 +134,14 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
 
       before = Stats.expired_keys(ctx)
 
-      ShardHelpers.eventually(fn ->
-        System.os_time(:millisecond) > expire_at
-      end, "key not expired yet", 40, 10)
+      ShardHelpers.eventually(
+        fn ->
+          System.os_time(:millisecond) > expire_at
+        end,
+        "key not expired yet",
+        40,
+        10
+      )
 
       for i <- 0..(ctx.shard_count - 1) do
         shard = elem(ctx.shard_names, i)
@@ -146,17 +154,23 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
     test "increments by the number of keys removed in a sweep", %{ctx: ctx} do
       expire_at = System.os_time(:millisecond) + 200
 
-      keys = Enum.map(0..4, fn i ->
-        key = unique_key("sweep_multi_#{i}")
-        put_and_verify(ctx, key, "val", expire_at)
-        key
-      end)
+      keys =
+        Enum.map(0..4, fn i ->
+          key = unique_key("sweep_multi_#{i}")
+          put_and_verify(ctx, key, "val", expire_at)
+          key
+        end)
 
       before = Stats.expired_keys(ctx)
 
-      ShardHelpers.eventually(fn ->
-        System.os_time(:millisecond) > expire_at
-      end, "keys not expired yet", 40, 10)
+      ShardHelpers.eventually(
+        fn ->
+          System.os_time(:millisecond) > expire_at
+        end,
+        "keys not expired yet",
+        40,
+        10
+      )
 
       for i <- 0..(ctx.shard_count - 1) do
         shard = elem(ctx.shard_names, i)
@@ -172,7 +186,8 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   # ---------------------------------------------------------------------------
 
   describe "evicted_keys" do
-    @tag :skip  # MemoryGuard eviction depends on ETS sampling which is probabilistic — tested in memory_guard_eviction_test.exs
+    # MemoryGuard eviction depends on ETS sampling which is probabilistic — tested in memory_guard_eviction_test.exs
+    @tag :skip
     test "increments when memory pressure evicts a key", %{ctx: ctx} do
       expire_at = System.os_time(:millisecond) + 600_000
 
@@ -184,12 +199,12 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
       before = Stats.evicted_keys(ctx)
 
       {:ok, mg_pid} =
-        GenServer.start_link(Ferricstore.MemoryGuard, [
+        GenServer.start_link(Ferricstore.MemoryGuard,
           interval_ms: 60_000,
           max_memory_bytes: 1,
           shard_count: 4,
           eviction_policy: :volatile_lru
-        ])
+        )
 
       send(mg_pid, :check)
       :sys.get_state(mg_pid)
@@ -203,12 +218,12 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
       before = Stats.evicted_keys(ctx)
 
       {:ok, mg_pid} =
-        GenServer.start_link(Ferricstore.MemoryGuard, [
+        GenServer.start_link(Ferricstore.MemoryGuard,
           interval_ms: 60_000,
           max_memory_bytes: 1,
           shard_count: 4,
           eviction_policy: :noeviction
-        ])
+        )
 
       send(mg_pid, :check)
       Process.sleep(200)
@@ -249,7 +264,8 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   # ---------------------------------------------------------------------------
 
   describe "INFO stats includes all counter fields" do
-    test "INFO stats response contains keyspace_hits, keyspace_misses, expired_keys, evicted_keys", %{ctx: ctx} do
+    test "INFO stats response contains keyspace_hits, keyspace_misses, expired_keys, evicted_keys",
+         %{ctx: ctx} do
       key = unique_key("info")
       put_and_verify(ctx, key, "value")
       Router.get(ctx, unique_key("info_miss"))
@@ -297,11 +313,12 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
     test "hit/miss counts are accurate across 10000 operations", %{ctx: ctx} do
       prefix = unique_key("stress")
 
-      hit_keys = Enum.map(1..100, fn i ->
-        key = "#{prefix}_hit_#{i}"
-        put_and_verify(ctx, key, "value_#{i}")
-        key
-      end)
+      hit_keys =
+        Enum.map(1..100, fn i ->
+          key = "#{prefix}_hit_#{i}"
+          put_and_verify(ctx, key, "value_#{i}")
+          key
+        end)
 
       miss_keys = Enum.map(1..100, fn i -> "#{prefix}_miss_#{i}" end)
 
@@ -327,5 +344,4 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
       assert actual_misses == expected_misses
     end
   end
-
 end

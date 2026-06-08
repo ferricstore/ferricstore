@@ -1,19 +1,18 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy do
-
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.FlowRecord
-import FerricstoreServer.Health.Dashboard.QueryParams
-import FerricstoreServer.Health.Dashboard.Render.Admin, only: [render_config_command_table: 2]
-import FerricstoreServer.Health.Dashboard.Render.FlowHistory, only: [flow_detail_path: 2]
-import FerricstoreServer.Health.Dashboard.Render.FlowOverview, only: [render_flow_stat_card: 3]
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.FlowRecord
+  import FerricstoreServer.Health.Dashboard.QueryParams
+  import FerricstoreServer.Health.Dashboard.Render.Admin, only: [render_config_command_table: 2]
+  import FerricstoreServer.Health.Dashboard.Render.FlowHistory, only: [flow_detail_path: 2]
+  import FerricstoreServer.Health.Dashboard.Render.FlowOverview, only: [render_flow_stat_card: 3]
   import FerricstoreServer.Health.Dashboard.Render.FlowFilters
   import FerricstoreServer.Health.Dashboard.Render.FlowTables
 
-@flow_dashboard_sample_limit 400
-@flow_dashboard_recent_limit 40
-@flow_dashboard_policy_state_preview_limit 6
-@flow_dashboard_retention_default_limit 100
-@flow_dashboard_retention_max_limit 10_000
+  @flow_dashboard_sample_limit 400
+  @flow_dashboard_recent_limit 40
+  @flow_dashboard_policy_state_preview_limit 6
+  @flow_dashboard_retention_default_limit 100
+  @flow_dashboard_retention_max_limit 10_000
 
   def flow_policy_editor_data(type) do
     type = flow_policy_clean_form_value(type || "")

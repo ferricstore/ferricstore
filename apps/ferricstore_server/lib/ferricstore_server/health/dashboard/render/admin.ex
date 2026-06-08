@@ -1,7 +1,6 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
-
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.Render.Overview
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.Render.Overview
 
   def render_slowlog_summary(entries) do
     count = length(entries)
@@ -594,5 +593,4 @@ import FerricstoreServer.Health.Dashboard.Render.Overview
   # ---------------------------------------------------------------------------
   # HTML rendering -- FerricFlow Sub-pages
   # ---------------------------------------------------------------------------
-
 end

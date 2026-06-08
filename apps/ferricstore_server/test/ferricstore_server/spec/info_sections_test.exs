@@ -40,7 +40,10 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn ->
-        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k ->
+          Router.delete(FerricStore.Instance.get(:default), k)
+        end)
+
         :ok
       end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
@@ -94,14 +97,17 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       # Each shard should have a role field
       for i <- 0..(shard_count() - 1) do
         role_key = "shard_#{i}_role"
+
         assert Map.has_key?(fields, role_key),
                "missing #{role_key} in INFO raft, got: #{inspect(Map.keys(fields))}"
 
         role = Map.fetch!(fields, role_key)
+
         assert role in ["leader", "follower", "candidate"],
                "shard #{i} role must be leader, follower, or candidate, got: #{role}"
 
         term_key = "shard_#{i}_current_term"
+
         assert Map.has_key?(fields, term_key),
                "missing #{term_key} in INFO raft"
 
@@ -159,6 +165,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
 
       for i <- 0..(shard_count() - 1) do
         key = "shard_#{i}_data_file_count"
+
         assert Map.has_key?(fields, key),
                "missing #{key} in INFO bitcask, got: #{inspect(Map.keys(fields))}"
 
@@ -328,6 +335,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       result = Server.handle("INFO", ["keydir_analysis"], store)
 
       assert is_binary(result), "INFO keydir_analysis must return a string"
+
       assert String.contains?(result, "# Keydir_Analysis"),
              "must have Keydir_Analysis section header"
 
@@ -404,8 +412,17 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       result = Server.handle("INFO", ["all"], store)
       headers = section_headers(result)
 
-      for expected <- ["Server", "Clients", "Memory", "Keyspace", "Stats",
-                       "Persistence", "Replication", "CPU", "Namespace_Config"] do
+      for expected <- [
+            "Server",
+            "Clients",
+            "Memory",
+            "Keyspace",
+            "Stats",
+            "Persistence",
+            "Replication",
+            "CPU",
+            "Namespace_Config"
+          ] do
         assert expected in headers,
                "INFO all must include #{expected} section"
       end
@@ -431,8 +448,18 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
     test "1000 INFO calls do not crash" do
       store = build_real_store()
 
-      sections = ["all", "raft", "bitcask", "ferricstore", "keydir_analysis",
-                   "server", "clients", "memory", "keyspace", "stats"]
+      sections = [
+        "all",
+        "raft",
+        "bitcask",
+        "ferricstore",
+        "keydir_analysis",
+        "server",
+        "clients",
+        "memory",
+        "keyspace",
+        "stats"
+      ]
 
       results =
         for i <- 1..1000 do

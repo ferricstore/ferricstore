@@ -97,9 +97,7 @@ defmodule Mix.Tasks.Ferricstore.Merge do
         )
 
       nil ->
-        Mix.shell().info(
-          "Merge scheduler for shard #{index} is not running."
-        )
+        Mix.shell().info("Merge scheduler for shard #{index} is not running.")
     end
   end
 

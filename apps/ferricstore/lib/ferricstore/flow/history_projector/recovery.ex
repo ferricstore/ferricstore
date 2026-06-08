@@ -16,11 +16,25 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
         live_records = live_history_records(records)
         {entries, locations} = recovered_history_entries(live_records, keydir, shard_data_path)
 
-        with :ok <- HistoryProjector.publish_lmdb_history_locations(shard_data_path, 0, entries, locations),
+        with :ok <-
+               HistoryProjector.publish_lmdb_history_locations(
+                 shard_data_path,
+                 0,
+                 entries,
+                 locations
+               ),
              :ok <-
-               HistoryProjector.publish_keydir_entries(instance_ctx, shard_index, keydir, 0, entries, locations),
+               HistoryProjector.publish_keydir_entries(
+                 instance_ctx,
+                 shard_index,
+                 keydir,
+                 0,
+                 entries,
+                 locations
+               ),
              :ok <- HistoryProjector.publish_history_index(instance_ctx, shard_index, entries),
-             :ok <- HistoryProjector.trim_history_hot_cache(instance_ctx, shard_index, keydir, entries) do
+             :ok <-
+               HistoryProjector.trim_history_hot_cache(instance_ctx, shard_index, keydir, entries) do
           :ok
         end
 
@@ -137,14 +151,14 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   end
 
   def keydir_row_value(
-         _shard_data_path,
-         {_key, value, _expire_at_ms, _lfu, _file_id, _offset, _size}
-       )
-       when is_binary(value),
-       do: {:ok, value}
+        _shard_data_path,
+        {_key, value, _expire_at_ms, _lfu, _file_id, _offset, _size}
+      )
+      when is_binary(value),
+      do: {:ok, value}
 
   def keydir_row_value(shard_data_path, {_key, nil, _expire_at_ms, _lfu, file_id, offset, _size})
-       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 do
+      when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 do
     shard_data_path
     |> ShardETS.file_path(file_id)
     |> NIF.v2_pread_at(offset)
@@ -165,7 +179,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   end
 
   def skip_history_log_recover?(shard_data_path, projected)
-       when is_integer(projected) and projected >= 0 do
+      when is_integer(projected) and projected >= 0 do
     default_history_hot_max_events() == 0 and lmdb_projection_present?(shard_data_path) and
       history_log_safe_to_skip?(shard_data_path)
   end
@@ -198,7 +212,13 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   def prepare_recovered_history_projector(instance_ctx, shard_index, shard_data_path) do
     with :ok <- HistoryProjector.ensure_history_file(shard_data_path) do
       projected = HistoryProjectedIndex.read(shard_data_path)
-      HistoryProjector.publish_projected_index(instance_ctx, shard_index, shard_data_path, projected)
+
+      HistoryProjector.publish_projected_index(
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        projected
+      )
     end
   rescue
     error -> {:error, {:history_projector_prepare_failed, error}}

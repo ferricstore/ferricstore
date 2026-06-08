@@ -70,7 +70,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
     %{
       filters: filters,
-      result: flow_query_execute(filters) |> DashboardAccess.flow_query_filter_result_for_acl(acl_username),
+      result:
+        flow_query_execute(filters)
+        |> DashboardAccess.flow_query_filter_result_for_acl(acl_username),
       available_types: flow_available_types(sampled_records),
       total_sampled: length(sampled_records),
       sample_limit: @flow_dashboard_sample_limit,
@@ -191,9 +193,14 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
     {command, fun} =
       case mode do
-        "parent" -> {"FLOW.BY_PARENT", fn -> flow_dashboard_flow_by_parent(target, opts) end}
-        "correlation" -> {"FLOW.BY_CORRELATION", fn -> flow_dashboard_flow_by_correlation(target, opts) end}
-        _ -> {"FLOW.BY_ROOT", fn -> flow_dashboard_flow_by_root(target, opts) end}
+        "parent" ->
+          {"FLOW.BY_PARENT", fn -> flow_dashboard_flow_by_parent(target, opts) end}
+
+        "correlation" ->
+          {"FLOW.BY_CORRELATION", fn -> flow_dashboard_flow_by_correlation(target, opts) end}
+
+        _ ->
+          {"FLOW.BY_ROOT", fn -> flow_dashboard_flow_by_root(target, opts) end}
       end
 
     case bounded_dashboard_call(fun, flow_dashboard_list_fetch_timeout_ms(), :lineage) do

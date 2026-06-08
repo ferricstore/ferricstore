@@ -53,7 +53,12 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
   end
 
   defp kill_shard_and_wait(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name =
+      Router.shard_name(
+        FerricStore.Instance.get(:default),
+        Router.shard_for(FerricStore.Instance.get(:default), key)
+      )
+
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
@@ -83,12 +88,16 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
       # During shard restart, WARaft segment replay re-applies list_op on
       # empty ETS, then recover_keydir overwrites the ETS entry with a
       # cold pointer. The cold read from Bitcask should return the blob.
-      ShardHelpers.eventually(fn ->
-        case FerricStore.lrange(k, 0, -1) do
-          {:ok, list} when is_list(list) -> true
-          _ -> false
-        end
-      end, "list should be readable after crash")
+      ShardHelpers.eventually(
+        fn ->
+          case FerricStore.lrange(k, 0, -1) do
+            {:ok, list} when is_list(list) -> true
+            _ -> false
+          end
+        end,
+        "list should be readable after crash"
+      )
+
       {:ok, after_crash} = FerricStore.lrange(k, 0, -1)
 
       # The list should contain exactly the original elements after recovery.
@@ -105,6 +114,7 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
         # writes still work after recovery.
         {:ok, _} = FerricStore.rpush(k, ["x", "y", "z"])
         {:ok, fresh} = FerricStore.lrange(k, 0, -1)
+
         assert is_list(fresh) and fresh != [],
                "writes must work after list crash recovery"
       end
@@ -123,21 +133,28 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        case FerricStore.zrange(k, 0, -1) do
-          {:ok, ["a", "b"]} -> true
-          _ -> false
-        end
-      end, "sorted set members lost after crash")
+      ShardHelpers.eventually(
+        fn ->
+          case FerricStore.zrange(k, 0, -1) do
+            {:ok, ["a", "b"]} -> true
+            _ -> false
+          end
+        end,
+        "sorted set members lost after crash"
+      )
 
       # Writes still work after recovery
       {:ok, _} = FerricStore.zadd(k, [{1.5, "c"}])
-      ShardHelpers.eventually(fn ->
-        case FerricStore.zrange(k, 0, -1) do
-          {:ok, updated} -> "c" in updated
-          _ -> false
-        end
-      end, "zadd should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          case FerricStore.zrange(k, 0, -1) do
+            {:ok, updated} -> "c" in updated
+            _ -> false
+          end
+        end,
+        "zadd should work after crash"
+      )
     end
   end
 
@@ -159,15 +176,22 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, "hello world"} == FerricStore.get(k)
-      end, "appended value lost after crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "hello world"} == FerricStore.get(k)
+        end,
+        "appended value lost after crash"
+      )
 
       # Writes still work after recovery
       {:ok, _} = FerricStore.append(k, "!")
-      ShardHelpers.eventually(fn ->
-        {:ok, "hello world!"} == FerricStore.get(k)
-      end, "append should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "hello world!"} == FerricStore.get(k)
+        end,
+        "append should work after crash"
+      )
     end
 
     @tag :durability
@@ -187,19 +211,29 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(dst)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, nil} == FerricStore.get(src)
-      end, "source key reappeared after crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, nil} == FerricStore.get(src)
+        end,
+        "source key reappeared after crash"
+      )
 
-      ShardHelpers.eventually(fn ->
-        {:ok, "val"} == FerricStore.get(dst)
-      end, "renamed key value lost after crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "val"} == FerricStore.get(dst)
+        end,
+        "renamed key value lost after crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(dst, "updated")
-      ShardHelpers.eventually(fn ->
-        {:ok, "updated"} == FerricStore.get(dst)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "updated"} == FerricStore.get(dst)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -218,19 +252,29 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, "val"} == FerricStore.get(k)
-      end, "persisted key value lost after crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "val"} == FerricStore.get(k)
+        end,
+        "persisted key value lost after crash"
+      )
 
-      ShardHelpers.eventually(fn ->
-        {:ok, nil} == FerricStore.pttl(k)
-      end, "TTL was not removed after persist + crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, nil} == FerricStore.pttl(k)
+        end,
+        "TTL was not removed after persist + crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, "new_val")
-      ShardHelpers.eventually(fn ->
-        {:ok, "new_val"} == FerricStore.get(k)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "new_val"} == FerricStore.get(k)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -248,22 +292,32 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, "val"} == FerricStore.get(k)
-      end, "value lost after expire + crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "val"} == FerricStore.get(k)
+        end,
+        "value lost after expire + crash"
+      )
 
-      ShardHelpers.eventually(fn ->
-        case FerricStore.pttl(k) do
-          {:ok, ttl} when is_integer(ttl) and ttl > 0 -> true
-          _ -> false
-        end
-      end, "TTL should survive crash")
+      ShardHelpers.eventually(
+        fn ->
+          case FerricStore.pttl(k) do
+            {:ok, ttl} when is_integer(ttl) and ttl > 0 -> true
+            _ -> false
+          end
+        end,
+        "TTL should survive crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, "refreshed")
-      ShardHelpers.eventually(fn ->
-        {:ok, "refreshed"} == FerricStore.get(k)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "refreshed"} == FerricStore.get(k)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -278,15 +332,22 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, nil} == FerricStore.get(k)
-      end, "getdel'd key reappeared after crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, nil} == FerricStore.get(k)
+        end,
+        "getdel'd key reappeared after crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, "reborn")
-      ShardHelpers.eventually(fn ->
-        {:ok, "reborn"} == FerricStore.get(k)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "reborn"} == FerricStore.get(k)
+        end,
+        "writes should work after crash"
+      )
     end
   end
 
@@ -310,15 +371,22 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, ""} == FerricStore.get(k)
-      end, "empty value must survive crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, ""} == FerricStore.get(k)
+        end,
+        "empty value must survive crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, "no_longer_empty")
-      ShardHelpers.eventually(fn ->
-        {:ok, "no_longer_empty"} == FerricStore.get(k)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "no_longer_empty"} == FerricStore.get(k)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -334,15 +402,22 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, binary_val} == FerricStore.get(k)
-      end, "binary value with null bytes corrupted after crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, binary_val} == FerricStore.get(k)
+        end,
+        "binary value with null bytes corrupted after crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, <<0, 0, 0>>)
-      ShardHelpers.eventually(fn ->
-        {:ok, <<0, 0, 0>>} == FerricStore.get(k)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, <<0, 0, 0>>} == FerricStore.get(k)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -357,15 +432,22 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(long_key)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, "long_key_value"} == FerricStore.get(long_key)
-      end, "long key value lost after crash")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "long_key_value"} == FerricStore.get(long_key)
+        end,
+        "long key value lost after crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(long_key, "updated_long")
-      ShardHelpers.eventually(fn ->
-        {:ok, "updated_long"} == FerricStore.get(long_key)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "updated_long"} == FerricStore.get(long_key)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -382,18 +464,25 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        case FerricStore.get(k) do
-          {:ok, val} when val == large_val -> true
-          _ -> false
-        end
-      end, "large value corrupted after crash")
+      ShardHelpers.eventually(
+        fn ->
+          case FerricStore.get(k) do
+            {:ok, val} when val == large_val -> true
+            _ -> false
+          end
+        end,
+        "large value corrupted after crash"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, "small_again")
-      ShardHelpers.eventually(fn ->
-        {:ok, "small_again"} == FerricStore.get(k)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "small_again"} == FerricStore.get(k)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -409,15 +498,22 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn ->
-        {:ok, "v2"} == FerricStore.get(k)
-      end, "overwrite not persisted, expected v2")
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "v2"} == FerricStore.get(k)
+        end,
+        "overwrite not persisted, expected v2"
+      )
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, "v3")
-      ShardHelpers.eventually(fn ->
-        {:ok, "v3"} == FerricStore.get(k)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "v3"} == FerricStore.get(k)
+        end,
+        "writes should work after crash"
+      )
     end
   end
 
@@ -449,16 +545,23 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       # All 100 keys must be readable after crash
       for {k, i} <- keys do
-        ShardHelpers.eventually(fn ->
-          {:ok, "val_#{i}"} == FerricStore.get(k)
-        end, "key #{k} lost after crash (expected val_#{i})")
+        ShardHelpers.eventually(
+          fn ->
+            {:ok, "val_#{i}"} == FerricStore.get(k)
+          end,
+          "key #{k} lost after crash (expected val_#{i})"
+        )
       end
 
       # Writes still work after recovery
       :ok = FerricStore.set(first_key, "post_bulk_crash")
-      ShardHelpers.eventually(fn ->
-        {:ok, "post_bulk_crash"} == FerricStore.get(first_key)
-      end, "writes should work after crash")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "post_bulk_crash"} == FerricStore.get(first_key)
+        end,
+        "writes should work after crash"
+      )
     end
 
     @tag :durability
@@ -488,16 +591,23 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
       # All keys must be readable after crashing one shard
       for {shard_idx, k} <- shard_keys do
-        ShardHelpers.eventually(fn ->
-          {:ok, "shard_#{shard_idx}_val"} == FerricStore.get(k)
-        end, "key #{k} on shard #{shard_idx} lost after crash of shard 0")
+        ShardHelpers.eventually(
+          fn ->
+            {:ok, "shard_#{shard_idx}_val"} == FerricStore.get(k)
+          end,
+          "key #{k} on shard #{shard_idx} lost after crash of shard 0"
+        )
       end
 
       # Writes still work on recovered shard
       :ok = FerricStore.set(first_key, "recovered_write")
-      ShardHelpers.eventually(fn ->
-        {:ok, "recovered_write"} == FerricStore.get(first_key)
-      end, "writes should work on recovered shard")
+
+      ShardHelpers.eventually(
+        fn ->
+          {:ok, "recovered_write"} == FerricStore.get(first_key)
+        end,
+        "writes should work on recovered shard"
+      )
     end
   end
 end

@@ -130,10 +130,15 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       # Abrupt close while the parser is waiting for more data
       :gen_tcp.close(sock)
 
-      ShardHelpers.eventually(fn ->
-        assert_server_healthy(port)
-        true
-      end, "server should be healthy after mid-command disconnect", 20, 50)
+      ShardHelpers.eventually(
+        fn ->
+          assert_server_healthy(port)
+          true
+        end,
+        "server should be healthy after mid-command disconnect",
+        20,
+        50
+      )
     end
   end
 
@@ -142,7 +147,9 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
   # ===========================================================================
 
   describe "client disconnect mid-pipeline" do
-    test "server cleans up when client sends pipeline and disconnects before reading", %{port: port} do
+    test "server cleans up when client sends pipeline and disconnects before reading", %{
+      port: port
+    } do
       sock = connect_and_hello(port)
 
       # Send 5 SET commands as a pipeline
@@ -158,10 +165,15 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       # Close immediately without reading any responses
       :gen_tcp.close(sock)
 
-      ShardHelpers.eventually(fn ->
-        assert_server_healthy(port)
-        true
-      end, "server should be healthy after mid-pipeline disconnect", 20, 50)
+      ShardHelpers.eventually(
+        fn ->
+          assert_server_healthy(port)
+          true
+        end,
+        "server should be healthy after mid-pipeline disconnect",
+        20,
+        50
+      )
     end
   end
 
@@ -239,10 +251,15 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
         :gen_tcp.close(sock)
       end
 
-      ShardHelpers.eventually(fn ->
-        assert_server_healthy(port)
-        true
-      end, "server should be healthy after rapid connect/disconnect", 20, 50)
+      ShardHelpers.eventually(
+        fn ->
+          assert_server_healthy(port)
+          true
+        end,
+        "server should be healthy after rapid connect/disconnect",
+        20,
+        50
+      )
     end
   end
 
@@ -287,10 +304,15 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
 
       :gen_tcp.close(sock)
 
-      ShardHelpers.eventually(fn ->
-        assert_server_healthy(port)
-        true
-      end, "server should be healthy after half-close", 20, 50)
+      ShardHelpers.eventually(
+        fn ->
+          assert_server_healthy(port)
+          true
+        end,
+        "server should be healthy after half-close",
+        20,
+        50
+      )
     end
   end
 
@@ -363,10 +385,13 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       # so retry the GET until the value is available.
       sock_post = connect_and_hello(port)
 
-      ShardHelpers.eventually(fn ->
-        send_cmd(sock_post, ["GET", k_before])
-        recv_response(sock_post) == "durable"
-      end, "pre-crash value should survive shard restart")
+      ShardHelpers.eventually(
+        fn ->
+          send_cmd(sock_post, ["GET", k_before])
+          recv_response(sock_post) == "durable"
+        end,
+        "pre-crash value should survive shard restart"
+      )
 
       k_after = "after_crash_#{:rand.uniform(999_999)}"
       send_cmd(sock_post, ["SET", k_after, "new_val"])
@@ -415,7 +440,9 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
   # ===========================================================================
 
   describe "SUBSCRIBE then disconnect" do
-    test "server cleans up subscription when subscriber disconnects without UNSUBSCRIBE", %{port: port} do
+    test "server cleans up subscription when subscriber disconnects without UNSUBSCRIBE", %{
+      port: port
+    } do
       channel = "clc_sub_#{:rand.uniform(999_999)}"
 
       # Subscribe on a connection, then close without unsubscribing
@@ -503,10 +530,15 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
 
       :gen_tcp.close(sock)
 
-      ShardHelpers.eventually(fn ->
-        assert_server_healthy(port)
-        true
-      end, "server should be healthy after garbage input", 20, 50)
+      ShardHelpers.eventually(
+        fn ->
+          assert_server_healthy(port)
+          true
+        end,
+        "server should be healthy after garbage input",
+        20,
+        50
+      )
     end
 
     test "garbage followed by valid RESP on new connection works", %{port: port} do

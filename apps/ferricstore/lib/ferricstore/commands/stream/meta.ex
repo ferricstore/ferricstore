@@ -48,20 +48,36 @@ defmodule Ferricstore.Commands.Stream.Meta do
       Ops.compound_get(store, key, CompoundKey.type_key(key)) == "stream"
   end
 
-  @spec durable_entry(binary(), map()) :: {non_neg_integer(), binary(), binary(), non_neg_integer(), non_neg_integer()} | nil
+  @spec durable_entry(binary(), map()) ::
+          {non_neg_integer(), binary(), binary(), non_neg_integer(), non_neg_integer()} | nil
   def durable_entry(key, store) do
     store
     |> Ops.compound_get(key, CompoundKey.stream_meta_key(key))
     |> decode()
   end
 
-  @spec put_local(binary(), non_neg_integer(), binary(), binary(), non_neg_integer(), non_neg_integer()) :: true
+  @spec put_local(
+          binary(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: true
   def put_local(key, len, first, last, ms, seq) do
     ensure_table()
     :ets.insert(@meta_table, {key, len, first, last, ms, seq})
   end
 
-  @spec put(binary(), non_neg_integer(), binary(), binary(), non_neg_integer(), non_neg_integer(), map()) ::
+  @spec put(
+          binary(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          map()
+        ) ::
           :ok | {:error, term()}
   def put(key, len, first, last, ms, seq, store) do
     put_local(key, len, first, last, ms, seq)

@@ -32,6 +32,7 @@ defmodule FerricstoreServer.GracefulShutdownTest do
         port = :ranch.get_port(Listener)
         Process.put(:cached_port, port)
         port
+
       port ->
         port
     end
@@ -39,7 +40,10 @@ defmodule FerricstoreServer.GracefulShutdownTest do
 
   defp connect do
     port = get_port()
-    {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw], 5_000)
+
+    {:ok, sock} =
+      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw], 5_000)
+
     send_cmd(sock, ["HELLO", "3"])
     _resp = recv_response(sock)
     sock
@@ -87,31 +91,60 @@ defmodule FerricstoreServer.GracefulShutdownTest do
       if pid && Process.alive?(pid) do
         ref = Process.monitor(pid)
         Process.exit(pid, :kill)
-        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
+
+        receive do
+          {:DOWN, ^ref, _, _, _} -> :ok
+        after
+          5_000 -> :ok
+        end
       end
     end
 
     # Wait for full readiness
-    ShardHelpers.eventually(fn ->
-      shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
+    ShardHelpers.eventually(
+      fn ->
+        shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
 
-      Enum.all?(0..(shard_count_val - 1), fn i ->
-        pid = Process.whereis(Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), i))
-        alive = is_pid(pid) and Process.alive?(pid)
+        Enum.all?(0..(shard_count_val - 1), fn i ->
+          pid =
+            Process.whereis(
+              Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), i)
+            )
 
-        alive and try do
-          match?({:ok, {:raft_log_pos, _, _}}, Ferricstore.Raft.WARaftBackend.storage_position(i))
-        catch
-          :exit, _ -> false
-        end
-      end) and try do
-        Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), "__readiness_probe__", "ok", 0)
-        Ferricstore.Store.Router.delete(FerricStore.Instance.get(:default), "__readiness_probe__")
-        true
-      catch
-        :exit, _ -> false
-      end
-    end, "full write path should be ready after restart", 300, 200)
+          alive = is_pid(pid) and Process.alive?(pid)
+
+          alive and
+            try do
+              match?(
+                {:ok, {:raft_log_pos, _, _}},
+                Ferricstore.Raft.WARaftBackend.storage_position(i)
+              )
+            catch
+              :exit, _ -> false
+            end
+        end) and
+          try do
+            Ferricstore.Store.Router.put(
+              FerricStore.Instance.get(:default),
+              "__readiness_probe__",
+              "ok",
+              0
+            )
+
+            Ferricstore.Store.Router.delete(
+              FerricStore.Instance.get(:default),
+              "__readiness_probe__"
+            )
+
+            true
+          catch
+            :exit, _ -> false
+          end
+      end,
+      "full write path should be ready after restart",
+      300,
+      200
+    )
 
     Ferricstore.Health.set_ready(true)
   end
@@ -130,12 +163,17 @@ defmodule FerricstoreServer.GracefulShutdownTest do
       ShardHelpers.compact_wal()
       shutdown_and_restart()
 
-      ShardHelpers.eventually(fn ->
-        sock2 = connect()
-        result = tcp_get(sock2, "tcp_gsd_1")
-        :gen_tcp.close(sock2)
-        assert result == "hello_shutdown"
-      end, "GET after restart should return value", 10, 500)
+      ShardHelpers.eventually(
+        fn ->
+          sock2 = connect()
+          result = tcp_get(sock2, "tcp_gsd_1")
+          :gen_tcp.close(sock2)
+          assert result == "hello_shutdown"
+        end,
+        "GET after restart should return value",
+        10,
+        500
+      )
     end
 
     test "multiple keys from different connections survive" do

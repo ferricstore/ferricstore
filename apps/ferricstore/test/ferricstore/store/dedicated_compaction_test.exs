@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   @moduledoc """
   Tests for dedicated promoted Bitcask compaction.
 
-  Covers: write-count trigger, file rotation during compaction, crash
+  Covers: manual promoted compaction, file rotation during compaction, crash
   recovery with multiple files, ETS offset correctness after compaction,
   old file cleanup, and edge cases.
   """
@@ -291,11 +291,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Compaction triggers on write count
+  # Manual promoted compaction after write/delete churn
   # ---------------------------------------------------------------------------
 
-  describe "compaction on write count" do
-    test "dedicated compaction still runs after restart with cold promotion marker" do
+  describe "manual promoted compaction" do
+    test "manual compaction works after restart with cold promotion marker" do
       store = real_store()
       key = ukey("restart_compact")
       promote_hash(store, key)
@@ -344,7 +344,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
     end
 
-    test "many writes trigger compaction and data is still readable" do
+    test "manual compaction after many writes keeps data readable" do
       store = real_store()
       key = ukey("compact_trigger")
       promote_hash(store, key)
@@ -384,7 +384,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert "new_value" == Hash.handle("HGET", [key, "after_compact"], store)
     end
 
-    test "deletes count towards compaction threshold" do
+    test "manual compaction after delete churn keeps original fields" do
       store = real_store()
       key = ukey("del_compact")
       promote_hash(store, key)

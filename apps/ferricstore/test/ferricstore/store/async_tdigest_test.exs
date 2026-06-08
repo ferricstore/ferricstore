@@ -64,6 +64,7 @@ defmodule Ferricstore.Store.AsyncTDigestTest do
   end
 
   defp to_float(x) when is_number(x), do: x * 1.0
+
   defp to_float(x) when is_binary(x) do
     case Float.parse(x) do
       {f, _} -> f
@@ -169,6 +170,7 @@ defmodule Ferricstore.Store.AsyncTDigestTest do
       # We can't predict the exact count — but it must be a non-negative
       # number, must not crash, and must be readable.
       w = total_weight(key)
+
       assert w >= 0.0 and w <= 3.0 + 20 * 2,
              "expected weight in [0, 43] after mixed add+reset, got #{w}"
     end

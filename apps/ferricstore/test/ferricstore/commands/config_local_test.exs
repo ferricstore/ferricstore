@@ -103,13 +103,17 @@ defmodule Ferricstore.Commands.ConfigLocalTest do
 
   describe "CONFIG SET LOCAL error cases" do
     test "rejects unknown local parameter" do
-      result = Server.handle("CONFIG", ["SET", "LOCAL", "unknown_param", "value"], MockStore.make())
+      result =
+        Server.handle("CONFIG", ["SET", "LOCAL", "unknown_param", "value"], MockStore.make())
+
       assert {:error, msg} = result
       assert msg =~ "Unsupported" or msg =~ "unknown"
     end
 
     test "rejects invalid log_level value" do
-      result = Server.handle("CONFIG", ["SET", "LOCAL", "log_level", "invalid_level"], MockStore.make())
+      result =
+        Server.handle("CONFIG", ["SET", "LOCAL", "log_level", "invalid_level"], MockStore.make())
+
       assert {:error, msg} = result
       assert msg =~ "Invalid" or msg =~ "invalid"
     end
@@ -157,7 +161,9 @@ defmodule Ferricstore.Commands.ConfigLocalTest do
     end
 
     test "CONFIG SET maxmemory-policy still validates" do
-      result = Server.handle("CONFIG", ["SET", "maxmemory-policy", "noeviction"], MockStore.make())
+      result =
+        Server.handle("CONFIG", ["SET", "maxmemory-policy", "noeviction"], MockStore.make())
+
       assert result == :ok
     end
   end

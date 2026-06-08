@@ -1,6 +1,17 @@
-Code.require_file("blob_side_channel_test/sections/blob_garbage_sweep_streams_keydir_refs_copying_full_ets_table.exs", __DIR__)
-Code.require_file("blob_side_channel_test/sections/ra_generic_batch_accepts_pre_externalized_blob_refs.exs", __DIR__)
-Code.require_file("blob_side_channel_test/sections/blob_garbage_sweep_ignores_expired_blob_refs_still_present_in_keydir.exs", __DIR__)
+Code.require_file(
+  "blob_side_channel_test/sections/blob_garbage_sweep_streams_keydir_refs_copying_full_ets_table.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "blob_side_channel_test/sections/ra_generic_batch_accepts_pre_externalized_blob_refs.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "blob_side_channel_test/sections/blob_garbage_sweep_ignores_expired_blob_refs_still_present_in_keydir.exs",
+  __DIR__
+)
 
 defmodule Ferricstore.Store.BlobSideChannelTest do
   use ExUnit.Case, async: false
@@ -63,9 +74,10 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
   use Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepStreamsKeydirRefsCopyingFullEtsTable
   use Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPreExternalizedBlobRefs
+
   use Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnoresExpiredBlobRefsStillPresentInKeydir
 
-defp force_rotate_active_file(shard) do
+  defp force_rotate_active_file(shard) do
     :sys.replace_state(shard, fn state ->
       new_id = state.active_file_id + 1
       shard_path = state.shard_data_path
@@ -199,4 +211,3 @@ defp force_rotate_active_file(shard) do
     end
   end
 end
-

@@ -1,5 +1,6 @@
 Code.require_file("node_join_sync_test/sections/new_node_join_continuous_writes.exs", __DIR__)
 Code.require_file("node_join_sync_test/sections/leader_failover_during_sync.exs", __DIR__)
+
 defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   @moduledoc """
   Tests that a new node joining the cluster receives a complete, consistent
@@ -100,15 +101,6 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     |> Enum.reject(fn path -> current_data_dir && Path.expand(path) == current_data_dir end)
     |> Enum.each(&File.rm_rf/1)
   end
-
-
-
-
-
-
-
-
-
 
   # ---------------------------------------------------------------------------
   # Helpers — these call into :peer nodes via :erpc

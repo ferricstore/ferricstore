@@ -34,11 +34,11 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
 
       # Assert the error is NOT double-wrapped
       refute match?({:ok, {:error, _}}, result),
-        "sadd wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "sadd wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       # The correct return should be {:error, _}
       assert match?({:error, _}, result),
-        "sadd should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "sadd should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "srem on a sorted-set key returns {:error, _}, not {:ok, {:error, _}}" do
@@ -49,10 +49,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.srem("r3h1_zset", ["member1"])
 
       refute match?({:ok, {:error, _}}, result),
-        "srem wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "srem wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "srem should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "srem should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "smembers on a sorted-set key returns {:error, _}, not {:ok, {:error, _}}" do
@@ -61,10 +61,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.smembers("r3h1_zset2")
 
       refute match?({:ok, {:error, _}}, result),
-        "smembers wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "smembers wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "smembers should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "smembers should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "scard on a string key returns {:error, _}, not {:ok, {:error, _}}" do
@@ -73,10 +73,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.scard("r3h1_str2")
 
       refute match?({:ok, {:error, _}}, result),
-        "scard wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "scard wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "scard should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "scard should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
   end
 
@@ -91,10 +91,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.zadd("r3h2_str", [{1.0, "member1"}])
 
       refute match?({:ok, {:error, _}}, result),
-        "zadd wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "zadd wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "zadd should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "zadd should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "zadd on a set key returns {:error, _}, not {:ok, {:error, _}}" do
@@ -103,10 +103,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.zadd("r3h2_set", [{1.0, "member1"}])
 
       refute match?({:ok, {:error, _}}, result),
-        "zadd wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "zadd wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "zadd should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "zadd should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "zcard on a string key returns {:error, _}, not {:ok, {:error, _}}" do
@@ -115,10 +115,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.zcard("r3h2_str2")
 
       refute match?({:ok, {:error, _}}, result),
-        "zcard wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "zcard wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "zcard should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "zcard should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "zrem on a set key returns {:error, _}, not {:ok, {:error, _}}" do
@@ -127,10 +127,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.zrem("r3h2_set2", ["member1"])
 
       refute match?({:ok, {:error, _}}, result),
-        "zrem wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "zrem wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "zrem should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "zrem should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "zrange on a string key returns {:error, _}, not {:ok, {:error, _}}" do
@@ -139,10 +139,10 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       result = FerricStore.zrange("r3h2_str3", 0, -1)
 
       refute match?({:ok, {:error, _}}, result),
-        "zrange wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "zrange wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "zrange should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "zrange should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
 
     test "zscore on a set key returns {:error, _} without crashing" do
@@ -159,13 +159,13 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
         end
 
       refute match?({:rescued, _}, result),
-        "zscore crashed on wrong type: #{inspect(result)}"
+             "zscore crashed on wrong type: #{inspect(result)}"
 
       refute match?({:ok, {:error, _}}, result),
-        "zscore wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
+             "zscore wraps WRONGTYPE error inside {:ok, _} — error is not propagated"
 
       assert match?({:error, _}, result),
-        "zscore should return {:error, _} on type mismatch, got: #{inspect(result)}"
+             "zscore should return {:error, _} on type mismatch, got: #{inspect(result)}"
     end
   end
 

@@ -27,26 +27,36 @@ defmodule Ferricstore.GracefulShutdownTest do
     ShardHelpers.restart_current_data_dir(isolated_ctx)
 
     # Wait for full readiness: shards alive + WARaft storage + write path works
-    ShardHelpers.eventually(fn ->
-      shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
+    ShardHelpers.eventually(
+      fn ->
+        shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
 
-      Enum.all?(0..(shard_count_val - 1), fn i ->
-        pid = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))
-        alive = is_pid(pid) and Process.alive?(pid)
+        Enum.all?(0..(shard_count_val - 1), fn i ->
+          pid = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))
+          alive = is_pid(pid) and Process.alive?(pid)
 
-        alive and try do
-          match?({:ok, {:raft_log_pos, _, _}}, Ferricstore.Raft.WARaftBackend.storage_position(i))
-        catch
-          :exit, _ -> false
-        end
-      end) and try do
-        Router.put(FerricStore.Instance.get(:default), "__readiness_probe__", "ok", 0)
-        Router.delete(FerricStore.Instance.get(:default), "__readiness_probe__")
-        true
-      catch
-        :exit, _ -> false
-      end
-    end, "full write path should be ready after restart", 300, 200)
+          alive and
+            try do
+              match?(
+                {:ok, {:raft_log_pos, _, _}},
+                Ferricstore.Raft.WARaftBackend.storage_position(i)
+              )
+            catch
+              :exit, _ -> false
+            end
+        end) and
+          try do
+            Router.put(FerricStore.Instance.get(:default), "__readiness_probe__", "ok", 0)
+            Router.delete(FerricStore.Instance.get(:default), "__readiness_probe__")
+            true
+          catch
+            :exit, _ -> false
+          end
+      end,
+      "full write path should be ready after restart",
+      300,
+      200
+    )
 
     Ferricstore.Health.set_ready(true)
   end
@@ -59,8 +69,10 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "before_shutdown" end,
-        "key should survive graceful shutdown")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == "before_shutdown" end,
+        "key should survive graceful shutdown"
+      )
     end
 
     test "100 keys survive", %{isolated_ctx: isolated_ctx} do
@@ -75,8 +87,10 @@ defmodule Ferricstore.GracefulShutdownTest do
       shutdown_and_restart(isolated_ctx)
 
       for {k, expected} <- keys do
-        ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == expected end,
-          "key #{k} should survive shutdown")
+        ShardHelpers.eventually(
+          fn -> Router.get(FerricStore.Instance.get(:default), k) == expected end,
+          "key #{k} should survive shutdown"
+        )
       end
     end
 
@@ -89,8 +103,10 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "v3" end,
-        "latest value should survive")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == "v3" end,
+        "latest value should survive"
+      )
     end
 
     test "deleted key stays deleted after restart", %{isolated_ctx: isolated_ctx} do
@@ -102,21 +118,32 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == nil end,
-        "deleted key should stay deleted")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == nil end,
+        "deleted key should stay deleted"
+      )
     end
   end
 
   describe "TTL survives graceful shutdown" do
     test "key with TTL still has TTL after restart", %{isolated_ctx: isolated_ctx} do
       k = ukey("ttl")
-      Router.put(FerricStore.Instance.get(:default), k, "with_ttl", 60_000 + System.os_time(:millisecond))
+
+      Router.put(
+        FerricStore.Instance.get(:default),
+        k,
+        "with_ttl",
+        60_000 + System.os_time(:millisecond)
+      )
+
       ShardHelpers.flush_all_shards()
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "with_ttl" end,
-        "TTL key should survive shutdown")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == "with_ttl" end,
+        "TTL key should survive shutdown"
+      )
     end
   end
 
@@ -135,8 +162,10 @@ defmodule Ferricstore.GracefulShutdownTest do
       shutdown_and_restart(isolated_ctx)
 
       for {k, i} <- keys do
-        ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "shard_#{i}_data" end,
-          "shard #{i} key should survive")
+        ShardHelpers.eventually(
+          fn -> Router.get(FerricStore.Instance.get(:default), k) == "shard_#{i}_data" end,
+          "shard #{i} key should survive"
+        )
       end
     end
   end
@@ -154,8 +183,10 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "50" end,
-        "counter should be 50 after restart")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == "50" end,
+        "counter should be 50 after restart"
+      )
     end
   end
 
@@ -169,15 +200,23 @@ defmodule Ferricstore.GracefulShutdownTest do
       shutdown_and_restart(isolated_ctx)
 
       k2 = ukey("after")
-      ShardHelpers.eventually(fn ->
-        Router.put(FerricStore.Instance.get(:default), k2, "new_data") == :ok
-      end, "write should succeed after restart")
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k2) == "new_data" end,
-        "new data should be readable")
+      ShardHelpers.eventually(
+        fn ->
+          Router.put(FerricStore.Instance.get(:default), k2, "new_data") == :ok
+        end,
+        "write should succeed after restart"
+      )
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k1) == "old_data" end,
-        "old data should still be there")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k2) == "new_data" end,
+        "new data should be readable"
+      )
+
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k1) == "old_data" end,
+        "old data should still be there"
+      )
     end
   end
 
@@ -189,16 +228,20 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "cycle1" end,
-        "data should survive first cycle")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == "cycle1" end,
+        "data should survive first cycle"
+      )
 
       Router.put(FerricStore.Instance.get(:default), k, "cycle2")
       ShardHelpers.flush_all_shards()
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "cycle2" end,
-        "data should survive second cycle")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == "cycle2" end,
+        "data should survive second cycle"
+      )
     end
   end
 
@@ -210,8 +253,10 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "" end,
-        "empty string should survive")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == "" end,
+        "empty string should survive"
+      )
     end
 
     test "binary with null bytes survives", %{isolated_ctx: isolated_ctx} do
@@ -222,8 +267,10 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == val end,
-        "binary value should survive")
+      ShardHelpers.eventually(
+        fn -> Router.get(FerricStore.Instance.get(:default), k) == val end,
+        "binary value should survive"
+      )
     end
 
     test "large value survives", %{isolated_ctx: isolated_ctx} do
@@ -234,10 +281,13 @@ defmodule Ferricstore.GracefulShutdownTest do
 
       shutdown_and_restart(isolated_ctx)
 
-      ShardHelpers.eventually(fn ->
-        got = Router.get(FerricStore.Instance.get(:default), k)
-        got != nil and byte_size(got) == 100_000
-      end, "large value should survive")
+      ShardHelpers.eventually(
+        fn ->
+          got = Router.get(FerricStore.Instance.get(:default), k)
+          got != nil and byte_size(got) == 100_000
+        end,
+        "large value should survive"
+      )
     end
   end
 end

@@ -1,6 +1,5 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.Overview do
-
-import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.Format
 
   def render_top_bar(data) do
     overview = data.overview
@@ -423,5 +422,4 @@ import FerricstoreServer.Health.Dashboard.Format
     </div>
     """
   end
-
 end

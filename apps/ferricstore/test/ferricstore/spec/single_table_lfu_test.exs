@@ -277,17 +277,21 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       mem_before = :ets.info(table, :memory)
 
       # Evict all values on shard 0 (set value slot to nil)
-      :ets.foldl(fn {key, _val, exp, lfu, fid, off, vsize}, acc ->
-        :ets.insert(table, {key, nil, exp, lfu, fid, off, vsize})
-        acc
-      end, :ok, table)
+      :ets.foldl(
+        fn {key, _val, exp, lfu, fid, off, vsize}, acc ->
+          :ets.insert(table, {key, nil, exp, lfu, fid, off, vsize})
+          acc
+        end,
+        :ok,
+        table
+      )
 
       :erlang.garbage_collect()
       mem_after = :ets.info(table, :memory)
 
       assert mem_after <= mem_before,
              "memory should not increase after evicting all values " <>
-             "(before: #{mem_before} words, after: #{mem_after} words)"
+               "(before: #{mem_before} words, after: #{mem_after} words)"
     end
 
     # Test 13: Concurrent read + eviction -- no crash
@@ -335,9 +339,13 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # After restart, key should be readable (rebuilt from Bitcask)
       drain_all()
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "restart_key") == "restart_val"
-      end, "key should be readable after shard restart")
+
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "restart_key") == "restart_val"
+        end,
+        "key should be readable after shard restart"
+      )
 
       # Verify it's in the keydir with the 7-element tuple format
       [{key, _val, exp, packed_lfu, _fid, _off, _vsize}] = keydir_lookup("restart_key")
@@ -512,7 +520,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 23: volatile_lfu only evicts keys with TTL
     test "23. volatile_lfu only evicts keys with TTL" do
       # This tests the eviction policy logic
-      Router.put(FerricStore.Instance.get(:default), "vol_no_ttl", "val")  # no TTL
+      # no TTL
+      Router.put(FerricStore.Instance.get(:default), "vol_no_ttl", "val")
       future = System.os_time(:millisecond) + 60_000
       Router.put(FerricStore.Instance.get(:default), "vol_with_ttl", "val", future)
       drain_all()
@@ -551,6 +560,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       drain_all()
 
       [{_, _, _, lfu_after, _fid, _off, _vsize}] = keydir_lookup("scan_key")
+
       assert lfu_after == lfu_before,
              "SCAN should not change LFU counter (before=#{lfu_before}, after=#{lfu_after})"
     end
@@ -601,6 +611,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       [{_, val, _, _, _, _, _}] = keydir_lookup(key)
       assert val == "val", "value should be restored"
+
       assert lfu_counter(key) == 5,
              "LFU counter should reset to 5 on re-warm, got #{lfu_counter(key)}"
     end
@@ -609,6 +620,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     test "28. lfu_log_factor config is respected" do
       # Verify the config key exists (or has a default)
       factor = Application.get_env(:ferricstore, :lfu_log_factor, 10)
+
       assert is_integer(factor) and factor > 0,
              "lfu_log_factor must be a positive integer, got #{inspect(factor)}"
     end
@@ -629,6 +641,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       nonzero_eff = effective_counter("lfu_nonzero")
 
       assert zero_eff == 0
+
       assert nonzero_eff > zero_eff,
              "nonzero key should have higher counter than zero key"
     end
@@ -641,9 +654,11 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # Read 10 keys 200 times each to bump their counters
       hot_keys = Enum.take(keys, 10)
+
       Enum.each(hot_keys, fn k ->
         for _ <- 1..200, do: Router.get(FerricStore.Instance.get(:default), k)
       end)
+
       drain_all()
 
       # Get all entries with their effective LFU counters
@@ -653,7 +668,9 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
           case keydir_lookup(k) do
             [{^k, val, exp, packed_lfu, _, _, _}] when val != nil ->
               [{k, val, exp, LFU.effective_counter(packed_lfu)}]
-            _ -> []
+
+            _ ->
+              []
           end
         end)
 
@@ -726,6 +743,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       drain_all()
 
       [{_, _, exp, _, _, _, _}] = keydir_lookup("ttl_key")
+
       assert exp > 0 and exp <= future + 1000,
              "expire_at_ms should be approximately #{future}, got #{exp}"
     end
@@ -757,7 +775,11 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 36: Promotion still works with single table
     test "36. promotion still works with single table" do
       # Write enough hash fields to verify the compound key path works
-      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), "promo_hash"))
+      shard =
+        Router.shard_name(
+          FerricStore.Instance.get(:default),
+          Router.shard_for(FerricStore.Instance.get(:default), "promo_hash")
+        )
 
       GenServer.call(shard, {:compound_put, "promo_hash", "H:promo_hash\0field1", "val1", 0})
       drain_all()
@@ -787,6 +809,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # Verify the tuple has 7 elements (keydir format with disk location fields)
       entries = keydir_lookup("raft_key")
+
       assert [{_, _, _, _, _, _, _}] = entries,
              "keydir entry should be 7-element tuple, got #{inspect(entries)}"
     end

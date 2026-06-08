@@ -1,15 +1,60 @@
 Code.require_file("flow_test/sections/flow_internal_keys_use_compact_partition_tags.exs", __DIR__)
-Code.require_file("flow_test/sections/claim_due_multi_state_claims_earliest_due_job_instead_first_listed_state.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_create_stores_debug_lineage_metadata_indexes_it.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_spawn_children_rejects_missing_wait_state_waiting_children.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_spawn_children_wait_any_resolves_on_first_successful_child_across_s.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_native_due_index_mirrors_create_claim_due.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_claim_due_drains_higher_priorities_before_lower_priorities_default.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_policy_exposes_type_state_retry_retention_defaults.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_claim_due_automatically_reclaims_expired_leases_ratio.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_fail_many_atomically_fails_one_partition_batch.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_history_supports_range_reverse_event_worker_filters.exs", __DIR__)
-Code.require_file("flow_test/sections/flow_history_hot_max_rejects_values_above_configured_maximum.exs", __DIR__)
+
+Code.require_file(
+  "flow_test/sections/claim_due_multi_state_claims_earliest_due_job_instead_first_listed_state.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_create_stores_debug_lineage_metadata_indexes_it.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_spawn_children_rejects_missing_wait_state_waiting_children.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_spawn_children_wait_any_resolves_on_first_successful_child_across_s.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_native_due_index_mirrors_create_claim_due.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_claim_due_drains_higher_priorities_before_lower_priorities_default.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_policy_exposes_type_state_retry_retention_defaults.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_claim_due_automatically_reclaims_expired_leases_ratio.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_fail_many_atomically_fails_one_partition_batch.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_history_supports_range_reverse_event_worker_filters.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "flow_test/sections/flow_history_hot_max_rejects_values_above_configured_maximum.exs",
+  __DIR__
+)
+
 Code.require_file("flow_test/sections/flushdb_clears_flow_lmdb_terminal_projections.exs", __DIR__)
 
 defmodule Ferricstore.FlowTest do
@@ -451,7 +496,7 @@ defmodule Ferricstore.FlowTest do
   use Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfiguredMaximum
   use Ferricstore.FlowTest.Sections.FlushdbClearsFlowLmdbTerminalProjections
 
-defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   defp start_flow_restart_instance(name, data_dir) do
@@ -540,4 +585,3 @@ defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
     end
   end
 end
-

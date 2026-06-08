@@ -85,13 +85,18 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
       # In multi-node Raft, writes forwarded to the leader replicate back
       # to followers asynchronously. Poll until all ACKed members appear.
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        violations = HistoryRecorder.verify_set_durability(history, [n1], key)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          violations = HistoryRecorder.verify_set_durability(history, [n1], key)
 
-        assert violations == [],
-               "Set durability violated:\n" <>
-                 HistoryRecorder.format_violations(violations)
-      end, "set durability on n1", 50, 100)
+          assert violations == [],
+                 "Set durability violated:\n" <>
+                   HistoryRecorder.format_violations(violations)
+        end,
+        "set durability on n1",
+        50,
+        100
+      )
 
       {:ok, members} = :rpc.call(n1.name, FerricStore, :smembers, [key])
 
@@ -142,24 +147,29 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
         |> MapSet.new()
 
       # Poll until all ACKed members appear on the node (replication lag).
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        {:ok, present} = :rpc.call(node.name, FerricStore, :smembers, [key])
-        present_set = MapSet.new(present)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          {:ok, present} = :rpc.call(node.name, FerricStore, :smembers, [key])
+          present_set = MapSet.new(present)
 
-        # Check for phantom members: present but never ACKed
-        phantom = MapSet.difference(present_set, acked)
+          # Check for phantom members: present but never ACKed
+          phantom = MapSet.difference(present_set, acked)
 
-        assert MapSet.size(phantom) == 0,
-               "Phantom members appeared that were never ACKed: " <>
-                 inspect(MapSet.to_list(phantom))
+          assert MapSet.size(phantom) == 0,
+                 "Phantom members appeared that were never ACKed: " <>
+                   inspect(MapSet.to_list(phantom))
 
-        # Check for missing ACKed members
-        missing = MapSet.difference(acked, present_set)
+          # Check for missing ACKed members
+          missing = MapSet.difference(acked, present_set)
 
-        assert MapSet.size(missing) == 0,
-               "ACKed members missing from SMEMBERS: " <>
-                 inspect(MapSet.to_list(missing))
-      end, "set phantom check on #{node.name}", 50, 100)
+          assert MapSet.size(missing) == 0,
+                 "ACKed members missing from SMEMBERS: " <>
+                   inspect(MapSet.to_list(missing))
+        end,
+        "set phantom check on #{node.name}",
+        50,
+        100
+      )
 
       IO.puts(
         "  #{MapSet.size(acked)} ACKed members present; " <>
@@ -208,13 +218,18 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
       ok_count = Enum.count(results, &match?({:ok, _}, &1))
 
       # Poll until all ACKed members appear (replication lag on followers).
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        violations = HistoryRecorder.verify_set_durability(history, [node], key)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          violations = HistoryRecorder.verify_set_durability(history, [node], key)
 
-        assert violations == [],
-               "Set durability violated under concurrency:\n" <>
-                 HistoryRecorder.format_violations(violations)
-      end, "concurrent set durability on #{node.name}", 50, 100)
+          assert violations == [],
+                 "Set durability violated under concurrency:\n" <>
+                   HistoryRecorder.format_violations(violations)
+        end,
+        "concurrent set durability on #{node.name}",
+        50,
+        100
+      )
 
       {:ok, members} = :rpc.call(node.name, FerricStore, :smembers, [key])
 

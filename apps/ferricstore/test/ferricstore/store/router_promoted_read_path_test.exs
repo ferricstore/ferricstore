@@ -59,7 +59,9 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
 
     without_shared_log(ctx, fn ->
       assert "cc" == Router.compound_get(ctx, redis_key, field)
-      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements, _metadata}
+
+      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements,
+                       _metadata}
     end)
   end
 
@@ -71,7 +73,9 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
 
     without_shared_log(ctx, fn ->
       assert {"cc", 0} == Router.compound_get_meta(ctx, redis_key, field)
-      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements, _metadata}
+
+      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements,
+                       _metadata}
     end)
   end
 
@@ -84,7 +88,9 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
 
     without_shared_log(ctx, fn ->
       assert ["cc", "dd"] == Router.compound_batch_get(ctx, redis_key, fields)
-      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements, _metadata}
+
+      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements,
+                       _metadata}
     end)
   end
 
@@ -99,7 +105,9 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
 
     without_shared_log(ctx, fn ->
       assert [{"cc", 0}, {"dd", 0}] == Router.compound_batch_get_meta(ctx, redis_key, fields)
-      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements, _metadata}
+
+      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements,
+                       _metadata}
     end)
   end
 

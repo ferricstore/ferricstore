@@ -1,4 +1,8 @@
-Code.require_file("blob_store_test/sections/put_appends_blob_segment_record_returns_small_ref.exs", __DIR__)
+Code.require_file(
+  "blob_store_test/sections/put_appends_blob_segment_record_returns_small_ref.exs",
+  __DIR__
+)
+
 defmodule Ferricstore.Store.BlobStoreTest do
   use ExUnit.Case, async: true
 
@@ -12,32 +16,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     on_exit(fn -> File.rm_rf!(root) end)
     %{root: root}
   end
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
   test "put rotates append segments when the active segment crosses the size cap", %{
     root: root
@@ -53,7 +31,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, {second_path, _offset, _size}} = BlobStore.file_ref(root, 0, second_ref)
     assert first_path != second_path
   end
-
 
   test "recover_shard rejects symlinked append segments without mutating the target", %{
     root: root
@@ -79,7 +56,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert File.read!(outside_path) == "sentinel"
   end
 
-
   test "recover_shard invalidates cached append offsets after truncating a corrupt record", %{
     root: root
   } do
@@ -100,17 +76,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^third_payload} = BlobStore.get(root, 0, third_ref)
   end
 
-
-
-
-
-
-
-
-
-
-
-
   test "get and verify reject corrupt segment headers even when payload bytes match", %{
     root: root
   } do
@@ -122,9 +87,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:error, :segment_header_mismatch} = BlobStore.get(root, 0, ref)
     assert {:error, :segment_header_mismatch} = BlobStore.verify(root, 0, ref)
   end
-
-
-
 
   test "sweep_unreferenced deletes an append segment when no live ref points to it", %{
     root: root
@@ -169,7 +131,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert File.stat!(segment_path).size == segment_bytes
     assert {:ok, :binary.copy("pending", 256)} == BlobStore.get(root, 0, ref)
   end
-
 
   test "sweep_unreferenced preserves an append segment while any ref in it is live", %{
     root: root
@@ -263,7 +224,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute File.exists?(segment_path)
   end
 
-
   test "sweep_unreferenced can reclaim a dead rotated segment while newer segment stays live", %{
     root: root
   } do
@@ -307,8 +267,6 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, {second_path, _offset, _size}} = BlobStore.file_ref(root, 0, second_ref)
     assert second_path != first_path
   end
-
-
 
   use Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordReturnsSmallRef
 

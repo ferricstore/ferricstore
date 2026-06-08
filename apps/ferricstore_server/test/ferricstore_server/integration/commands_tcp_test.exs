@@ -27,7 +27,6 @@ defmodule FerricstoreServer.Integration.CommandsTcpTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-
   defp send_cmd(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))
     :ok = :gen_tcp.send(sock, data)

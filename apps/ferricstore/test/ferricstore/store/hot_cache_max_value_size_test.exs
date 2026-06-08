@@ -64,7 +64,10 @@ defmodule Ferricstore.Store.HotCacheMaxValueSizeTest do
   end
 
   describe "value exactly at threshold" do
-    test "value at exactly threshold bytes is stored hot (> not >=)", %{shard: shard, keydir: keydir} do
+    test "value at exactly threshold bytes is stored hot (> not >=)", %{
+      shard: shard,
+      keydir: keydir
+    } do
       exact_value = String.duplicate("e", @small_threshold)
       :ok = GenServer.call(shard, {:put, "exact", exact_value, 0})
 
@@ -77,7 +80,10 @@ defmodule Ferricstore.Store.HotCacheMaxValueSizeTest do
   end
 
   describe "overwrite transitions" do
-    test "small value -> large value transitions from hot to cold", %{shard: shard, keydir: keydir} do
+    test "small value -> large value transitions from hot to cold", %{
+      shard: shard,
+      keydir: keydir
+    } do
       small = String.duplicate("s", 10)
       large = String.duplicate("L", @small_threshold + 50)
 
@@ -100,7 +106,10 @@ defmodule Ferricstore.Store.HotCacheMaxValueSizeTest do
       assert large == GenServer.call(shard, {:get, "transition"})
     end
 
-    test "large value -> small value transitions from cold to hot", %{shard: shard, keydir: keydir} do
+    test "large value -> small value transitions from cold to hot", %{
+      shard: shard,
+      keydir: keydir
+    } do
       large = String.duplicate("L", @small_threshold + 50)
       small = String.duplicate("s", 10)
 
@@ -139,7 +148,10 @@ defmodule Ferricstore.Store.HotCacheMaxValueSizeTest do
       assert value == GenServer.call(shard, {:get, "null_bytes"})
     end
 
-    test "STRLEN on large cold value uses value_size from 7-tuple (no disk read needed)", %{shard: shard, keydir: keydir} do
+    test "STRLEN on large cold value uses value_size from 7-tuple (no disk read needed)", %{
+      shard: shard,
+      keydir: keydir
+    } do
       large_value = String.duplicate("z", @small_threshold + 200)
       :ok = GenServer.call(shard, {:put, "strlen_key", large_value, 0})
       :ok = GenServer.call(shard, :flush)

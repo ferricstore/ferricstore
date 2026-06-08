@@ -17,7 +17,9 @@ defmodule Ferricstore.Store.IoUringIntegrationTest do
     assert {:unix, :linux} == :os.type()
     assert NIF.io_uring_available()
 
-    dir = Path.join(System.tmp_dir!(), "ferricstore_io_uring_#{System.unique_integer([:positive])}")
+    dir =
+      Path.join(System.tmp_dir!(), "ferricstore_io_uring_#{System.unique_integer([:positive])}")
+
     path = Path.join(dir, "00000000000000000001.data")
 
     File.mkdir_p!(dir)

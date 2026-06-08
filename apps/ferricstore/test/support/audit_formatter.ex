@@ -22,10 +22,11 @@ defmodule Ferricstore.Test.AuditFormatter do
     File.mkdir_p!(@log_dir)
 
     # Detect which app we're in from the mix project
-    app_name = case Mix.Project.config()[:app] do
-      nil -> "unknown"
-      app -> Atom.to_string(app)
-    end
+    app_name =
+      case Mix.Project.config()[:app] do
+        nil -> "unknown"
+        app -> Atom.to_string(app)
+      end
 
     log_path = Path.join(@log_dir, "#{app_name}.log")
     File.write!(log_path, "=== #{app_name} started #{timestamp()} ===\n")
@@ -35,29 +36,39 @@ defmodule Ferricstore.Test.AuditFormatter do
 
   @impl true
   def handle_cast({:test_finished, %ExUnit.Test{} = test}, state) do
-    status = case test.state do
-      nil -> "PASS"
-      {:excluded, _} -> "SKIP"
-      {:skipped, _} -> "SKIP"
-      {:invalid, _} -> "INVALID"
-      _ -> "FAIL"
-    end
+    status =
+      case test.state do
+        nil -> "PASS"
+        {:excluded, _} -> "SKIP"
+        {:skipped, _} -> "SKIP"
+        {:invalid, _} -> "INVALID"
+        _ -> "FAIL"
+      end
+
     duration_ms = div(test.time, 1000)
 
     shard_count = try_shard_count()
     {ets_count, prefix_count} = ets_snapshot(shard_count)
     {writer_pending, batcher_pending} = queue_snapshot(shard_count)
-    pt_count = try do :persistent_term.info().count rescue _ -> 0 end
+
+    pt_count =
+      try do
+        :persistent_term.info().count
+      rescue
+        _ -> 0
+      end
+
     proc_count = length(Process.list())
     {bitcask_files, bitcask_bytes} = bitcask_snapshot(shard_count)
 
     # Sample up to 5 key prefixes to trace ownership
     key_prefixes = if ets_count > 0, do: sample_key_prefixes(shard_count, 5), else: ""
 
-    test_ns = case test.tags[:namespace] do
-      ns when is_binary(ns) -> ns
-      _ -> "-"
-    end
+    test_ns =
+      case test.tags[:namespace] do
+        ns when is_binary(ns) -> ns
+        _ -> "-"
+      end
 
     leak_parts =
       []
@@ -68,6 +79,7 @@ defmodule Ferricstore.Test.AuditFormatter do
     leak_tag = if leak_parts == [], do: "", else: " #{Enum.join(leak_parts, " ")}"
 
     module = inspect(test.module)
+
     line =
       "[#{timestamp()}] #{status} (#{duration_ms}ms) #{module} > #{test.name} | " <>
         "ns=#{test_ns} ets=#{ets_count} prefix=#{prefix_count} pt=#{pt_count} procs=#{proc_count} " <>
@@ -134,12 +146,15 @@ defmodule Ferricstore.Test.AuditFormatter do
         case File.ls(shard_dir) do
           {:ok, entries} ->
             log_files = Enum.filter(entries, &String.ends_with?(&1, ".log"))
-            total_bytes = Enum.reduce(log_files, 0, fn f, acc ->
-              case File.stat(Path.join(shard_dir, f)) do
-                {:ok, %{size: size}} -> acc + size
-                _ -> acc
-              end
-            end)
+
+            total_bytes =
+              Enum.reduce(log_files, 0, fn f, acc ->
+                case File.stat(Path.join(shard_dir, f)) do
+                  {:ok, %{size: size}} -> acc + size
+                  _ -> acc
+                end
+              end)
+
             {files_acc + length(log_files), bytes_acc + total_bytes}
 
           _ ->
@@ -158,10 +173,17 @@ defmodule Ferricstore.Test.AuditFormatter do
     keys =
       Enum.reduce(0..(shard_count - 1), [], fn i, acc ->
         try do
-          :ets.foldl(fn {k, _, _, _, _, _, _}, a when is_binary(k) ->
-            if length(a) < max * 3, do: [k | a], else: throw(:enough)
-          _, a -> a
-          end, acc, :"keydir_#{i}")
+          :ets.foldl(
+            fn
+              {k, _, _, _, _, _, _}, a when is_binary(k) ->
+                if length(a) < max * 3, do: [k | a], else: throw(:enough)
+
+              _, a ->
+                a
+            end,
+            acc,
+            :"keydir_#{i}"
+          )
         rescue
           _ -> acc
         catch

@@ -72,11 +72,17 @@ defmodule Ferricstore.FlowWorkflowDemoTest do
     log_query("flow_get", final)
 
     log_step("5 query completed list")
-    assert {:ok, completed_list} = FerricStore.flow_list(type, state: "completed", partition_key: partition, count: 10)
+
+    assert {:ok, completed_list} =
+             FerricStore.flow_list(type, state: "completed", partition_key: partition, count: 10)
+
     log_query("flow_list completed", Enum.map(completed_list, &flow_summary/1))
 
     log_step("6 query by correlation")
-    assert {:ok, correlated} = FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 10)
+
+    assert {:ok, correlated} =
+             FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 10)
+
     log_query("flow_by_correlation", Enum.map(correlated, &flow_summary/1))
 
     log_step("7 query workflow info")

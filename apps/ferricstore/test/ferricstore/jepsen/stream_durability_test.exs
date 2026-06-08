@@ -85,27 +85,30 @@ defmodule Ferricstore.Jepsen.StreamDurabilityTest do
         assert length(acked_ids) == 50,
                "Expected 50 ACKed XADD entries on #{node.name}, got #{length(acked_ids)}"
 
-        Ferricstore.Test.ShardHelpers.eventually(fn ->
-          range_result = remote_stream_cmd(node.name, "XRANGE", [stream_key, "-", "+"])
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            range_result = remote_stream_cmd(node.name, "XRANGE", [stream_key, "-", "+"])
 
-          assert is_list(range_result),
-                 "XRANGE should return a list on #{node.name}, got: #{inspect(range_result)}"
+            assert is_list(range_result),
+                   "XRANGE should return a list on #{node.name}, got: #{inspect(range_result)}"
 
-          present_ids =
-            Enum.map(range_result, fn [id | _fields] -> id end)
-            |> MapSet.new()
+            present_ids =
+              Enum.map(range_result, fn [id | _fields] -> id end)
+              |> MapSet.new()
 
-          missing =
-            Enum.reject(acked_ids, &MapSet.member?(present_ids, &1))
+            missing =
+              Enum.reject(acked_ids, &MapSet.member?(present_ids, &1))
 
-          assert missing == [],
-                 "#{length(missing)} ACKed stream entries missing on #{node.name}: " <>
-                   "#{inspect(Enum.take(missing, 5))}"
-        end, "stream entries on #{node.name}", 50, 100)
-
-        IO.puts(
-          "  Node #{node.index}: #{length(acked_ids)} stream entries ACKed; 0 lost"
+            assert missing == [],
+                   "#{length(missing)} ACKed stream entries missing on #{node.name}: " <>
+                     "#{inspect(Enum.take(missing, 5))}"
+          end,
+          "stream entries on #{node.name}",
+          50,
+          100
         )
+
+        IO.puts("  Node #{node.index}: #{length(acked_ids)} stream entries ACKed; 0 lost")
       end)
     end
 
@@ -166,23 +169,28 @@ defmodule Ferricstore.Jepsen.StreamDurabilityTest do
           {result, i}
         end
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        range_result = remote_stream_cmd(n1.name, "XRANGE", [stream_key, "-", "+"])
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          range_result = remote_stream_cmd(n1.name, "XRANGE", [stream_key, "-", "+"])
 
-        assert length(range_result) == 50,
-               "XRANGE should return 50 entries, got #{length(range_result)}"
+          assert length(range_result) == 50,
+                 "XRANGE should return 50 entries, got #{length(range_result)}"
 
-        range_ids = Enum.map(range_result, fn [id | _] -> id end)
-        acked_id_list = Enum.map(acked_ids, fn {id, _seq} -> id end)
+          range_ids = Enum.map(range_result, fn [id | _] -> id end)
+          acked_id_list = Enum.map(acked_ids, fn {id, _seq} -> id end)
 
-        assert range_ids == acked_id_list,
-               "XRANGE entries not in write order"
+          assert range_ids == acked_id_list,
+                 "XRANGE entries not in write order"
 
-        Enum.each(Enum.with_index(range_result, 1), fn {[_id, "seq", seq_val | _], expected_seq} ->
-          assert seq_val == "#{expected_seq}",
-                 "Entry seq mismatch: expected #{expected_seq}, got #{seq_val}"
-        end)
-      end, "XRANGE entries should match XADDs after replication", 50, 100)
+          Enum.each(Enum.with_index(range_result, 1), fn {[_id, "seq", seq_val | _], expected_seq} ->
+            assert seq_val == "#{expected_seq}",
+                   "Entry seq mismatch: expected #{expected_seq}, got #{seq_val}"
+          end)
+        end,
+        "XRANGE entries should match XADDs after replication",
+        50,
+        100
+      )
     end
 
     @tag :jepsen
@@ -216,26 +224,29 @@ defmodule Ferricstore.Jepsen.StreamDurabilityTest do
       Enum.each(remaining, fn node ->
         {stream_key, expected_ids} = Map.get(per_node_entries, node)
 
-        Ferricstore.Test.ShardHelpers.eventually(fn ->
-          range_result = remote_stream_cmd(node.name, "XRANGE", [stream_key, "-", "+"])
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            range_result = remote_stream_cmd(node.name, "XRANGE", [stream_key, "-", "+"])
 
-          assert is_list(range_result),
-                 "XRANGE should return list on surviving #{node.name}"
+            assert is_list(range_result),
+                   "XRANGE should return list on surviving #{node.name}"
 
-          present_ids = Enum.map(range_result, fn [id | _] -> id end) |> MapSet.new()
+            present_ids = Enum.map(range_result, fn [id | _] -> id end) |> MapSet.new()
 
-          missing =
-            Enum.reject(expected_ids, &MapSet.member?(present_ids, &1))
+            missing =
+              Enum.reject(expected_ids, &MapSet.member?(present_ids, &1))
 
-          assert missing == [],
-                 "#{length(missing)} stream entries missing on surviving #{node.name}: " <>
-                   "#{inspect(Enum.take(missing, 5))}"
-        end, "stream entries on surviving #{node.name}", 50, 100)
+            assert missing == [],
+                   "#{length(missing)} stream entries missing on surviving #{node.name}: " <>
+                     "#{inspect(Enum.take(missing, 5))}"
+          end,
+          "stream entries on surviving #{node.name}",
+          50,
+          100
+        )
       end)
 
-      IO.puts(
-        "  Stream data intact on #{length(remaining)} surviving nodes after node kill"
-      )
+      IO.puts("  Stream data intact on #{length(remaining)} surviving nodes after node kill")
     end
 
     @tag :jepsen
@@ -254,12 +265,17 @@ defmodule Ferricstore.Jepsen.StreamDurabilityTest do
             is_binary(result)
           end)
 
-        Ferricstore.Test.ShardHelpers.eventually(fn ->
-          xlen_result = remote_stream_cmd(node.name, "XLEN", [stream_key])
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            xlen_result = remote_stream_cmd(node.name, "XLEN", [stream_key])
 
-          assert xlen_result == acked_count,
-                 "XLEN mismatch on #{node.name}: expected #{acked_count}, got #{xlen_result}"
-        end, "XLEN on #{node.name}", 50, 100)
+            assert xlen_result == acked_count,
+                   "XLEN mismatch on #{node.name}: expected #{acked_count}, got #{xlen_result}"
+          end,
+          "XLEN on #{node.name}",
+          50,
+          100
+        )
       end)
     end
   end

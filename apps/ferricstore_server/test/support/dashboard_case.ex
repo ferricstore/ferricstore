@@ -133,4 +133,3 @@ defmodule FerricstoreServer.Test.DashboardCase do
     end
   end
 end
-

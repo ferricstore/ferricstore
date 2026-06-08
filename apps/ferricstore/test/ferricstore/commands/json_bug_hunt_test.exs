@@ -354,15 +354,16 @@ defmodule Ferricstore.Commands.JsonBugHuntTest do
     end
 
     test "nested type detection via path" do
-      store = store_with_json(%{
-        "str" => "hello",
-        "num" => 42,
-        "flt" => 1.5,
-        "bool" => true,
-        "nil" => nil,
-        "arr" => [],
-        "obj" => %{}
-      })
+      store =
+        store_with_json(%{
+          "str" => "hello",
+          "num" => 42,
+          "flt" => 1.5,
+          "bool" => true,
+          "nil" => nil,
+          "arr" => [],
+          "obj" => %{}
+        })
 
       assert "string" == Json.handle("JSON.TYPE", ["doc", "$.str"], store)
       assert "integer" == Json.handle("JSON.TYPE", ["doc", "$.num"], store)

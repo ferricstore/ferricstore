@@ -14,7 +14,9 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
   import FerricstoreServer.Health.Dashboard.Render.FlowFilters
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory, except: [flow_signal_rows: 2]
   import FerricstoreServer.Health.Dashboard.Render.FlowOverview
-  import FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy, except: [flow_policy_editor_data: 1]
+
+  import FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy,
+    except: [flow_policy_editor_data: 1]
 
   import FerricstoreServer.Health.Dashboard.Render.FlowTables,
     except: [default_flow_projection_health: 0]
@@ -81,37 +83,67 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
     :assigns
   ])
 
-  EEx.function_from_file(:def, :flow_workers, Path.join(@templates_dir, "flow_workers.html.eex"), [
-    :assigns
-  ])
+  EEx.function_from_file(
+    :def,
+    :flow_workers,
+    Path.join(@templates_dir, "flow_workers.html.eex"),
+    [
+      :assigns
+    ]
+  )
 
   EEx.function_from_file(:def, :flow_due, Path.join(@templates_dir, "flow_due.html.eex"), [
     :assigns
   ])
 
-  EEx.function_from_file(:def, :flow_failures, Path.join(@templates_dir, "flow_failures.html.eex"), [
-    :assigns
-  ])
+  EEx.function_from_file(
+    :def,
+    :flow_failures,
+    Path.join(@templates_dir, "flow_failures.html.eex"),
+    [
+      :assigns
+    ]
+  )
 
-  EEx.function_from_file(:def, :flow_lineage, Path.join(@templates_dir, "flow_lineage.html.eex"), [
-    :assigns
-  ])
+  EEx.function_from_file(
+    :def,
+    :flow_lineage,
+    Path.join(@templates_dir, "flow_lineage.html.eex"),
+    [
+      :assigns
+    ]
+  )
 
   EEx.function_from_file(:def, :flow_query, Path.join(@templates_dir, "flow_query.html.eex"), [
     :assigns
   ])
 
-  EEx.function_from_file(:def, :flow_signals, Path.join(@templates_dir, "flow_signals.html.eex"), [
-    :assigns
-  ])
+  EEx.function_from_file(
+    :def,
+    :flow_signals,
+    Path.join(@templates_dir, "flow_signals.html.eex"),
+    [
+      :assigns
+    ]
+  )
 
-  EEx.function_from_file(:def, :flow_policies, Path.join(@templates_dir, "flow_policies.html.eex"), [
-    :assigns
-  ])
+  EEx.function_from_file(
+    :def,
+    :flow_policies,
+    Path.join(@templates_dir, "flow_policies.html.eex"),
+    [
+      :assigns
+    ]
+  )
 
-  EEx.function_from_file(:def, :flow_retention, Path.join(@templates_dir, "flow_retention.html.eex"), [
-    :assigns
-  ])
+  EEx.function_from_file(
+    :def,
+    :flow_retention,
+    Path.join(@templates_dir, "flow_retention.html.eex"),
+    [
+      :assigns
+    ]
+  )
 
   EEx.function_from_file(:def, :flow_detail, Path.join(@templates_dir, "flow_detail.html.eex"), [
     :assigns

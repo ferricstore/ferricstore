@@ -251,7 +251,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
         timeout_ms = flow_dashboard_detail_fetch_timeout_ms()
         opts = flow_dashboard_get_opts(partition_key)
 
-        case bounded_dashboard_call(fn -> flow_dashboard_flow_get(id, opts) end, timeout_ms, :record) do
+        case bounded_dashboard_call(
+               fn -> flow_dashboard_flow_get(id, opts) end,
+               timeout_ms,
+               :record
+             ) do
           {:ok, {:ok, %{} = record}} -> {:ok, record}
           {:ok, {:ok, nil}} -> {:not_found, nil}
           {:ok, {:error, reason}} -> {{:error, reason}, nil}
@@ -267,14 +271,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   end
 
   defp flow_detail_partition_match?(_record, nil), do: true
-  defp flow_detail_partition_match?(record, partition_key), do: flow_record_partition_key(record) == partition_key
+
+  defp flow_detail_partition_match?(record, partition_key),
+    do: flow_record_partition_key(record) == partition_key
 
   defp flow_dashboard_get_opts(nil), do: [payload: false]
   defp flow_dashboard_get_opts(partition_key), do: [payload: false, partition_key: partition_key]
 
   defp flow_detail_history_page_opts(opts) when is_list(opts) do
     before = normalize_flow_history_cursor(Keyword.get(opts, :history_before))
-    after_cursor = if is_nil(before), do: normalize_flow_history_cursor(Keyword.get(opts, :history_after))
+
+    after_cursor =
+      if is_nil(before), do: normalize_flow_history_cursor(Keyword.get(opts, :history_after))
 
     %{
       count: normalize_flow_history_count(Keyword.get(opts, :history_count)),
@@ -301,13 +309,21 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
           ]
 
         _ ->
-          [count: flow_detail_history_fetch_count(page), values: false, consistent_projection: true]
+          [
+            count: flow_detail_history_fetch_count(page),
+            values: false,
+            consistent_projection: true
+          ]
       end
       |> flow_detail_history_cursor_opts(page)
 
     timeout_ms = flow_dashboard_detail_fetch_timeout_ms()
 
-    case bounded_dashboard_call(fn -> flow_dashboard_flow_history(id, opts) end, timeout_ms, :history) do
+    case bounded_dashboard_call(
+           fn -> flow_dashboard_flow_history(id, opts) end,
+           timeout_ms,
+           :history
+         ) do
       {:ok, {:ok, history}} when is_list(history) ->
         {history, page} = flow_detail_history_page(history, page)
         {:ok, history, page}
@@ -330,7 +346,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     :exit, reason -> {{:exit, reason}, [], page}
   end
 
-  defp flow_detail_history_fetch_count(%{before: before, after_cursor: after_cursor, count: count})
+  defp flow_detail_history_fetch_count(%{
+         before: before,
+         after_cursor: after_cursor,
+         count: count
+       })
        when is_binary(before) or is_binary(after_cursor),
        do: count + 2
 
@@ -342,12 +362,14 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     |> Keyword.put(:rev, true)
   end
 
-  defp flow_detail_history_cursor_opts(opts, %{after_cursor: after_cursor}) when is_binary(after_cursor),
-    do: Keyword.put(opts, :from_event, after_cursor)
+  defp flow_detail_history_cursor_opts(opts, %{after_cursor: after_cursor})
+       when is_binary(after_cursor),
+       do: Keyword.put(opts, :from_event, after_cursor)
 
   defp flow_detail_history_cursor_opts(opts, _page), do: opts
 
-  defp flow_detail_history_page(history, %{before: before, count: count} = page) when is_binary(before) do
+  defp flow_detail_history_page(history, %{before: before, count: count} = page)
+       when is_binary(before) do
     older_desc = flow_history_drop_event(history, before)
     has_older = length(older_desc) > count
     page_events = older_desc |> Enum.take(count) |> Enum.reverse()
@@ -430,21 +452,30 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     |> Map.put(:current_live_params, flow_detail_history_current_params(page))
   end
 
-  defp flow_detail_history_older_url(id, partition_key, %{has_older: true, oldest_event_id: oldest, count: count})
+  defp flow_detail_history_older_url(id, partition_key, %{
+         has_older: true,
+         oldest_event_id: oldest,
+         count: count
+       })
        when is_binary(oldest) do
     flow_detail_path(id, partition_key, %{"history_before" => oldest, "history_count" => count})
   end
 
   defp flow_detail_history_older_url(_id, _partition_key, _page), do: nil
 
-  defp flow_detail_history_newer_url(id, partition_key, %{has_newer: true, newest_event_id: newest, count: count})
+  defp flow_detail_history_newer_url(id, partition_key, %{
+         has_newer: true,
+         newest_event_id: newest,
+         count: count
+       })
        when is_binary(newest) do
     flow_detail_path(id, partition_key, %{"history_after" => newest, "history_count" => count})
   end
 
   defp flow_detail_history_newer_url(_id, _partition_key, _page), do: nil
 
-  defp flow_detail_history_current_params(%{before: before, count: count}) when is_binary(before) do
+  defp flow_detail_history_current_params(%{before: before, count: count})
+       when is_binary(before) do
     %{"history_before" => before, "history_count" => count}
   end
 
@@ -453,7 +484,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     %{"history_after" => after_cursor, "history_count" => count}
   end
 
-  defp flow_detail_history_current_params(%{count: @flow_dashboard_history_default_count}), do: %{}
+  defp flow_detail_history_current_params(%{count: @flow_dashboard_history_default_count}),
+    do: %{}
+
   defp flow_detail_history_current_params(%{count: count}), do: %{"history_count" => count}
 
   defp flow_detail_values(nil, _history), do: {:skipped, [], %{}}
@@ -471,7 +504,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     else
       timeout_ms = flow_dashboard_detail_fetch_timeout_ms()
 
-      case bounded_dashboard_call(fn -> flow_dashboard_flow_value_mget(refs) end, timeout_ms, :values) do
+      case bounded_dashboard_call(
+             fn -> flow_dashboard_flow_value_mget(refs) end,
+             timeout_ms,
+             :values
+           ) do
         {:ok, {:ok, values}} when is_list(values) and length(values) == length(refs) ->
           {:ok, value_refs, Map.new(Enum.zip(refs, values))}
 

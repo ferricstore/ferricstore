@@ -2,7 +2,8 @@ defmodule Ferricstore.Commands.Stream.Args do
   @moduledoc false
 
   @spec parse_xadd_args([binary()]) ::
-          {:ok, binary(), :auto | {:explicit, integer(), integer()} | {:partial, integer()}, [
+          {:ok, binary(), :auto | {:explicit, integer(), integer()} | {:partial, integer()},
+           [
              binary()
            ], term(), boolean()}
           | {:error, binary()}
@@ -77,7 +78,8 @@ defmodule Ferricstore.Commands.Stream.Args do
   def parse_count_opt(_), do: {:error, "ERR syntax error"}
 
   @spec parse_xread_args([binary()]) ::
-          {:ok, non_neg_integer() | :infinity, {:block, non_neg_integer()} | :no_block, [
+          {:ok, non_neg_integer() | :infinity, {:block, non_neg_integer()} | :no_block,
+           [
              {binary(), binary()}
            ]}
           | {:error, binary()}

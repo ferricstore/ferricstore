@@ -46,11 +46,17 @@ defmodule FerricstoreServer.Application do
         # listener so it's ready when the first connection process starts.
         pg_child_spec()
       ] ++
-      [ranch_listener_spec(port)] ++
+        [ranch_listener_spec(port)] ++
         tls_listener_children() ++
         [FerricstoreServer.Health.Endpoint.child_spec(health_port)]
 
-    opts = [strategy: :one_for_one, name: FerricstoreServer.Supervisor, max_restarts: 20, max_seconds: 10]
+    opts = [
+      strategy: :one_for_one,
+      name: FerricstoreServer.Supervisor,
+      max_restarts: 20,
+      max_seconds: 10
+    ]
+
     result = Supervisor.start_link(children, opts)
 
     # Inject server-specific callbacks into the default Instance.
@@ -79,11 +85,13 @@ defmodule FerricstoreServer.Application do
     # commands. Connections that are idle will be closed by the supervisor.
     # Connections mid-command get time to complete.
     grace_ms = Application.get_env(:ferricstore, :shutdown_grace_ms, 2_000)
-    active = try do
-      :ranch.procs(FerricstoreServer.Listener, :connections) |> length()
-    catch
-      _, _ -> 0
-    end
+
+    active =
+      try do
+        :ranch.procs(FerricstoreServer.Listener, :connections) |> length()
+      catch
+        _, _ -> 0
+      end
 
     if active > 0 do
       Logger.info("FerricstoreServer: waiting #{grace_ms}ms for #{active} active connections")
@@ -163,14 +171,18 @@ defmodule FerricstoreServer.Application do
   # bind to `port` (0 = ephemeral, useful in tests).
   defp ranch_listener_spec(port) do
     nodelay = Application.get_env(:ferricstore, :tcp_nodelay, true)
-    transport_opts = %{socket_opts: [
-      port: port,
-      nodelay: nodelay,
-      recbuf: Application.get_env(:ferricstore, :tcp_recbuf, 131_072),
-      sndbuf: Application.get_env(:ferricstore, :tcp_sndbuf, 131_072),
-      backlog: 1024,
-      keepalive: true
-    ]}
+
+    transport_opts = %{
+      socket_opts: [
+        port: port,
+        nodelay: nodelay,
+        recbuf: Application.get_env(:ferricstore, :tcp_recbuf, 131_072),
+        sndbuf: Application.get_env(:ferricstore, :tcp_sndbuf, 131_072),
+        backlog: 1024,
+        keepalive: true
+      ]
+    }
+
     protocol_opts = %{}
 
     :ranch.child_spec(

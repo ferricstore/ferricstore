@@ -46,6 +46,7 @@ defmodule Ferricstore.Commands.KeydirFullTest do
     :sys.replace_state(MemoryGuard, fn state ->
       %{state | last_pressure_level: :reject, eviction_policy: :noeviction}
     end)
+
     # Also update persistent_term so the hot-path reads see the change
     MemoryGuard.set_reject_writes(true)
     MemoryGuard.set_keydir_full(true)
@@ -54,8 +55,14 @@ defmodule Ferricstore.Commands.KeydirFullTest do
   # Forces MemoryGuard into ok pressure (no rejection).
   defp force_ok_mode do
     :sys.replace_state(MemoryGuard, fn state ->
-      %{state | last_pressure_level: :ok, keydir_pressure_level: :ok, eviction_policy: :noeviction}
+      %{
+        state
+        | last_pressure_level: :ok,
+          keydir_pressure_level: :ok,
+          eviction_policy: :noeviction
+      }
     end)
+
     MemoryGuard.set_reject_writes(false)
     MemoryGuard.set_keydir_full(false)
   end
@@ -66,6 +73,7 @@ defmodule Ferricstore.Commands.KeydirFullTest do
     :sys.replace_state(MemoryGuard, fn state ->
       %{state | last_pressure_level: :reject, eviction_policy: :volatile_lru}
     end)
+
     # volatile_lru + reject = don't reject writes (eviction handles it)
     MemoryGuard.set_reject_writes(false)
     MemoryGuard.set_keydir_full(false)

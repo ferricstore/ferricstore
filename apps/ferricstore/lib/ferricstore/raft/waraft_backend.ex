@@ -55,7 +55,6 @@ defmodule Ferricstore.Raft.WARaftBackend do
     :demote_to_witness
   ]
 
-
   use Ferricstore.Raft.WARaftBackend.Sections.PublicApi
   use Ferricstore.Raft.WARaftBackend.Sections.CommitPath
   use Ferricstore.Raft.WARaftBackend.Sections.Startup

@@ -10,7 +10,6 @@ defmodule FerricstoreServer.Integration.MultiClientTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-
   defp connect(port) do
     {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw])
     sock

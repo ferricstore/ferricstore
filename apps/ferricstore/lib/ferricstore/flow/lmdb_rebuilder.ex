@@ -358,7 +358,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             end
 
           reverse_key = LMDB.terminal_by_state_key_key(key)
-          metadata_ops = TerminalProjection.query_metadata_index_ops(record, projection_expire_at_ms)
+
+          metadata_ops =
+            TerminalProjection.query_metadata_index_ops(record, projection_expire_at_ms)
+
           active_delete_ops = LMDB.active_index_delete_ops(lmdb_path, key)
 
           {
@@ -786,7 +789,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        ) do
     case :ets.lookup(keydir, state_key) do
       [{^state_key, value, expire_at_ms, _lfu, _fid, _off, _vsize}] when is_binary(value) ->
-        case ColdState.decode_state_record(state_key, value, expire_at_ms, shard_index, instance_ctx) do
+        case ColdState.decode_state_record(
+               state_key,
+               value,
+               expire_at_ms,
+               shard_index,
+               instance_ctx
+             ) do
           [{_key, _value, _expire_at_ms, record}] -> {:ok, record}
           _ -> :error
         end

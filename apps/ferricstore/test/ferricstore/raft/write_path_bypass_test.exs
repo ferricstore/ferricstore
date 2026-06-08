@@ -209,7 +209,13 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
 
     test "returns nil when key does not exist" do
       k = ukey("getex_missing")
-      assert nil == Router.getex(FerricStore.Instance.get(:default), k, System.os_time(:millisecond) + 60_000)
+
+      assert nil ==
+               Router.getex(
+                 FerricStore.Instance.get(:default),
+                 k,
+                 System.os_time(:millisecond) + 60_000
+               )
     end
   end
 
@@ -295,13 +301,20 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
   describe "RATELIMIT via bypass" do
     test "allows within window, rejects over limit" do
       k = ukey("ratelimit")
-      [status1, _count1, _rem1, _ttl1] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, 1_000, 2, 1)
+
+      [status1, _count1, _rem1, _ttl1] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, 1_000, 2, 1)
+
       assert status1 == "allowed"
 
-      [status2, _count2, _rem2, _ttl2] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, 1_000, 2, 1)
+      [status2, _count2, _rem2, _ttl2] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, 1_000, 2, 1)
+
       assert status2 == "allowed"
 
-      [status3, _count3, _rem3, _ttl3] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, 1_000, 2, 1)
+      [status3, _count3, _rem3, _ttl3] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, 1_000, 2, 1)
+
       assert status3 == "denied"
     end
   end
@@ -353,10 +366,11 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
         end
 
       results = Task.await_many(tasks, 30_000)
+
       assert Enum.all?(results, fn
-        {:ok, _} -> true
-        _ -> false
-      end)
+               {:ok, _} -> true
+               _ -> false
+             end)
 
       assert "50" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -489,15 +503,22 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
         for _ <- 1..20 do
           Task.async(fn ->
             val = Router.get(FerricStore.Instance.get(:default), k)
+
             cond do
-              val == nil -> :nil_ok
-              is_integer(val) -> :valid
+              val == nil ->
+                :nil_ok
+
+              is_integer(val) ->
+                :valid
+
               is_binary(val) ->
                 case Integer.parse(val) do
                   {_n, ""} -> :valid
                   _ -> {:invalid, val}
                 end
-              true -> {:invalid, val}
+
+              true ->
+                {:invalid, val}
             end
           end)
         end

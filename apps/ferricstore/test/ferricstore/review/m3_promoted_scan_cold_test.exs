@@ -20,6 +20,7 @@ defmodule Ferricstore.Review.M3PromotedScanColdTest do
 
   setup do
     original = Application.get_env(:ferricstore, :promotion_threshold)
+
     original_pt =
       try do
         :persistent_term.get(:ferricstore_promotion_threshold)
@@ -59,31 +60,66 @@ defmodule Ferricstore.Review.M3PromotedScanColdTest do
       flush: fn -> :ok end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }

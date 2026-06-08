@@ -1,11 +1,10 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
-
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.FlowRecord
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.FlowRecord
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory
-import FerricstoreServer.Health.Dashboard.Render.FlowFilters
+  import FerricstoreServer.Health.Dashboard.Render.FlowFilters
 
-@flow_terminal_states ~w(completed failed cancelled)
+  @flow_terminal_states ~w(completed failed cancelled)
 
   def default_flow_projection_health do
     %{
@@ -129,12 +128,12 @@ import FerricstoreServer.Health.Dashboard.Render.FlowFilters
   defp numeric_metric_value(_value), do: 0
 
   def render_flow_states_table(
-         states,
-         total_sampled,
-         filtered_sampled,
-         sample_limit,
-         filters
-       ) do
+        states,
+        total_sampled,
+        filtered_sampled,
+        sample_limit,
+        filters
+      ) do
     rows =
       case states do
         [] ->
@@ -359,13 +358,13 @@ import FerricstoreServer.Health.Dashboard.Render.FlowFilters
   end
 
   def render_flow_signals_table(
-         signals,
-         total_sampled,
-         filtered_sampled,
-         sample_limit,
-         filters,
-         mode
-       ) do
+        signals,
+        total_sampled,
+        filtered_sampled,
+        sample_limit,
+        filters,
+        mode
+      ) do
     rows =
       case signals do
         [] ->
@@ -446,19 +445,19 @@ import FerricstoreServer.Health.Dashboard.Render.FlowFilters
     do: "Signals"
 
   def flow_signals_table_title(total_sampled, filtered_sampled, sample_limit, filters, :page)
-       when is_integer(total_sampled) and is_integer(filtered_sampled) and
-              is_integer(sample_limit) do
+      when is_integer(total_sampled) and is_integer(filtered_sampled) and
+             is_integer(sample_limit) do
     "Flow Signals <span class=\"badge badge-idle\">#{escape(flow_signals_filter_summary(filters))}</span> <span class=\"badge badge-idle\">sampled #{format_number(filtered_sampled)} / #{format_number(total_sampled)} / #{format_number(sample_limit)}</span>"
   end
 
   def flow_signals_table_title(
-         _total_sampled,
-         _filtered_sampled,
-         _sample_limit,
-         _filters,
-         _mode
-       ),
-       do: "Signals"
+        _total_sampled,
+        _filtered_sampled,
+        _sample_limit,
+        _filters,
+        _mode
+      ),
+      do: "Signals"
 
   def flow_signal_state_move_html(row) do
     from_state = Map.get(row, :from_state, "")
@@ -787,5 +786,4 @@ import FerricstoreServer.Health.Dashboard.Render.FlowFilters
     </table>
     """
   end
-
 end

@@ -1,5 +1,19 @@
 defmodule Ferricstore.Commands.Flow do
-  @moduledoc false
+  @moduledoc """
+  RESP command dispatch boundary for FerricFlow commands.
+
+  The Rust RESP parser builds Flow AST tuples and this module forwards them to
+  the public `FerricStore.flow_*` APIs, normalizing replies into Redis-friendly
+  values. It intentionally stays thin so command parsing, API validation, and
+  Raft apply logic remain separate.
+
+  ## Performance boundary
+
+  Flow write commands can be batched by the connection pipeline before reaching
+  here. Keep this dispatcher mechanical: no behaviours/protocols, no per-command
+  dynamic lookup tables in hot writes, and no response hydration beyond API
+  contracts.
+  """
 
   @spec handle_ast(term(), map()) :: term()
   def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag) and is_binary(msg),

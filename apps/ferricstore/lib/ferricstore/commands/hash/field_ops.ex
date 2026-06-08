@@ -125,14 +125,16 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     end
   end
 
-  @spec getex_parsed(binary(), [binary()], integer(), map()) :: [binary() | nil] | {:error, term()}
+  @spec getex_parsed(binary(), [binary()], integer(), map()) ::
+          [binary() | nil] | {:error, term()}
   def getex_parsed(key, fields, expire_at_ms, store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       getex_fields(fields, key, store, expire_at_ms)
     end
   end
 
-  @spec getex_fields([binary()], binary(), map(), integer()) :: [binary() | nil] | {:error, term()}
+  @spec getex_fields([binary()], binary(), map(), integer()) ::
+          [binary() | nil] | {:error, term()}
   def getex_fields(fields, key, store, expire_at_ms) do
     {unique_fields, compound_keys, metas_by_field} = batch_field_metas(fields, key, store)
     entries = existing_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
@@ -179,7 +181,9 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
     compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
     existing_values = Ops.compound_batch_get(store, key, compound_keys)
-    {added, entries} = put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms)
+
+    {added, entries} =
+      put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms)
 
     case Ops.compound_batch_put(store, key, entries) do
       :ok -> added
@@ -286,7 +290,12 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     collapse_field_values(rest, next_fields_rev, Map.put(values_by_field, field, value))
   end
 
-  defp persistent_field_entries([field | fields], [compound_key | compound_keys], metas_by_field, acc) do
+  defp persistent_field_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         metas_by_field,
+         acc
+       ) do
     next_acc =
       case Map.fetch!(metas_by_field, field) do
         {value, expire_at_ms} when expire_at_ms != 0 -> [{compound_key, value, 0} | acc]
@@ -303,7 +312,13 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     existing_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms, [])
   end
 
-  defp existing_field_entries([field | fields], [compound_key | compound_keys], metas_by_field, expire_at_ms, acc) do
+  defp existing_field_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         metas_by_field,
+         expire_at_ms,
+         acc
+       ) do
     next_acc =
       case Map.fetch!(metas_by_field, field) do
         {value, _old_expire} -> [{compound_key, value, expire_at_ms} | acc]
@@ -320,7 +335,15 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     {added, Enum.reverse(entries)}
   end
 
-  defp put_entries([field | fields], [compound_key | compound_keys], [nil | existing_values], values_by_field, expire_at_ms, added, entries) do
+  defp put_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         [nil | existing_values],
+         values_by_field,
+         expire_at_ms,
+         added,
+         entries
+       ) do
     entry = {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
 
     put_entries(
@@ -334,7 +357,15 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     )
   end
 
-  defp put_entries([field | fields], [compound_key | compound_keys], [_existing | existing_values], values_by_field, expire_at_ms, added, entries) do
+  defp put_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         [_existing | existing_values],
+         values_by_field,
+         expire_at_ms,
+         added,
+         entries
+       ) do
     entry = {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
 
     put_entries(
@@ -348,7 +379,15 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     )
   end
 
-  defp put_entries([field | fields], [compound_key | compound_keys], [], values_by_field, expire_at_ms, added, entries) do
+  defp put_entries(
+         [field | fields],
+         [compound_key | compound_keys],
+         [],
+         values_by_field,
+         expire_at_ms,
+         added,
+         entries
+       ) do
     entry = {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
 
     put_entries(fields, compound_keys, [], values_by_field, expire_at_ms, added, [

@@ -24,7 +24,8 @@ defmodule Ferricstore.Commands.RedisCompatStringsTest do
     test "INCR at integer max boundary" do
       store = MockStore.make()
       # Set to near max 64-bit signed integer
-      max_val = 9_223_372_036_854_775_806  # Long.MAX_VALUE - 1
+      # Long.MAX_VALUE - 1
+      max_val = 9_223_372_036_854_775_806
       store.put.("counter", Integer.to_string(max_val), 0)
 
       result = Strings.handle("INCR", ["counter"], store)

@@ -111,7 +111,8 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
 
     ShardHelpers.eventually(
       fn ->
-        with {:ok, record} <- FerricStore.flow_get(terminal_id, partition_key: partition, full: true) do
+        with {:ok, record} <-
+               FerricStore.flow_get(terminal_id, partition_key: partition, full: true) do
           record.state == "completed" and
             record.payload == :binary.copy("transition:", 128) and
             record.result == :binary.copy("result:", 128)

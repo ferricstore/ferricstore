@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
   @moduledoc false
 
   import FerricstoreServer.Health.Dashboard.Format
+
   def page_head(title, refresh_seconds) do
     page_head(title, refresh_seconds, [])
   end

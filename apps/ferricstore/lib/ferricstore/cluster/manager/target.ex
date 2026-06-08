@@ -33,8 +33,8 @@ defmodule Ferricstore.Cluster.Manager.Target do
   end
 
   def normalize_target_membership_result({:ok, membership}, _target_node)
-       when is_map(membership),
-       do: {:ok, membership}
+      when is_map(membership),
+      do: {:ok, membership}
 
   def normalize_target_membership_result(membership, _target_node) when is_map(membership) do
     if Enum.all?(membership, fn {_shard, status} -> is_boolean(status) end) do
@@ -547,6 +547,5 @@ defmodule Ferricstore.Cluster.Manager.Target do
   catch
     kind, reason ->
       {:error, {:target_index_read_failed, target_node, shard_idx, {kind, reason}}}
-end
-
+  end
 end

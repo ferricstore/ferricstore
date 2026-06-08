@@ -1,4 +1,8 @@
-Code.require_file("promotion_test/sections/promotion_batches_shared_tombstones_after_dedicated_copy.exs", __DIR__)
+Code.require_file(
+  "promotion_test/sections/promotion_batches_shared_tombstones_after_dedicated_copy.exs",
+  __DIR__
+)
+
 Code.require_file("promotion_test/sections/small_hash_stays_in_shared_bitcask.exs", __DIR__)
 Code.require_file("promotion_test/sections/small_set_stays_in_shared_bitcask.exs", __DIR__)
 Code.require_file("promotion_test/sections/small_sorted_set_stays_in_shared_bitcask.exs", __DIR__)

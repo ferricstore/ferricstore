@@ -95,10 +95,13 @@ defmodule Ferricstore.Commands.RedisCompatWrongtypeTest do
       # If this returns {:simple, "hash"}, it documents a known FerricStore
       # incompatibility with Redis.
       case type_result do
-        {:simple, "string"} -> :ok
+        {:simple, "string"} ->
+          :ok
+
         {:simple, "hash"} ->
           # This is a known compatibility gap: SET doesn't clean TypeRegistry
           :ok
+
         other ->
           flunk("Unexpected TYPE result after SET overwrites hash: #{inspect(other)}")
       end
@@ -173,6 +176,7 @@ defmodule Ferricstore.Commands.RedisCompatWrongtypeTest do
       Strings.handle("SET", ["mykey", "hello"], store)
 
       result = List.handle("LPUSH", ["mykey", "a"], store)
+
       assert is_integer(result) or match?({:error, "WRONGTYPE" <> _}, result),
              "LPUSH on string key: #{inspect(result)}"
     end
@@ -182,6 +186,7 @@ defmodule Ferricstore.Commands.RedisCompatWrongtypeTest do
       Strings.handle("SET", ["mykey", "hello"], store)
 
       result = Hash.handle("HSET", ["mykey", "field", "value"], store)
+
       assert is_integer(result) or match?({:error, "WRONGTYPE" <> _}, result),
              "HSET on string key: #{inspect(result)}"
     end
@@ -191,6 +196,7 @@ defmodule Ferricstore.Commands.RedisCompatWrongtypeTest do
       Strings.handle("SET", ["mykey", "hello"], store)
 
       result = Set.handle("SADD", ["mykey", "member"], store)
+
       assert is_integer(result) or match?({:error, "WRONGTYPE" <> _}, result),
              "SADD on string key: #{inspect(result)}"
     end
@@ -200,6 +206,7 @@ defmodule Ferricstore.Commands.RedisCompatWrongtypeTest do
       Strings.handle("SET", ["mykey", "hello"], store)
 
       result = SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
+
       assert is_integer(result) or match?({:error, "WRONGTYPE" <> _}, result),
              "ZADD on string key: #{inspect(result)}"
     end

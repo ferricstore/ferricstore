@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Health.Dashboard.DoctorSupport do
   import FerricstoreServer.Health.Dashboard.QueryParams
 
   alias Ferricstore.Commands.Server, as: ServerCommands
+
   def doctor_command(args) do
     case ServerCommands.handle("FERRICSTORE.DOCTOR", args, doctor_command_store()) do
       %{} = result -> result
@@ -110,7 +111,7 @@ defmodule FerricstoreServer.Health.Dashboard.DoctorSupport do
     do: error
 
   def doctor_job_result_summary(%{"result" => %{"status" => status, "duration_ms" => ms}})
-       when is_binary(status) do
+      when is_binary(status) do
     "#{status}, #{format_duration_ms(ms)}"
   end
 

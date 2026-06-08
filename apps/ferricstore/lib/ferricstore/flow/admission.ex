@@ -51,7 +51,13 @@ defmodule Ferricstore.Flow.Admission do
     ref = ensure_ref()
     :atomics.put(ref, @paused_slot, 1)
     :atomics.put(ref, @retry_after_ms_slot, max(retry_after_ms, 0))
-    :atomics.put(ref, @reason_slot, Map.get(@reason_codes, reason, @reason_codes.operational_pressure))
+
+    :atomics.put(
+      ref,
+      @reason_slot,
+      Map.get(@reason_codes, reason, @reason_codes.operational_pressure)
+    )
+
     :ok
   end
 
@@ -91,7 +97,10 @@ defmodule Ferricstore.Flow.Admission do
   end
 
   @spec overload_error(atom(), non_neg_integer()) :: {:error, binary()}
-  def overload_error(default_reason \\ :operational_pressure, default_retry_after_ms \\ @default_retry_after_ms) do
+  def overload_error(
+        default_reason \\ :operational_pressure,
+        default_retry_after_ms \\ @default_retry_after_ms
+      ) do
     current = status()
     retry_after_ms = positive_int(current.retry_after_ms, default_retry_after_ms)
     reason = if current.reject_new_creates?, do: current.reason, else: default_reason

@@ -79,9 +79,7 @@ defmodule FerricstoreServer.TlsRotationTest do
     csr_path = Path.join(dir, "expired-csr.pem")
 
     with {_, 0} <-
-           System.cmd("openssl", ["genrsa", "-out", key_path, "2048"],
-             stderr_to_stdout: true
-           ),
+           System.cmd("openssl", ["genrsa", "-out", key_path, "2048"], stderr_to_stdout: true),
          {_, 0} <-
            System.cmd(
              "openssl",
@@ -101,12 +99,18 @@ defmodule FerricstoreServer.TlsRotationTest do
       case System.cmd(
              "openssl",
              [
-               "x509", "-req",
-               "-in", csr_path,
-               "-signkey", key_path,
-               "-out", cert_path,
-               "-startdate", two_days_ago,
-               "-enddate", one_day_ago
+               "x509",
+               "-req",
+               "-in",
+               csr_path,
+               "-signkey",
+               key_path,
+               "-out",
+               cert_path,
+               "-startdate",
+               two_days_ago,
+               "-enddate",
+               one_day_ago
              ],
              stderr_to_stdout: true
            ) do

@@ -167,7 +167,9 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 1_000
                )
 
-      assert {:ok, %{id: ^id, state: "queued"}} = EmbeddedFlow.flow_get(id, partition_key: partition)
+      assert {:ok, %{id: ^id, state: "queued"}} =
+               EmbeddedFlow.flow_get(id, partition_key: partition)
+
       assert {:ok, [%{id: ^id}]} = EmbeddedFlow.flow_list(type, partition_key: partition)
 
       assert {:ok, [%{id: ^id}]} =

@@ -22,9 +22,11 @@ defmodule FerricstoreServer.Bench.TcpActiveModeBenchTest do
 
     # Pre-populate keys
     IO.puts("\nPopulating #{@num_keys} keys...")
+
     for i <- 1..@num_keys do
       FerricStore.set("#{prefix}:#{i}", String.duplicate("v", @value_size))
     end
+
     Process.sleep(500)
 
     modes = [true, 100, 200, 300, 500]
@@ -44,9 +46,10 @@ defmodule FerricstoreServer.Bench.TcpActiveModeBenchTest do
     # Header
     header =
       "  #{String.pad_trailing("Mode", 10)}" <>
-      Enum.map_join(conn_counts, "", fn c ->
-        String.pad_leading("#{c}c", 12)
-      end)
+        Enum.map_join(conn_counts, "", fn c ->
+          String.pad_leading("#{c}c", 12)
+        end)
+
     IO.puts(header)
     IO.puts("  #{String.duplicate("-", 10 + length(conn_counts) * 12)}")
 
@@ -82,9 +85,10 @@ defmodule FerricstoreServer.Bench.TcpActiveModeBenchTest do
       # Print row
       row =
         "  #{String.pad_trailing("#{inspect(mode)}", 10)}" <>
-        Enum.map_join(results, "", fn rps ->
-          String.pad_leading("#{div(rps, 1000)}K", 12)
-        end)
+          Enum.map_join(results, "", fn rps ->
+            String.pad_leading("#{div(rps, 1000)}K", 12)
+          end)
+
       IO.puts(row)
 
       Application.put_env(:ferricstore, :socket_active_mode, old_mode)
@@ -99,11 +103,13 @@ defmodule FerricstoreServer.Bench.TcpActiveModeBenchTest do
 
     # Also print per-connection numbers
     IO.puts("\n  Per-connection reads/sec:")
+
     header2 =
       "  #{String.pad_trailing("Mode", 10)}" <>
-      Enum.map_join(conn_counts, "", fn c ->
-        String.pad_leading("#{c}c", 12)
-      end)
+        Enum.map_join(conn_counts, "", fn c ->
+          String.pad_leading("#{c}c", 12)
+        end)
+
     IO.puts(header2)
     IO.puts("  #{String.duplicate("-", 10 + length(conn_counts) * 12)}")
     # Re-run would be needed for per-conn, but we can infer from above
@@ -112,6 +118,7 @@ defmodule FerricstoreServer.Bench.TcpActiveModeBenchTest do
   defp run_bench(port, prefix, num_conn, pipeline, duration_sec) do
     # Start pg group for ACL if not running
     pg_group = FerricstoreServer.Connection.acl_pg_group()
+
     case :pg.start_link(pg_group) do
       {:ok, _} -> :ok
       {:error, {:already_started, _}} -> :ok

@@ -240,8 +240,10 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
 
       assert is_list(result)
       assert length(result) == 3
-      assert Enum.at(result, 0) == 1       # DEL returned 1
-      assert Enum.at(result, 1) == 0       # EXISTS returns 0 (deleted)
+      # DEL returned 1
+      assert Enum.at(result, 0) == 1
+      # EXISTS returns 0 (deleted)
+      assert Enum.at(result, 1) == 0
       assert Enum.at(result, 2) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
@@ -419,30 +421,32 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
       :gen_tcp.close(sock_setup)
 
       # Writer task: SET the key repeatedly
-      writer = Task.async(fn ->
-        sock = connect_and_hello(port)
+      writer =
+        Task.async(fn ->
+          sock = connect_and_hello(port)
 
-        for i <- 1..50 do
-          send_cmd(sock, ["SET", k, "value_#{i}"])
-          recv_response(sock)
-        end
-
-        :gen_tcp.close(sock)
-      end)
-
-      # Reader task: GET the key repeatedly
-      reader = Task.async(fn ->
-        sock = connect_and_hello(port)
-
-        results =
-          for _ <- 1..50 do
-            send_cmd(sock, ["GET", k])
+          for i <- 1..50 do
+            send_cmd(sock, ["SET", k, "value_#{i}"])
             recv_response(sock)
           end
 
-        :gen_tcp.close(sock)
-        results
-      end)
+          :gen_tcp.close(sock)
+        end)
+
+      # Reader task: GET the key repeatedly
+      reader =
+        Task.async(fn ->
+          sock = connect_and_hello(port)
+
+          results =
+            for _ <- 1..50 do
+              send_cmd(sock, ["GET", k])
+              recv_response(sock)
+            end
+
+          :gen_tcp.close(sock)
+          results
+        end)
 
       Task.await(writer, 10_000)
       results = Task.await(reader, 10_000)

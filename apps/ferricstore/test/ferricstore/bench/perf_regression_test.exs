@@ -14,47 +14,57 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   # ---------------------------------------------------------------------------
 
   if Code.ensure_loaded?(FerricstoreServer.Resp.Parser) do
-  test "benchmark: RESP Parser.parse/1 Application.get_env overhead" do
-    # Parser.parse/1 calls Application.get_env on every invocation (line 130).
-    # Parser.parse/2 accepts the max_value_size directly, bypassing the lookup.
-    # This benchmark quantifies the overhead.
+    test "benchmark: RESP Parser.parse/1 Application.get_env overhead" do
+      # Parser.parse/1 calls Application.get_env on every invocation (line 130).
+      # Parser.parse/2 accepts the max_value_size directly, bypassing the lookup.
+      # This benchmark quantifies the overhead.
 
-    data = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
-    max = 1_048_576
-    n = 200_000
+      data = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+      max = 1_048_576
+      n = 200_000
 
-    # Warm up
-    for _ <- 1..1000 do
-      FerricstoreServer.Resp.Parser.parse(data)
-      FerricstoreServer.Resp.Parser.parse(data, max)
+      # Warm up
+      for _ <- 1..1000 do
+        FerricstoreServer.Resp.Parser.parse(data)
+        FerricstoreServer.Resp.Parser.parse(data, max)
+      end
+
+      # Measure parse/1 (calls Application.get_env)
+      {time_with_env, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(data)
+        end)
+
+      # Measure parse/2 (no Application.get_env)
+      {time_without_env, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(data, max)
+        end)
+
+      ops_with = n / (time_with_env / 1_000_000)
+      ops_without = n / (time_without_env / 1_000_000)
+      overhead_pct = (time_with_env - time_without_env) / time_without_env * 100
+
+      IO.puts(
+        "  Parser.parse/1 (Application.get_env): #{round(ops_with)} ops/sec (#{time_with_env}us)"
+      )
+
+      IO.puts(
+        "  Parser.parse/2 (direct):              #{round(ops_without)} ops/sec (#{time_without_env}us)"
+      )
+
+      IO.puts("  Overhead: #{Float.round(overhead_pct, 1)}%")
+
+      # The test passes regardless -- it's measuring, not gating.
+      # But log a finding if overhead > 5%.
+      if overhead_pct > 5.0 do
+        IO.puts(
+          "  ** FINDING: Application.get_env adds #{Float.round(overhead_pct, 1)}% overhead to RESP parsing"
+        )
+      end
+
+      assert true
     end
-
-    # Measure parse/1 (calls Application.get_env)
-    {time_with_env, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(data)
-    end)
-
-    # Measure parse/2 (no Application.get_env)
-    {time_without_env, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(data, max)
-    end)
-
-    ops_with = n / (time_with_env / 1_000_000)
-    ops_without = n / (time_without_env / 1_000_000)
-    overhead_pct = (time_with_env - time_without_env) / time_without_env * 100
-
-    IO.puts("  Parser.parse/1 (Application.get_env): #{round(ops_with)} ops/sec (#{time_with_env}us)")
-    IO.puts("  Parser.parse/2 (direct):              #{round(ops_without)} ops/sec (#{time_without_env}us)")
-    IO.puts("  Overhead: #{Float.round(overhead_pct, 1)}%")
-
-    # The test passes regardless -- it's measuring, not gating.
-    # But log a finding if overhead > 5%.
-    if overhead_pct > 5.0 do
-      IO.puts("  ** FINDING: Application.get_env adds #{Float.round(overhead_pct, 1)}% overhead to RESP parsing")
-    end
-
-    assert true
-  end
   end
 
   # ---------------------------------------------------------------------------
@@ -76,14 +86,16 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     end
 
     # Measure current implementation (string concat)
-    {time_concat, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Store.CompoundKey.hash_field(key, field)
-    end)
+    {time_concat, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n, do: Ferricstore.Store.CompoundKey.hash_field(key, field)
+      end)
 
     # Measure iolist-to-binary approach (potential fix)
-    {time_iolist, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: IO.iodata_to_binary(["H:", key, <<0>>, field])
-    end)
+    {time_iolist, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n, do: IO.iodata_to_binary(["H:", key, <<0>>, field])
+      end)
 
     ops_concat = n / (time_concat / 1_000_000)
     ops_iolist = n / (time_iolist / 1_000_000)
@@ -92,9 +104,10 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     IO.puts("  IOList alternative:  #{round(ops_iolist)} ops/sec (#{time_iolist}us)")
 
     # Also measure the type_key which is simpler: "T:" <> key
-    {time_type_key, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Store.CompoundKey.type_key(key)
-    end)
+    {time_type_key, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n, do: Ferricstore.Store.CompoundKey.type_key(key)
+      end)
 
     IO.puts("  CompoundKey.type_key: #{round(n / (time_type_key / 1_000_000))} ops/sec")
     assert true
@@ -105,42 +118,47 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   # ---------------------------------------------------------------------------
 
   if Code.ensure_loaded?(FerricstoreServer.Resp.Encoder) do
-  test "benchmark: RESP encoding common responses" do
-    n = 500_000
+    test "benchmark: RESP encoding common responses" do
+      n = 500_000
 
-    # Warm up
-    for _ <- 1..1000 do
-      FerricstoreServer.Resp.Encoder.encode(:ok)
-      FerricstoreServer.Resp.Encoder.encode("hello world")
-      FerricstoreServer.Resp.Encoder.encode(["one", "two", "three", "four", "five"])
+      # Warm up
+      for _ <- 1..1000 do
+        FerricstoreServer.Resp.Encoder.encode(:ok)
+        FerricstoreServer.Resp.Encoder.encode("hello world")
+        FerricstoreServer.Resp.Encoder.encode(["one", "two", "three", "four", "five"])
+      end
+
+      # Measure :ok encoding
+      {time_ok, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(:ok)
+        end)
+
+      # Measure bulk string encoding
+      {time_bulk, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode("hello world")
+        end)
+
+      # Measure array encoding (5 elements)
+      {time_array, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n,
+              do: FerricstoreServer.Resp.Encoder.encode(["one", "two", "three", "four", "five"])
+        end)
+
+      # Measure nil encoding
+      {time_nil, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(nil)
+        end)
+
+      IO.puts("  Encode :ok:        #{round(n / (time_ok / 1_000_000))} ops/sec")
+      IO.puts("  Encode bulk str:   #{round(n / (time_bulk / 1_000_000))} ops/sec")
+      IO.puts("  Encode 5-array:    #{round(n / (time_array / 1_000_000))} ops/sec")
+      IO.puts("  Encode nil:        #{round(n / (time_nil / 1_000_000))} ops/sec")
+      assert true
     end
-
-    # Measure :ok encoding
-    {time_ok, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(:ok)
-    end)
-
-    # Measure bulk string encoding
-    {time_bulk, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode("hello world")
-    end)
-
-    # Measure array encoding (5 elements)
-    {time_array, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(["one", "two", "three", "four", "five"])
-    end)
-
-    # Measure nil encoding
-    {time_nil, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(nil)
-    end)
-
-    IO.puts("  Encode :ok:        #{round(n / (time_ok / 1_000_000))} ops/sec")
-    IO.puts("  Encode bulk str:   #{round(n / (time_bulk / 1_000_000))} ops/sec")
-    IO.puts("  Encode 5-array:    #{round(n / (time_array / 1_000_000))} ops/sec")
-    IO.puts("  Encode nil:        #{round(n / (time_nil / 1_000_000))} ops/sec")
-    assert true
-  end
   end
 
   # ---------------------------------------------------------------------------
@@ -166,32 +184,47 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     end
 
     # Measure shard_for (crc32 + slot map lookup)
-    {time_shard_for, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
-    end)
+    {time_shard_for, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n,
+            do: Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
+      end)
 
     # Measure shard_name (atom interpolation)
-    {time_shard_name, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
-    end)
+    {time_shard_name, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n,
+            do: Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
+      end)
 
     # Measure the combined routing path
-    {time_combined, _} = :timer.tc(fn ->
-      for _ <- 1..n do
-        idx = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
-        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), idx)
-      end
-    end)
+    {time_combined, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n do
+          idx = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
+          Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), idx)
+        end
+      end)
 
     # Measure raw crc32 for baseline
-    {time_crc32, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: :erlang.crc32(key) |> Bitwise.band(1023)
-    end)
+    {time_crc32, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n, do: :erlang.crc32(key) |> Bitwise.band(1023)
+      end)
 
     IO.puts("  Raw crc32:      #{round(n / (time_crc32 / 1_000_000))} ops/sec (#{time_crc32}us)")
-    IO.puts("  shard_for:      #{round(n / (time_shard_for / 1_000_000))} ops/sec (#{time_shard_for}us)")
-    IO.puts("  shard_name:     #{round(n / (time_shard_name / 1_000_000))} ops/sec (#{time_shard_name}us)")
-    IO.puts("  Combined:       #{round(n / (time_combined / 1_000_000))} ops/sec (#{time_combined}us)")
+
+    IO.puts(
+      "  shard_for:      #{round(n / (time_shard_for / 1_000_000))} ops/sec (#{time_shard_for}us)"
+    )
+
+    IO.puts(
+      "  shard_name:     #{round(n / (time_shard_name / 1_000_000))} ops/sec (#{time_shard_name}us)"
+    )
+
+    IO.puts(
+      "  Combined:       #{round(n / (time_combined / 1_000_000))} ops/sec (#{time_combined}us)"
+    )
 
     # shard_name creates an atom every call via string interpolation.
     # If a cached tuple approach is faster, we'll see it here.
@@ -216,20 +249,24 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     end
 
     # Measure Stats.incr_commands (persistent_term.get + counters.add)
-    {time_incr, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Stats.incr_commands()
-    end)
+    {time_incr, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n, do: Ferricstore.Stats.incr_commands()
+      end)
 
     # Measure raw counters.add with pre-fetched ref (no persistent_term indirection)
     ref = :persistent_term.get(:ferricstore_stats_counter_ref)
-    {time_raw, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: :counters.add(ref, 2, 1)
-    end)
+
+    {time_raw, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n, do: :counters.add(ref, 2, 1)
+      end)
 
     # Measure persistent_term.get alone (atom key)
-    {time_pt, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: :persistent_term.get(:ferricstore_stats_counter_ref)
-    end)
+    {time_pt, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n, do: :persistent_term.get(:ferricstore_stats_counter_ref)
+      end)
 
     ops_incr = n / (time_incr / 1_000_000)
     ops_raw = n / (time_raw / 1_000_000)
@@ -256,9 +293,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     n = 1_000_000
 
     # Build a pre-computed tuple for comparison
-    shard_names = List.to_tuple(
-      for i <- 0..15, do: :"Ferricstore.Store.Shard.#{i}"
-    )
+    shard_names = List.to_tuple(for i <- 0..15, do: :"Ferricstore.Store.Shard.#{i}")
 
     # Warm up
     for _ <- 1..1000 do
@@ -267,24 +302,26 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     end
 
     # Measure current implementation (string interpolation -> atom)
-    {time_interp, _} = :timer.tc(fn ->
-      for _ <- 1..n do
-        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
-        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 1)
-        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 2)
-        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 3)
-      end
-    end)
+    {time_interp, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n do
+          Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
+          Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 1)
+          Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 2)
+          Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 3)
+        end
+      end)
 
     # Measure tuple lookup (pre-computed atoms)
-    {time_tuple, _} = :timer.tc(fn ->
-      for _ <- 1..n do
-        _ = elem(shard_names, 0)
-        _ = elem(shard_names, 1)
-        _ = elem(shard_names, 2)
-        _ = elem(shard_names, 3)
-      end
-    end)
+    {time_tuple, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n do
+          _ = elem(shard_names, 0)
+          _ = elem(shard_names, 1)
+          _ = elem(shard_names, 2)
+          _ = elem(shard_names, 3)
+        end
+      end)
 
     ops_interp = n * 4 / (time_interp / 1_000_000)
     ops_tuple = n * 4 / (time_tuple / 1_000_000)
@@ -323,14 +360,15 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     end
 
     # Measure direct ETS lookup (what exists_fast? does)
-    {time_ets, _} = :timer.tc(fn ->
-      for _ <- 1..n do
-        case :ets.lookup(table, key) do
-          [{^key, _val, 0, _lfu, _fid, _off, _vsize}] -> true
-          _ -> false
+    {time_ets, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n do
+          case :ets.lookup(table, key) do
+            [{^key, _val, 0, _lfu, _fid, _off, _vsize}] -> true
+            _ -> false
+          end
         end
-      end
-    end)
+      end)
 
     ops_ets = n / (time_ets / 1_000_000)
     IO.puts("  ETS direct lookup: #{round(ops_ets)} ops/sec (#{time_ets}us)")
@@ -345,45 +383,49 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   # ---------------------------------------------------------------------------
 
   if Code.ensure_loaded?(FerricstoreServer.Resp.Parser) do
-  test "benchmark: RESP parse throughput for common commands" do
-    n = 200_000
+    test "benchmark: RESP parse throughput for common commands" do
+      n = 200_000
 
-    set_cmd = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
-    get_cmd = "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"
-    pipeline = String.duplicate(get_cmd, 10)
-    inline_cmd = "PING\r\n"
+      set_cmd = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+      get_cmd = "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"
+      pipeline = String.duplicate(get_cmd, 10)
+      inline_cmd = "PING\r\n"
 
-    max = 1_048_576
+      max = 1_048_576
 
-    # Warm up
-    for _ <- 1..1000 do
-      FerricstoreServer.Resp.Parser.parse(set_cmd, max)
-      FerricstoreServer.Resp.Parser.parse(get_cmd, max)
-      FerricstoreServer.Resp.Parser.parse(pipeline, max)
+      # Warm up
+      for _ <- 1..1000 do
+        FerricstoreServer.Resp.Parser.parse(set_cmd, max)
+        FerricstoreServer.Resp.Parser.parse(get_cmd, max)
+        FerricstoreServer.Resp.Parser.parse(pipeline, max)
+      end
+
+      {time_set, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(set_cmd, max)
+        end)
+
+      {time_get, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(get_cmd, max)
+        end)
+
+      {time_pipeline, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(pipeline, max)
+        end)
+
+      {time_inline, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(inline_cmd, max)
+        end)
+
+      IO.puts("  Parse SET cmd:     #{round(n / (time_set / 1_000_000))} ops/sec")
+      IO.puts("  Parse GET cmd:     #{round(n / (time_get / 1_000_000))} ops/sec")
+      IO.puts("  Parse 10-cmd pipe: #{round(n / (time_pipeline / 1_000_000))} ops/sec")
+      IO.puts("  Parse PING inline: #{round(n / (time_inline / 1_000_000))} ops/sec")
+      assert true
     end
-
-    {time_set, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(set_cmd, max)
-    end)
-
-    {time_get, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(get_cmd, max)
-    end)
-
-    {time_pipeline, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(pipeline, max)
-    end)
-
-    {time_inline, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(inline_cmd, max)
-    end)
-
-    IO.puts("  Parse SET cmd:     #{round(n / (time_set / 1_000_000))} ops/sec")
-    IO.puts("  Parse GET cmd:     #{round(n / (time_get / 1_000_000))} ops/sec")
-    IO.puts("  Parse 10-cmd pipe: #{round(n / (time_pipeline / 1_000_000))} ops/sec")
-    IO.puts("  Parse PING inline: #{round(n / (time_inline / 1_000_000))} ops/sec")
-    assert true
-  end
   end
 
   # ---------------------------------------------------------------------------
@@ -391,36 +433,39 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   # ---------------------------------------------------------------------------
 
   if Code.ensure_loaded?(FerricstoreServer.Resp.Encoder) do
-  test "benchmark: Encoder list encoding with varying sizes" do
-    n = 200_000
+    test "benchmark: Encoder list encoding with varying sizes" do
+      n = 200_000
 
-    list_1 = ["hello"]
-    list_5 = Enum.map(1..5, &"item_#{&1}")
-    list_20 = Enum.map(1..20, &"item_#{&1}")
+      list_1 = ["hello"]
+      list_5 = Enum.map(1..5, &"item_#{&1}")
+      list_20 = Enum.map(1..20, &"item_#{&1}")
 
-    # Warm up
-    for _ <- 1..1000 do
-      FerricstoreServer.Resp.Encoder.encode(list_1)
-      FerricstoreServer.Resp.Encoder.encode(list_5)
-      FerricstoreServer.Resp.Encoder.encode(list_20)
+      # Warm up
+      for _ <- 1..1000 do
+        FerricstoreServer.Resp.Encoder.encode(list_1)
+        FerricstoreServer.Resp.Encoder.encode(list_5)
+        FerricstoreServer.Resp.Encoder.encode(list_20)
+      end
+
+      {time_1, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(list_1)
+        end)
+
+      {time_5, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(list_5)
+        end)
+
+      {time_20, _} =
+        :timer.tc(fn ->
+          for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(list_20)
+        end)
+
+      IO.puts("  Encode 1-element list:  #{round(n / (time_1 / 1_000_000))} ops/sec")
+      IO.puts("  Encode 5-element list:  #{round(n / (time_5 / 1_000_000))} ops/sec")
+      IO.puts("  Encode 20-element list: #{round(n / (time_20 / 1_000_000))} ops/sec")
+      assert true
     end
-
-    {time_1, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(list_1)
-    end)
-
-    {time_5, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(list_5)
-    end)
-
-    {time_20, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(list_20)
-    end)
-
-    IO.puts("  Encode 1-element list:  #{round(n / (time_1 / 1_000_000))} ops/sec")
-    IO.puts("  Encode 5-element list:  #{round(n / (time_5 / 1_000_000))} ops/sec")
-    IO.puts("  Encode 20-element list: #{round(n / (time_20 / 1_000_000))} ops/sec")
-    assert true
-  end
   end
 end

@@ -180,7 +180,8 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
     end
   end
 
-  defp parse_zadd_opts(score_member_args, opts), do: parse_zadd_score_members(score_member_args, opts)
+  defp parse_zadd_opts(score_member_args, opts),
+    do: parse_zadd_score_members(score_member_args, opts)
 
   defp parse_zadd_score_members(score_member_args, opts) do
     cond do

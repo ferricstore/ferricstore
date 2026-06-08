@@ -68,6 +68,7 @@ defmodule Ferricstore.Store.WriteVersion do
   def get(shard_index) do
     ref = :persistent_term.get(@pt_key)
     size = :counters.info(ref).size
+
     if shard_index < size do
       :counters.get(ref, shard_index + 1)
     else
@@ -80,6 +81,7 @@ defmodule Ferricstore.Store.WriteVersion do
   def get(ctx, shard_index) do
     ref = ctx.write_version
     size = :counters.info(ref).size
+
     if shard_index < size do
       :counters.get(ref, shard_index + 1)
     else

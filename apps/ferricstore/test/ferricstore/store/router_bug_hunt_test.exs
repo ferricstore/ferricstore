@@ -36,6 +36,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   # and ensure shards are alive after tests that kill them.
   setup do
     ShardHelpers.flush_all_keys()
+
     on_exit(fn ->
       ShardHelpers.flush_all_keys()
       ShardHelpers.wait_shards_alive()
@@ -98,7 +99,9 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   describe "put/get routes to correct shard" do
     test "put with a key mapping to shard 0, then get returns the value" do
       key = key_for_shard(0, "shard0")
-      assert Router.shard_for(FerricStore.Instance.get(:default), key) == 0, "Precondition: key must hash to shard 0"
+
+      assert Router.shard_for(FerricStore.Instance.get(:default), key) == 0,
+             "Precondition: key must hash to shard 0"
 
       assert :ok = Router.put(FerricStore.Instance.get(:default), key, "hello_shard0")
       assert "hello_shard0" == Router.get(FerricStore.Instance.get(:default), key)
@@ -145,8 +148,10 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       ShardHelpers.wait_shards_alive()
 
       # After restart, Bitcask replays the log and the value should be recoverable.
-      ShardHelpers.eventually(fn -> value == Router.get(FerricStore.Instance.get(:default), key) end,
-        "Value should survive shard crash and restart (recovered from Bitcask)")
+      ShardHelpers.eventually(
+        fn -> value == Router.get(FerricStore.Instance.get(:default), key) end,
+        "Value should survive shard crash and restart (recovered from Bitcask)"
+      )
     end
 
     test "multiple keys on same shard survive crash" do
@@ -163,8 +168,10 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       ShardHelpers.wait_shards_alive()
 
       for {k, v} <- keys do
-        ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == v end,
-          "Key #{k} should survive crash recovery")
+        ShardHelpers.eventually(
+          fn -> Router.get(FerricStore.Instance.get(:default), k) == v end,
+          "Key #{k} should survive crash recovery"
+        )
       end
     end
   end
@@ -175,7 +182,11 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
   describe "get on non-existent key" do
     test "returns nil for a key that was never set" do
-      assert nil == Router.get(FerricStore.Instance.get(:default), "rbh_nonexistent_key_that_does_not_exist")
+      assert nil ==
+               Router.get(
+                 FerricStore.Instance.get(:default),
+                 "rbh_nonexistent_key_that_does_not_exist"
+               )
     end
 
     test "returns nil for a random unique key" do
@@ -471,7 +482,9 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("conc_rw")
       Router.put(FerricStore.Instance.get(:default), key, "initial")
 
-      pids_before = for i <- 0..3, do: {i, Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))}
+      pids_before =
+        for i <- 0..3,
+            do: {i, Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))}
 
       tasks =
         for i <- 1..20 do

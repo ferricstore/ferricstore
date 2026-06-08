@@ -134,27 +134,33 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
   # ===========================================================================
 
   describe "SET/GET interleaving" do
-    test "two clients SET same key — final value is one of the two, never corrupted", %{port: port} do
+    test "two clients SET same key — final value is one of the two, never corrupted", %{
+      port: port
+    } do
       key = ukey("setget_race")
       iterations = 200
 
       task_a =
         Task.async(fn ->
           s = connect_and_hello(port)
+
           for _ <- 1..iterations do
             send_cmd(s, ["SET", key, "AAAA"])
             recv_response(s)
           end
+
           :gen_tcp.close(s)
         end)
 
       task_b =
         Task.async(fn ->
           s = connect_and_hello(port)
+
           for _ <- 1..iterations do
             send_cmd(s, ["SET", key, "BBBB"])
             recv_response(s)
           end
+
           :gen_tcp.close(s)
         end)
 
@@ -211,16 +217,22 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
 
       # Everything remaining in the list + everything popped = total.
       # Under full-suite load, Raft apply may lag — retry until consistent.
-      ShardHelpers.eventually(fn ->
-        verify = connect_and_hello(port)
-        send_cmd(verify, ["LLEN", key])
-        remaining = recv_response(verify)
-        :gen_tcp.close(verify)
+      ShardHelpers.eventually(
+        fn ->
+          verify = connect_and_hello(port)
+          send_cmd(verify, ["LLEN", key])
+          remaining = recv_response(verify)
+          :gen_tcp.close(verify)
 
-        remaining_count = if is_integer(remaining), do: remaining, else: 0
-        assert length(popped) + remaining_count == total,
-               "popped=#{length(popped)} + remaining=#{remaining_count} != #{total}"
-      end, "list items should sum to total", 10, 200)
+          remaining_count = if is_integer(remaining), do: remaining, else: 0
+
+          assert length(popped) + remaining_count == total,
+                 "popped=#{length(popped)} + remaining=#{remaining_count} != #{total}"
+        end,
+        "list items should sum to total",
+        10,
+        200
+      )
 
       # No duplicates among popped items
       assert length(popped) == length(Enum.uniq(popped))
@@ -519,6 +531,7 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
       for client_id <- 1..10, f <- 1..fields_per_client do
         field = "c#{client_id}_f#{f}"
         expected = "v#{client_id}_#{f}"
+
         assert Map.get(field_map, field) == expected,
                "Missing or wrong value for field #{field}: #{inspect(Map.get(field_map, field))}"
       end
@@ -539,10 +552,12 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
 
       # Seed keys
       seed = connect_and_hello(port)
+
       for k <- keys do
         send_cmd(seed, ["SET", k, "0"])
         assert recv_response(seed) == ok()
       end
+
       :gen_tcp.close(seed)
 
       # Client A: 100-command pipeline (INCR on all keys, repeated)
@@ -610,16 +625,20 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
   # ===========================================================================
 
   describe "cross-shard MULTI concurrent" do
-    test "5 clients execute cross-shard MULTI/EXEC on overlapping keys — no crashes", %{port: port} do
+    test "5 clients execute cross-shard MULTI/EXEC on overlapping keys — no crashes", %{
+      port: port
+    } do
       # Get keys on different shards
       cross_keys = ShardHelpers.keys_on_different_shards(min(4, shard_count()))
 
       # Seed all keys
       seed = connect_and_hello(port)
+
       for k <- cross_keys do
         send_cmd(seed, ["SET", k, "0"])
         assert recv_response(seed) == ok()
       end
+
       :gen_tcp.close(seed)
 
       tasks =
@@ -680,7 +699,9 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
 
   defp wait_for_barrier(barrier, target) do
     case Agent.get(barrier, & &1) do
-      n when n >= target -> :ok
+      n when n >= target ->
+        :ok
+
       _ ->
         Process.sleep(1)
         wait_for_barrier(barrier, target)
@@ -688,6 +709,9 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
   end
 
   defp shard_count do
-    :persistent_term.get(:ferricstore_shard_count, Application.get_env(:ferricstore, :shard_count, 4))
+    :persistent_term.get(
+      :ferricstore_shard_count,
+      Application.get_env(:ferricstore, :shard_count, 4)
+    )
   end
 end

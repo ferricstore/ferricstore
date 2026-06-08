@@ -101,7 +101,7 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
   end
 
   def format_timestamp_ms_or_dash(timestamp_ms)
-       when is_integer(timestamp_ms) and timestamp_ms > 0 do
+      when is_integer(timestamp_ms) and timestamp_ms > 0 do
     format_timestamp_ms(timestamp_ms)
   rescue
     _ -> "-"
@@ -110,7 +110,7 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
   def format_timestamp_ms_or_dash(_timestamp_ms), do: "-"
 
   def format_timeline_timestamp_ms(timestamp_ms)
-       when is_integer(timestamp_ms) and timestamp_ms > 0 do
+      when is_integer(timestamp_ms) and timestamp_ms > 0 do
     timestamp_ms
     |> DateTime.from_unix!(:millisecond)
     |> Calendar.strftime("%H:%M:%S")

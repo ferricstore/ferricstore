@@ -94,8 +94,7 @@ defmodule Ferricstore.Merge.Semaphore do
   def handle_call({:acquire, shard_index}, {caller_pid, _tag}, %{holder: nil} = state) do
     ref = Process.monitor(caller_pid)
 
-    {:reply, :ok,
-     %{state | holder: {shard_index, caller_pid}, monitor_ref: ref}}
+    {:reply, :ok, %{state | holder: {shard_index, caller_pid}, monitor_ref: ref}}
   end
 
   def handle_call({:acquire, _shard_index}, _from, %{holder: {held_shard, _pid}} = state) do
@@ -121,9 +120,7 @@ defmodule Ferricstore.Merge.Semaphore do
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do
-    Logger.warning(
-      "Merge semaphore: holder process crashed, auto-releasing semaphore"
-    )
+    Logger.warning("Merge semaphore: holder process crashed, auto-releasing semaphore")
 
     {:noreply, %{state | holder: nil, monitor_ref: nil}}
   end

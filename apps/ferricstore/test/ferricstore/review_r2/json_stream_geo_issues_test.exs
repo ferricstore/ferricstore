@@ -89,9 +89,15 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
                  "GEOADD",
                  [
                    key,
-                   to_string(point_a_lng), to_string(point_a_lat), "A",
-                   to_string(point_b_lng), to_string(point_b_lat), "B",
-                   to_string(point_c_lng), to_string(point_c_lat), "C"
+                   to_string(point_a_lng),
+                   to_string(point_a_lat),
+                   "A",
+                   to_string(point_b_lng),
+                   to_string(point_b_lat),
+                   "B",
+                   to_string(point_c_lng),
+                   to_string(point_c_lat),
+                   "C"
                  ],
                  store
                )
@@ -111,8 +117,13 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
           "GEOSEARCH",
           [
             key,
-            "FROMLONLAT", to_string(center_lng), to_string(center_lat),
-            "BYBOX", "60", "1200", "KM",
+            "FROMLONLAT",
+            to_string(center_lng),
+            to_string(center_lat),
+            "BYBOX",
+            "60",
+            "1200",
+            "KM",
             "ASC"
           ],
           store
@@ -164,8 +175,13 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
           "GEOSEARCH",
           [
             key,
-            "FROMLONLAT", to_string(center_lng), to_string(center_lat),
-            "BYBOX", "50", "50", "KM",
+            "FROMLONLAT",
+            to_string(center_lng),
+            to_string(center_lat),
+            "BYBOX",
+            "50",
+            "50",
+            "KM",
             "ASC"
           ],
           store
@@ -443,6 +459,7 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
 
       # BLOCK is silently ignored, COUNT works, data returned immediately
       assert is_list(result)
+
       assert length(result) == 1,
              "R2-M4 BUG: BLOCK is silently ignored alongside COUNT. " <>
                "Got: #{inspect(result)}"

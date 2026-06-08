@@ -1,5 +1,6 @@
 Code.require_file("advanced_types_tcp_test/sections/geoadd_over_tcp.exs", __DIR__)
 Code.require_file("advanced_types_tcp_test/sections/json_type_over_tcp.exs", __DIR__)
+
 defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   @moduledoc """
   End-to-end TCP integration tests for GEO, HYPERLOGLOG, STREAM, and JSON commands.
@@ -121,49 +122,15 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   # GEO commands
   # ===========================================================================
 
-
-
-
-
-
-
   # ===========================================================================
   # HYPERLOGLOG commands
   # ===========================================================================
-
-
-
-
 
   # ===========================================================================
   # STREAM commands
   # ===========================================================================
 
-
-
-
-
-
-
-
-
-
-
-
   # ===========================================================================
   # JSON commands
   # ===========================================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
 end

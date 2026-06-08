@@ -240,8 +240,9 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       # EXEC should return nil (transaction aborted)
       send_cmd(sock1, ["EXEC"])
       result = recv_response(sock1)
+
       assert result == nil,
-        "EXEC should return nil when watched key is modified by another connection, got: #{inspect(result)}"
+             "EXEC should return nil when watched key is modified by another connection, got: #{inspect(result)}"
 
       # Verify value is from the other connection, not the transaction
       send_cmd(sock1, ["GET", k])
@@ -250,7 +251,9 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       :gen_tcp.close(sock1)
     end
 
-    test "modification of different key on same shard aborts due to shard-level versioning", %{port: port} do
+    test "modification of different key on same shard aborts due to shard-level versioning", %{
+      port: port
+    } do
       # NOTE: FerricStore uses shard-level write_version for WATCH, not
       # per-key versioning like Redis. Any write to the same shard (even to
       # a different key) increments the version and causes EXEC to abort.
@@ -454,8 +457,10 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       assert length(result) == 3
 
       # APPEND returns new length
-      assert Enum.at(result, 0) == 6   # "hello " = 6 bytes
-      assert Enum.at(result, 1) == 11  # "hello world" = 11 bytes
+      # "hello " = 6 bytes
+      assert Enum.at(result, 0) == 6
+      # "hello world" = 11 bytes
+      assert Enum.at(result, 1) == 11
       assert Enum.at(result, 2) == "hello world"
 
       :gen_tcp.close(sock)
@@ -495,11 +500,16 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       assert is_list(result)
       assert length(result) == 5
 
-      assert Enum.at(result, 0) == 6       # INCR 5 -> 6
-      assert Enum.at(result, 1) == 6       # APPEND "foobar" = 6 bytes
-      assert Enum.at(result, 2) == 7       # INCR 6 -> 7
-      assert Enum.at(result, 3) == "7"     # GET k_num (string after INCR)
-      assert Enum.at(result, 4) == "foobar" # GET k_str
+      # INCR 5 -> 6
+      assert Enum.at(result, 0) == 6
+      # APPEND "foobar" = 6 bytes
+      assert Enum.at(result, 1) == 6
+      # INCR 6 -> 7
+      assert Enum.at(result, 2) == 7
+      # GET k_num (string after INCR)
+      assert Enum.at(result, 3) == "7"
+      # GET k_str
+      assert Enum.at(result, 4) == "foobar"
 
       :gen_tcp.close(sock)
     end

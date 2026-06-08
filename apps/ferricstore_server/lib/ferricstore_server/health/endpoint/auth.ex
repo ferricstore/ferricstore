@@ -35,7 +35,10 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
   end
 
   @spec authorize_command_request(term(), map(), RouteRequirements.requirement(), :html | :json) ::
-          :ok | {:unauthorized, binary()} | {:redirect_login, binary()} | {:forbidden, term(), binary()}
+          :ok
+          | {:unauthorized, binary()}
+          | {:redirect_login, binary()}
+          | {:forbidden, term(), binary()}
   def authorize_command_request(peer, headers, requirement, response_kind) do
     case dashboard_identity(peer, headers) do
       {:ok, :open} -> :ok

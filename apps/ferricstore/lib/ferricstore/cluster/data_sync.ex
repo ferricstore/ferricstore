@@ -99,7 +99,6 @@ defmodule Ferricstore.Cluster.DataSync do
 
       case waraft_log_first_index(leader_node, shard_index) do
         first_index when is_integer(first_index) ->
-
           if target_index >= first_index do
             blob_status = leader_blob_files?(shard_index, leader_node)
             result = maybe_require_blob_resync(:wal_bridgeable, blob_status)

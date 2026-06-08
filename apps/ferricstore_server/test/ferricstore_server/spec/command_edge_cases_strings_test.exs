@@ -106,11 +106,13 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesStringsTest do
 
   defp ukey(base), do: "{edgetest}:#{base}_#{:rand.uniform(9_999_999)}"
 
-  defp assert_ok(result), do: assert result == {:simple, "OK"} or result == :ok
+  defp assert_ok(result), do: assert(result == {:simple, "OK"} or result == :ok)
 
   defp assert_error_contains(result, substring) do
     assert {:error, msg} = result
-    assert String.contains?(msg, substring), "Expected error containing #{inspect(substring)}, got: #{inspect(msg)}"
+
+    assert String.contains?(msg, substring),
+           "Expected error containing #{inspect(substring)}, got: #{inspect(msg)}"
   end
 
   # ===========================================================================

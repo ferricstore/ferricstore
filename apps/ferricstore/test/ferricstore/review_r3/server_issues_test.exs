@@ -30,38 +30,40 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       #   T:myhash  (type metadata)
       #   H:myhash\0f1, H:myhash\0f2, H:myhash\0f3, H:myhash\0f4, H:myhash\0f5
       # That's 6 ETS entries for 1 logical key.
-      :ok = FerricStore.hset("r3h3_hash", %{
-        "f1" => "v1",
-        "f2" => "v2",
-        "f3" => "v3",
-        "f4" => "v4",
-        "f5" => "v5"
-      })
+      :ok =
+        FerricStore.hset("r3h3_hash", %{
+          "f1" => "v1",
+          "f2" => "v2",
+          "f3" => "v3",
+          "f4" => "v4",
+          "f5" => "v5"
+        })
 
       {:ok, db_size} = FerricStore.dbsize()
 
       assert db_size == 1,
-        "DBSIZE should return 1 for a single hash key, got #{db_size} — " <>
-        "compound keys (H:, T:) are being counted"
+             "DBSIZE should return 1 for a single hash key, got #{db_size} — " <>
+               "compound keys (H:, T:) are being counted"
     end
 
     test "KEYS * returns 1 for a single hash with 5 fields" do
-      :ok = FerricStore.hset("r3h3_keys_hash", %{
-        "f1" => "v1",
-        "f2" => "v2",
-        "f3" => "v3",
-        "f4" => "v4",
-        "f5" => "v5"
-      })
+      :ok =
+        FerricStore.hset("r3h3_keys_hash", %{
+          "f1" => "v1",
+          "f2" => "v2",
+          "f3" => "v3",
+          "f4" => "v4",
+          "f5" => "v5"
+        })
 
       {:ok, all_keys} = FerricStore.keys()
 
       assert length(all_keys) == 1,
-        "KEYS * should return 1 key, got #{length(all_keys)} — " <>
-        "compound keys are leaking through: #{inspect(all_keys)}"
+             "KEYS * should return 1 key, got #{length(all_keys)} — " <>
+               "compound keys are leaking through: #{inspect(all_keys)}"
 
       assert all_keys == ["r3h3_keys_hash"],
-        "KEYS * should return the logical key name, got: #{inspect(all_keys)}"
+             "KEYS * should return the logical key name, got: #{inspect(all_keys)}"
     end
 
     test "DBSIZE counts mixed types correctly" do
@@ -73,7 +75,7 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       {:ok, db_size} = FerricStore.dbsize()
 
       assert db_size == 3,
-        "DBSIZE should return 3 for 1 string + 1 hash + 1 set, got #{db_size}"
+             "DBSIZE should return 3 for 1 string + 1 hash + 1 set, got #{db_size}"
     end
   end
 
@@ -87,10 +89,11 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       # compound keys (H:key\0field, T:key). If RANDOMKEY doesn't filter,
       # it will eventually return one of these.
       for i <- 1..5 do
-        :ok = FerricStore.hset("r3h4_hash_#{i}", %{
-          "field_a" => "val_a",
-          "field_b" => "val_b"
-        })
+        :ok =
+          FerricStore.hset("r3h4_hash_#{i}", %{
+            "field_a" => "val_a",
+            "field_b" => "val_b"
+          })
       end
 
       # Sample RANDOMKEY many times. With 5 hashes × (1 T: + 2 H:) = 15
@@ -115,16 +118,17 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
         end
 
       assert leaked_keys == [],
-        "RANDOMKEY returned #{length(leaked_keys)} internal compound key(s): " <>
-        "#{inspect(Enum.take(leaked_keys, 3))}"
+             "RANDOMKEY returned #{length(leaked_keys)} internal compound key(s): " <>
+               "#{inspect(Enum.take(leaked_keys, 3))}"
     end
 
     test "RANDOMKEY returns one of the logical hash key names" do
-      keys_created = for i <- 1..5 do
-        key = "r3h4_only_#{i}"
-        :ok = FerricStore.hset(key, %{"f" => "v"})
-        key
-      end
+      keys_created =
+        for i <- 1..5 do
+          key = "r3h4_only_#{i}"
+          :ok = FerricStore.hset(key, %{"f" => "v"})
+          key
+        end
 
       results =
         for _ <- 1..50 do
@@ -137,8 +141,8 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       # Every returned key must be one of the logical keys we created
       Enum.each(results, fn key ->
         assert key in keys_created,
-          "RANDOMKEY returned '#{key}' which is not a user-visible key. " <>
-          "Expected one of: #{inspect(keys_created)}"
+               "RANDOMKEY returned '#{key}' which is not a user-visible key. " <>
+                 "Expected one of: #{inspect(keys_created)}"
       end)
     end
   end
@@ -156,7 +160,7 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
 
       # Expected logical keys
       expected =
-        (for i <- 1..10, do: "r3h5_str_#{i}") ++ ["r3h5_hash", "r3h5_set"]
+        (for(i <- 1..10, do: "r3h5_str_#{i}") ++ ["r3h5_hash", "r3h5_set"])
         |> Enum.sort()
 
       # Build a store map that uses Router functions (like the real server does)
@@ -167,9 +171,9 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       collected_sorted = Enum.sort(collected)
 
       assert collected_sorted == expected,
-        "SCAN missed keys. Expected #{length(expected)}, got #{length(collected)}.\n" <>
-        "Missing: #{inspect(expected -- collected_sorted)}\n" <>
-        "Extra: #{inspect(collected_sorted -- expected)}"
+             "SCAN missed keys. Expected #{length(expected)}, got #{length(collected)}.\n" <>
+               "Missing: #{inspect(expected -- collected_sorted)}\n" <>
+               "Extra: #{inspect(collected_sorted -- expected)}"
     end
 
     test "SCAN with MATCH pattern returns only matching keys" do
@@ -184,7 +188,7 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       expected = for i <- 1..5, do: "r3h5_alpha_#{i}"
 
       assert Enum.sort(collected) == Enum.sort(expected),
-        "SCAN MATCH missed keys. Expected #{inspect(expected)}, got #{inspect(collected)}"
+             "SCAN MATCH missed keys. Expected #{inspect(expected)}, got #{inspect(collected)}"
     end
   end
 
@@ -212,10 +216,10 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       {:ok, result2} = FerricStore.bf_exists("r3h6_bloom", "element_2")
 
       assert result1 == 0,
-        "BF.EXISTS returned #{result1} after FLUSHDB — Bloom filter was not cleared"
+             "BF.EXISTS returned #{result1} after FLUSHDB — Bloom filter was not cleared"
 
       assert result2 == 0,
-        "BF.EXISTS returned #{result2} after FLUSHDB — Bloom filter was not cleared"
+             "BF.EXISTS returned #{result2} after FLUSHDB — Bloom filter was not cleared"
     end
 
     test "BF.ADD after FLUSHDB creates a fresh filter" do
@@ -229,13 +233,13 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       {:ok, added} = FerricStore.bf_add("r3h6_fresh", "after_flush")
 
       assert added == 1,
-        "BF.ADD after FLUSHDB should return 1 (new element), got #{added}"
+             "BF.ADD after FLUSHDB should return 1 (new element), got #{added}"
 
       # The old element should not be found in the new filter
       {:ok, old_exists} = FerricStore.bf_exists("r3h6_fresh", "before_flush")
 
       assert old_exists == 0,
-        "BF.EXISTS for pre-flush element returned #{old_exists} — stale Bloom data survived FLUSHDB"
+             "BF.EXISTS for pre-flush element returned #{old_exists} — stale Bloom data survived FLUSHDB"
     end
   end
 
@@ -256,15 +260,15 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       {:ok, remaining_ttl} = FerricStore.ttl(lock_key)
 
       assert remaining_ttl != nil,
-        "Lock key has no TTL — lock was stored without expiry"
+             "Lock key has no TTL — lock was stored without expiry"
 
       # Allow generous tolerance (within 2 seconds of expected)
       assert remaining_ttl >= ttl_ms - 2_000,
-        "Lock TTL too low: #{remaining_ttl}ms, expected ~#{ttl_ms}ms. " <>
-        "Possible double-add causing TTL to be halved."
+             "Lock TTL too low: #{remaining_ttl}ms, expected ~#{ttl_ms}ms. " <>
+               "Possible double-add causing TTL to be halved."
 
       assert remaining_ttl <= ttl_ms + 1_000,
-        "Lock TTL too high: #{remaining_ttl}ms, expected ~#{ttl_ms}ms"
+             "Lock TTL too high: #{remaining_ttl}ms, expected ~#{ttl_ms}ms"
 
       # Clean up: unlock
       {:ok, 1} = FerricStore.unlock(lock_key, owner)
@@ -281,12 +285,16 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
 
       # Should not be acquirable by another owner immediately
       result = FerricStore.lock(lock_key, owner2, ttl_ms)
-      assert match?({:error, _}, result),
-        "Lock should be held, but another owner could acquire it immediately"
 
-      Ferricstore.Test.Utils.eventually(fn ->
-        assert :ok = FerricStore.lock(lock_key, owner2, ttl_ms)
-      end, 5_000)
+      assert match?({:error, _}, result),
+             "Lock should be held, but another owner could acquire it immediately"
+
+      Ferricstore.Test.Utils.eventually(
+        fn ->
+          assert :ok = FerricStore.lock(lock_key, owner2, ttl_ms)
+        end,
+        5_000
+      )
 
       # Clean up
       FerricStore.unlock(lock_key, owner2)

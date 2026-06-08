@@ -754,7 +754,7 @@ defmodule Ferricstore.Config do
         "allkeys-lru" -> :allkeys_lru
         "volatile-ttl" -> :volatile_ttl
         "noeviction" -> :noeviction
-    end
+      end
 
     Application.put_env(:ferricstore, :eviction_policy, atom)
     reconfigure_memory_guard("maxmemory-policy", %{eviction_policy: atom})

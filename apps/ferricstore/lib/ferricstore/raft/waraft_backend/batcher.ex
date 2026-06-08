@@ -592,7 +592,14 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
             Enum.zip(froms, replies)
             |> Enum.each(fn {from, reply} -> GenServer.reply(from, reply) end)
 
-            Telemetry.emit_flush_telemetry(state, prefix, slot, result, flush_started, flush_finished)
+            Telemetry.emit_flush_telemetry(
+              state,
+              prefix,
+              slot,
+              result,
+              flush_started,
+              flush_finished
+            )
           end
 
           state
@@ -675,7 +682,15 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         result = safe_backend_call(:__commit_batch_direct__, [state.shard_index, commands])
         flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
-        Telemetry.emit_hot_flush_telemetry(state, :batch, slot, result, flush_started, flush_finished)
+
+        Telemetry.emit_hot_flush_telemetry(
+          state,
+          :batch,
+          slot,
+          result,
+          flush_started,
+          flush_finished
+        )
       end
 
       %{state | batch_slot: nil}
@@ -699,7 +714,15 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         result = safe_backend_call(:__commit_put_batch_direct__, [state.shard_index, entries])
         flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
-        Telemetry.emit_hot_flush_telemetry(state, :put_batch, slot, result, flush_started, flush_finished)
+
+        Telemetry.emit_hot_flush_telemetry(
+          state,
+          :put_batch,
+          slot,
+          result,
+          flush_started,
+          flush_finished
+        )
       end
 
       %{state | put_slot: nil}
@@ -923,7 +946,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
         :ok
     end
   end
-
 
   defp hot_batch_window_ms do
     Application.get_env(:ferricstore, :waraft_hot_batch_window_ms, @default_hot_batch_window_ms)

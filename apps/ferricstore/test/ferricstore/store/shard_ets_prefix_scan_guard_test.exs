@@ -1,7 +1,10 @@
 defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
   use ExUnit.Case, async: true
 
-  @prefix_scan_path Path.expand("../../../lib/ferricstore/store/shard/ets/prefix_scan.ex", __DIR__)
+  @prefix_scan_path Path.expand(
+                      "../../../lib/ferricstore/store/shard/ets/prefix_scan.ex",
+                      __DIR__
+                    )
 
   test "prefix scans batch cold disk reads" do
     source = File.read!(@prefix_scan_path)

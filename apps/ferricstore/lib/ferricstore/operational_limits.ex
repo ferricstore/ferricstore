@@ -69,7 +69,12 @@ defmodule Ferricstore.OperationalLimits do
           @default_disk_pressure_ratio
         ),
       reject:
-        ratio(opts, :disk_reject_ratio, :operational_disk_reject_ratio, @default_disk_reject_ratio),
+        ratio(
+          opts,
+          :disk_reject_ratio,
+          :operational_disk_reject_ratio,
+          @default_disk_reject_ratio
+        ),
       panic:
         ratio(opts, :disk_panic_ratio, :operational_disk_panic_ratio, @default_disk_panic_ratio)
     }

@@ -14,4 +14,3 @@ defmodule Ferricstore.Test.RaftCase do
     end
   end
 end
-

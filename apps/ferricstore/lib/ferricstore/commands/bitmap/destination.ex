@@ -12,7 +12,9 @@ defmodule Ferricstore.Commands.Bitmap.Destination do
 
   @spec metadata_value_size(map(), binary()) :: non_neg_integer() | nil | :unknown
   def metadata_value_size(%FerricStore.Instance{} = store, key), do: Ops.value_size(store, key)
-  def metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key), do: Ops.value_size(store, key)
+
+  def metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key),
+    do: Ops.value_size(store, key)
 
   def metadata_value_size(%{value_size: value_size}, key) when is_function(value_size, 1),
     do: value_size.(key)
@@ -54,7 +56,8 @@ defmodule Ferricstore.Commands.Bitmap.Destination do
     end
   end
 
-  @spec compound_destination_backup(binary(), binary(), map()) :: {:compound, list()} | :unrestorable
+  @spec compound_destination_backup(binary(), binary(), map()) ::
+          {:compound, list()} | :unrestorable
   def compound_destination_backup(key, type, store) do
     if compound_backup_supported?(store) do
       {:compound,
@@ -65,7 +68,8 @@ defmodule Ferricstore.Commands.Bitmap.Destination do
     end
   end
 
-  @spec restore_bitop_destination(map(), binary(), {:compound, list()} | :unrestorable, term()) :: term()
+  @spec restore_bitop_destination(map(), binary(), {:compound, list()} | :unrestorable, term()) ::
+          term()
   def restore_bitop_destination(_store, _key, :unrestorable, original_error), do: original_error
 
   def restore_bitop_destination(store, key, {:compound, entries}, original_error) do

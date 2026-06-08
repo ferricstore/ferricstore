@@ -17,7 +17,15 @@
 # :bench — long-running throughput benchmarks (30s+ per test). Excluded by default.
 #   Run with `mix test test/ferricstore/cluster/throughput_bench_test.exs --include bench`.
 ExUnit.start(
-  exclude: [:bench, :linux_io_uring, :large_alloc, :cluster, :jepsen, :shard_kill, :partition_test],
+  exclude: [
+    :bench,
+    :linux_io_uring,
+    :large_alloc,
+    :cluster,
+    :jepsen,
+    :shard_kill,
+    :partition_test
+  ],
   formatters: [ExUnit.CLIFormatter, JUnitFormatter, Ferricstore.Test.AuditFormatter]
 )
 

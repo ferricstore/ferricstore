@@ -645,7 +645,8 @@ defmodule Ferricstore.Cluster.Manager do
       "ClusterManager: WARaft target marker write failed for #{target_node}: #{inspect(marker_error)}; rolling back membership"
     )
 
-    membership_rollback = Target.remove_join_added_members(target_node, state, preexisting_membership)
+    membership_rollback =
+      Target.remove_join_added_members(target_node, state, preexisting_membership)
 
     target_rollback =
       cleanup_waraft_target_join_state(target_node, state, cleanup_data_on_failure?)
@@ -695,7 +696,6 @@ defmodule Ferricstore.Cluster.Manager do
       :ok
     end
   end
-
 
   defp do_add_node(target_node, membership, state) do
     case Process.get(:ferricstore_cluster_manager_do_add_node_hook) do
@@ -965,18 +965,25 @@ defmodule Ferricstore.Cluster.Manager do
     end
   end
 
+  false
 
-   false
-  def __extract_direct_sync_indices_for_test__(target_node, sync_results), do: Target.__extract_direct_sync_indices_for_test__(target_node, sync_results)
+  def __extract_direct_sync_indices_for_test__(target_node, sync_results),
+    do: Target.__extract_direct_sync_indices_for_test__(target_node, sync_results)
 
-   false
-  def __target_shard_has_data_for_test__(target_node, data_dir, shard_idx), do: Target.__target_shard_has_data_for_test__(target_node, data_dir, shard_idx)
+  false
 
-   false
-  def __cleanup_target_data_dir_for_test__(target_node, data_dir, shard_count), do: Target.__cleanup_target_data_dir_for_test__(target_node, data_dir, shard_count)
+  def __target_shard_has_data_for_test__(target_node, data_dir, shard_idx),
+    do: Target.__target_shard_has_data_for_test__(target_node, data_dir, shard_idx)
 
-   false
-  def read_target_indices(target_node, shard_count), do: Target.read_target_indices(target_node, shard_count)
+  false
+
+  def __cleanup_target_data_dir_for_test__(target_node, data_dir, shard_count),
+    do: Target.__cleanup_target_data_dir_for_test__(target_node, data_dir, shard_count)
+
+  false
+
+  def read_target_indices(target_node, shard_count),
+    do: Target.read_target_indices(target_node, shard_count)
 
   defp role_to_membership(:voter), do: :voter
   defp role_to_membership(:replica), do: :promotable

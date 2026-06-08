@@ -21,7 +21,6 @@ defmodule FerricstoreServer.Connection.Sendfile do
                              65_536
                            )
 
-
   @spec threshold_bytes() :: pos_integer()
   def threshold_bytes, do: @sendfile_threshold_bytes
 
@@ -210,7 +209,13 @@ defmodule FerricstoreServer.Connection.Sendfile do
              count, validator}
 
           {relative_offset, count} ->
-            case SendIO.pread_file_ref_range(path, value_offset, value_size, relative_offset, count) do
+            case SendIO.pread_file_ref_range(
+                   path,
+                   value_offset,
+                   value_size,
+                   relative_offset,
+                   count
+                 ) do
               {:ok, value} -> {:value, value}
               :fallback -> :fallback
             end
@@ -468,7 +473,6 @@ defmodule FerricstoreServer.Connection.Sendfile do
         {:error_after_header, reason}
     end
   end
-
 
   defp handle_mget_sendfile_result({:sent, new_state}, _keys, _state, _fn),
     do: {:continue, "", new_state}
@@ -860,7 +864,6 @@ defmodule FerricstoreServer.Connection.Sendfile do
       {:error_after_header, reason, _chunks} -> {:error_after_header, reason}
     end
   end
-
 
   @doc false
   def send_file_ref(key, path, offset, size, state) do

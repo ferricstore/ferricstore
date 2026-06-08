@@ -116,7 +116,15 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
     :erlang.term_to_binary({event_id, event_ms, expire_at_ms, compound_key})
   end
 
-  def encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms, {:flow_history, file_id}, offset, value_size)
+  def encode_history_index_value(
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms,
+        {:flow_history, file_id},
+        offset,
+        value_size
+      )
       when is_binary(event_id) and is_integer(event_ms) and is_binary(compound_key) and
              is_integer(expire_at_ms) and is_integer(file_id) and file_id >= 0 and
              is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 do

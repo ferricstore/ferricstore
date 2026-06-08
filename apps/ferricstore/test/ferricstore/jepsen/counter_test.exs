@@ -159,9 +159,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
       assert final_int == ok_count,
              "Counter #{final_int} != successful increments #{ok_count}"
 
-      IO.puts(
-        "  Counter agreement: final=#{final_int}, ok_increments=#{ok_count}"
-      )
+      IO.puts("  Counter agreement: final=#{final_int}, ok_increments=#{ok_count}")
     end
 
     @tag :jepsen
@@ -201,9 +199,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
                "found #{length(non_monotonic)} regressions in " <>
                "#{inspect(Enum.take(non_monotonic, 5))}"
 
-      IO.puts(
-        "  #{length(observed_values)} increments observed, all monotonically increasing"
-      )
+      IO.puts("  #{length(observed_values)} increments observed, all monotonically increasing")
     end
   end
 

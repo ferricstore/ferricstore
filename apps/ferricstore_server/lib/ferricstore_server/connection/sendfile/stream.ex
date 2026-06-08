@@ -5,10 +5,10 @@ defmodule FerricstoreServer.Connection.Sendfile.Stream do
   alias FerricstoreServer.Connection.Sendfile.IO, as: SendIO
 
   @file_stream_chunk_bytes Application.compile_env(
-                              :ferricstore_server,
-                              :file_stream_chunk_bytes,
-                              65_536
-                            )
+                             :ferricstore_server,
+                             :file_stream_chunk_bytes,
+                             65_536
+                           )
 
   def do_stream_file_get(path, offset, size, validator, state) do
     case SendIO.file_open(path) do

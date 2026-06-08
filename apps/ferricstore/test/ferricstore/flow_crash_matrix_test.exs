@@ -146,7 +146,9 @@ defmodule Ferricstore.FlowCrashMatrixTest do
     create_and_complete(type, partition, id, result: "lmdb-result")
     fault = install_blocking_fault(:before_flow_lmdb_flush_write)
     state_key = Ferricstore.Flow.Keys.state_key(id, partition)
-    assert :ok = LMDBWriter.enqueue(:default, shard, [{:project_flow_state_from_source, state_key}])
+
+    assert :ok =
+             LMDBWriter.enqueue(:default, shard, [{:project_flow_state_from_source, state_key}])
 
     op =
       start_unlinked(fn ->
@@ -402,7 +404,10 @@ defmodule Ferricstore.FlowCrashMatrixTest do
   end
 
   defp flow_shard(id, partition) do
-    Router.shard_for(FerricStore.Instance.get(:default), Ferricstore.Flow.Keys.state_key(id, partition))
+    Router.shard_for(
+      FerricStore.Instance.get(:default),
+      Ferricstore.Flow.Keys.state_key(id, partition)
+    )
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

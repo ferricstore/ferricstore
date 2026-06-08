@@ -150,7 +150,6 @@ defmodule FerricStore.API.Sets do
   # Sorted Sets
   # ---------------------------------------------------------------------------
 
-
   @doc """
   Returns the membership status of multiple members in the set at `key`.
 

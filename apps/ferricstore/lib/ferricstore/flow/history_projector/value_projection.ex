@@ -6,14 +6,14 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   def compact_projected_flow_values(
-         instance_ctx,
-         shard_index,
-         shard_data_path,
-         keydir,
-         file_path,
-         file_id,
-         entries
-       ) do
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        keydir,
+        file_path,
+        file_id,
+        entries
+      ) do
     refs = projected_flow_value_refs(entries)
 
     keydir_items = projected_flow_value_keydir_items(keydir, refs)
@@ -112,8 +112,8 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   end
 
   def direct_segment_value_file_id?({:waraft_segment, index})
-       when is_integer(index) and index > 0,
-       do: true
+      when is_integer(index) and index > 0,
+      do: true
 
   def direct_segment_value_file_id?(_file_id), do: false
 
@@ -255,15 +255,15 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   end
 
   def projected_flow_value_entry_from_row(
-         key,
-         bytes,
-         expire_at_ms,
-         lfu,
-         file_id,
-         offset,
-         value_size,
-         row
-       ) do
+        key,
+        bytes,
+        expire_at_ms,
+        lfu,
+        file_id,
+        offset,
+        value_size,
+        row
+      ) do
     %{
       key: key,
       value: bytes,
@@ -277,14 +277,14 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   end
 
   def direct_projected_flow_value_entry_from_row(
-         key,
-         expire_at_ms,
-         lfu,
-         file_id,
-         offset,
-         value_size,
-         row
-       ) do
+        key,
+        expire_at_ms,
+        lfu,
+        file_id,
+        offset,
+        value_size,
+        row
+      ) do
     %{
       key: key,
       value: nil,
@@ -298,54 +298,54 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   end
 
   def projected_flow_value_bytes(
-         _instance_ctx,
-         _shard_index,
-         _shard_data_path,
-         _key,
-         value,
-         _file_id,
-         _offset
-       )
-       when is_binary(value),
-       do: {:ok, value}
+        _instance_ctx,
+        _shard_index,
+        _shard_data_path,
+        _key,
+        value,
+        _file_id,
+        _offset
+      )
+      when is_binary(value),
+      do: {:ok, value}
 
   def projected_flow_value_bytes(
-         _instance_ctx,
-         _shard_index,
-         shard_data_path,
-         key,
-         nil,
-         file_id,
-         offset
-       )
-       when is_integer(file_id) and file_id >= 0 do
+        _instance_ctx,
+        _shard_index,
+        shard_data_path,
+        key,
+        nil,
+        file_id,
+        offset
+      )
+      when is_integer(file_id) and file_id >= 0 do
     shard_data_path
     |> ShardETS.file_path(file_id)
     |> Ferricstore.Store.ColdRead.pread_keyed(offset, key, 10_000)
   end
 
   def projected_flow_value_bytes(
-         _instance_ctx,
-         _shard_index,
-         shard_data_path,
-         _key,
-         nil,
-         {:flow_history, _file_id} = file_id,
-         offset
-       ) do
+        _instance_ctx,
+        _shard_index,
+        shard_data_path,
+        _key,
+        nil,
+        {:flow_history, _file_id} = file_id,
+        offset
+      ) do
     HistoryProjector.read_value(shard_data_path, file_id, offset)
   end
 
   def projected_flow_value_bytes(
-         instance_ctx,
-         shard_index,
-         _shard_data_path,
-         key,
-         nil,
-         file_id,
-         _offset
-       )
-       when is_tuple(file_id) do
+        instance_ctx,
+        shard_index,
+        _shard_data_path,
+        key,
+        nil,
+        file_id,
+        _offset
+      )
+      when is_tuple(file_id) do
     Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
       instance_ctx,
       shard_index,
@@ -355,18 +355,18 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   end
 
   def projected_flow_value_bytes(
-         _instance_ctx,
-         _shard_index,
-         _shard_data_path,
-         _key,
-         _value,
-         _file_id,
-         _offset
-       ),
-       do: :error
+        _instance_ctx,
+        _shard_index,
+        _shard_data_path,
+        _key,
+        _value,
+        _file_id,
+        _offset
+      ),
+      do: :error
 
   def validate_projected_value_locations(entries, locations)
-       when length(entries) == length(locations) do
+      when length(entries) == length(locations) do
     if Enum.all?(locations, &valid_projected_value_location?/1) do
       :ok
     else
@@ -378,19 +378,19 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
     do: {:error, {:flow_value_projection_location_mismatch, length(entries), locations}}
 
   def valid_projected_value_location?({offset, value_size})
-       when is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0,
-       do: true
+      when is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0,
+      do: true
 
   def valid_projected_value_location?(_location), do: false
 
   def direct_segment_value_entry?(%{
-         source_file_id: {tag, index},
-         source_offset: offset,
-         source_value_size: value_size
-       })
-       when tag == :waraft_segment and is_integer(index) and index > 0 and
-              is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size > 0,
-       do: true
+        source_file_id: {tag, index},
+        source_offset: offset,
+        source_value_size: value_size
+      })
+      when tag == :waraft_segment and is_integer(index) and index > 0 and
+             is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size > 0,
+      do: true
 
   def direct_segment_value_entry?(_entry), do: false
 
@@ -422,25 +422,25 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   end
 
   def copy_projected_flow_values(
-         _instance_ctx,
-         _shard_index,
-         _shard_data_path,
-         _keydir,
-         _file_path,
-         _file_id,
-         []
-       ),
-       do: :ok
+        _instance_ctx,
+        _shard_index,
+        _shard_data_path,
+        _keydir,
+        _file_path,
+        _file_id,
+        []
+      ),
+      do: :ok
 
   def copy_projected_flow_values(
-         instance_ctx,
-         shard_index,
-         shard_data_path,
-         keydir,
-         file_path,
-         file_id,
-         value_entries
-       ) do
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        keydir,
+        file_path,
+        file_id,
+        value_entries
+      ) do
     batch =
       Enum.map(value_entries, fn %{key: key, value: value, expire_at_ms: expire_at_ms} ->
         {key, value, expire_at_ms}
@@ -466,7 +466,10 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   end
 
   def publish_lmdb_value_locations(shard_data_path, file_id, entries, locations) do
-    HistoryProjector.write_lmdb_ops(shard_data_path, lmdb_value_location_ops(file_id, entries, locations))
+    HistoryProjector.write_lmdb_ops(
+      shard_data_path,
+      lmdb_value_location_ops(file_id, entries, locations)
+    )
   end
 
   def lmdb_value_location_ops(file_id, entries, locations) do
@@ -501,7 +504,11 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
             HistoryProjector.track_keydir_binary_remove_row(instance_ctx, shard_index, row)
 
             if delete_apply_projection_cache? do
-              HistoryProjector.delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
+              HistoryProjector.delete_apply_projection_cache_for_row(
+                instance_ctx,
+                shard_index,
+                row
+              )
             end
 
             HistoryProjector.safe_ets_delete(keydir, key)
@@ -653,15 +660,15 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   def generated_flow_value_ref?(_ref), do: false
 
   def readable_value_locator?(file_id, offset, value_size)
-       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
-              is_integer(value_size) and value_size >= 0,
-       do: true
+      when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+             is_integer(value_size) and value_size >= 0,
+      do: true
 
   def readable_value_locator?({tag, index}, offset, value_size)
-       when tag in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
-              is_integer(index) and index > 0 and is_integer(offset) and offset >= 0 and
-              is_integer(value_size) and value_size >= 0,
-       do: true
+      when tag in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+             is_integer(index) and index > 0 and is_integer(offset) and offset >= 0 and
+             is_integer(value_size) and value_size >= 0,
+      do: true
 
   def readable_value_locator?(_file_id, _offset, _value_size), do: false
 

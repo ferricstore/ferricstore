@@ -1,7 +1,6 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.Prefixes do
-
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.Render.Overview
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.Render.Overview
 
   def render_prefixes_table(data) do
     prefix_count = length(data.prefixes)
@@ -59,5 +58,4 @@ import FerricstoreServer.Health.Dashboard.Render.Overview
       %{label: "Cold Reads", value: format_number(cold_reads)}
     ])
   end
-
 end

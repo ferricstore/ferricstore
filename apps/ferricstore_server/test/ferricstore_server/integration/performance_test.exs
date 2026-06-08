@@ -168,7 +168,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       :gen_tcp.close(sock)
 
       assert elapsed < 5_000,
-        "1000 sequential PINGs took #{elapsed}ms, expected < 5000ms"
+             "1000 sequential PINGs took #{elapsed}ms, expected < 5000ms"
     end
 
     @tag :bench
@@ -186,7 +186,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       :gen_tcp.close(sock)
 
       assert elapsed < 10_000,
-        "1000 sequential SETs took #{elapsed}ms, expected < 10000ms"
+             "1000 sequential SETs took #{elapsed}ms, expected < 10000ms"
     end
 
     @tag :bench
@@ -211,7 +211,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       :gen_tcp.close(sock)
 
       assert elapsed < 10_000,
-        "1000 sequential GETs took #{elapsed}ms, expected < 10000ms"
+             "1000 sequential GETs took #{elapsed}ms, expected < 10000ms"
     end
   end
 
@@ -243,7 +243,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       assert Enum.all?(responses, &(&1 == {:simple, "PONG"}))
 
       assert elapsed < 2_000,
-        "Pipeline 1000 PINGs took #{elapsed}ms, expected < 2000ms"
+             "Pipeline 1000 PINGs took #{elapsed}ms, expected < 2000ms"
     end
 
     @tag :bench
@@ -274,7 +274,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
 
       # 5000 pipelined SETs -- generous threshold for slow machines
       assert elapsed < 30_000,
-        "5000 pipelined SETs (5 batches) took #{elapsed}ms, expected < 30000ms"
+             "5000 pipelined SETs (5 batches) took #{elapsed}ms, expected < 30000ms"
     end
 
     @tag :bench
@@ -311,7 +311,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       assert length(responses) == 1_000
 
       assert pipe_elapsed < seq_elapsed,
-        "Pipeline (#{pipe_elapsed}ms) should be faster than sequential (#{seq_elapsed}ms)"
+             "Pipeline (#{pipe_elapsed}ms) should be faster than sequential (#{seq_elapsed}ms)"
     end
   end
 
@@ -348,7 +348,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       assert Enum.all?(results, &match?({:ok, :ok}, &1))
 
       assert elapsed < 10_000,
-        "10 concurrent clients x 100 SETs took #{elapsed}ms, expected < 10000ms"
+             "10 concurrent clients x 100 SETs took #{elapsed}ms, expected < 10000ms"
     end
 
     @tag :bench
@@ -389,7 +389,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       assert Enum.all?(results, &match?({:ok, :ok}, &1))
 
       assert elapsed < 15_000,
-        "50 concurrent clients x 10 GETs took #{elapsed}ms, expected < 15000ms"
+             "50 concurrent clients x 10 GETs took #{elapsed}ms, expected < 15000ms"
     end
   end
 
@@ -449,7 +449,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       :gen_tcp.close(sock)
 
       assert elapsed < 2_000,
-        "1MB SET+GET took #{elapsed}ms, expected < 2000ms"
+             "1MB SET+GET took #{elapsed}ms, expected < 2000ms"
     end
 
     @tag :bench
@@ -470,7 +470,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       :gen_tcp.close(sock)
 
       assert elapsed < 10_000,
-        "10MB SET+GET took #{elapsed}ms, expected < 10000ms"
+             "10MB SET+GET took #{elapsed}ms, expected < 10000ms"
     end
   end
 
@@ -503,7 +503,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       Router.delete(FerricStore.Instance.get(:default), key)
 
       assert avg_us < 100,
-        "Average Router.get from ETS cache was #{Float.round(avg_us, 2)}us, expected < 100us"
+             "Average Router.get from ETS cache was #{Float.round(avg_us, 2)}us, expected < 100us"
     end
   end
 
@@ -528,7 +528,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         count = Map.get(shard_counts, shard_idx, 0)
 
         assert count > 0,
-          "Shard #{shard_idx} has 0 keys -- distribution is broken"
+               "Shard #{shard_idx} has 0 keys -- distribution is broken"
       end
 
       # Assert no shard has > 60% of the keys
@@ -536,7 +536,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         pct = count / 1_000 * 100
 
         assert pct <= 60.0,
-          "Shard #{shard_idx} has #{count} keys (#{Float.round(pct, 1)}%), expected <= 60%"
+               "Shard #{shard_idx} has #{count} keys (#{Float.round(pct, 1)}%), expected <= 60%"
       end
     end
   end
@@ -585,7 +585,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         end)
 
       assert expired_count == 1_000,
-        "Expected all 1000 keys expired, but #{1_000 - expired_count} are still alive"
+             "Expected all 1000 keys expired, but #{1_000 - expired_count} are still alive"
 
       :gen_tcp.close(sock)
     end
@@ -609,7 +609,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         end)
 
       assert elapsed < 10_000,
-        "200 connect-PING-disconnect cycles took #{elapsed}ms, expected < 10000ms"
+             "200 connect-PING-disconnect cycles took #{elapsed}ms, expected < 10000ms"
     end
   end
 
@@ -649,7 +649,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
             set_responses = Enum.take(responses, 100)
 
             assert Enum.all?(set_responses, &(&1 == {:simple, "OK"})),
-              "Client #{client_id}: not all SETs returned OK"
+                   "Client #{client_id}: not all SETs returned OK"
 
             # Last 100 responses should be the correct values (GETs)
             get_responses = Enum.drop(responses, 100)
@@ -659,7 +659,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
               actual = Enum.at(get_responses, i - 1)
 
               assert actual == expected,
-                "Client #{client_id}, key #{i}: expected #{inspect(expected)}, got #{inspect(actual)}"
+                     "Client #{client_id}, key #{i}: expected #{inspect(expected)}, got #{inspect(actual)}"
             end
 
             :gen_tcp.close(sock)

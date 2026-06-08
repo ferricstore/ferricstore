@@ -1,5 +1,10 @@
 Code.require_file("acl_permissions_test/sections/acl_check_command_2_all.exs", __DIR__)
-Code.require_file("acl_permissions_test/sections/tcp_global_keyspace_enumeration_restricted_key_patterns.exs", __DIR__)
+
+Code.require_file(
+  "acl_permissions_test/sections/tcp_global_keyspace_enumeration_restricted_key_patterns.exs",
+  __DIR__
+)
+
 defmodule FerricstoreServer.Spec.AclPermissionsTest do
   @moduledoc """
   Tests for ACL command-level permission enforcement.
@@ -150,46 +155,27 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   # Unit tests: Acl.check_command/2
   # ---------------------------------------------------------------------------
 
-
-
-
-
   # ---------------------------------------------------------------------------
   # Unit tests: Acl.check_command/2 with categories
   # ---------------------------------------------------------------------------
-
-
-
-
-
 
   # ---------------------------------------------------------------------------
   # TCP integration tests: NOPERM enforcement over the wire
   # ---------------------------------------------------------------------------
 
-
-
-
-
-
-
   # ---------------------------------------------------------------------------
   # Edge case: AUTH changes permissions mid-connection
   # ---------------------------------------------------------------------------
-
 
   # ---------------------------------------------------------------------------
   # Stress test: 1000 commands with permission checking
   # ---------------------------------------------------------------------------
 
-
   # ---------------------------------------------------------------------------
   # Unit tests: category definitions
   # ---------------------------------------------------------------------------
 
-
   # ---------------------------------------------------------------------------
   # NOPERM error message format
   # ---------------------------------------------------------------------------
-
 end

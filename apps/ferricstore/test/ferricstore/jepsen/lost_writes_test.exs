@@ -115,19 +115,22 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         node_entries = Map.get(per_node_entries, node.name, [])
 
         Enum.each(node_entries, fn {:ok, key, value, _node, _ts} ->
-          Ferricstore.Test.ShardHelpers.eventually(fn ->
-            {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
+          Ferricstore.Test.ShardHelpers.eventually(
+            fn ->
+              {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
 
-            assert read == value,
-                   "Lost write: key=#{key} expected=#{value} got=#{inspect(read)} " <>
-                     "on node=#{node.name}"
-          end, "durability #{key} on #{node.name}", 50, 100)
+              assert read == value,
+                     "Lost write: key=#{key} expected=#{value} got=#{inspect(read)} " <>
+                       "on node=#{node.name}"
+            end,
+            "durability #{key} on #{node.name}",
+            50,
+            100
+          )
         end)
       end)
 
-      IO.puts(
-        "  #{length(all_entries)} acknowledged writes verified durable after node kills"
-      )
+      IO.puts("  #{length(all_entries)} acknowledged writes verified durable after node kills")
     end
 
     @tag :jepsen
@@ -185,10 +188,16 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
       violations =
         Enum.flat_map(all_entries, fn {:ok, key, value, _node, _ts} ->
           try do
-            Ferricstore.Test.ShardHelpers.eventually(fn ->
-              {:ok, read} = :rpc.call(writer.name, FerricStore, :get, [key])
-              assert read == value
-            end, "durability #{key}", 50, 100)
+            Ferricstore.Test.ShardHelpers.eventually(
+              fn ->
+                {:ok, read} = :rpc.call(writer.name, FerricStore, :get, [key])
+                assert read == value
+              end,
+              "durability #{key}",
+              50,
+              100
+            )
+
             []
           rescue
             e -> [{key, value, Exception.message(e)}]
@@ -198,9 +207,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
       assert violations == [],
              "Durability violated:\n#{inspect(violations)}"
 
-      IO.puts(
-        "  #{length(all_entries)} writes verified durable on surviving writer node"
-      )
+      IO.puts("  #{length(all_entries)} writes verified durable on surviving writer node")
     end
   end
 end

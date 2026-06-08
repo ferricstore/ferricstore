@@ -11,82 +11,83 @@ defmodule Ferricstore.Store.PromotionTest.Sections.PromotionBatchesSharedTombsto
       alias Ferricstore.Store.Shard.Compound, as: ShardCompound
       alias Ferricstore.Test.ShardHelpers
 
-  test "promotion batches shared tombstones after dedicated copy" do
-    source =
-      __DIR__
-      |> Path.join("../../../lib/ferricstore/store/promotion.ex")
-      |> File.read!()
+      test "promotion batches shared tombstones after dedicated copy" do
+        source =
+          __DIR__
+          |> Path.join("../../../lib/ferricstore/store/promotion.ex")
+          |> File.read!()
 
-    assert source =~ "v2_append_ops_batch_nosync(active_path, tombstone_ops)"
-    assert source =~ "v2_fsync(active_path)"
-  end
-
-  test "promoted recovery reports leftover compact temp cleanup failures" do
-    root =
-      Path.join(
-        System.tmp_dir!(),
-        "promotion_compact_cleanup_fail_#{System.unique_integer([:positive])}"
-      )
-
-    keydir =
-      :ets.new(:"promotion_compact_cleanup_fail_#{System.unique_integer([:positive])}", [
-        :set,
-        :public
-      ])
-
-    on_exit(fn ->
-      try do
-        :ets.delete(keydir)
-      rescue
-        ArgumentError -> :ok
+        assert source =~ "v2_append_ops_batch_nosync(active_path, tombstone_ops)"
+        assert source =~ "v2_fsync(active_path)"
       end
 
-      File.rm_rf(root)
-    end)
+      test "promoted recovery reports leftover compact temp cleanup failures" do
+        root =
+          Path.join(
+            System.tmp_dir!(),
+            "promotion_compact_cleanup_fail_#{System.unique_integer([:positive])}"
+          )
 
-    Ferricstore.DataDir.ensure_layout!(root, 1)
-    shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
-    redis_key = "recover-temp-cleanup-fail"
-    marker_key = Promotion.marker_key(redis_key)
-    dedicated_path = Promotion.dedicated_path(root, 0, :hash, redis_key)
+        keydir =
+          :ets.new(:"promotion_compact_cleanup_fail_#{System.unique_integer([:positive])}", [
+            :set,
+            :public
+          ])
 
-    File.mkdir_p!(dedicated_path)
-    File.touch!(Path.join(dedicated_path, "00000.log"))
-    File.mkdir!(Path.join(dedicated_path, "compact_1.log"))
+        on_exit(fn ->
+          try do
+            :ets.delete(keydir)
+          rescue
+            ArgumentError -> :ok
+          end
 
-    :ets.insert(keydir, {marker_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
-    compact_dir = Path.join(dedicated_path, "compact_1.log")
-    parent = self()
-    handler_id = {:promotion_compact_temp_cleanup_failed, parent, make_ref()}
-
-    :telemetry.attach(
-      handler_id,
-      [:ferricstore, :promotion, :compact_temp_cleanup_failed],
-      fn event, measurements, metadata, _config ->
-        send(parent, {:compact_temp_cleanup_failed, event, measurements, metadata})
-      end,
-      nil
-    )
-
-    try do
-      log =
-        capture_log(fn ->
-          assert %{} = Promotion.recover_promoted(shard_path, keydir, root, 0)
+          File.rm_rf(root)
         end)
 
-      assert log =~ "Promotion recovery: failed to remove leftover compact temp file compact_1.log"
+        Ferricstore.DataDir.ensure_layout!(root, 1)
+        shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+        redis_key = "recover-temp-cleanup-fail"
+        marker_key = Promotion.marker_key(redis_key)
+        dedicated_path = Promotion.dedicated_path(root, 0, :hash, redis_key)
 
-      assert_receive {:compact_temp_cleanup_failed,
-                      [:ferricstore, :promotion, :compact_temp_cleanup_failed], %{count: 1},
-                      %{path: ^compact_dir, name: "compact_1.log", reason: {_kind, _message}}},
-                     1_000
-    after
-      :telemetry.detach(handler_id)
-    end
-  end
+        File.mkdir_p!(dedicated_path)
+        File.touch!(Path.join(dedicated_path, "00000.log"))
+        File.mkdir!(Path.join(dedicated_path, "compact_1.log"))
 
-  # Builds a store map backed by the real Router with promotion-aware
-  # compound callbacks -- the same as what the connection module builds.
+        :ets.insert(keydir, {marker_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+        compact_dir = Path.join(dedicated_path, "compact_1.log")
+        parent = self()
+        handler_id = {:promotion_compact_temp_cleanup_failed, parent, make_ref()}
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :promotion, :compact_temp_cleanup_failed],
+          fn event, measurements, metadata, _config ->
+            send(parent, {:compact_temp_cleanup_failed, event, measurements, metadata})
+          end,
+          nil
+        )
+
+        try do
+          log =
+            capture_log(fn ->
+              assert %{} = Promotion.recover_promoted(shard_path, keydir, root, 0)
+            end)
+
+          assert log =~
+                   "Promotion recovery: failed to remove leftover compact temp file compact_1.log"
+
+          assert_receive {:compact_temp_cleanup_failed,
+                          [:ferricstore, :promotion, :compact_temp_cleanup_failed], %{count: 1},
+                          %{path: ^compact_dir, name: "compact_1.log", reason: {_kind, _message}}},
+                         1_000
+        after
+          :telemetry.detach(handler_id)
+        end
+      end
+
+      # Builds a store map backed by the real Router with promotion-aware
+      # compound callbacks -- the same as what the connection module builds.
     end
   end
 end

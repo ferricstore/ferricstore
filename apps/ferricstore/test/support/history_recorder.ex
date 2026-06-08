@@ -170,8 +170,7 @@ defmodule Ferricstore.Test.HistoryRecorder do
           if final_int >= max_acked do
             []
           else
-            [{:counter_regression, key,
-              expected_min: max_acked, got: final_int, node: node.name}]
+            [{:counter_regression, key, expected_min: max_acked, got: final_int, node: node.name}]
           end
 
         {:ok, nil} ->
@@ -221,8 +220,7 @@ defmodule Ferricstore.Test.HistoryRecorder do
           if MapSet.size(missing) == 0 do
             []
           else
-            [{:missing_members, key,
-              missing: MapSet.to_list(missing), node: node.name}]
+            [{:missing_members, key, missing: MapSet.to_list(missing), node: node.name}]
           end
 
         {:badrpc, reason} ->

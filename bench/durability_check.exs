@@ -41,9 +41,12 @@ for i <- 1..total do
   key = "durable:#{String.pad_leading(Integer.to_string(i), 6, "0")}"
 
   case Router.put(ctx, key, payload, 0) do
-    :ok -> :ok
+    :ok ->
+      :ok
+
     {:error, reason} ->
       :counters.add(errors, 1, 1)
+
       if :counters.get(errors, 1) <= 5 do
         IO.puts("  ERROR on write #{i}: #{inspect(reason)}")
       end
@@ -80,6 +83,7 @@ shard_count = ctx.shard_count
 
 for i <- 0..(shard_count - 1) do
   shard_name = Router.shard_name(ctx, i)
+
   try do
     GenServer.call(shard_name, :flush, 30_000)
   catch
@@ -107,12 +111,14 @@ for i <- 1..total do
   cond do
     value == nil ->
       :counters.add(ets_missing, 1, 1)
+
       if :counters.get(ets_missing, 1) <= 5 do
         IO.puts("  MISSING in ETS: #{key}")
       end
 
     value != payload ->
       :counters.add(ets_wrong_value, 1, 1)
+
       if :counters.get(ets_wrong_value, 1) <= 5 do
         IO.puts("  WRONG VALUE in ETS: #{key} (got #{byte_size(value)} bytes)")
       end
@@ -148,12 +154,15 @@ for i <- 1..total do
   case :ets.lookup(keydir, key) do
     [{^key, _val, _exp, _lfu, fid, offset, _vsize}] when is_integer(fid) and fid >= 0 ->
       shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-      file_path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+      file_path =
+        Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
 
       case NIF.v2_pread_at(file_path, offset) do
         {:ok, disk_value} ->
           if disk_value != payload do
             :counters.add(disk_wrong_value, 1, 1)
+
             if :counters.get(disk_wrong_value, 1) <= 5 do
               IO.puts("  WRONG on disk: #{key}")
             end
@@ -161,6 +170,7 @@ for i <- 1..total do
 
         {:error, reason} ->
           :counters.add(disk_missing, 1, 1)
+
           if :counters.get(disk_missing, 1) <= 5 do
             IO.puts("  DISK READ ERROR: #{key} — #{inspect(reason)}")
           end
@@ -168,12 +178,14 @@ for i <- 1..total do
 
     [{^key, _val, _exp, _lfu, fid, _off, _vsize}] ->
       :counters.add(disk_missing, 1, 1)
+
       if :counters.get(disk_missing, 1) <= 5 do
         IO.puts("  PENDING file_id: #{key} (fid=#{inspect(fid)})")
       end
 
     [] ->
       :counters.add(disk_missing, 1, 1)
+
       if :counters.get(disk_missing, 1) <= 5 do
         IO.puts("  NOT IN KEYDIR: #{key}")
       end

@@ -1,5 +1,6 @@
 Code.require_file("edge_cases_test/sections/value_size_boundaries.exs", __DIR__)
 Code.require_file("edge_cases_test/sections/data_type_boundaries_over_tcp.exs", __DIR__)
+
 defmodule FerricstoreServer.Integration.EdgeCasesTest do
   @moduledoc """
   Edge case and stress tests covering value size limits, key size limits,
@@ -115,36 +116,29 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   # 1. Value size boundaries
   # ---------------------------------------------------------------------------
 
-
   # ---------------------------------------------------------------------------
   # 4. TTL edge cases
   # ---------------------------------------------------------------------------
-
 
   # ---------------------------------------------------------------------------
   # 5. Duplicate keys and update semantics
   # ---------------------------------------------------------------------------
 
-
   # ---------------------------------------------------------------------------
   # 6. Large value TCP round-trips
   # ---------------------------------------------------------------------------
-
 
   # ---------------------------------------------------------------------------
   # 7. Protocol stress
   # ---------------------------------------------------------------------------
 
-
   # ---------------------------------------------------------------------------
   # 8. Concurrent write stress
   # ---------------------------------------------------------------------------
 
-
   # ---------------------------------------------------------------------------
   # 10. Protocol-level size guards (Elixir dispatcher layer)
   # ---------------------------------------------------------------------------
-
 
   # ===========================================================================
   # 12. Protocol edge cases (TCP layer)
@@ -172,21 +166,17 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     :gen_tcp.recv(sock, 0, timeout)
   end
 
-
   # ===========================================================================
   # 13. Connection edge cases (TCP layer)
   # ===========================================================================
-
 
   # ===========================================================================
   # 14. Data type boundaries over TCP
   # ===========================================================================
 
-
   # ===========================================================================
   # 15. Concurrent access over TCP
   # ===========================================================================
-
 
   # Helper for receiving a pubsub push message on a subscribed socket.
   # In pubsub mode, the server uses active:once and sends data asynchronously.

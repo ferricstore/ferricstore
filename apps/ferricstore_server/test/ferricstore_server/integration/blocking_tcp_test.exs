@@ -554,7 +554,9 @@ defmodule FerricstoreServer.Integration.BlockingTcpTest do
   # ---------------------------------------------------------------------------
 
   describe "BLMOVE wakes on push from another client" do
-    test "client A BLMOVEs, client B RPUSHes to source, client A receives the moved value", %{port: port} do
+    test "client A BLMOVEs, client B RPUSHes to source, client A receives the moved value", %{
+      port: port
+    } do
       src = ukey("blmove_wake_src")
       dst = ukey("blmove_wake_dst")
 

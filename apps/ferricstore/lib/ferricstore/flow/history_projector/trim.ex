@@ -4,7 +4,15 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
 
-  def trim_history_caps(instance_ctx, shard_index, shard_data_path, keydir, file_path, entries, callbacks) do
+  def trim_history_caps(
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        keydir,
+        file_path,
+        entries,
+        callbacks
+      ) do
     cap_requirements =
       history_cap_requirements(entries, fn history_key ->
         callbacks.load_history_max_cap.(history_key, keydir, shard_data_path)
@@ -73,7 +81,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   end
 
   def put_history_cap_requirement(%{history_key: history_key} = entry, acc)
-       when is_binary(history_key) do
+      when is_binary(history_key) do
     state =
       Map.get(acc, history_key, %{
         cap: nil,
@@ -99,8 +107,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   end
 
   def history_cap_from_entry(%{history_max_events: max_events})
-       when is_integer(max_events) and max_events > 0,
-       do: max_events
+      when is_integer(max_events) and max_events > 0,
+      do: max_events
 
   def history_cap_from_entry(_entry), do: nil
 
@@ -130,11 +138,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   def history_cap_required?(%{unknown_version?: true}, _max_events), do: true
 
   def history_cap_required?(%{max_version: version}, max_events)
-       when is_integer(version) and version > max_events,
-       do: true
+      when is_integer(version) and version > max_events,
+      do: true
 
   def history_cap_required?(_state, _max_events), do: false
-
 
   def lmdb_history_over_cap_items(history_key, shard_data_path, max_events) do
     lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
@@ -183,7 +190,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
     end
   end
 
-  def trim_history_hot_cache_by_rank(_instance_ctx, _shard_index, _keydir, [], _callbacks), do: :ok
+  def trim_history_hot_cache_by_rank(_instance_ctx, _shard_index, _keydir, [], _callbacks),
+    do: :ok
 
   def trim_history_hot_cache_by_rank(instance_ctx, shard_index, keydir, entries, callbacks) do
     caps = history_hot_caps(entries)
@@ -246,7 +254,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   end
 
   def direct_hot_history_evict_event_ids(%{history_key: history_key, terminal?: true} = entry)
-       when is_binary(history_key) do
+      when is_binary(history_key) do
     entry
     |> Map.get(:hot_evict_event_ids, [])
     |> List.wrap()
@@ -254,9 +262,9 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   end
 
   def direct_hot_history_evict_event_ids(
-         %{history_key: history_key, history_hot_max_events: 0, event_id: event_id} = entry
-       )
-       when is_binary(history_key) and is_binary(event_id) and event_id != "" do
+        %{history_key: history_key, history_hot_max_events: 0, event_id: event_id} = entry
+      )
+      when is_binary(history_key) and is_binary(event_id) and event_id != "" do
     entry
     |> Map.get(:hot_evict_event_ids, [])
     |> List.wrap()
@@ -266,7 +274,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   end
 
   def direct_hot_history_evict_event_ids(%{history_key: history_key} = entry)
-       when is_binary(history_key) do
+      when is_binary(history_key) do
     entry
     |> Map.get(:hot_evict_event_ids, [])
     |> List.wrap()
@@ -284,17 +292,17 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   def history_hot_direct_or_under_cap?(%{history_hot_max_events: 0}), do: true
 
   def history_hot_direct_or_under_cap?(%{
-         history_hot_max_events: 1,
-         version: version,
-         hot_evict_event_ids: [_ | _]
-       })
-       when is_integer(version) and version > 1,
-       do: true
+        history_hot_max_events: 1,
+        version: version,
+        hot_evict_event_ids: [_ | _]
+      })
+      when is_integer(version) and version > 1,
+      do: true
 
   def history_hot_direct_or_under_cap?(%{history_hot_max_events: max_events, version: version})
-       when is_integer(max_events) and max_events > 0 and is_integer(version) and
-              version <= max_events,
-       do: true
+      when is_integer(max_events) and max_events > 0 and is_integer(version) and
+             version <= max_events,
+      do: true
 
   def history_hot_direct_or_under_cap?(_entry), do: false
 
@@ -317,23 +325,23 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   end
 
   def evict_hot_history_items(
-         [],
-         _instance_ctx,
-         _shard_index,
-         _keydir,
-         _native,
-         _callbacks
-       ),
-       do: :ok
+        [],
+        _instance_ctx,
+        _shard_index,
+        _keydir,
+        _native,
+        _callbacks
+      ),
+      do: :ok
 
   def evict_hot_history_items(
-         items,
-         instance_ctx,
-         shard_index,
-         keydir,
-         native,
-         callbacks
-       ) do
+        items,
+        instance_ctx,
+        shard_index,
+        keydir,
+        native,
+        callbacks
+      ) do
     if native do
       NativeFlowIndex.delete_entries(native, history_delete_entries(items))
     end
@@ -368,7 +376,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   end
 
   def validate_tombstone_locations(locations, expected_count)
-       when is_list(locations) and length(locations) == expected_count do
+      when is_list(locations) and length(locations) == expected_count do
     if Enum.all?(locations, &valid_tombstone_location?/1) do
       :ok
     else
@@ -380,8 +388,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
     do: {:error, {:history_tombstone_batch_result_mismatch, expected_count, locations}}
 
   def valid_tombstone_location?({:delete, offset, record_size})
-       when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size > 0,
-       do: true
+      when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size > 0,
+      do: true
 
   def valid_tombstone_location?(_location), do: false
 

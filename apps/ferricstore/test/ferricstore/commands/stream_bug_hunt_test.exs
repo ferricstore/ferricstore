@@ -241,7 +241,9 @@ defmodule Ferricstore.Commands.StreamBugHuntTest do
 
     test "empty result on non-existent stream" do
       store = MockStore.make()
-      assert [] == Stream.handle("XREVRANGE", ["nope_#{System.unique_integer()}", "+", "-"], store)
+
+      assert [] ==
+               Stream.handle("XREVRANGE", ["nope_#{System.unique_integer()}", "+", "-"], store)
     end
   end
 

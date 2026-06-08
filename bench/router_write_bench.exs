@@ -137,8 +137,7 @@ Benchee.run(
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
-    {Benchee.Formatters.HTML,
-     file: "bench/output/router_single_shard.html", auto_open: false}
+    {Benchee.Formatters.HTML, file: "bench/output/router_single_shard.html", auto_open: false}
   ]
 )
 
@@ -146,7 +145,10 @@ Benchee.run(
 # Section 2: All shards — N concurrent writers, keys distributed across shards
 # ---------------------------------------------------------------------------
 
-IO.puts("\n--- Section 2: All #{shard_count} shards — keys distributed (realistic workload) ---\n")
+IO.puts(
+  "\n--- Section 2: All #{shard_count} shards — keys distributed (realistic workload) ---\n"
+)
+
 IO.puts("This shows the benefit of sharding: #{shard_count} independent write paths.\n")
 
 all_shards_counter = :counters.new(1, [:atomics])
@@ -169,8 +171,7 @@ Benchee.run(
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
-    {Benchee.Formatters.HTML,
-     file: "bench/output/router_all_shards.html", auto_open: false}
+    {Benchee.Formatters.HTML, file: "bench/output/router_all_shards.html", auto_open: false}
   ]
 )
 
@@ -181,6 +182,7 @@ Benchee.run(
 IO.puts("\n--- Section 3: Total writes/second (batches/s × N writers) ---\n")
 
 IO.puts("Calculating from Section 2 results above:\n")
+
 IO.puts(
   String.pad_trailing("writers", 10) <>
     String.pad_trailing("batches/s (above)", 22) <>

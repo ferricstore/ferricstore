@@ -502,7 +502,10 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle_ast({:zmscore, args}, store), do: Reads.zmscore_args(args, store)
   def handle_ast({:zscore, key, member}, store), do: Reads.zscore_member(key, member, store)
   def handle_ast({:zrank, key, member}, store), do: Reads.zrank_member(key, member, false, store)
-  def handle_ast({:zrevrank, key, member}, store), do: Reads.zrank_member(key, member, true, store)
+
+  def handle_ast({:zrevrank, key, member}, store),
+    do: Reads.zrank_member(key, member, true, store)
+
   def handle_ast({:zcard, key}, store), do: Reads.zcard_key(key, store)
 
   def handle_ast({:zincrby, _key, {:error, reason}, _member}, _store), do: {:error, reason}
@@ -539,7 +542,9 @@ defmodule Ferricstore.Commands.SortedSet do
     do: Reads.zrandmember_parsed(key, count, with_scores, store)
 
   def handle_ast({:zscan, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:zscan, key, cursor, opts}, store), do: Reads.zscan_parsed(key, cursor, opts, store)
+
+  def handle_ast({:zscan, key, cursor, opts}, store),
+    do: Reads.zscan_parsed(key, cursor, opts, store)
 
   def handle_ast({:zrangebyscore, _key, {:error, reason}}, _store), do: {:error, reason}
   def handle_ast({:zrevrangebyscore, _key, {:error, reason}}, _store), do: {:error, reason}
@@ -844,7 +849,8 @@ defmodule Ferricstore.Commands.SortedSet do
           key
           |> load_members(store)
           |> Enum.count(fn {_member, score} ->
-            Helpers.score_gte_bound?(score, min_bound) and Helpers.score_lte_bound?(score, max_bound)
+            Helpers.score_gte_bound?(score, min_bound) and
+              Helpers.score_lte_bound?(score, max_bound)
           end)
       end
     end
@@ -928,7 +934,8 @@ defmodule Ferricstore.Commands.SortedSet do
           key
           |> load_members(store)
           |> Enum.filter(fn {_member, score} ->
-            Helpers.score_gte_bound?(score, min_bound) and Helpers.score_lte_bound?(score, max_bound)
+            Helpers.score_gte_bound?(score, min_bound) and
+              Helpers.score_lte_bound?(score, max_bound)
           end)
           |> sort_members(reverse?)
       end
@@ -971,5 +978,4 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp sort_members(members, true), do: members |> sort_members(false) |> Enum.reverse()
-
 end

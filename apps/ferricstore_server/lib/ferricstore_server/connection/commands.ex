@@ -184,7 +184,7 @@ defmodule FerricstoreServer.Connection.Commands do
   def hello_auth_args_after_version([], auth), do: {:ok, auth}
 
   def hello_auth_args_after_version([option, username, password | rest], _auth)
-       when is_binary(option) and is_binary(username) and is_binary(password) do
+      when is_binary(option) and is_binary(username) and is_binary(password) do
     case String.upcase(option) do
       "AUTH" -> hello_auth_args_after_version(rest, {username, password})
       _other -> {:error, "ERR Syntax error in HELLO option '#{option}'"}

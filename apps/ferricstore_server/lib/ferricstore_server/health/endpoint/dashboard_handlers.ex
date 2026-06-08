@@ -181,7 +181,15 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
         |> Dashboard.collect_flow_page()
 
       body = data |> Dashboard.live_flow_payload() |> Jason.encode!()
-      Response.send_response(socket, transport, 200, "OK", "application/json; charset=utf-8", body)
+
+      Response.send_response(
+        socket,
+        transport,
+        200,
+        "OK",
+        "application/json; charset=utf-8",
+        body
+      )
     end
   end
 

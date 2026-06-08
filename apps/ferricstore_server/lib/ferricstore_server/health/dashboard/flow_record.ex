@@ -21,8 +21,11 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
     end
   end
 
-  def flow_record_parent_id(record), do: flow_first_non_empty_binary(record, [:parent_flow_id, :parent_id])
-  def flow_record_root_id(record), do: flow_first_non_empty_binary(record, [:root_flow_id, :root_id])
+  def flow_record_parent_id(record),
+    do: flow_first_non_empty_binary(record, [:parent_flow_id, :parent_id])
+
+  def flow_record_root_id(record),
+    do: flow_first_non_empty_binary(record, [:root_flow_id, :root_id])
 
   def flow_record_correlation_id(record),
     do: flow_first_non_empty_binary(record, [:correlation_id, :correlation])
@@ -112,13 +115,26 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
     worker = flow_record_worker(record)
 
     cond do
-      state in @flow_terminal_states -> "terminal: #{state}"
-      state == "running" and flow_expired_lease?(record) -> "lease expired; reclaimable by workers"
-      state == "running" and is_binary(worker) and worker != "" -> "leased by #{worker}"
-      state == "running" -> "running without worker metadata"
-      is_integer(run_at) and run_at > now -> "scheduled for future"
-      state == "queued" -> "due now, waiting for worker claim"
-      true -> "waiting in #{state}"
+      state in @flow_terminal_states ->
+        "terminal: #{state}"
+
+      state == "running" and flow_expired_lease?(record) ->
+        "lease expired; reclaimable by workers"
+
+      state == "running" and is_binary(worker) and worker != "" ->
+        "leased by #{worker}"
+
+      state == "running" ->
+        "running without worker metadata"
+
+      is_integer(run_at) and run_at > now ->
+        "scheduled for future"
+
+      state == "queued" ->
+        "due now, waiting for worker claim"
+
+      true ->
+        "waiting in #{state}"
     end
   end
 
@@ -139,7 +155,8 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
   end
 
   def flow_retrying?(record),
-    do: flow_record_attempts(record) > 0 and flow_record_state(record) not in @flow_terminal_states
+    do:
+      flow_record_attempts(record) > 0 and flow_record_state(record) not in @flow_terminal_states
 
   def flow_failed?(record), do: flow_record_state(record) == "failed"
 

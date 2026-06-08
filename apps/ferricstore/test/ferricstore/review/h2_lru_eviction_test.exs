@@ -35,7 +35,7 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
       far_future = System.os_time(:millisecond) + 3_600_000
 
       # Stale keys: ldt 100 minutes ago.
-      old_ldt = (LFU.now_minutes() - 100) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 100 &&& 0xFFFF
       old_lfu = LFU.pack(old_ldt, 5)
 
       for i <- 0..4 do
@@ -50,12 +50,12 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
       end
 
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 60_000,
           max_memory_bytes: 1,
           shard_count: 4,
           eviction_policy: :volatile_lru
-        ])
+        )
 
       send(pid, :check)
       Process.sleep(200)
@@ -86,7 +86,7 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
     test "stale keys are evicted before recently-accessed keys" do
       far_future = System.os_time(:millisecond) + 3_600_000
 
-      old_ldt = (LFU.now_minutes() - 100) &&& 0xFFFF
+      old_ldt = LFU.now_minutes() - 100 &&& 0xFFFF
       old_lfu = LFU.pack(old_ldt, 5)
 
       for i <- 0..4 do
@@ -100,12 +100,12 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
       end
 
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 60_000,
           max_memory_bytes: 1,
           shard_count: 4,
           eviction_policy: :allkeys_lru
-        ])
+        )
 
       send(pid, :check)
       Process.sleep(200)

@@ -26,79 +26,97 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
 
     # Pre-populate 1000 keys via Router.put (goes through Raft)
     for i <- 1..1000 do
-      Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{i}", String.duplicate("v", 100), 0)
+      Router.put(
+        FerricStore.Instance.get(:default),
+        "#{prefix}:#{i}",
+        String.duplicate("v", 100),
+        0
+      )
     end
+
     Process.sleep(200)
 
     key = "#{prefix}:500"
     idx = Router.shard_for(FerricStore.Instance.get(:default), key)
     keydir = Router.resolve_keydir(FerricStore.Instance.get(:default), idx)
 
-    IO.puts("\n=== Read Path Per-Layer Cost (#{@iterations} iters, production sample_rate=100) ===\n")
+    IO.puts(
+      "\n=== Read Path Per-Layer Cost (#{@iterations} iters, production sample_rate=100) ===\n"
+    )
 
     # 1. Full Router.get
-    {router_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Router.get(FerricStore.Instance.get(:default), key)
-    end)
+    {router_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations, do: Router.get(FerricStore.Instance.get(:default), key)
+      end)
 
     # 2. Direct ETS lookup only
-    {ets_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations do
-        case :ets.lookup(keydir, key) do
-          [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil -> value
-          _ -> nil
+    {ets_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations do
+          case :ets.lookup(keydir, key) do
+            [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil -> value
+            _ -> nil
+          end
         end
-      end
-    end)
+      end)
 
     # 3. shard_for
-    {hash_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Router.shard_for(FerricStore.Instance.get(:default), key)
-    end)
+    {hash_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations, do: Router.shard_for(FerricStore.Instance.get(:default), key)
+      end)
 
     # 4. Stats.incr_keyspace_hits
-    {hits_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Stats.incr_keyspace_hits()
-    end)
+    {hits_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations, do: Stats.incr_keyspace_hits()
+      end)
 
     # 5. maybe_record_hot_read (at sample_rate=100, ~1% actually records)
     # We measure the sampling check + occasional recording
     rate = :persistent_term.get(:ferricstore_read_sample_rate, 100)
-    {hot_read_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations do
-        if rate <= 1 or :rand.uniform(rate) == 1 do
-          Stats.record_hot_read(key)
+
+    {hot_read_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations do
+          if rate <= 1 or :rand.uniform(rate) == 1 do
+            Stats.record_hot_read(key)
+          end
         end
-      end
-    end)
+      end)
 
     # 6. maybe_lfu_touch (at sample_rate=100)
     [{^key, _v, _e, packed_lfu, _f, _o, _vs}] = :ets.lookup(keydir, key)
-    {lfu_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations do
-        if rate <= 1 or :rand.uniform(rate) == 1 do
-          LFU.touch(keydir, key, packed_lfu)
+
+    {lfu_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations do
+          if rate <= 1 or :rand.uniform(rate) == 1 do
+            LFU.touch(keydir, key, packed_lfu)
+          end
         end
-      end
-    end)
+      end)
 
     # 7. Just the sampling overhead (2x persistent_term.get + 2x rand.uniform)
-    {sample_overhead_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations do
-        r1 = :persistent_term.get(:ferricstore_read_sample_rate, 100)
-        _ = :rand.uniform(r1)
-        r2 = :persistent_term.get(:ferricstore_read_sample_rate, 100)
-        _ = :rand.uniform(r2)
-      end
-    end)
+    {sample_overhead_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations do
+          r1 = :persistent_term.get(:ferricstore_read_sample_rate, 100)
+          _ = :rand.uniform(r1)
+          r2 = :persistent_term.get(:ferricstore_read_sample_rate, 100)
+          _ = :rand.uniform(r2)
+        end
+      end)
 
     # 8. Single persistent_term.get + single rand.uniform (proposed)
-    {sample_single_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations do
-        r = :persistent_term.get(:ferricstore_read_sample_rate, 100)
-        _ = :rand.uniform(r)
-      end
-    end)
+    {sample_single_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..@iterations do
+          r = :persistent_term.get(:ferricstore_read_sample_rate, 100)
+          _ = :rand.uniform(r)
+        end
+      end)
 
     router_ns = div(router_us * 1000, @iterations)
     ets_ns = div(ets_us * 1000, @iterations)
@@ -109,7 +127,10 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
     sample_overhead_ns = div(sample_overhead_us * 1000, @iterations)
     sample_single_ns = div(sample_single_us * 1000, @iterations)
 
-    IO.puts("  #{String.pad_trailing("Layer", 45)} #{String.pad_leading("ns/op", 8)} #{String.pad_leading("% of total", 10)}")
+    IO.puts(
+      "  #{String.pad_trailing("Layer", 45)} #{String.pad_leading("ns/op", 8)} #{String.pad_leading("% of total", 10)}"
+    )
+
     IO.puts("  #{String.duplicate("-", 68)}")
 
     layers = [
@@ -126,7 +147,10 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
 
     for {label, ns} <- layers do
       pct = if router_ns > 0, do: Float.round(ns / router_ns * 100, 1), else: 0.0
-      IO.puts("  #{String.pad_trailing(label, 45)} #{String.pad_leading("#{ns}ns", 8)} #{String.pad_leading("#{pct}%", 10)}")
+
+      IO.puts(
+        "  #{String.pad_trailing(label, 45)} #{String.pad_leading("#{ns}ns", 8)} #{String.pad_leading("#{pct}%", 10)}"
+      )
     end
   end
 
@@ -134,25 +158,37 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
     prefix = "rppt_thr_#{System.unique_integer([:positive])}"
 
     for i <- 1..10_000 do
-      Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{i}", String.duplicate("v", 100), 0)
+      Router.put(
+        FerricStore.Instance.get(:default),
+        "#{prefix}:#{i}",
+        String.duplicate("v", 100),
+        0
+      )
     end
+
     Process.sleep(300)
 
     counter = :counters.new(1, [:atomics])
     stop = :atomics.new(1, [])
 
-    tasks = for _ <- 1..50 do
-      Task.async(fn ->
-        l = fn l ->
-          if :atomics.get(stop, 1) == 1, do: throw(:stop)
-          key = "#{prefix}:#{:rand.uniform(10_000)}"
-          Router.get(FerricStore.Instance.get(:default), key)
-          :counters.add(counter, 1, 1)
-          l.(l)
-        end
-        try do l.(l) catch :throw, :stop -> :ok end
-      end)
-    end
+    tasks =
+      for _ <- 1..50 do
+        Task.async(fn ->
+          l = fn l ->
+            if :atomics.get(stop, 1) == 1, do: throw(:stop)
+            key = "#{prefix}:#{:rand.uniform(10_000)}"
+            Router.get(FerricStore.Instance.get(:default), key)
+            :counters.add(counter, 1, 1)
+            l.(l)
+          end
+
+          try do
+            l.(l)
+          catch
+            :throw, :stop -> :ok
+          end
+        end)
+      end
 
     Process.sleep(3_000)
     :atomics.put(stop, 1, 1)

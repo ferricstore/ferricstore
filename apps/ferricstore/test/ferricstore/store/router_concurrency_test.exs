@@ -34,7 +34,9 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
   describe "router key distribution" do
     test "keys are distributed across multiple shards" do
       shard_assignments =
-        Enum.group_by(0..99, fn i -> Router.shard_for(FerricStore.Instance.get(:default), "key_#{i}") end)
+        Enum.group_by(0..99, fn i ->
+          Router.shard_for(FerricStore.Instance.get(:default), "key_#{i}")
+        end)
 
       shard_count = map_size(shard_assignments)
 
@@ -55,7 +57,9 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
     test "shard_for distributes 1000 keys across all 4 shards" do
       shard_assignments =
-        Enum.group_by(0..999, fn i -> Router.shard_for(FerricStore.Instance.get(:default), "key_#{i}") end)
+        Enum.group_by(0..999, fn i ->
+          Router.shard_for(FerricStore.Instance.get(:default), "key_#{i}")
+        end)
 
       for shard_idx <- 0..3 do
         assert Map.has_key?(shard_assignments, shard_idx),
@@ -96,7 +100,9 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
     test "slot_for distributes keys across many slots" do
       slot_assignments =
-        Enum.group_by(0..999, fn i -> Router.slot_for(FerricStore.Instance.get(:default), "key_#{i}") end)
+        Enum.group_by(0..999, fn i ->
+          Router.slot_for(FerricStore.Instance.get(:default), "key_#{i}")
+        end)
 
       assert map_size(slot_assignments) > 100,
              "Expected 1000 keys to cover many slots, " <>
@@ -176,6 +182,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       # Shard processes are all still alive
       for i <- 0..3 do
         name = Router.shard_name(FerricStore.Instance.get(:default), i)
+
         assert Process.alive?(Process.whereis(name)),
                "Shard #{i} (#{name}) died during concurrent operations"
       end

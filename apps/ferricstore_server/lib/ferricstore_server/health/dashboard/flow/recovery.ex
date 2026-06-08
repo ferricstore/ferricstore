@@ -35,7 +35,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
     records =
       sampled_records
-      |> merge_flow_records(DashboardAccess.filter_flow_records_for_acl(queried_records, acl_username))
+      |> merge_flow_records(
+        DashboardAccess.filter_flow_records_for_acl(queried_records, acl_username)
+      )
       |> filter_flow_records_by_type(filters.type)
       |> filter_flow_records_by_partition(filters.partition_key)
       |> filter_flow_records_by_name(filters.q)
@@ -179,7 +181,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
   end
 
   @spec flow_recovery_query_records(map(), [binary()]) ::
-          {[map()], %{failures: :ok | :skipped | {:error, term()}, stuck: :ok | :skipped | {:error, term()}}}
+          {[map()],
+           %{
+             failures: :ok | :skipped | {:error, term()},
+             stuck: :ok | :skipped | {:error, term()}
+           }}
   defp flow_recovery_query_records(%{type: type} = filters, _available_types)
        when is_binary(type) and type != "" do
     flow_recovery_query_records_for_types([type], filters)
@@ -192,7 +198,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
   end
 
   @spec flow_recovery_query_records_for_types([binary()], map()) ::
-          {[map()], %{failures: :ok | :skipped | {:error, term()}, stuck: :ok | :skipped | {:error, term()}}}
+          {[map()],
+           %{
+             failures: :ok | :skipped | {:error, term()},
+             stuck: :ok | :skipped | {:error, term()}
+           }}
   defp flow_recovery_query_records_for_types(types, filters) do
     timeout_ms = flow_dashboard_list_fetch_timeout_ms()
 
@@ -226,7 +236,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
     end)
   end
 
-  @spec flow_recovery_exact_source((-> term()), non_neg_integer()) :: {[map()], :ok | {:error, term()}}
+  @spec flow_recovery_exact_source((-> term()), non_neg_integer()) ::
+          {[map()], :ok | {:error, term()}}
   defp flow_recovery_exact_source(fun, timeout_ms) do
     case bounded_dashboard_call(fun, timeout_ms, :flow_recovery_exact) do
       {:ok, {:ok, records}} when is_list(records) -> {records, :ok}
@@ -301,9 +312,14 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
       _ ->
         case Integer.parse(value) do
-          {parsed, ""} when parsed >= 1 and parsed <= max_value -> {:ok, parsed}
-          {parsed, ""} when parsed > max_value -> {:error, "ERR #{key} exceeds maximum #{max_value}"}
-          _ -> {:error, "ERR #{key} must be a positive integer"}
+          {parsed, ""} when parsed >= 1 and parsed <= max_value ->
+            {:ok, parsed}
+
+          {parsed, ""} when parsed > max_value ->
+            {:error, "ERR #{key} exceeds maximum #{max_value}"}
+
+          _ ->
+            {:error, "ERR #{key} must be a positive integer"}
         end
     end
   end

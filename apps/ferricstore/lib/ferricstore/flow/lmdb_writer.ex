@@ -1,5 +1,20 @@
 defmodule Ferricstore.Flow.LMDBWriter do
-  @moduledoc false
+  @moduledoc """
+  Async Flow projection writer for LMDB.
+
+  This module is a boundary between durable Flow truth and cold/query indexes.
+  Raft + Bitcask state/history records are the source of truth. `LMDBWriter`
+  consumes queued projection ops after the hot apply path and batches them into
+  LMDB so history, terminal, lineage, and value-ref queries can catch up without
+  blocking normal Flow writes.
+
+  ## Performance boundary
+
+  This is still a hot-adjacent module: enqueue cost is paid by Flow create,
+  transition, terminal, retention, and history paths. Keep enqueue functions
+  allocation-light and avoid extra processes/calls in request paths. Refactors
+  here need DBOS/Flow benchmark comparison.
+  """
 
   alias Ferricstore.Flow.LMDBWriter.AfterFlush
   alias Ferricstore.Flow.LMDBWriter.EnqueueControl

@@ -210,6 +210,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              )
 
     wait_terminal_removed!(id, "tenant-retention")
+
     assert {:ok, [%{large: large_blob_after_terminal_expiry}]} =
              FerricStore.flow_value_mget([created.payload_ref])
 
@@ -240,6 +241,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
              )
 
     wait_terminal_removed!(id, "tenant-retention")
+
     assert {:ok, [%{large: large_blob_after_terminal_expiry}]} =
              FerricStore.flow_value_mget([created.payload_ref])
 

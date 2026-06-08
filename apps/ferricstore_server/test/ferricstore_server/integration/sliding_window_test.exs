@@ -475,7 +475,9 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
       values = for i <- 1..10, do: "val_#{i}"
 
       # Pipeline: 10 SETs then 10 GETs
-      set_cmds = Enum.zip(keys, values) |> Enum.map(fn {k, v} -> Encoder.encode(["SET", k, v]) end)
+      set_cmds =
+        Enum.zip(keys, values) |> Enum.map(fn {k, v} -> Encoder.encode(["SET", k, v]) end)
+
       get_cmds = Enum.map(keys, fn k -> Encoder.encode(["GET", k]) end)
 
       pipeline = IO.iodata_to_binary(set_cmds ++ get_cmds)

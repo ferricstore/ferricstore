@@ -1,5 +1,10 @@
-Code.require_file("prob_bug_hunt_test/sections/probabilistic_direct_writes_surface_directory_fsync_failures.exs", __DIR__)
+Code.require_file(
+  "prob_bug_hunt_test/sections/probabilistic_direct_writes_surface_directory_fsync_failures.exs",
+  __DIR__
+)
+
 Code.require_file("prob_bug_hunt_test/sections/cms_edge_cases.exs", __DIR__)
+
 defmodule Ferricstore.Commands.ProbBugHuntTest do
   @moduledoc """
   Bug-hunting tests for the four probabilistic data structure command
@@ -48,55 +53,33 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
   alias Ferricstore.Commands.TopK
   alias Ferricstore.Test.MockStore
 
-
-
   # ===========================================================================
   # Bloom filter (BF.*)
   # ===========================================================================
-
-
-
-
-
 
   # ===========================================================================
   # Cuckoo filter (CF.*)
   # ===========================================================================
 
-
-
-
   # ===========================================================================
   # Count-Min Sketch (CMS.*)
   # ===========================================================================
-
-
-
 
   # ===========================================================================
   # Top-K (TOPK.*)
   # ===========================================================================
 
-
-
   # ===========================================================================
   # All commands on non-existent key
   # ===========================================================================
-
 
   # ===========================================================================
   # Wrong-type key access
   # ===========================================================================
 
-
-
   # ===========================================================================
   # Additional edge cases
   # ===========================================================================
-
-
-
-
 
   # ===========================================================================
   # Helpers

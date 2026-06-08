@@ -116,7 +116,13 @@ defmodule Ferricstore.Flow.LMDB.Cold do
     _ -> :error
   end
 
-  def encode_value_locator(value_ref, owner_flow_id, owner_version, %Locator{kind: :value} = locator, attrs \\ [])
+  def encode_value_locator(
+        value_ref,
+        owner_flow_id,
+        owner_version,
+        %Locator{kind: :value} = locator,
+        attrs \\ []
+      )
       when is_binary(value_ref) and is_binary(owner_flow_id) and is_integer(owner_version) and
              owner_version >= 0 and (is_map(attrs) or is_list(attrs)) do
     attrs = Map.new(attrs)

@@ -74,7 +74,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
     type_records =
       records
-      |> merge_flow_records(DashboardAccess.filter_flow_records_for_acl(terminal_records, acl_username))
+      |> merge_flow_records(
+        DashboardAccess.filter_flow_records_for_acl(terminal_records, acl_username)
+      )
       |> filter_flow_records_by_type(filters.type)
 
     filtered_records = filter_flow_records(type_records, filters)
@@ -110,11 +112,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     |> maybe_put_query_opt(:range, normalize_flow_range_filter(Map.get(params, "range")))
     |> maybe_put_query_opt(
       :from_ms,
-      parse_flow_time_filter(Map.get(params, "from_ms") || Map.get(params, "from") || Map.get(params, "from_at"))
+      parse_flow_time_filter(
+        Map.get(params, "from_ms") || Map.get(params, "from") || Map.get(params, "from_at")
+      )
     )
     |> maybe_put_query_opt(
       :to_ms,
-      parse_flow_time_filter(Map.get(params, "to_ms") || Map.get(params, "to") || Map.get(params, "to_at"))
+      parse_flow_time_filter(
+        Map.get(params, "to_ms") || Map.get(params, "to") || Map.get(params, "to_at")
+      )
     )
     |> maybe_put_query_opt(:limit, normalize_flow_limit_filter(Map.get(params, "limit")))
     |> Enum.reverse()
@@ -136,7 +142,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   end
 
   @spec states_page_limit(map()) :: pos_integer()
-  def states_page_limit(data) when is_map(data), do: Map.get(data, :limit, @flow_dashboard_recent_limit)
+  def states_page_limit(data) when is_map(data),
+    do: Map.get(data, :limit, @flow_dashboard_recent_limit)
 
   @spec collect_workers_page(keyword()) :: map()
   def collect_workers_page(opts \\ []) do
@@ -176,19 +183,25 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     else
       filters
       |> flow_states_terminal_fetch_types(available_types)
-      |> flow_fetch_terminal_records(terminal_states, max(filters.limit, @flow_dashboard_sample_limit))
+      |> flow_fetch_terminal_records(
+        terminal_states,
+        max(filters.limit, @flow_dashboard_sample_limit)
+      )
     end
   end
 
-  defp flow_states_terminal_fetch_states(%{state: state}) when state in @flow_terminal_states, do: [state]
+  defp flow_states_terminal_fetch_states(%{state: state}) when state in @flow_terminal_states,
+    do: [state]
 
-  defp flow_states_terminal_fetch_states(%{state: nil, type: type}) when is_binary(type) and type != "",
-    do: @flow_terminal_states
+  defp flow_states_terminal_fetch_states(%{state: nil, type: type})
+       when is_binary(type) and type != "",
+       do: @flow_terminal_states
 
   defp flow_states_terminal_fetch_states(_filters), do: []
 
-  defp flow_states_terminal_fetch_types(%{type: type}, _available_types) when is_binary(type) and type != "",
-    do: [type]
+  defp flow_states_terminal_fetch_types(%{type: type}, _available_types)
+       when is_binary(type) and type != "",
+       do: [type]
 
   defp flow_states_terminal_fetch_types(_filters, available_types), do: available_types
 
@@ -217,7 +230,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
       else
         case flow_dashboard_terminal_records(type, state, remaining) do
           {:ok, records} ->
-            {:cont, {prepend_flow_dashboard_chunk(records, acc), max(remaining - length(records), 0)}}
+            {:cont,
+             {prepend_flow_dashboard_chunk(records, acc), max(remaining - length(records), 0)}}
 
           {:error, _reason} ->
             {:cont, {acc, remaining}}
@@ -231,7 +245,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   defp flow_dashboard_terminal_records(type, state, limit) do
     opts = [state: state, count: limit, include_cold: true, consistent_projection: true]
 
-    case bounded_dashboard_call(fn -> flow_dashboard_flow_list(type, opts) end, flow_dashboard_list_fetch_timeout_ms(), :terminal_records) do
+    case bounded_dashboard_call(
+           fn -> flow_dashboard_flow_list(type, opts) end,
+           flow_dashboard_list_fetch_timeout_ms(),
+           :terminal_records
+         ) do
       {:ok, {:ok, records}} when is_list(records) -> {:ok, records}
       {:ok, {:error, reason}} -> {:error, reason}
       {:ok, other} -> {:error, {:unexpected_flow_list_result, other}}

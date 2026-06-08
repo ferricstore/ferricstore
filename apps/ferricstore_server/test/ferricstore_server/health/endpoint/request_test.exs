@@ -7,8 +7,8 @@ defmodule FerricstoreServer.Health.Endpoint.RequestTest do
     request = "POST /dashboard/action HTTP/1.1\r\nContent-Length: 4\r\nX-Test: yes\r\n\r\nbody"
 
     assert Request.parse_request_line(request) ==
-             {:ok, "POST", "/dashboard/action",
-              %{"content-length" => "4", "x-test" => "yes"}, "body"}
+             {:ok, "POST", "/dashboard/action", %{"content-length" => "4", "x-test" => "yes"},
+              "body"}
   end
 
   test "parse_request_line rejects malformed request lines" do

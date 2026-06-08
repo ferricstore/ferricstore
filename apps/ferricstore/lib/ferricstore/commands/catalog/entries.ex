@@ -723,7 +723,6 @@ defmodule Ferricstore.Commands.Catalog.Entries do
     }
   ]
 
-
   @commands_by_name Map.new(@commands, fn cmd -> {cmd.name, cmd} end)
   @commands_by_upper Map.new(@commands, fn cmd -> {String.upcase(cmd.name), cmd} end)
 

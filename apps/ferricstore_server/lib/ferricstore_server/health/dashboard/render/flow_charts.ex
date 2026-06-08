@@ -1,9 +1,8 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.Render.FlowHistory
 
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.Render.FlowHistory
-
-@flow_dashboard_timeline_chart_max_events 80
+  @flow_dashboard_timeline_chart_max_events 80
 
   def render_flow_issue_cards(summary) do
     due_now = Map.get(summary, :due_now_sampled, 0)
@@ -266,7 +265,7 @@ import FerricstoreServer.Health.Dashboard.Render.FlowHistory
   end
 
   def flow_timeline_x(row, index, count, %{min_time: min_time, max_time: max_time} = layout)
-       when is_integer(min_time) and is_integer(max_time) and max_time > min_time do
+      when is_integer(min_time) and is_integer(max_time) and max_time > min_time do
     case row.time_ms do
       time when is_integer(time) ->
         layout.left + round((time - min_time) / max(max_time - min_time, 1) * layout.plot_width)
@@ -438,7 +437,7 @@ import FerricstoreServer.Health.Dashboard.Render.FlowHistory
   end
 
   def flow_timeline_duration_ms(%{time_ms: start_ms}, %{time_ms: end_ms})
-       when is_integer(start_ms) and is_integer(end_ms) and end_ms >= start_ms do
+      when is_integer(start_ms) and is_integer(end_ms) and end_ms >= start_ms do
     end_ms - start_ms
   end
 

@@ -58,8 +58,10 @@ defmodule Ferricstore.Store.Shard.RotationFsyncTest do
 
       assert new_state.active_file_id == 1,
              "rotation must bump active_file_id"
+
       assert new_state.active_file_path != active_path,
              "rotation must change active_file_path"
+
       assert File.exists?(new_state.active_file_path),
              "new active file must exist on disk"
 
@@ -68,12 +70,14 @@ defmodule Ferricstore.Store.Shard.RotationFsyncTest do
 
       assert Enum.any?(events, fn m -> m[:kind] == :old_file end),
              "expected :old_file rotation_fsync event, got #{inspect(events)}"
+
       assert Enum.any?(events, fn m -> m[:kind] == :new_dir end),
              "expected :new_dir rotation_fsync event, got #{inspect(events)}"
 
       # old_file must precede new_dir in emission order
       old_idx = Enum.find_index(events, fn m -> m[:kind] == :old_file end)
       new_idx = Enum.find_index(events, fn m -> m[:kind] == :new_dir end)
+
       assert old_idx < new_idx,
              "old_file fsync must precede new_dir fsync; got events: #{inspect(events)}"
     end

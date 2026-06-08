@@ -1,12 +1,19 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
+  import FerricstoreServer.Health.Dashboard.Format
 
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.FlowRecord, except: [flow_named_value_refs: 1, flow_value_ref_entries: 2, normalize_flow_named_value_refs: 1, normalize_flow_value_ref: 1]
+  import FerricstoreServer.Health.Dashboard.FlowRecord,
+    except: [
+      flow_named_value_refs: 1,
+      flow_value_ref_entries: 2,
+      normalize_flow_named_value_refs: 1,
+      normalize_flow_value_ref: 1
+    ]
+
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory
   import FerricstoreServer.Health.Dashboard.Render.FlowTables
 
-@flow_dashboard_value_ref_limit 40
-@flow_terminal_states ~w(completed failed cancelled)
+  @flow_dashboard_value_ref_limit 40
+  @flow_terminal_states ~w(completed failed cancelled)
 
   def flow_record_status_label(record) do
     state = flow_record_state(record)
@@ -23,12 +30,12 @@ import FerricstoreServer.Health.Dashboard.FlowRecord, except: [flow_named_value_
   end
 
   def render_flow_detail_flash(%{flash: %{kind: :ok, message: message}})
-       when is_binary(message) do
+      when is_binary(message) do
     ~s(<div class="flow-alert flow-alert-ok">#{escape(message)}</div>)
   end
 
   def render_flow_detail_flash(%{flash: %{kind: :error, message: message}})
-       when is_binary(message) do
+      when is_binary(message) do
     ~s(<div class="flow-alert flow-alert-error">#{escape(message)}</div>)
   end
 
@@ -88,7 +95,7 @@ import FerricstoreServer.Health.Dashboard.FlowRecord, except: [flow_named_value_
   end
 
   def render_flow_detail_signals(%{record: %{} = record, history: history})
-       when is_list(history) do
+      when is_list(history) do
     rows = flow_signal_rows(record, history)
 
     render_flow_signals_table(rows, nil, nil, nil, %{}, :detail)
@@ -195,7 +202,7 @@ import FerricstoreServer.Health.Dashboard.FlowRecord, except: [flow_named_value_
   def render_flow_rewind_action(_data), do: ""
 
   def render_flow_rewind_partition_input(partition_key)
-       when is_binary(partition_key) and partition_key != "" do
+      when is_binary(partition_key) and partition_key != "" do
     ~s(<input type="hidden" name="partition_key" value="#{escape_attr(partition_key)}">)
   end
 
@@ -566,5 +573,4 @@ import FerricstoreServer.Health.Dashboard.FlowRecord, except: [flow_named_value_
 
     "#{event_id}: #{flow_history_event_label(fields)} #{flow_history_state_move(fields)}"
   end
-
 end

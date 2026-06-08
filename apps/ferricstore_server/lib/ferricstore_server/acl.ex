@@ -82,8 +82,16 @@ defmodule FerricstoreServer.Acl do
 
   require Logger
 
-  alias FerricstoreServer.Acl.{CommandCategories, Formatter, Password, Persistence, Rules, Tables, Patterns, Protection}
-
+  alias FerricstoreServer.Acl.{
+    CommandCategories,
+    Formatter,
+    Password,
+    Persistence,
+    Rules,
+    Tables,
+    Patterns,
+    Protection
+  }
 
   # ---------------------------------------------------------------------------
   # Types
@@ -494,13 +502,15 @@ defmodule FerricstoreServer.Acl do
     - `false` otherwise
   """
   @spec key_matches_any?(binary(), :read | :write, [key_pattern()]) :: boolean()
-  def key_matches_any?(key, access_type, patterns), do: Patterns.key_matches_any?(key, access_type, patterns)
+  def key_matches_any?(key, access_type, patterns),
+    do: Patterns.key_matches_any?(key, access_type, patterns)
 
   @doc """
   Returns true if the Pub/Sub channel matches any ACL channel pattern.
   """
   @spec channel_matches_any?(binary(), [channel_pattern()]) :: boolean()
-  def channel_matches_any?(channel, patterns), do: Patterns.channel_matches_any?(channel, patterns)
+  def channel_matches_any?(channel, patterns),
+    do: Patterns.channel_matches_any?(channel, patterns)
 
   @doc """
   Compiles a Redis ACL glob pattern into a regular expression.
@@ -725,11 +735,13 @@ defmodule FerricstoreServer.Acl do
   @spec localhost?({:inet.ip_address(), :inet.port_number()} | nil) :: boolean()
   def localhost?(peer), do: Protection.localhost?(peer)
 
-  @spec check_protected_mode({:inet.ip_address(), :inet.port_number()} | nil) :: :ok | {:error, binary()}
+  @spec check_protected_mode({:inet.ip_address(), :inet.port_number()} | nil) ::
+          :ok | {:error, binary()}
   def check_protected_mode(peer), do: Protection.check_protected_mode(peer)
 
   @spec log_command_denied(binary(), binary(), binary(), term()) :: :ok
-  def log_command_denied(username, command, client_ip, client_id), do: Protection.log_command_denied(username, command, client_ip, client_id)
+  def log_command_denied(username, command, client_ip, client_id),
+    do: Protection.log_command_denied(username, command, client_ip, client_id)
 
   # ---------------------------------------------------------------------------
   # GenServer callbacks
@@ -891,7 +903,6 @@ defmodule FerricstoreServer.Acl do
   # ---------------------------------------------------------------------------
   # Private -- password hashing (Fix 1)
   # ---------------------------------------------------------------------------
-
 
   @spec maybe_schedule_auto_save(map()) :: map()
   defp maybe_schedule_auto_save(state) do

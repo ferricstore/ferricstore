@@ -70,7 +70,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
         %{kind: :ok, message: "Policy saved", type: type}
 
       "error" ->
-        message = params |> Map.get("message", "Policy update failed") |> flow_policy_clean_form_value()
+        message =
+          params |> Map.get("message", "Policy update failed") |> flow_policy_clean_form_value()
+
         %{kind: :error, message: message}
 
       _ ->
@@ -82,9 +84,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
   def collect_retention_page(opts \\ []) when is_list(opts) do
     now_ms = System.system_time(:millisecond)
-    limit = flow_retention_limit!(Keyword.get(opts, :limit, @flow_dashboard_retention_default_limit))
+
+    limit =
+      flow_retention_limit!(Keyword.get(opts, :limit, @flow_dashboard_retention_default_limit))
+
     sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
-    records = DashboardAccess.filter_flow_records_for_acl(sampled_records, DashboardAccess.keyspace_acl_username(opts))
+
+    records =
+      DashboardAccess.filter_flow_records_for_acl(
+        sampled_records,
+        DashboardAccess.keyspace_acl_username(opts)
+      )
+
     candidates = flow_retention_candidates(records, now_ms)
     terminal_sampled = Enum.count(records, &flow_retention_terminal_record?/1)
 
@@ -97,7 +108,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       terminal_sampled: terminal_sampled,
       active_sampled: max(length(records) - terminal_sampled, 0),
       eligible_sampled: length(candidates),
-      candidates: candidates |> Enum.take(min(limit, @flow_dashboard_retention_candidate_preview_limit)),
+      candidates:
+        candidates |> Enum.take(min(limit, @flow_dashboard_retention_candidate_preview_limit)),
       storage: Operational.collect_storage_summary(),
       projection: FerricstoreServer.Health.Dashboard.collect_flow_projection_health(),
       flash: Keyword.get(opts, :flash),
@@ -114,10 +126,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
         "cleanup" ->
           with :ok <- flow_retention_cleanup_confirmed(params) do
             case flow_dashboard_retention_cleanup(limit: limit) do
-              {:ok, result} when is_map(result) -> {:ok, :cleanup, flow_retention_cleanup_counts(result, limit)}
-              {:error, reason} when is_binary(reason) -> {:error, reason}
-              {:error, reason} -> {:error, inspect(reason)}
-              other -> {:error, "ERR unexpected retention cleanup result: #{inspect(other, limit: 8)}"}
+              {:ok, result} when is_map(result) ->
+                {:ok, :cleanup, flow_retention_cleanup_counts(result, limit)}
+
+              {:error, reason} when is_binary(reason) ->
+                {:error, reason}
+
+              {:error, reason} ->
+                {:error, inspect(reason)}
+
+              other ->
+                {:error, "ERR unexpected retention cleanup result: #{inspect(other, limit: 8)}"}
             end
           end
 
@@ -150,7 +169,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
         }
 
       "error" ->
-        message = params |> Map.get("message", "Retention cleanup failed") |> flow_policy_clean_form_value()
+        message =
+          params
+          |> Map.get("message", "Retention cleanup failed")
+          |> flow_policy_clean_form_value()
+
         %{kind: :error, message: message}
 
       _ ->
@@ -165,8 +188,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
   defp flow_retention_cleanup_confirmed(params) do
     case Map.get(params, "confirm_cleanup") do
-      value when value in ["true", "on", "yes", "1"] -> :ok
-      _ -> {:error, "ERR cleanup requires confirm_cleanup=true after reviewing the sample preview"}
+      value when value in ["true", "on", "yes", "1"] ->
+        :ok
+
+      _ ->
+        {:error, "ERR cleanup requires confirm_cleanup=true after reviewing the sample preview"}
     end
   end
 

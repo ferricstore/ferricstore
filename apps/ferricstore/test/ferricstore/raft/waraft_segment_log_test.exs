@@ -1,6 +1,17 @@
-Code.require_file("waraft_segment_log_test/sections/segment_log_caps_ets_tail_while_disk_backed_reads_still_see_older_entrie.exs", __DIR__)
-Code.require_file("waraft_segment_log_test/sections/sync_apply_projection_batch_append_fdatasyncs_before_returning.exs", __DIR__)
-Code.require_file("waraft_segment_log_test/sections/default_segment_size_does_not_roll_over_during_normal_hot_batches.exs", __DIR__)
+Code.require_file(
+  "waraft_segment_log_test/sections/segment_log_caps_ets_tail_while_disk_backed_reads_still_see_older_entrie.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_segment_log_test/sections/sync_apply_projection_batch_append_fdatasyncs_before_returning.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_segment_log_test/sections/default_segment_size_does_not_roll_over_during_normal_hot_batches.exs",
+  __DIR__
+)
 
 defmodule Ferricstore.Raft.WARaftSegmentLogTest do
   use ExUnit.Case, async: false

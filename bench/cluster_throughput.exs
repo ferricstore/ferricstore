@@ -42,10 +42,12 @@ if nodes == [] do
   Or run single-node for comparison:
     mix run bench/erpc_throughput.exs
   """)
+
   System.halt(1)
 end
 
 IO.puts("Connecting to #{length(nodes)} nodes...")
+
 for node <- nodes do
   case Node.connect(node) do
     true -> IO.puts("  Connected: #{node}")
@@ -60,6 +62,7 @@ payload = String.duplicate("x", 100)
 
 # Pre-populate
 IO.puts("\nPre-populating 10K keys on #{primary}...")
+
 for i <- 1..10_000 do
   :erpc.call(primary, FerricStore, :set, ["bench:#{i}", payload])
 end
@@ -85,7 +88,10 @@ Benchee.run(
       :erpc.call(primary, FerricStore, :get, ["bench:#{:rand.uniform(10_000)}"])
     end,
     "HSET (quorum, primary)" => fn ->
-      :erpc.call(primary, FerricStore, :hset, ["bench:q:hash:#{:rand.uniform(key_max)}", %{"field" => payload}])
+      :erpc.call(primary, FerricStore, :hset, [
+        "bench:q:hash:#{:rand.uniform(key_max)}",
+        %{"field" => payload}
+      ])
     end,
     "INCR (quorum, primary)" => fn ->
       :erpc.call(primary, FerricStore, :incr, ["bench:q:counter:#{:rand.uniform(key_max)}"])

@@ -282,7 +282,8 @@ defmodule Ferricstore.Flow.LMDB do
   def terminal_by_state_global_prefix,
     do: Ferricstore.Flow.LMDB.IndexCodec.terminal_by_state_global_prefix()
 
-  def active_index_global_prefix, do: Ferricstore.Flow.LMDB.IndexCodec.active_index_global_prefix()
+  def active_index_global_prefix,
+    do: Ferricstore.Flow.LMDB.IndexCodec.active_index_global_prefix()
 
   def active_index_prefix(index_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.active_index_prefix(index_key)
@@ -357,7 +358,8 @@ defmodule Ferricstore.Flow.LMDB do
 
   def history_expire_prefix, do: Ferricstore.Flow.LMDB.IndexCodec.history_expire_prefix()
 
-  def history_flow_expire_prefix, do: Ferricstore.Flow.LMDB.IndexCodec.history_flow_expire_prefix()
+  def history_flow_expire_prefix,
+    do: Ferricstore.Flow.LMDB.IndexCodec.history_flow_expire_prefix()
 
   def segment_value_pin_prefix, do: Ferricstore.Flow.LMDB.SegmentPins.prefix()
 
@@ -371,7 +373,14 @@ defmodule Ferricstore.Flow.LMDB do
     do: Ferricstore.Flow.LMDB.SegmentPins.encode_batch(file_id, entries)
 
   def segment_value_pin_put_ops(value_key, expire_at_ms, file_id, offset, value_size),
-    do: Ferricstore.Flow.LMDB.SegmentPins.put_ops(value_key, expire_at_ms, file_id, offset, value_size)
+    do:
+      Ferricstore.Flow.LMDB.SegmentPins.put_ops(
+        value_key,
+        expire_at_ms,
+        file_id,
+        offset,
+        value_size
+      )
 
   def segment_value_pin_batch_put_ops(entries),
     do: Ferricstore.Flow.LMDB.SegmentPins.batch_put_ops(entries)
@@ -400,9 +409,7 @@ defmodule Ferricstore.Flow.LMDB do
         expire_at_ms
       )
 
-  def encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms, file_id, offset, value_size),
-    do:
-      Ferricstore.Flow.LMDB.IndexCodec.encode_history_index_value(
+  def encode_history_index_value(
         event_id,
         event_ms,
         compound_key,
@@ -410,13 +417,24 @@ defmodule Ferricstore.Flow.LMDB do
         file_id,
         offset,
         value_size
-      )
+      ),
+      do:
+        Ferricstore.Flow.LMDB.IndexCodec.encode_history_index_value(
+          event_id,
+          event_ms,
+          compound_key,
+          expire_at_ms,
+          file_id,
+          offset,
+          value_size
+        )
 
   def encode_history_expire_value(history_index_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.encode_history_expire_value(history_index_key)
 
   def encode_history_flow_expire_value(history_key, expire_at_ms),
-    do: Ferricstore.Flow.LMDB.IndexCodec.encode_history_flow_expire_value(history_key, expire_at_ms)
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.encode_history_flow_expire_value(history_key, expire_at_ms)
 
   def decode_history_expire_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_expire_value(blob)
@@ -425,7 +443,13 @@ defmodule Ferricstore.Flow.LMDB do
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_flow_expire_value(blob)
 
   def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil),
-    do: Ferricstore.Flow.LMDB.IndexCodec.encode_query_index_value(id, updated_at_ms, expire_at_ms, state_key)
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.encode_query_index_value(
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key
+      )
 
   def encode_active_index_value(index_key, id, score, expire_at_ms, state_key),
     do:
@@ -523,7 +547,12 @@ defmodule Ferricstore.Flow.LMDB do
       )
 
   def encode_terminal_expire_value(terminal_key, state_key, count_key),
-    do: Ferricstore.Flow.LMDB.IndexCodec.encode_terminal_expire_value(terminal_key, state_key, count_key)
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.encode_terminal_expire_value(
+        terminal_key,
+        state_key,
+        count_key
+      )
 
   def decode_terminal_expire_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_expire_value(blob)

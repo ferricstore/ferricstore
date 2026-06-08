@@ -129,11 +129,12 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
 
       # Read 100 times — if each read copies 1MB, we'd use ~100MB.
       # With zero-copy (refc binary), memory stays flat.
-      results = for _ <- 1..100 do
-        {:ok, result} = FerricStore.get(key)
-        assert byte_size(result) == 1_000_000
-        result
-      end
+      results =
+        for _ <- 1..100 do
+          {:ok, result} = FerricStore.get(key)
+          assert byte_size(result) == 1_000_000
+          result
+        end
 
       :erlang.garbage_collect()
       {:memory, mem_after} = Process.info(self(), :memory)
@@ -144,8 +145,9 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
       # Memory growth should be well under 100MB (100 × 1MB if copying).
       # With refc binaries, all 100 results share the same underlying data.
       growth_mb = (mem_after - mem_before) / 1_048_576
+
       assert growth_mb < 20,
-        "100 reads of 1MB value grew heap by #{Float.round(growth_mb, 1)}MB — likely copying instead of zero-copy"
+             "100 reads of 1MB value grew heap by #{Float.round(growth_mb, 1)}MB — likely copying instead of zero-copy"
     end
 
     test "value can be sent to another process without copy" do

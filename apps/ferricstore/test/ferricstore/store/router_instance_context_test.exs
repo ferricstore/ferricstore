@@ -170,5 +170,4 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
       end)
     end)
   end
-
 end

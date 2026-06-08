@@ -395,7 +395,10 @@ defmodule Ferricstore.Commands.RedisCompatHashTest do
       Hash.handle("HSCAN", [key, cursor, "COUNT", "#{count}"], store)
 
     # Elements are [field1, val1, field2, val2, ...]
-    fields = for i <- 0..(div(max(length(elements), 2), 2) - 1), elements != [], do: Enum.at(elements, i * 2)
+    fields =
+      for i <- 0..(div(max(length(elements), 2), 2) - 1),
+          elements != [],
+          do: Enum.at(elements, i * 2)
 
     if next_cursor == "0" do
       fields

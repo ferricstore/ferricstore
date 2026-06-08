@@ -2,10 +2,10 @@ defmodule FerricstoreServer.Connection.Sendfile.IO do
   @moduledoc false
 
   @file_stream_chunk_bytes Application.compile_env(
-                              :ferricstore_server,
-                              :file_stream_chunk_bytes,
-                              65_536
-                            )
+                             :ferricstore_server,
+                             :file_stream_chunk_bytes,
+                             65_536
+                           )
 
   @bitcask_header_size 26
   @bitcask_tombstone_value_size 4_294_967_295
@@ -167,6 +167,7 @@ defmodule FerricstoreServer.Connection.Sendfile.IO do
       {offset, count} -> binary_part(value, offset, count)
     end
   end
+
   def validate_open_file_ref(path, fd, key, value_offset, value_size),
     do: validate_open_file_ref(path, fd, key, value_offset, value_size, :verify_payload)
 
@@ -186,18 +187,18 @@ defmodule FerricstoreServer.Connection.Sendfile.IO do
   def validate_open_file_range(_path, _fd, _offset, _size, :none, _mode), do: :ok
 
   def validate_open_file_range(
-         path,
-         fd,
-         _offset,
-         _size,
-         {:blob, value_offset, value_size},
-         mode
-       ),
-       do: validate_open_blob_file_ref(path, fd, value_offset, value_size, mode)
+        path,
+        fd,
+        _offset,
+        _size,
+        {:blob, value_offset, value_size},
+        mode
+      ),
+      do: validate_open_blob_file_ref(path, fd, value_offset, value_size, mode)
 
   def validate_open_blob_file_ref(path, fd, value_offset, value_size, mode)
-       when is_integer(value_offset) and value_offset >= 0 and is_integer(value_size) and
-              value_size >= 0 do
+      when is_integer(value_offset) and value_offset >= 0 and is_integer(value_size) and
+             value_size >= 0 do
     case Path.extname(path) do
       ".blob" -> validate_open_legacy_blob_file_ref(path, fd, value_offset, value_size)
       ".bloblog" -> validate_open_segment_blob_file_ref(fd, value_offset, value_size, mode)
@@ -241,12 +242,12 @@ defmodule FerricstoreServer.Connection.Sendfile.IO do
   end
 
   def maybe_verify_segment_blob_payload(
-         fd,
-         value_offset,
-         value_size,
-         expected_checksum,
-         mode
-       ) do
+        fd,
+        value_offset,
+        value_size,
+        expected_checksum,
+        mode
+      ) do
     # Blob side-channel files are addressed by checksum. Validate the payload
     # before sending any RESP header so TCP sendfile cannot expose corrupt bytes.
     started = System.monotonic_time()
@@ -275,9 +276,9 @@ defmodule FerricstoreServer.Connection.Sendfile.IO do
   end
 
   def decode_blob_segment_header(
-         <<@blob_segment_header_magic::binary, size::unsigned-big-64, checksum::binary-size(32)>>
-       ),
-       do: {:ok, size, checksum}
+        <<@blob_segment_header_magic::binary, size::unsigned-big-64, checksum::binary-size(32)>>
+      ),
+      do: {:ok, size, checksum}
 
   def decode_blob_segment_header(_header), do: :error
 
@@ -328,7 +329,7 @@ defmodule FerricstoreServer.Connection.Sendfile.IO do
   end
 
   def validate_open_value_ref(fd, key, value_offset, value_size)
-       when is_binary(key) and is_integer(value_offset) and is_integer(value_size) do
+      when is_binary(key) and is_integer(value_offset) and is_integer(value_size) do
     key_size = byte_size(key)
 
     with true <- value_size <= @bitcask_tombstone_value_size,
@@ -380,14 +381,14 @@ defmodule FerricstoreServer.Connection.Sendfile.IO do
     do: {:ok, file_cache}
 
   def cached_validate_file_range(
-         path,
-         fd,
-         _offset,
-         _size,
-         {:blob, value_offset, value_size},
-         mode,
-         file_cache
-       ) do
+        path,
+        fd,
+        _offset,
+        _size,
+        {:blob, value_offset, value_size},
+        mode,
+        file_cache
+      ) do
     cache_key = validation_cache_key(path, nil, value_offset, value_size, mode)
 
     cached_validate(cache_key, file_cache, fn ->

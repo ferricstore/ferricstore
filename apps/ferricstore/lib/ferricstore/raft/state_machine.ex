@@ -61,6 +61,13 @@ defmodule Ferricstore.Raft.StateMachine do
   The interval is stored in the machine state at init time (from the config
   map or application env) so that `apply/3` remains deterministic -- it never
   reads runtime configuration.
+
+  ## Performance boundary
+
+  `apply/3` is the core durable write hot path. Do not replace section macros
+  or split apply helpers without before/after DBOS Flow and memtier benchmarks.
+  No behaviours/protocol dispatch, no extra maps/lists in per-command loops,
+  and no extra GenServer/Task calls in apply.
   """
 
   import Kernel, except: [apply: 3]
@@ -196,7 +203,6 @@ defmodule Ferricstore.Raft.StateMachine do
   # ---------------------------------------------------------------------------
   # Replicated state callbacks
   # ---------------------------------------------------------------------------
-
 
   use Ferricstore.Raft.StateMachine.Sections.Init
   use Ferricstore.Raft.StateMachine.Sections.ApplyDispatch

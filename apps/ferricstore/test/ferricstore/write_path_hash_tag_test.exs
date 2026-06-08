@@ -28,7 +28,8 @@ defmodule Ferricstore.WritePathHashTagTest do
 
   describe "hash tags" do
     test "{user:42}:session and {user:42}:profile hash to same shard" do
-      assert Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:session") == Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:profile")
+      assert Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:session") ==
+               Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:profile")
     end
 
     test "no tag hashes on full key" do
@@ -77,7 +78,9 @@ defmodule Ferricstore.WritePathHashTagTest do
       Router.put(FerricStore.Instance.get(:default), k1, "sess", 0)
       Router.put(FerricStore.Instance.get(:default), k2, "prof", 0)
 
-      assert Router.shard_for(FerricStore.Instance.get(:default), k1) == Router.shard_for(FerricStore.Instance.get(:default), k2)
+      assert Router.shard_for(FerricStore.Instance.get(:default), k1) ==
+               Router.shard_for(FerricStore.Instance.get(:default), k2)
+
       assert "sess" == Router.get(FerricStore.Instance.get(:default), k1)
       assert "prof" == Router.get(FerricStore.Instance.get(:default), k2)
     end

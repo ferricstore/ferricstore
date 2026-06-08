@@ -29,7 +29,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ConfigTest do
 
   test "initial_state builds writer startup state" do
     ref = :atomics.new(2, signed: false)
-    state = Config.initial_state([instance_ctx: %{name: :ctx}], :ctx, 2, "/tmp/ferric-config", ref)
+
+    state =
+      Config.initial_state([instance_ctx: %{name: :ctx}], :ctx, 2, "/tmp/ferric-config", ref)
 
     assert state.instance_name == :ctx
     assert state.shard_index == 2

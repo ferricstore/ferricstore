@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
 
   def sweep_blob_garbage(ctx) do
     initial = blob_gc_empty_stats()
-  
+
     result =
       Enum.reduce_while(
         Range.new(0, :erlang.-(effective_shard_count(ctx), 1)),
@@ -12,26 +12,27 @@ defmodule Ferricstore.Store.Router.BlobGC do
           case sweep_blob_garbage_shard(ctx, idx) do
             {:ok, %{skipped: true} = stats} ->
               {:cont, {:ok, blob_gc_merge_stats(acc, :maps.merge(blob_gc_empty_stats(), stats))}}
-  
+
             {:ok, stats} ->
               {:cont, {:ok, blob_gc_merge_stats(acc, stats)}}
-  
+
             {:error, reason} ->
               emit_blob_gc_failed(ctx, idx, reason)
               {:halt, {:error, {idx, reason}}}
           end
         end
       )
-  
+
     case result do
       {:ok, stats} ->
         emit_blob_gc(ctx, stats)
         {:ok, stats}
-  
+
       {:error, _reason} = error ->
         error
     end
   end
+
   defp sweep_blob_garbage_shard(ctx, idx) do
     try do
       with {:ok, hardened_ids, hardened_stats} <- blob_gc_reconcile_hardened_protections(ctx, idx),
@@ -56,6 +57,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
       :exit, reason -> {:error, {:blob_gc_shard_unavailable, reason}}
     end
   end
+
   defp blob_gc_reconcile_hardened_protections(ctx, idx) do
     case :erlang.==(
            Application.get_env(:ferricstore, :blob_protection_reconcile_enabled, true),
@@ -64,33 +66,33 @@ defmodule Ferricstore.Store.Router.BlobGC do
       false ->
         limit = blob_gc_reconcile_limit()
         ids = Ferricstore.Store.BlobStore.hardened_protection_ids(ctx.data_dir, idx, limit)
-  
+
         case ids do
           [] ->
             {:ok, [], %{hardened_protections_seen: 0, hardened_protections_blocked: 0}}
-  
+
           [_ | _] ->
             timeout_ms = blob_gc_reconcile_barrier_timeout_ms()
-  
+
             with :ok <- Ferricstore.Raft.WARaftBackend.blob_protection_barrier(idx, timeout_ms),
                  :ok <- blob_gc_wait_replay_safe(ctx, idx, timeout_ms) do
               emit_blob_protection_reconcile(ctx, idx, :erlang.length(ids), 0)
-  
+
               {:ok, ids,
                %{hardened_protections_seen: :erlang.length(ids), hardened_protections_blocked: 0}}
             else
               {:ok, %{skipped: true, reason: reason}} ->
                 emit_blob_protection_reconcile_failed(ctx, idx, :erlang.length(ids), reason)
-  
+
                 {:ok, [],
                  %{
                    hardened_protections_seen: :erlang.length(ids),
                    hardened_protections_blocked: :erlang.length(ids)
                  }}
-  
+
               {:error, reason} ->
                 emit_blob_protection_reconcile_failed(ctx, idx, :erlang.length(ids), reason)
-  
+
                 {:ok, [],
                  %{
                    hardened_protections_seen: :erlang.length(ids),
@@ -98,29 +100,31 @@ defmodule Ferricstore.Store.Router.BlobGC do
                  }}
             end
         end
-  
+
       true ->
         {:ok, [], %{hardened_protections_blocked: 0}}
     end
   end
+
   defp blob_gc_wait_replay_safe(ctx, idx, timeout_ms) do
     deadline = :erlang.+(System.monotonic_time(:millisecond), :erlang.max(timeout_ms, 0))
     blob_gc_wait_replay_safe_until(ctx, idx, deadline)
   end
+
   defp blob_gc_wait_replay_safe_until(ctx, idx, deadline_ms) do
     try do
       state = :sys.get_state(resolve_shard(ctx, idx))
-  
+
       case blob_gc_replay_safe?(state, idx) do
         :ok ->
           :ok
-  
+
         {:ok, %{skipped: true} = skipped} ->
           case :erlang.>=(System.monotonic_time(:millisecond), deadline_ms) do
             false ->
               Process.sleep(10)
               blob_gc_wait_replay_safe_until(ctx, idx, deadline_ms)
-  
+
             true ->
               {:ok, skipped}
           end
@@ -129,19 +133,23 @@ defmodule Ferricstore.Store.Router.BlobGC do
       :exit, reason -> {:error, {:blob_gc_replay_wait_shard_unavailable, reason}}
     end
   end
+
   defp blob_gc_reconcile_limit() do
     case Application.get_env(:ferricstore, :blob_protection_reconcile_max_records, 1000) do
       value when :erlang.andalso(:erlang.is_integer(value), :erlang.>(value, 0)) -> value
       _other -> 1000
     end
   end
+
   defp blob_gc_reconcile_barrier_timeout_ms() do
     case Application.get_env(:ferricstore, :blob_protection_reconcile_barrier_timeout_ms, 30000) do
       value when :erlang.andalso(:erlang.is_integer(value), :erlang.>=(value, 0)) -> value
       _other -> 30000
     end
   end
-  defp blob_gc_replay_safe?(%{instance_ctx: instance_ctx}, idx) when :erlang.is_map(instance_ctx) do
+
+  defp blob_gc_replay_safe?(%{instance_ctx: instance_ctx}, idx)
+       when :erlang.is_map(instance_ctx) do
     with %{last_applied_index: applied_ref, last_released_cursor_index: released_ref} <-
            instance_ctx,
          {:ok, applied} <- blob_gc_read_replay_index(applied_ref, idx),
@@ -154,12 +162,15 @@ defmodule Ferricstore.Store.Router.BlobGC do
       _ -> blob_gc_skipped(:missing_raft_replay_metrics)
     end
   end
+
   defp blob_gc_replay_safe?(%{raft?: true}, _idx) do
     blob_gc_skipped(:missing_raft_replay_metrics)
   end
+
   defp blob_gc_replay_safe?(_state, _idx) do
     :ok
   end
+
   defp blob_gc_skipped(reason) do
     {:ok,
      %{
@@ -172,10 +183,11 @@ defmodule Ferricstore.Store.Router.BlobGC do
        reason: reason
      }}
   end
+
   defp blob_gc_read_replay_index(ref, idx) do
     try do
       value = :atomics.get(ref, :erlang.+(idx, 1))
-  
+
       case (case :erlang.is_integer(value) do
               false -> false
               true -> :erlang.>=(value, 0)
@@ -189,6 +201,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
       :exit, _ -> :error
     end
   end
+
   defp blob_gc_fsync_active_file(%{active_file_path: path}) when :erlang.is_binary(path) do
     case Ferricstore.Bitcask.NIF.v2_fsync(path) do
       :ok -> :ok
@@ -197,26 +210,29 @@ defmodule Ferricstore.Store.Router.BlobGC do
       other -> {:error, {:blob_gc_active_fsync_failed, path, other}}
     end
   end
+
   defp blob_gc_fsync_active_file(_state) do
     {:error, {:blob_gc_active_fsync_failed, nil, :missing}}
   end
+
   defp blob_gc_live_refs(ctx, idx, state) do
     keydir =
       case Map.get(state, :ets) do
         x when :erlang.orelse(:erlang."=:="(x, false), :erlang."=:="(x, nil)) ->
           resolve_keydir(ctx, idx)
-  
+
         x ->
           x
       end
-  
+
     now = Ferricstore.HLC.now_ms()
-  
+
     with {:ok, keydir_refs} <- blob_gc_keydir_live_refs(ctx, idx, state, keydir, now),
          {:ok, lmdb_refs} <- blob_gc_flow_lmdb_live_refs(ctx, idx, now) do
       {:ok, MapSet.union(keydir_refs, lmdb_refs)}
     end
   end
+
   defp blob_gc_keydir_live_refs(ctx, idx, state, keydir, now) do
     try do
       refs =
@@ -231,7 +247,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
           MapSet.new(),
           keydir
         )
-  
+
       {:ok, refs}
     rescue
       _ in [ArgumentError] -> {:error, {:blob_gc_keydir_scan_failed, idx}}
@@ -239,6 +255,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
       :throw, {:blob_gc_keydir_live_refs_error, {:error, _reason} = error} -> error
     end
   end
+
   defp blob_gc_flow_lmdb_live_refs(ctx, idx, now) do
     blob_gc_scan_flow_lmdb_refs(
       Ferricstore.Flow.LMDB.path(
@@ -252,17 +269,18 @@ defmodule Ferricstore.Store.Router.BlobGC do
       now
     )
   end
+
   defp blob_gc_scan_flow_lmdb_refs(path, after_key, refs, now) do
     page_size = blob_gc_flow_lmdb_page_size()
-  
+
     case Ferricstore.Flow.LMDB.prefix_entries_after(path, "f:", after_key, page_size) do
       {:ok, []} ->
         {:ok, refs}
-  
+
       {:ok, entries} ->
         with {:ok, refs} <- blob_gc_collect_lmdb_value_refs(entries, refs, now) do
           {last_key, _} = List.last(entries)
-  
+
           case (case :erlang.<(:erlang.length(entries), page_size) do
                   false -> :erlang.==(last_key, after_key)
                   true -> true
@@ -271,11 +289,12 @@ defmodule Ferricstore.Store.Router.BlobGC do
             true -> {:ok, refs}
           end
         end
-  
+
       {:error, reason} ->
         {:error, {:blob_gc_flow_lmdb_scan_failed, reason}}
     end
   end
+
   defp blob_gc_collect_lmdb_value_refs(entries, refs, now) do
     Enum.reduce_while(entries, {:ok, refs}, fn {key, blob}, {:ok, refs} ->
       case blob_gc_lmdb_value_ref(blob, now) do
@@ -285,31 +304,34 @@ defmodule Ferricstore.Store.Router.BlobGC do
       end
     end)
   end
+
   defp blob_gc_lmdb_value_ref(blob, now) do
     case Ferricstore.Flow.LMDB.decode_value_locator(blob, now) do
       {:ok, _locator} ->
         {:ok, nil}
-  
+
       :expired ->
         {:ok, nil}
-  
+
       :not_locator ->
         case Ferricstore.Flow.LMDB.decode_value(blob, now) do
           {:ok, value} -> blob_gc_decode_ref(value)
           :expired -> {:ok, nil}
           :error -> {:error, :invalid_value_wrapper}
         end
-  
+
       :error ->
         {:error, :invalid_value_locator}
     end
   end
+
   defp blob_gc_flow_lmdb_page_size() do
     case Application.get_env(:ferricstore, :blob_gc_flow_lmdb_page_size, 1024) do
       value when :erlang.andalso(:erlang.is_integer(value), :erlang.>(value, 0)) -> value
       _ -> 1024
     end
   end
+
   defp blob_gc_entry_ref(ctx, idx, state, {key, value, exp, lfu, fid, off, size}, now)
        when :erlang.andalso(
               :erlang.andalso(
@@ -323,9 +345,11 @@ defmodule Ferricstore.Store.Router.BlobGC do
       _ -> blob_gc_live_entry_ref(ctx, idx, state, {key, value, exp, lfu, fid, off, size})
     end
   end
+
   defp blob_gc_entry_ref(ctx, idx, state, entry, _now) do
     blob_gc_live_entry_ref(ctx, idx, state, entry)
   end
+
   defp blob_gc_live_entry_ref(
          _ctx,
          _idx,
@@ -335,6 +359,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
        when :erlang.andalso(:erlang.is_binary(key), :erlang.is_binary(value)) do
     blob_gc_decode_ref(value)
   end
+
   defp blob_gc_live_entry_ref(ctx, idx, state, {key, _value, _exp, _lfu, fid, off, _size})
        when :erlang.andalso(
               :erlang.andalso(
@@ -347,12 +372,13 @@ defmodule Ferricstore.Store.Router.BlobGC do
               :erlang.>=(off, 0)
             ) do
     path = blob_gc_entry_file_path(ctx, idx, state, key, fid)
-  
+
     case Ferricstore.Store.ColdRead.pread_keyed(path, off, key, 10000) do
       {:ok, value} -> blob_gc_decode_ref(value)
       {:error, reason} -> {:error, {:blob_gc_live_ref_scan_failed, key, reason}}
     end
   end
+
   defp blob_gc_live_entry_ref(ctx, idx, _state, {key, _value, _exp, _lfu, fid, off, value_size})
        when :erlang.andalso(
               :erlang.is_binary(key),
@@ -391,7 +417,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
     case blob_gc_waraft_ref_candidate?(ctx, value_size) do
       x when :erlang.orelse(:erlang."=:="(x, false), :erlang."=:="(x, nil)) ->
         {:ok, nil}
-  
+
       _ ->
         case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, fid, key) do
           {:ok, value} -> blob_gc_decode_ref(value)
@@ -400,16 +426,18 @@ defmodule Ferricstore.Store.Router.BlobGC do
         end
     end
   end
+
   defp blob_gc_live_entry_ref(_ctx, _idx, _state, _entry) do
     {:ok, nil}
   end
+
   defp blob_gc_waraft_ref_candidate?(ctx, value_size) do
     threshold = Ferricstore.Store.BlobValue.threshold(ctx)
-  
+
     case :erlang.>(threshold, 0) do
       false ->
         false
-  
+
       true ->
         case Ferricstore.Store.BlobRef.encoded_size?(value_size) do
           false ->
@@ -417,15 +445,16 @@ defmodule Ferricstore.Store.Router.BlobGC do
               false -> false
               true -> :erlang.>=(value_size, threshold)
             end
-  
+
           true ->
             true
-  
+
           other ->
             :erlang.error({:badbool, :or, other})
         end
     end
   end
+
   defp blob_gc_after_live_refs_hook(ctx, idx, live_refs) do
     with :ok <-
            Ferricstore.FaultInjection.maybe_pause(:after_blob_gc_live_refs, %{
@@ -438,12 +467,14 @@ defmodule Ferricstore.Store.Router.BlobGC do
       end
     end
   end
+
   defp blob_gc_decode_ref(value) when :erlang.is_binary(value) do
     case Ferricstore.Store.BlobRef.decode(value) do
       {:ok, %Ferricstore.Store.BlobRef{} = ref} -> {:ok, ref}
       _ -> {:ok, nil}
     end
   end
+
   defp blob_gc_retention_metadata_key?(key) do
     case (case Ferricstore.Flow.Keys.state_key?(key) do
             false -> Ferricstore.Flow.Keys.value_key?(key)
@@ -455,23 +486,27 @@ defmodule Ferricstore.Store.Router.BlobGC do
       other -> :erlang.error({:badbool, :or, other})
     end
   end
+
   defp blob_gc_flow_history_entry_key?(<<"X:f:{", rest::binary>>) do
     :erlang."/="(:binary.match(rest, "}:h:"), :nomatch)
   end
+
   defp blob_gc_flow_history_entry_key?(_key) do
     false
   end
+
   defp blob_gc_entry_file_path(ctx, idx, state, key, fid) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-  
+
     case Map.get(Map.get(state, :promoted_instances, %{}), redis_key) do
       %{path: dedicated_path} when :erlang.is_binary(dedicated_path) ->
         Ferricstore.Store.Shard.Compound.dedicated_file_path(dedicated_path, fid)
-  
+
       _ ->
         cold_file_path(ctx, idx, fid)
     end
   end
+
   defp blob_gc_empty_stats() do
     %{
       deleted_files: 0,
@@ -484,15 +519,17 @@ defmodule Ferricstore.Store.Router.BlobGC do
       hardened_protections_blocked: 0
     }
   end
+
   defp blob_gc_merge_stats(acc, stats) do
     Map.merge(acc, stats, fn
       _key, a, b when :erlang.andalso(:erlang.is_integer(a), :erlang.is_integer(b)) ->
         :erlang.+(a, b)
-  
+
       _key, _a, b ->
         b
     end)
   end
+
   defp emit_blob_protection_reconcile(ctx, idx, released_count, blocked_count) do
     :telemetry.execute(
       [:ferricstore, :blob, :protection, :reconcile],
@@ -500,6 +537,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
       %{instance: ctx.name, shard_index: idx}
     )
   end
+
   defp emit_blob_protection_reconcile_failed(ctx, idx, blocked_count, reason) do
     :telemetry.execute(
       [:ferricstore, :blob, :protection, :reconcile, :failed],
@@ -507,6 +545,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
       %{instance: ctx.name, shard_index: idx, reason: reason}
     )
   end
+
   defp emit_blob_gc(ctx, stats) do
     :telemetry.execute([:ferricstore, :blob, :gc], stats, %{
       instance: ctx.name,
@@ -519,6 +558,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
       reason: Map.get(stats, :reason)
     })
   end
+
   defp emit_blob_gc_failed(ctx, idx, reason) do
     :telemetry.execute(
       [:ferricstore, :blob, :gc, :failed],
@@ -526,15 +566,19 @@ defmodule Ferricstore.Store.Router.BlobGC do
       %{instance: ctx.name, shard_index: idx, reason: reason}
     )
   end
+
   defp effective_shard_count(ctx) do
     ctx.shard_count
   end
+
   defp resolve_shard(ctx, idx) do
     :erlang.element(:erlang.+(idx, 1), ctx.shard_names)
   end
+
   defp resolve_keydir(ctx, idx) do
     :erlang.element(:erlang.+(idx, 1), ctx.keydir_refs)
   end
+
   defp cold_file_path(ctx, idx, {:flow_history, file_id}) do
     Ferricstore.Flow.HistoryProjector.history_file_path(
       Ferricstore.DataDir.shard_data_path(
@@ -544,9 +588,10 @@ defmodule Ferricstore.Store.Router.BlobGC do
       file_id
     )
   end
+
   defp cold_file_path(ctx, idx, file_id) do
     shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-  
+
     Path.join(
       shard_path,
       <<String.Chars.to_string(String.pad_leading(:erlang.integer_to_binary(file_id), 5, "0"))::binary,

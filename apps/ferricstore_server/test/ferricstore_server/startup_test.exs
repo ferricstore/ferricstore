@@ -297,7 +297,12 @@ defmodule FerricstoreServer.StartupTest do
 
     test "scan_large_values returns {0, nil, 0} when no large values exist" do
       # All keys were flushed in setup; write only small values.
-      Router.put(FerricStore.Instance.get(:default), "small_#{:rand.uniform(9_999_999)}", "tiny", 0)
+      Router.put(
+        FerricStore.Instance.get(:default),
+        "small_#{:rand.uniform(9_999_999)}",
+        "tiny",
+        0
+      )
 
       assert {0, nil, 0} = Ferricstore.Application.scan_large_values(4, 512 * 1024)
     end
@@ -306,8 +311,19 @@ defmodule FerricstoreServer.StartupTest do
       key_medium = "medium_val_#{:rand.uniform(9_999_999)}"
       key_biggest = "biggest_val_#{:rand.uniform(9_999_999)}"
 
-      Router.put(FerricStore.Instance.get(:default), key_medium, :binary.copy(<<1>>, 600 * 1024), 0)
-      Router.put(FerricStore.Instance.get(:default), key_biggest, :binary.copy(<<2>>, 800 * 1024), 0)
+      Router.put(
+        FerricStore.Instance.get(:default),
+        key_medium,
+        :binary.copy(<<1>>, 600 * 1024),
+        0
+      )
+
+      Router.put(
+        FerricStore.Instance.get(:default),
+        key_biggest,
+        :binary.copy(<<2>>, 800 * 1024),
+        0
+      )
 
       {count, largest_key, largest_size} =
         Ferricstore.Application.scan_large_values(4, 512 * 1024)
@@ -390,7 +406,7 @@ defmodule FerricstoreServer.StartupTest do
       end
 
       assert_receive {:telemetry_event, ^ref, [:ferricstore, :embedded, :large_values_detected],
-                       measurements, metadata},
+                      measurements, metadata},
                      1_000
 
       assert measurements.count >= 1
@@ -402,7 +418,12 @@ defmodule FerricstoreServer.StartupTest do
 
     test "no warning or telemetry when all values are below threshold" do
       # Only small values exist (setup flushed everything).
-      Router.put(FerricStore.Instance.get(:default), "small_check_#{:rand.uniform(9_999_999)}", "ok", 0)
+      Router.put(
+        FerricStore.Instance.get(:default),
+        "small_check_#{:rand.uniform(9_999_999)}",
+        "ok",
+        0
+      )
 
       test_pid = self()
       ref = make_ref()
@@ -421,7 +442,9 @@ defmodule FerricstoreServer.StartupTest do
       log =
         ExUnit.CaptureLog.capture_log(fn ->
           case Ferricstore.Application.scan_large_values(4, 512 * 1024) do
-            {0, _key, _size} -> :ok
+            {0, _key, _size} ->
+              :ok
+
             {count, lk, ls} ->
               :telemetry.execute(
                 [:ferricstore, :embedded, :large_values_detected],

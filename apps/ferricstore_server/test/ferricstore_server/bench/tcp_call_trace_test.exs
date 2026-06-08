@@ -10,11 +10,17 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     for i <- 1..1000 do
       FerricStore.set("#{prefix}:#{i}", String.duplicate("v", 100))
     end
+
     Process.sleep(300)
 
-    {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [
-      :binary, active: false, packet: :raw, buffer: 1_048_576
-    ])
+    {:ok, sock} =
+      :gen_tcp.connect(~c"127.0.0.1", port, [
+        :binary,
+        active: false,
+        packet: :raw,
+        buffer: 1_048_576
+      ])
+
     :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
     {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
 
@@ -60,8 +66,10 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     # Analyze per module
     for {mod, label} <- modules_to_trace do
       {_mod, total_calls, func_list} = :cprof.analyse(mod)
+
       if total_calls > 0 do
         IO.puts("  #{label} (#{inspect(mod)}): #{total_calls} total calls")
+
         func_list
         |> Enum.sort_by(fn {_mfa, count} -> -count end)
         |> Enum.take(10)
@@ -69,6 +77,7 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
           per_get = Float.round(count / 1000, 1)
           IO.puts("    #{f}/#{a}: #{count} calls (#{per_get} per GET)")
         end)
+
         IO.puts("")
       end
     end
@@ -76,12 +85,16 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     # Overall top functions
     {_total, top_modules} = :cprof.analyse()
     IO.puts("  === Top modules by call count ===\n")
+
     top_modules
     |> Enum.sort_by(fn {_mod, count, _} -> -count end)
     |> Enum.take(20)
     |> Enum.each(fn {mod, count, _funcs} ->
       per_get = Float.round(count / 1000, 1)
-      IO.puts("    #{String.pad_trailing(inspect(mod), 50)} #{String.pad_leading("#{count}", 10)} (#{per_get}/GET)")
+
+      IO.puts(
+        "    #{String.pad_trailing(inspect(mod), 50)} #{String.pad_leading("#{count}", 10)} (#{per_get}/GET)"
+      )
     end)
 
     :cprof.stop()
@@ -94,11 +107,16 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     for i <- 1..1000 do
       FerricStore.set("#{prefix}:#{i}", String.duplicate("v", 100))
     end
+
     Process.sleep(300)
 
-    {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [
-      :binary, active: false, packet: :raw
-    ])
+    {:ok, sock} =
+      :gen_tcp.connect(~c"127.0.0.1", port, [
+        :binary,
+        active: false,
+        packet: :raw
+      ])
+
     :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
     {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
 
@@ -116,50 +134,57 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     resp3_cmd = "*2\r\n$3\r\nGET\r\n$#{byte_size(key)}\r\n#{key}\r\n"
 
     # 1. RESP3 parse
-    {parse_us, _} = :timer.tc(fn ->
-      for _ <- 1..10_000 do
-        FerricstoreServer.Resp.Parser.parse(resp3_cmd)
-      end
-    end)
+    {parse_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..10_000 do
+          FerricstoreServer.Resp.Parser.parse(resp3_cmd)
+        end
+      end)
 
     # 2. Command dispatch (String.upcase + lookup in dispatch map)
-    {dispatch_us, _} = :timer.tc(fn ->
-      for _ <- 1..10_000 do
-        String.upcase("get")
-      end
-    end)
+    {dispatch_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..10_000 do
+          String.upcase("get")
+        end
+      end)
 
     # 3. Router.get (shard_for + ETS lookup + LFU touch)
-    {router_us, _} = :timer.tc(fn ->
-      for _ <- 1..10_000 do
-        Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), key)
-      end
-    end)
+    {router_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..10_000 do
+          Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), key)
+        end
+      end)
 
     # 4. RESP3 encode
     value = String.duplicate("v", 100)
-    {encode_us, _} = :timer.tc(fn ->
-      for _ <- 1..10_000 do
-        FerricstoreServer.Resp.Encoder.encode(value)
-      end
-    end)
+
+    {encode_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..10_000 do
+          FerricstoreServer.Resp.Encoder.encode(value)
+        end
+      end)
 
     # 5. Full TCP round-trip
-    {tcp_us, _} = :timer.tc(fn ->
-      for _ <- 1..10_000 do
-        :gen_tcp.send(sock, resp3_cmd)
-        {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
-      end
-    end)
+    {tcp_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..10_000 do
+          :gen_tcp.send(sock, resp3_cmd)
+          {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
+        end
+      end)
 
     :gen_tcp.close(sock)
 
     # 6. Embedded FerricStore.get
-    {embedded_us, _} = :timer.tc(fn ->
-      for _ <- 1..10_000 do
-        FerricStore.get(key)
-      end
-    end)
+    {embedded_us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..10_000 do
+          FerricStore.get(key)
+        end
+      end)
 
     parse_ns = div(parse_us * 1000, 10_000)
     dispatch_ns = div(dispatch_us * 1000, 10_000)
@@ -171,7 +196,10 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     server_total = parse_ns + dispatch_ns + router_ns + encode_ns
     tcp_overhead = tcp_ns - server_total
 
-    IO.puts("  #{String.pad_trailing("Layer", 35)} #{String.pad_leading("Time/op", 10)} #{String.pad_leading("% of TCP", 10)}")
+    IO.puts(
+      "  #{String.pad_trailing("Layer", 35)} #{String.pad_leading("Time/op", 10)} #{String.pad_leading("% of TCP", 10)}"
+    )
+
     IO.puts("  #{String.duplicate("-", 60)}")
 
     layers = [
@@ -187,7 +215,10 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
 
     for {label, ns} <- layers do
       pct = if tcp_ns > 0, do: Float.round(ns / tcp_ns * 100, 1), else: 0.0
-      IO.puts("  #{String.pad_trailing(label, 35)} #{String.pad_leading("#{ns}ns", 10)} #{String.pad_leading("#{pct}%", 10)}")
+
+      IO.puts(
+        "  #{String.pad_trailing(label, 35)} #{String.pad_leading("#{ns}ns", 10)} #{String.pad_leading("#{pct}%", 10)}"
+      )
     end
   end
 end

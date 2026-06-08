@@ -115,7 +115,6 @@ defmodule FerricStore.API.Hashes do
   # Phoenix PubSub to subscribe to list-push events.
   # ---------------------------------------------------------------------------
 
-
   @doc """
   Deletes one or more fields from the hash stored at `key`.
 

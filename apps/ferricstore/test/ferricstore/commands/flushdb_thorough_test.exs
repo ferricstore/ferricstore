@@ -18,7 +18,11 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
   defp ets_total_keys do
     Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
-      try do acc + :ets.info(:"keydir_#{i}", :size) rescue _ -> acc end
+      try do
+        acc + :ets.info(:"keydir_#{i}", :size)
+      rescue
+        _ -> acc
+      end
     end)
   end
 
@@ -42,7 +46,9 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
   describe "FLUSHDB clears ETS completely" do
     test "string keys removed from ETS" do
-      for i <- 1..100, do: Router.put(FerricStore.Instance.get(:default), "flush_str:#{i}", "val", 0)
+      for i <- 1..100,
+          do: Router.put(FerricStore.Instance.get(:default), "flush_str:#{i}", "val", 0)
+
       wait_for_ets_count_at_least(100)
 
       FerricStore.flushall()
@@ -54,15 +60,23 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
       FerricStore.hset("myhash", %{"f1" => "v1", "f2" => "v2", "f3" => "v3"})
 
       # Verify compound keys exist
-      has_compound = Enum.any?(0..(shard_count() - 1), fn i ->
-        try do
-          :ets.foldl(fn {key, _, _, _, _, _, _}, acc ->
-            if String.starts_with?(key, "H:") or String.starts_with?(key, "T:"), do: acc + 1, else: acc
-          end, 0, :"keydir_#{i}") > 0
-        rescue
-          _ -> false
-        end
-      end)
+      has_compound =
+        Enum.any?(0..(shard_count() - 1), fn i ->
+          try do
+            :ets.foldl(
+              fn {key, _, _, _, _, _, _}, acc ->
+                if String.starts_with?(key, "H:") or String.starts_with?(key, "T:"),
+                  do: acc + 1,
+                  else: acc
+              end,
+              0,
+              :"keydir_#{i}"
+            ) > 0
+          rescue
+            _ -> false
+          end
+        end)
+
       assert has_compound
 
       FerricStore.flushall()
@@ -152,12 +166,16 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
       test "FLUSHDB over TCP clears all keys" do
         port = FerricstoreServer.Listener.port()
 
-        for i <- 1..50, do: Router.put(FerricStore.Instance.get(:default), "tcp_flush:#{i}", "val", 0)
+        for i <- 1..50,
+            do: Router.put(FerricStore.Instance.get(:default), "tcp_flush:#{i}", "val", 0)
+
         FerricStore.hset("tcp_flush:hash", %{"f" => "v"})
 
         assert ets_total_keys() > 50
 
-        {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+        {:ok, sock} =
+          :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
         :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
         {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
 

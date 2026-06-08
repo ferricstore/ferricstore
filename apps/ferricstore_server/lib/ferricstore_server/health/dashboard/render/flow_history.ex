@@ -1,11 +1,10 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowHistory do
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.FlowRecord
 
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.FlowRecord
-
-@flow_dashboard_history_default_count 50
-@flow_dashboard_value_preview_bytes 8 * 1024
-@flow_terminal_states ~w(completed failed cancelled)
+  @flow_dashboard_history_default_count 50
+  @flow_dashboard_value_preview_bytes 8 * 1024
+  @flow_terminal_states ~w(completed failed cancelled)
 
   def flow_signal_rows(record, history) when is_map(record) and is_list(history) do
     history

@@ -172,15 +172,27 @@ defmodule FerricstoreServer.Acl.Rules do
   end
 
   defp parse_key_rule(user, "%R~" <> pattern, pending_key_patterns) do
-    queue_key_pattern(user, {pattern, :read, FerricstoreServer.Acl.compile_glob(pattern)}, pending_key_patterns)
+    queue_key_pattern(
+      user,
+      {pattern, :read, FerricstoreServer.Acl.compile_glob(pattern)},
+      pending_key_patterns
+    )
   end
 
   defp parse_key_rule(user, "%W~" <> pattern, pending_key_patterns) do
-    queue_key_pattern(user, {pattern, :write, FerricstoreServer.Acl.compile_glob(pattern)}, pending_key_patterns)
+    queue_key_pattern(
+      user,
+      {pattern, :write, FerricstoreServer.Acl.compile_glob(pattern)},
+      pending_key_patterns
+    )
   end
 
   defp parse_key_rule(user, "~" <> pattern, pending_key_patterns) do
-    queue_key_pattern(user, {pattern, :rw, FerricstoreServer.Acl.compile_glob(pattern)}, pending_key_patterns)
+    queue_key_pattern(
+      user,
+      {pattern, :rw, FerricstoreServer.Acl.compile_glob(pattern)},
+      pending_key_patterns
+    )
   end
 
   defp parse_key_rule(user, "resetkeys", _pending_key_patterns), do: {:ok, %{user | keys: []}, []}
@@ -193,8 +205,15 @@ defmodule FerricstoreServer.Acl.Rules do
 
   def add_channel_pattern(user, pattern) do
     case user_channels(user) do
-      :all -> user
-      channels -> Map.put(user, :channels, channels ++ [{pattern, FerricstoreServer.Acl.compile_glob(pattern)}])
+      :all ->
+        user
+
+      channels ->
+        Map.put(
+          user,
+          :channels,
+          channels ++ [{pattern, FerricstoreServer.Acl.compile_glob(pattern)}]
+        )
     end
   end
 
@@ -218,7 +237,9 @@ defmodule FerricstoreServer.Acl.Rules do
   end
 
   @spec user_channels(user()) :: :all | list()
-  def user_channels(%{channels: channels}) when channels == :all or is_list(channels), do: channels
+  def user_channels(%{channels: channels}) when channels == :all or is_list(channels),
+    do: channels
+
   def user_channels(_user), do: :all
 
   @spec format_acl_command_rule_name(binary()) :: binary()

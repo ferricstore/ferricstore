@@ -207,12 +207,17 @@ defmodule FerricstoreServer.InfoKeyspaceExpiryTest do
       send_cmd(sock, ["SET", "avg_ttl_2", "val", "EX", "300"])
       recv_response(sock)
 
-      ShardHelpers.eventually(fn ->
-        send_cmd(sock, ["INFO", "keyspace"])
-        result = recv_response(sock)
-        parsed = parse_keyspace_line(result)
-        parsed != nil and parsed.avg_ttl > 0
-      end, "avg_ttl should be > 0 after setting keys with TTL", 10, 100)
+      ShardHelpers.eventually(
+        fn ->
+          send_cmd(sock, ["INFO", "keyspace"])
+          result = recv_response(sock)
+          parsed = parse_keyspace_line(result)
+          parsed != nil and parsed.avg_ttl > 0
+        end,
+        "avg_ttl should be > 0 after setting keys with TTL",
+        10,
+        100
+      )
 
       send_cmd(sock, ["INFO", "keyspace"])
       result = recv_response(sock)

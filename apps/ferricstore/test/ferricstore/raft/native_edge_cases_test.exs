@@ -69,7 +69,8 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       :ok = Router.put(FerricStore.Instance.get(:default), k, "expired_val", past)
 
       # CAS should treat the expired key as missing and return nil
-      assert nil == Router.cas(FerricStore.Instance.get(:default), k, "expired_val", "new_val", nil)
+      assert nil ==
+               Router.cas(FerricStore.Instance.get(:default), k, "expired_val", "new_val", nil)
 
       # The key should still not be readable
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
@@ -202,7 +203,8 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       max = 100
 
       # Add some requests in the current window
-      ["allowed", 5, _rem, _ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 5)
+      ["allowed", 5, _rem, _ttl] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 5)
 
       # Wait for TWO full windows so both current and previous counts
       # are completely zeroed out by the sliding window rotation logic.
@@ -211,7 +213,8 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       Process.sleep(window_ms * 2 + 10)
 
       # After two full windows, all previous counts have decayed to zero.
-      [status, count, remaining, _ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 1)
+      [status, count, remaining, _ttl] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 1)
 
       assert status == "allowed"
       assert count == 1
@@ -226,7 +229,9 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       # Fire 10 rapid calls
       results =
         for i <- 1..10 do
-          [_status, count, _rem, _ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 1)
+          [_status, count, _rem, _ttl] =
+            Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 1)
+
           {i, count}
         end
 
@@ -243,17 +248,23 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       max = 100
 
       # Add 5 at once
-      ["allowed", c1, r1, _ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 5)
+      ["allowed", c1, r1, _ttl] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 5)
+
       assert c1 == 5
       assert r1 == 95
 
       # Add 3 more
-      ["allowed", c2, r2, _ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 3)
+      ["allowed", c2, r2, _ttl] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 3)
+
       assert c2 == 8
       assert r2 == 92
 
       # Try to add 93 more (would exceed max of 100)
-      ["denied", c3, r3, _ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 93)
+      ["denied", c3, r3, _ttl] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max, 93)
+
       assert c3 == 8
       assert r3 == 92
     end
@@ -265,11 +276,15 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       max = 5
 
       # Exhaust k1
-      ["allowed", 5, 0, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k1, window_ms, max, 5)
-      ["denied", 5, 0, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k1, window_ms, max, 1)
+      ["allowed", 5, 0, _] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k1, window_ms, max, 5)
+
+      ["denied", 5, 0, _] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k1, window_ms, max, 1)
 
       # k2 should be completely independent and still allow
-      ["allowed", 1, 4, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k2, window_ms, max, 1)
+      ["allowed", 1, 4, _] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k2, window_ms, max, 1)
     end
 
     test "rate limit window_ms=0 -- edge case" do
@@ -319,6 +334,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
 
       # The individual results should be some permutation of 1..10
       values = Enum.map(results, fn {:ok, n} -> n end)
+
       assert Enum.sort(values) == Enum.to_list(1..10),
              "Each INCR should have seen a unique intermediate value, got: #{inspect(Enum.sort(values))}"
     end
@@ -331,7 +347,13 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       tasks =
         for i <- 1..5 do
           Task.async(fn ->
-            Router.cas(FerricStore.Instance.get(:default), k, "starting_value", "cas_winner_#{i}", nil)
+            Router.cas(
+              FerricStore.Instance.get(:default),
+              k,
+              "starting_value",
+              "cas_winner_#{i}",
+              nil
+            )
           end)
         end
 

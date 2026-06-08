@@ -32,6 +32,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
   rescue
     error -> {:error, {:history_file_unavailable, error}}
   end
+
   def ensure_history_file(shard_data_path) do
     dir = history_dir(shard_data_path)
     path = history_file_path(shard_data_path, 0)
@@ -66,24 +67,24 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
   end
 
   def maybe_persist_projected_index(
-         _instance_ctx,
-         _shard_index,
-         _shard_data_path,
-         _file_path,
-         _index,
-         nil
-       ),
-       do: :ok
+        _instance_ctx,
+        _shard_index,
+        _shard_data_path,
+        _file_path,
+        _index,
+        nil
+      ),
+      do: :ok
 
   def maybe_persist_projected_index(
-         instance_ctx,
-         shard_index,
-         shard_data_path,
-         _file_path,
-         index,
-         requested_index
-       )
-       when is_integer(index) and is_integer(requested_index) do
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        _file_path,
+        index,
+        requested_index
+      )
+      when is_integer(index) and is_integer(requested_index) do
     HistoryProjector.publish_projected_index(instance_ctx, shard_index, shard_data_path, index)
   end
 
@@ -106,6 +107,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
 
   def validate_locations(entries, locations),
     do: {:error, {:location_count_mismatch, length(entries), length(locations)}}
+
   def publish_keydir_entries(instance_ctx, shard_index, keydir, file_id, entries, locations) do
     initial_lfu = LFU.initial()
 
@@ -113,11 +115,20 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
     |> Enum.zip(locations)
     |> Enum.each(fn {entry, {offset, value_size}} ->
       case HistoryProjector.safe_ets_lookup(keydir, entry.key) do
-        [row] -> HistoryProjector.delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
-        _missing -> :ok
+        [row] ->
+          HistoryProjector.delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
+
+        _missing ->
+          :ok
       end
 
-      HistoryProjector.track_keydir_binary_delta(instance_ctx, keydir, shard_index, entry.key, nil)
+      HistoryProjector.track_keydir_binary_delta(
+        instance_ctx,
+        keydir,
+        shard_index,
+        entry.key,
+        nil
+      )
 
       HistoryProjector.safe_ets_insert(
         keydir,
@@ -126,6 +137,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
       )
     end)
   end
+
   def publish_history_index(instance_ctx, shard_index, entries) do
     {flow_index, flow_lookup} =
       NativeFlowIndex.table_names(HistoryProjector.instance_name(instance_ctx), shard_index)
@@ -156,6 +168,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
 
     {Enum.reverse(new_entries), Enum.reverse(update_entries)}
   end
+
   def publish_lmdb_history_locations(shard_data_path, file_id, entries, locations) do
     with :ok <- maybe_history_projector_lmdb_publish_hook(shard_data_path, file_id, entries) do
       write_lmdb_ops(shard_data_path, lmdb_history_location_ops(file_id, entries, locations))

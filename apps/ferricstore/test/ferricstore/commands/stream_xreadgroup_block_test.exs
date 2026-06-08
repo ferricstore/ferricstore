@@ -39,11 +39,12 @@ defmodule Ferricstore.Commands.StreamXreadgroupBlockTest do
       Stream.handle("XADD", [key, "1-0", "f", "v"], store)
       Stream.handle("XGROUP", ["CREATE", key, "grp", "0"], store)
 
-      result = Stream.handle(
-        "XREADGROUP",
-        ["GROUP", "grp", "consumer1", "BLOCK", "0", "STREAMS", key, ">"],
-        store
-      )
+      result =
+        Stream.handle(
+          "XREADGROUP",
+          ["GROUP", "grp", "consumer1", "BLOCK", "0", "STREAMS", key, ">"],
+          store
+        )
 
       # Data available — should return immediately, not block
       assert is_list(result)
@@ -59,11 +60,12 @@ defmodule Ferricstore.Commands.StreamXreadgroupBlockTest do
       for i <- 1..5, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], store)
       Stream.handle("XGROUP", ["CREATE", key, "grp", "0"], store)
 
-      result = Stream.handle(
-        "XREADGROUP",
-        ["GROUP", "grp", "c1", "COUNT", "2", "BLOCK", "0", "STREAMS", key, ">"],
-        store
-      )
+      result =
+        Stream.handle(
+          "XREADGROUP",
+          ["GROUP", "grp", "c1", "COUNT", "2", "BLOCK", "0", "STREAMS", key, ">"],
+          store
+        )
 
       assert is_list(result)
       [[^key, entries]] = result
@@ -85,11 +87,12 @@ defmodule Ferricstore.Commands.StreamXreadgroupBlockTest do
       )
 
       # Now BLOCK — no new messages, should signal block
-      result = Stream.handle(
-        "XREADGROUP",
-        ["GROUP", "grp", "c1", "BLOCK", "100", "STREAMS", key, ">"],
-        store
-      )
+      result =
+        Stream.handle(
+          "XREADGROUP",
+          ["GROUP", "grp", "c1", "BLOCK", "100", "STREAMS", key, ">"],
+          store
+        )
 
       # Should return {:block, timeout_ms, ...} tuple for the connection layer
       assert is_tuple(result)
@@ -104,11 +107,12 @@ defmodule Ferricstore.Commands.StreamXreadgroupBlockTest do
       Stream.handle("XADD", [key, "1-0", "f", "v"], store)
       Stream.handle("XGROUP", ["CREATE", key, "grp", "0"], store)
 
-      result = Stream.handle(
-        "XREADGROUP",
-        ["GROUP", "grp", "c1", "STREAMS", key, ">"],
-        store
-      )
+      result =
+        Stream.handle(
+          "XREADGROUP",
+          ["GROUP", "grp", "c1", "STREAMS", key, ">"],
+          store
+        )
 
       assert is_list(result)
       [[^key, entries]] = result
@@ -122,11 +126,12 @@ defmodule Ferricstore.Commands.StreamXreadgroupBlockTest do
       for i <- 1..5, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], store)
       Stream.handle("XGROUP", ["CREATE", key, "grp", "0"], store)
 
-      result = Stream.handle(
-        "XREADGROUP",
-        ["GROUP", "grp", "c1", "BLOCK", "0", "COUNT", "3", "STREAMS", key, ">"],
-        store
-      )
+      result =
+        Stream.handle(
+          "XREADGROUP",
+          ["GROUP", "grp", "c1", "BLOCK", "0", "COUNT", "3", "STREAMS", key, ">"],
+          store
+        )
 
       assert is_list(result)
       [[^key, entries]] = result

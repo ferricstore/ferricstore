@@ -357,42 +357,57 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Prob file migration
   # -------------------------------------------------------------------
 
-@spec migrate_prob_files(binary(), :ets.tid(), non_neg_integer(), term()) :: :ok
-@doc false
-def migrate_prob_files(shard_data_path, keydir, index, instance_ctx \\ nil) do
-  ProbMigration.migrate_prob_files(shard_data_path, keydir, index, instance_ctx)
-end
+  @spec migrate_prob_files(binary(), :ets.tid(), non_neg_integer(), term()) :: :ok
+  @doc false
+  def migrate_prob_files(shard_data_path, keydir, index, instance_ctx \\ nil) do
+    ProbMigration.migrate_prob_files(shard_data_path, keydir, index, instance_ctx)
+  end
 
-@spec migrate_prob_file(
-        binary(),
-        binary(),
-        :ets.tid(),
-        non_neg_integer(),
-        non_neg_integer(),
-        term()
-      ) :: non_neg_integer()
-@doc false
-def migrate_prob_file(prob_dir, filename, keydir, shard_index, count, instance_ctx \\ nil) do
-  ProbMigration.migrate_prob_file(prob_dir, filename, keydir, shard_index, count, instance_ctx)
-end
+  @spec migrate_prob_file(
+          binary(),
+          binary(),
+          :ets.tid(),
+          non_neg_integer(),
+          non_neg_integer(),
+          term()
+        ) :: non_neg_integer()
+  @doc false
+  def migrate_prob_file(prob_dir, filename, keydir, shard_index, count, instance_ctx \\ nil) do
+    ProbMigration.migrate_prob_file(prob_dir, filename, keydir, shard_index, count, instance_ctx)
+  end
 
-@spec migrate_if_missing(
-        :ets.tid(),
-        non_neg_integer(),
-        binary(),
-        binary(),
-        atom(),
-        non_neg_integer()
-      ) :: non_neg_integer()
-@doc false
-def migrate_if_missing(keydir, shard_index, filename_key, path, type, count, instance_ctx \\ nil) do
-  ProbMigration.migrate_if_missing(keydir, shard_index, filename_key, path, type, count, instance_ctx)
-end
+  @spec migrate_if_missing(
+          :ets.tid(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          atom(),
+          non_neg_integer()
+        ) :: non_neg_integer()
+  @doc false
+  def migrate_if_missing(
+        keydir,
+        shard_index,
+        filename_key,
+        path,
+        type,
+        count,
+        instance_ctx \\ nil
+      ) do
+    ProbMigration.migrate_if_missing(
+      keydir,
+      shard_index,
+      filename_key,
+      path,
+      type,
+      count,
+      instance_ctx
+    )
+  end
 
-@spec build_prob_meta(atom(), binary(), binary()) :: {atom(), map()}
-@doc false
-def build_prob_meta(type, path, key), do: ProbMigration.build_prob_meta(type, path, key)
-
+  @spec build_prob_meta(atom(), binary(), binary()) :: {atom(), map()}
+  @doc false
+  def build_prob_meta(type, path, key), do: ProbMigration.build_prob_meta(type, path, key)
 
   # -------------------------------------------------------------------
   # Raft startup
@@ -428,10 +443,9 @@ def build_prob_meta(type, path, key), do: ProbMigration.build_prob_meta(type, pa
   # Terminate
   # -------------------------------------------------------------------
 
-@spec do_terminate(term(), map()) :: :ok
-@doc false
-def do_terminate(reason, state), do: Shutdown.do_terminate(reason, state)
-
+  @spec do_terminate(term(), map()) :: :ok
+  @doc false
+  def do_terminate(reason, state), do: Shutdown.do_terminate(reason, state)
 
   defp cleanup_compact_temps(shard_path, files) do
     Enum.each(files, fn name ->

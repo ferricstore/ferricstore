@@ -91,8 +91,11 @@ defmodule Ferricstore.Commands.Geo.Parsing do
 
       "BYRADIUS" ->
         case rest do
-          [radius_str, unit_str | rest] -> parse_geosearch_radius(radius_str, unit_str, rest, opts)
-          _ -> {:error, "ERR syntax error"}
+          [radius_str, unit_str | rest] ->
+            parse_geosearch_radius(radius_str, unit_str, rest, opts)
+
+          _ ->
+            {:error, "ERR syntax error"}
         end
 
       "BYBOX" ->

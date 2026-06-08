@@ -77,19 +77,15 @@ Benchee.run(
     "Parser: 1000 pipelined SET commands" => fn ->
       {:ok, _values, ""} = Parser.parse(pipelined_1000)
     end,
-
     "Parser: simple string (+OK)" => fn ->
       {:ok, [{:simple, "OK"}], ""} = Parser.parse(simple_string_bin)
     end,
-
     "Parser: bulk string (1KB payload)" => fn ->
       {:ok, [_value], ""} = Parser.parse(bulk_1kb_bin)
     end,
-
     "Parser: array of 10 bulk strings" => fn ->
       {:ok, [_array], ""} = Parser.parse(nested_array_bin)
     end,
-
     "Parser: map with 20 entries" => fn ->
       {:ok, [_map], ""} = Parser.parse(map_20_bin)
     end,
@@ -99,15 +95,12 @@ Benchee.run(
     "Encoder: {:simple, \"OK\"}" => fn ->
       Encoder.encode(simple_ok)
     end,
-
     "Encoder: 10-element array" => fn ->
       Encoder.encode(array_10)
     end,
-
     "Encoder: map with 10 keys" => fn ->
       Encoder.encode(map_10)
     end,
-
     "Encoder: bulk string (1KB)" => fn ->
       Encoder.encode(bulk_1kb_term)
     end,
@@ -118,12 +111,10 @@ Benchee.run(
       bin = Encoder.encode(simple_ok) |> IO.iodata_to_binary()
       {:ok, [{:simple, "OK"}], ""} = Parser.parse(bin)
     end,
-
     "Roundtrip: 10-element array" => fn ->
       bin = Encoder.encode(array_10) |> IO.iodata_to_binary()
       {:ok, [_array], ""} = Parser.parse(bin)
     end,
-
     "Roundtrip: map with 10 keys" => fn ->
       bin = Encoder.encode(map_10) |> IO.iodata_to_binary()
       {:ok, [_map], ""} = Parser.parse(bin)

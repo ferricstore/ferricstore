@@ -35,7 +35,8 @@ defmodule Ferricstore.ReviewR4.D1NondeterministicOsTimeTest do
       # on wall clock time, not a deterministic timestamp from the Raft log.
 
       now = System.os_time(:millisecond)
-      expire_at = now + 100  # expires 100ms from now
+      # expires 100ms from now
+      expire_at = now + 100
 
       state = %{
         cross_shard_locks: %{"mykey" => {make_ref(), expire_at}},
@@ -66,8 +67,10 @@ defmodule Ferricstore.ReviewR4.D1NondeterministicOsTimeTest do
 
       state = %{
         cross_shard_locks: %{
-          "key_a" => {make_ref(), now - 1},   # expired
-          "key_b" => {make_ref(), now + 5000}  # active
+          # expired
+          "key_a" => {make_ref(), now - 1},
+          # active
+          "key_b" => {make_ref(), now + 5000}
         },
         cross_shard_intents: %{}
       }

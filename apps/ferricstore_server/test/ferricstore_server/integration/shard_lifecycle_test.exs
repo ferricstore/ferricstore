@@ -52,7 +52,10 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
   end
 
   defp shard_index_for(key), do: Router.shard_for(FerricStore.Instance.get(:default), key)
-  defp shard_name_for(key), do: Router.shard_name(FerricStore.Instance.get(:default), shard_index_for(key))
+
+  defp shard_name_for(key),
+    do: Router.shard_name(FerricStore.Instance.get(:default), shard_index_for(key))
+
   defp shard_pid_for(key), do: Process.whereis(shard_name_for(key))
 
   # Builds a store map backed by the real Router (application-supervised shards).
@@ -135,7 +138,6 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
   # TCP helpers (adapted from ConnectionTest / CommandsTcpTest)
   # ---------------------------------------------------------------------------
 
-
   defp connect_and_hello(port) do
     {:ok, sock} =
       :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
@@ -188,8 +190,10 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       _new_pid = wait_for_new_pid(shard_name_for(k), pid)
       ShardHelpers.wait_shards_alive()
 
-      ShardHelpers.eventually(fn -> v == Router.get(FerricStore.Instance.get(:default), k) end,
-        "Value should be recovered from Bitcask after shard restart")
+      ShardHelpers.eventually(
+        fn -> v == Router.get(FerricStore.Instance.get(:default), k) end,
+        "Value should be recovered from Bitcask after shard restart"
+      )
     end
 
     test "new shard process is registered under same name after restart" do
@@ -226,8 +230,10 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       ShardHelpers.wait_shards_alive()
 
       # First GET after restart: cache miss, warms from Bitcask
-      ShardHelpers.eventually(fn -> v == Router.get(FerricStore.Instance.get(:default), k) end,
-        "Value should be recovered from Bitcask after shard restart")
+      ShardHelpers.eventually(
+        fn -> v == Router.get(FerricStore.Instance.get(:default), k) end,
+        "Value should be recovered from Bitcask after shard restart"
+      )
 
       # Second GET: served from ETS
       assert v == Router.get(FerricStore.Instance.get(:default), k)
@@ -257,8 +263,10 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
 
       # All 10 keys should still be retrievable regardless of which shard they map to
       for {k, i} <- Enum.with_index(keys, 1) do
-        ShardHelpers.eventually(fn -> "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k) end,
-          "Key #{k} should survive three restarts of shard 0")
+        ShardHelpers.eventually(
+          fn -> "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k) end,
+          "Key #{k} should survive three restarts of shard 0"
+        )
       end
     end
 
@@ -285,14 +293,24 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       assert result in [:ok, :exit_caught]
 
       # After restart is complete, writes should succeed
-      _new_pid = wait_for_new_pid(Router.shard_name(FerricStore.Instance.get(:default), 0), old_pid)
+      _new_pid =
+        wait_for_new_pid(Router.shard_name(FerricStore.Instance.get(:default), 0), old_pid)
+
       ShardHelpers.wait_shards_alive()
-      ShardHelpers.eventually(fn ->
-        Router.put(FerricStore.Instance.get(:default), k, "after_restart", 0) == :ok
-      end, "put should succeed after shard restart")
-      ShardHelpers.eventually(fn ->
-        "after_restart" == Router.get(FerricStore.Instance.get(:default), k)
-      end, "get should return value written after shard restart")
+
+      ShardHelpers.eventually(
+        fn ->
+          Router.put(FerricStore.Instance.get(:default), k, "after_restart", 0) == :ok
+        end,
+        "put should succeed after shard restart"
+      )
+
+      ShardHelpers.eventually(
+        fn ->
+          "after_restart" == Router.get(FerricStore.Instance.get(:default), k)
+        end,
+        "get should return value written after shard restart"
+      )
     end
   end
 
@@ -309,7 +327,9 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       assert "v" == Router.get(FerricStore.Instance.get(:default), k)
 
       :timer.sleep(350)
-      assert nil == Router.get(FerricStore.Instance.get(:default), k), "Key should be nil after 300ms TTL"
+
+      assert nil == Router.get(FerricStore.Instance.get(:default), k),
+             "Key should be nil after 300ms TTL"
     end
 
     test "expired key not counted in DBSIZE" do
@@ -334,7 +354,9 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       assert k in Router.keys(FerricStore.Instance.get(:default))
 
       :timer.sleep(300)
-      refute k in Router.keys(FerricStore.Instance.get(:default)), "Expired key should not appear in keys()"
+
+      refute k in Router.keys(FerricStore.Instance.get(:default)),
+             "Expired key should not appear in keys()"
     end
 
     test "EXPIRE then sleep then key is gone" do
@@ -394,7 +416,8 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
 
       # Each GET triggers lazy eviction
       for k <- keys do
-        assert nil == Router.get(FerricStore.Instance.get(:default), k), "Expired key #{k} should return nil"
+        assert nil == Router.get(FerricStore.Instance.get(:default), k),
+               "Expired key #{k} should return nil"
       end
 
       # None should appear in keys()
@@ -451,6 +474,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       # Shards 1, 2, 3 should remain alive with the same PIDs
       for {i, original_pid} <- pids_1_to_3 do
         current_pid = shard_pid(i)
+
         assert current_pid == original_pid,
                "Shard #{i} should not have restarted (one_for_one strategy)"
 

@@ -42,10 +42,15 @@ defmodule Ferricstore.Store.LFU do
   """
   @spec init_config_cache() :: :ok
   def init_config_cache do
-    :persistent_term.put(:ferricstore_lfu_decay_time,
-      Application.get_env(:ferricstore, :lfu_decay_time, 1))
-    :persistent_term.put(:ferricstore_lfu_log_factor,
-      Application.get_env(:ferricstore, :lfu_log_factor, 10))
+    :persistent_term.put(
+      :ferricstore_lfu_decay_time,
+      Application.get_env(:ferricstore, :lfu_decay_time, 1)
+    )
+
+    :persistent_term.put(
+      :ferricstore_lfu_log_factor,
+      Application.get_env(:ferricstore, :lfu_log_factor, 10)
+    )
 
     # Atomics for the per-minute initial value cache.
     # Slot 1: cached minute, Slot 2: packed initial value.

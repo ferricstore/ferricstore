@@ -31,9 +31,14 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesHashTest do
   defp connect_and_hello(port) do
     {:ok, sock} =
       :gen_tcp.connect({127, 0, 0, 1}, port, [
-        :binary, active: false, packet: :raw, nodelay: true,
-        recbuf: 4 * 1024 * 1024, sndbuf: 4 * 1024 * 1024
+        :binary,
+        active: false,
+        packet: :raw,
+        nodelay: true,
+        recbuf: 4 * 1024 * 1024,
+        sndbuf: 4 * 1024 * 1024
       ])
+
     send_cmd(sock, ["HELLO", "3"])
     _greeting = recv_direct(sock, "", 5_000)
     sock
@@ -41,7 +46,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesHashTest do
 
   defp recv_direct(sock, buf, timeout) do
     case Parser.parse(buf) do
-      {:ok, [val | _], _rest} -> val
+      {:ok, [val | _], _rest} ->
+        val
+
       {:ok, [], _} ->
         case :gen_tcp.recv(sock, 0, timeout) do
           {:ok, data} -> recv_direct(sock, buf <> data, timeout)
@@ -62,7 +69,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesHashTest do
       [val | rest] ->
         Process.put(@parsed_key, rest)
         val
-      [] -> recv_loop(sock, Process.get(@binary_key, ""), timeout)
+
+      [] ->
+        recv_loop(sock, Process.get(@binary_key, ""), timeout)
     end
   end
 
@@ -72,6 +81,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesHashTest do
         Process.put(@parsed_key, rest_vals)
         Process.put(@binary_key, rest_bin)
         val
+
       {:ok, [], _} ->
         case :gen_tcp.recv(sock, 0, timeout) do
           {:ok, data} -> recv_loop(sock, buf <> data, timeout)
@@ -89,7 +99,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesHashTest do
 
   defp assert_error_contains(result, substring) do
     assert {:error, msg} = result
-    assert String.contains?(msg, substring), "Expected error containing #{inspect(substring)}, got: #{inspect(msg)}"
+
+    assert String.contains?(msg, substring),
+           "Expected error containing #{inspect(substring)}, got: #{inspect(msg)}"
   end
 
   # ===========================================================================

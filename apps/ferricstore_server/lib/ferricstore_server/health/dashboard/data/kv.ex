@@ -7,8 +7,10 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
   alias FerricstoreServer.Health.Dashboard.Data.Operational
 
   import FerricstoreServer.Health.Dashboard.Format, only: [format_bytes: 1, format_duration_ms: 1]
+
   import FerricstoreServer.Health.Dashboard.QueryParams,
     only: [dashboard_param: 2, truthy_dashboard_param?: 1]
+
   import FerricstoreServer.Health.Dashboard.Render.KVPages, only: [kv_command_groups: 0]
 
   @keyspace_dashboard_default_limit 50
@@ -113,7 +115,8 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
               keydir
             )
 
-          {Map.merge(acc_map, shard_map, fn _k, v1, v2 -> v1 + v2 end), acc_total + shard_count_val}
+          {Map.merge(acc_map, shard_map, fn _k, v1, v2 -> v1 + v2 end),
+           acc_total + shard_count_val}
         rescue
           _ -> {acc_map, acc_total}
         catch
@@ -172,8 +175,11 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
 
     try do
       case :ets.select(keydir, match_spec, @keyspace_dashboard_select_batch) do
-        :"$end_of_table" -> {[], 0}
-        {entries, continuation} -> continue_keyspace_rows(entries, continuation, index, filters, remaining, [], 0)
+        :"$end_of_table" ->
+          {[], 0}
+
+        {entries, continuation} ->
+          continue_keyspace_rows(entries, continuation, index, filters, remaining, [], 0)
       end
     rescue
       ArgumentError -> {[], 0}
@@ -203,13 +209,27 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
 
       true ->
         case :ets.select(continuation) do
-          :"$end_of_table" -> {Enum.reverse(rows), scanned}
-          {next_entries, next_continuation} -> continue_keyspace_rows(next_entries, next_continuation, index, filters, remaining, rows, scanned)
+          :"$end_of_table" ->
+            {Enum.reverse(rows), scanned}
+
+          {next_entries, next_continuation} ->
+            continue_keyspace_rows(
+              next_entries,
+              next_continuation,
+              index,
+              filters,
+              remaining,
+              rows,
+              scanned
+            )
         end
     end
   end
 
-  defp keyspace_entry_row(index, {physical_key, value, expire_at_ms, lfu, file_id, offset, value_size}) do
+  defp keyspace_entry_row(
+         index,
+         {physical_key, value, expire_at_ms, lfu, file_id, offset, value_size}
+       ) do
     %{
       key: keyspace_logical_key(physical_key),
       physical_key: physical_key,
@@ -275,28 +295,46 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
   defp keyspace_location_label(_value, {:waraft_segment, _index}), do: "segment cold"
   defp keyspace_location_label(_value, {:waraft_projection, _index}), do: "projection cold"
   defp keyspace_location_label(_value, {:waraft_apply_projection, _index}), do: "projection cold"
-  defp keyspace_location_label(_value, file_id) when is_integer(file_id) and file_id >= 0, do: "bitcask cold"
+
+  defp keyspace_location_label(_value, file_id) when is_integer(file_id) and file_id >= 0,
+    do: "bitcask cold"
+
   defp keyspace_location_label(_value, _file_id), do: "unknown"
 
   defp inspect_keyspace_key("", _rows), do: nil
 
   defp inspect_keyspace_key(key, rows) do
     case Enum.find(rows, &(&1.key == key or &1.physical_key == key)) do
-      nil -> %{key: key, found?: false, type: "none", ttl: "-", size: "-", location: "-", shard: "-"}
-      row -> %{key: key, found?: true, type: row.type, ttl: row.ttl, size: row.size, location: row.location, shard: row.shard}
+      nil ->
+        %{key: key, found?: false, type: "none", ttl: "-", size: "-", location: "-", shard: "-"}
+
+      row ->
+        %{
+          key: key,
+          found?: true,
+          type: row.type,
+          ttl: row.ttl,
+          size: row.size,
+          location: row.location,
+          shard: row.shard
+        }
     end
   end
 
   defp parse_bounded_int(value, default, min_value, max_value) do
     parsed =
       cond do
-        is_integer(value) -> value
+        is_integer(value) ->
+          value
+
         is_binary(value) ->
           case Integer.parse(value) do
             {int, ""} -> int
             _ -> default
           end
-        true -> default
+
+        true ->
+          default
       end
 
     parsed |> max(min_value) |> min(max_value)

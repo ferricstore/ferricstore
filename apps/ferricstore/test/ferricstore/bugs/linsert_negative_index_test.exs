@@ -46,9 +46,9 @@ defmodule Ferricstore.Bugs.LinsertNegativeIndexTest do
       expected_len = count + 2
 
       assert length(result) == expected_len,
-        "Expected #{expected_len} elements after #{count} LINSERT operations, " <>
-        "but got #{length(result)}. Position collisions caused element loss. " <>
-        "List: #{inspect(Enum.take(result, 5))} ... #{inspect(Enum.take(result, -5))}"
+             "Expected #{expected_len} elements after #{count} LINSERT operations, " <>
+               "but got #{length(result)}. Position collisions caused element loss. " <>
+               "List: #{inspect(Enum.take(result, 5))} ... #{inspect(Enum.take(result, -5))}"
     end
 
     test "LINSERT BEFORE first element repeatedly preserves all elements" do
@@ -67,12 +67,12 @@ defmodule Ferricstore.Bugs.LinsertNegativeIndexTest do
       expected_len = count + 1
 
       assert length(result) == expected_len,
-        "Expected #{expected_len} elements after #{count} LINSERT BEFORE first operations, " <>
-        "but got #{length(result)}. Position collisions caused element loss."
+             "Expected #{expected_len} elements after #{count} LINSERT BEFORE first operations, " <>
+               "but got #{length(result)}. Position collisions caused element loss."
 
       # "anchor" should still be the last element
       assert List.last(result) == "anchor",
-        "The original anchor element should remain at the end of the list"
+             "The original anchor element should remain at the end of the list"
     end
   end
 end

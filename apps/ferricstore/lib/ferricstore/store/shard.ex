@@ -42,6 +42,12 @@ defmodule Ferricstore.Store.Shard do
   Shards register under the name returned by
   `Ferricstore.Store.Router.shard_name/1`, e.g.
   `:"Ferricstore.Store.Shard.0"`.
+
+  ## Performance boundary
+
+  Shard write/read helpers are hot. Keep per-command paths allocation-light and
+  avoid extra GenServer/Task hops. Any refactor in this module or its shard
+  helper modules needs memtier and Flow benchmark comparison.
   """
 
   use GenServer
@@ -171,7 +177,6 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
   # GenServer callbacks
   # -------------------------------------------------------------------
-
 
   use Ferricstore.Store.Shard.Startup
   use Ferricstore.Store.Shard.Calls

@@ -389,17 +389,27 @@ defmodule FerricstoreServer.Spec.ScanFilteringTest do
       FerricStore.hset("dbsize_del", %{"a" => "1", "b" => "2"})
 
       # Under full-suite load, Raft apply may lag — retry until visible.
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        {:ok, before_del} = FerricStore.dbsize()
-        assert before_del == 1
-      end, "dbsize should be 1 after hset", 10, 100)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          {:ok, before_del} = FerricStore.dbsize()
+          assert before_del == 1
+        end,
+        "dbsize should be 1 after hset",
+        10,
+        100
+      )
 
       FerricStore.del("dbsize_del")
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        {:ok, after_del} = FerricStore.dbsize()
-        assert after_del == 0
-      end, "dbsize should be 0 after del", 10, 100)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          {:ok, after_del} = FerricStore.dbsize()
+          assert after_del == 0
+        end,
+        "dbsize should be 0 after del",
+        10,
+        100
+      )
     end
 
     test "DBSIZE via Commands.Server excludes compound keys (MockStore)" do

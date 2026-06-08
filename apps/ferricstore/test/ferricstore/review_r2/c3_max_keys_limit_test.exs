@@ -58,6 +58,7 @@ defmodule Ferricstore.ReviewR2.C3MaxKeysLimitTest do
         {:error, msg} when is_binary(msg) ->
           refute String.contains?(msg, "max key limit"),
                  "Should not be rejected by key limit, got: #{msg}"
+
         _ ->
           :ok
       end
@@ -68,7 +69,9 @@ defmodule Ferricstore.ReviewR2.C3MaxKeysLimitTest do
       keys =
         Stream.iterate(0, &(&1 + 1))
         |> Stream.map(fn i -> "same_shard_limit_#{i}" end)
-        |> Stream.filter(fn k -> Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k) == 0 end)
+        |> Stream.filter(fn k ->
+          Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k) == 0
+        end)
         |> Enum.take(30)
 
       keys_with_roles = Enum.map(keys, fn k -> {k, :write} end)

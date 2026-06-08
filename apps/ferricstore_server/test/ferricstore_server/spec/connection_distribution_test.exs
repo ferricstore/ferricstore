@@ -186,7 +186,9 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
         lines
         |> Enum.filter(fn line ->
           trimmed = String.trim(line)
-          String.starts_with?(trimmed, "keys:") and not String.starts_with?(trimmed, "total_keys:")
+
+          String.starts_with?(trimmed, "keys:") and
+            not String.starts_with?(trimmed, "total_keys:")
         end)
         |> Enum.map(fn line ->
           line

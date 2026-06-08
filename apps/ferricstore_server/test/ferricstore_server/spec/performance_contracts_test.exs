@@ -94,7 +94,9 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
             do_drain(sock, remaining, buf <> data, acc)
 
           {:error, reason} ->
-            flunk("drain_responses: recv error #{inspect(reason)}, got #{length(acc)} of #{length(acc) + remaining}")
+            flunk(
+              "drain_responses: recv error #{inspect(reason)}, got #{length(acc)} of #{length(acc) + remaining}"
+            )
         end
     end
   end
@@ -166,7 +168,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       # Spec target: p99 < 10us for ETS hot hit.
       # CI budget: average < 1ms (1000us) per GET — extremely generous.
       assert avg_us < 1_000,
-        "Average Router.get on warm key was #{Float.round(avg_us, 1)}us, expected < 1000us"
+             "Average Router.get on warm key was #{Float.round(avg_us, 1)}us, expected < 1000us"
 
       # Clean up
       Router.delete(FerricStore.Instance.get(:default), key)
@@ -199,7 +201,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       # On a single-node Raft cluster this is fast, but the group-commit window
       # and fsync introduce latency. 20ms per sequential SET is generous for CI.
       assert avg_ms < 20,
-        "Average SET latency was #{Float.round(avg_ms * 1.0, 2)}ms, expected < 20ms"
+             "Average SET latency was #{Float.round(avg_ms * 1.0, 2)}ms, expected < 20ms"
     end
   end
 
@@ -238,7 +240,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       assert Enum.all?(get_responses, &(&1 == "pval"))
 
       assert elapsed < 50,
-        "Pipeline of 10 commands took #{elapsed}ms, expected < 50ms"
+             "Pipeline of 10 commands took #{elapsed}ms, expected < 50ms"
     end
 
     @tag :bench
@@ -262,7 +264,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       assert Enum.all?(responses, &(&1 == {:simple, "PONG"}))
 
       assert elapsed < 50,
-        "Pipeline of 10 PINGs took #{elapsed}ms, expected < 50ms"
+             "Pipeline of 10 PINGs took #{elapsed}ms, expected < 50ms"
     end
   end
 
@@ -306,10 +308,10 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       # We should have found at least 1000 keys (there may be more from
       # other tests if FLUSHDB didn't fully clear, but at least 1000).
       assert total_keys >= 1000,
-        "SCAN found only #{total_keys} keys, expected >= 1000"
+             "SCAN found only #{total_keys} keys, expected >= 1000"
 
       assert elapsed < 500,
-        "SCAN over #{total_keys} keys took #{elapsed}ms, expected < 500ms"
+             "SCAN over #{total_keys} keys took #{elapsed}ms, expected < 500ms"
     end
   end
 
@@ -360,7 +362,10 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       # Record cold path time by doing repeated GenServer calls
       # (Force cache miss by using a key pattern that bypasses ETS)
       cold_keys = for i <- 1..100, do: ukey("cold_#{i}")
-      Enum.each(cold_keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "cold_value") end)
+
+      Enum.each(cold_keys, fn k ->
+        Router.put(FerricStore.Instance.get(:default), k, "cold_value")
+      end)
 
       # Evict cold keys from keydir to force cold reads
       Enum.each(cold_keys, fn k ->
@@ -383,7 +388,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       # On any hardware, ETS lookup should be at least 2x faster than
       # a GenServer call that hits Bitcask.
       assert warm_avg < cold_avg,
-        "Warm avg=#{Float.round(warm_avg, 1)}us should be faster than cold avg=#{Float.round(cold_avg, 1)}us"
+             "Warm avg=#{Float.round(warm_avg, 1)}us should be faster than cold avg=#{Float.round(cold_avg, 1)}us"
 
       # Clean up
       Router.delete(FerricStore.Instance.get(:default), key)

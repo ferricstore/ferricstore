@@ -25,7 +25,9 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistryTest do
     PendingRegistry.trim_replay_reservation(projector, 1_000_000)
     assert PendingRegistry.replay_reservation_flushed_index(projector) == 0
 
-    assert PendingRegistry.reserve_replay_range(projector, [%{ra_index: 5}, %{ra_index: 7}]) == :ok
+    assert PendingRegistry.reserve_replay_range(projector, [%{ra_index: 5}, %{ra_index: 7}]) ==
+             :ok
+
     assert PendingRegistry.mark_replay_range_flushed(projector, 6) == :ok
     assert PendingRegistry.replay_reservation_flushed_index(projector) == 6
 

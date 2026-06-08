@@ -25,4 +25,3 @@ defmodule Ferricstore.Test.AclCase do
     end
   end
 end
-

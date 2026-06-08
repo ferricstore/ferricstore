@@ -182,7 +182,6 @@ defmodule FerricStore.API.SortedSets do
   # Native Commands
   # ---------------------------------------------------------------------------
 
-
   @doc """
   Returns the rank of `member` in the sorted set at `key` (ascending score order).
 

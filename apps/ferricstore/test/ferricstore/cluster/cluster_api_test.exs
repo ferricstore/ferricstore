@@ -54,7 +54,10 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
   describe "compatibility hooks" do
     test "system start/stop hooks are no-ops because WARaft owns runtime startup" do
       root =
-        Path.join(System.tmp_dir!(), "ferricstore_cluster_api_#{System.unique_integer([:positive])}")
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_cluster_api_#{System.unique_integer([:positive])}"
+        )
 
       on_exit(fn -> File.rm_rf(root) end)
 

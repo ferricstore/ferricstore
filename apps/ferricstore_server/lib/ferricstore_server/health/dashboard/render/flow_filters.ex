@@ -1,18 +1,17 @@
 defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
+  import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.QueryParams
 
-import FerricstoreServer.Health.Dashboard.Format
-import FerricstoreServer.Health.Dashboard.QueryParams
-
-@flow_dashboard_recent_limit 40
-@flow_dashboard_max_recent_limit 200
-@flow_dashboard_time_range_options [
-  {nil, "All time"},
-  {"5m", "Last 5 minutes"},
-  {"15m", "Last 15 minutes"},
-  {"1h", "Last 1 hour"},
-  {"6h", "Last 6 hours"},
-  {"24h", "Last 24 hours"}
-]
+  @flow_dashboard_recent_limit 40
+  @flow_dashboard_max_recent_limit 200
+  @flow_dashboard_time_range_options [
+    {nil, "All time"},
+    {"5m", "Last 5 minutes"},
+    {"15m", "Last 15 minutes"},
+    {"1h", "Last 1 hour"},
+    {"6h", "Last 6 hours"},
+    {"24h", "Last 24 hours"}
+  ]
 
   def render_flow_type_filter(data) do
     filters =

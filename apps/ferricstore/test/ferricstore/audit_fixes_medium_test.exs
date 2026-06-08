@@ -8,7 +8,6 @@ defmodule Ferricstore.AuditFixesMediumTest do
 
   alias Ferricstore.Commands.{Strings, Hash, Set, Server, Generic}
 
-
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map
   # ---------------------------------------------------------------------------
@@ -25,7 +24,9 @@ defmodule Ferricstore.AuditFixesMediumTest do
       put: fn _key, _val, _exp -> :ok end,
       delete: fn _key -> :ok end,
       exists?: fn key -> Map.has_key?(data, key) end,
-      keys: fn -> Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1) end,
+      keys: fn ->
+        Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1)
+      end,
       flush: fn -> :ok end,
       dbsize: fn -> map_size(data) end,
       incr: fn _key, _delta -> {:ok, 1} end,
@@ -425,7 +426,9 @@ defmodule Ferricstore.AuditFixesMediumTest do
     end
 
     test "SCAN pagination respects sort order" do
-      data = for i <- 1..10, into: %{}, do: {"key_#{String.pad_leading("#{i}", 3, "0")}", {"v", 0}}
+      data =
+        for i <- 1..10, into: %{}, do: {"key_#{String.pad_leading("#{i}", 3, "0")}", {"v", 0}}
+
       store = mock_store(data)
 
       all_keys = collect_scan_keys(store, "0", 3, [])

@@ -6,7 +6,6 @@ defmodule Ferricstore.AuditFixesTest do
   from the guide audit; C1, H3, M5-M6, L4-L5, L7 from the memory audit).
   """
 
-
   use ExUnit.Case, async: true
   # All tests have been split into:
   #   audit_fixes_critical_test.exs

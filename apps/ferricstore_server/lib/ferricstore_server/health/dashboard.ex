@@ -33,7 +33,15 @@ defmodule FerricstoreServer.Health.Dashboard do
   alias FerricstoreServer.Health.Dashboard.Data.{KV, Operational}
   alias FerricstoreServer.Health.Dashboard.LivePayload
   alias FerricstoreServer.Health.Dashboard.Templates
-  alias FerricstoreServer.Health.Dashboard.Flow.{Browse, Detail, PolicyRetention, Projection, Query, Recovery}
+
+  alias FerricstoreServer.Health.Dashboard.Flow.{
+    Browse,
+    Detail,
+    PolicyRetention,
+    Projection,
+    Query,
+    Recovery
+  }
 
   require Logger
 
@@ -667,7 +675,8 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @doc "Collects Flow lineage records by parent, root, or correlation id."
   @spec collect_flow_lineage_page(keyword()) :: map()
-  def collect_flow_lineage_page(opts \\ []) when is_list(opts), do: Query.collect_lineage_page(opts)
+  def collect_flow_lineage_page(opts \\ []) when is_list(opts),
+    do: Query.collect_lineage_page(opts)
 
   @doc false
   @spec flow_lineage_opts_from_query(binary()) :: keyword()
@@ -695,7 +704,8 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @doc "Collects recent Flow signal events from a bounded Flow sample."
   @spec collect_flow_signals_page(keyword()) :: map()
-  def collect_flow_signals_page(opts \\ []) when is_list(opts), do: Query.collect_signals_page(opts)
+  def collect_flow_signals_page(opts \\ []) when is_list(opts),
+    do: Query.collect_signals_page(opts)
 
   @doc false
   @spec flow_signals_opts_from_query(binary()) :: keyword()
@@ -728,7 +738,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec collect_flow_detail_page(binary(), keyword()) :: map()
   def collect_flow_detail_page(id, opts \\ [])
-  def collect_flow_detail_page(id, opts) when is_binary(id) and is_list(opts), do: Detail.collect_page(id, opts)
+
+  def collect_flow_detail_page(id, opts) when is_binary(id) and is_list(opts),
+    do: Detail.collect_page(id, opts)
 
   @doc """
   Renders the Flow detail page.
@@ -744,6 +756,4 @@ defmodule FerricstoreServer.Health.Dashboard do
   # ---------------------------------------------------------------------------
   # HTML rendering -- Main Dashboard
   # ---------------------------------------------------------------------------
-
-
 end

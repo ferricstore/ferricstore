@@ -464,7 +464,9 @@ defmodule Ferricstore.Commands.Strings do
   def handle_ast(_ast, _store), do: {:error, "ERR wrong number of arguments for 'set' command"}
 
   defp get_key("", _store), do: {:error, "ERR empty key"}
-  defp get_key(key, _store) when byte_size(key) > @max_key_bytes, do: {:error, "ERR key too large"}
+
+  defp get_key(key, _store) when byte_size(key) > @max_key_bytes,
+    do: {:error, "ERR key too large"}
 
   defp get_key(key, store) do
     case read_string_value(key, store) do

@@ -909,10 +909,17 @@ defmodule Ferricstore.Commands.Hash do
 
   defp write_hash_field(store, key, compound_key, value, success, type_status) do
     case Ops.compound_put(store, key, compound_key, value, 0) do
-      :ok -> success
-      true -> success
-      {:error, _reason} = error -> FieldOps.rollback_new_type_marker(key, store, type_status, error)
-      other -> {:error, other}
+      :ok ->
+        success
+
+      true ->
+        success
+
+      {:error, _reason} = error ->
+        FieldOps.rollback_new_type_marker(key, store, type_status, error)
+
+      other ->
+        {:error, other}
     end
   end
 
@@ -921,5 +928,4 @@ defmodule Ferricstore.Commands.Hash do
       select_random_hash_fields(key, count, with_values, store)
     end
   end
-
 end

@@ -17,6 +17,7 @@ defmodule Ferricstore.Test.MockStore do
   @spec make(map()) :: map()
   def make(initial \\ %{}) do
     {:ok, pid} = Agent.start_link(fn -> initial end)
+
     tmp_dir =
       Path.join(
         System.tmp_dir!(),

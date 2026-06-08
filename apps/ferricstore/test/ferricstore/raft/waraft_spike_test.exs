@@ -1,5 +1,12 @@
-Code.require_file("waraft_spike_test/sections/one_shard_waraft_adapter_bootstrap_set_get.exs", __DIR__)
-Code.require_file("waraft_spike_test/sections/custom_durable_segment_log_stays_quiet_telemetry_app_not_started.exs", __DIR__)
+Code.require_file(
+  "waraft_spike_test/sections/one_shard_waraft_adapter_bootstrap_set_get.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "waraft_spike_test/sections/custom_durable_segment_log_stays_quiet_telemetry_app_not_started.exs",
+  __DIR__
+)
 
 defmodule Ferricstore.Raft.WARaftSpikeTest do
   use ExUnit.Case, async: false
@@ -29,9 +36,10 @@ defmodule Ferricstore.Raft.WARaftSpikeTest do
   end
 
   use Ferricstore.Raft.WARaftSpikeTest.Sections.OneShardWaraftAdapterBootstrapSetGet
+
   use Ferricstore.Raft.WARaftSpikeTest.Sections.CustomDurableSegmentLogStaysQuietTelemetryAppNotStarted
 
-defp start_waraft_peers(unique, count) do
+  defp start_waraft_peers(unique, count) do
     code_paths = Enum.flat_map(:code.get_path(), fn path -> [~c"-pa", path] end)
     cookie = Atom.to_charlist(Node.get_cookie())
 
@@ -317,4 +325,3 @@ defp start_waraft_peers(unique, count) do
     File.rename!(tmp_path, storage_path)
   end
 end
-

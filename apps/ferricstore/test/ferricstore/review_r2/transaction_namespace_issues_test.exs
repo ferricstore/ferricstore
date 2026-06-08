@@ -39,7 +39,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   # ---------------------------------------------------------------------------
 
   describe "R2-M9: namespace config changes vs in-flight batcher slots" do
-
     test "namespace config changes apply to subsequent batcher writes" do
       # Pick a namespace prefix and a key that uses it.
       prefix = "r2m9ns"
@@ -57,7 +56,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       assert :ok = Router.put(FerricStore.Instance.get(:default), new_key, "v", 0)
       assert Router.get(FerricStore.Instance.get(:default), new_key) == "v"
     end
-
   end
 
   # ---------------------------------------------------------------------------
@@ -65,7 +63,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   # ---------------------------------------------------------------------------
 
   describe "R2-M10: embedded MULTI/EXEC has no ACL enforcement" do
-
     test "FerricStore.multi executes all commands without ACL check" do
       # In embedded mode, FerricStore.multi/1 uses FerricStore.Tx which calls
       # Coordinator.execute(queue, %{}, sandbox_namespace) — the empty map
@@ -84,11 +81,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
         end)
 
       assert results == [:ok, "written_without_acl"],
-        "multi/exec should execute all commands (no ACL enforcement in embedded mode)"
+             "multi/exec should execute all commands (no ACL enforcement in embedded mode)"
 
       assert Router.get(FerricStore.Instance.get(:default), key) == "written_without_acl"
     end
-
 
     test "Coordinator.execute accepts any command type without permission check" do
       # Directly invoke the Coordinator with commands that would require
@@ -106,9 +102,8 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [:ok, "secret", 1],
-        "Coordinator executes all commands without ACL checks"
+             "Coordinator executes all commands without ACL checks"
     end
-
 
     test "Tx.execute passes empty watched_keys (no WATCH support in embedded API)" do
       # FerricStore.Tx.execute/1 always passes %{} as watched_keys to
@@ -130,7 +125,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
         end)
 
       assert results == [:ok, "overwritten_by_tx"],
-        "Tx always executes — no WATCH support means no optimistic locking in embedded API"
+             "Tx always executes — no WATCH support means no optimistic locking in embedded API"
     end
   end
 
@@ -139,7 +134,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   # ---------------------------------------------------------------------------
 
   describe "R2-M11: WATCH/EXEC contract" do
-
     test "EXEC succeeds when watched key is unchanged" do
       key = "r2m11:unchanged_#{System.unique_integer([:positive])}"
 
@@ -158,7 +152,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       assert Router.get(FerricStore.Instance.get(:default), key) == "updated_by_tx"
     end
 
-
     test "EXEC fails (returns nil) when watched key is modified" do
       key = "r2m11:modified_#{System.unique_integer([:positive])}"
 
@@ -176,10 +169,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       result = Coordinator.execute(queue, watched, nil)
 
       assert result == nil, "EXEC should return nil when a watched key was modified"
-      assert Router.get(FerricStore.Instance.get(:default), key) == "changed_by_other",
-        "original modification should persist — tx was aborted"
-    end
 
+      assert Router.get(FerricStore.Instance.get(:default), key) == "changed_by_other",
+             "original modification should persist — tx was aborted"
+    end
 
     test "WATCH detects key deletion" do
       key = "r2m11:deleted_#{System.unique_integer([:positive])}"
@@ -197,7 +190,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       assert result == nil, "EXEC should abort when a watched key was deleted"
     end
-
 
     test "WATCH on multiple keys — one modified aborts entire transaction" do
       key_a = "r2m11:multi_a_#{System.unique_integer([:positive])}"
@@ -221,10 +213,13 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       result = Coordinator.execute(queue, watched, nil)
 
       assert result == nil, "EXEC should abort if ANY watched key was modified"
-      assert Router.get(FerricStore.Instance.get(:default), key_a) == "a_orig", "key_a should be unchanged"
-      assert Router.get(FerricStore.Instance.get(:default), key_b) == "b_changed", "key_b should retain the external modification"
-    end
 
+      assert Router.get(FerricStore.Instance.get(:default), key_a) == "a_orig",
+             "key_a should be unchanged"
+
+      assert Router.get(FerricStore.Instance.get(:default), key_b) == "b_changed",
+             "key_b should retain the external modification"
+    end
 
     test "write to different key on same shard does NOT abort WATCH (value-hash semantics)" do
       # Value-hash WATCH compares phash2(value) per key, not per-shard
@@ -233,8 +228,9 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       {key_a, key_b} = ShardHelpers.keys_on_same_shard()
 
       # Sanity check: both keys must route to the same shard.
-      assert Router.shard_for(FerricStore.Instance.get(:default), key_a) == Router.shard_for(FerricStore.Instance.get(:default), key_b),
-        "test infrastructure: keys should be on the same shard"
+      assert Router.shard_for(FerricStore.Instance.get(:default), key_a) ==
+               Router.shard_for(FerricStore.Instance.get(:default), key_b),
+             "test infrastructure: keys should be on the same shard"
 
       Router.put(FerricStore.Instance.get(:default), key_a, "watched_val", 0)
 
@@ -249,10 +245,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       # Value-hash semantics: no false positive — EXEC succeeds.
       assert is_list(result),
-        "value-hash WATCH should not abort for unrelated writes on the same shard"
+             "value-hash WATCH should not abort for unrelated writes on the same shard"
+
       assert result == ["watched_val"]
     end
-
 
     test "WATCH value hash changes when value changes" do
       key = "r2m11:hash_#{System.unique_integer([:positive])}"
@@ -263,9 +259,9 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key, "v2", 0)
       h2 = watch_token(key)
 
-      assert h1 != h2, "WATCH token should change when value changes (h1=#{inspect(h1)}, h2=#{inspect(h2)})"
+      assert h1 != h2,
+             "WATCH token should change when value changes (h1=#{inspect(h1)}, h2=#{inspect(h2)})"
     end
-
 
     test "concurrent WATCH/EXEC — only one succeeds under contention" do
       key = "r2m11:race_#{System.unique_integer([:positive])}"
@@ -302,7 +298,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   # ---------------------------------------------------------------------------
 
   describe "WATCH with value hash (H13 fix)" do
-
     test "SET NX skip does not abort WATCH" do
       key = "h13:nx_skip_#{System.unique_integer([:positive])}"
 
@@ -327,7 +322,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       assert result == ["original"]
     end
 
-
     test "actual value change aborts WATCH" do
       key = "h13:changed_#{System.unique_integer([:positive])}"
 
@@ -346,7 +340,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       assert Router.get(FerricStore.Instance.get(:default), key) == "new_value"
     end
 
-
     test "DEL aborts WATCH" do
       key = "h13:del_#{System.unique_integer([:positive])}"
 
@@ -363,7 +356,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       assert result == nil, "EXEC should abort when watched key is deleted"
       assert Router.get(FerricStore.Instance.get(:default), key) == nil
     end
-
 
     test "same-value rewrite aborts WATCH because the stored version changes" do
       key = "h13:idempotent_#{System.unique_integer([:positive])}"
@@ -384,12 +376,12 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
              "EXEC should abort after same-value rewrite, got: #{inspect(result)}"
     end
 
-
     test "write to different key on same shard does not abort WATCH" do
       {key_a, key_b} = ShardHelpers.keys_on_same_shard()
 
-      assert Router.shard_for(FerricStore.Instance.get(:default), key_a) == Router.shard_for(FerricStore.Instance.get(:default), key_b),
-        "test infrastructure: keys should be on the same shard"
+      assert Router.shard_for(FerricStore.Instance.get(:default), key_a) ==
+               Router.shard_for(FerricStore.Instance.get(:default), key_b),
+             "test infrastructure: keys should be on the same shard"
 
       Router.put(FerricStore.Instance.get(:default), key_a, "watched", 0)
 
@@ -403,10 +395,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       result = Coordinator.execute(queue, watched, nil)
 
       assert is_list(result),
-        "EXEC should succeed — unrelated key on same shard, got: #{inspect(result)}"
+             "EXEC should succeed — unrelated key on same shard, got: #{inspect(result)}"
+
       assert result == ["watched"]
     end
-
 
     test "WATCH on non-existent key — creating the key aborts" do
       key = "h13:nonexist_#{System.unique_integer([:positive])}"
@@ -423,7 +415,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       assert result == nil, "EXEC should abort when non-existent watched key is created"
     end
-
 
     test "WATCH on non-existent key — stays non-existent succeeds" do
       key = "h13:stays_nil_#{System.unique_integer([:positive])}"

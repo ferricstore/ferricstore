@@ -66,18 +66,23 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
           assert result == :ok,
                  "PUT v#{i} should succeed on #{node.name}, got: #{inspect(result)}"
 
-          Ferricstore.Test.ShardHelpers.eventually(fn ->
-            {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
+          Ferricstore.Test.ShardHelpers.eventually(
+            fn ->
+              {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
 
-            assert read_val != nil,
-                   "Read after write should not be nil on #{node.name} for iteration #{i}"
+              assert read_val != nil,
+                     "Read after write should not be nil on #{node.name} for iteration #{i}"
 
-            read_int = extract_version(read_val)
+              read_int = extract_version(read_val)
 
-            assert read_int >= i,
-                   "Stale read on #{node.name}: wrote v#{i} but read #{read_val} " <>
-                     "(version #{read_int} < #{i})"
-          end, "ryw v#{i} on #{node.name}", 50, 50)
+              assert read_int >= i,
+                     "Stale read on #{node.name}: wrote v#{i} but read #{read_val} " <>
+                       "(version #{read_int} < #{i})"
+            end,
+            "ryw v#{i} on #{node.name}",
+            50,
+            50
+          )
         end)
       end
     end
@@ -93,13 +98,18 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
 
           # In multi-node Raft, the writing node may be a follower whose
           # local ETS lags behind the leader. Poll until replication lands.
-          Ferricstore.Test.ShardHelpers.eventually(fn ->
-            {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
+          Ferricstore.Test.ShardHelpers.eventually(
+            fn ->
+              {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
 
-            assert read_val == value,
-                   "Read-your-writes violated on #{node.name}: " <>
-                     "wrote #{value} but read #{inspect(read_val)}"
-          end, "ryw #{value} on #{node.name}", 50, 50)
+              assert read_val == value,
+                     "Read-your-writes violated on #{node.name}: " <>
+                       "wrote #{value} but read #{inspect(read_val)}"
+            end,
+            "ryw #{value} on #{node.name}",
+            50,
+            50
+          )
         end
       end
     end
@@ -259,10 +269,17 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
         end
 
         # Poll until replication completes
-        Ferricstore.Test.ShardHelpers.eventually(fn ->
-          {:ok, final} = :rpc.call(node.name, FerricStore, :get, [key])
-          assert final == "version:100", "Last-write-wins violated on #{node.name}: got #{inspect(final)}"
-        end, "lww final on #{node.name}", 50, 100)
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            {:ok, final} = :rpc.call(node.name, FerricStore, :get, [key])
+
+            assert final == "version:100",
+                   "Last-write-wins violated on #{node.name}: got #{inspect(final)}"
+          end,
+          "lww final on #{node.name}",
+          50,
+          100
+        )
       end)
     end
   end

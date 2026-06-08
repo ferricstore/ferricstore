@@ -632,7 +632,8 @@ defmodule Ferricstore.TDigest.Core do
 
         # Walk centroids accumulating weight
         {result, _} =
-          Enum.reduce_while(centroids, {nil, 0.0}, fn {mean, weight}, {_prev_result, cum_weight} ->
+          Enum.reduce_while(centroids, {nil, 0.0}, fn {mean, weight},
+                                                      {_prev_result, cum_weight} ->
             new_cum = cum_weight + weight
 
             if new_cum >= target do

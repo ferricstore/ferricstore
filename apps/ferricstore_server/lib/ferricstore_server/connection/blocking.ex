@@ -841,6 +841,7 @@ defmodule FerricstoreServer.Connection.Blocking do
 
   defp block_deadline(timeout_ms), do: WaitLoop.block_deadline(timeout_ms)
   defp waiter_deadline(deadline), do: WaitLoop.waiter_deadline(deadline)
+
   defp immediate_blocking_pop(keys, pop_cmd, store) do
     Enum.reduce_while(keys, nil, fn key, nil ->
       case ListOps.safe_list_handle(pop_cmd, [key], store) do
@@ -923,7 +924,6 @@ defmodule FerricstoreServer.Connection.Blocking do
         [type]
     end
   end
-
 
   defp safe_dispatch(ast, store) do
     Ferricstore.Commands.Dispatcher.dispatch_ast(ast, store)

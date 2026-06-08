@@ -223,7 +223,9 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
 
     test "direct async NIF on non-existent file sends error to caller" do
       corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.bloom_file_exists_async(self(), corr_id, "/tmp/nonexistent_async_bloom.bloom", "x")
+
+      :ok =
+        NIF.bloom_file_exists_async(self(), corr_id, "/tmp/nonexistent_async_bloom.bloom", "x")
 
       assert_receive {:tokio_complete, ^corr_id, :error, "enoent"}, 5000
     end
@@ -380,7 +382,9 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
         :ok = NIF.bloom_file_exists_async(self(), corr_id, path, "target")
 
         receive do
-          {:tokio_complete, ^corr_id, :ok, 1} -> :ok
+          {:tokio_complete, ^corr_id, :ok, 1} ->
+            :ok
+
           {:tokio_complete, ^corr_id, status, val} ->
             flunk("Iteration #{i}: expected {:ok, 1}, got {#{inspect(status)}, #{inspect(val)}}")
         after

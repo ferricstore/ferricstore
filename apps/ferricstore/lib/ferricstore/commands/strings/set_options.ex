@@ -80,7 +80,11 @@ defmodule Ferricstore.Commands.Strings.SetOptions do
   end
 
   defp from_ast([{:ex, seconds} | rest], acc, default) when is_integer(seconds) do
-    from_ast(rest, %{acc | expire_at_ms: CommandTime.now_ms() + seconds * 1000, has_expiry: true}, default)
+    from_ast(
+      rest,
+      %{acc | expire_at_ms: CommandTime.now_ms() + seconds * 1000, has_expiry: true},
+      default
+    )
   end
 
   defp from_ast([{:px, ms} | rest], acc, default) when is_integer(ms) do

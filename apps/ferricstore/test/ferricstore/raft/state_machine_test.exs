@@ -1,16 +1,41 @@
-Code.require_file("state_machine_test/sections/coalesces_consecutive_flow_native_index_ops_crossing_ordering_barriers.exs", __DIR__)
+Code.require_file(
+  "state_machine_test/sections/coalesces_consecutive_flow_native_index_ops_crossing_ordering_barriers.exs",
+  __DIR__
+)
+
 Code.require_file("state_machine_test/sections/flow_blob_side_channel_apply.exs", __DIR__)
 Code.require_file("state_machine_test/sections/flow_command_time.exs", __DIR__)
 Code.require_file("state_machine_test/sections/flow_index_rollback.exs", __DIR__)
 Code.require_file("state_machine_test/sections/state_machine_compound_reads.exs", __DIR__)
-Code.require_file("state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_1.exs", __DIR__)
-Code.require_file("state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_2.exs", __DIR__)
-Code.require_file("state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_3.exs", __DIR__)
-Code.require_file("state_machine_test/sections/apply_3_set_key_value_expire_at_ms_opts.exs", __DIR__)
+
+Code.require_file(
+  "state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_1.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_2.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_3.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "state_machine_test/sections/apply_3_set_key_value_expire_at_ms_opts.exs",
+  __DIR__
+)
+
 Code.require_file("state_machine_test/sections/apply_3_delete_key.exs", __DIR__)
 Code.require_file("state_machine_test/sections/handle_aux_5.exs", __DIR__)
 Code.require_file("state_machine_test/sections/release_cursor_log_compaction.exs", __DIR__)
-Code.require_file("state_machine_test/sections/spop_removes_type_marker_final_set_member_popped.exs", __DIR__)
+
+Code.require_file(
+  "state_machine_test/sections/spop_removes_type_marker_final_set_member_popped.exs",
+  __DIR__
+)
 
 defmodule Ferricstore.Raft.StateMachineTest do
   @moduledoc """

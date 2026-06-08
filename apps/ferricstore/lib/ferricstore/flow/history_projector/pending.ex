@@ -21,7 +21,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   end
 
   def reserve_pending_counter(counter, count, max_pending)
-       when is_integer(max_pending) and max_pending >= 0 do
+      when is_integer(max_pending) and max_pending >= 0 do
     pending_entries = :atomics.add_get(counter, 1, count)
 
     if pending_entries <= max_pending do

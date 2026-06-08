@@ -139,7 +139,6 @@ Benchee.run(
       :ok = :gen_tcp.send(ping_sock, ping_cmd)
       {:ok, _data} = :gen_tcp.recv(ping_sock, 0, 5_000)
     end,
-
     "TCP SET + GET (2 roundtrips)" => fn ->
       :ok = :gen_tcp.send(set_get_sock, set_cmd)
       {:ok, _set_resp} = :gen_tcp.recv(set_get_sock, 0, 5_000)
@@ -177,17 +176,14 @@ Benchee.run(
       :ok = :gen_tcp.send(pipe1_sock, pipeline_1)
       {:ok, _resp} = :gen_tcp.recv(pipe1_sock, 0, 5_000)
     end,
-
     "Pipeline: 10 SETs" => fn ->
       :ok = :gen_tcp.send(pipe10_sock, pipeline_10)
       _resp = TcpBench.recv_exact(pipe10_sock, 50)
     end,
-
     "Pipeline: 100 SETs" => fn ->
       :ok = :gen_tcp.send(pipe100_sock, pipeline_100)
       _resp = TcpBench.recv_exact(pipe100_sock, 500)
     end,
-
     "Pipeline: 1000 SETs" => fn ->
       :ok = :gen_tcp.send(pipe1000_sock, pipeline_1000)
       _resp = TcpBench.recv_exact(pipe1000_sock, 5000)

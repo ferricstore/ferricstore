@@ -223,10 +223,14 @@ defmodule Ferricstore.OperationalGuardTest do
 
     assert_receive {:memory_pressure, :pressure}
 
-    Utils.eventually(fn ->
-      assert Admission.reject_new_creates?()
-      assert Admission.status().reason == :rss_pressure
-    end, 1_000, 10)
+    Utils.eventually(
+      fn ->
+        assert Admission.reject_new_creates?()
+        assert Admission.status().reason == :rss_pressure
+      end,
+      1_000,
+      10
+    )
 
     refute OperationalGuard.reject_flow_creates?()
   end
@@ -271,10 +275,14 @@ defmodule Ferricstore.OperationalGuardTest do
        telemetry_fun: fn _event, _measurements, _metadata -> :ok end}
     )
 
-    Utils.eventually(fn ->
-      refute Admission.reject_new_creates?()
-      refute OperationalGuard.reject_flow_creates?()
-    end, 1_000, 10)
+    Utils.eventually(
+      fn ->
+        refute Admission.reject_new_creates?()
+        refute OperationalGuard.reject_flow_creates?()
+      end,
+      1_000,
+      10
+    )
   end
 
   test "sticky RSS pause stays closed while active Flow memory is still high" do

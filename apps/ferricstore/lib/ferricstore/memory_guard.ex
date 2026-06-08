@@ -428,7 +428,9 @@ defmodule Ferricstore.MemoryGuard do
 
       :pressure ->
         if state.last_pressure_level != :pressure do
-          Logger.error("MemoryGuard: high memory pressure (#{Float.round(stats.ratio * 100, 1)}%)")
+          Logger.error(
+            "MemoryGuard: high memory pressure (#{Float.round(stats.ratio * 100, 1)}%)"
+          )
         end
 
         emit_shard_pressure_events(stats)

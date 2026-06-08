@@ -54,7 +54,6 @@ defmodule Ferricstore.Raft.WARaftStorage do
 
   @type handle :: map()
 
-
   use Ferricstore.Raft.WARaftStorage.Sections.Lifecycle
   use Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands
   use Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection

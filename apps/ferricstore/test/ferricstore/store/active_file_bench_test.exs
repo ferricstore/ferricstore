@@ -17,7 +17,10 @@ defmodule Ferricstore.Store.ActiveFileBenchTest do
       end)
 
     ns_per_call = elapsed_us * 1000 / iterations
-    IO.puts("\n  ActiveFile.get (cached): #{Float.round(ns_per_call, 1)} ns/call (#{iterations} iterations)")
+
+    IO.puts(
+      "\n  ActiveFile.get (cached): #{Float.round(ns_per_call, 1)} ns/call (#{iterations} iterations)"
+    )
 
     # Should be under 50ns (atomics.get + Process.get)
     assert ns_per_call < 200, "Expected <200ns, got #{Float.round(ns_per_call, 1)}ns"
@@ -38,7 +41,10 @@ defmodule Ferricstore.Store.ActiveFileBenchTest do
       end)
 
     ns_per_call = elapsed_us * 1000 / iterations
-    IO.puts("  ActiveFile.get (cold):   #{Float.round(ns_per_call, 1)} ns/call (#{iterations} iterations)")
+
+    IO.puts(
+      "  ActiveFile.get (cold):   #{Float.round(ns_per_call, 1)} ns/call (#{iterations} iterations)"
+    )
 
     # Cold path includes ETS lookup — should be under 500ns
     assert ns_per_call < 2000, "Expected <2000ns, got #{Float.round(ns_per_call, 1)}ns"

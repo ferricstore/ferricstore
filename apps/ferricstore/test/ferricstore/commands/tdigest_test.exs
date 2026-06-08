@@ -37,7 +37,7 @@ defmodule Ferricstore.Commands.TDigestTest do
   use Ferricstore.Commands.TDigestTest.Sections.TdigestCdf
   use Ferricstore.Commands.TDigestTest.Sections.StressTests
 
-defp parse_float_str("nan"), do: :nan
+  defp parse_float_str("nan"), do: :nan
   defp parse_float_str("inf"), do: :infinity
   defp parse_float_str("-inf"), do: :neg_infinity
 
@@ -66,4 +66,3 @@ defp parse_float_str("nan"), do: :nan
     end)
   end
 end
-

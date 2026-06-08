@@ -159,10 +159,10 @@ defmodule Ferricstore.Test.SourceFiles do
 
   def flow_source do
     flow_paths =
-      (__DIR__
-       |> Path.expand()
-       |> Path.join("../../lib/ferricstore/flow/**/*.ex")
-       |> Path.wildcard())
+      __DIR__
+      |> Path.expand()
+      |> Path.join("../../lib/ferricstore/flow/**/*.ex")
+      |> Path.wildcard()
       |> Enum.sort()
 
     @flow_sources

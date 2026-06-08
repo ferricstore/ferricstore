@@ -48,9 +48,14 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       # Put a key and verify touch updates the LFU counter
       Router.put(FerricStore.Instance.get(:default), "lfu_test_key", "value", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "lfu_test_key") == "value"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "lfu_test_key") == "value"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
       idx = Router.shard_for(FerricStore.Instance.get(:default), "lfu_test_key")
       keydir = :"keydir_#{idx}"
@@ -117,22 +122,33 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "exists_fast? returns true for present key" do
       Router.put(FerricStore.Instance.get(:default), "exists_fast_test", "value", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.exists_fast?(FerricStore.Instance.get(:default), "exists_fast_test") == true
-      end, "key not visible via exists_fast?", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.exists_fast?(FerricStore.Instance.get(:default), "exists_fast_test") == true
+        end,
+        "key not visible via exists_fast?",
+        20,
+        10
+      )
     end
 
     test "exists_fast? returns false for absent key" do
-      assert Router.exists_fast?(FerricStore.Instance.get(:default), "nonexistent_key_xyz") == false
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), "nonexistent_key_xyz") ==
+               false
     end
 
     test "exists_fast? returns false for expired key" do
       # Set a key with an expiry in the past
       Router.put(FerricStore.Instance.get(:default), "expired_fast_test", "value", 1)
 
-      ShardHelpers.eventually(fn ->
-        Router.exists_fast?(FerricStore.Instance.get(:default), "expired_fast_test") == false
-      end, "expired key should return false", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.exists_fast?(FerricStore.Instance.get(:default), "expired_fast_test") == false
+        end,
+        "expired key should return false",
+        20,
+        10
+      )
     end
 
     test "check_keydir_full uses exists_fast? instead of GenServer" do
@@ -140,12 +156,18 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       # to check existence via ETS without GenServer.call
       Router.put(FerricStore.Instance.get(:default), "keydir_full_test", "value", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "keydir_full_test") == "value"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "keydir_full_test") == "value"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
       # Put should succeed (updates existing key even when full)
-      assert :ok = Router.put(FerricStore.Instance.get(:default), "keydir_full_test", "updated", 0)
+      assert :ok =
+               Router.put(FerricStore.Instance.get(:default), "keydir_full_test", "updated", 0)
     end
   end
 
@@ -165,20 +187,32 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
     test "shard_name is fast (no string interpolation overhead)" do
       # Just verify functional correctness - the perf improvement is structural
-      assert Router.shard_name(FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
-      assert Router.shard_name(FerricStore.Instance.get(:default), 1) == :"Ferricstore.Store.Shard.1"
-      assert Router.shard_name(FerricStore.Instance.get(:default), 2) == :"Ferricstore.Store.Shard.2"
-      assert Router.shard_name(FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 0) ==
+               :"Ferricstore.Store.Shard.0"
+
+      assert Router.shard_name(FerricStore.Instance.get(:default), 1) ==
+               :"Ferricstore.Store.Shard.1"
+
+      assert Router.shard_name(FerricStore.Instance.get(:default), 2) ==
+               :"Ferricstore.Store.Shard.2"
+
+      assert Router.shard_name(FerricStore.Instance.get(:default), 3) ==
+               :"Ferricstore.Store.Shard.3"
     end
 
     test "routing works correctly with pre-computed names" do
       Router.put(FerricStore.Instance.get(:default), "route_test_1", "v1", 0)
       Router.put(FerricStore.Instance.get(:default), "route_test_2", "v2", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "route_test_1") == "v1" and
-          Router.get(FerricStore.Instance.get(:default), "route_test_2") == "v2"
-      end, "keys not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "route_test_1") == "v1" and
+            Router.get(FerricStore.Instance.get(:default), "route_test_2") == "v2"
+        end,
+        "keys not readable after put",
+        20,
+        10
+      )
     end
   end
 
@@ -191,24 +225,39 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       # Test core operations through the command pipeline
       Router.put(FerricStore.Instance.get(:default), "store_cache_test", "hello", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "store_cache_test") == "hello"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "store_cache_test") == "hello"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
       assert Router.exists?(FerricStore.Instance.get(:default), "store_cache_test") == true
       Router.delete(FerricStore.Instance.get(:default), "store_cache_test")
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "store_cache_test") == nil
-      end, "key not deleted", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "store_cache_test") == nil
+        end,
+        "key not deleted",
+        20,
+        10
+      )
     end
 
     test "incr works with cached store" do
       Router.put(FerricStore.Instance.get(:default), "incr_cache_test", "10", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "incr_cache_test") == "10"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "incr_cache_test") == "10"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
       assert {:ok, 15} = Router.incr(FerricStore.Instance.get(:default), "incr_cache_test", 5)
     end
@@ -275,9 +324,14 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       # Verify through a successful TCP pipeline that the buffer works
       Router.put(FerricStore.Instance.get(:default), "buffer_test", "hello", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "buffer_test") == "hello"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "buffer_test") == "hello"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
     end
   end
 end
