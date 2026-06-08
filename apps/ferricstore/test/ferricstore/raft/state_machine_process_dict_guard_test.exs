@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   test "apply entry clears consolidated apply process state" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()

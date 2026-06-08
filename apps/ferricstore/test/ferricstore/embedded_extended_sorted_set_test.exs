@@ -7,6 +7,7 @@ defmodule Ferricstore.EmbeddedExtendedSortedSetTest do
   xrevrange, xtrim.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

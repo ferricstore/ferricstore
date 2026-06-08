@@ -11,6 +11,7 @@ defmodule Mix.Tasks.FerricstoreTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   import ExUnit.CaptureIO
 

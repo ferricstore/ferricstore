@@ -1,16 +1,16 @@
-Code.require_file("state_machine_test/sections/part_01.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_02.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_03.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_04.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_05.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_06_a.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_06_b.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_06_c.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_07.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_08.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_09.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_10.exs", __DIR__)
-Code.require_file("state_machine_test/sections/part_11.exs", __DIR__)
+Code.require_file("state_machine_test/sections/coalesces_consecutive_flow_native_index_ops_crossing_ordering_barriers.exs", __DIR__)
+Code.require_file("state_machine_test/sections/flow_blob_side_channel_apply.exs", __DIR__)
+Code.require_file("state_machine_test/sections/flow_command_time.exs", __DIR__)
+Code.require_file("state_machine_test/sections/flow_index_rollback.exs", __DIR__)
+Code.require_file("state_machine_test/sections/state_machine_compound_reads.exs", __DIR__)
+Code.require_file("state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_1.exs", __DIR__)
+Code.require_file("state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_2.exs", __DIR__)
+Code.require_file("state_machine_test/sections/apply_3_put_key_value_expire_at_ms_part_3.exs", __DIR__)
+Code.require_file("state_machine_test/sections/apply_3_set_key_value_expire_at_ms_opts.exs", __DIR__)
+Code.require_file("state_machine_test/sections/apply_3_delete_key.exs", __DIR__)
+Code.require_file("state_machine_test/sections/handle_aux_5.exs", __DIR__)
+Code.require_file("state_machine_test/sections/release_cursor_log_compaction.exs", __DIR__)
+Code.require_file("state_machine_test/sections/spop_removes_type_marker_final_set_member_popped.exs", __DIR__)
 
 defmodule Ferricstore.Raft.StateMachineTest do
   @moduledoc """
@@ -22,6 +22,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :raft
+  @moduletag :global_state
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.{BlobCommand, StateMachine}
@@ -96,7 +98,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
     }
   end
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part01
+  use Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNativeIndexOpsCrossingOrderingBarriers
 
   defp safe_delete_ets(table) do
     :ets.delete(table)
@@ -339,25 +341,25 @@ defmodule Ferricstore.Raft.StateMachineTest do
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part02
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowBlobSideChannelApply
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part03
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part04
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part05
+  use Ferricstore.Raft.StateMachineTest.Sections.StateMachineCompoundReads
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part06A
-  use Ferricstore.Raft.StateMachineTest.Sections.Part06B
-  use Ferricstore.Raft.StateMachineTest.Sections.Part06C
+  use Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMsPart1
+  use Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMsPart2
+  use Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMsPart3
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part07
+  use Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMsOpts
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part08
+  use Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part09
+  use Ferricstore.Raft.StateMachineTest.Sections.HandleAux5
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part10
+  use Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction
 
   defp state_with_missing_active_file(state, opts \\ []) do
     file_id = 9_000_000 + :erlang.unique_integer([:positive])
@@ -449,7 +451,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
                     %{request: ^request, reason: :keydir_unavailable, source: :raft_apply}}
   end
 
-  use Ferricstore.Raft.StateMachineTest.Sections.Part11
+  use Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalSetMemberPopped
 
   def relay_compound_put_append_telemetry(_event, measurements, metadata, test_pid) do
     send(test_pid, {:compound_put_append, measurements, metadata})

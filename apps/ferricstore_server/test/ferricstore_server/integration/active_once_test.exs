@@ -23,6 +23,8 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser

@@ -1,5 +1,5 @@
-Code.require_file("advanced_types_tcp_test/sections/part_01.exs", __DIR__)
-Code.require_file("advanced_types_tcp_test/sections/part_02.exs", __DIR__)
+Code.require_file("advanced_types_tcp_test/sections/geoadd_over_tcp.exs", __DIR__)
+Code.require_file("advanced_types_tcp_test/sections/json_type_over_tcp.exs", __DIR__)
 defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   @moduledoc """
   End-to-end TCP integration tests for GEO, HYPERLOGLOG, STREAM, and JSON commands.
@@ -9,6 +9,8 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
@@ -19,9 +21,9 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  use FerricstoreServer.Integration.AdvancedTypesTcpTest.Sections.Part01
+  use FerricstoreServer.Integration.AdvancedTypesTcpTest.Sections.GeoaddOverTcp
 
-  use FerricstoreServer.Integration.AdvancedTypesTcpTest.Sections.Part02
+  use FerricstoreServer.Integration.AdvancedTypesTcpTest.Sections.JsonTypeOverTcp
 
   defp send_cmd(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))

@@ -8,6 +8,7 @@ defmodule FerricstoreServer.PubSubTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.PubSub
   alias FerricstoreServer.Acl

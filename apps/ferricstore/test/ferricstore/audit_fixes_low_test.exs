@@ -5,6 +5,7 @@ defmodule Ferricstore.AuditFixesLowTest do
   """
 
   use ExUnit.Case, async: true
+  @moduletag :global_state
 
   alias Ferricstore.GlobMatcher
   alias Ferricstore.Commands.Generic

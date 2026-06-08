@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.CommandClockTest do
   use ExUnit.Case, async: false
+  @moduletag :raft
 
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.CommandClock

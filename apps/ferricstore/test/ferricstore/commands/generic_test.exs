@@ -1,5 +1,5 @@
-Code.require_file("generic_test/sections/part_01.exs", __DIR__)
-Code.require_file("generic_test/sections/part_02.exs", __DIR__)
+Code.require_file("generic_test/sections/type.exs", __DIR__)
+Code.require_file("generic_test/sections/object_idletime.exs", __DIR__)
 defmodule Ferricstore.Commands.GenericTest do
   @moduledoc false
   use ExUnit.Case, async: true
@@ -107,9 +107,9 @@ defmodule Ferricstore.Commands.GenericTest do
 
 
 
-  use Ferricstore.Commands.GenericTest.Sections.Part01
+  use Ferricstore.Commands.GenericTest.Sections.Type
 
-  use Ferricstore.Commands.GenericTest.Sections.Part02
+  use Ferricstore.Commands.GenericTest.Sections.ObjectIdletime
 
   defp iterate_scan(store, cursor, acc, count_opt, count_val) do
     [next_cursor, keys] = Generic.handle("SCAN", [cursor, count_opt, count_val], store)

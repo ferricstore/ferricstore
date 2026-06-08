@@ -8,6 +8,7 @@ defmodule FerricstoreServer.Bench.TcpActiveModeBenchTest do
   Run: mix test apps/ferricstore_server/test/ferricstore_server/bench/tcp_active_mode_bench_test.exs --include bench
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag :bench
   @moduletag timeout: 600_000
 

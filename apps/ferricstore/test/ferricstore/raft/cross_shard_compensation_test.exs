@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.CrossShardCompensationTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   alias Ferricstore.Raft.StateMachine
 

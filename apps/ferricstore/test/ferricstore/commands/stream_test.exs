@@ -1,6 +1,6 @@
-Code.require_file("stream_test/sections/part_01.exs", __DIR__)
-Code.require_file("stream_test/sections/part_02.exs", __DIR__)
-Code.require_file("stream_test/sections/part_03.exs", __DIR__)
+Code.require_file("stream_test/sections/xadd.exs", __DIR__)
+Code.require_file("stream_test/sections/xdel.exs", __DIR__)
+Code.require_file("stream_test/sections/edge_cases.exs", __DIR__)
 
 defmodule Ferricstore.Commands.StreamTest do
   @moduledoc false
@@ -33,9 +33,9 @@ defmodule Ferricstore.Commands.StreamTest do
   # XADD
   # ===========================================================================
 
-  use Ferricstore.Commands.StreamTest.Sections.Part01
+  use Ferricstore.Commands.StreamTest.Sections.Xadd
 
-  use Ferricstore.Commands.StreamTest.Sections.Part02
+  use Ferricstore.Commands.StreamTest.Sections.Xdel
 
-  use Ferricstore.Commands.StreamTest.Sections.Part03
+  use Ferricstore.Commands.StreamTest.Sections.EdgeCases
 end

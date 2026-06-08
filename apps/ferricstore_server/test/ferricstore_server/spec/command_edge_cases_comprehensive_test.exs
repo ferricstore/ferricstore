@@ -1,5 +1,5 @@
-Code.require_file("command_edge_cases_comprehensive_test/sections/part_01.exs", __DIR__)
-Code.require_file("command_edge_cases_comprehensive_test/sections/part_02.exs", __DIR__)
+Code.require_file("command_edge_cases_comprehensive_test/sections/wrongtype_cross_type_access.exs", __DIR__)
+Code.require_file("command_edge_cases_comprehensive_test/sections/wrong_arity_rejection_sweep.exs", __DIR__)
 defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
   @moduledoc """
   Comprehensive edge-case tests for EVERY FerricStore command category.
@@ -30,6 +30,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
@@ -61,9 +62,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  use FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest.Sections.Part01
+  use FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest.Sections.WrongtypeCrossTypeAccess
 
-  use FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest.Sections.Part02
+  use FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest.Sections.WrongArityRejectionSweep
 
   defp connect_and_hello(port) do
     {:ok, sock} =

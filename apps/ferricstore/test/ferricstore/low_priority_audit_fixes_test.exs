@@ -7,6 +7,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
   Each test verifies a specific audit finding was correctly addressed.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.{LFU, Router, ValueCodec}
   alias Ferricstore.Test.ShardHelpers

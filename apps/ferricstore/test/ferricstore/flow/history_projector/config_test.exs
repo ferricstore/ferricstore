@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.HistoryProjector.ConfigTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.HistoryProjector.Config
 

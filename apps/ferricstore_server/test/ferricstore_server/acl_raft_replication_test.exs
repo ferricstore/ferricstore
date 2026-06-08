@@ -1,6 +1,9 @@
 defmodule FerricstoreServer.AclRaftReplicationTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  @moduletag :raft
+  @moduletag :acl
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

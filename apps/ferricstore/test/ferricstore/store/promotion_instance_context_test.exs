@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
   @moduledoc false
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, Router}

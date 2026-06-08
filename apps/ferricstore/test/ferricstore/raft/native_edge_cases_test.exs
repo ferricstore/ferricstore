@@ -21,6 +21,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :raft
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.StateMachineColdReadErrorGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   test "state-machine batch cold reads report per-index NIF errors" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()

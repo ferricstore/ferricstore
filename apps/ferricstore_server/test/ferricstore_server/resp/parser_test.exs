@@ -1,7 +1,7 @@
-Code.require_file("parser_test/sections/part_01.exs", __DIR__)
-Code.require_file("parser_test/sections/part_02.exs", __DIR__)
-Code.require_file("parser_test/sections/part_03.exs", __DIR__)
-Code.require_file("parser_test/sections/part_04.exs", __DIR__)
+Code.require_file("parser_test/sections/simple_string.exs", __DIR__)
+Code.require_file("parser_test/sections/server_command_parser_part_1.exs", __DIR__)
+Code.require_file("parser_test/sections/server_command_parser_part_2.exs", __DIR__)
+Code.require_file("parser_test/sections/flow_command_ast.exs", __DIR__)
 
 defmodule FerricstoreServer.Resp.ParserTest do
   use ExUnit.Case, async: true
@@ -12,8 +12,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
   # Simple string (+)
   # ---------------------------------------------------------------------------
 
-  use FerricstoreServer.Resp.ParserTest.Sections.Part01
-  use FerricstoreServer.Resp.ParserTest.Sections.Part02
-  use FerricstoreServer.Resp.ParserTest.Sections.Part03
-  use FerricstoreServer.Resp.ParserTest.Sections.Part04
+  use FerricstoreServer.Resp.ParserTest.Sections.SimpleString
+  use FerricstoreServer.Resp.ParserTest.Sections.ServerCommandParserPart1
+  use FerricstoreServer.Resp.ParserTest.Sections.ServerCommandParserPart2
+  use FerricstoreServer.Resp.ParserTest.Sections.FlowCommandAst
 end

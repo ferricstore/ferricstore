@@ -5,6 +5,7 @@ defmodule Ferricstore.MediumAuditFixesTest do
   """
 
   use ExUnit.Case, async: true
+  @moduletag :global_state
 
   # -----------------------------------------------------------------------
   # Perf M9: Batcher.cancel_timer should not do selective receive

@@ -1,5 +1,6 @@
 defmodule Ferricstore.Commands.BloomSecurityTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Bloom
 

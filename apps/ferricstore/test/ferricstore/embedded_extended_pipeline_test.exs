@@ -5,6 +5,7 @@ defmodule Ferricstore.EmbeddedExtendedPipelineTest do
   Covers: multi/1 (MULTI/EXEC transactions).
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

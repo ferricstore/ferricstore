@@ -15,6 +15,7 @@ defmodule Ferricstore.Bench.RecoveryTimeBenchTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   @moduletag :bench
   @moduletag timeout: 180_000

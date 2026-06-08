@@ -5,6 +5,7 @@ defmodule Ferricstore.EmbeddedExtendedListTest do
   Covers: lindex, lset, lrem, linsert, lmove, lpos.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

@@ -1,5 +1,6 @@
 defmodule FerricStore.Flow.WorkflowSDKTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   defmodule Store do
     def flow_create(id, opts) do

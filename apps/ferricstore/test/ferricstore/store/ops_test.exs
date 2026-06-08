@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.OpsTest do
   # by the application-wide MemoryGuard skip-promotion flag, which pressure
   # tests mutate globally, so this module cannot run concurrently with them.
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.LocalTxStore

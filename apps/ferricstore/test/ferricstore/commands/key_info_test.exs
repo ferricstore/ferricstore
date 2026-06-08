@@ -13,6 +13,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   since KEY_INFO queries ETS tables and the Router directly.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Dispatcher, Native}
   alias Ferricstore.Store.Router

@@ -8,6 +8,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Merge.Scheduler
   alias Ferricstore.Store.Router

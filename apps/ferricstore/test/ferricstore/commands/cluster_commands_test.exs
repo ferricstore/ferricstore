@@ -8,6 +8,7 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Cluster
   alias Ferricstore.Test.ShardHelpers

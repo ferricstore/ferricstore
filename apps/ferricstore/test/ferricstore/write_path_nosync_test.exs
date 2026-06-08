@@ -5,6 +5,7 @@ defmodule Ferricstore.WritePathNosyncTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.{BitcaskWriter, Router}
   alias Ferricstore.Test.ShardHelpers

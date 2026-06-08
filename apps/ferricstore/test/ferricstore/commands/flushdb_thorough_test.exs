@@ -4,6 +4,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
   ETS keydirs, prefix index, compound keys (H:, T:, S:, Z:), and Bitcask.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

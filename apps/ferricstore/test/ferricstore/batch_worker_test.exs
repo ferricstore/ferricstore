@@ -1,5 +1,6 @@
 defmodule Ferricstore.BatchWorkerTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

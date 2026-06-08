@@ -1,17 +1,19 @@
-Code.require_file("flow_lmdb_test/sections/part_01.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_02.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_03.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_04.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_05.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_06.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_07.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_08.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_09.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_10.exs", __DIR__)
-Code.require_file("flow_lmdb_test/sections/part_11.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/warm_opens_empty_shard_env_before_first_user_read.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/history_projector_fsyncs_copied_generated_values_before_publishing_lmdb.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/startup_rebuilds_active_flow_indexes_dedicated_lmdb_active_index.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/default_startup_repairs_active_projection_clears_stale_lmdb_flush_marker.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/mirror_writer_projects_terminal_history_hot_flow_index_during_flush.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/state_machine_still_requires_lmdb_mirror_enqueue_mode_configured_off.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/mirror_flow_reads_reject_stale_lmdb_record_fall_back_bitcask_truth.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/lineage_include_cold_reverse_reads_newest_lmdb_prefix_rows.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/async_terminal_history_cold_only_after_lmdb_projection.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/partial_retention_cleanup_keeps_values_still_referenced_terminal_state.exs", __DIR__)
+Code.require_file("flow_lmdb_test/sections/startup_keeps_terminal_history_cold_while_durable_history_remains_querya.exs", __DIR__)
 
 defmodule Ferricstore.Flow.LMDBTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   defmodule FlushProbeWriter do
     use GenServer
@@ -49,17 +51,17 @@ defmodule Ferricstore.Flow.LMDBTest do
     end
   end
 
-  use Ferricstore.Flow.LMDBTest.Sections.Part01
-  use Ferricstore.Flow.LMDBTest.Sections.Part02
-  use Ferricstore.Flow.LMDBTest.Sections.Part03
-  use Ferricstore.Flow.LMDBTest.Sections.Part04
-  use Ferricstore.Flow.LMDBTest.Sections.Part05
-  use Ferricstore.Flow.LMDBTest.Sections.Part06
-  use Ferricstore.Flow.LMDBTest.Sections.Part07
-  use Ferricstore.Flow.LMDBTest.Sections.Part08
-  use Ferricstore.Flow.LMDBTest.Sections.Part09
-  use Ferricstore.Flow.LMDBTest.Sections.Part10
-  use Ferricstore.Flow.LMDBTest.Sections.Part11
+  use Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUserRead
+  use Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGeneratedValuesBeforePublishingLmdb
+  use Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDedicatedLmdbActiveIndex
+  use Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjectionClearsStaleLmdbFlushMarker
+  use Ferricstore.Flow.LMDBTest.Sections.MirrorWriterProjectsTerminalHistoryHotFlowIndexDuringFlush
+  use Ferricstore.Flow.LMDBTest.Sections.StateMachineStillRequiresLmdbMirrorEnqueueModeConfiguredOff
+  use Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecordFallBackBitcaskTruth
+  use Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewestLmdbPrefixRows
+  use Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLmdbProjection
+  use Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesStillReferencedTerminalState
+  use Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhileDurableHistoryRemainsQuerya
 
 defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)

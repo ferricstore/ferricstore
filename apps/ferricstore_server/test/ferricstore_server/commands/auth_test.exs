@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Commands.AuthTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Config
   alias FerricstoreServer.Resp.{Encoder, Parser}

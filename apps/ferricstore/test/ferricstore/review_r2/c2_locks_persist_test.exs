@@ -5,6 +5,7 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   @moduletag :shard_kill
 

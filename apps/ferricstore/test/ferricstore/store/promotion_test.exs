@@ -1,12 +1,13 @@
-Code.require_file("promotion_test/sections/part_01.exs", __DIR__)
-Code.require_file("promotion_test/sections/part_02.exs", __DIR__)
-Code.require_file("promotion_test/sections/part_03.exs", __DIR__)
-Code.require_file("promotion_test/sections/part_04.exs", __DIR__)
+Code.require_file("promotion_test/sections/promotion_batches_shared_tombstones_after_dedicated_copy.exs", __DIR__)
+Code.require_file("promotion_test/sections/small_hash_stays_in_shared_bitcask.exs", __DIR__)
+Code.require_file("promotion_test/sections/small_set_stays_in_shared_bitcask.exs", __DIR__)
+Code.require_file("promotion_test/sections/small_sorted_set_stays_in_shared_bitcask.exs", __DIR__)
 
 defmodule Ferricstore.Store.PromotionTest do
   @moduledoc false
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   import ExUnit.CaptureLog
 
   alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Strings}
@@ -58,7 +59,7 @@ defmodule Ferricstore.Store.PromotionTest do
     end)
   end
 
-  use Ferricstore.Store.PromotionTest.Sections.Part01
+  use Ferricstore.Store.PromotionTest.Sections.PromotionBatchesSharedTombstonesAfterDedicatedCopy
 
   defp real_store do
     %{
@@ -190,7 +191,7 @@ defmodule Ferricstore.Store.PromotionTest do
   # Small hash stays in shared Bitcask (under threshold)
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Store.PromotionTest.Sections.Part02
+  use Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
 
   defp populate_set(store, key, n) do
     members = Enum.map(1..n, fn i -> "member_#{i}" end)
@@ -202,7 +203,7 @@ defmodule Ferricstore.Store.PromotionTest do
   # Small set stays in shared Bitcask (under threshold)
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Store.PromotionTest.Sections.Part03
+  use Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask
 
   defp populate_zset(store, key, n) do
     pairs =
@@ -218,5 +219,5 @@ defmodule Ferricstore.Store.PromotionTest do
   # Small sorted set stays in shared Bitcask (under threshold)
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Store.PromotionTest.Sections.Part04
+  use Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBitcask
 end

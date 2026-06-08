@@ -4,6 +4,7 @@ defmodule Ferricstore.InstanceCallbacksTest do
   routing, and on_push callback in list commands.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
   alias Ferricstore.Store.Router

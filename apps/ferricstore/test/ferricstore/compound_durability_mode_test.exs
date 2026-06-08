@@ -8,6 +8,7 @@ defmodule Ferricstore.CompoundDurabilityModeTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag timeout: 60_000
 
   alias Ferricstore.Test.ShardHelpers

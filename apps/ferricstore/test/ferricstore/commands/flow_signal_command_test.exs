@@ -1,5 +1,7 @@
 defmodule Ferricstore.Commands.FlowSignalCommandTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Test.{MockStore, ShardHelpers}

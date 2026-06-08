@@ -1,5 +1,6 @@
 defmodule Ferricstore.Commands.DoctorTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Dispatcher, Server}
   alias Ferricstore.Test.IsolatedInstance

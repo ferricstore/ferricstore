@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.HistoryProjector.LogTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.HistoryProjector.Log
 

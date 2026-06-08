@@ -1,5 +1,6 @@
 defmodule Ferricstore.ReviewR4.D15BatcherPendingHangTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Test.ShardHelpers

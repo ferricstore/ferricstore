@@ -12,6 +12,7 @@ defmodule Ferricstore.CrossShardOpTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Store.Router

@@ -14,6 +14,8 @@ defmodule FerricstoreServer.AclSecurityTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :acl
+  @moduletag :global_state
 
   alias FerricstoreServer.Acl
   alias Ferricstore.AuditLog

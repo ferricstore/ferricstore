@@ -12,6 +12,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Coordinator

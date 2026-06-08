@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.OrderedIndexTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.OrderedIndex

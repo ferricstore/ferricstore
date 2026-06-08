@@ -1,5 +1,6 @@
 defmodule Ferricstore.FlowHistoryRetentionGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   @moduletag :guard
 

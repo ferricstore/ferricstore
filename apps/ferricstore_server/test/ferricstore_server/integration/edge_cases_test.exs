@@ -1,5 +1,5 @@
-Code.require_file("edge_cases_test/sections/part_01.exs", __DIR__)
-Code.require_file("edge_cases_test/sections/part_02.exs", __DIR__)
+Code.require_file("edge_cases_test/sections/value_size_boundaries.exs", __DIR__)
+Code.require_file("edge_cases_test/sections/data_type_boundaries_over_tcp.exs", __DIR__)
 defmodule FerricstoreServer.Integration.EdgeCasesTest do
   @moduledoc """
   Edge case and stress tests covering value size limits, key size limits,
@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Resp.{Encoder, Parser}
@@ -37,9 +38,9 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     :ok
   end
 
-  use FerricstoreServer.Integration.EdgeCasesTest.Sections.Part01
+  use FerricstoreServer.Integration.EdgeCasesTest.Sections.ValueSizeBoundaries
 
-  use FerricstoreServer.Integration.EdgeCasesTest.Sections.Part02
+  use FerricstoreServer.Integration.EdgeCasesTest.Sections.DataTypeBoundariesOverTcp
 
   defp ukey(base), do: "ec_#{base}_#{:rand.uniform(9_999_999)}"
 

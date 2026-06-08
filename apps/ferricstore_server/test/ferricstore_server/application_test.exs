@@ -9,6 +9,7 @@ defmodule FerricstoreServer.ApplicationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Listener
   alias Ferricstore.Store.ShardSupervisor

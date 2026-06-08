@@ -1,5 +1,6 @@
 defmodule Ferricstore.OperationalGuardTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Flow.Admission
   alias Ferricstore.OperationalGuard

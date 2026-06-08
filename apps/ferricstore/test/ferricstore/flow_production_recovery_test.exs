@@ -1,5 +1,7 @@
 defmodule Ferricstore.FlowProductionRecoveryTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   @moduletag :shard_kill
   @moduletag timeout: 180_000

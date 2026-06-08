@@ -8,6 +8,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Commands.Hash

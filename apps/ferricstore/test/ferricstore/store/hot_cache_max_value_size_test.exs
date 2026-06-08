@@ -1,5 +1,6 @@
 defmodule Ferricstore.Store.HotCacheMaxValueSizeTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.IsolatedInstance
 

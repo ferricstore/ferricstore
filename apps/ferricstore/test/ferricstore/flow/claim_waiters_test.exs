@@ -1,5 +1,7 @@
 defmodule Ferricstore.Flow.ClaimWaitersTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Test.ShardHelpers

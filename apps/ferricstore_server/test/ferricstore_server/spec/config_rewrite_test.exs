@@ -19,6 +19,7 @@ defmodule FerricstoreServer.Spec.ConfigRewriteTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Config
 

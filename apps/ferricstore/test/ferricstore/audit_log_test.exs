@@ -8,6 +8,7 @@ defmodule Ferricstore.AuditLogTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.AuditLog
   alias Ferricstore.Test.ShardHelpers

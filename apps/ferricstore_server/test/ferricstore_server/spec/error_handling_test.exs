@@ -28,6 +28,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Dispatcher, Expiry, Hash, List, Set, Stream, Strings}
   alias Ferricstore.Config

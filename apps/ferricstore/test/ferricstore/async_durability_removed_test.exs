@@ -1,5 +1,6 @@
 defmodule Ferricstore.AsyncDurabilityRemovedTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Namespace
   alias Ferricstore.NamespaceConfig

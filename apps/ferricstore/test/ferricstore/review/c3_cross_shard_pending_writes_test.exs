@@ -5,6 +5,7 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag :shard_kill
 
   alias Ferricstore.Bitcask.NIF

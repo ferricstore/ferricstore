@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.HistoryProjector.PendingRegistryTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
 
   alias Ferricstore.Flow.HistoryProjector.PendingRegistry
 

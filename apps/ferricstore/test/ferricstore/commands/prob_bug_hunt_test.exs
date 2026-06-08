@@ -1,5 +1,5 @@
-Code.require_file("prob_bug_hunt_test/sections/part_01.exs", __DIR__)
-Code.require_file("prob_bug_hunt_test/sections/part_02.exs", __DIR__)
+Code.require_file("prob_bug_hunt_test/sections/probabilistic_direct_writes_surface_directory_fsync_failures.exs", __DIR__)
+Code.require_file("prob_bug_hunt_test/sections/cms_edge_cases.exs", __DIR__)
 defmodule Ferricstore.Commands.ProbBugHuntTest do
   @moduledoc """
   Bug-hunting tests for the four probabilistic data structure command
@@ -102,9 +102,9 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
   # Helpers
   # ===========================================================================
 
-  use Ferricstore.Commands.ProbBugHuntTest.Sections.Part01
+  use Ferricstore.Commands.ProbBugHuntTest.Sections.ProbabilisticDirectWritesSurfaceDirectoryFsyncFailures
 
-  use Ferricstore.Commands.ProbBugHuntTest.Sections.Part02
+  use Ferricstore.Commands.ProbBugHuntTest.Sections.CmsEdgeCases
 
   defp to_info_map(list) do
     list

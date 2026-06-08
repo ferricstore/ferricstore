@@ -4,6 +4,7 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
   Split from CommandsEdgeCasesTest.
   """
   use ExUnit.Case, async: true
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Expiry, Strings}
   alias Ferricstore.Test.MockStore

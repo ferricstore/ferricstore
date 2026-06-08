@@ -19,6 +19,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :raft
 
   alias Ferricstore.Test.ClusterHelper
 

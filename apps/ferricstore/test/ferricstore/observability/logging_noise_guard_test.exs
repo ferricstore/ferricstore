@@ -1,5 +1,6 @@
 defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   @repo_root Path.expand("../../../../../", __DIR__)
   @lib_root Path.join(@repo_root, "apps/ferricstore/lib")

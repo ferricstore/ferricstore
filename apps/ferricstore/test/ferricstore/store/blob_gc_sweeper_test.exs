@@ -1,5 +1,6 @@
 defmodule Ferricstore.Store.BlobGCSweeperTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.BlobGCSweeper
   alias Ferricstore.Store.Router

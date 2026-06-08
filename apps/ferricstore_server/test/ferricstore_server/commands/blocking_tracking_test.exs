@@ -1,5 +1,6 @@
 defmodule FerricstoreServer.Commands.BlockingTrackingTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Commands.Stream

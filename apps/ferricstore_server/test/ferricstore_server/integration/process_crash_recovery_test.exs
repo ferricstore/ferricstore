@@ -8,6 +8,8 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
+  @moduletag :global_state
   @moduletag :shard_kill
   @moduletag timeout: 600_000
 

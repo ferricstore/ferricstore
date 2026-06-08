@@ -1,5 +1,5 @@
-Code.require_file("blocking_bug_hunt_test/sections/part_01.exs", __DIR__)
-Code.require_file("blocking_bug_hunt_test/sections/part_02.exs", __DIR__)
+Code.require_file("blocking_bug_hunt_test/sections/blocking_list_dispatch_converts_storage_raises_into_error_replies.exs", __DIR__)
+Code.require_file("blocking_bug_hunt_test/sections/blpop_float_timeout_0_5.exs", __DIR__)
 
 defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   @moduledoc """
@@ -36,6 +36,7 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Blocking, List, Stream}
   alias Ferricstore.Store.Router
@@ -134,7 +135,7 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   # TCP helpers
   # ===========================================================================
 
-  use FerricstoreServer.Commands.BlockingBugHuntTest.Sections.Part01
+  use FerricstoreServer.Commands.BlockingBugHuntTest.Sections.BlockingListDispatchConvertsStorageRaisesIntoErrorReplies
 
   defp send_cmd_raw(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))
@@ -258,5 +259,5 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   # 1. BLPOP with timeout 0.5 (float seconds)
   # ===========================================================================
 
-  use FerricstoreServer.Commands.BlockingBugHuntTest.Sections.Part02
+  use FerricstoreServer.Commands.BlockingBugHuntTest.Sections.BlpopFloatTimeout05
 end

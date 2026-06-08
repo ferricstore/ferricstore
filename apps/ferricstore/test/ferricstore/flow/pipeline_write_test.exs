@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.PipelineWriteTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.PipelineWrite
 

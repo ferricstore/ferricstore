@@ -11,6 +11,7 @@ defmodule Ferricstore.Bugs.ListWrongtypeTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag timeout: 30_000
 
   setup do

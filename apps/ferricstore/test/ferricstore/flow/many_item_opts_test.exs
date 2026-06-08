@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.ManyItemOptsTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.ManyItemOpts
 

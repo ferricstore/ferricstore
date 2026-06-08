@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :raft
 
   alias Ferricstore.HLC
   alias Ferricstore.Raft.StateMachine

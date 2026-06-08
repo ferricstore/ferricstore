@@ -1,5 +1,7 @@
 defmodule FerricstoreServer.AclFuzzTest do
   use ExUnit.Case, async: false
+  @moduletag :acl
+  @moduletag :global_state
 
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Connection.Auth

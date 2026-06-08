@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.ClaimWaiterSchedulerTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.ClaimWaiterScheduler
 

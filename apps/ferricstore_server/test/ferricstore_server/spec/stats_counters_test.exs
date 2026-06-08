@@ -17,6 +17,7 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router

@@ -13,6 +13,8 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

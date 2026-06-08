@@ -10,6 +10,7 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

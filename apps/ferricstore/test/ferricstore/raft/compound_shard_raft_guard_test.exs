@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.CompoundShardRaftGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   @compound_path Path.expand(
                    "../../../lib/ferricstore/store/shard/compound/ops.ex",

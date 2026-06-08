@@ -34,6 +34,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag :shard_kill
 
   alias Ferricstore.Store.{LFU, Router}

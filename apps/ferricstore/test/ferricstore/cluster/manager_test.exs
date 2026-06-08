@@ -1,5 +1,5 @@
-Code.require_file("manager_test/sections/part_01.exs", __DIR__)
-Code.require_file("manager_test/sections/part_02.exs", __DIR__)
+Code.require_file("manager_test/sections/standalone_mode.exs", __DIR__)
+Code.require_file("manager_test/sections/role_membership_mapping_part_2.exs", __DIR__)
 
 defmodule Ferricstore.Cluster.ManagerTest do
   @moduledoc """
@@ -19,7 +19,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
   # Standalone mode
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Cluster.ManagerTest.Sections.Part01
+  use Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode
 
-  use Ferricstore.Cluster.ManagerTest.Sections.Part02
+  use Ferricstore.Cluster.ManagerTest.Sections.RoleMembershipMappingPart2
 end

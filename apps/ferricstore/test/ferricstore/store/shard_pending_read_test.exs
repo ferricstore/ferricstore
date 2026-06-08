@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
   # Async cold-read warming consults the shared MemoryGuard skip-promotion flag.
   # Keep this module synchronous so pressure tests cannot race these assertions.
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard

@@ -1,5 +1,5 @@
-Code.require_file("config_values_test/sections/part_01.exs", __DIR__)
-Code.require_file("config_values_test/sections/part_02.exs", __DIR__)
+Code.require_file("config_values_test/sections/read_only_param_maxmemory.exs", __DIR__)
+Code.require_file("config_values_test/sections/config_set_emits_telemetry.exs", __DIR__)
 defmodule FerricstoreServer.Spec.ConfigValuesTest do
   @moduledoc """
   Spec section 18: Configuration Value Tests.
@@ -19,6 +19,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Server
   alias Ferricstore.Config
@@ -152,9 +153,9 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
 
   # Extract every other element from a flat list starting at the given offset.
 
-  use FerricstoreServer.Spec.ConfigValuesTest.Sections.Part01
+  use FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemory
 
-  use FerricstoreServer.Spec.ConfigValuesTest.Sections.Part02
+  use FerricstoreServer.Spec.ConfigValuesTest.Sections.ConfigSetEmitsTelemetry
 
   defp every_other(list, offset) do
     list

@@ -1,5 +1,5 @@
-Code.require_file("commands_tcp_test/sections/part_01.exs", __DIR__)
-Code.require_file("commands_tcp_test/sections/part_02.exs", __DIR__)
+Code.require_file("commands_tcp_test/sections/set_get_over_tcp.exs", __DIR__)
+Code.require_file("commands_tcp_test/sections/incr_over_tcp.exs", __DIR__)
 
 defmodule FerricstoreServer.Integration.CommandsTcpTest do
   @moduledoc """
@@ -17,6 +17,7 @@ defmodule FerricstoreServer.Integration.CommandsTcpTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
@@ -110,7 +111,7 @@ defmodule FerricstoreServer.Integration.CommandsTcpTest do
   # SET and GET over TCP
   # ---------------------------------------------------------------------------
 
-  use FerricstoreServer.Integration.CommandsTcpTest.Sections.Part01
+  use FerricstoreServer.Integration.CommandsTcpTest.Sections.SetGetOverTcp
 
-  use FerricstoreServer.Integration.CommandsTcpTest.Sections.Part02
+  use FerricstoreServer.Integration.CommandsTcpTest.Sections.IncrOverTcp
 end

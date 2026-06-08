@@ -15,6 +15,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Expiry, SortedSet, Strings}
   alias Ferricstore.Store.Router

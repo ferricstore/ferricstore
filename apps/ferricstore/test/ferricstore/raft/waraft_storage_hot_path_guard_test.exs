@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   test "LMDB release-cursor poke is explicitly opt-in" do
     source = File.read!(Path.expand("../../../lib/ferricstore/flow/lmdb_writer.ex", __DIR__))

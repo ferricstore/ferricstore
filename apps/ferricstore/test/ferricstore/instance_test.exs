@@ -1,6 +1,7 @@
 defmodule Ferricstore.InstanceTest do
   @moduledoc "Tests that use FerricStore pattern works end-to-end."
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   defmodule EmbeddedA do
     use FerricStore, shard_count: 1

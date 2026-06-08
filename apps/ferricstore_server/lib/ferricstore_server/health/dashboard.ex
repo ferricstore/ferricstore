@@ -32,194 +32,13 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   alias FerricstoreServer.Health.Dashboard.Data.{KV, Operational}
   alias FerricstoreServer.Health.Dashboard.LivePayload
+  alias FerricstoreServer.Health.Dashboard.Templates
   alias FerricstoreServer.Health.Dashboard.Flow.{Browse, Detail, PolicyRetention, Projection, Query, Recovery}
 
-  require EEx
   require Logger
 
   import FerricstoreServer.Health.Dashboard.DoctorSupport
   import FerricstoreServer.Health.Dashboard.Flow.Sample
-  import FerricstoreServer.Health.Dashboard.Layout
-  import FerricstoreServer.Health.Dashboard.Render.Admin
-  import FerricstoreServer.Health.Dashboard.Render.DoctorPages
-  import FerricstoreServer.Health.Dashboard.Render.FlowCharts
-  import FerricstoreServer.Health.Dashboard.Render.FlowComponents
-  import FerricstoreServer.Health.Dashboard.Render.FlowDetail
-  import FerricstoreServer.Health.Dashboard.Render.FlowFilters
-  import FerricstoreServer.Health.Dashboard.Render.FlowHistory, except: [flow_signal_rows: 2]
-  import FerricstoreServer.Health.Dashboard.Render.FlowOverview
-  import FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy, except: [flow_policy_editor_data: 1]
-
-  import FerricstoreServer.Health.Dashboard.Render.FlowTables,
-    except: [default_flow_projection_health: 0]
-
-  import FerricstoreServer.Health.Dashboard.Render.KVPages, except: [kv_command_groups: 0]
-  import FerricstoreServer.Health.Dashboard.Render.Overview
-  import FerricstoreServer.Health.Dashboard.Render.Prefixes
-
-  # ---------------------------------------------------------------------------
-
-  @templates_dir Path.expand("dashboard/templates", __DIR__)
-  EEx.function_from_file(
-    :defp,
-    :template_overview,
-    Path.join(@templates_dir, "overview.html.eex"),
-    [
-      :assigns
-    ]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_slowlog,
-    Path.join(@templates_dir, "slowlog.html.eex"),
-    [
-      :assigns
-    ]
-  )
-
-  EEx.function_from_file(:defp, :template_merge, Path.join(@templates_dir, "merge.html.eex"), [
-    :assigns
-  ])
-
-  EEx.function_from_file(:defp, :template_config, Path.join(@templates_dir, "config.html.eex"), [
-    :assigns
-  ])
-
-  EEx.function_from_file(:defp, :template_raft, Path.join(@templates_dir, "raft.html.eex"), [
-    :assigns
-  ])
-
-  EEx.function_from_file(
-    :defp,
-    :template_clients,
-    Path.join(@templates_dir, "clients.html.eex"),
-    [
-      :assigns
-    ]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_storage,
-    Path.join(@templates_dir, "storage.html.eex"),
-    [
-      :assigns
-    ]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_doctor,
-    Path.join(@templates_dir, "doctor.html.eex"),
-    [
-      :assigns
-    ]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_prefixes,
-    Path.join(@templates_dir, "prefixes.html.eex"),
-    [
-      :assigns
-    ]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_keyspace,
-    Path.join(@templates_dir, "keyspace.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_commands,
-    Path.join(@templates_dir, "commands.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_reads,
-    Path.join(@templates_dir, "reads.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(:defp, :template_flow, Path.join(@templates_dir, "flow.html.eex"), [
-    :assigns
-  ])
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_states,
-    Path.join(@templates_dir, "flow_states.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_workers,
-    Path.join(@templates_dir, "flow_workers.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_due,
-    Path.join(@templates_dir, "flow_due.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_failures,
-    Path.join(@templates_dir, "flow_failures.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_lineage,
-    Path.join(@templates_dir, "flow_lineage.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_query,
-    Path.join(@templates_dir, "flow_query.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_signals,
-    Path.join(@templates_dir, "flow_signals.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_policies,
-    Path.join(@templates_dir, "flow_policies.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_retention,
-    Path.join(@templates_dir, "flow_retention.html.eex"),
-    [:assigns]
-  )
-
-  EEx.function_from_file(
-    :defp,
-    :template_flow_detail,
-    Path.join(@templates_dir, "flow_detail.html.eex"),
-    [:assigns]
-  )
 
   # ---------------------------------------------------------------------------
   # Types
@@ -370,7 +189,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render(dashboard_data()) :: binary()
   def render(data) do
-    render_template(template_overview(%{data: data}))
+    render_template(Templates.overview(%{data: data}))
   end
 
   @doc """
@@ -400,7 +219,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_slowlog_page(%{slowlog: [slowlog_entry()]}) :: binary()
   def render_slowlog_page(data) do
-    render_template(template_slowlog(%{data: data}))
+    render_template(Templates.slowlog(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -420,7 +239,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_merge_page(%{merge: [merge_status()]}) :: binary()
   def render_merge_page(data) do
-    render_template(template_merge(%{data: data}))
+    render_template(Templates.merge(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -440,7 +259,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_config_page(config_page_data() | map()) :: binary()
   def render_config_page(data) do
-    render_template(template_config(%{data: data}))
+    render_template(Templates.config(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -460,7 +279,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_raft_page(%{raft_shards: [raft_shard_data()], cluster: cluster_data()}) :: binary()
   def render_raft_page(data) do
-    render_template(template_raft(%{data: data}))
+    render_template(Templates.raft(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -481,7 +300,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec render_clients_page(%{clients: [client_data()], connections: connections_data()}) ::
           binary()
   def render_clients_page(data) do
-    render_template(template_clients(%{data: data}))
+    render_template(Templates.clients(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -505,7 +324,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_storage_page(map()) :: binary()
   def render_storage_page(data) do
-    render_template(template_storage(%{data: data}))
+    render_template(Templates.storage(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -535,7 +354,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_doctor_page(map()) :: binary()
   def render_doctor_page(data) do
-    render_template(template_doctor(%{data: data}))
+    render_template(Templates.doctor(%{data: data}))
   end
 
   @doc false
@@ -581,7 +400,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_prefixes_page(map()) :: binary()
   def render_prefixes_page(data) do
-    render_template(template_prefixes(%{data: data}))
+    render_template(Templates.prefixes(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -601,7 +420,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_keyspace_page(map()) :: binary()
   def render_keyspace_page(data) do
-    render_template(template_keyspace(%{data: data}))
+    render_template(Templates.keyspace(%{data: data}))
   end
 
   @doc """
@@ -617,7 +436,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_commands_page(map()) :: binary()
   def render_commands_page(data) do
-    render_template(template_commands(%{data: data}))
+    render_template(Templates.commands(%{data: data}))
   end
 
   @doc """
@@ -633,7 +452,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_reads_page(map()) :: binary()
   def render_reads_page(data) do
-    render_template(template_reads(%{data: data}))
+    render_template(Templates.reads(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -664,7 +483,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_flow_page(map()) :: binary()
   def render_flow_page(data) do
-    render_template(template_flow(%{data: data}))
+    render_template(Templates.flow(%{data: data}))
   end
 
   @doc """
@@ -717,7 +536,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_flow_policies_page(map()) :: binary()
   def render_flow_policies_page(data) do
-    render_template(template_flow_policies(%{data: data}))
+    render_template(Templates.flow_policies(%{data: data}))
   end
 
   @doc """
@@ -757,7 +576,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_flow_retention_page(map()) :: binary()
   def render_flow_retention_page(data) do
-    render_template(template_flow_retention(%{data: data}))
+    render_template(Templates.flow_retention(%{data: data}))
   end
 
   @doc """
@@ -789,7 +608,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Renders the Flow state-centric page."
   @spec render_flow_states_page(map()) :: binary()
   def render_flow_states_page(data) do
-    render_template(template_flow_states(%{data: data}))
+    render_template(Templates.flow_states(%{data: data}))
   end
 
   @doc false
@@ -807,7 +626,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Renders the Flow workers and leases page."
   @spec render_flow_workers_page(map()) :: binary()
   def render_flow_workers_page(data) do
-    render_template(template_flow_workers(%{data: data}))
+    render_template(Templates.flow_workers(%{data: data}))
   end
 
   @doc "Collects data for the Flow due and scheduled work page."
@@ -817,7 +636,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Renders the Flow due and scheduled work page."
   @spec render_flow_due_page(map()) :: binary()
   def render_flow_due_page(data) do
-    render_template(template_flow_due(%{data: data}))
+    render_template(Templates.flow_due(%{data: data}))
   end
 
   @doc "Collects failed, stuck, and expired-lease Flow work for operator recovery."
@@ -843,7 +662,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Renders the Flow failures and recovery page."
   @spec render_flow_failures_page(map()) :: binary()
   def render_flow_failures_page(data) do
-    render_template(template_flow_failures(%{data: data}))
+    render_template(Templates.flow_failures(%{data: data}))
   end
 
   @doc "Collects Flow lineage records by parent, root, or correlation id."
@@ -857,7 +676,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Renders the Flow lineage page."
   @spec render_flow_lineage_page(map()) :: binary()
   def render_flow_lineage_page(data) do
-    render_template(template_flow_lineage(%{data: data}))
+    render_template(Templates.flow_lineage(%{data: data}))
   end
 
   @doc "Collects a safe Flow query explorer result."
@@ -871,7 +690,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Renders the Flow query explorer page."
   @spec render_flow_query_page(map()) :: binary()
   def render_flow_query_page(data) do
-    render_template(template_flow_query(%{data: data}))
+    render_template(Templates.flow_query(%{data: data}))
   end
 
   @doc "Collects recent Flow signal events from a bounded Flow sample."
@@ -885,7 +704,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc "Renders the Flow signals page."
   @spec render_flow_signals_page(map()) :: binary()
   def render_flow_signals_page(data) do
-    render_template(template_flow_signals(%{data: data}))
+    render_template(Templates.flow_signals(%{data: data}))
   end
 
   @doc false
@@ -916,22 +735,11 @@ defmodule FerricstoreServer.Health.Dashboard do
   """
   @spec render_flow_detail_page(map()) :: binary()
   def render_flow_detail_page(data) do
-    render_template(template_flow_detail(%{data: data}))
+    render_template(Templates.flow_detail(%{data: data}))
   end
 
   @spec render_template(binary()) :: binary()
   defp render_template(html), do: String.trim_leading(html)
-
-  @spec render_overview_content(dashboard_data()) :: binary()
-  defp render_overview_content(data) do
-    """
-    #{render_cache_performance(data.hotcold)}
-    #{render_lifecycle(data.lifecycle)}
-    #{render_shards(data.shards)}
-    #{render_memory_alert(data.memory)}
-    #{render_connections(data.connections)}
-    """
-  end
 
   # ---------------------------------------------------------------------------
   # HTML rendering -- Main Dashboard

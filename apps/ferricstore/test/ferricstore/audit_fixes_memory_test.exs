@@ -5,6 +5,7 @@ defmodule Ferricstore.AuditFixesMemoryTest do
   """
 
   use ExUnit.Case, async: true
+  @moduletag :global_state
 
   # ---------------------------------------------------------------------------
   # Memory audit H1: eviction uses {count, list} accumulator

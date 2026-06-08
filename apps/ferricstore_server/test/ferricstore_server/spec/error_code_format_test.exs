@@ -14,6 +14,7 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Dispatcher, Generic, Strings}
   alias Ferricstore.Config

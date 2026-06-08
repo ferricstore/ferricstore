@@ -1,5 +1,5 @@
-Code.require_file("node_join_sync_test/sections/part_01.exs", __DIR__)
-Code.require_file("node_join_sync_test/sections/part_02.exs", __DIR__)
+Code.require_file("node_join_sync_test/sections/new_node_join_continuous_writes.exs", __DIR__)
+Code.require_file("node_join_sync_test/sections/leader_failover_during_sync.exs", __DIR__)
 defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   @moduledoc """
   Tests that a new node joining the cluster receives a complete, consistent
@@ -41,9 +41,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     :ok
   end
 
-  use Ferricstore.Cluster.NodeJoinSyncTest.Sections.Part01
+  use Ferricstore.Cluster.NodeJoinSyncTest.Sections.NewNodeJoinContinuousWrites
 
-  use Ferricstore.Cluster.NodeJoinSyncTest.Sections.Part02
+  use Ferricstore.Cluster.NodeJoinSyncTest.Sections.LeaderFailoverDuringSync
 
   defp cleanup_orphan_peers do
     # Stop any peers registered in the ETS table (from start_node)

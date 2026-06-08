@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.ReplyAwaiterTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   alias Ferricstore.Raft.ReplyAwaiter
 

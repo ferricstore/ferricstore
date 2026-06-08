@@ -13,6 +13,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.Router

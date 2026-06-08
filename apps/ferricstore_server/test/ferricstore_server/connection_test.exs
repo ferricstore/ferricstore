@@ -1,6 +1,6 @@
-Code.require_file("connection_test/sections/part_01.exs", __DIR__)
-Code.require_file("connection_test/sections/part_02.exs", __DIR__)
-Code.require_file("connection_test/sections/part_03.exs", __DIR__)
+Code.require_file("connection_test/sections/server_accepts_tcp_connection.exs", __DIR__)
+Code.require_file("connection_test/sections/pipeline_prefetch_does_not_read_through_keyless_write_barrier.exs", __DIR__)
+Code.require_file("connection_test/sections/hello_3_mid_session_returns_greeting_again.exs", __DIR__)
 
 defmodule FerricstoreServer.ConnectionTest do
   @moduledoc false
@@ -58,9 +58,9 @@ defmodule FerricstoreServer.ConnectionTest do
   # TCP connection
   # ---------------------------------------------------------------------------
 
-  use FerricstoreServer.ConnectionTest.Sections.Part01
-  use FerricstoreServer.ConnectionTest.Sections.Part02
-  use FerricstoreServer.ConnectionTest.Sections.Part03
+  use FerricstoreServer.ConnectionTest.Sections.ServerAcceptsTcpConnection
+  use FerricstoreServer.ConnectionTest.Sections.PipelinePrefetchDoesNotReadThroughKeylessWriteBarrier
+  use FerricstoreServer.ConnectionTest.Sections.Hello3MidSessionReturnsGreetingAgain
 
 def handle_quorum_submit(event, measurements, metadata, test_pid) do
     send(test_pid, {:quorum_submit, event, measurements, metadata})

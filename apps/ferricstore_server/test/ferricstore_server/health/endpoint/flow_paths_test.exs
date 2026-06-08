@@ -1,5 +1,6 @@
 defmodule FerricstoreServer.Health.Endpoint.FlowPathsTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias FerricstoreServer.Health.Endpoint.FlowPaths
 

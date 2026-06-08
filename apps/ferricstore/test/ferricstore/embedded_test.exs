@@ -1,5 +1,5 @@
-Code.require_file("embedded_test/sections/part_01.exs", __DIR__)
-Code.require_file("embedded_test/sections/part_02.exs", __DIR__)
+Code.require_file("embedded_test/sections/set_3_get_1.exs", __DIR__)
+Code.require_file("embedded_test/sections/combined_operations.exs", __DIR__)
 defmodule Ferricstore.EmbeddedTest do
   @moduledoc """
   Comprehensive tests for the FerricStore embedded mode direct Elixir API.
@@ -9,6 +9,7 @@ defmodule Ferricstore.EmbeddedTest do
   for isolation and run with async: false.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
@@ -165,8 +166,8 @@ defmodule Ferricstore.EmbeddedTest do
   # Integration — combined data type operations
   # ===========================================================================
 
-  use Ferricstore.EmbeddedTest.Sections.Part01
+  use Ferricstore.EmbeddedTest.Sections.Set3Get1
 
-  use Ferricstore.EmbeddedTest.Sections.Part02
+  use Ferricstore.EmbeddedTest.Sections.CombinedOperations
 
 end

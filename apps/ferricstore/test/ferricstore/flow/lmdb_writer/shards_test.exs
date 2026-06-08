@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.LMDBWriter.ShardsTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.LMDBWriter.Shards
 

@@ -1,4 +1,4 @@
-Code.require_file("blob_store_test/sections/part_01.exs", __DIR__)
+Code.require_file("blob_store_test/sections/put_appends_blob_segment_record_returns_small_ref.exs", __DIR__)
 defmodule Ferricstore.Store.BlobStoreTest do
   use ExUnit.Case, async: true
 
@@ -310,7 +310,7 @@ defmodule Ferricstore.Store.BlobStoreTest do
 
 
 
-  use Ferricstore.Store.BlobStoreTest.Sections.Part01
+  use Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordReturnsSmallRef
 
   defp tmp_files(root, shard_index) do
     root

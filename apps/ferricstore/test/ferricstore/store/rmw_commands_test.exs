@@ -26,6 +26,7 @@ defmodule Ferricstore.Store.RmwCommandsTest do
   part of this coverage.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

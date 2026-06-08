@@ -1,6 +1,7 @@
 defmodule Ferricstore.Commands.ConfigLocalTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Server
   alias Ferricstore.Config

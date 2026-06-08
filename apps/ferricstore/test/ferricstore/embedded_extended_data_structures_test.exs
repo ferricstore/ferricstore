@@ -7,6 +7,7 @@ defmodule Ferricstore.EmbeddedExtendedDataStructuresTest do
   TopK, T-Digest, JSON, Geo, and embedded value size limits.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

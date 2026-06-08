@@ -24,6 +24,7 @@ defmodule Ferricstore.Store.AsyncTDigestTest do
   fewer than 500 observations under the lost-update bug.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

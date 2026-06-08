@@ -1,9 +1,11 @@
-Code.require_file("waraft_segment_log_test/sections/part_01.exs", __DIR__)
-Code.require_file("waraft_segment_log_test/sections/part_02.exs", __DIR__)
-Code.require_file("waraft_segment_log_test/sections/part_03.exs", __DIR__)
+Code.require_file("waraft_segment_log_test/sections/segment_log_caps_ets_tail_while_disk_backed_reads_still_see_older_entrie.exs", __DIR__)
+Code.require_file("waraft_segment_log_test/sections/sync_apply_projection_batch_append_fdatasyncs_before_returning.exs", __DIR__)
+Code.require_file("waraft_segment_log_test/sections/default_segment_size_does_not_roll_over_during_normal_hot_batches.exs", __DIR__)
 
 defmodule Ferricstore.Raft.WARaftSegmentLogTest do
   use ExUnit.Case, async: false
+  @moduletag :raft
+  @moduletag :global_state
 
   def handle_corrupt_telemetry(event, measurements, metadata, parent) do
     send(parent, {:segment_log_corrupt, event, measurements, metadata})
@@ -25,9 +27,9 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     send(parent, {:segment_log_fold, event, measurements, metadata})
   end
 
-  use Ferricstore.Raft.WARaftSegmentLogTest.Sections.Part01
+  use Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWhileDiskBackedReadsStillSeeOlderEntrie
 
-  use Ferricstore.Raft.WARaftSegmentLogTest.Sections.Part02
+  use Ferricstore.Raft.WARaftSegmentLogTest.Sections.SyncApplyProjectionBatchAppendFdatasyncsBeforeReturning
 
   defp clear_segment_offset_registry do
     if :ets.info(:ferricstore_waraft_segment_offset_registry) != :undefined do
@@ -123,5 +125,5 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     {:ok, Enum.reverse(entries)}
   end
 
-  use Ferricstore.Raft.WARaftSegmentLogTest.Sections.Part03
+  use Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesNotRollOverDuringNormalHotBatches
 end

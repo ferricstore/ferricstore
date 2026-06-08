@@ -1,5 +1,7 @@
 defmodule Ferricstore.Raft.WARaftApplicationBootTest do
   use ExUnit.Case, async: false
+  @moduletag :raft
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Commands.Generic

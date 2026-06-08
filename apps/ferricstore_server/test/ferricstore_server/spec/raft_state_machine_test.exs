@@ -18,6 +18,8 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :raft
+  @moduletag :global_state
 
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher

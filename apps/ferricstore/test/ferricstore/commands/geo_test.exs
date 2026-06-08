@@ -1,5 +1,5 @@
-Code.require_file("geo_test/sections/part_01.exs", __DIR__)
-Code.require_file("geo_test/sections/part_02.exs", __DIR__)
+Code.require_file("geo_test/sections/geohash_encode_decode_roundtrip.exs", __DIR__)
+Code.require_file("geo_test/sections/geosearch.exs", __DIR__)
 defmodule Ferricstore.Commands.GeoTest do
   @moduledoc """
   Unit tests for `Ferricstore.Commands.Geo`.
@@ -25,9 +25,9 @@ defmodule Ferricstore.Commands.GeoTest do
   @rome_lng 12.496366
   @rome_lat 41.902782
 
-  use Ferricstore.Commands.GeoTest.Sections.Part01
+  use Ferricstore.Commands.GeoTest.Sections.GeohashEncodeDecodeRoundtrip
 
-  use Ferricstore.Commands.GeoTest.Sections.Part02
+  use Ferricstore.Commands.GeoTest.Sections.Geosearch
 
   defp store_with_geo(key, members) do
     store = MockStore.make()

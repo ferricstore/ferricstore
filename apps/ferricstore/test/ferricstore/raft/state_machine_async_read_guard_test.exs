@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.StateMachineAsyncReadGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   test "Raft apply cold-read fallbacks use async pread" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()

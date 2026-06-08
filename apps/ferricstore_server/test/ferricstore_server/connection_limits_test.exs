@@ -4,6 +4,7 @@ defmodule FerricstoreServer.ConnectionLimitsTest do
   MULTI queue overflow, and pipeline batch overflow.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

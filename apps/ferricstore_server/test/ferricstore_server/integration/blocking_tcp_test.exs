@@ -21,6 +21,7 @@ defmodule FerricstoreServer.Integration.BlockingTcpTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser

@@ -8,6 +8,7 @@ defmodule Ferricstore.ExpirySweepTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   import Ferricstore.Test.ShardHelpers, only: [eventually: 4, flush_all_keys: 0]

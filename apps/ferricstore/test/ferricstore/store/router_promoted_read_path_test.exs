@@ -1,5 +1,6 @@
 defmodule Ferricstore.Store.RouterPromotedReadPathTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.{CompoundKey, Router}
   alias Ferricstore.Test.IsolatedInstance

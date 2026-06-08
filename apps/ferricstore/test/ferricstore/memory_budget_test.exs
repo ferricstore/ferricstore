@@ -1,5 +1,6 @@
 defmodule Ferricstore.MemoryBudgetTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.MemoryBudget
 

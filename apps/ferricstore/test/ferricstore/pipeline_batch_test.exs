@@ -4,6 +4,7 @@ defmodule Ferricstore.PipelineBatchTest do
   entry per shard via the Coordinator, rather than executing them one at a time.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

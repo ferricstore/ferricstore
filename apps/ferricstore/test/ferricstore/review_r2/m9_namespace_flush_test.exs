@@ -5,6 +5,7 @@ defmodule Ferricstore.ReviewR2.M9NamespaceFlushTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher

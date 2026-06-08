@@ -3,6 +3,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
   Tests for namespace config audit trail: changed_at and changed_by.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Namespace
   alias Ferricstore.Commands.Server

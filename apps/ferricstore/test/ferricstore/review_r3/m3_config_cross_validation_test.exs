@@ -5,6 +5,7 @@ defmodule Ferricstore.ReviewR3.M3ConfigCrossValidationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Config
 

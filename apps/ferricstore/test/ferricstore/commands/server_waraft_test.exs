@@ -1,5 +1,6 @@
 defmodule Ferricstore.Commands.ServerWARaftTest do
   use ExUnit.Case, async: false
+  @moduletag :raft
 
   alias Ferricstore.Commands.Server
 

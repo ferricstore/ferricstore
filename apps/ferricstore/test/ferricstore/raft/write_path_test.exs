@@ -1,6 +1,6 @@
-Code.require_file("write_path_test/sections/part_01.exs", __DIR__)
-Code.require_file("write_path_test/sections/part_02.exs", __DIR__)
-Code.require_file("write_path_test/sections/part_03.exs", __DIR__)
+Code.require_file("write_path_test/sections/set_via_router_goes_through_raft.exs", __DIR__)
+Code.require_file("write_path_test/sections/list_op_lpush_through_raft_adds_element.exs", __DIR__)
+Code.require_file("write_path_test/sections/ratelimit_add_through_raft.exs", __DIR__)
 
 defmodule Ferricstore.Raft.WritePathTest do
   @moduledoc """
@@ -12,6 +12,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :raft
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.WARaftSegmentReader
@@ -51,7 +52,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   # 1. SET via Router goes through Raft when enabled
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Raft.WritePathTest.Sections.Part01
+  use Ferricstore.Raft.WritePathTest.Sections.SetViaRouterGoesThroughRaft
 
   defp fresh_sm_state do
     dir = Path.join(System.tmp_dir!(), "wp_sm_#{:rand.uniform(9_999_999)}")
@@ -95,7 +96,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   # 12. list_op — LPUSH through Raft adds element
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Raft.WritePathTest.Sections.Part02
+  use Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElement
 
-  use Ferricstore.Raft.WritePathTest.Sections.Part03
+  use Ferricstore.Raft.WritePathTest.Sections.RatelimitAddThroughRaft
 end

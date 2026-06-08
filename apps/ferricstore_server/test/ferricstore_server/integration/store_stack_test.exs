@@ -2,6 +2,8 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
   @moduledoc false
 
   use ExUnit.Case, async: false
+  @moduletag :integration
+  @moduletag :global_state
   @moduletag :shard_kill
   @moduletag :cluster
 

@@ -12,6 +12,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Server
   alias Ferricstore.Store.Router

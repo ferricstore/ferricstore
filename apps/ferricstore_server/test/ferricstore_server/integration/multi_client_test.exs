@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Integration.MultiClientTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

@@ -13,6 +13,7 @@ defmodule FerricstoreServer.ShutdownTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag :cluster
 
   alias Ferricstore.DataDir

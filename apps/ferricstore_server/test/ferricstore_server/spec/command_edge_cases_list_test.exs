@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesListTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

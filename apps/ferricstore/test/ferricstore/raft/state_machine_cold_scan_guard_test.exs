@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.StateMachineColdScanGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   test "cross-shard prefix scans batch cold Bitcask reads" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()

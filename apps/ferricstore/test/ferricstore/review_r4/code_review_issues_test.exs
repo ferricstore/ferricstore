@@ -11,6 +11,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

@@ -1,5 +1,6 @@
 defmodule FerricstoreServer.ACL.DoctorACLTest do
   use ExUnit.Case, async: true
+  @moduletag :acl
 
   alias FerricstoreServer.Acl.CommandCategories
 

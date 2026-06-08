@@ -5,6 +5,7 @@ defmodule Ferricstore.ReviewR2.M1UnlockRetryTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Raft.Cluster
   alias Ferricstore.Test.ShardHelpers

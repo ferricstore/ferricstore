@@ -16,6 +16,8 @@ defmodule FerricstoreServer.Integration.CrossShardAtomicTcpTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
+  @moduletag :global_state
   @moduletag timeout: 60_000
 
   alias FerricstoreServer.Resp.Encoder

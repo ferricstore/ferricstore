@@ -11,6 +11,8 @@ defmodule Ferricstore.Bugs.IncrOverflowTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
   @moduletag timeout: 30_000
 
   @int64_max 9_223_372_036_854_775_807

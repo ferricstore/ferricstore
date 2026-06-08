@@ -1,5 +1,5 @@
-Code.require_file("prob_edge_cases_test/sections/part_01.exs", __DIR__)
-Code.require_file("prob_edge_cases_test/sections/part_02.exs", __DIR__)
+Code.require_file("prob_edge_cases_test/sections/bloom_edge_cases.exs", __DIR__)
+Code.require_file("prob_edge_cases_test/sections/nif_level_edge_cases.exs", __DIR__)
 defmodule Ferricstore.ProbEdgeCasesTest do
   @moduledoc """
   Comprehensive edge case tests for probabilistic data structures and MemoryGuard.
@@ -14,6 +14,7 @@ defmodule Ferricstore.ProbEdgeCasesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
   alias Ferricstore.Bitcask.NIF
@@ -38,9 +39,9 @@ defmodule Ferricstore.ProbEdgeCasesTest do
   # Test helpers
   # ===========================================================================
 
-  use Ferricstore.ProbEdgeCasesTest.Sections.Part01
+  use Ferricstore.ProbEdgeCasesTest.Sections.BloomEdgeCases
 
-  use Ferricstore.ProbEdgeCasesTest.Sections.Part02
+  use Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases
 
   defp make_prob_dir(prefix) do
     dir =

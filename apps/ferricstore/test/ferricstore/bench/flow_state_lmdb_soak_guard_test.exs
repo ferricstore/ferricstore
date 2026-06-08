@@ -1,5 +1,6 @@
 defmodule Ferricstore.Bench.FlowStateLMDBSoakGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   @moduletag :bench
 

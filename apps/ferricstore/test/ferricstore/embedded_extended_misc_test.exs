@@ -12,6 +12,7 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
   Geo, and value size limits.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

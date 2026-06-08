@@ -1,5 +1,6 @@
 defmodule FerricstoreServer.Health.Endpoint.DashboardHandlersTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Health.Endpoint.DashboardHandlers

@@ -5,6 +5,7 @@ defmodule Ferricstore.Review.H7DedicatedCompactCleanupTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   @moduletag :shard_kill
 

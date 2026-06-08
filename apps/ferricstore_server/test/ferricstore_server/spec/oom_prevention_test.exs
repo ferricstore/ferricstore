@@ -6,6 +6,7 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.MemoryGuard
 

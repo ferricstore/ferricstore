@@ -1,7 +1,7 @@
-Code.require_file("shard_async_io_test/sections/part_01.exs", __DIR__)
-Code.require_file("shard_async_io_test/sections/part_02.exs", __DIR__)
-Code.require_file("shard_async_io_test/sections/part_03.exs", __DIR__)
-Code.require_file("shard_async_io_test/sections/part_04.exs", __DIR__)
+Code.require_file("shard_async_io_test/sections/v2_append_batch_nosync_nif.exs", __DIR__)
+Code.require_file("shard_async_io_test/sections/concurrent_writes.exs", __DIR__)
+Code.require_file("shard_async_io_test/sections/shared_log_compaction.exs", __DIR__)
+Code.require_file("shard_async_io_test/sections/file_size_accounting.exs", __DIR__)
 
 defmodule Ferricstore.Store.ShardAsyncIoTest do
   @moduledoc """
@@ -157,8 +157,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   # v2_append_batch_nosync NIF
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Store.ShardAsyncIoTest.Sections.Part01
-  use Ferricstore.Store.ShardAsyncIoTest.Sections.Part02
-  use Ferricstore.Store.ShardAsyncIoTest.Sections.Part03
-  use Ferricstore.Store.ShardAsyncIoTest.Sections.Part04
+  use Ferricstore.Store.ShardAsyncIoTest.Sections.V2AppendBatchNosyncNif
+  use Ferricstore.Store.ShardAsyncIoTest.Sections.ConcurrentWrites
+  use Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction
+  use Ferricstore.Store.ShardAsyncIoTest.Sections.FileSizeAccounting
 end

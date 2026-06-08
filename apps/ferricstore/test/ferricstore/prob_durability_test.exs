@@ -21,6 +21,7 @@ defmodule Ferricstore.ProbDurabilityTest do
   Elixir-facing command surface deserves its own guard.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

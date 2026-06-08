@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
 
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBIndexDecode

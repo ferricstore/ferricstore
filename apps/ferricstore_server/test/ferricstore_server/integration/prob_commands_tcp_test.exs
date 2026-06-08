@@ -7,6 +7,8 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
   sends raw RESP commands, and verifies responses.
   """
   use ExUnit.Case, async: false
+  @moduletag :integration
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

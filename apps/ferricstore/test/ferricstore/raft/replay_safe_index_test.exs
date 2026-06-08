@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.ReplaySafeIndexTest do
   use ExUnit.Case, async: false
+  @moduletag :raft
   import ExUnit.CaptureLog
 
   alias Ferricstore.Raft.{ReplaySafeIndex, ReplaySafeIndexWriter}

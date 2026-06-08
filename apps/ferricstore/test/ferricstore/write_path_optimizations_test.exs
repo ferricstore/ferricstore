@@ -17,6 +17,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   import Bitwise
 

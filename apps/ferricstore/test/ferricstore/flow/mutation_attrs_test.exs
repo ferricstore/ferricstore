@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.MutationAttrsTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.MutationAttrs
 

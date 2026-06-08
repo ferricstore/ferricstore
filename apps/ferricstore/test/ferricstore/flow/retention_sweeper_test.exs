@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.RetentionSweeperTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
 
   alias Ferricstore.Flow.RetentionSweeper
 

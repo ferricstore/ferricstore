@@ -1,11 +1,11 @@
-Code.require_file("dashboard_test/sections/part_01.exs", __DIR__)
-Code.require_file("dashboard_test/sections/part_02.exs", __DIR__)
-Code.require_file("dashboard_test/sections/part_03.exs", __DIR__)
-Code.require_file("dashboard_test/sections/part_04.exs", __DIR__)
-Code.require_file("dashboard_test/sections/part_05.exs", __DIR__)
-Code.require_file("dashboard_test/sections/part_06.exs", __DIR__)
-Code.require_file("dashboard_test/sections/part_07.exs", __DIR__)
-Code.require_file("dashboard_test/sections/part_08.exs", __DIR__)
+Code.require_file("dashboard_test/sections/collection_and_overview.exs", __DIR__)
+Code.require_file("dashboard_test/sections/acl_flow_actions.exs", __DIR__)
+Code.require_file("dashboard_test/sections/acl_filtering_and_config.exs", __DIR__)
+Code.require_file("dashboard_test/sections/operational_pages.exs", __DIR__)
+Code.require_file("dashboard_test/sections/flow_browse_and_queries.exs", __DIR__)
+Code.require_file("dashboard_test/sections/flow_detail_actions.exs", __DIR__)
+Code.require_file("dashboard_test/sections/flow_detail_policies_retention.exs", __DIR__)
+Code.require_file("dashboard_test/sections/http_flow_routes.exs", __DIR__)
 
 defmodule FerricstoreServer.Health.DashboardTest do
   @moduledoc """
@@ -21,6 +21,8 @@ defmodule FerricstoreServer.Health.DashboardTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :dashboard
+  @moduletag :global_state
   @moduletag timeout: 60_000
 
   alias FerricstoreServer.Health.Dashboard
@@ -174,12 +176,12 @@ defmodule FerricstoreServer.Health.DashboardTest do
   # Dashboard.collect/0
   # ---------------------------------------------------------------------------
 
-  use FerricstoreServer.Health.DashboardTest.Sections.Part01
-  use FerricstoreServer.Health.DashboardTest.Sections.Part02
-  use FerricstoreServer.Health.DashboardTest.Sections.Part03
-  use FerricstoreServer.Health.DashboardTest.Sections.Part04
-  use FerricstoreServer.Health.DashboardTest.Sections.Part05
-  use FerricstoreServer.Health.DashboardTest.Sections.Part06
-  use FerricstoreServer.Health.DashboardTest.Sections.Part07
-  use FerricstoreServer.Health.DashboardTest.Sections.Part08
+  use FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview
+  use FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions
+  use FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig
+  use FerricstoreServer.Health.DashboardTest.Sections.OperationalPages
+  use FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries
+  use FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions
+  use FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRetention
+  use FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes
 end

@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   @moduletag :bench
 

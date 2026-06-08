@@ -1,5 +1,5 @@
-Code.require_file("acl_permissions_test/sections/part_01.exs", __DIR__)
-Code.require_file("acl_permissions_test/sections/part_02.exs", __DIR__)
+Code.require_file("acl_permissions_test/sections/acl_check_command_2_all.exs", __DIR__)
+Code.require_file("acl_permissions_test/sections/tcp_global_keyspace_enumeration_restricted_key_patterns.exs", __DIR__)
 defmodule FerricstoreServer.Spec.AclPermissionsTest do
   @moduledoc """
   Tests for ACL command-level permission enforcement.
@@ -21,6 +21,8 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :acl
+  @moduletag :global_state
 
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
@@ -31,9 +33,9 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  use FerricstoreServer.Spec.AclPermissionsTest.Sections.Part01
+  use FerricstoreServer.Spec.AclPermissionsTest.Sections.AclCheckCommand2All
 
-  use FerricstoreServer.Spec.AclPermissionsTest.Sections.Part02
+  use FerricstoreServer.Spec.AclPermissionsTest.Sections.TcpGlobalKeyspaceEnumerationRestrictedKeyPatterns
 
   defp send_cmd(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))

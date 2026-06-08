@@ -14,6 +14,7 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Hash
   alias Ferricstore.Store.Router

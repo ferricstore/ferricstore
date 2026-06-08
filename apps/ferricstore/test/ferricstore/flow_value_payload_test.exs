@@ -1,5 +1,7 @@
 defmodule Ferricstore.FlowValuePayloadTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

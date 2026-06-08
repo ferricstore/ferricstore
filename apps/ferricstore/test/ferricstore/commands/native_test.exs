@@ -6,6 +6,7 @@ defmodule Ferricstore.Commands.NativeTest do
   since native commands use atomic GenServer calls.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Native
   alias Ferricstore.MemoryGuard

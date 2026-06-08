@@ -1,6 +1,6 @@
-Code.require_file("list_test/sections/part_01.exs", __DIR__)
-Code.require_file("list_test/sections/part_02.exs", __DIR__)
-Code.require_file("list_test/sections/part_03.exs", __DIR__)
+Code.require_file("list_test/sections/storage_path_guards.exs", __DIR__)
+Code.require_file("list_test/sections/lpush.exs", __DIR__)
+Code.require_file("list_test/sections/lmove.exs", __DIR__)
 
 defmodule Ferricstore.Commands.ListTest do
   @moduledoc """
@@ -19,7 +19,7 @@ defmodule Ferricstore.Commands.ListTest do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
-  use Ferricstore.Commands.ListTest.Sections.Part01
+  use Ferricstore.Commands.ListTest.Sections.StoragePathGuards
 
   defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
 
@@ -60,7 +60,7 @@ defmodule Ferricstore.Commands.ListTest do
   # LPUSH
   # ===========================================================================
 
-  use Ferricstore.Commands.ListTest.Sections.Part02
+  use Ferricstore.Commands.ListTest.Sections.Lpush
 
-  use Ferricstore.Commands.ListTest.Sections.Part03
+  use Ferricstore.Commands.ListTest.Sections.Lmove
 end

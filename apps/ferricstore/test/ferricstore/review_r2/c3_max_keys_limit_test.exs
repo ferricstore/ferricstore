@@ -5,6 +5,7 @@ defmodule Ferricstore.ReviewR2.C3MaxKeysLimitTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.CrossShardOp
   alias Ferricstore.Test.ShardHelpers

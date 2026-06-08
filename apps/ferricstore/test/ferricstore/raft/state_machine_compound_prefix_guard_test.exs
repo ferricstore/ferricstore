@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.StateMachineCompoundPrefixGuardTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   test "cross-shard prefix keys are filtered in the ETS match spec" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()

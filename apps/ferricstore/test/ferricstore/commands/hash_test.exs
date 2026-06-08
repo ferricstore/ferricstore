@@ -1,6 +1,6 @@
-Code.require_file("hash_test/sections/part_01.exs", __DIR__)
-Code.require_file("hash_test/sections/part_02.exs", __DIR__)
-Code.require_file("hash_test/sections/part_03.exs", __DIR__)
+Code.require_file("hash_test/sections/hset.exs", __DIR__)
+Code.require_file("hash_test/sections/hexpire.exs", __DIR__)
+Code.require_file("hash_test/sections/wrongtype_enforcement_edge_cases.exs", __DIR__)
 
 defmodule Ferricstore.Commands.HashTest do
   @moduledoc false
@@ -19,9 +19,9 @@ defmodule Ferricstore.Commands.HashTest do
   # HSET
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Commands.HashTest.Sections.Part01
-  use Ferricstore.Commands.HashTest.Sections.Part02
-  use Ferricstore.Commands.HashTest.Sections.Part03
+  use Ferricstore.Commands.HashTest.Sections.Hset
+  use Ferricstore.Commands.HashTest.Sections.Hexpire
+  use Ferricstore.Commands.HashTest.Sections.WrongtypeEnforcementEdgeCases
 
 defp collect_hscan_fields(store, key, cursor, count) do
     collect_hscan_fields(store, key, cursor, count, [])

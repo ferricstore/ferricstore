@@ -1,19 +1,21 @@
-Code.require_file("flow_test/sections/part_01.exs", __DIR__)
-Code.require_file("flow_test/sections/part_02.exs", __DIR__)
-Code.require_file("flow_test/sections/part_03.exs", __DIR__)
-Code.require_file("flow_test/sections/part_04.exs", __DIR__)
-Code.require_file("flow_test/sections/part_05.exs", __DIR__)
-Code.require_file("flow_test/sections/part_06.exs", __DIR__)
-Code.require_file("flow_test/sections/part_07.exs", __DIR__)
-Code.require_file("flow_test/sections/part_08.exs", __DIR__)
-Code.require_file("flow_test/sections/part_09.exs", __DIR__)
-Code.require_file("flow_test/sections/part_10.exs", __DIR__)
-Code.require_file("flow_test/sections/part_11.exs", __DIR__)
-Code.require_file("flow_test/sections/part_12.exs", __DIR__)
-Code.require_file("flow_test/sections/part_13.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_internal_keys_use_compact_partition_tags.exs", __DIR__)
+Code.require_file("flow_test/sections/claim_due_multi_state_claims_earliest_due_job_instead_first_listed_state.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_create_stores_debug_lineage_metadata_indexes_it.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_spawn_children_rejects_missing_wait_state_waiting_children.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_spawn_children_wait_any_resolves_on_first_successful_child_across_s.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_native_due_index_mirrors_create_claim_due.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_claim_due_drains_higher_priorities_before_lower_priorities_default.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_policy_exposes_type_state_retry_retention_defaults.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_claim_due_automatically_reclaims_expired_leases_ratio.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_fail_many_atomically_fails_one_partition_batch.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_history_supports_range_reverse_event_worker_filters.exs", __DIR__)
+Code.require_file("flow_test/sections/flow_history_hot_max_rejects_values_above_configured_maximum.exs", __DIR__)
+Code.require_file("flow_test/sections/flushdb_clears_flow_lmdb_terminal_projections.exs", __DIR__)
 
 defmodule Ferricstore.FlowTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 
@@ -435,19 +437,19 @@ defmodule Ferricstore.FlowTest do
     claimed
   end
 
-  use Ferricstore.FlowTest.Sections.Part01
-  use Ferricstore.FlowTest.Sections.Part02
-  use Ferricstore.FlowTest.Sections.Part03
-  use Ferricstore.FlowTest.Sections.Part04
-  use Ferricstore.FlowTest.Sections.Part05
-  use Ferricstore.FlowTest.Sections.Part06
-  use Ferricstore.FlowTest.Sections.Part07
-  use Ferricstore.FlowTest.Sections.Part08
-  use Ferricstore.FlowTest.Sections.Part09
-  use Ferricstore.FlowTest.Sections.Part10
-  use Ferricstore.FlowTest.Sections.Part11
-  use Ferricstore.FlowTest.Sections.Part12
-  use Ferricstore.FlowTest.Sections.Part13
+  use Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags
+  use Ferricstore.FlowTest.Sections.ClaimDueMultiStateClaimsEarliestDueJobInsteadFirstListedState
+  use Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataIndexesIt
+  use Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitStateWaitingChildren
+  use Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstSuccessfulChildAcrossS
+  use Ferricstore.FlowTest.Sections.FlowNativeDueIndexMirrorsCreateClaimDue
+  use Ferricstore.FlowTest.Sections.FlowClaimDueDrainsHigherPrioritiesBeforeLowerPrioritiesDefault
+  use Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetentionDefaults
+  use Ferricstore.FlowTest.Sections.FlowClaimDueAutomaticallyReclaimsExpiredLeasesRatio
+  use Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionBatch
+  use Ferricstore.FlowTest.Sections.FlowHistorySupportsRangeReverseEventWorkerFilters
+  use Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfiguredMaximum
+  use Ferricstore.FlowTest.Sections.FlushdbClearsFlowLmdbTerminalProjections
 
 defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)

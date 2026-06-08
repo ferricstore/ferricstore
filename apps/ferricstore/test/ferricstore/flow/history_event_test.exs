@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.HistoryEventTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.HistoryEvent
 

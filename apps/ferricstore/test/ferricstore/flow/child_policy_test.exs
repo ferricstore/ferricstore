@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.ChildPolicyTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.ChildPolicy
 

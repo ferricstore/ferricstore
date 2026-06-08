@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

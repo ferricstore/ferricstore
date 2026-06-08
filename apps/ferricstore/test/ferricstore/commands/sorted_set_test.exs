@@ -1,5 +1,5 @@
-Code.require_file("sorted_set_test/sections/part_01.exs", __DIR__)
-Code.require_file("sorted_set_test/sections/part_02.exs", __DIR__)
+Code.require_file("sorted_set_test/sections/zadd.exs", __DIR__)
+Code.require_file("sorted_set_test/sections/zpopmin.exs", __DIR__)
 
 defmodule Ferricstore.Commands.SortedSetTest do
   @moduledoc false
@@ -13,9 +13,9 @@ defmodule Ferricstore.Commands.SortedSetTest do
   # ZADD
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Commands.SortedSetTest.Sections.Part01
+  use Ferricstore.Commands.SortedSetTest.Sections.Zadd
 
-  use Ferricstore.Commands.SortedSetTest.Sections.Part02
+  use Ferricstore.Commands.SortedSetTest.Sections.Zpopmin
 
   defp collect_zscan_members(store, key, cursor, count) do
     collect_zscan_members(store, key, cursor, count, [])

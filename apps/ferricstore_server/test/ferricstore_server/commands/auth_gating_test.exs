@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Commands.AuthGatingTest do
   authenticates.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Config
   alias Ferricstore.Store.Router

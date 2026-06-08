@@ -6,6 +6,7 @@ defmodule FerricstoreServer.InfoKeyspaceExpiryTest do
   TTL set, and a reasonable avg_ttl value, rather than hardcoded zeros.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

@@ -1,6 +1,6 @@
-Code.require_file("tdigest_test/sections/part_01.exs", __DIR__)
-Code.require_file("tdigest_test/sections/part_02.exs", __DIR__)
-Code.require_file("tdigest_test/sections/part_03.exs", __DIR__)
+Code.require_file("tdigest_test/sections/tdigest_create.exs", __DIR__)
+Code.require_file("tdigest_test/sections/tdigest_cdf.exs", __DIR__)
+Code.require_file("tdigest_test/sections/stress_tests.exs", __DIR__)
 
 defmodule Ferricstore.Commands.TDigestTest do
   @moduledoc """
@@ -33,9 +33,9 @@ defmodule Ferricstore.Commands.TDigestTest do
   # 1. TDIGEST.CREATE
   # ===========================================================================
 
-  use Ferricstore.Commands.TDigestTest.Sections.Part01
-  use Ferricstore.Commands.TDigestTest.Sections.Part02
-  use Ferricstore.Commands.TDigestTest.Sections.Part03
+  use Ferricstore.Commands.TDigestTest.Sections.TdigestCreate
+  use Ferricstore.Commands.TDigestTest.Sections.TdigestCdf
+  use Ferricstore.Commands.TDigestTest.Sections.StressTests
 
 defp parse_float_str("nan"), do: :nan
   defp parse_float_str("inf"), do: :infinity

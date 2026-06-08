@@ -1,5 +1,5 @@
-Code.require_file("bitmap_test/sections/part_01.exs", __DIR__)
-Code.require_file("bitmap_test/sections/part_02.exs", __DIR__)
+Code.require_file("bitmap_test/sections/setbit.exs", __DIR__)
+Code.require_file("bitmap_test/sections/bitop_xor.exs", __DIR__)
 
 defmodule Ferricstore.Commands.BitmapTest do
   @moduledoc false
@@ -17,7 +17,7 @@ defmodule Ferricstore.Commands.BitmapTest do
   # SETBIT
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Commands.BitmapTest.Sections.Part01
+  use Ferricstore.Commands.BitmapTest.Sections.Setbit
 
-  use Ferricstore.Commands.BitmapTest.Sections.Part02
+  use Ferricstore.Commands.BitmapTest.Sections.BitopXor
 end

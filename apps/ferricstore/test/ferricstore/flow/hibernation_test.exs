@@ -1,5 +1,7 @@
 defmodule Ferricstore.Flow.HibernationTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   alias Ferricstore.Flow.{Hibernation, Locator}
 

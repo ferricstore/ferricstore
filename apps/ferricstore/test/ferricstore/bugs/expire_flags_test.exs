@@ -10,6 +10,7 @@ defmodule Ferricstore.Bugs.ExpireFlagsTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag timeout: 30_000
 
   alias Ferricstore.Commands.Expiry

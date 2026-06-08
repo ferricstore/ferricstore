@@ -1,6 +1,7 @@
 defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   @moduledoc false
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   test "state-machine command stores expose compound batch reads" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()

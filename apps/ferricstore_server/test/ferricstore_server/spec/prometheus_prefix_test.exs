@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
   alias Ferricstore.Metrics

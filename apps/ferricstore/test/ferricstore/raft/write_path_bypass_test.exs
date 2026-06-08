@@ -13,6 +13,8 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :raft
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

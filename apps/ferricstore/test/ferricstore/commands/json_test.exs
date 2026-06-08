@@ -1,5 +1,5 @@
-Code.require_file("json_test/sections/part_01.exs", __DIR__)
-Code.require_file("json_test/sections/part_02.exs", __DIR__)
+Code.require_file("json_test/sections/json_set.exs", __DIR__)
+Code.require_file("json_test/sections/json_clear.exs", __DIR__)
 defmodule Ferricstore.Commands.JsonTest do
   @moduledoc false
   use ExUnit.Case, async: true
@@ -14,9 +14,9 @@ defmodule Ferricstore.Commands.JsonTest do
 
   # Stores a JSON document and returns the store.
 
-  use Ferricstore.Commands.JsonTest.Sections.Part01
+  use Ferricstore.Commands.JsonTest.Sections.JsonSet
 
-  use Ferricstore.Commands.JsonTest.Sections.Part02
+  use Ferricstore.Commands.JsonTest.Sections.JsonClear
 
   defp store_with_json(key \\ "doc", json_value) do
     store = MockStore.make()

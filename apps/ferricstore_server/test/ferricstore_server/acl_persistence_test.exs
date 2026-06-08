@@ -1,5 +1,5 @@
-Code.require_file("acl_persistence_test/sections/part_01.exs", __DIR__)
-Code.require_file("acl_persistence_test/sections/part_02.exs", __DIR__)
+Code.require_file("acl_persistence_test/sections/save_1_basic.exs", __DIR__)
+Code.require_file("acl_persistence_test/sections/read_only_filesystem.exs", __DIR__)
 defmodule FerricstoreServer.AclPersistenceTest do
   @moduledoc """
   Tests for ACL file persistence: SAVE, LOAD, auto-load on startup,
@@ -11,6 +11,8 @@ defmodule FerricstoreServer.AclPersistenceTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :acl
+  @moduletag :global_state
 
   alias FerricstoreServer.Acl
 
@@ -27,9 +29,9 @@ defmodule FerricstoreServer.AclPersistenceTest do
     %{tmp_dir: tmp_dir}
   end
 
-  use FerricstoreServer.AclPersistenceTest.Sections.Part01
+  use FerricstoreServer.AclPersistenceTest.Sections.Save1Basic
 
-  use FerricstoreServer.AclPersistenceTest.Sections.Part02
+  use FerricstoreServer.AclPersistenceTest.Sections.ReadOnlyFilesystem
 
   defp eventually(fun, msg, attempts \\ 100) do
     if fun.() do

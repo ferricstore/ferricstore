@@ -11,6 +11,8 @@ defmodule FerricstoreServer.AclTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :acl
+  @moduletag :global_state
 
   alias FerricstoreServer.Acl
 

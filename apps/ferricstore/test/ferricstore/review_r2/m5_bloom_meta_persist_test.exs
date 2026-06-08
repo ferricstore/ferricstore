@@ -4,6 +4,7 @@ defmodule Ferricstore.ReviewR2.M5BloomMetaPersistTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Bloom
   alias Ferricstore.Test.ShardHelpers

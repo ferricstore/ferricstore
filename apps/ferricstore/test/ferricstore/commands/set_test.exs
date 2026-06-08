@@ -1,5 +1,5 @@
-Code.require_file("set_test/sections/part_01.exs", __DIR__)
-Code.require_file("set_test/sections/part_02.exs", __DIR__)
+Code.require_file("set_test/sections/sadd.exs", __DIR__)
+Code.require_file("set_test/sections/srandmember.exs", __DIR__)
 
 defmodule Ferricstore.Commands.SetTest do
   @moduledoc false
@@ -13,9 +13,9 @@ defmodule Ferricstore.Commands.SetTest do
   # SADD
   # ---------------------------------------------------------------------------
 
-  use Ferricstore.Commands.SetTest.Sections.Part01
+  use Ferricstore.Commands.SetTest.Sections.Sadd
 
-  use Ferricstore.Commands.SetTest.Sections.Part02
+  use Ferricstore.Commands.SetTest.Sections.Srandmember
 
   defp collect_sscan_members(store, key, cursor, count) do
     collect_sscan_members(store, key, cursor, count, [])

@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.BlobCommandTest do
   use ExUnit.Case, async: true
+  @moduletag :raft
 
   alias Ferricstore.Raft.BlobCommand
   alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey}

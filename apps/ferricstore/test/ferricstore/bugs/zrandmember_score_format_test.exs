@@ -10,6 +10,7 @@ defmodule Ferricstore.Bugs.ZrandmemberScoreFormatTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
   @moduletag timeout: 30_000
 
   alias Ferricstore.Commands.SortedSet

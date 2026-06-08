@@ -11,6 +11,7 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
   alias Ferricstore.Bitcask.NIF

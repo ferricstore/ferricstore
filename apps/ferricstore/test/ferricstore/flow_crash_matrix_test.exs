@@ -1,5 +1,7 @@
 defmodule Ferricstore.FlowCrashMatrixTest do
   use ExUnit.Case, async: false
+  @moduletag :flow
+  @moduletag :global_state
 
   @moduletag :crash_matrix
   @moduletag timeout: 240_000

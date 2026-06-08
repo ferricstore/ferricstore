@@ -7,6 +7,7 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
   SET EXAT/PXAT/GET/KEEPTTL options.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()

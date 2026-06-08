@@ -1,5 +1,5 @@
-Code.require_file("sendfile_test/sections/part_01.exs", __DIR__)
-Code.require_file("sendfile_test/sections/part_02.exs", __DIR__)
+Code.require_file("sendfile_test/sections/encrypted_file_ref_response_streams_bounded_chunks_instead_one_large_bin.exs", __DIR__)
+Code.require_file("sendfile_test/sections/sandboxed_mixed_get_set_pipeline_validates_stream_refs_internal_lookup_k.exs", __DIR__)
 
 defmodule FerricstoreServer.Connection.SendfileTest do
   use ExUnit.Case, async: false
@@ -44,9 +44,9 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     {:ok, ctx: ctx}
   end
 
-  use FerricstoreServer.Connection.SendfileTest.Sections.Part01
+  use FerricstoreServer.Connection.SendfileTest.Sections.EncryptedFileRefResponseStreamsBoundedChunksInsteadOneLargeBin
 
-  use FerricstoreServer.Connection.SendfileTest.Sections.Part02
+  use FerricstoreServer.Connection.SendfileTest.Sections.SandboxedMixedGetSetPipelineValidatesStreamRefsInternalLookupK
 
   defp tcp_pair do
     {:ok, listen} =

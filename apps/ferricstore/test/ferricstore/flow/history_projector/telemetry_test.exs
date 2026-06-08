@@ -1,5 +1,6 @@
 defmodule Ferricstore.Flow.HistoryProjector.TelemetryTest do
   use ExUnit.Case, async: true
+  @moduletag :flow
 
   alias Ferricstore.Flow.HistoryProjector.Telemetry
 

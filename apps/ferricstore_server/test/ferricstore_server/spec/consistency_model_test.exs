@@ -14,6 +14,7 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser

@@ -9,6 +9,7 @@ defmodule Ferricstore.Review.M2WarmCacheBypassTest do
   with large binaries that should stay cold.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

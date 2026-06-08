@@ -5,6 +5,7 @@ defmodule Ferricstore.WritePathSetOptionsTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

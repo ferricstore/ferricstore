@@ -1,5 +1,6 @@
-Code.require_file("resp_edge_cases_test/sections/part_01.exs", __DIR__)
-Code.require_file("resp_edge_cases_test/sections/part_02.exs", __DIR__)
+Code.require_file("resp_edge_cases_test/sections/parser_bulk_string_embedded_crlf_sequences.exs", __DIR__)
+Code.require_file("resp_edge_cases_test/sections/encoder_float_edge_cases.exs", __DIR__)
+
 defmodule FerricstoreServer.Resp.RespEdgeCasesTest do
   @moduledoc """
   Comprehensive edge case tests for the RESP3 parser and encoder.
@@ -16,9 +17,9 @@ defmodule FerricstoreServer.Resp.RespEdgeCasesTest do
 
   # Helper to flatten iodata for assertion
 
-  use FerricstoreServer.Resp.RespEdgeCasesTest.Sections.Part01
+  use FerricstoreServer.Resp.RespEdgeCasesTest.Sections.ParserBulkStringEmbeddedCrlfSequences
 
-  use FerricstoreServer.Resp.RespEdgeCasesTest.Sections.Part02
+  use FerricstoreServer.Resp.RespEdgeCasesTest.Sections.EncoderFloatEdgeCases
 
   defp to_bin(iodata), do: IO.iodata_to_binary(iodata)
 

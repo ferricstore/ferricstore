@@ -9,6 +9,7 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
 

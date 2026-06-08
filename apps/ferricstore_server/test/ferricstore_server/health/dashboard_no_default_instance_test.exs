@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Health.DashboardNoDefaultInstanceTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  @moduletag :dashboard
 
   alias FerricstoreServer.Health.Dashboard
 

@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Integration.DataStructuresTcpTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser

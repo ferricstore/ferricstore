@@ -1,6 +1,7 @@
 defmodule Ferricstore.NamespaceConfigTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Commands.Namespace

@@ -3,6 +3,7 @@ defmodule Ferricstore.Store.ShardETSTest do
   # Cold-read warming consults the global MemoryGuard skip-promotion flag, so
   # these tests must not race modules that intentionally force memory pressure.
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.CompoundKey

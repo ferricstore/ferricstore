@@ -16,6 +16,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   # These tests do GenServer.call to shards/batchers which can be slow
   # on CI if ra needs to recover. Give 60s per test instead of 30s.

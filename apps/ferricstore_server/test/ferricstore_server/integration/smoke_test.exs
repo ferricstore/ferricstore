@@ -17,6 +17,7 @@ defmodule FerricstoreServer.Integration.SmokeTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

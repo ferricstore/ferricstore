@@ -5,6 +5,7 @@ defmodule Ferricstore.EmbeddedExtendedSetTest do
   Covers: smismember, srandmember, spop, sdiff, sinter, sunion.
   """
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
