@@ -33,6 +33,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   alias FerricstoreServer.Health.Dashboard.Data.{KV, Operational}
   alias FerricstoreServer.Health.Dashboard.LivePayload
   alias FerricstoreServer.Health.Dashboard.Templates
+  alias FerricstoreServer.Health.Dashboard.Types
 
   alias FerricstoreServer.Health.Dashboard.Flow.{
     Browse,
@@ -49,145 +50,13 @@ defmodule FerricstoreServer.Health.Dashboard do
   import FerricstoreServer.Health.Dashboard.Flow.Sample
 
   # ---------------------------------------------------------------------------
-  # Types
-  @typedoc "Dashboard data map containing all sections."
-  @type dashboard_data :: %{
-          overview: overview_data(),
-          shards: [shard_data()],
-          hotcold: hotcold_data(),
-          memory: memory_data(),
-          connections: connections_data(),
-          slowlog: [slowlog_entry()],
-          merge: [merge_status()],
-          namespace_config: [Ferricstore.NamespaceConfig.ns_entry()],
-          cluster: cluster_data()
-        }
-
-  @typedoc "Overview section data."
-  @type overview_data :: %{
-          status: :ok | :starting,
-          uptime_seconds: non_neg_integer(),
-          total_keys: non_neg_integer(),
-          total_commands: non_neg_integer(),
-          total_connections: non_neg_integer(),
-          memory_bytes: non_neg_integer(),
-          run_id: binary()
-        }
-
-  @typedoc "Per-shard status data."
-  @type shard_data :: %{
-          index: non_neg_integer(),
-          status: String.t(),
-          keys: non_neg_integer(),
-          ets_memory_bytes: non_neg_integer()
-        }
-
-  @typedoc "Hot/cold read metrics."
-  @type hotcold_data :: %{
-          hot_read_pct: float(),
-          cold_reads_per_sec: float(),
-          total_hot: non_neg_integer(),
-          total_cold: non_neg_integer(),
-          top_prefixes: [Ferricstore.Stats.hotness_entry()]
-        }
-
-  @typedoc "Memory pressure data."
-  @type memory_data :: %{
-          total_bytes: non_neg_integer(),
-          max_bytes: non_neg_integer(),
-          ratio: float(),
-          pressure_level: Ferricstore.MemoryGuard.pressure_level(),
-          eviction_policy: atom(),
-          shards: %{non_neg_integer() => %{bytes: non_neg_integer(), ratio: float()}}
-        }
-
-  @typedoc "Connection metrics."
-  @type connections_data :: %{
-          active: non_neg_integer(),
-          blocked: non_neg_integer(),
-          tracking: non_neg_integer()
-        }
-
-  @typedoc "A single slowlog entry for display."
-  @type slowlog_entry :: %{
-          id: non_neg_integer(),
-          timestamp_us: integer(),
-          duration_us: non_neg_integer(),
-          command: [binary()]
-        }
-
-  @typedoc "Merge scheduler status for one shard."
-  @type merge_status :: %{
-          shard_index: non_neg_integer(),
-          mode: atom(),
-          merging: boolean(),
-          last_merge_at: integer() | nil,
-          merge_count: non_neg_integer(),
-          total_bytes_reclaimed: non_neg_integer()
-        }
-
-  @typedoc "Cluster topology data."
-  @type cluster_data :: %{
-          node_name: atom(),
-          cluster_mode: :standalone | :cluster,
-          cluster_size: non_neg_integer(),
-          nodes: [atom()]
-        }
-
-  @typedoc "Per-shard Raft consensus data."
-  @type raft_shard_data :: %{
-          shard: non_neg_integer(),
-          status: :ok | :unavailable,
-          leader: tuple() | nil,
-          current_term: non_neg_integer(),
-          commit_index: non_neg_integer(),
-          last_applied: non_neg_integer(),
-          log_size: non_neg_integer(),
-          members: [tuple()]
-        }
-
-  @typedoc "Active client connection data."
-  @type client_data :: %{
-          optional(:client_id) => pos_integer(),
-          optional(:client_name) => binary() | nil,
-          optional(:username) => binary() | nil,
-          pid: pid(),
-          peer: String.t(),
-          age_seconds: non_neg_integer(),
-          flags: String.t()
-        }
-
-  @typedoc "Configuration command reference row."
-  @type config_command_entry :: %{
-          command: binary(),
-          scope: binary(),
-          mutability: binary(),
-          notes: binary()
-        }
-
-  @typedoc "Configuration parameter reference row."
-  @type config_parameter_entry :: %{
-          parameter: binary(),
-          scope: binary(),
-          mutability: binary(),
-          notes: binary()
-        }
-
-  @typedoc "Configuration dashboard page data."
-  @type config_page_data :: %{
-          namespace_config: [Ferricstore.NamespaceConfig.ns_entry()],
-          config_commands: [config_command_entry()],
-          config_parameters: [config_parameter_entry()]
-        }
-
-  # ---------------------------------------------------------------------------
   # Public API -- Main Dashboard
   # ---------------------------------------------------------------------------
 
   @doc """
   Collects all dashboard data from running subsystems.
   """
-  @spec collect() :: dashboard_data()
+  @spec collect() :: Types.dashboard_data()
   def collect do
     Operational.collect_dashboard(collect_flow_summary())
   end
@@ -195,7 +64,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Renders the main dashboard page as a complete HTML document.
   """
-  @spec render(dashboard_data()) :: binary()
+  @spec render(Types.dashboard_data()) :: binary()
   def render(data) do
     render_template(Templates.overview(%{data: data}))
   end
@@ -207,7 +76,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   browser patches only components whose HTML changed, preserving scroll,
   selected text, and browser paint state.
   """
-  @spec live_overview_payload(dashboard_data()) :: map()
+  @spec live_overview_payload(Types.dashboard_data()) :: map()
   def live_overview_payload(data), do: LivePayload.overview_payload(data)
 
   # ---------------------------------------------------------------------------
@@ -217,7 +86,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Collects data for the slow log sub-page.
   """
-  @spec collect_slowlog_page() :: %{slowlog: [slowlog_entry()]}
+  @spec collect_slowlog_page() :: %{slowlog: [Types.slowlog_entry()]}
   def collect_slowlog_page do
     Operational.collect_slowlog_page()
   end
@@ -225,7 +94,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Renders the slow log sub-page.
   """
-  @spec render_slowlog_page(%{slowlog: [slowlog_entry()]}) :: binary()
+  @spec render_slowlog_page(%{slowlog: [Types.slowlog_entry()]}) :: binary()
   def render_slowlog_page(data) do
     render_template(Templates.slowlog(%{data: data}))
   end
@@ -237,7 +106,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Collects data for the merge status sub-page.
   """
-  @spec collect_merge_page() :: %{merge: [merge_status()]}
+  @spec collect_merge_page() :: %{merge: [Types.merge_status()]}
   def collect_merge_page do
     Operational.collect_merge_page()
   end
@@ -245,7 +114,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Renders the merge status sub-page.
   """
-  @spec render_merge_page(%{merge: [merge_status()]}) :: binary()
+  @spec render_merge_page(%{merge: [Types.merge_status()]}) :: binary()
   def render_merge_page(data) do
     render_template(Templates.merge(%{data: data}))
   end
@@ -257,7 +126,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Collects data for the namespace config sub-page.
   """
-  @spec collect_config_page() :: config_page_data()
+  @spec collect_config_page() :: Types.config_page_data()
   def collect_config_page do
     Operational.collect_config_page()
   end
@@ -265,7 +134,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Renders the namespace config sub-page (no auto-refresh).
   """
-  @spec render_config_page(config_page_data() | map()) :: binary()
+  @spec render_config_page(Types.config_page_data() | map()) :: binary()
   def render_config_page(data) do
     render_template(Templates.config(%{data: data}))
   end
@@ -277,7 +146,10 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Collects data for the Raft consensus sub-page.
   """
-  @spec collect_raft_page() :: %{raft_shards: [raft_shard_data()], cluster: cluster_data()}
+  @spec collect_raft_page() :: %{
+          raft_shards: [Types.raft_shard_data()],
+          cluster: Types.cluster_data()
+        }
   def collect_raft_page do
     Operational.collect_raft_page()
   end
@@ -285,7 +157,10 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Renders the Raft consensus sub-page.
   """
-  @spec render_raft_page(%{raft_shards: [raft_shard_data()], cluster: cluster_data()}) :: binary()
+  @spec render_raft_page(%{
+          raft_shards: [Types.raft_shard_data()],
+          cluster: Types.cluster_data()
+        }) :: binary()
   def render_raft_page(data) do
     render_template(Templates.raft(%{data: data}))
   end
@@ -297,7 +172,10 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Collects data for the client list sub-page.
   """
-  @spec collect_clients_page() :: %{clients: [client_data()], connections: connections_data()}
+  @spec collect_clients_page() :: %{
+          clients: [Types.client_data()],
+          connections: Types.connections_data()
+        }
   def collect_clients_page do
     Operational.collect_clients_page()
   end
@@ -305,7 +183,10 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Renders the client list sub-page.
   """
-  @spec render_clients_page(%{clients: [client_data()], connections: connections_data()}) ::
+  @spec render_clients_page(%{
+          clients: [Types.client_data()],
+          connections: Types.connections_data()
+        }) ::
           binary()
   def render_clients_page(data) do
     render_template(Templates.clients(%{data: data}))
