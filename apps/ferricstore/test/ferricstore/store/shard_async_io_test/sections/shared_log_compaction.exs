@@ -221,12 +221,25 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
         end
 
         test "drains deferred BitcaskWriter writes before selecting compacted records" do
-          source = shard_source()
+          source = Ferricstore.Test.SourceFiles.shard_source()
+
+          [_before, run_compaction_section] =
+            String.split(
+              source,
+              "def handle_call({:run_compaction, file_ids}, _from, state) do",
+              parts: 2
+            )
+
+          [run_compaction_body | _after] =
+            Regex.split(~r/^\s*def handle_call/ms, run_compaction_section, parts: 2)
 
           flush_pos =
-            :binary.match(source, "BitcaskWriter.flush(state.instance_ctx, state.index)")
+            :binary.match(
+              run_compaction_body,
+              "BitcaskWriter.flush(state.instance_ctx, state.index)"
+            )
 
-          reduce_pos = :binary.match(source, "Enum.reduce(file_ids")
+          reduce_pos = :binary.match(run_compaction_body, "Enum.reduce(file_ids")
 
           assert {flush_offset, _} = flush_pos
           assert {reduce_offset, _} = reduce_pos

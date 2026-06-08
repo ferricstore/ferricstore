@@ -227,10 +227,11 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow transition due-index moves cache repeated batch keys" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [function_source] =
-      Regex.run(
-        ~r/defp flow_transition_move_due_indexes_nonempty\(state, plans\).*?^  end/ms,
-        source
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_transition_move_due_indexes_nonempty",
+        "from_due_cache"
       )
 
     assert function_source =~ "from_due_cache"
@@ -243,10 +244,11 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow claim_due native multi-key path does not sort due keys before the NIF scan" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [function_source] =
-      Regex.run(
-        ~r/defp flow_claim_due_scan_keys\(\n         state,\n         due_keys,.*?^  end/ms,
-        source
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_scan_keys_native_multi_loop",
+        "NativeFlowIndex.claim_due_candidates"
       )
 
     refute function_source =~ "Enum.sort",
@@ -258,8 +260,8 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     assert source =~ "@flow_max_key_size 65_535"
 
-    [function_source] =
-      Regex.run(~r/defp flow_validate_key_size\(key\).*?^  end/ms, source)
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "flow_validate_key_size")
 
     assert function_source =~ "@flow_max_key_size"
 
@@ -270,8 +272,11 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow small values skip blob externalization dispatch on apply hot path" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [function_source] =
-      Regex.run(~r/defp maybe_externalize_apply_value\(state, value\).*?^  end/ms, source)
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "maybe_externalize_apply_value"
+      )
 
     assert function_source =~ "flow_inline_blob_value?(threshold, value)"
 
@@ -294,19 +299,21 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert state_machine_source =~ "flow_attrs_same_stamped_shard?"
     assert state_machine_source =~ "flow_key_infos_same_stamped_shard?"
 
-    [attrs_check_source] =
-      Regex.run(
-        ~r/defp flow_many_same_state_machine_shard\?\(.*?^  defp flow_many_same_state_machine_shard\?\(_state, _attrs_list, _stamped_shard\)/ms,
-        state_machine_source
+    attrs_check_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_many_same_state_machine_shard?",
+        "Router.shard_for(ctx, key)"
       )
 
     assert attrs_check_source =~ "flow_attrs_same_stamped_shard?"
     assert attrs_check_source =~ "Router.shard_for(ctx, key)"
 
-    [key_info_check_source] =
-      Regex.run(
-        ~r/defp flow_many_same_state_machine_shard_by_keys\?\(.*?^  defp flow_many_same_state_machine_shard_by_keys\?\(_state, _key_infos\)/ms,
-        state_machine_source
+    key_info_check_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_many_same_state_machine_shard_by_keys?",
+        "Router.shard_for(ctx, key)"
       )
 
     assert key_info_check_source =~ "flow_key_infos_same_stamped_shard?"
@@ -319,18 +326,20 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert source =~
              "flow_many_partitions_valid?(state, attrs_list, Map.get(attrs, @flow_shard_marker))"
 
-    [valid_source] =
-      Regex.run(
-        ~r/defp flow_many_partitions_valid\?\(state, attrs_list, stamped_shard\).*?^  defp flow_many_partition_keys_present/ms,
-        source
+    valid_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_many_partitions_valid?",
+        "flow_many_same_state_machine_shard?"
       )
 
     assert valid_source =~ "flow_many_same_state_machine_shard?(state, attrs_list, stamped_shard)"
 
-    [same_shard_source] =
-      Regex.run(
-        ~r/defp flow_many_same_state_machine_shard\?\(\n         %\{instance_ctx: ctx, shard_index: shard_index\},\n         attrs_list,\n         stamped_shard\n       \).*?^  defp flow_many_same_state_machine_shard\?\(_state, _attrs_list, _stamped_shard\)/ms,
-        source
+    same_shard_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_many_same_state_machine_shard?",
+        "stamped_shard == shard_index"
       )
 
     assert same_shard_source =~ "stamped_shard == shard_index"
@@ -356,10 +365,11 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow claim_due fast index path avoids generic per-plan tuple dispatch" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [function_source] =
-      Regex.run(
-        ~r/defp flow_claim_fast_index_entries\(_state, plans\).*?^  defp flow_claim_cached_due_index_key/ms,
-        source
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_fast_index_entries",
+        "flow_claim_fast_index_entries_loop(plans,"
       )
 
     assert function_source =~ "flow_claim_fast_index_entries_loop(plans,"
@@ -380,15 +390,20 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow terminal transition caches repeated lifecycle index keys" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [state_index_source] =
-      Regex.run(~r/defp flow_transition_move_state_indexes\(state, plans\).*?^  end/ms, source)
+    state_index_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_transition_move_state_indexes",
+        "flow_claim_cached_state_index_key"
+      )
 
     assert state_index_source =~ "flow_claim_cached_state_index_key"
 
-    [delete_source] =
-      Regex.run(
-        ~r/defp flow_transition_delete_old_secondary_indexes\(state, plans\).*?^  defp flow_transition_put_new_running_indexes/ms,
-        source
+    delete_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_transition_delete_old_secondary_indexes",
+        "flow_claim_cached_worker_index_key"
       )
 
     assert delete_source =~ "flow_claim_cached_inflight_index_key"
@@ -461,17 +476,17 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert source =~ "flow_create_projection_entries_and_records("
     assert source =~ "queue_pending_flow_history_projections_batch(projection_entries)"
 
-    [function_source] =
-      Regex.run(~r/defp flow_many_put_history\(state, plans, event\).*?^  end/ms, source)
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "flow_many_put_history")
 
     refute function_source =~ "flow_history_put_ready_entry(",
            "transition/complete/fail/cancel batches should not Process.get/put the pending history queue once per event"
 
-    [function_source] =
-      Regex.run(~r/defp flow_create_put_history\(state, records\).*?^  end/ms, source)
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "flow_create_put_history")
 
     assert [async_create_source, _sync_fallback_source] =
-             String.split(function_source, "\n    else\n", parts: 2)
+             Regex.split(~r/\n\s+else\n/, function_source, parts: 2)
 
     refute async_create_source =~ "flow_history_put_ready_entry(",
            "create_many should queue async history projections in one batch instead of one Process.get/put per event"
@@ -562,11 +577,8 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow native claim key construction validates generated keys in one fast path" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [function_source] =
-      Regex.run(
-        ~r/defp flow_native_claim_keys\(due_key, type, state_filter, worker\).*?^  end/ms,
-        source
-      )
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "flow_native_claim_keys")
 
     assert function_source =~ "flow_validate_native_claim_key_sizes("
 
@@ -577,10 +589,11 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow native claim hydration reuses precomputed state-key prefix" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [function_source] =
-      Regex.run(
-        ~r/defp flow_plan_claim_candidates_native\(\n         state,.*?^  defp flow_plan_claim_candidates_native\(\n         _state,/ms,
-        source
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_plan_claim_candidates_native",
+        "state_key_prefix"
       )
 
     assert function_source =~ "flow_read_claim_candidate_hot_values("
@@ -605,11 +618,8 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "flow blob-ref writes compute initial LFU once per value" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [function_source] =
-      Regex.run(
-        ~r/defp raw_put_flow_blob_ref\(state, key, encoded_ref, expire_at_ms\).*?^  end/ms,
-        source
-      )
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "raw_put_flow_blob_ref")
 
     assert function_source =~ "lfu = LFU.initial()"
 

@@ -659,7 +659,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
 
         assert source =~ "previous = :ets.lookup(shard_state.keydir, key)"
         assert source =~ "segment_project_clear_compound_for_string_put(sm_state, key, previous)"
-        assert source =~ "previous\n      )"
+
+        assert Regex.match?(
+                 ~r/ShardETS\.ets_insert_with_location\(\s*shard_state,.*?previous,\s*threshold\s*\)/s,
+                 source
+               )
       end
 
       test "unified segment put_batch validates and applies entries in one pass" do

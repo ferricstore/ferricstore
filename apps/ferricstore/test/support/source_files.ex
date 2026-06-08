@@ -206,6 +206,24 @@ defmodule Ferricstore.Test.SourceFiles do
     joined_source(@state_machine_sources)
   end
 
+  def private_function_sources(source, function) do
+    pattern = ~r/^\s*defp\s+#{Regex.escape(function)}(?=[\s(]).*?(?=^\s*defp\s+|\z)/ms
+
+    pattern
+    |> Regex.scan(source)
+    |> List.flatten()
+  end
+
+  def private_function_source!(source, function, contains \\ nil) do
+    source
+    |> private_function_sources(function)
+    |> Enum.find(fn body -> is_nil(contains) or String.contains?(body, contains) end)
+    |> case do
+      nil -> raise "could not find private function #{function} containing #{inspect(contains)}"
+      body -> body
+    end
+  end
+
   defp joined_source(paths) do
     Enum.map_join(paths, "\n", fn path ->
       path

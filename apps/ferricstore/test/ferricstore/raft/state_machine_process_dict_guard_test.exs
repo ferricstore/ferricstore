@@ -5,11 +5,8 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   test "apply entry clears consolidated apply process state" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [_match, body] =
-      Regex.run(
-        ~r/(defp clear_stale_pending_state do.*?)(?=\n  defp apply_now_ms)/s,
-        source
-      )
+    body =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "clear_stale_pending_state")
 
     assert body =~ "Process.delete(@sm_apply_state_key)",
            "stale consolidated apply state can release a Ra cursor after a crashed apply"
@@ -30,11 +27,8 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   test "pending write apply state declares and clears one key set" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [_match, with_pending_body] =
-      Regex.run(
-        ~r/(defp with_pending_writes\(state, fun\) do.*?)(?=\n  defp pending_write_error_result\?)/s,
-        source
-      )
+    with_pending_body =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "with_pending_writes")
 
     assert source =~ "@sm_pending_write_keys"
     assert with_pending_body =~ "init_pending_write_process_state(state)"
@@ -60,20 +54,21 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
     assert source =~ "defp apply_delete_batch_keys_fast",
            "delete_batch should have a dedicated pure-delete fast path"
 
-    [_match, fast_body] =
-      Regex.run(
-        ~r/(defp apply_delete_batch_keys_fast\(state, keys\) do.*?)(?=\n  defp maybe_prepare_delete_batch_fast)/s,
-        source
+    fast_body =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "apply_delete_batch_keys_fast"
       )
 
     assert fast_body =~ "queue_pending_delete_fast"
     refute fast_body =~ "do_delete("
 
-    [_before_publish, publish_section] =
-      String.split(source, "defp apply_fast_delete_pending_locations(\n         state,", parts: 2)
-
-    [publish_body | _after_publish] =
-      String.split(publish_section, "\n  defp apply_pending_locations", parts: 2)
+    publish_body =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "apply_fast_delete_pending_locations",
+        ":ets.delete(state.ets, key)"
+      )
 
     assert publish_body =~ ":ets.delete(state.ets, key)"
     assert publish_body =~ "maybe_queue_lmdb_state_delete_after_publish(state, key)"
@@ -82,10 +77,11 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
   test "no-meta apply path clears consolidated apply process state" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    [_match, body] =
-      Regex.run(
-        ~r/(defp maybe_release_cursor\(_meta, _old_count, state, result\) do.*?)(?=\n  defp release_cursor_effects)/s,
-        source
+    body =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "maybe_release_cursor",
+        "Process.delete(@sm_apply_state_key)"
       )
 
     assert body =~ "Process.delete(@sm_apply_state_key)",
