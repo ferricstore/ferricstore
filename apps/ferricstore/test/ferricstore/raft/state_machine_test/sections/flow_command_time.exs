@@ -425,7 +425,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           [_, body] =
             Regex.run(
-              ~r/defp flow_apply_claim_batch\(state, due_key, plans, stale_due_ids, now_ms\) do(.*?)\n  end\n\n  defp flow_claim_move_indexes/s,
+              ~r/defp flow_apply_claim_batch\(state, due_key, plans, stale_due_ids, now_ms\) do(.*?)(?=^\s*defp flow_claim_move_indexes)/ms,
               source
             )
 

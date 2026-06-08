@@ -72,11 +72,15 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     # should be removed, and avoid an extra ETS prefix count on the pop path.
     assert source =~ "defp maybe_delete_empty_compound_type_key_after_pop"
 
-    assert source =~
-             "maybe_delete_empty_compound_type_key_after_pop(\n               state,\n               redis_key,\n               length(members),\n               length(selected)\n             )"
+    assert Regex.match?(
+             ~r/maybe_delete_empty_compound_type_key_after_pop\(\s*state,\s*redis_key,\s*length\(members\),\s*length\(selected\)\s*\)/,
+             source
+           )
 
-    assert source =~
-             "maybe_delete_empty_compound_type_key_after_pop(\n               state,\n               redis_key,\n               length(sorted),\n               length(selected)\n             )"
+    assert Regex.match?(
+             ~r/maybe_delete_empty_compound_type_key_after_pop\(\s*state,\s*redis_key,\s*length\(sorted\),\s*length\(selected\)\s*\)/,
+             source
+           )
 
     refute source =~
              "Enum.each(selected, fn member ->\n        do_compound_delete(state, redis_key, CompoundKey.set_member(redis_key, member))"

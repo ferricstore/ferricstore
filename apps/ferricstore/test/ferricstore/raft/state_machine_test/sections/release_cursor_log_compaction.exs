@@ -100,7 +100,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
 
           [_match, body] =
             Regex.run(
-              ~r/(defp instance_data_path\?\(.*?)(?=\n  defp initial_file_stats)/s,
+              ~r/(defp instance_data_path\?\(.*?)(?=^\s*defp initial_file_stats)/ms,
               source
             )
 
