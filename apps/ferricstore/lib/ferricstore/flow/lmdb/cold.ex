@@ -47,6 +47,13 @@ defmodule Ferricstore.Flow.LMDB.Cold do
     |> Kernel.<>(":")
   end
 
+  def due_state_bucket_prefix(bucket_ms, type, state)
+      when is_integer(bucket_ms) and bucket_ms >= 0 and is_binary(type) and is_binary(state) do
+    ["flow:due:v1", encode_u64(bucket_ms), escape_key_part(type), escape_key_part(state)]
+    |> Enum.join(":")
+    |> Kernel.<>(":")
+  end
+
   def due_claim_prefix(attrs) when is_map(attrs) or is_list(attrs) do
     attrs = Map.new(attrs)
 

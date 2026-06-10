@@ -110,6 +110,30 @@ defmodule Ferricstore.Store.Router.Part07 do
 
       defp flow_claim_due_auto_partition(ctx, attrs, start_idx, remaining, offset, acc) do
         idx = rem(start_idx + offset, ctx.shard_count)
+
+        case flow_claim_due_auto_empty_precheck(ctx, idx, attrs) do
+          :empty ->
+            flow_claim_due_auto_partition(ctx, attrs, start_idx, remaining, offset + 1, acc)
+
+          {:non_empty, cold_due_mode} ->
+            attrs
+            |> Map.put(:cold_due_mode, cold_due_mode)
+            |> flow_claim_due_auto_partition_write(ctx, idx, start_idx, remaining, offset, acc)
+
+          _unknown ->
+            flow_claim_due_auto_partition_write(
+              attrs,
+              ctx,
+              idx,
+              start_idx,
+              remaining,
+              offset,
+              acc
+            )
+        end
+      end
+
+      defp flow_claim_due_auto_partition_write(attrs, ctx, idx, start_idx, remaining, offset, acc) do
         key = "f:{flow-claim-auto-" <> Integer.to_string(idx) <> "}:d"
         shard_attrs = Map.put(attrs, :limit, remaining)
 
@@ -285,10 +309,62 @@ defmodule Ferricstore.Store.Router.Part07 do
         _kind, _reason -> :unknown
       end
 
+      defp flow_claim_due_auto_empty_precheck(ctx, idx, attrs) do
+        type = Map.fetch!(attrs, :type)
+        state = Map.get(attrs, :state)
+        priority = Map.get(attrs, :priority)
+
+        with true <- flow_claim_due_empty_precheck_allowed?(ctx, idx),
+             {:ok, due_keys} <- flow_claim_due_auto_precheck_keys(ctx, idx, type, state, priority),
+             true <- due_keys != [],
+             {:ok, native} <- direct_flow_index_read(ctx, idx, & &1) do
+          now_ms = flow_claim_due_precheck_now_ms(attrs)
+
+          case NativeFlowIndex.due_keys_present(native, due_keys, now_ms) do
+            [] ->
+              if flow_claim_due_cold_precheck_present?(
+                   ctx,
+                   idx,
+                   type,
+                   state,
+                   priority,
+                   :auto,
+                   now_ms,
+                   Map.get(attrs, :cold_due_mode)
+                 ) do
+                {:non_empty, :allow}
+              else
+                :empty
+              end
+
+            [_ | _] ->
+              {:non_empty, :skip}
+          end
+        else
+          _other -> :unknown
+        end
+      rescue
+        _error -> :unknown
+      catch
+        _kind, _reason -> :unknown
+      end
+
       defp flow_claim_due_precheck_now_ms(%{now_ms: now_ms}) when is_integer(now_ms), do: now_ms
 
       defp flow_claim_due_precheck_now_ms(_attrs),
         do: CommandTime.now_ms() + @flow_claim_due_precheck_slack_ms
+
+      defp flow_claim_due_cold_precheck_present?(
+             _ctx,
+             _idx,
+             _type,
+             "running",
+             _priority,
+             _partition_key,
+             _now_ms,
+             _cold_due_mode
+           ),
+           do: false
 
       defp flow_claim_due_cold_precheck_present?(
              ctx,
@@ -310,19 +386,16 @@ defmodule Ferricstore.Store.Router.Part07 do
           Enum.any?(states, fn claim_state ->
             Enum.any?(priorities, fn claim_priority ->
               Enum.any?(buckets, fn bucket_ms ->
-                prefix =
-                  Ferricstore.Flow.LMDB.cold_due_claim_prefix(
-                    bucket_ms: bucket_ms,
-                    type: type,
-                    state: claim_state,
-                    partition_key: partition_key,
-                    priority: claim_priority
-                  )
-
-                case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
-                  {:ok, [_ | _]} -> true
-                  _ -> false
-                end
+                flow_claim_due_cold_precheck_partition_present?(
+                  ctx,
+                  idx,
+                  path,
+                  bucket_ms,
+                  type,
+                  claim_state,
+                  claim_priority,
+                  partition_key
+                )
               end)
             end)
           end)
@@ -363,6 +436,49 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       defp flow_claim_due_cold_precheck_buckets(_now_ms), do: []
+
+      defp flow_claim_due_cold_precheck_partition_present?(
+             _ctx,
+             _idx,
+             path,
+             bucket_ms,
+             type,
+             claim_state,
+             _claim_priority,
+             :auto
+           ) do
+        prefix = Ferricstore.Flow.LMDB.cold_due_state_bucket_prefix(bucket_ms, type, claim_state)
+
+        case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+          {:ok, [_ | _]} -> true
+          _ -> false
+        end
+      end
+
+      defp flow_claim_due_cold_precheck_partition_present?(
+             _ctx,
+             _idx,
+             path,
+             bucket_ms,
+             type,
+             claim_state,
+             claim_priority,
+             partition_key
+           ) do
+        prefix =
+          Ferricstore.Flow.LMDB.cold_due_claim_prefix(
+            bucket_ms: bucket_ms,
+            type: type,
+            state: claim_state,
+            partition_key: partition_key,
+            priority: claim_priority
+          )
+
+        case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+          {:ok, [_ | _]} -> true
+          _ -> false
+        end
+      end
 
       defp flow_claim_due_empty_precheck_allowed?(ctx, idx) do
         selected_waraft_ctx?(ctx) and flow_claim_due_single_local_member?(idx)
@@ -409,6 +525,53 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       defp flow_claim_due_precheck_states(_state), do: :unknown
+
+      defp flow_claim_due_auto_precheck_keys(ctx, idx, type, state, priority)
+           when is_binary(type) do
+        with {:ok, states} <- flow_claim_due_precheck_states(state),
+             priorities <- flow_claim_any_priorities(priority),
+             true <- Enum.all?(priorities, &is_integer/1),
+             [_ | _] = partition_keys <- flow_auto_partition_keys_for_shard(ctx, idx) do
+          keys =
+            for state <- states,
+                priority <- priorities,
+                partition_key <- partition_keys do
+              Ferricstore.Flow.Keys.due_key(type, state, priority, partition_key)
+            end
+
+          {:ok, keys}
+        else
+          _other -> :unknown
+        end
+      end
+
+      defp flow_claim_due_auto_precheck_keys(_ctx, _idx, _type, _state, _priority), do: :unknown
+
+      defp flow_auto_partition_keys_for_shard(%{shard_count: shard_count} = ctx, idx)
+           when is_integer(shard_count) and shard_count > 0 and is_integer(idx) do
+        key = {__MODULE__, :flow_auto_partition_keys_for_shard, shard_count}
+
+        key
+        |> :persistent_term.get(nil)
+        |> case do
+          nil ->
+            groups =
+              Ferricstore.Flow.Keys.auto_partition_keys()
+              |> Enum.group_by(fn partition_key ->
+                "__auto_probe__"
+                |> Ferricstore.Flow.Keys.due_key("__auto_probe__", 0, partition_key)
+                |> then(&shard_for(ctx, &1))
+              end)
+
+            :persistent_term.put(key, groups)
+            Map.get(groups, idx, [])
+
+          groups ->
+            Map.get(groups, idx, [])
+        end
+      end
+
+      defp flow_auto_partition_keys_for_shard(_ctx, _idx), do: []
 
       defp flow_claim_due_partition_key_results(results, limit) do
         results

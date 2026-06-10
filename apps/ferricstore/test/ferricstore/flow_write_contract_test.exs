@@ -233,7 +233,8 @@ defmodule Ferricstore.FlowWriteContractTest do
     refute projection_entry_source =~ "now_ms: now_ms",
            "hot-path projection entries should use one compact value descriptor instead of extra map fields"
 
-    refute source =~ "Flow.encode_history_fields(record, event, now_ms, Map.get(entry, :meta, %{}))",
+    refute source =~
+             "Flow.encode_history_fields(record, event, now_ms, Map.get(entry, :meta, %{}))",
            "single-command history planning must also enqueue lazy descriptors"
 
     assert source =~ "value: {:flow_history_fields, record, event, now_ms, meta}"
@@ -243,9 +244,9 @@ defmodule Ferricstore.FlowWriteContractTest do
     source = File.read!("lib/ferricstore/flow/history_projector.ex")
 
     assert [_, async_source] =
-             String.split(source, "\n  def enqueue_async(instance_ctx, shard_index, entries, ra_index)",
-               parts: 2
-             )
+             String.split(
+               source,
+               "\n  def enqueue_async(instance_ctx, shard_index, entries, ra_index)", parts: 2)
 
     assert [async_source, _] = String.split(async_source, "\n  @spec flush", parts: 2)
 
@@ -418,6 +419,58 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     refute function_source =~ "__MODULE__.Keys.due_key",
            "claim_due can probe many partitions per poll; validation must use length math instead of allocating every generated due-index key"
+  end
+
+  test "flow claim_due AUTO skips empty shards before Raft writes" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_auto_partition",
+        "flow_claim_due_auto_empty_precheck"
+      )
+
+    assert function_source =~ "flow_claim_due_auto_empty_precheck(ctx, idx, attrs)"
+
+    precheck_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_auto_empty_precheck",
+        "NativeFlowIndex.due_keys_present"
+      )
+
+    assert precheck_source =~ "NativeFlowIndex.due_keys_present"
+    assert precheck_source =~ "flow_claim_due_auto_precheck_keys"
+    assert source =~ "flow_auto_partition_keys_for_shard"
+  end
+
+  test "flow claim_due reclaim precheck does not scan cold due rows for running leases" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_cold_precheck_present?",
+        ~s("running")
+      )
+
+    assert function_source =~ ~s("running")
+    assert function_source =~ "do: false"
+  end
+
+  test "flow claim_due AUTO cold precheck uses broad shard prefix instead of per bucket partition scans" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_cold_precheck_partition_present?",
+        ":auto"
+      )
+
+    assert function_source =~ "cold_due_state_bucket_prefix"
+    refute function_source =~ "flow_auto_partition_keys_for_shard"
   end
 
   test "flow claim_due fast index path avoids generic per-plan tuple dispatch" do
