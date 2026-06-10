@@ -7,6 +7,7 @@ const HEADER_SIZE: usize = 24;
 const FLAG_CUSTOM_PAYLOAD: u8 = 0x02;
 const STATUS_OK: u16 = 0;
 const COMPACT_FLOW_CLAIM_JOBS: u8 = 0x80;
+const COMPACT_OK_LIST: u8 = 0x81;
 
 #[derive(Debug, PartialEq, Eq)]
 struct FrameSlice<'a> {
@@ -99,6 +100,22 @@ fn encode_compact_claim_jobs_response_frame<'a>(
     jobs: Term<'a>,
 ) -> NifResult<Term<'a>> {
     let frame = match build_compact_claim_jobs_response_frame(opcode, lane_id, request_id, jobs) {
+        Some(frame) => frame,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+
+    Ok(Binary::from_owned(frame, env).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+fn encode_compact_ok_list_response_frame<'a>(
+    env: Env<'a>,
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    values: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let frame = match build_compact_ok_list_response_frame(opcode, lane_id, request_id, values) {
         Some(frame) => frame,
         None => return Ok(atoms::nil().encode(env)),
     };
@@ -221,6 +238,37 @@ fn build_compact_claim_jobs_response_frame<'a>(
     build_custom_ok_response_frame(opcode, lane_id, request_id, &payload)
 }
 
+fn build_compact_ok_list_response_frame<'a>(
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    values: Term<'a>,
+) -> Option<OwnedBinary> {
+    let mut values_iter: ListIterator<'a> = values.decode().ok()?;
+    let mut count = 0u32;
+
+    for value in &mut values_iter {
+        let value = value.decode::<Binary<'a>>().ok()?;
+
+        if !is_ok_binary(value.as_slice()) {
+            return None;
+        }
+
+        count = count.checked_add(1)?;
+    }
+
+    let mut payload = [0u8; 5];
+    payload[0] = COMPACT_OK_LIST;
+    payload[1..5].copy_from_slice(&count.to_be_bytes());
+    build_custom_ok_response_frame(opcode, lane_id, request_id, &payload)
+}
+
+fn is_ok_binary(value: &[u8]) -> bool {
+    value.len() == 2
+        && (value[0] == b'O' || value[0] == b'o')
+        && (value[1] == b'K' || value[1] == b'k')
+}
+
 fn append_compact_binary(out: &mut Vec<u8>, value: &[u8]) -> Option<()> {
     let len = u32::try_from(value.len()).ok()?;
     out.extend_from_slice(&len.to_be_bytes());
@@ -246,8 +294,26 @@ fn build_custom_ok_response_frame(
 ) -> Option<OwnedBinary> {
     let body_len = 2usize.checked_add(payload.len())?;
     let mut out = OwnedBinary::new(HEADER_SIZE + body_len)?;
-    let bytes = out.as_mut_slice();
+    write_custom_ok_response_frame(
+        out.as_mut_slice(),
+        opcode,
+        lane_id,
+        request_id,
+        body_len,
+        payload,
+    );
 
+    Some(out)
+}
+
+fn write_custom_ok_response_frame(
+    bytes: &mut [u8],
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    body_len: usize,
+    payload: &[u8],
+) {
     bytes[0..4].copy_from_slice(MAGIC);
     bytes[4] = VERSION | RESPONSE_DIRECTION;
     bytes[5] = FLAG_CUSTOM_PAYLOAD;
@@ -257,8 +323,19 @@ fn build_custom_ok_response_frame(
     bytes[20..24].copy_from_slice(&(body_len as u32).to_be_bytes());
     bytes[24..26].copy_from_slice(&STATUS_OK.to_be_bytes());
     bytes[26..].copy_from_slice(payload);
+}
 
-    Some(out)
+#[cfg(test)]
+fn build_custom_ok_response_bytes(
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let body_len = 2usize.checked_add(payload.len())?;
+    let mut bytes = vec![0u8; HEADER_SIZE + body_len];
+    write_custom_ok_response_frame(&mut bytes, opcode, lane_id, request_id, body_len, payload);
+    Some(bytes)
 }
 
 mod atoms {
@@ -337,7 +414,7 @@ mod tests {
     #[test]
     fn custom_ok_response_frame_wraps_payload_in_one_buffer() {
         let frame =
-            build_custom_ok_response_frame(0x0203, 2, 99, &[COMPACT_FLOW_CLAIM_JOBS, 0, 0, 0, 0])
+            build_custom_ok_response_bytes(0x0203, 2, 99, &[COMPACT_FLOW_CLAIM_JOBS, 0, 0, 0, 0])
                 .expect("frame allocation succeeds");
         let bytes = frame.as_slice();
 

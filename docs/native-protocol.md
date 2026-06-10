@@ -57,11 +57,15 @@ Flags:
 0x20 more chunks follow
 ```
 
-Requests accept `0x10` by default. `0x08 compressed body` is accepted only
-after the connection negotiates `compression: "zlib"` through `HELLO` or
-`STARTUP`. `0x20 more chunks follow` is accepted for request reassembly.
-Warning, trace, and custom-payload flags are reserved. Unknown request flags are
-rejected before command dispatch.
+Requests accept `0x10` by default. `0x01 trace requested` is accepted only when
+the server enables native tracing. `0x08 compressed body` is accepted only after
+the server enables request compression and the connection negotiates
+`compression: "zlib"` through `HELLO` or `STARTUP`. `0x20 more chunks follow` is
+accepted for request reassembly. Warning and custom-payload request flags are
+reserved. Unknown request flags are rejected before command dispatch.
+
+Client command requests must use a non-zero `request_id`. `request_id=0` is
+reserved for server-initiated management frames such as `EVENT` and `GOAWAY`.
 
 `0x10 no reply requested` executes the command but suppresses the normal
 response frame. Use it only for idempotent or application-tolerant writes where
@@ -81,8 +85,9 @@ response chunks: same lane_id/opcode/request_id, full response body split
 Compressed chunked payloads are compressed as one logical body, then split.
 Receivers reassemble chunks first, then decompress if `0x08` is present on the
 final logical response. The server bounds incomplete request chunk streams per
-connection with `FERRICSTORE_NATIVE_MAX_PENDING_CHUNKS`. Compressed request
-bodies are rejected if decompressed bytes exceed `max_frame_bytes`.
+connection with `FERRICSTORE_NATIVE_MAX_PENDING_CHUNKS` and
+`FERRICSTORE_NATIVE_MAX_PENDING_CHUNK_BYTES`. Compressed request bodies are
+rejected if decompressed bytes exceed `max_frame_bytes`.
 
 ## Typed values
 
@@ -167,8 +172,9 @@ max_inflight_per_connection
 max_inflight_per_lane
 ```
 
-The server enforces those windows in addition to bounded lane queues and frame
-limits. A closed window returns `busy` with `flow_control_window_exhausted`.
+The server clamps requested windows to configured server maxima and enforces
+those windows in addition to bounded lane queues and frame limits. A closed
+window returns `busy` with `flow_control_window_exhausted`.
 
 `STARTUP` may include:
 
@@ -178,6 +184,9 @@ driver_name
 events
 compression: "none" | "zlib"
 ```
+
+`compression: "zlib"` is an opt-in server feature. The default advertised and
+accepted compression is `"none"`.
 
 ## KV opcodes
 

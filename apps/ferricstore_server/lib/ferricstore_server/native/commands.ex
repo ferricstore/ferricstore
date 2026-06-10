@@ -200,7 +200,7 @@ defmodule FerricstoreServer.Native.Commands do
             |> Map.merge(@admin_commands)
             |> Map.merge(@flow_commands)
 
-  @supported_compressions ["none", "zlib"]
+  @supported_compressions ["none"]
   @supported_auth ["password", "acl-password"]
   @supported_atomicity ["none", "per_shard", "same_shard"]
   @supported_events [
@@ -1075,6 +1075,11 @@ defmodule FerricstoreServer.Native.Commands do
     items
     |> Enum.map(fn
       %{"id" => id} -> id
+      %{id: id} -> id
+      [id | _rest] -> id
+      {id, _payload} -> id
+      {id, _partition_key, _payload} -> id
+      {id, _partition_key, _lease_token, _fencing_token} -> id
       _ -> nil
     end)
     |> binary_list()
@@ -1117,7 +1122,11 @@ defmodule FerricstoreServer.Native.Commands do
     do: Map.put(state, :compact_flow_responses, false)
 
   defp negotiate_compression(state, compression) when compression in ["zlib", :zlib],
-    do: {:ok, Map.put(state, :compression, :zlib)}
+    do:
+      if(Application.get_env(:ferricstore, :native_request_compression_enabled, false),
+        do: {:ok, Map.put(state, :compression, :zlib)},
+        else: {:error, "ERR native request compression is disabled"}
+      )
 
   defp negotiate_compression(state, compression) when compression in ["none", nil, :none],
     do: {:ok, Map.put(state, :compression, :none)}
@@ -1128,11 +1137,17 @@ defmodule FerricstoreServer.Native.Commands do
   defp maybe_set_native_limit(state, key, value)
        when key in [:max_inflight_per_connection, :max_inflight_per_lane] do
     if is_integer(value) and value >= 0 do
-      Map.put(state, key, value)
+      Map.put(state, key, min(value, configured_native_limit(key)))
     else
       state
     end
   end
+
+  defp configured_native_limit(:max_inflight_per_connection),
+    do: Application.get_env(:ferricstore, :native_max_inflight_per_connection, 4096)
+
+  defp configured_native_limit(:max_inflight_per_lane),
+    do: Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024)
 
   defp hello_payload(state) do
     %{
@@ -1187,7 +1202,7 @@ defmodule FerricstoreServer.Native.Commands do
         compact_flow_responses: Map.get(state, :compact_flow_responses, false),
         supported: ["typed_value", "flow_claim_jobs_v1", "ok_list_v1"]
       },
-      compression: @supported_compressions,
+      compression: supported_compressions(),
       auth: @supported_auth,
       atomicity: @supported_atomicity,
       deadlines: %{
@@ -1377,6 +1392,14 @@ defmodule FerricstoreServer.Native.Commands do
       enforced: true,
       window_update: true
     }
+  end
+
+  defp supported_compressions do
+    if Application.get_env(:ferricstore, :native_request_compression_enabled, false) do
+      ["none", "zlib"]
+    else
+      @supported_compressions
+    end
   end
 
   defp server_payload do

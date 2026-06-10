@@ -109,6 +109,20 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert Codec.encode_compact_ok_list(["OK", "ERR failed"]) == nil
   end
 
+  test "native NIF encodes compact OK-list response frame directly" do
+    frame = NIF.encode_compact_ok_list_response_frame(0x0210, 3, 42, ["OK", "ok", "Ok"])
+    tag = Codec.compact_tags().ok_list
+    custom_payload = Codec.flags().custom_payload
+
+    <<"FSNP", 0x81, flags, 3::unsigned-32, 0x0210::unsigned-16, 42::unsigned-64,
+      body_len::unsigned-32, body::binary>> = frame
+
+    assert body_len == byte_size(body)
+    assert Bitwise.band(flags, custom_payload) != 0
+    assert <<0::unsigned-16, ^tag, 3::unsigned-32>> = body
+    assert NIF.encode_compact_ok_list_response_frame(0x0210, 3, 42, ["OK", "ERR"]) == nil
+  end
+
   test "command response frames compact hot Flow many responses when negotiated" do
     [frame] =
       Codec.encode_command_response_frames(0x0210, 3, 42, :ok, ["OK", "OK"],

@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
   alias Ferricstore.Config
   alias Ferricstore.Flow.ClaimWaiters
+  alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Commands
@@ -28,9 +29,13 @@ defmodule FerricstoreServer.Native.CommandsTest do
     FerricstoreServer.Acl.reset!()
     old_max_batch_commands = Application.get_env(:ferricstore, :native_max_batch_commands)
 
+    old_request_compression_enabled =
+      Application.get_env(:ferricstore, :native_request_compression_enabled)
+
     on_exit(fn ->
       Config.set("requirepass", "")
-      Application.put_env(:ferricstore, :native_max_batch_commands, old_max_batch_commands)
+      restore_env(:native_max_batch_commands, old_max_batch_commands)
+      restore_env(:native_request_compression_enabled, old_request_compression_enabled)
       FerricstoreServer.Acl.reset!()
     end)
 
@@ -46,7 +51,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.multiplexing.ordered_per_lane == true
     assert payload.flow_control.window_update == true
     assert payload.flow_control.enforced == true
-    assert "zlib" in payload.compression
+    assert payload.compression == ["none"]
     assert payload.chunking.request_reassembly == true
     assert payload.chunking.response_chunks == true
     assert payload.response_codecs.typed_value == true
@@ -90,6 +95,15 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert "owner_flow_id" in payload.schemas["FLOW.VALUE.PUT"]["fields"]
     assert "retention_ttl_ms" in payload.schemas["FLOW.CREATE"]["fields"]
+  end
+
+  test "OPTIONS advertises zlib request compression only when enabled" do
+    Application.put_env(:ferricstore, :native_request_compression_enabled, true)
+
+    {status, payload, _state} = Commands.execute(@op_options, %{}, state())
+
+    assert status == :ok
+    assert "zlib" in payload.compression
   end
 
   test "native validates custom command fields before dispatch" do
@@ -170,6 +184,39 @@ defmodule FerricstoreServer.Native.CommandsTest do
       )
 
     assert status == :ok
+  end
+
+  test "BATCH same_shard validates compact FLOW.CREATE_MANY item arrays" do
+    ctx = FerricStore.Instance.get(:default)
+    {id1, id2} = different_shard_ids(ctx, "native-create-many-same-shard")
+    now_ms = System.system_time(:millisecond)
+
+    {status, reason, _state} =
+      Commands.execute(
+        @op_batch,
+        %{
+          "atomicity" => "same_shard",
+          "commands" => [
+            %{
+              "opcode" => @op_flow_create_many,
+              "lane_id" => 1,
+              "request_id" => 501,
+              "body" => %{
+                "type" => "native-create-many-same-shard",
+                "state" => "queued",
+                "now_ms" => now_ms,
+                "run_at_ms" => now_ms,
+                "independent" => true,
+                "items" => [[id1, "payload"], [id2, "payload"]]
+              }
+            }
+          ]
+        },
+        state(instance_ctx: ctx)
+      )
+
+    assert status == :bad_request
+    assert reason =~ "same_shard"
   end
 
   test "native FLOW.CREATE_MANY can return OK on all-success independent create" do
@@ -433,6 +480,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
         max_frame_bytes: 16 * 1024 * 1024,
         max_lanes: 1024,
         lane_max_queue: 1024,
+        max_inflight_per_connection: 4096,
+        max_inflight_per_lane: 1024,
         compression: :none,
         event_subscriptions: MapSet.new(),
         flow_wake_subscription: nil,
@@ -442,4 +491,19 @@ defmodule FerricstoreServer.Native.CommandsTest do
       Map.new(overrides)
     )
   end
+
+  defp different_shard_ids(ctx, prefix) do
+    id1 = "#{prefix}-#{System.unique_integer([:positive])}-a"
+    shard1 = Router.shard_for(ctx, id1)
+
+    id2 =
+      1..10_000
+      |> Stream.map(&"#{prefix}-#{System.unique_integer([:positive])}-#{&1}")
+      |> Enum.find(&(Router.shard_for(ctx, &1) != shard1))
+
+    {id1, id2}
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

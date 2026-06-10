@@ -90,7 +90,8 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
-  @spec decode_body(non_neg_integer(), non_neg_integer(), binary()) :: {:ok, term()} | {:error, binary()}
+  @spec decode_body(non_neg_integer(), non_neg_integer(), binary()) ::
+          {:ok, term()} | {:error, binary()}
   def decode_body(opcode, flags, body) when is_integer(opcode) and is_integer(flags) do
     if Bitwise.band(flags, @flag_custom_payload) != 0 do
       decode_custom_request_body(opcode, body)
@@ -309,6 +310,13 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
+  defp compact_response_frame(opcode, lane_id, request_id, :ok, value, opts)
+       when opcode in [0x020F, 0x0210, 0x0212, 0x0213, 0x0214] do
+    if direct_compact_frame?(opts) do
+      NIF.encode_compact_ok_list_response_frame(opcode, lane_id, request_id, value)
+    end
+  end
+
   defp compact_response_frame(_opcode, _lane_id, _request_id, _status, _value, _opts), do: nil
 
   defp direct_compact_frame?(opts) do
@@ -399,9 +407,9 @@ defmodule FerricstoreServer.Native.Codec do
     with {:ok, type, rest} <- take_compact_binary(rest),
          {:ok, state, rest} <- take_compact_optional_binary(rest),
          {:ok, worker, rest} <- take_compact_binary(rest),
-         <<lease_ms::signed-64, limit::signed-64, block_ms::signed-64, reclaim_expired::unsigned-8,
-           reclaim_ratio::signed-64, priority_marker::signed-64, return_mode::unsigned-8,
-           partition_mode::unsigned-8, rest::binary>> <- rest,
+         <<lease_ms::signed-64, limit::signed-64, block_ms::signed-64,
+           reclaim_expired::unsigned-8, reclaim_ratio::signed-64, priority_marker::signed-64,
+           return_mode::unsigned-8, partition_mode::unsigned-8, rest::binary>> <- rest,
          {:ok, partitions, ""} <- take_compact_partitions(partition_mode, rest) do
       payload =
         %{
@@ -526,8 +534,13 @@ defmodule FerricstoreServer.Native.Codec do
   defp put_create_many_return_mode(payload, _mode), do: payload
 
   defp put_partition_values(payload, 0, _partitions), do: payload
-  defp put_partition_values(payload, 1, partition_key), do: Map.put(payload, "partition_key", partition_key)
-  defp put_partition_values(payload, 2, partition_keys), do: Map.put(payload, "partition_keys", partition_keys)
+
+  defp put_partition_values(payload, 1, partition_key),
+    do: Map.put(payload, "partition_key", partition_key)
+
+  defp put_partition_values(payload, 2, partition_keys),
+    do: Map.put(payload, "partition_keys", partition_keys)
+
   defp put_partition_values(payload, _mode, _partitions), do: payload
 
   @spec encode_value(term()) :: binary()

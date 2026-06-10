@@ -50,4 +50,13 @@ defmodule FerricstoreServer.Native.NIF do
         ) :: binary() | nil
   def encode_compact_claim_jobs_response_frame(_opcode, _lane_id, _request_id, _jobs),
     do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec encode_compact_ok_list_response_frame(
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          term()
+        ) :: binary() | nil
+  def encode_compact_ok_list_response_frame(_opcode, _lane_id, _request_id, _values),
+    do: :erlang.nif_error(:nif_not_loaded)
 end

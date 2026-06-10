@@ -23,6 +23,19 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     old_response_chunk_bytes = Application.get_env(:ferricstore, :native_response_chunk_bytes)
     old_max_pending_chunks = Application.get_env(:ferricstore, :native_max_pending_chunks)
 
+    old_max_pending_chunk_bytes =
+      Application.get_env(:ferricstore, :native_max_pending_chunk_bytes)
+
+    old_trace_enabled = Application.get_env(:ferricstore, :native_trace_enabled)
+
+    old_request_compression_enabled =
+      Application.get_env(:ferricstore, :native_request_compression_enabled)
+
+    old_max_inflight_per_connection =
+      Application.get_env(:ferricstore, :native_max_inflight_per_connection)
+
+    old_max_inflight_per_lane = Application.get_env(:ferricstore, :native_max_inflight_per_lane)
+
     unless Listener.running?() do
       {:ok, _pid} = Listener.start(0)
 
@@ -33,8 +46,13 @@ defmodule FerricstoreServer.Native.IntegrationTest do
 
     on_exit(fn ->
       Config.set("requirepass", "")
-      Application.put_env(:ferricstore, :native_response_chunk_bytes, old_response_chunk_bytes)
-      Application.put_env(:ferricstore, :native_max_pending_chunks, old_max_pending_chunks)
+      restore_env(:native_response_chunk_bytes, old_response_chunk_bytes)
+      restore_env(:native_max_pending_chunks, old_max_pending_chunks)
+      restore_env(:native_max_pending_chunk_bytes, old_max_pending_chunk_bytes)
+      restore_env(:native_trace_enabled, old_trace_enabled)
+      restore_env(:native_request_compression_enabled, old_request_compression_enabled)
+      restore_env(:native_max_inflight_per_connection, old_max_inflight_per_connection)
+      restore_env(:native_max_inflight_per_lane, old_max_inflight_per_lane)
     end)
 
     %{port: Listener.port()}
@@ -153,6 +171,24 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     :gen_tcp.close(sock)
   end
 
+  test "WINDOW_UPDATE cannot raise request windows above server configured limits", %{port: _port} do
+    Application.put_env(:ferricstore, :native_max_inflight_per_connection, 7)
+    Application.put_env(:ferricstore, :native_max_inflight_per_lane, 3)
+    port = restart_listener([])
+    sock = connect(port)
+
+    send_request(sock, @op_window_update, 0, 46, %{
+      "max_inflight_per_connection" => 10_000,
+      "max_inflight_per_lane" => 10_000
+    })
+
+    assert {0, payload} = recv_response(sock)
+    assert payload["limits"]["max_inflight_per_connection"] == 7
+    assert payload["limits"]["max_inflight_per_lane"] == 3
+
+    :gen_tcp.close(sock)
+  end
+
   test "BATCH executes data commands and returns per-command results", %{port: port} do
     sock = connect(port)
     key = "native:batch:#{System.unique_integer([:positive])}"
@@ -193,7 +229,18 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     :gen_tcp.close(sock)
   end
 
+  test "STARTUP rejects zlib request compression by default", %{port: port} do
+    sock = connect(port)
+
+    send_request(sock, @op_startup, 0, 47, %{"compression" => "zlib"})
+    assert {6, payload} = recv_response(sock)
+    assert payload["message"] =~ "compression is disabled"
+
+    :gen_tcp.close(sock)
+  end
+
   test "STARTUP negotiates zlib and accepts compressed request bodies", %{port: port} do
+    Application.put_env(:ferricstore, :native_request_compression_enabled, true)
     sock = connect(port)
     key = "native:zlib:#{System.unique_integer([:positive])}"
 
@@ -223,6 +270,7 @@ defmodule FerricstoreServer.Native.IntegrationTest do
   test "compressed request is rejected if decompressed body exceeds max frame bytes", %{
     port: _port
   } do
+    Application.put_env(:ferricstore, :native_request_compression_enabled, true)
     port = restart_listener(max_frame_bytes: 128)
     sock = connect(port)
 
@@ -248,12 +296,76 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     :gen_tcp.close(sock)
   end
 
-  test "reserved request flags are rejected until negotiated", %{port: port} do
+  test "unknown request flags are rejected", %{port: port} do
     sock = connect(port)
 
-    send_request(sock, @op_get, 1, 26, %{"key" => "native-reserved-flag"}, 0x01)
+    send_request(sock, @op_get, 1, 26, %{"key" => "native-reserved-flag"}, 0x80)
     assert {6, payload} = recv_response(sock)
     assert payload["message"] =~ "unsupported flags"
+
+    :gen_tcp.close(sock)
+  end
+
+  test "request id 0 is reserved for server events", %{port: port} do
+    sock = connect(port)
+
+    send_request(sock, @op_get, 1, 0, %{"key" => "native-reserved-request-id"})
+    assert {6, payload} = recv_response(sock)
+    assert payload["message"] =~ "request_id 0"
+
+    :gen_tcp.close(sock)
+  end
+
+  test "trace flag is rejected unless enabled by server config", %{port: port} do
+    sock = connect(port)
+
+    send_request(sock, @op_get, 1, 48, %{"key" => "native-trace-disabled"}, Codec.flags().trace)
+    assert {6, payload} = recv_response(sock)
+    assert payload["message"] =~ "trace flag is disabled"
+
+    :gen_tcp.close(sock)
+  end
+
+  test "trace flag returns native server stage timings", %{port: port} do
+    Application.put_env(:ferricstore, :native_trace_enabled, true)
+    sock = connect(port)
+    key = "native:trace:#{System.unique_integer([:positive])}"
+
+    send_request(
+      sock,
+      @op_set,
+      1,
+      27,
+      %{"key" => key, "value" => "value"},
+      Codec.flags().trace
+    )
+
+    meta = recv_response_meta(sock)
+    assert meta.status == 0
+    assert Bitwise.band(meta.flags, Codec.flags().trace) != 0
+    assert meta.value["value"] == "OK"
+
+    trace = meta.value["trace"]
+
+    for key <- [
+          "server_decode_us",
+          "server_route_us",
+          "server_lane_queue_wait_us",
+          "server_body_decode_us",
+          "server_command_execute_us",
+          "server_ra_wait_us",
+          "server_apply_us",
+          "server_bitcask_append_us",
+          "server_pending_locations_us",
+          "server_flow_index_update_us",
+          "server_zset_index_update_us",
+          "server_response_encode_us"
+        ] do
+      assert is_integer(trace[key])
+      assert trace[key] >= 0
+    end
+
+    refute Map.has_key?(trace, "server_lane_enqueue_us")
 
     :gen_tcp.close(sock)
   end
@@ -323,6 +435,24 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     :ok = :gen_tcp.send(sock, frame2)
     assert {6, payload} = recv_response(sock)
     assert payload["message"] =~ "pending chunk"
+
+    :gen_tcp.close(sock)
+  end
+
+  test "incomplete chunk streams are bounded by total pending bytes", %{port: port} do
+    Application.put_env(:ferricstore, :native_max_pending_chunk_bytes, 16)
+    sock = connect(port)
+
+    body = Codec.encode_value(%{"key" => "native:pending-chunk-bytes", "value" => "too-large"})
+
+    frame =
+      @op_set
+      |> Codec.encode_frame(1, 49, body, Codec.flags().more_chunks)
+      |> IO.iodata_to_binary()
+
+    :ok = :gen_tcp.send(sock, frame)
+    assert {6, payload} = recv_response(sock)
+    assert payload["message"] =~ "pending chunk bytes"
 
     :gen_tcp.close(sock)
   end
@@ -432,6 +562,9 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     {:ok, _pid} = Listener.start(0, opts)
     Listener.port()
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   defp send_request(sock, opcode, lane_id, request_id, payload, flags \\ 0) do
     frame =
