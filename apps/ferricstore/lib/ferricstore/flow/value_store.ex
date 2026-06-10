@@ -56,15 +56,55 @@ defmodule Ferricstore.Flow.ValueStore do
 
   def value_put(_ctx, _value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
-  def value_mget(ctx, refs) when is_list(refs) do
-    case raw_mget(ctx, refs) do
-      values when is_list(values) -> {:ok, Enum.map(values, &Codec.decode_value/1)}
-      {:error, _reason} = error -> error
-      other -> {:error, "ERR flow value mget failed: #{inspect(other)}"}
+  def value_mget(ctx, refs, opts \\ [])
+
+  def value_mget(ctx, refs, opts) when is_list(refs) and is_list(opts) do
+    with {:ok, max_bytes} <- optional_value_mget_max_bytes(opts) do
+      case raw_mget(ctx, refs) do
+        values when is_list(values) ->
+          {:ok,
+           refs
+           |> Enum.zip(values)
+           |> Enum.map(fn {ref, value} -> decode_or_omit_value(ref, value, max_bytes) end)}
+
+        {:error, _reason} = error ->
+          error
+
+        other ->
+          {:error, "ERR flow value mget failed: #{inspect(other)}"}
+      end
     end
   end
 
-  def value_mget(_ctx, _refs), do: {:error, "ERR flow refs must be a list"}
+  def value_mget(_ctx, _refs, opts) when not is_list(opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  def value_mget(_ctx, _refs, _opts), do: {:error, "ERR flow refs must be a list"}
+
+  defp optional_value_mget_max_bytes(opts) do
+    value =
+      Keyword.get(
+        opts,
+        :max_bytes,
+        Keyword.get(opts, :value_max_bytes, Keyword.get(opts, :payload_max_bytes))
+      )
+
+    case value do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> {:error, "ERR flow max_bytes must be a non-negative integer"}
+    end
+  end
+
+  defp decode_or_omit_value(_ref, nil, _max_bytes), do: nil
+
+  defp decode_or_omit_value(ref, value, max_bytes)
+       when is_binary(ref) and is_binary(value) and is_integer(max_bytes) and
+              byte_size(value) > max_bytes do
+    %{ref: ref, value_omitted: true, value_size: byte_size(value)}
+  end
+
+  defp decode_or_omit_value(_ref, value, _max_bytes), do: Codec.decode_value(value)
 
   def raw_mget(_ctx, []), do: []
 

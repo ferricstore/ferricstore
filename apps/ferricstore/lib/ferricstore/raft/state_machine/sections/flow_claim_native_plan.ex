@@ -500,11 +500,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
         now_ms = flow_attrs_now_ms(attrs)
         partition_key = Map.get(attrs, :partition_key)
 
-        with {:ok, record} <- flow_require_record(state, id, partition_key),
-             {:ok, record, next} <-
-               flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms),
-             :ok <- flow_apply_complete(state, record, next, partition_key, now_ms, attrs) do
-          :ok
+        with {:ok, record} <- flow_require_record(state, id, partition_key) do
+          case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
+            {:ok, :noop} ->
+              :ok
+
+            {:ok, record, next} ->
+              flow_apply_complete(state, record, next, partition_key, now_ms, attrs)
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
@@ -524,47 +530,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
         do: {:error, "ERR flow items must be a non-empty list"}
 
       defp flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
-        with :ok <- flow_require_running_lease(record, lease_token),
-             :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
-          version = Map.fetch!(record, :version) + 1
-          id = Map.fetch!(record, :id)
-          partition_key = Map.get(record, :partition_key)
+        if flow_duplicate_terminal_noop?(record, attrs, "completed") do
+          {:ok, :noop}
+        else
+          with :ok <- flow_require_running_lease(record, lease_token),
+               :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+            version = Map.fetch!(record, :version) + 1
+            id = Map.fetch!(record, :id)
+            partition_key = Map.get(record, :partition_key)
 
-          payload_ref =
-            flow_value_ref(
-              attrs,
-              :payload,
-              id,
-              version,
-              partition_key,
-              Map.get(record, :payload_ref)
-            )
+            payload_ref =
+              flow_value_ref(
+                attrs,
+                :payload,
+                id,
+                version,
+                partition_key,
+                Map.get(record, :payload_ref)
+              )
 
-          result_ref = flow_value_ref(attrs, :result, id, version, partition_key)
-          retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
+            result_ref = flow_value_ref(attrs, :result, id, version, partition_key)
+            retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
 
-          with {:ok, value_refs} <-
-                 flow_named_value_refs(record, attrs, id, version, partition_key) do
-            next =
-              %{
-                record
-                | state: "completed",
-                  version: version,
-                  updated_at_ms: now_ms,
-                  payload_ref: payload_ref,
-                  result_ref: result_ref,
-                  ttl_ms: nil,
-                  retention_ttl_ms: retention_ttl_ms,
-                  lease_owner: nil,
-                  lease_token: nil,
-                  lease_deadline_ms: 0,
-                  next_run_at_ms: nil
-              }
-              |> flow_put_record_value_refs(value_refs)
-              |> flow_stamp_terminal_retention(now_ms)
+            with {:ok, value_refs} <-
+                   flow_named_value_refs(record, attrs, id, version, partition_key) do
+              next =
+                %{
+                  record
+                  | state: "completed",
+                    version: version,
+                    updated_at_ms: now_ms,
+                    payload_ref: payload_ref,
+                    result_ref: result_ref,
+                    ttl_ms: nil,
+                    retention_ttl_ms: retention_ttl_ms,
+                    lease_owner: nil,
+                    lease_token: nil,
+                    lease_deadline_ms: 0,
+                    next_run_at_ms: nil
+                }
+                |> flow_put_record_value_refs(value_refs)
+                |> flow_stamp_terminal_retention(now_ms)
 
-            with :ok <- flow_validate_terminal_state_index_key(next) do
-              {:ok, record, next}
+              with :ok <- flow_validate_terminal_state_index_key(next) do
+                {:ok, record, next}
+              end
             end
           end
         end
@@ -610,6 +620,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
                      {:ok, [{record, next, attrs} | acc],
                       has_values? or flow_attrs_have_record_values?(attrs),
                       has_after_terminal? or flow_terminal_after_required?(:complete, next)}}
+
+                  {:ok, :noop} ->
+                    {:cont, {:ok, acc, has_values?, has_after_terminal?}}
 
                   {:error, _reason} = error ->
                     {:halt, error}
@@ -737,6 +750,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
               has_after_terminal? or flow_terminal_after_required?(op, next)
             )
 
+          {:ok, :noop} ->
+            flow_terminal_pipeline_prepare_records(
+              state,
+              op,
+              rest_attrs,
+              rest_records,
+              [:ok | results],
+              plans,
+              has_record_values?,
+              has_after_terminal?
+            )
+
           {:error, _reason} = error ->
             flow_terminal_pipeline_prepare_records(
               state,
@@ -837,6 +862,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
               has_after_terminal? or flow_terminal_after_required?(op, next)
             )
 
+          {:ok, :noop} ->
+            flow_terminal_pipeline_prepare(
+              state,
+              op,
+              rest,
+              virtual_records,
+              [:ok | results],
+              plans,
+              has_record_values?,
+              has_after_terminal?
+            )
+
           {:error, _reason} = error ->
             flow_terminal_pipeline_prepare(
               state,
@@ -884,6 +921,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
                now_ms
              ) do
           {:ok, record, next} -> {:ok, next, {record, next, attrs}}
+          {:ok, :noop} -> {:ok, :noop}
           {:error, _reason} = error -> error
         end
       end
@@ -897,6 +935,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
                now_ms
              ) do
           {:ok, record, next, history_meta} -> {:ok, next, {record, next, history_meta, attrs}}
+          {:ok, :noop} -> {:ok, :noop}
           {:error, _reason} = error -> error
         end
       end
@@ -909,6 +948,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
                now_ms
              ) do
           {:ok, record, next} -> {:ok, next, {record, next, attrs}}
+          {:ok, :noop} -> {:ok, :noop}
           {:error, _reason} = error -> error
         end
       end

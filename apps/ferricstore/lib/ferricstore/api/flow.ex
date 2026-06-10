@@ -39,12 +39,17 @@ defmodule FerricStore.API.Flow do
   @doc """
   Reads reusable Flow values by reference, preserving request order.
   """
-  @spec flow_value_mget([binary()]) :: {:ok, [term()]} | {:error, binary()}
-  def flow_value_mget(refs) when is_list(refs) do
-    Ferricstore.Flow.value_mget(default_ctx(), refs)
+  @spec flow_value_mget([binary()], keyword()) :: {:ok, [term()]} | {:error, binary()}
+  def flow_value_mget(refs, opts \\ [])
+
+  def flow_value_mget(refs, opts) when is_list(refs) and is_list(opts) do
+    Ferricstore.Flow.value_mget(default_ctx(), refs, opts)
   end
 
-  def flow_value_mget(_refs), do: {:error, "ERR flow refs must be a list"}
+  def flow_value_mget(_refs, opts) when not is_list(opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  def flow_value_mget(_refs, _opts), do: {:error, "ERR flow refs must be a list"}
 
   @doc """
   Records an external Flow signal and optionally attaches named values or moves

@@ -489,13 +489,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
           true ->
             projection_enabled? = flow_lmdb_projection_enabled?(state)
+            lagged_projection? = Ferricstore.Flow.LMDB.mode() == :lagged
             originals = Process.get(:sm_pending_originals, %{})
             pending_values = Process.get(:sm_pending_values, %{})
 
             case Enum.reduce_while(
                    key_records,
-                   {:ok, [], [], originals, pending_values},
-                   fn {key, record}, {:ok, entries, writes, originals, pending_values} ->
+                   {:ok, [], [], originals, pending_values, false},
+                   fn {key, record}, {:ok, entries, writes, originals, pending_values, dirty?} ->
                      value = flow_encode(record)
                      expire_at_ms = flow_state_record_expire_at(record)
                      originals = Map.put_new(originals, key, :missing)
@@ -514,7 +515,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                            entries,
                            writes,
                            originals,
-                           pending_values
+                           pending_values,
+                           lagged_projection?,
+                           dirty?
                          )
 
                        {:ok, :blob_ref, stored_value, pending_value} ->
@@ -530,7 +533,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                            entries,
                            writes,
                            originals,
-                           pending_values
+                           pending_values,
+                           lagged_projection?,
+                           dirty?
                          )
 
                        {:error, _reason} = error ->
@@ -538,7 +543,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                      end
                    end
                  ) do
-              {:ok, entries, writes, originals, pending_values} ->
+              {:ok, entries, writes, originals, pending_values, dirty?} ->
+                if dirty?, do: queue_pending_lmdb_projection_dirty()
+
                 Process.put(:sm_pending_originals, originals)
                 Process.put(:sm_pending_values, pending_values)
                 Process.put(:sm_pending_writes, writes ++ Process.get(:sm_pending_writes, []))
@@ -565,13 +572,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
           true ->
             projection_enabled? = flow_lmdb_projection_enabled?(state)
+            lagged_projection? = Ferricstore.Flow.LMDB.mode() == :lagged
             originals = Process.get(:sm_pending_originals, %{})
             pending_values = Process.get(:sm_pending_values, %{})
 
             case Enum.reduce_while(
                    key_records,
-                   {:ok, [], [], originals, pending_values},
-                   fn {key, record}, {:ok, entries, writes, originals, pending_values} ->
+                   {:ok, [], [], originals, pending_values, false},
+                   fn {key, record}, {:ok, entries, writes, originals, pending_values, dirty?} ->
                      value = flow_encode(record)
                      expire_at_ms = flow_state_record_expire_at(record)
                      previous = safe_ets_lookup(state.ets, key)
@@ -592,7 +600,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                            entries,
                            writes,
                            originals,
-                           pending_values
+                           pending_values,
+                           lagged_projection?,
+                           dirty?
                          )
 
                        {:ok, :blob_ref, stored_value, pending_value} ->
@@ -609,7 +619,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                            entries,
                            writes,
                            originals,
-                           pending_values
+                           pending_values,
+                           lagged_projection?,
+                           dirty?
                          )
 
                        {:error, _reason} = error ->
@@ -617,7 +629,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                      end
                    end
                  ) do
-              {:ok, entries, writes, originals, pending_values} ->
+              {:ok, entries, writes, originals, pending_values, dirty?} ->
+                if dirty?, do: queue_pending_lmdb_projection_dirty()
+
                 Process.put(:sm_pending_originals, originals)
                 Process.put(:sm_pending_values, pending_values)
                 Process.put(:sm_pending_writes, writes ++ Process.get(:sm_pending_writes, []))
@@ -645,7 +659,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
              entries,
              writes,
              originals,
-             pending_values
+             pending_values,
+             lagged_projection?,
+             dirty?
            ) do
         terminal? = Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state))
         disk_val = to_disk_binary(stored_value)
@@ -661,9 +677,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
           )
         end
 
-        if Ferricstore.Flow.LMDB.mode() == :lagged and terminal? do
-          queue_pending_lmdb_projection_dirty()
-        end
+        dirty? = dirty? or (lagged_projection? and terminal?)
 
         {ets_value, lfu, write} =
           cond do
@@ -692,7 +706,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         entry = {key, ets_value, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
         pending_values = Map.put(pending_values, key, {pending_value, expire_at_ms})
 
-        {:cont, {:ok, [entry | entries], [write | writes], originals, pending_values}}
+        {:cont, {:ok, [entry | entries], [write | writes], originals, pending_values, dirty?}}
       end
 
       defp flow_stage_new_state_record_batch_entry(
@@ -707,7 +721,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
              entries,
              writes,
              originals,
-             pending_values
+             pending_values,
+             lagged_projection?,
+             dirty?
            ) do
         terminal? = Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state))
         disk_val = to_disk_binary(stored_value)
@@ -724,9 +740,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
           )
         end
 
-        if Ferricstore.Flow.LMDB.mode() == :lagged and terminal? do
-          queue_pending_lmdb_projection_dirty()
-        end
+        dirty? = dirty? or (lagged_projection? and terminal?)
 
         {ets_value, lfu, write} =
           cond do
@@ -748,7 +762,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         entry = {key, ets_value, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
         pending_values = Map.put(pending_values, key, {pending_value, expire_at_ms})
 
-        {:cont, {:ok, [entry | entries], [write | writes], originals, pending_values}}
+        {:cont, {:ok, [entry | entries], [write | writes], originals, pending_values, dirty?}}
       end
 
       defp flow_index_put_many_new(state, records) do

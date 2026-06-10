@@ -12,6 +12,7 @@ defmodule FerricstoreServer.MixProject do
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
+      package: package(),
       deps: deps()
     ]
   end
@@ -26,12 +27,33 @@ defmodule FerricstoreServer.MixProject do
     ]
   end
 
+  defp package do
+    [
+      description:
+        "FerricStore TCP server with RESP compatibility and native binary protocol for FerricFlow.",
+      files: [
+        "lib",
+        "native/native_protocol_nif/.cargo",
+        "native/native_protocol_nif/src",
+        "native/native_protocol_nif/Cargo*",
+        "checksum-*.exs",
+        "mix.exs"
+      ],
+      licenses: ["Apache-2.0"],
+      links: %{
+        "GitHub" => "https://github.com/ferricstore/ferricstore"
+      }
+    ]
+  end
+
   defp deps do
     [
       {:ferricstore, in_umbrella: true},
       {:ranch, "~> 2.2"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.4"},
+      {:rustler_precompiled, "~> 0.8"},
+      {:rustler, "~> 0.37", optional: true},
       {:arch_test, "~> 0.3.1", only: [:dev, :test], runtime: false}
     ]
   end

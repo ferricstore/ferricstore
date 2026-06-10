@@ -328,6 +328,7 @@ fn flow_create_option<'a>(
                 FlowOptType::Positive(b"history_max_events"),
             ),
             (b"IDEMPOTENT", "idempotent", FlowOptType::Boolean),
+            (b"RETURN", "return", FlowOptType::Binary),
         ],
     )
 }
@@ -600,4 +601,3 @@ enum FlowPolicyOpt<'a> {
     Backoff(Term<'a>),
     Retention(Term<'a>),
 }
-

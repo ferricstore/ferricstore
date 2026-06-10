@@ -362,8 +362,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
           history_hot_max_events: Map.get(record, :history_hot_max_events),
           history_max_events: Map.get(record, :history_max_events),
           terminal?: flow_terminal_record?(record),
-          value_refs: flow_history_projection_value_refs(record),
-          value: Flow.encode_history_fields(record, event, now_ms, meta)
+          value: {:flow_history_fields, record, event, now_ms, meta}
         }
         |> flow_history_maybe_put_hot_evict_event_ids(
           flow_history_hot_evict_event_ids(record, event_id, version, previous_history_ms)
@@ -454,6 +453,136 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       defp flow_require_transition_lease(%{lease_token: nil}, nil), do: :ok
       defp flow_require_transition_lease(%{lease_token: token}, token), do: :ok
       defp flow_require_transition_lease(_record, _token), do: {:error, "ERR stale flow lease"}
+
+      defp flow_duplicate_terminal_noop?(record, attrs, terminal_state) do
+        Map.get(record, :state) == terminal_state and
+          Ferricstore.Flow.LMDB.terminal_state?(terminal_state) and
+          flow_same_fencing_token?(record, attrs)
+      end
+
+      defp flow_duplicate_transition_noop?(record, attrs, to_state) do
+        Map.get(record, :state) == to_state and
+          not Ferricstore.Flow.LMDB.terminal_state?(to_state) and
+          is_nil(Map.get(record, :lease_token)) and
+          flow_same_fencing_token?(record, attrs)
+      end
+
+      defp flow_duplicate_retry_noop?(state, record, attrs) do
+        case flow_attrs_fencing_token(attrs) do
+          fencing_token when is_integer(fencing_token) ->
+            is_nil(Map.get(record, :lease_token)) and
+              flow_same_fencing_token?(record, attrs) and
+              (flow_duplicate_retry_schedule_noop?(record, attrs) or
+                 flow_latest_history_event_matches?(state, record, "retry", fencing_token))
+
+          _ ->
+            false
+        end
+      end
+
+      defp flow_duplicate_retry_schedule_noop?(record, attrs) do
+        run_at_ms = Map.get(attrs, :run_at_ms)
+        state = Map.get(record, :state)
+        scheduled? = is_integer(Map.get(record, :next_run_at_ms))
+
+        cond do
+          state == "running" or Ferricstore.Flow.LMDB.terminal_state?(state) ->
+            false
+
+          is_integer(run_at_ms) ->
+            Map.get(record, :next_run_at_ms) == run_at_ms
+
+          scheduled? ->
+            state == flow_retry_run_state(record) and Map.get(record, :attempts, 0) > 0
+
+          true ->
+            false
+        end
+      end
+
+      defp flow_same_fencing_token?(record, attrs) do
+        case flow_attrs_fencing_token(attrs) do
+          fencing_token when is_integer(fencing_token) ->
+            Map.get(record, :fencing_token, 0) == fencing_token
+
+          _ ->
+            false
+        end
+      end
+
+      defp flow_attrs_fencing_token(attrs) do
+        case Map.fetch(attrs, :fencing_token) do
+          {:ok, fencing_token} -> fencing_token
+          :error -> nil
+        end
+      end
+
+      defp flow_latest_history_event_matches?(state, record, event, fencing_token) do
+        id = Map.get(record, :id)
+
+        if is_binary(id) and is_binary(event) do
+          history_key = FlowKeys.history_key(id, Map.get(record, :partition_key))
+
+          case flow_index_rank_range(state, history_key, 0, 0, true) do
+            [{event_id, _event_ms} | _] when is_binary(event_id) ->
+              flow_history_event_matches?(
+                state,
+                record,
+                history_key,
+                event_id,
+                event,
+                fencing_token
+              )
+
+            _ ->
+              false
+          end
+        else
+          false
+        end
+      end
+
+      defp flow_history_event_matches?(
+             state,
+             record,
+             history_key,
+             event_id,
+             event,
+             fencing_token
+           ) do
+        compound_key = FlowKeys.stream_entry_key_from_history_key(history_key, event_id)
+
+        case flow_history_lookup_value(state, compound_key) do
+          {:hit, value, _expire_at_ms} ->
+            fields =
+              value
+              |> flow_decode_history_fields(record)
+              |> flow_history_fields_to_map()
+
+            Map.get(fields, "event") == event and
+              flow_history_integer_field(fields, "fencing_token") == fencing_token and
+              flow_history_integer_field(fields, "version") == Map.get(record, :version)
+
+          _ ->
+            false
+        end
+      end
+
+      defp flow_history_integer_field(fields, key) do
+        case Map.get(fields, key) do
+          value when is_integer(value) ->
+            value
+
+          value when is_binary(value) ->
+            case Integer.parse(value) do
+              {integer, ""} -> integer
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+      end
 
       defp flow_require_rewindable(%{lease_token: token}) when is_binary(token),
         do: {:error, "ERR flow cannot rewind leased flow"}

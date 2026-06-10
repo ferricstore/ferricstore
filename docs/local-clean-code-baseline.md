@@ -164,3 +164,19 @@ Raw output:
 ```text
 /tmp/ferricstore-clean-code-baseline/dbos_1m.txt
 ```
+
+## Repeatable runner
+
+The same benchmark shape can be run from the repo with:
+
+```bash
+python3 bench/local_regression_baseline.py --start-server --suite all
+```
+
+Dry-run the exact commands without starting the server or running long benchmarks:
+
+```bash
+python3 bench/local_regression_baseline.py --dry-run
+```
+
+This runner keeps the RESP/memtier and DBOS-style Python SDK baselines stable. It does not benchmark the native TCP protocol until the SDK has a native transport adapter.

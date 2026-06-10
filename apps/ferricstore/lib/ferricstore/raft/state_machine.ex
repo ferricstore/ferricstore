@@ -125,8 +125,6 @@ defmodule Ferricstore.Raft.StateMachine do
   @sm_apply_state_key :sm_apply_state
   @sm_standalone_staged_key :sm_standalone_staged_apply
   @sm_waraft_projection_writer_key :sm_waraft_projection_writer
-  @sm_force_async_flow_history_key :sm_force_async_flow_history
-  @sm_force_sync_flow_history_key :sm_force_sync_flow_history
   @sm_pending_write_keys [
     :sm_pending_writes,
     :sm_pending_originals,

@@ -650,32 +650,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
              ra_index
            ) do
         result =
-          if sync_flow_history_projection?() do
-            # history projection, otherwise crash recovery can skip committed
-            # commands whose Flow history was still only in projector memory.
-            HistoryProjector.write_entries_sync(
-              ctx,
-              shard_index,
-              flow_history_projection_shard_data_path(state, ctx, shard_index),
-              entries,
-              ra_index,
-              flow_history_projection_opts(state, ctx)
-            )
-          else
-            case HistoryProjector.enqueue_async(ctx, shard_index, entries, ra_index) do
-              :ok ->
-                :ok
-
-              {:error, _reason} ->
-                HistoryProjector.write_entries_sync(
-                  ctx,
-                  shard_index,
-                  flow_history_projection_shard_data_path(state, ctx, shard_index),
-                  entries,
-                  ra_index,
-                  flow_history_projection_opts(state, ctx)
-                )
-            end
+          case HistoryProjector.enqueue_async(ctx, shard_index, entries, ra_index) do
+            :ok -> :ok
+            {:error, reason} -> {:error, reason}
           end
 
         case result do
@@ -716,17 +693,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
       defp record_waraft_replay_dependency(_kind, _shard_index, _index), do: :ok
 
-      defp flow_history_projection_shard_data_path(_state, %{data_dir: data_dir}, shard_index)
-           when is_binary(data_dir) do
-        Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
-      end
-
-      defp flow_history_projection_shard_data_path(state, _ctx, _shard_index),
-        do: state.shard_data_path
-
-      defp flow_history_projection_opts(%{ets: keydir}, nil), do: [keydir: keydir]
-      defp flow_history_projection_opts(_state, _ctx), do: []
-
       defp queue_pending_delete(key, prob_path) do
         pending = Process.get(:sm_pending_writes, [])
         Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
@@ -742,14 +708,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       end
 
       defp standalone_staged_apply?, do: Process.get(@sm_standalone_staged_key) == true
-
-      defp sync_flow_history_projection?,
-        # The standalone staging flag is also used by WARaft segment apply to delay
-        # ETS publication until segment projection succeeds. That must not make
-        # async Flow history synchronous; WARaft gates replay on the projected index.
-        do:
-          (standalone_staged_apply?() and not waraft_segment_projection_apply?()) or
-            Process.get(@sm_force_sync_flow_history_key) == true
 
       defp waraft_segment_projection_apply?,
         do: is_function(Process.get(@sm_waraft_projection_writer_key))
@@ -895,20 +853,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
         }
       end
 
-      defp flow_async_history_config(config) do
-        Map.get_lazy(config, :flow_async_history, fn ->
-          case Application.get_env(:ferricstore, :flow_async_history, true) do
-            value when value in [true, "1", "true"] ->
-              true
-
-            value when value in [false, "0", "false"] ->
-              false
-
-            _ ->
-              true
-          end
-        end)
-      end
+      defp flow_async_history_config(_config), do: true
 
       defp duration_us(started_at) do
         System.monotonic_time()

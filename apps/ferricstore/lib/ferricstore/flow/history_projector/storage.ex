@@ -90,6 +90,11 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
 
   def encode_entry(%{value: value} = entry) when is_binary(value), do: entry
 
+  def encode_entry(%{value: {:flow_history_fields, record, event, now_ms, meta}} = entry) do
+    value = flow_call(:encode_history_fields, [record, event, now_ms, meta])
+    Map.put(entry, :value, value)
+  end
+
   def encode_entry(%{snapshot: snapshot} = entry) do
     Map.put(entry, :value, flow_call(:encode_history_snapshot, [snapshot]))
   end

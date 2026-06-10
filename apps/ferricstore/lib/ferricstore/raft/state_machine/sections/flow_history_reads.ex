@@ -828,8 +828,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
             history_hot_max_events: Map.get(record, :history_hot_max_events),
             history_max_events: Map.get(record, :history_max_events),
             terminal?: flow_terminal_record?(record),
-            value_refs: flow_history_projection_value_refs(record),
-            value: Flow.encode_history_fields(record, event, now_ms, meta)
+            value: {:flow_history_fields, record, event, now_ms, meta}
           }
           |> flow_history_maybe_put_hot_evict_event_ids(
             flow_history_hot_evict_event_ids(record, event_id, version, previous_history_ms)
@@ -879,41 +878,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       defp flow_previous_history_ms(_record), do: nil
 
       defp flow_history_put_or_queue_entry(state, entry) do
-        if flow_async_history_enabled?(state) do
-          queue_pending_flow_history_projection(entry)
+        if Process.get(:sm_pending_flow_history_projections, :undefined) == :undefined do
+          ra_index = current_ra_index()
+
+          case HistoryProjector.enqueue_async(
+                 instance_ctx_for_state(state),
+                 state.shard_index,
+                 [entry],
+                 ra_index
+               ) do
+            :ok ->
+              record_waraft_replay_dependency(:history, state.shard_index, ra_index)
+              :ok
+
+            {:error, reason} ->
+              {:error, {:flow_history_projection_failed, reason}}
+          end
         else
-          raw_put_cold(state, entry.key, flow_history_entry_value(entry), entry.expire_at_ms)
+          queue_pending_flow_history_projection(entry)
         end
       end
 
-      defp flow_history_entry_value(%{value: value}) when is_binary(value), do: value
+      defp flow_async_history?(_state), do: true
 
-      defp flow_history_entry_value(%{snapshot: snapshot}) do
-        Flow.encode_history_snapshot(snapshot)
-      end
-
-      defp flow_history_entry_value(%{record: record, event: event, now_ms: now_ms} = entry) do
-        Flow.encode_history_fields(record, event, now_ms, Map.get(entry, :meta, %{}))
-      end
-
-      defp flow_async_history?(state), do: Map.get(state, :flow_async_history, false) == true
-
-      defp flow_async_history_enabled?(state) do
-        flow_async_history?(state) or Process.get(@sm_force_async_flow_history_key) == true
-      end
+      defp flow_async_history_enabled?(_state), do: true
 
       defp flow_with_forced_async_history(fun) when is_function(fun, 0) do
-        previous = Process.get(@sm_force_async_flow_history_key, :unset)
-        Process.put(@sm_force_async_flow_history_key, true)
-
-        try do
-          fun.()
-        after
-          case previous do
-            :unset -> Process.delete(@sm_force_async_flow_history_key)
-            value -> Process.put(@sm_force_async_flow_history_key, value)
-          end
-        end
+        fun.()
       end
 
       defp flow_history_index_put(state, history_key, event_id, ms, 1) do

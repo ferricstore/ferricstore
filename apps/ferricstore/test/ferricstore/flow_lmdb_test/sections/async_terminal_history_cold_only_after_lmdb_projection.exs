@@ -103,17 +103,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
         ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
         shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
 
-        _projector =
-          start_supervised!(
-            {Ferricstore.Flow.HistoryProjector,
-             [
-               shard_index: 0,
-               shard_data_path: shard_data_path,
-               instance_ctx: ctx,
-               recover_on_init: false
-             ]}
-          )
-
         on_exit(fn ->
           Ferricstore.Test.IsolatedInstance.checkin(ctx)
           restore_env(:flow_lmdb_mode, old_mode)

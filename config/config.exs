@@ -3,7 +3,7 @@ import Config
 # Repo checkouts build native crates from source by default. Packaged
 # dependency users still get RustlerPrecompiled artifacts because dependency
 # config files are not imported into the parent application.
-config :rustler_precompiled, :force_build, ferricstore: true
+config :rustler_precompiled, :force_build, ferricstore: true, ferricstore_server: true
 
 config :ferricstore, Ferricstore.Bitcask.NIF,
   skip_compilation?: false,
@@ -15,6 +15,22 @@ config :ferricstore, :ferricstore_wal_nif,
 
 # TCP server port (default: 6379, matches Redis)
 config :ferricstore, :port, 6379
+
+# Optional native binary SDK/data-plane listener. Disabled by default so the
+# Redis-compatible RESP listener remains the only public port unless explicitly
+# enabled with FERRICSTORE_NATIVE_ENABLED=true.
+config :ferricstore,
+  native_protocol_enabled: false,
+  native_port: 6388,
+  native_tls_port: nil,
+  native_max_frame_bytes: 16 * 1024 * 1024,
+  native_max_lanes_per_connection: 1024,
+  native_lane_max_queue: 1024,
+  native_max_batch_commands: 1024,
+  native_max_inflight_per_connection: 4096,
+  native_max_inflight_per_lane: 1024,
+  native_response_chunk_bytes: 0,
+  native_max_pending_chunks: 1024
 
 # Data directory for Bitcask shards
 config :ferricstore, :data_dir, "data"

@@ -396,6 +396,7 @@ defmodule Ferricstore.FlowTest.Sections.ClaimDueMultiStateClaimsEarliestDueJobIn
               state: "queued",
               worker: "worker-a",
               partition_key: partition_key,
+              priority: 0,
               limit: 1,
               block_ms: 500,
               payload: false

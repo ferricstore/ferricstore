@@ -130,6 +130,11 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
     _ -> 0
   end
 
+  def append_overflow(projector, entries),
+    do: PendingRegistry.append_overflow(projector, entries)
+
+  def take_overflow(projector), do: PendingRegistry.take_overflow(projector)
+
   def entry_index_range(entries) do
     Enum.reduce(entries, nil, fn entry, acc ->
       case Map.get(entry, :ra_index) do

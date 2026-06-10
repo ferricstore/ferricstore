@@ -295,6 +295,32 @@ if config_env() == :prod do
          "once" -> :once
          n -> String.to_integer(n)
        end),
+    native_protocol_enabled: boolean_env.("FERRICSTORE_NATIVE_ENABLED", false),
+    native_port: String.to_integer(System.get_env("FERRICSTORE_NATIVE_PORT", "6388")),
+    native_tls_port:
+      (case System.get_env("FERRICSTORE_NATIVE_TLS_PORT") do
+         nil -> nil
+         value -> String.to_integer(value)
+       end),
+    native_tls_cert_file: System.get_env("FERRICSTORE_NATIVE_TLS_CERT_FILE"),
+    native_tls_key_file: System.get_env("FERRICSTORE_NATIVE_TLS_KEY_FILE"),
+    native_tls_ca_cert_file: System.get_env("FERRICSTORE_NATIVE_TLS_CA_CERT_FILE"),
+    native_max_frame_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_FRAME_BYTES", "16777216")),
+    native_max_lanes_per_connection:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_LANES_PER_CONNECTION", "1024")),
+    native_lane_max_queue:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_LANE_MAX_QUEUE", "1024")),
+    native_max_batch_commands:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_BATCH_COMMANDS", "1024")),
+    native_max_inflight_per_connection:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_CONNECTION", "4096")),
+    native_max_inflight_per_lane:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_LANE", "1024")),
+    native_response_chunk_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_RESPONSE_CHUNK_BYTES", "0")),
+    native_max_pending_chunks:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_PENDING_CHUNKS", "1024")),
     tcp_nodelay: boolean_env.("FERRICSTORE_TCP_NODELAY", true),
     tcp_recbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_RECBUF", "131072")),
     tcp_sndbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_SNDBUF", "131072"))

@@ -326,6 +326,8 @@ defmodule FerricstoreServer.Resp.ParserTest.Sections.FlowCommandAst do
                        "iot",
                        "INDEPENDENT",
                        "true",
+                       "RETURN",
+                       "OK_ON_SUCCESS",
                        "ITEMS",
                        "flow-auto-1",
                        "payload-1",
@@ -336,7 +338,7 @@ defmodule FerricstoreServer.Resp.ParserTest.Sections.FlowCommandAst do
                       [
                         {:id, "flow-auto-1", :payload, "payload-1"},
                         {:id, "flow-auto-2", :payload, "payload-2"}
-                      ], [type: "iot", independent: true]}, ["AUTO"]},
+                      ], [type: "iot", independent: true, return: "OK_ON_SUCCESS"]}, ["AUTO"]},
                     {:command, "FLOW.TRANSITION_MANY",
                      [
                        "MIXED",
@@ -370,7 +372,7 @@ defmodule FerricstoreServer.Resp.ParserTest.Sections.FlowCommandAst do
                        "flow.fail_many tenant-a INDEPENDENT true ITEMS flow-1 lease-1 1\r\n" <>
                        "flow.cancel_many tenant-a INDEPENDENT true ITEMS flow-1 1\r\n" <>
                        "flow.create_many MIXED TYPE iot RUN_AT 1000 IDEMPOTENT true INDEPENDENT true ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
-                       "flow.create_many AUTO TYPE iot INDEPENDENT true ITEMS flow-auto-1 payload-1 flow-auto-2 payload-2\r\n" <>
+                 "flow.create_many AUTO TYPE iot INDEPENDENT true RETURN OK_ON_SUCCESS ITEMS flow-auto-1 payload-1 flow-auto-2 payload-2\r\n" <>
                        "flow.transition_many MIXED queued ready RUN_AT 2000 INDEPENDENT true ITEMS flow-1 device-a 1 - flow-2 device-b 2 lease-2\r\n"
                    )
         end

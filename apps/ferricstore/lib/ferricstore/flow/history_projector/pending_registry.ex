@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
   @pending_registry :ferricstore_flow_history_projector_pending_registry
   @replay_reservation_registry :ferricstore_flow_history_projector_replay_reservations
+  @overflow_registry :ferricstore_flow_history_projector_overflow
 
   def reserve(%{pending_counter: counter, max_pending_entries: max_pending}, count),
     do: reserve_counter(counter, count, max_pending)
@@ -159,6 +160,33 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
   def replay_table, do: ensure_replay_reservation_registry()
 
+  def append_overflow(projector, entries) when is_atom(projector) and is_list(entries) do
+    table = ensure_overflow_registry()
+    sequence = :erlang.unique_integer([:monotonic, :positive])
+    :ets.insert(table, {{projector, sequence}, entries})
+    :ok
+  rescue
+    error -> {:error, {:overflow_append_failed, error}}
+  end
+
+  def take_overflow(projector) when is_atom(projector) do
+    table = ensure_overflow_registry()
+
+    rows =
+      :ets.select(table, [
+        {{{projector, :"$1"}, :"$2"}, [], [{{:"$1", :"$2"}}]}
+      ])
+
+    rows
+    |> Enum.sort_by(fn {sequence, _entries} -> sequence end)
+    |> Enum.flat_map(fn {sequence, entries} ->
+      :ets.delete(table, {projector, sequence})
+      entries
+    end)
+  rescue
+    _ -> []
+  end
+
   defp ensure_pending_registry(name) do
     ensure_registry(
       name,
@@ -178,6 +206,20 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
         write_concurrency: true
       ],
       :replay_reservation_registry_unavailable
+    )
+  end
+
+  defp ensure_overflow_registry do
+    ensure_registry(
+      @overflow_registry,
+      [
+        :named_table,
+        :public,
+        :ordered_set,
+        read_concurrency: true,
+        write_concurrency: true
+      ],
+      :overflow_registry_unavailable
     )
   end
 

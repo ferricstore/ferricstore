@@ -68,8 +68,9 @@ jobs:
       - name: Wait for all precompiled NIF artifacts
         if: steps.hex_creds.outputs.available == 'true'
         run: |
-          # Three crates x six targets = 18 tarballs. The RESP parser NIF is
+          # Four crates x six targets = 24 tarballs. The RESP parser NIF is
           # part of the core package because embedded and server paths share it.
+          # native_protocol_nif belongs to the server package/data plane.
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           for i in $(seq 1 90); do
@@ -77,9 +78,10 @@ jobs:
             BITCASK_COUNT=$(echo "$ASSETS" | grep -c "ferricstore_bitcask-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
             WAL_COUNT=$(echo "$ASSETS" | grep -c "ferricstore_wal_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
             RESP_COUNT=$(echo "$ASSETS" | grep -c "resp_parser_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
-            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6, resp=$RESP_COUNT/6"
-            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ] && [ "$RESP_COUNT" -ge 6 ]; then
-              echo "All 18 NIF artifacts present."
+            NATIVE_COUNT=$(echo "$ASSETS" | grep -c "native_protocol_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
+            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6, resp=$RESP_COUNT/6, native=$NATIVE_COUNT/6"
+            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ] && [ "$RESP_COUNT" -ge 6 ] && [ "$NATIVE_COUNT" -ge 6 ]; then
+              echo "All 24 NIF artifacts present."
               break
             fi
             if [ "$i" = "90" ]; then
@@ -141,6 +143,13 @@ jobs:
             "checksum-Elixir.Ferricstore.Resp.ParserNif.exs" \
             "resp_parser_nif-v${VERSION}-*.tar.gz" \
             "libresp_parser_nif-v${VERSION}-*.tar.gz"
+
+          cd ../ferricstore_server
+
+          generate_checksum_file \
+            "checksum-Elixir.FerricstoreServer.Native.NIF.exs" \
+            "native_protocol_nif-v${VERSION}-*.tar.gz" \
+            "libnative_protocol_nif-v${VERSION}-*.tar.gz"
 
       # Publish core package
       - name: Publish ferricstore (core)

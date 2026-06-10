@@ -402,7 +402,7 @@ defmodule FerricStore do
 
   defdelegate flow_create(id, opts), to: FlowAPI
   defdelegate flow_value_put(value, opts \\ []), to: FlowAPI
-  defdelegate flow_value_mget(refs), to: FlowAPI
+  defdelegate flow_value_mget(refs, opts \\ []), to: FlowAPI
   defdelegate flow_signal(id, opts), to: FlowAPI
   defdelegate flow_create_many(partition_key, items, opts \\ []), to: FlowAPI
   defdelegate flow_spawn_children(parent_id, children, opts \\ []), to: FlowAPI

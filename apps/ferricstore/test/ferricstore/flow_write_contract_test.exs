@@ -200,6 +200,64 @@ defmodule Ferricstore.FlowWriteContractTest do
            "Flow apply must not block on LMDB projection enqueue; flush/request are the sync boundary"
   end
 
+  test "flow history projection never sync-writes from state-machine apply" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    refute source =~ "HistoryProjector.write_entries_sync",
+           "Flow apply must enqueue history projection asynchronously and gate replay/release instead of sync-writing history"
+
+    refute source =~ "with_sync_flow_history",
+           "WARaft Flow apply must not force sync history projection"
+
+    refute source =~ "raw_put_cold(state, entry.key, flow_history_entry_value",
+           "Flow history writes must not have an inline cold-write branch controlled by config"
+  end
+
+  test "flow history projection entries stay lazy on the state-machine hot path" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    [projection_entry_source] =
+      Regex.run(~r/defp flow_history_projection_entry\(.*?^      end/ms, source)
+
+    refute projection_entry_source =~ "Flow.encode_history_fields",
+           "Flow apply should not encode history values; HistoryProjector encodes lazy descriptors async"
+
+    assert projection_entry_source =~ "value: {:flow_history_fields, record, event, now_ms, meta}"
+
+    refute projection_entry_source =~ "record: record",
+           "hot-path projection entries should use one compact value descriptor instead of extra map fields"
+
+    refute projection_entry_source =~ "event: event",
+           "hot-path projection entries should use one compact value descriptor instead of extra map fields"
+
+    refute projection_entry_source =~ "now_ms: now_ms",
+           "hot-path projection entries should use one compact value descriptor instead of extra map fields"
+
+    refute source =~ "Flow.encode_history_fields(record, event, now_ms, Map.get(entry, :meta, %{}))",
+           "single-command history planning must also enqueue lazy descriptors"
+
+    assert source =~ "value: {:flow_history_fields, record, event, now_ms, meta}"
+  end
+
+  test "flow history projector pressure path stores overflow instead of sync-failing apply" do
+    source = File.read!("lib/ferricstore/flow/history_projector.ex")
+
+    assert [_, async_source] =
+             String.split(source, "\n  def enqueue_async(instance_ctx, shard_index, entries, ra_index)",
+               parts: 2
+             )
+
+    assert [async_source, _] = String.split(async_source, "\n  @spec flush", parts: 2)
+
+    assert async_source =~ "Pending.append_overflow(projector, entries)"
+
+    refute async_source =~ "GenServer.cast(pid, :drain_overflow)",
+           "queue-full overflow must not cast one drain message per apply batch; flush/retry drains it coalesced"
+
+    refute async_source =~ "{:error, :queue_full}",
+           "queue-full history projection must move to retry overflow, not fail the Ra apply path"
+  end
+
   test "flow claim_due native planner owns history-ready planning without LMDB sync" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 

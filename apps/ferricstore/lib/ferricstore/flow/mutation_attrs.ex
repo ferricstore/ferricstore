@@ -138,7 +138,10 @@ defmodule Ferricstore.Flow.MutationAttrs do
         partition_key,
         mismatch_error \\ "ERR flow partition_key mismatch in batch"
       ) do
-    base_opts = Keyword.delete(opts, :partition_key)
+    base_opts =
+      opts
+      |> Keyword.delete(:partition_key)
+      |> Keyword.delete(:return)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- create_many_item_opts(item),

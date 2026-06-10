@@ -641,11 +641,17 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
              now_ms: now_ms + 1
            ]}
 
-        assert [:ok, {:error, _reason}] =
+        assert [:ok, :ok] =
                  Ferricstore.Flow.pipeline_write_batch_independent(ctx, [command, command])
 
         assert {:ok, %{state: "completed"}} =
                  FerricStore.flow_get(id, partition_key: partition_key)
+
+        assert {:ok, history} = FerricStore.flow_history(id, partition_key: partition_key)
+
+        assert Enum.count(history, fn {_event_id, fields} ->
+                 Map.get(fields, "event") == "completed" or Map.get(fields, :event) == "completed"
+               end) == 1
       end
 
       test "pipeline_write_batch_independent transitions preserve duplicate flow order" do

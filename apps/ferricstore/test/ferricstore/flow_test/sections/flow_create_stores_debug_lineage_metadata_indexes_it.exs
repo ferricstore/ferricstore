@@ -421,7 +421,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
 
         rejected_id = uid("return-rejected")
 
-        assert {:error, "ERR flow return option is not supported"} =
+        assert {:error, "ERR flow return must be items or ok_on_success"} =
                  FerricStore.flow_create_many(
                    partition,
                    [%{id: rejected_id}],

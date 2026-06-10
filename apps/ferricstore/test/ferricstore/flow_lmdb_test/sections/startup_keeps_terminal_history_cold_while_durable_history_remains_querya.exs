@@ -270,6 +270,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
 
         assert completed.state == "completed"
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
         lmdb_path =
           ctx.data_dir |> Ferricstore.DataDir.shard_data_path(0) |> Ferricstore.Flow.LMDB.path()
@@ -345,6 +346,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
                  Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
         lmdb_path =
           ctx.data_dir |> Ferricstore.DataDir.shard_data_path(0) |> Ferricstore.Flow.LMDB.path()

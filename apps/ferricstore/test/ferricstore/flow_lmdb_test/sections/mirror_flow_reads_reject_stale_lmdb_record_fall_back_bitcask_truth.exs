@@ -82,6 +82,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
 
         assert completed.version == 3
         assert completed.state == "completed"
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
         state_key = Ferricstore.Flow.Keys.state_key(completed.id, partition_key)
@@ -276,6 +277,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
                  })
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
         lmdb_path =
           ctx.data_dir

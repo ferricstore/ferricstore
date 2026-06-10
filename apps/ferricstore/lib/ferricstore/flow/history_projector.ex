@@ -16,6 +16,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   alias Ferricstore.Store.{DiskPressure, WriteVersion}
 
   @retry_interval_ms 50
+  @flush_drain_limit 16
 
   @type entry :: %{
           required(:key) => binary(),
@@ -113,14 +114,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   def enqueue_async(instance_ctx, shard_index, entries, ra_index) when is_list(entries) do
     projector = name(instance_ctx, shard_index)
+    entries = stamp_ra_index(entries, ra_index)
 
     case Process.whereis(projector) do
       nil ->
-        {:error, :not_started}
+        enqueue_overflow(instance_ctx, shard_index, projector, nil, entries)
 
       pid when is_pid(pid) ->
-        entries = stamp_ra_index(entries, ra_index)
-
         case Pending.reserve_pending(projector, length(entries)) do
           :ok ->
             Pending.reserve_replay_range(projector, entries)
@@ -140,11 +140,25 @@ defmodule Ferricstore.Flow.HistoryProjector do
               max_pending_entries
             )
 
-            {:error, :queue_full}
+            enqueue_overflow(instance_ctx, shard_index, projector, pid, entries)
         end
     end
   catch
     :exit, _reason -> {:error, :not_started}
+  end
+
+  defp enqueue_overflow(instance_ctx, shard_index, projector, pid, entries) do
+    Pending.reserve_replay_range(projector, entries)
+
+    case Pending.append_overflow(projector, entries) do
+      :ok ->
+        _ = pid
+        :ok
+
+      {:error, reason} ->
+        mark_queue_full(instance_ctx, shard_index)
+        {:error, {:overflow_failed, reason}}
+    end
   end
 
   @spec flush(map() | nil, non_neg_integer(), timeout()) :: :ok | {:error, term()}
@@ -288,8 +302,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
     projected_index = projected_index(instance_ctx, shard_index, shard_data_path)
     flushed_index = max(projected_index, Pending.replay_reservation_flushed_index(projector_name))
 
-    {:ok,
-     Config.initial_state(
+    state =
+      Config.initial_state(
        projector_name,
        shard_index,
        shard_data_path,
@@ -297,10 +311,17 @@ defmodule Ferricstore.Flow.HistoryProjector do
        pending_counter,
        max_pending_entries,
        flushed_index
-     )}
+      )
+
+    Process.send_after(self(), :drain_overflow, 0)
+    {:ok, state}
   end
 
   @impl true
+  def handle_cast(:drain_overflow, state) do
+    {:noreply, drain_overflow(state)}
+  end
+
   def handle_cast({:enqueue_reserved, entries}, state) do
     {:noreply, enqueue_entries(state, entries)}
   end
@@ -332,7 +353,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   @impl true
   def handle_call(:flush, _from, state) do
-    state = flush_pending(state)
+    state = flush_until_idle(state)
 
     result =
       if state.pending_count == 0 and state.requested_index == nil,
@@ -394,7 +415,59 @@ defmodule Ferricstore.Flow.HistoryProjector do
     {:noreply, flush_pending(%{state | flush_timer: nil}, :chunk)}
   end
 
+  def handle_info(:drain_overflow, state) do
+    {:noreply, drain_overflow(state)}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp flush_until_idle(state, attempts \\ @flush_drain_limit)
+
+  defp flush_until_idle(state, attempts) when attempts <= 0, do: state
+
+  defp flush_until_idle(state, attempts) do
+    state =
+      state
+      |> drain_overflow()
+      |> flush_pending()
+
+    if state.pending_count == 0 and state.requested_index == nil do
+      case drain_overflow(state) do
+        %{pending_count: 0, requested_index: nil} = idle_state -> idle_state
+        active_state -> flush_until_idle(active_state, attempts - 1)
+      end
+    else
+      flush_until_idle(state, attempts - 1)
+    end
+  end
+
+  defp drain_overflow(state) do
+    case Pending.take_overflow(state.projector_name) do
+      [] ->
+        state
+
+      entries ->
+        case Pending.reserve_pending(state, length(entries)) do
+          :ok ->
+            enqueue_entries(state, entries)
+
+          {:error, :queue_full, pending_entries, max_pending_entries} ->
+            :ok = Pending.append_overflow(state.projector_name, entries)
+            mark_queue_full(state.instance_ctx, state.shard_index)
+
+            emit_queue_full(
+              state.instance_ctx,
+              state.shard_index,
+              pending_entries,
+              length(entries),
+              max_pending_entries
+            )
+
+            Process.send_after(self(), :drain_overflow, @retry_interval_ms)
+            state
+        end
+    end
+  end
 
   defp enqueue_entries(state, entries) do
     pending = Enum.reverse(entries, state.pending)
@@ -447,7 +520,9 @@ defmodule Ferricstore.Flow.HistoryProjector do
           })
           |> publish_backlog_state()
 
-        maybe_schedule_next_chunk(next_state)
+        next_state
+        |> maybe_schedule_next_chunk()
+        |> drain_overflow()
 
       {:error, reason} ->
         mark_flush_failure(state.instance_ctx, state.shard_index)
@@ -523,6 +598,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
             flushed_index: max_index(state.flushed_index, projected_index)
         }
         |> publish_backlog_state()
+        |> drain_overflow()
 
       {:error, reason} ->
         mark_flush_failure(state.instance_ctx, state.shard_index)

@@ -29,7 +29,7 @@ defmodule Ferricstore.Flow do
   end
 
   defdelegate value_put(ctx, value, opts \\ []), to: Ferricstore.Flow.ValueStore
-  defdelegate value_mget(ctx, refs), to: Ferricstore.Flow.ValueStore
+  defdelegate value_mget(ctx, refs, opts \\ []), to: Ferricstore.Flow.ValueStore
 
   defdelegate signal(ctx, id, opts), to: Ferricstore.Flow.Signal, as: :run
 
@@ -81,7 +81,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
-           :ok <- validate_opts(opts),
+           :ok <- validate_opts(opts, return: true),
+           {:ok, return_mode} <- many_return_mode(opts),
            {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- Ferricstore.Flow.MutationAttrs.validate_create_many_items(items),
            {:ok, attrs_list} <-
@@ -89,8 +90,14 @@ defmodule Ferricstore.Flow do
            :ok <-
              Ferricstore.Flow.MutationAttrs.validate_unique_create_ids(attrs_list, independent?) do
         if independent? do
-          ctx
-          |> Router.flow_create_many_independent(attrs_list)
+          result =
+            if return_mode == :ok_on_success do
+              Router.flow_create_pipeline_batch_ok_on_success(ctx, attrs_list)
+            else
+              Router.flow_create_many_independent(ctx, attrs_list)
+            end
+
+          result
           |> then(&{:ok, &1})
           |> maybe_notify_claim_waiters(attrs_list, :state)
         else
@@ -265,7 +272,7 @@ defmodule Ferricstore.Flow do
     if claim_ready_hint_now?(attrs) do
       type = Map.get(attrs, :type)
       state = claim_ready_state(attrs, state_key)
-      priority = Map.get(attrs, :priority)
+      priority = Map.get(attrs, :priority, @default_priority)
       partition_key = Map.get(attrs, :partition_key)
       limit = max(Map.get(attrs, :limit, 1), 1)
 
@@ -750,6 +757,19 @@ defmodule Ferricstore.Flow do
 
       true ->
         :ok
+    end
+  end
+
+  defp many_return_mode(opts) do
+    case Keyword.get(opts, :return, :items) do
+      nil -> {:ok, :items}
+      :items -> {:ok, :items}
+      "items" -> {:ok, :items}
+      "ITEMS" -> {:ok, :items}
+      :ok_on_success -> {:ok, :ok_on_success}
+      "ok_on_success" -> {:ok, :ok_on_success}
+      "OK_ON_SUCCESS" -> {:ok, :ok_on_success}
+      _ -> {:error, "ERR flow return must be items or ok_on_success"}
     end
   end
 
