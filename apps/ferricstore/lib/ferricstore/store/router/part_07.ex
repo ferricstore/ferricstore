@@ -175,20 +175,46 @@ defmodule Ferricstore.Store.Router.Part07 do
             rem(idx - start_idx + ctx.shard_count, ctx.shard_count)
           end)
 
-        case flow_claim_due_partition_key_commands(ctx, groups, attrs, limit) do
+        if limit == 1 do
+          flow_claim_due_partition_key_groups_one(ctx, groups, attrs)
+        else
+          case flow_claim_due_partition_key_commands(ctx, groups, attrs, limit) do
+            [] ->
+              {:ok, []}
+
+            [{key, command}] ->
+              case raft_write(ctx, shard_for(ctx, key), key, command) do
+                {:ok, records} when is_list(records) -> {:ok, Enum.take(records, limit)}
+                other -> other
+              end
+
+            commands ->
+              ctx
+              |> pipeline_write_batch(commands)
+              |> flow_claim_due_partition_key_results(limit)
+          end
+        end
+      end
+
+      defp flow_claim_due_partition_key_groups_one(_ctx, [], _attrs), do: {:ok, []}
+
+      defp flow_claim_due_partition_key_groups_one(ctx, [group | rest], attrs) do
+        case flow_claim_due_partition_key_commands(ctx, [group], attrs, 1) do
           [] ->
-            {:ok, []}
+            flow_claim_due_partition_key_groups_one(ctx, rest, attrs)
 
           [{key, command}] ->
             case raft_write(ctx, shard_for(ctx, key), key, command) do
-              {:ok, records} when is_list(records) -> {:ok, Enum.take(records, limit)}
+              {:ok, []} -> flow_claim_due_partition_key_groups_one(ctx, rest, attrs)
+              {:ok, records} when is_list(records) -> {:ok, Enum.take(records, 1)}
               other -> other
             end
 
           commands ->
-            ctx
-            |> pipeline_write_batch(commands)
-            |> flow_claim_due_partition_key_results(limit)
+            case pipeline_write_batch(ctx, commands) |> flow_claim_due_partition_key_results(1) do
+              {:ok, []} -> flow_claim_due_partition_key_groups_one(ctx, rest, attrs)
+              other -> other
+            end
         end
       end
 
