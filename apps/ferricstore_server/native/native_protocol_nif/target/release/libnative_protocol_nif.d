@@ -1,1 +1,0 @@
-/Users/yoavgea/repos/ferricstore/apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.dylib: /Users/yoavgea/repos/ferricstore/apps/ferricstore_server/native/native_protocol_nif/src/lib.rs
