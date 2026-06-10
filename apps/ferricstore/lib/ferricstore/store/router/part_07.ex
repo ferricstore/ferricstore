@@ -549,7 +549,7 @@ defmodule Ferricstore.Store.Router.Part07 do
 
       defp flow_auto_partition_keys_for_shard(%{shard_count: shard_count} = ctx, idx)
            when is_integer(shard_count) and shard_count > 0 and is_integer(idx) do
-        key = {__MODULE__, :flow_auto_partition_keys_for_shard, shard_count}
+        key = {__MODULE__, :flow_auto_partition_keys_for_shard, ctx.name, ctx.slot_map}
 
         key
         |> :persistent_term.get(nil)

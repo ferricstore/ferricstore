@@ -246,7 +246,9 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert [_, async_source] =
              String.split(
                source,
-               "\n  def enqueue_async(instance_ctx, shard_index, entries, ra_index)", parts: 2)
+               "\n  def enqueue_async(instance_ctx, shard_index, entries, ra_index)",
+               parts: 2
+             )
 
     assert [async_source, _] = String.split(async_source, "\n  @spec flush", parts: 2)
 
@@ -443,6 +445,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert precheck_source =~ "NativeFlowIndex.due_keys_present"
     assert precheck_source =~ "flow_claim_due_auto_precheck_keys"
     assert source =~ "flow_auto_partition_keys_for_shard"
+    assert source =~ "{__MODULE__, :flow_auto_partition_keys_for_shard, ctx.name, ctx.slot_map}"
   end
 
   test "flow claim_due reclaim precheck does not scan cold due rows for running leases" do
