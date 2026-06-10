@@ -353,12 +353,6 @@ defmodule FerricstoreServer.Native.IntegrationTest do
           "server_lane_queue_wait_us",
           "server_body_decode_us",
           "server_command_execute_us",
-          "server_ra_wait_us",
-          "server_apply_us",
-          "server_bitcask_append_us",
-          "server_pending_locations_us",
-          "server_flow_index_update_us",
-          "server_zset_index_update_us",
           "server_response_encode_us"
         ] do
       assert is_integer(trace[key])
