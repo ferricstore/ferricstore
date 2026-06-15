@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.MutationAttrs do
   @moduledoc false
 
-  alias Ferricstore.Flow.RetryPolicy
+  alias Ferricstore.Flow.{Internal, RetryPolicy}
   alias Ferricstore.Store.Router
 
   import Ferricstore.Flow.Options,
@@ -87,7 +87,9 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def create_attrs(id, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, type} <- required_binary(opts, :type),
+         :ok <- Internal.reject_reserved_type(type, opts),
          {:ok, state} <- optional_binary(opts, :state, @default_state),
          {:ok, parent_flow_id} <- optional_binary_or_nil(opts, :parent_flow_id, nil),
          :ok <- validate_ref_size(:parent_flow_id, parent_flow_id),
@@ -136,7 +138,9 @@ defmodule Ferricstore.Flow.MutationAttrs do
     with :ok <- validate_opts(opts, return: true),
          :ok <- reject_start_and_claim_create_opts(opts),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_state(:type, type),
+         :ok <- Internal.reject_reserved_type(type, opts),
          :ok <- validate_state(:state, initial_state),
          :ok <- reject_running_state_transition(initial_state),
          {:ok, worker} <- required_binary(opts, :worker),
@@ -230,6 +234,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def spawn_children_attrs(parent_id, children, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(parent_id),
+         :ok <- Internal.reject_reserved_id(parent_id, opts),
          :ok <- validate_children(children),
          {:ok, partition_key} <- required_partition_key(Keyword.get(opts, :partition_key)),
          {:ok, group_id} <- required_binary(opts, :group_id),
@@ -294,6 +299,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def transition_attrs(id, from_state, to_state, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_state(:from, from_state),
          :ok <- validate_state(:to, to_state),
          :ok <- reject_running_state_transition(to_state),
@@ -327,6 +333,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def step_continue_attrs(id, lease_token, from_state, to_state, opts) do
     with :ok <- validate_opts(opts, return: true),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_lease_token(lease_token),
          :ok <- validate_state(:from, from_state),
          :ok <- validate_state(:to, to_state),
@@ -361,6 +368,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
     with :ok <- validate_opts(opts),
          :ok <- reject_public_value_ref_input(opts, :error_ref, :error),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_lease_token(lease_token),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -385,10 +393,43 @@ defmodule Ferricstore.Flow.MutationAttrs do
     end
   end
 
+  def reschedule_attrs(id, lease_token, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
+         :ok <- validate_lease_token(lease_token),
+         {:ok, state} <- required_binary(opts, :state),
+         :ok <- reject_running_state_transition(state),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, nil),
+         {:ok, priority} <- optional_priority_or_nil(opts) do
+      attrs =
+        %{
+          id: id,
+          lease_token: lease_token,
+          state: state,
+          fencing_token: fencing_token,
+          partition_key: partition_key,
+          run_at_ms: run_at_ms
+        }
+        |> maybe_put_attr(:priority, priority)
+        |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value_ref(opts, :payload_ref)
+        |> maybe_put_named_value_opts(opts)
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
   def complete_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
          :ok <- reject_public_value_ref_input(opts, :result_ref, :result),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_lease_token(lease_token),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -415,6 +456,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def extend_lease_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_lease_token(lease_token),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -465,6 +507,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
     with :ok <- validate_opts(opts),
          :ok <- reject_public_value_ref_input(opts, :error_ref, :error),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_lease_token(lease_token),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -492,6 +535,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
     with :ok <- validate_opts(opts),
          :ok <- reject_external_ref_input(opts, :reason_ref, :reason),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, lease_token} <- optional_lease_token(opts),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -543,6 +587,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
     with :ok <- validate_opts(opts),
          :ok <- reject_external_ref_input(opts, :reason_ref, :reason),
          :ok <- validate_id(id),
+         :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, to_event} <- required_binary(opts, :to_event),
          {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
          {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),

@@ -14,6 +14,7 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
   import FerricstoreServer.Health.Dashboard.Render.FlowFilters
   import FerricstoreServer.Health.Dashboard.Render.FlowHistory, except: [flow_signal_rows: 2]
   import FerricstoreServer.Health.Dashboard.Render.FlowOverview
+  import FerricstoreServer.Health.Dashboard.Render.FlowSchedules
 
   import FerricstoreServer.Health.Dashboard.Render.FlowQueryPolicy,
     except: [flow_policy_editor_data: 1]
@@ -95,6 +96,15 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
   EEx.function_from_file(:def, :flow_due, Path.join(@templates_dir, "flow_due.html.eex"), [
     :assigns
   ])
+
+  EEx.function_from_file(
+    :def,
+    :flow_schedules,
+    Path.join(@templates_dir, "flow_schedules.html.eex"),
+    [
+      :assigns
+    ]
+  )
 
   EEx.function_from_file(
     :def,

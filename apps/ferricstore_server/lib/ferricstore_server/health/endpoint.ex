@@ -356,6 +356,61 @@ defmodule FerricstoreServer.Health.Endpoint do
          socket,
          transport,
          "POST",
+         "/dashboard/flow/schedules",
+         peer,
+         headers,
+         body
+       ) do
+    unless Auth.observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      params = FlowPaths.decode_form_body(body)
+      command = FerricstoreServer.Health.Dashboard.flow_schedule_form_command(params)
+
+      case Auth.authorize_command_request(peer, headers, {command, []}, :html) do
+        :ok ->
+          location =
+            case FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params) do
+              {:ok, message} ->
+                "/dashboard/flow/schedules?" <>
+                  URI.encode_query(%{"status" => "ok", "message" => message})
+
+              {:error, reason} ->
+                "/dashboard/flow/schedules?" <>
+                  URI.encode_query(%{"status" => "error", "message" => reason})
+            end
+
+          send_redirect_response(socket, transport, location)
+
+        {:redirect_login, location} ->
+          send_redirect_response(socket, transport, location)
+
+        {:unauthorized, reason} ->
+          send_response(
+            socket,
+            transport,
+            401,
+            "Unauthorized",
+            "application/json",
+            Jason.encode!(%{error: reason})
+          )
+
+        {:forbidden, requirement, reason} ->
+          send_forbidden_response(
+            socket,
+            transport,
+            "/dashboard/flow/schedules",
+            requirement,
+            reason
+          )
+      end
+    end
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "POST",
          "/dashboard/flow/retention",
          peer,
          headers,
@@ -753,6 +808,21 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/due", peer, headers) do
     DashboardHandlers.handle_flow_due_page(socket, transport, peer, headers)
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/flow/schedules", peer, headers) do
+    DashboardHandlers.handle_flow_schedules(socket, transport, peer, headers, "")
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/flow/schedules?" <> query,
+         peer,
+         headers
+       ) do
+    DashboardHandlers.handle_flow_schedules(socket, transport, peer, headers, query)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/failures", peer, headers) do

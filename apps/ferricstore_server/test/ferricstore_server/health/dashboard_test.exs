@@ -5,6 +5,7 @@ Code.require_file("dashboard_test/sections/operational_pages.exs", __DIR__)
 Code.require_file("dashboard_test/sections/flow_browse_and_queries.exs", __DIR__)
 Code.require_file("dashboard_test/sections/flow_detail_actions.exs", __DIR__)
 Code.require_file("dashboard_test/sections/flow_detail_policies_retention.exs", __DIR__)
+Code.require_file("dashboard_test/sections/flow_schedules.exs", __DIR__)
 Code.require_file("dashboard_test/sections/http_flow_routes.exs", __DIR__)
 
 defmodule FerricstoreServer.Health.DashboardTest do
@@ -183,5 +184,6 @@ defmodule FerricstoreServer.Health.DashboardTest do
   use FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries
   use FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions
   use FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRetention
+  use FerricstoreServer.Health.DashboardTest.Sections.FlowSchedules
   use FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes
 end

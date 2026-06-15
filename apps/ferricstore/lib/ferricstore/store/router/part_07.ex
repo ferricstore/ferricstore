@@ -982,6 +982,30 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       @doc false
+      def flow_reschedule(ctx, %{id: id} = attrs) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_reschedule, key, attrs})
+        end
+      end
+
+      @doc false
+      def flow_schedule_replace(ctx, %{id: id} = attrs) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_schedule_replace, key, attrs})
+        end
+      end
+
+      @doc false
       def flow_start_and_claim(ctx, %{id: id} = attrs) when is_binary(id) do
         key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 

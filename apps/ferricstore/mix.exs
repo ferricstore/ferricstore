@@ -93,6 +93,7 @@ defmodule Ferricstore.MixProject do
       {:libcluster_etcd, "1.1.2", optional: true},
       {:telemetry, "~> 1.4"},
       {:jason, "~> 1.4"},
+      {:tzdata, "~> 1.1"},
       {:plug, "~> 1.16", optional: true},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

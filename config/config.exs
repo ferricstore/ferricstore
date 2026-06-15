@@ -5,6 +5,11 @@ import Config
 # config files are not imported into the parent application.
 config :rustler_precompiled, :force_build, ferricstore: true, ferricstore_server: true
 
+# Cron schedules use tzdata for IANA timezone/DST conversion. Keep the server
+# deterministic and network-quiet; timezone database updates come from normal
+# dependency upgrades.
+config :tzdata, :autoupdate, :disabled
+
 config :ferricstore, Ferricstore.Bitcask.NIF,
   skip_compilation?: false,
   load_from: {:ferricstore, "priv/native/ferricstore_bitcask"}

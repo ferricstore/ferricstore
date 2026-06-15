@@ -54,6 +54,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_step_continue 0x0222
   @op_flow_start_and_claim 0x0223
   @op_flow_run_steps_many 0x0224
+  @op_flow_schedule_create 0x0225
+  @op_flow_schedule_get 0x0226
+  @op_flow_schedule_delete 0x0227
+  @op_flow_schedule_fire_due 0x0228
+  @op_flow_schedule_list 0x0229
+  @op_flow_schedule_fire 0x022A
+  @op_flow_schedule_pause 0x022B
+  @op_flow_schedule_resume 0x022C
 
   setup do
     ConnRegistry.init_table()
@@ -131,6 +139,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.STEP_CONTINUE"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.START_AND_CLAIM"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.RUN_STEPS_MANY"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.CREATE"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.GET"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.FIRE"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.PAUSE"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.RESUME"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.DELETE"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.FIRE_DUE"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.LIST"))
 
     assert payload.schemas["FLOW.VALUE.MGET"]["fields"] == [
              "refs",
@@ -160,6 +176,18 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert "states" in payload.schemas["FLOW.RUN_STEPS_MANY"]["fields"]
     assert "steps" in payload.schemas["FLOW.RUN_STEPS_MANY"]["fields"]
+    assert payload.schemas["FLOW.SCHEDULE.CREATE"]["required"] == ["id", "target"]
+    assert "overwrite" in payload.schemas["FLOW.SCHEDULE.CREATE"]["fields"]
+    assert "timezone" in payload.schemas["FLOW.SCHEDULE.CREATE"]["fields"]
+    assert "overlap_policy" in payload.schemas["FLOW.SCHEDULE.CREATE"]["fields"]
+    assert "max_fires" in payload.schemas["FLOW.SCHEDULE.CREATE"]["fields"]
+    assert "end_at_ms" in payload.schemas["FLOW.SCHEDULE.CREATE"]["fields"]
+    assert payload.schemas["FLOW.SCHEDULE.FIRE"]["required"] == ["id"]
+    assert "fire_at_ms" in payload.schemas["FLOW.SCHEDULE.FIRE"]["fields"]
+    assert payload.schemas["FLOW.SCHEDULE.PAUSE"]["required"] == ["id"]
+    assert payload.schemas["FLOW.SCHEDULE.RESUME"]["required"] == ["id"]
+    assert "block_ms" in payload.schemas["FLOW.SCHEDULE.FIRE_DUE"]["fields"]
+    assert "target_type" in payload.schemas["FLOW.SCHEDULE.LIST"]["fields"]
   end
 
   test "OPTIONS advertises zlib request compression only when enabled" do
@@ -210,6 +238,177 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Commands.execute(
                @op_mget,
                %{"keys" => [key, missing]},
+               state(instance_ctx: ctx)
+             )
+  end
+
+  test "native schedule commands create, overwrite, fire, get, and delete schedules" do
+    ctx = FerricStore.Instance.get(:default)
+    now_ms = 7_000
+    schedule_id = "native-schedule-#{System.unique_integer([:positive])}"
+    old_target_id = schedule_id <> "-old-target"
+    new_target_id = schedule_id <> "-new-target"
+    old_partition = schedule_id <> "-old-partition"
+    new_partition = schedule_id <> "-new-partition"
+
+    create_body = %{
+      "id" => schedule_id,
+      "kind" => "one_shot",
+      "at_ms" => now_ms + 100,
+      "now_ms" => now_ms,
+      "target" => %{
+        "id" => old_target_id,
+        "type" => schedule_id <> "-old-type",
+        "partition_key" => old_partition,
+        "payload" => "old"
+      }
+    }
+
+    assert {:ok, %{id: ^schedule_id, next_run_at_ms: next_run_at_ms}, _state} =
+             Commands.execute(@op_flow_schedule_create, create_body, state(instance_ctx: ctx))
+
+    assert next_run_at_ms == now_ms + 100
+
+    assert {:error, "ERR flow already exists", _state} =
+             Commands.execute(@op_flow_schedule_create, create_body, state(instance_ctx: ctx))
+
+    overwrite_body =
+      Map.merge(create_body, %{
+        "at_ms" => now_ms + 500,
+        "now_ms" => now_ms + 1,
+        "overwrite" => true,
+        "target" => %{
+          "id" => new_target_id,
+          "type" => schedule_id <> "-new-type",
+          "partition_key" => new_partition,
+          "payload" => "new"
+        }
+      })
+
+    assert {:ok, %{id: ^schedule_id, next_run_at_ms: next_run_at_ms}, _state} =
+             Commands.execute(@op_flow_schedule_create, overwrite_body, state(instance_ctx: ctx))
+
+    assert next_run_at_ms == now_ms + 500
+
+    assert {:ok, %{state: "paused"}, _state} =
+             Commands.execute(
+               @op_flow_schedule_pause,
+               %{"id" => schedule_id, "now_ms" => now_ms + 2},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, %{fired: 0, claimed: 0}, _state} =
+             Commands.execute(
+               @op_flow_schedule_fire_due,
+               %{"now_ms" => now_ms + 500, "worker" => "native-schedule-test"},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, %{state: "active"}, _state} =
+             Commands.execute(
+               @op_flow_schedule_resume,
+               %{"id" => schedule_id, "now_ms" => now_ms + 3},
+               state(instance_ctx: ctx)
+             )
+
+    manual_schedule_id = schedule_id <> "-manual"
+    manual_target_id = manual_schedule_id <> "-target"
+
+    assert {:ok, _manual_schedule, _state} =
+             Commands.execute(
+               @op_flow_schedule_create,
+               %{
+                 "id" => manual_schedule_id,
+                 "kind" => "one_shot",
+                 "at_ms" => now_ms + 30_000,
+                 "now_ms" => now_ms,
+                 "target" => %{
+                   "id" => manual_target_id,
+                   "type" => manual_schedule_id <> "-type",
+                   "payload" => "manual"
+                 }
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, %{fired: 1, target_id: ^manual_target_id}, _state} =
+             Commands.execute(
+               @op_flow_schedule_fire,
+               %{"id" => manual_schedule_id, "now_ms" => now_ms + 2},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, %{payload: "manual"}} =
+             FerricStore.Impl.flow_get(ctx, manual_target_id, payload: true)
+
+    assert {:ok, schedules, _state} =
+             Commands.execute(
+               @op_flow_schedule_list,
+               %{
+                 "state" => "active",
+                 "kind" => "one_shot",
+                 "target_type" => schedule_id <> "-new-type",
+                 "count" => 10
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert Enum.any?(schedules, &(&1.id == schedule_id))
+
+    assert {:ok, %{fired: 0, claimed: 0}, _state} =
+             Commands.execute(
+               @op_flow_schedule_fire_due,
+               %{"now_ms" => now_ms + 100, "worker" => "native-schedule-test"},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, nil} =
+             FerricStore.Impl.flow_get(ctx, old_target_id, partition_key: old_partition)
+
+    assert {:ok, %{fired: 1, claimed: 1}, _state} =
+             Commands.execute(
+               @op_flow_schedule_fire_due,
+               %{"now_ms" => now_ms + 500, "worker" => "native-schedule-test"},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, target} =
+             FerricStore.Impl.flow_get(ctx, new_target_id,
+               partition_key: new_partition,
+               payload: true
+             )
+
+    assert target.payload == "new"
+
+    assert {:ok, %{state: "completed"}, _state} =
+             Commands.execute(
+               @op_flow_schedule_get,
+               %{"id" => schedule_id},
+               state(instance_ctx: ctx)
+             )
+
+    future_schedule_id = schedule_id <> "-delete"
+
+    assert {:ok, _schedule, _state} =
+             Commands.execute(
+               @op_flow_schedule_create,
+               %{
+                 "id" => future_schedule_id,
+                 "kind" => "one_shot",
+                 "at_ms" => now_ms + 10_000,
+                 "now_ms" => now_ms,
+                 "target" => %{
+                   "id" => future_schedule_id <> "-target",
+                   "type" => future_schedule_id <> "-type"
+                 }
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, "OK", _state} =
+             Commands.execute(
+               @op_flow_schedule_delete,
+               %{"id" => future_schedule_id, "now_ms" => now_ms + 1},
                state(instance_ctx: ctx)
              )
   end

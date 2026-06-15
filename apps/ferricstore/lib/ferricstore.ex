@@ -404,6 +404,14 @@ defmodule FerricStore do
   defdelegate flow_complete_many(partition_key, items, opts \\ []), to: FlowAPI
   defdelegate flow_run_steps_many(items, opts \\ []), to: FlowAPI
   defdelegate flow_transition(id, from_state, to_state, opts \\ []), to: FlowAPI
+  defdelegate flow_schedule_create(id, opts), to: FlowAPI
+  defdelegate flow_schedule_get(id, opts \\ []), to: FlowAPI
+  defdelegate flow_schedule_fire(id, opts \\ []), to: FlowAPI
+  defdelegate flow_schedule_pause(id, opts \\ []), to: FlowAPI
+  defdelegate flow_schedule_resume(id, opts \\ []), to: FlowAPI
+  defdelegate flow_schedule_list(opts \\ []), to: FlowAPI
+  defdelegate flow_schedule_delete(id, opts \\ []), to: FlowAPI
+  defdelegate flow_schedule_fire_due(opts \\ []), to: FlowAPI
   defdelegate flow_start_and_claim(id, type, initial_state, opts \\ []), to: FlowAPI
   defdelegate flow_step_continue(id, lease_token, from_state, to_state, opts \\ []), to: FlowAPI
 

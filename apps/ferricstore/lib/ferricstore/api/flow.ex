@@ -291,6 +291,134 @@ defmodule FerricStore.API.Flow do
     do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
+  Creates a durable Flow schedule.
+
+  Supported schedule kinds:
+
+    * `kind: :one_shot, at_ms: ts`
+    * `kind: :delay, delay_ms: ms`
+    * `kind: :interval, every_ms: ms, start_at_ms: ts`
+    * `kind: :cron, cron: "*/5 * * * *", start_at_ms: ts`
+
+  Cron is minute-granularity and defaults to UTC. Pass `timezone: "IANA/Zone"`
+  for wall-clock cron matching with DST handling. Recurring schedules can also
+  set `:overlap_policy` to `:allow`, `:skip`, `:queue_after_previous`, or
+  `:fail_schedule`.
+
+  `:target` is a Flow create option list containing at least `:type`. Keep
+  schedule definitions small; large target values should be stored with
+  `flow_value_put/2` and referenced with `:payload_ref` or `:value_refs`.
+  """
+  @spec flow_schedule_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_schedule_create(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.Schedule.create(default_ctx(), id, opts)
+  end
+
+  def flow_schedule_create(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow schedule id must be a non-empty string"}
+
+  def flow_schedule_create(_id, _opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc "Returns a durable Flow schedule by id."
+  @spec flow_schedule_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_schedule_get(id, opts \\ [])
+
+  def flow_schedule_get(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.Schedule.get(default_ctx(), id, opts)
+  end
+
+  def flow_schedule_get(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow schedule id must be a non-empty string"}
+
+  def flow_schedule_get(_id, _opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc """
+  Fires one active schedule immediately.
+
+  This is intended for admin/debug/backfill flows. Pass `:fire_at_ms` to make a
+  manual fire use a specific logical occurrence time; otherwise `:now_ms` is
+  used.
+  """
+  @spec flow_schedule_fire(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_schedule_fire(id, opts \\ [])
+
+  def flow_schedule_fire(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.Schedule.fire(default_ctx(), id, opts)
+  end
+
+  def flow_schedule_fire(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow schedule id must be a non-empty string"}
+
+  def flow_schedule_fire(_id, _opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc "Pauses an active durable Flow schedule."
+  @spec flow_schedule_pause(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_schedule_pause(id, opts \\ [])
+
+  def flow_schedule_pause(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.Schedule.pause(default_ctx(), id, opts)
+  end
+
+  def flow_schedule_pause(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow schedule id must be a non-empty string"}
+
+  def flow_schedule_pause(_id, _opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc "Resumes a paused durable Flow schedule."
+  @spec flow_schedule_resume(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_schedule_resume(id, opts \\ [])
+
+  def flow_schedule_resume(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.Schedule.resume(default_ctx(), id, opts)
+  end
+
+  def flow_schedule_resume(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow schedule id must be a non-empty string"}
+
+  def flow_schedule_resume(_id, _opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc "Lists durable Flow schedules."
+  @spec flow_schedule_list(keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_schedule_list(opts \\ [])
+
+  def flow_schedule_list(opts) when is_list(opts) do
+    Ferricstore.Flow.Schedule.list(default_ctx(), opts)
+  end
+
+  def flow_schedule_list(_opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc "Cancels a durable Flow schedule."
+  @spec flow_schedule_delete(binary(), keyword()) :: :ok | {:error, binary()}
+  def flow_schedule_delete(id, opts \\ [])
+
+  def flow_schedule_delete(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.Schedule.delete(default_ctx(), id, opts)
+  end
+
+  def flow_schedule_delete(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow schedule id must be a non-empty string"}
+
+  def flow_schedule_delete(_id, _opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc false
+  @spec flow_schedule_fire_due(keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_schedule_fire_due(opts \\ [])
+
+  def flow_schedule_fire_due(opts) when is_list(opts) do
+    Ferricstore.Flow.Schedule.fire_due(default_ctx(), opts)
+  end
+
+  def flow_schedule_fire_due(_opts),
+    do: {:error, "ERR flow schedule opts must be a keyword list"}
+
+  @doc """
   Creates a Flow and immediately leases its first logical step to a worker.
 
   This is the "start execution now" primitive for step-style workflows. It

@@ -41,7 +41,8 @@ defmodule FerricstoreServer.Health.Dashboard do
     PolicyRetention,
     Projection,
     Query,
-    Recovery
+    Recovery,
+    Schedules
   }
 
   require Logger
@@ -527,6 +528,28 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_flow_due_page(data) do
     render_template(Templates.flow_due(%{data: data}))
   end
+
+  @doc "Collects durable FerricFlow schedules for operators."
+  @spec collect_flow_schedules_page(keyword()) :: map()
+  def collect_flow_schedules_page(opts \\ []), do: Schedules.collect_page(opts)
+
+  @doc false
+  @spec flow_schedules_opts_from_query(binary()) :: keyword()
+  def flow_schedules_opts_from_query(query), do: Schedules.opts_from_query(query)
+
+  @doc "Renders the durable FerricFlow schedules page."
+  @spec render_flow_schedules_page(map()) :: binary()
+  def render_flow_schedules_page(data) do
+    render_template(Templates.flow_schedules(%{data: data}))
+  end
+
+  @doc false
+  @spec apply_flow_schedule_form(map()) :: {:ok, binary()} | {:error, binary()}
+  def apply_flow_schedule_form(params), do: Schedules.apply_form(params)
+
+  @doc false
+  @spec flow_schedule_form_command(map()) :: binary()
+  def flow_schedule_form_command(params), do: Schedules.form_command(params)
 
   @doc "Collects failed, stuck, and expired-lease Flow work for operator recovery."
   @spec collect_flow_failures_page(keyword()) :: map()
