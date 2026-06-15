@@ -17,6 +17,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       alias Ferricstore.Store.CompoundKey
       alias Ferricstore.Store.Promotion
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.ZSetIndex
 
@@ -152,6 +153,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         ShardLifecycle.recover_keydir(shard_data_path, keydir, shard_index, ctx)
 
         instance_name = ctx.name
+        compound_member_index = CompoundMemberIndex.table_name(instance_name, shard_index)
+        ensure_ets_table!(compound_member_index, :ordered_set)
+        CompoundMemberIndex.rebuild(compound_member_index, keydir)
+
         {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, shard_index)
         ensure_ets_table!(zset_score_index, :ordered_set)
         ensure_ets_table!(zset_score_lookup, :set)
@@ -190,6 +195,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           ets: keydir,
           instance_ctx: ctx,
           instance_name: instance_name,
+          compound_member_index_name: compound_member_index,
           zset_score_index_name: zset_score_index,
           zset_score_lookup_name: zset_score_lookup,
           flow_index_name: flow_index,
@@ -321,7 +327,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
             position: target_position_for_replay_start(target_position, replay_after_index),
             target_index: target_index,
             replay_after_index: replay_after_index,
-            replay_dependencies: %{history: %{}},
+            replay_dependencies: replay_dependency_defaults(),
             error: nil
           }
 
@@ -481,21 +487,25 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       end
 
       defp merge_recovery_replay_dependencies(left, right) when is_map(right) do
-        history =
-          right
-          |> Map.get(:history, %{})
-          |> normalize_replay_dependency_map()
+        Enum.reduce([:history, :apply_projection], left || replay_dependency_defaults(), fn
+          kind, acc ->
+            dependency_map =
+              right
+              |> Map.get(kind, %{})
+              |> normalize_replay_dependency_map()
 
-        if map_size(history) == 0 do
-          left
-        else
-          Map.update(left || %{}, :history, history, fn existing ->
-            merge_replay_dependency_maps(existing, history)
-          end)
-        end
+            if map_size(dependency_map) == 0 do
+              acc
+            else
+              Map.update(acc, kind, dependency_map, fn existing ->
+                merge_replay_dependency_maps(existing, dependency_map)
+              end)
+            end
+        end)
       end
 
-      defp merge_recovery_replay_dependencies(left, _right), do: left || %{history: %{}}
+      defp merge_recovery_replay_dependencies(left, _right),
+        do: left || replay_dependency_defaults()
 
       defp command_from_segment_log_entry({_term, {:default, {corr, command}}})
            when is_reference(corr),

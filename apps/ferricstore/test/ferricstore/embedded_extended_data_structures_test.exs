@@ -186,48 +186,6 @@ defmodule Ferricstore.EmbeddedExtendedDataStructuresTest do
     end
   end
 
-  # ===========================================================================
-  # JSON smoke tests
-  # ===========================================================================
-
-  describe "JSON" do
-    test "json_set and json_get" do
-      assert :ok = FerricStore.json_set("js:key", "$", ~s({"name":"alice","age":30}))
-      assert {:ok, result} = FerricStore.json_get("js:key", "$")
-      assert is_binary(result)
-    end
-
-    test "json_del removes value" do
-      FerricStore.json_set("js:del", "$", ~s({"a":1,"b":2}))
-      assert {:ok, _} = FerricStore.json_del("js:del", "$.a")
-    end
-
-    test "json_type returns type" do
-      FerricStore.json_set("js:type", "$", ~s({"name":"alice"}))
-      assert {:ok, type_str} = FerricStore.json_type("js:type", "$")
-      assert is_binary(type_str)
-    end
-
-    test "json_objkeys returns keys" do
-      FerricStore.json_set("js:keys", "$", ~s({"a":1,"b":2}))
-      assert {:ok, keys} = FerricStore.json_objkeys("js:keys", "$")
-      assert is_list(keys)
-    end
-
-    test "json_objlen returns key count" do
-      FerricStore.json_set("js:len", "$", ~s({"a":1,"b":2}))
-      assert {:ok, len} = FerricStore.json_objlen("js:len", "$")
-      assert is_integer(len)
-    end
-
-    test "json_numincrby increments number" do
-      FerricStore.json_set("js:inc", "$", ~s({"count":5}))
-      assert {:ok, result} = FerricStore.json_numincrby("js:inc", "$.count", "3")
-      assert is_binary(result)
-    end
-  end
-
-  # ===========================================================================
   # Geo smoke tests
   # ===========================================================================
 

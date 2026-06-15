@@ -13,6 +13,16 @@ defmodule Ferricstore.Flow.PipelineWriteCommand do
     command({:create, id, opts}, callbacks)
   end
 
+  def command({:start_and_claim, id, type, initial_state, opts}, callbacks) do
+    with {:ok, attrs} <- callbacks.start_and_claim_attrs.(id, type, initial_state, opts) do
+      state_command(:flow_start_and_claim, attrs)
+    end
+  end
+
+  def command({:flow_start_and_claim, id, type, initial_state, opts}, callbacks) do
+    command({:start_and_claim, id, type, initial_state, opts}, callbacks)
+  end
+
   def command({:transition, id, from_state, to_state, opts}, callbacks) do
     with {:ok, attrs} <- callbacks.transition_attrs.(id, from_state, to_state, opts) do
       state_command(:flow_transition, attrs)
@@ -21,6 +31,37 @@ defmodule Ferricstore.Flow.PipelineWriteCommand do
 
   def command({:flow_transition, id, from_state, to_state, opts}, callbacks) do
     command({:transition, id, from_state, to_state, opts}, callbacks)
+  end
+
+  def command({:step_continue, id, lease_token, from_state, to_state, opts}, callbacks) do
+    with {:ok, attrs} <-
+           callbacks.step_continue_attrs.(id, lease_token, from_state, to_state, opts) do
+      state_command(:flow_step_continue, attrs)
+    end
+  end
+
+  def command({:flow_step_continue, id, lease_token, from_state, to_state, opts}, callbacks) do
+    command({:step_continue, id, lease_token, from_state, to_state, opts}, callbacks)
+  end
+
+  def command({:named_value_put, value, opts}, callbacks) do
+    with {:ok, attrs} <- callbacks.named_value_attrs.(value, opts) do
+      state_command(:flow_named_value_put, attrs)
+    end
+  end
+
+  def command({:flow_named_value_put, value, opts}, callbacks) do
+    command({:named_value_put, value, opts}, callbacks)
+  end
+
+  def command({:signal, id, opts}, callbacks) do
+    with {:ok, attrs} <- callbacks.signal_attrs.(id, opts) do
+      state_command(:flow_signal, attrs)
+    end
+  end
+
+  def command({:flow_signal, id, opts}, callbacks) do
+    command({:signal, id, opts}, callbacks)
   end
 
   def command({:complete, id, lease_token, opts}, callbacks) do

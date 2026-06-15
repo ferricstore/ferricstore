@@ -49,7 +49,9 @@ defmodule FerricstoreServer.Native.Connection do
     :max_pending_chunks,
     :max_pending_chunk_bytes,
     :response_coalesce_max,
+    :response_coalesce_bytes,
     :command_state,
+    :idle_timeout_ms,
     compression: :none,
     buffer: "",
     lanes: %{},
@@ -149,7 +151,15 @@ defmodule FerricstoreServer.Native.Connection do
                     64 * 1024 * 1024
                   ),
                 response_coalesce_max:
-                  max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64))
+                  max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
+                response_coalesce_bytes:
+                  Application.get_env(
+                    :ferricstore,
+                    :native_response_coalesce_bytes,
+                    8 * 1024 * 1024
+                  ),
+                idle_timeout_ms:
+                  Application.get_env(:ferricstore, :native_idle_timeout_ms, 90_000)
               }
               |> refresh_command_state()
 
@@ -165,6 +175,8 @@ defmodule FerricstoreServer.Native.Connection do
     if active_mode == :once do
       transport.setopts(socket, active: :once)
     end
+
+    idle_timeout = idle_receive_timeout(state)
 
     receive do
       {:tcp, ^socket, data} ->
@@ -246,8 +258,18 @@ defmodule FerricstoreServer.Native.Connection do
 
       _other ->
         loop(state)
+    after
+      idle_timeout ->
+        cleanup_connection(state)
+        transport.close(socket)
     end
   end
+
+  defp idle_receive_timeout(%__MODULE__{idle_timeout_ms: timeout})
+       when is_integer(timeout) and timeout > 0,
+       do: timeout
+
+  defp idle_receive_timeout(_state), do: :infinity
 
   defp handle_data(state, data) do
     buffer =
@@ -634,7 +656,7 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp cleanup_connection(state) do
     Ferricstore.Flow.ClaimWaiters.cleanup(self())
-    Enum.each(state.lanes, fn {_lane_id, pid} -> send(pid, :shutdown) end)
+    Enum.each(state.lanes, fn {_lane_id, pid} -> Lane.stop(pid) end)
     ConnRegistry.unregister(state.client_id, self())
     Stats.decr_connections()
     :ok
@@ -819,44 +841,80 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp send_lane_responses(state, lane_id, iodata_list, done_count) do
     state = finish_inflight(state, lane_id, done_count)
+    responses = Enum.reverse(iodata_list)
 
     {state, responses} =
-      collect_ready_lane_responses(state, Enum.reverse(iodata_list), done_count)
+      collect_ready_lane_responses(
+        state,
+        responses,
+        done_count,
+        response_coalesce_iodata_size(state, responses)
+      )
 
     state.transport.send(state.socket, Enum.reverse(responses))
     state
   end
 
-  defp collect_ready_lane_responses(state, acc, scanned) do
-    if scanned >= state.response_coalesce_max do
-      {state, acc}
-    else
-      receive do
-        {:native_lane_response, lane_id, iodata} ->
-          state = finish_inflight(state, lane_id)
-          collect_ready_lane_responses(state, [iodata | acc], scanned + 1)
+  defp collect_ready_lane_responses(state, acc, scanned, bytes) do
+    cond do
+      scanned >= state.response_coalesce_max ->
+        {state, acc}
 
-        {:native_lane_responses, lane_id, iodata_list, done_count} ->
-          state = finish_inflight(state, lane_id, done_count)
+      response_coalesce_bytes_reached?(state, bytes) ->
+        {state, acc}
 
-          collect_ready_lane_responses(
-            state,
-            Enum.reverse(iodata_list) ++ acc,
-            scanned + done_count
-          )
+      true ->
+        receive do
+          {:native_lane_response, lane_id, iodata} ->
+            state = finish_inflight(state, lane_id)
 
-        {:native_lane_done, lane_id} ->
-          state = finish_inflight(state, lane_id)
-          collect_ready_lane_responses(state, acc, scanned + 1)
+            collect_ready_lane_responses(
+              state,
+              [iodata | acc],
+              scanned + 1,
+              response_coalesce_add_iodata_size(state, bytes, iodata)
+            )
 
-        {:native_lane_done_many, lane_id, done_count} ->
-          state = finish_inflight(state, lane_id, done_count)
-          collect_ready_lane_responses(state, acc, scanned + done_count)
-      after
-        0 -> {state, acc}
-      end
+          {:native_lane_responses, lane_id, iodata_list, done_count} ->
+            state = finish_inflight(state, lane_id, done_count)
+
+            collect_ready_lane_responses(
+              state,
+              Enum.reverse(iodata_list) ++ acc,
+              scanned + done_count,
+              response_coalesce_add_iodata_size(state, bytes, iodata_list)
+            )
+
+          {:native_lane_done, lane_id} ->
+            state = finish_inflight(state, lane_id)
+            collect_ready_lane_responses(state, acc, scanned + 1, bytes)
+
+          {:native_lane_done_many, lane_id, done_count} ->
+            state = finish_inflight(state, lane_id, done_count)
+            collect_ready_lane_responses(state, acc, scanned + done_count, bytes)
+        after
+          0 -> {state, acc}
+        end
     end
   end
+
+  defp response_coalesce_iodata_size(%{response_coalesce_bytes: limit}, iodata)
+       when is_integer(limit) and limit > 0,
+       do: :erlang.iolist_size(iodata)
+
+  defp response_coalesce_iodata_size(_state, _iodata), do: 0
+
+  defp response_coalesce_add_iodata_size(%{response_coalesce_bytes: limit}, bytes, iodata)
+       when is_integer(limit) and limit > 0,
+       do: bytes + :erlang.iolist_size(iodata)
+
+  defp response_coalesce_add_iodata_size(_state, bytes, _iodata), do: bytes
+
+  defp response_coalesce_bytes_reached?(%{response_coalesce_bytes: limit}, bytes)
+       when is_integer(limit) and limit > 0,
+       do: bytes >= limit
+
+  defp response_coalesce_bytes_reached?(_state, _bytes), do: false
 
   defp invalidated_username(:all), do: "all"
   defp invalidated_username(username), do: username

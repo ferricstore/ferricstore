@@ -78,7 +78,7 @@ defmodule FerricstoreServer.AclFuzzTest do
   end
 
   test "cached command ACL agrees with canonical ACL for generated rule sets" do
-    commands = ~w(GET SET DEL FLUSHDB INFO JSON.GET JSON.SET XADD XRANGE ZADD ZRANGE)
+    commands = ~w(GET SET DEL FLUSHDB INFO XADD XRANGE ZADD ZRANGE)
 
     rule_sets = [
       ["on", "nopass", "allkeys", "-@all", "+GET"],

@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -406,6 +405,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         end
       end
 
+      defp do_flow_start_and_claim(state, %{id: id} = attrs) do
+        partition_key = Map.get(attrs, :partition_key)
+        state_key = FlowKeys.state_key(id, partition_key)
+
+        case flow_create_existing_state(state, attrs, state_key) do
+          nil -> flow_start_and_claim_apply_new_record(state, attrs, state_key)
+          _existing -> {:error, "ERR flow already exists"}
+        end
+      end
+
       defp do_flow_named_value_put(
              state,
              %{id: id, name: name, value: value, partition_key: partition_key} = attrs
@@ -415,22 +424,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
         with {:ok, record} <- flow_require_record(state, id, partition_key) do
           refs = flow_record_value_refs(record)
-          digest = flow_value_digest(value)
+          encoded_value = flow_named_value_put_encoded_value(value)
+          digest = flow_named_value_put_digest(value, encoded_value)
           existing = Map.get(refs, name)
           override? = Map.get(attrs, :override, false)
 
           cond do
             flow_named_value_same_digest?(existing, digest) ->
-              {:ok,
-               %{
-                 ref: Map.fetch!(existing, :ref),
-                 partition_key: partition_key,
-                 owner_flow_id: id,
-                 name: name,
-                 version: Map.get(existing, :version),
-                 created: false,
-                 stored: false
-               }}
+              flow_named_value_put_result(attrs, %{
+                ref: Map.fetch!(existing, :ref),
+                partition_key: partition_key,
+                owner_flow_id: id,
+                name: name,
+                version: Map.get(existing, :version),
+                created: false,
+                stored: false
+              })
 
             not is_nil(existing) and not override? ->
               {:error,
@@ -439,49 +448,152 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             true ->
               version = Map.fetch!(record, :version) + 1
 
-              with {:ok, value_refs} <-
-                     flow_named_value_refs(
-                       record,
-                       %{
-                         values: %{name => value},
-                         override_values: if(override?, do: [name], else: [])
-                       },
-                       id,
-                       version,
-                       partition_key
-                     ) do
-                next =
-                  record
-                  |> Map.put(:version, version)
-                  |> Map.put(:updated_at_ms, now_ms)
-                  |> flow_put_record_value_refs(value_refs)
-
-                with :ok <- flow_validate_record_keys(next),
-                     :ok <- flow_put_named_record_values(state, next, %{values: %{name => value}}),
-                     :ok <-
-                       flow_put_state_record(state, FlowKeys.state_key(id, partition_key), next),
-                     :ok <- flow_history_put_planned(state, record, next, "value_put", now_ms),
-                     :ok <- flow_after_history_put(state, next) do
-                  entry = Map.fetch!(value_refs, name)
-
-                  {:ok,
-                   %{
-                     ref: Map.fetch!(entry, :ref),
-                     partition_key: partition_key,
-                     owner_flow_id: id,
-                     name: name,
-                     version: Map.get(entry, :version),
-                     created: is_nil(existing),
-                     stored: true
-                   }}
-                end
-              end
+              flow_named_value_put_store(
+                state,
+                record,
+                attrs,
+                refs,
+                existing,
+                id,
+                name,
+                value,
+                encoded_value,
+                digest,
+                partition_key,
+                now_ms,
+                version,
+                override?
+              )
           end
         end
       end
 
+      defp flow_named_value_put_encoded_value(value) do
+        case BlobCommand.flow_blob_value_ref(value) do
+          {:ok, _encoded_ref} -> :generic
+          :error -> {:ok, Flow.encode_value(value)}
+        end
+      end
+
+      defp flow_named_value_put_digest(_value, {:ok, encoded_value}),
+        do: flow_value_digest_encoded(encoded_value)
+
+      defp flow_named_value_put_digest(value, :generic), do: flow_value_digest(value)
+
+      defp flow_named_value_put_store(
+             state,
+             record,
+             attrs,
+             refs,
+             existing,
+             id,
+             name,
+             _value,
+             {:ok, encoded_value},
+             digest,
+             partition_key,
+             now_ms,
+             version,
+             _override?
+           ) do
+        value_version = flow_named_value_next_version(existing)
+        ref = FlowKeys.value_key(id <> ":" <> name, :shared, value_version, partition_key)
+        entry = %{ref: ref, version: value_version, digest: digest}
+        value_refs = Map.put(refs, name, entry)
+
+        next =
+          record
+          |> Map.put(:version, version)
+          |> Map.put(:updated_at_ms, now_ms)
+          |> flow_put_record_value_refs(value_refs)
+
+        link_key = flow_shared_value_link_key(next, name, entry)
+
+        with :ok <- flow_validate_record_keys(next),
+             :ok <- flow_validate_key_size(ref),
+             :ok <- raw_put_cold(state, ref, encoded_value, flow_record_expire_at(next)),
+             :ok <- flow_maybe_put_shared_value_link(state, link_key, ref, next),
+             :ok <- flow_put_state_record(state, FlowKeys.state_key(id, partition_key), next),
+             :ok <- flow_history_put_planned(state, record, next, "value_put", now_ms),
+             :ok <- flow_after_history_put(state, next) do
+          flow_named_value_put_result(attrs, %{
+            ref: ref,
+            partition_key: partition_key,
+            owner_flow_id: id,
+            name: name,
+            version: value_version,
+            created: is_nil(existing),
+            stored: true
+          })
+        end
+      end
+
+      defp flow_named_value_put_store(
+             state,
+             record,
+             attrs,
+             _refs,
+             existing,
+             id,
+             name,
+             value,
+             :generic,
+             _digest,
+             partition_key,
+             now_ms,
+             version,
+             override?
+           ) do
+        with {:ok, value_refs} <-
+               flow_named_value_refs(
+                 record,
+                 %{
+                   values: %{name => value},
+                   override_values: if(override?, do: [name], else: [])
+                 },
+                 id,
+                 version,
+                 partition_key
+               ) do
+          next =
+            record
+            |> Map.put(:version, version)
+            |> Map.put(:updated_at_ms, now_ms)
+            |> flow_put_record_value_refs(value_refs)
+
+          with :ok <- flow_validate_record_keys(next),
+               :ok <- flow_put_named_record_values(state, next, %{values: %{name => value}}),
+               :ok <- flow_put_state_record(state, FlowKeys.state_key(id, partition_key), next),
+               :ok <- flow_history_put_planned(state, record, next, "value_put", now_ms),
+               :ok <- flow_after_history_put(state, next) do
+            entry = Map.fetch!(value_refs, name)
+
+            flow_named_value_put_result(attrs, %{
+              ref: Map.fetch!(entry, :ref),
+              partition_key: partition_key,
+              owner_flow_id: id,
+              name: name,
+              version: Map.get(entry, :version),
+              created: is_nil(existing),
+              stored: true
+            })
+          end
+        end
+      end
+
+      defp flow_named_value_put_result(%{return: :ok_on_success}, _result), do: {:ok, :ok}
+
+      defp flow_named_value_put_result(_attrs, result), do: {:ok, result}
+
       defp do_flow_named_value_put(_state, _attrs),
         do: {:error, "ERR flow value name must be a non-empty string"}
+
+      defp do_flow_named_value_put_pipeline_batch(state, %{records: [_ | _] = attrs_list}) do
+        Enum.map(attrs_list, fn attrs -> do_flow_named_value_put(state, attrs) end)
+      end
+
+      defp do_flow_named_value_put_pipeline_batch(_state, _attrs),
+        do: {:error, "ERR flow items must be a non-empty list"}
 
       defp do_flow_signal(state, %{id: id, signal: signal} = attrs) do
         now_ms = flow_attrs_now_ms(attrs)
@@ -504,6 +616,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
           :ok
         end
       end
+
+      defp do_flow_signal_many(state, %{records: [_ | _] = records} = attrs) do
+        records
+        |> flow_expand_shared_attrs(Map.get(attrs, :shared))
+        |> Enum.map(&do_flow_signal(state, &1))
+      end
+
+      defp do_flow_signal_many(_state, _attrs),
+        do: {:error, "ERR flow signal_many requires records"}
 
       defp flow_signal_next_record(record, attrs, now_ms) do
         version = Map.fetch!(record, :version) + 1
@@ -667,6 +788,72 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         end
       end
 
+      defp flow_start_and_claim_apply_new_record(state, attrs, state_key) do
+        with :ok <- flow_validate_start_and_claim_attrs(attrs) do
+          key_info = flow_create_fast_key_info(attrs, state_key)
+
+          record =
+            state
+            |> flow_create_record(attrs)
+            |> flow_start_and_claim_record(attrs)
+
+          plan = flow_create_fast_plan(record, attrs, key_info)
+
+          with :ok <- flow_many_same_state_machine_shard_by_keys?(state, [key_info]),
+               :ok <- flow_validate_create_fast_plan_keys(plan),
+               :ok <- flow_create_many_fast_apply(state, [plan]) do
+            {:ok, record}
+          else
+            {:error, _reason} = error ->
+              error
+
+            _ ->
+              flow_start_and_claim_apply_new_record_slow(state, attrs, state_key, record)
+          end
+        end
+      end
+
+      defp flow_start_and_claim_apply_new_record_slow(state, attrs, state_key, record) do
+        with :ok <- flow_validate_record_keys(record),
+             :ok <- flow_put_record_values(state, record, attrs),
+             :ok <- flow_put_new_state_record(state, state_key, record),
+             :ok <- flow_create_put_registry_marker(state, record),
+             :ok <- flow_due_put(state, record),
+             :ok <- flow_index_put(state, record),
+             :ok <- flow_history_put(state, record, "created", Map.get(record, :created_at_ms)),
+             :ok <- flow_history_trim(state, record) do
+          {:ok, record}
+        end
+      end
+
+      defp flow_start_and_claim_record(record, attrs) do
+        now_ms = flow_attrs_now_ms(attrs)
+        lease_ms = Map.fetch!(attrs, :lease_ms)
+        fencing_token = 1
+        worker = Map.fetch!(attrs, :worker)
+        deadline_ms = now_ms + lease_ms
+
+        token =
+          worker <>
+            ":" <>
+            Integer.to_string(now_ms) <> ":" <> Integer.to_string(fencing_token)
+
+        %{
+          record
+          | state: "running",
+            run_state: Map.fetch!(attrs, :run_state),
+            attempts: 1,
+            fencing_token: fencing_token,
+            updated_at_ms: now_ms,
+            ttl_ms: nil,
+            terminal_retention_until_ms: nil,
+            lease_owner: worker,
+            lease_token: token,
+            lease_deadline_ms: deadline_ms,
+            next_run_at_ms: deadline_ms
+        }
+      end
+
       defp do_flow_create_many(state, %{records: [_ | _] = attrs_list} = attrs) do
         stamped_shard = Map.get(attrs, @flow_shard_marker)
 
@@ -722,6 +909,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       defp do_flow_create_pipeline_batch(_state, _attrs),
         do: {:error, "ERR flow items must be a non-empty list"}
 
+      defp do_flow_start_and_claim_pipeline_batch(
+             state,
+             %{records: [_ | _] = attrs_list} = attrs
+           ) do
+        case flow_start_and_claim_pipeline_batch_fast_prepare(
+               state,
+               attrs_list,
+               Map.get(attrs, @flow_shard_marker)
+             ) do
+          {:ok, plans, records} ->
+            case flow_create_many_fast_apply(state, plans) do
+              :ok -> Enum.map(records, &{:ok, &1})
+              {:error, _reason} = error -> List.duplicate(error, length(attrs_list))
+            end
+
+          :fallback ->
+            flow_start_and_claim_pipeline_batch_prepare(state, attrs_list)
+        end
+      end
+
+      defp do_flow_start_and_claim_pipeline_batch(_state, _attrs),
+        do: {:error, "ERR flow items must be a non-empty list"}
+
       defp flow_create_pipeline_batch_fast_prepare(state, attrs_list, stamped_shard) do
         if Enum.any?(attrs_list, &Map.get(&1, :idempotent, false)) do
           :fallback
@@ -738,6 +948,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             _ -> :fallback
           end
         end
+      end
+
+      defp flow_start_and_claim_pipeline_batch_fast_prepare(state, attrs_list, stamped_shard) do
+        with :ok <- flow_validate_start_and_claim_attrs_list(attrs_list),
+             :ok <- flow_many_partition_keys_present?(attrs_list),
+             key_infos = flow_create_fast_key_infos(attrs_list, stamped_shard),
+             :ok <- flow_many_same_state_machine_shard_by_keys?(state, key_infos),
+             :ok <- flow_create_many_unique?(attrs_list),
+             {:ok, plans, records} <-
+               flow_start_and_claim_non_idempotent_many_prepare(state, attrs_list, key_infos) do
+          {:ok, plans, records}
+        else
+          _ -> :fallback
+        end
+      end
+
+      defp flow_validate_start_and_claim_attrs_list(attrs_list) do
+        Enum.reduce_while(attrs_list, :ok, fn attrs, :ok ->
+          case flow_validate_start_and_claim_attrs(attrs) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
       end
 
       defp flow_create_fast_key_infos(attrs_list, stamped_shard) do
@@ -820,6 +1053,59 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         end
       end
 
+      defp flow_start_and_claim_non_idempotent_many_prepare(state, attrs_list, key_infos) do
+        keys = Enum.map(key_infos, & &1.state_key)
+        registry_keys = Enum.map(key_infos, & &1.registry_key)
+
+        if Enum.any?(flow_registry_keys_present_hot_only(state, registry_keys), & &1) or
+             Enum.any?(flow_state_keys_present_hot_only(state, keys), & &1) do
+          {:error, "ERR flow already exists"}
+        else
+          attrs_list
+          |> Enum.zip(key_infos)
+          |> Enum.reduce_while({:ok, [], []}, fn {%{id: _id} = attrs, key_info},
+                                                 {:ok, plans, records} ->
+            record =
+              state
+              |> flow_create_record(attrs)
+              |> flow_start_and_claim_record(attrs)
+
+            plan = flow_create_fast_plan(record, attrs, key_info)
+
+            case flow_validate_create_fast_plan_keys(plan) do
+              :ok -> {:cont, {:ok, [plan | plans], [record | records]}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end)
+          |> case do
+            {:ok, plans, records} -> {:ok, Enum.reverse(plans), Enum.reverse(records)}
+            {:error, _reason} = error -> error
+          end
+        end
+      end
+
+      defp flow_start_and_claim_pipeline_batch_prepare(state, attrs_list) do
+        {results, _seen} =
+          Enum.reduce(attrs_list, {[], MapSet.new()}, fn attrs, {results, seen} ->
+            case flow_validate_start_and_claim_attrs(attrs) do
+              :ok ->
+                key = FlowKeys.state_key(Map.fetch!(attrs, :id), Map.get(attrs, :partition_key))
+
+                if MapSet.member?(seen, key) do
+                  {[{:error, "ERR flow already exists"} | results], seen}
+                else
+                  result = do_flow_start_and_claim(state, attrs)
+                  {[result | results], MapSet.put(seen, key)}
+                end
+
+              {:error, _reason} = error ->
+                {[error | results], seen}
+            end
+          end)
+
+        Enum.reverse(results)
+      end
+
       defp flow_create_fast_plan(record, attrs, %{
              tag: tag,
              state_key: state_key,
@@ -839,6 +1125,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
           tag: tag,
           state_key: state_key,
           registry_key: registry_key,
+          shard_index: Map.get(attrs, @flow_shard_marker),
           history_key: history_key,
           state_index_key: flow_state_index_key_with_tag(tag, type, flow_state),
           state_index_score: score,

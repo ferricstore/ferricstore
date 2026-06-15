@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.HistoryQuery
   alias Ferricstore.Flow.LMDBIndexRead
+  alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.RecordQuery
   alias Ferricstore.Flow.RecordRead
   alias Ferricstore.Flow.TerminalQuery
@@ -35,7 +36,7 @@ defmodule Ferricstore.Flow.ReadAPI do
              @terminal_states,
              @default_lmdb_query_scan_limit
            ) do
-      {:ok, records}
+      {:ok, maybe_project_meta(records, opts)}
     end
   end
 
@@ -265,6 +266,14 @@ defmodule Ferricstore.Flow.ReadAPI do
 
   defp validate_ms_range(from_ms, to_ms),
     do: HistoryQuery.validate_ms_range(from_ms, to_ms)
+
+  defp maybe_project_meta(records, opts) do
+    if Keyword.get(opts, :return) == :meta do
+      Enum.map(records, &RecordProjection.meta/1)
+    else
+      records
+    end
+  end
 
   defp flow_terminal_state(opts), do: TerminalQuery.state(opts, @terminal_states)
 

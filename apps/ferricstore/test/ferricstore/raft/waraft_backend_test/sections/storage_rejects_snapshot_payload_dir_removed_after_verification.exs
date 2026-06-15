@@ -66,6 +66,78 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
         end
       end
 
+      test "storage replaces projection dir recreated before staged promotion", %{root: root} do
+        source_root = Path.join(root, "recreated-projection-source")
+        target_root = Path.join(root, "recreated-projection-target")
+        File.mkdir_p!(source_root)
+        File.mkdir_p!(target_root)
+
+        source_ctx = build_ctx(source_root)
+
+        assert :ok =
+                 WARaftBackend.start(source_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert :ok = WARaftBackend.write(0, {:put, "snapshot:recreated-projection", "new", 0})
+        assert {:ok, {:raft_log_pos, index, term} = position} = WARaftBackend.create_snapshot(0)
+
+        snapshot_path =
+          Path.join([
+            source_root,
+            "waraft",
+            "ferricstore_waraft_backend.1",
+            "snapshot.#{index}.#{term}"
+          ])
+
+        assert :ok = WARaftBackend.stop()
+        FerricStore.Instance.cleanup(source_ctx.name)
+
+        target_ctx = build_ctx(target_root)
+
+        assert :ok =
+                 WARaftBackend.start(target_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert :ok = WARaftBackend.write(0, {:put, "snapshot:recreated-projection", "old", 0})
+        assert :ok = WARaftBackend.stop()
+
+        root_dir = Path.join([target_root, "waraft", "ferricstore_waraft_backend.1"])
+        target_projection = Path.join(root_dir, "segment_projection_log")
+        stale_file = Path.join(target_projection, "stale-recreated")
+
+        handle = %{
+          ctx: target_ctx,
+          shard_index: 0,
+          root_dir: root_dir,
+          sm_state: nil,
+          position: {:raft_log_pos, 1, 1},
+          label: nil,
+          config: nil
+        }
+
+        Process.put(:ferricstore_waraft_snapshot_install_hook, fn
+          {:before_promote, :segment_projection_log, ^target_projection} ->
+            File.mkdir_p!(target_projection)
+            File.write!(stale_file, "stale")
+            :ok
+
+          _event ->
+            :ok
+        end)
+
+        try do
+          assert {:ok, _handle} =
+                   Ferricstore.Raft.WARaftStorage.open_snapshot(snapshot_path, position, handle)
+        after
+          Process.delete(:ferricstore_waraft_snapshot_install_hook)
+        end
+
+        assert File.dir?(target_projection)
+        refute File.exists?(stale_file)
+      end
+
       test "storage rejects oversized snapshot metadata before install", %{
         root: root,
         ctx: ctx

@@ -26,6 +26,11 @@ Code.require_file(
 )
 
 Code.require_file(
+  "flow_test/sections/flow_list_auto_partitions_merges_hot_ids_before_hydration.exs",
+  __DIR__
+)
+
+Code.require_file(
   "flow_test/sections/flow_claim_due_drains_higher_priorities_before_lower_priorities_default.exs",
   __DIR__
 )
@@ -488,6 +493,7 @@ defmodule Ferricstore.FlowTest do
   use Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitStateWaitingChildren
   use Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstSuccessfulChildAcrossS
   use Ferricstore.FlowTest.Sections.FlowNativeDueIndexMirrorsCreateClaimDue
+  use Ferricstore.FlowTest.Sections.FlowListAutoPartitionsMergesHotIdsBeforeHydration
   use Ferricstore.FlowTest.Sections.FlowClaimDueDrainsHigherPrioritiesBeforeLowerPrioritiesDefault
   use Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetentionDefaults
   use Ferricstore.FlowTest.Sections.FlowClaimDueAutomaticallyReclaimsExpiredLeasesRatio

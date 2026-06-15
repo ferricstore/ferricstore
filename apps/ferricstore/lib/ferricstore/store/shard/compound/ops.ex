@@ -5,6 +5,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
   alias Ferricstore.Store.{CompoundCommand, Promotion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.Shard.Compound.Promoted
 
@@ -280,7 +281,10 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
             _dedicated_path -> Promoted.bump_promoted_writes(new_state, redis_key)
           end
 
-        new_state = ZSetIndex.apply_put(new_state, redis_key, compound_key, value)
+        new_state =
+          new_state
+          |> compound_member_index_put(compound_key)
+          |> ZSetIndex.apply_put(redis_key, compound_key, value)
 
         {:reply, :ok, new_state}
 
@@ -330,7 +334,10 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
               new_state
           end
 
-        new_state = ZSetIndex.apply_puts(new_state, redis_key, entries)
+        new_state =
+          new_state
+          |> compound_member_index_puts(entries)
+          |> ZSetIndex.apply_puts(redis_key, entries)
 
         {:reply, :ok, new_state}
 
@@ -357,7 +364,11 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
             else: new_state
 
         new_state = Promoted.maybe_promote(new_state, redis_key, compound_key)
-        new_state = ZSetIndex.apply_put(new_state, redis_key, compound_key, value)
+
+        new_state =
+          new_state
+          |> compound_member_index_put(compound_key)
+          |> ZSetIndex.apply_put(redis_key, compound_key, value)
 
         {:reply, :ok, new_state}
 
@@ -386,6 +397,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
             new_state =
               state
               |> Promoted.bump_promoted_writes(redis_key)
+              |> compound_member_index_put(compound_key)
               |> ZSetIndex.apply_put(redis_key, compound_key, value)
 
             {:reply, :ok, new_state}
@@ -440,6 +452,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     new_state =
       new_state
       |> Promoted.maybe_promote(redis_key, last_compound_key)
+      |> compound_member_index_puts(entries)
       |> ZSetIndex.apply_puts(redis_key, entries)
 
     {:reply, :ok, new_state}
@@ -472,6 +485,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
 
               Promoted.bump_promoted_writes(acc, redis_key)
           end)
+          |> compound_member_index_puts(entries)
           |> ZSetIndex.apply_puts(redis_key, entries)
 
         {:reply, :ok, new_state}
@@ -504,7 +518,10 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
             tracked_state
           end
 
-        new_state = ZSetIndex.apply_delete(new_state, redis_key, compound_key)
+        new_state =
+          new_state
+          |> compound_member_index_delete(compound_key)
+          |> ZSetIndex.apply_delete(redis_key, compound_key)
 
         {:reply, :ok, %{new_state | write_version: new_version}}
 
@@ -542,7 +559,9 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
                 acc
               end
 
-            ZSetIndex.apply_delete(acc, redis_key, compound_key)
+            acc
+            |> compound_member_index_delete(compound_key)
+            |> ZSetIndex.apply_delete(redis_key, compound_key)
           end)
 
         {:reply, :ok, %{new_state | write_version: new_version}}
@@ -574,6 +593,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
             new_state =
               state
               |> Map.merge(%{pending: new_pending, write_version: new_version})
+              |> compound_member_index_delete(compound_key)
               |> ZSetIndex.apply_delete(redis_key, compound_key)
 
             {:reply, :ok, new_state}
@@ -596,6 +616,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
             new_state =
               state
               |> Promoted.bump_promoted_writes(redis_key)
+              |> compound_member_index_delete(compound_key)
               |> ZSetIndex.apply_delete(redis_key, compound_key)
 
             {:reply, :ok, new_state}
@@ -652,7 +673,9 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
         new_state =
           compound_keys
           |> Enum.reduce(%{new_state | pending: new_pending}, fn compound_key, acc ->
-            ZSetIndex.apply_delete(acc, redis_key, compound_key)
+            acc
+            |> compound_member_index_delete(compound_key)
+            |> ZSetIndex.apply_delete(redis_key, compound_key)
           end)
           |> Map.update!(:write_version, &(&1 + length(compound_keys)))
 
@@ -686,6 +709,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
           Enum.reduce(compound_keys, state, fn compound_key, acc ->
             acc
             |> Promoted.bump_promoted_writes(redis_key)
+            |> compound_member_index_delete(compound_key)
             |> ZSetIndex.apply_delete(redis_key, compound_key)
           end)
 
@@ -707,6 +731,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
 
         new_state =
           %{state | promoted_instances: new_promoted, write_version: new_version}
+          |> compound_member_index_delete_prefix(prefix)
           |> ZSetIndex.clear_ready_key(redis_key)
 
         {:reply, :ok, new_state}
@@ -728,6 +753,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
           {:ok, new_state} ->
             new_state =
               %{new_state | write_version: new_state.write_version + 1}
+              |> compound_member_index_delete_prefix(prefix)
               |> ZSetIndex.clear_ready_key(redis_key)
 
             {:reply, :ok, new_state}
@@ -758,6 +784,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
 
         new_state =
           %{state | promoted_instances: new_promoted, write_version: state.write_version + 1}
+          |> compound_member_index_delete_prefix(prefix)
           |> ZSetIndex.clear_ready_key(redis_key)
 
         {:reply, :ok, new_state}
@@ -772,5 +799,28 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     prefix = Ferricstore.Store.CompoundKey.zset_prefix(redis_key)
     data_path = Promoted.promoted_store(state, redis_key) || state.shard_data_path
     ZSetIndex.ensure(state, redis_key, prefix, data_path)
+  end
+
+  defp compound_member_index_put(state, compound_key) do
+    CompoundMemberIndex.put(Map.get(state, :compound_member_index), compound_key)
+    state
+  end
+
+  defp compound_member_index_puts(state, entries) do
+    Enum.each(entries, fn {compound_key, _value, _expire_at_ms} ->
+      CompoundMemberIndex.put(Map.get(state, :compound_member_index), compound_key)
+    end)
+
+    state
+  end
+
+  defp compound_member_index_delete(state, compound_key) do
+    CompoundMemberIndex.delete(Map.get(state, :compound_member_index), compound_key)
+    state
+  end
+
+  defp compound_member_index_delete_prefix(state, prefix) do
+    CompoundMemberIndex.delete_prefix(Map.get(state, :compound_member_index), prefix)
+    state
   end
 end

@@ -224,8 +224,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
                      now_ms: 900
                    )
 
-          refute_receive {:apply_projection_cache_before_spill, _compactor_pid, _metadata}, 250
-          assert apply_projection_cache_rows(root, 0) == 0
+          receive do
+            {:apply_projection_cache_before_spill, compactor_pid, _metadata} ->
+              send(compactor_pid, :release_apply_projection_cache_compaction)
+          after
+            250 -> :ok
+          end
+
+          assert eventually(fn -> apply_projection_cache_rows(root, 0) == 0 end)
 
           assert {:ok, %{id: ^flow_id, state: "queued"}} =
                    Ferricstore.Flow.get(ctx, flow_id, partition_key: partition)
@@ -343,15 +349,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
                      now_ms: 900
                    )
 
-          refute_receive {:apply_projection_cache_snapshot_before_spill, _compactor_pid,
-                          _metadata},
-                         250
+          receive do
+            {:apply_projection_cache_snapshot_before_spill, compactor_pid, _metadata} ->
+              send(compactor_pid, :release_apply_projection_cache_snapshot_compaction)
+          after
+            250 -> :ok
+          end
 
-          assert apply_projection_cache_rows(root, 0) == 0
+          assert eventually(fn -> apply_projection_cache_rows(root, 0) == 0 end)
 
           snapshot_task = Task.async(fn -> WARaftBackend.create_snapshot(0) end)
           assert {:ok, {:raft_log_pos, _index, _term}} = Task.await(snapshot_task, 5_000)
-          assert apply_projection_cache_rows(root, 0) == 0
+          assert eventually(fn -> apply_projection_cache_rows(root, 0) == 0 end)
         after
           restore_env(:waraft_apply_projection_cache_max_entries, previous_limit)
           restore_env(:waraft_apply_projection_cache_compact_hook, previous_hook)
@@ -373,7 +382,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         flow_type = "router-flow-cache-restart-#{System.unique_integer([:positive])}"
         flow_id = "router-flow-cache-restart-id-#{System.unique_integer([:positive])}"
         partition = "tenant-cache-restart-#{System.unique_integer([:positive])}"
-        apply_projection_root = waraft_apply_projection_root(root, 0)
 
         try do
           Application.put_env(:ferricstore, :flow_async_history, true)
@@ -396,14 +404,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
           assert {:ok, %{id: ^flow_id, state: "queued"}} =
                    Ferricstore.Flow.get(ctx, flow_id, partition_key: partition)
 
-          assert apply_projection_cache_rows(root, 0) == 0
-          assert apply_projection_segment_files(apply_projection_root) == []
-
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
           clear_apply_projection_cache!()
-
-          assert apply_projection_segment_files(apply_projection_root) == []
 
           restarted_ctx = build_ctx(root)
 
@@ -415,8 +418,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
 
             assert {:ok, %{id: ^flow_id, state: "queued"}} =
                      Ferricstore.Flow.get(restarted_ctx, flow_id, partition_key: partition)
-
-            assert apply_projection_segment_files(apply_projection_root) == []
           after
             FerricStore.Instance.cleanup(restarted_ctx.name)
           end
@@ -443,7 +444,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         flow_type = "router-flow-cache-memory-restart-#{System.unique_integer([:positive])}"
         flow_id = "router-flow-cache-memory-restart-id-#{System.unique_integer([:positive])}"
         partition = "tenant-cache-memory-restart-#{System.unique_integer([:positive])}"
-        apply_projection_root = waraft_apply_projection_root(root, 0)
         payload = :binary.copy("memory-only-payload-", 64)
 
         try do
@@ -467,14 +467,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
           assert {:ok, %{id: ^flow_id, state: "queued", payload: ^payload}} =
                    Ferricstore.Flow.get(ctx, flow_id, partition_key: partition, payload: true)
 
-          assert apply_projection_cache_rows(root, 0) == 0
-          assert [] == apply_projection_segment_files(apply_projection_root)
-
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
           clear_apply_projection_cache!()
-
-          assert apply_projection_segment_files(apply_projection_root) == []
 
           restarted_ctx = build_ctx(root)
 

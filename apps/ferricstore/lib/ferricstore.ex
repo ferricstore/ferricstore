@@ -194,7 +194,6 @@ defmodule FerricStore do
   alias FerricStore.API.Geo, as: GeoAPI
   alias FerricStore.API.Hashes, as: HashesAPI
   alias FerricStore.API.HyperLogLog, as: HyperLogLogAPI
-  alias FerricStore.API.Json, as: JsonAPI
   alias FerricStore.API.Lists, as: ListsAPI
   alias FerricStore.API.Locks, as: LocksAPI
   alias FerricStore.API.Probabilistic, as: ProbabilisticAPI
@@ -364,17 +363,6 @@ defmodule FerricStore do
   defdelegate geohash(key, members), to: GeoAPI
   defdelegate geopos(key, members), to: GeoAPI
 
-  defdelegate json_set(key, path, value), to: JsonAPI
-  defdelegate json_get(key, path \\ "$"), to: JsonAPI
-  defdelegate json_del(key, path \\ "$"), to: JsonAPI
-  defdelegate json_type(key, path \\ "$"), to: JsonAPI
-  defdelegate json_numincrby(key, path, increment), to: JsonAPI
-  defdelegate json_arrappend(key, path, values), to: JsonAPI
-  defdelegate json_arrlen(key, path \\ "$"), to: JsonAPI
-  defdelegate json_strlen(key, path \\ "$"), to: JsonAPI
-  defdelegate json_objkeys(key, path \\ "$"), to: JsonAPI
-  defdelegate json_objlen(key, path \\ "$"), to: JsonAPI
-
   defdelegate lock(key, owner, ttl_ms), to: LocksAPI
   defdelegate unlock(key, owner), to: LocksAPI
   defdelegate extend(key, owner, ttl_ms), to: LocksAPI
@@ -414,7 +402,10 @@ defmodule FerricStore do
   defdelegate flow_extend_lease(id, lease_token, opts \\ []), to: FlowAPI
   defdelegate flow_complete(id, lease_token, opts \\ []), to: FlowAPI
   defdelegate flow_complete_many(partition_key, items, opts \\ []), to: FlowAPI
+  defdelegate flow_run_steps_many(items, opts \\ []), to: FlowAPI
   defdelegate flow_transition(id, from_state, to_state, opts \\ []), to: FlowAPI
+  defdelegate flow_start_and_claim(id, type, initial_state, opts \\ []), to: FlowAPI
+  defdelegate flow_step_continue(id, lease_token, from_state, to_state, opts \\ []), to: FlowAPI
 
   defdelegate flow_transition_many(partition_key, from_state, to_state, items, opts \\ []),
     to: FlowAPI

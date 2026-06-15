@@ -116,51 +116,6 @@ defmodule FerricstoreServer.Connection.Pipeline.Fallback do
         )
       end
 
-      defp dispatch_store_command(
-             _name,
-             _args,
-             {:json_set, key, path, value, flags},
-             _store,
-             ctx,
-             namespace
-           ) do
-        Router.json_set(ctx, namespace_key(namespace, key), path, value, flags)
-      end
-
-      defp dispatch_store_command(_name, _args, {:json_del, key, path}, _store, ctx, namespace) do
-        Router.json_del(ctx, namespace_key(namespace, key), path)
-      end
-
-      defp dispatch_store_command(
-             _name,
-             _args,
-             {:json_numincrby, key, path, increment},
-             _store,
-             ctx,
-             namespace
-           ) do
-        Router.json_numincrby(ctx, namespace_key(namespace, key), path, increment)
-      end
-
-      defp dispatch_store_command(
-             _name,
-             _args,
-             {:json_arrappend, key, path, values},
-             _store,
-             ctx,
-             namespace
-           ) do
-        Router.json_arrappend(ctx, namespace_key(namespace, key), path, values)
-      end
-
-      defp dispatch_store_command(_name, _args, {:json_toggle, key, path}, _store, ctx, namespace) do
-        Router.json_toggle(ctx, namespace_key(namespace, key), path)
-      end
-
-      defp dispatch_store_command(_name, _args, {:json_clear, key, path}, _store, ctx, namespace) do
-        Router.json_clear(ctx, namespace_key(namespace, key), path)
-      end
-
       defp dispatch_store_command(name, args, ast, store, _ctx, _namespace)
            when is_tuple(ast) and tuple_size(ast) in 2..5 do
         case Dispatcher.dispatch_ast(ast, store) do

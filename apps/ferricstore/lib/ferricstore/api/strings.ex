@@ -356,16 +356,20 @@ defmodule FerricStore.API.Strings do
       {:ok, "alice"}
 
   """
-  @spec mset(%{key() => value()}) :: :ok
+  @spec mset(%{key() => value()}) :: :ok | {:error, term()}
   def mset(pairs) when is_map(pairs) do
     ctx = default_ctx()
 
-    Enum.each(pairs, fn {key, value} ->
-      Router.put(ctx, key, value, 0)
-    end)
-
-    :ok
+    ctx
+    |> Router.batch_quorum_put(Map.to_list(pairs))
+    |> mset_batch_result()
   end
+
+  defp mset_batch_result(results) when is_list(results) do
+    if Enum.all?(results, &(&1 == :ok)), do: :ok, else: {:error, results}
+  end
+
+  defp mset_batch_result({:error, _reason} = error), do: error
 
   @doc """
   Appends `suffix` to the string value stored at `key`.

@@ -355,19 +355,6 @@ fn command_tag_name(cmd: &[u8]) -> Option<&'static str> {
         b"XGROUP" => Some("xgroup"),
         b"XREADGROUP" => Some("xreadgroup"),
         b"XACK" => Some("xack"),
-        b"JSON.SET" => Some("json_set"),
-        b"JSON.GET" => Some("json_get"),
-        b"JSON.DEL" => Some("json_del"),
-        b"JSON.NUMINCRBY" => Some("json_numincrby"),
-        b"JSON.TYPE" => Some("json_type"),
-        b"JSON.STRLEN" => Some("json_strlen"),
-        b"JSON.OBJKEYS" => Some("json_objkeys"),
-        b"JSON.OBJLEN" => Some("json_objlen"),
-        b"JSON.ARRAPPEND" => Some("json_arrappend"),
-        b"JSON.ARRLEN" => Some("json_arrlen"),
-        b"JSON.TOGGLE" => Some("json_toggle"),
-        b"JSON.CLEAR" => Some("json_clear"),
-        b"JSON.MGET" => Some("json_mget"),
         b"CAS" => Some("cas"),
         b"LOCK" => Some("lock"),
         b"UNLOCK" => Some("unlock"),
@@ -666,4 +653,3 @@ fn lossy_str(data: &[u8]) -> String {
 }
 
 rustler::init!("Elixir.Ferricstore.Resp.ParserNif");
-

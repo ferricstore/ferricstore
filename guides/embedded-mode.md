@@ -612,38 +612,6 @@ Geo is implemented on top of Sorted Sets with geohash-encoded scores.
 # positions => [[13.361389, 38.115556], [15.087269, 37.502669]]
 ```
 
-### JSON
-
-```elixir
-# JSON.SET -- set a JSON document
-:ok = FerricStore.json_set("doc", "$", ~s({"name":"alice","age":30,"tags":["elixir"]}))
-
-# JSON.GET -- get value at path
-{:ok, value} = FerricStore.json_get("doc", "$.name")
-# value => "[\"alice\"]"
-
-# JSON.NUMINCRBY -- increment number
-{:ok, result} = FerricStore.json_numincrby("doc", "$.age", "1")
-
-# JSON.TYPE -- get type at path
-{:ok, type} = FerricStore.json_type("doc", "$.name")
-# type => "string"
-
-# JSON.DEL -- delete at path
-{:ok, 1} = FerricStore.json_del("doc", "$.age")
-
-# JSON.OBJKEYS / JSON.OBJLEN
-{:ok, keys} = FerricStore.json_objkeys("doc")
-{:ok, len} = FerricStore.json_objlen("doc")
-
-# JSON.STRLEN -- string length at path
-{:ok, 5} = FerricStore.json_strlen("doc", "$.name")
-
-# JSON.ARRAPPEND / JSON.ARRLEN
-{:ok, 2} = FerricStore.json_arrappend("doc", "$.tags", ~s("rust"))
-{:ok, 2} = FerricStore.json_arrlen("doc", "$.tags")
-```
-
 ### Compare-and-Swap
 
 Atomic compare-and-swap routed directly through `Router.cas/4`.

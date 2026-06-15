@@ -87,7 +87,8 @@ defmodule Ferricstore.Store.Shard do
     :flow_transition_many,
     :flow_retry_many,
     :flow_fail_many,
-    :flow_cancel_many
+    :flow_cancel_many,
+    :flow_run_steps_many
   ]
 
   # Default maximum active file size before rotation (256 MB).
@@ -139,6 +140,7 @@ defmodule Ferricstore.Store.Shard do
     # at init time. Updated via handle_cast(:update_max_active_file_size, n).
     max_active_file_size: 256 * 1024 * 1024,
     writes_paused: false,
+    compound_member_index: nil,
     zset_score_index: nil,
     zset_score_lookup: nil,
     flow_index: nil,

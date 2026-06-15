@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.Router.Part09 do
   @moduledoc false
 
-  # Extracted from Router: json_numincrby .. compound_get_from_keydir
+  # Extracted from Router: forced_single_key_quorum .. compound_get_from_keydir
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.CommandTime
@@ -22,29 +22,6 @@ defmodule Ferricstore.Store.Router.Part09 do
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
-      @doc false
-      def json_numincrby(ctx, key, path, increment)
-          when is_binary(key) and (is_binary(path) or is_list(path)) and is_number(increment) do
-        forced_single_key_quorum(ctx, key, {:json_numincrby, key, path, increment})
-      end
-
-      @doc false
-      def json_arrappend(ctx, key, path, values)
-          when is_binary(key) and (is_binary(path) or is_list(path)) and is_list(values) do
-        forced_single_key_quorum(ctx, key, {:json_arrappend, key, path, values})
-      end
-
-      @doc false
-      def json_toggle(ctx, key, path)
-          when is_binary(key) and (is_binary(path) or is_list(path)) do
-        forced_single_key_quorum(ctx, key, {:json_toggle, key, path})
-      end
-
-      @doc false
-      def json_clear(ctx, key, path) when is_binary(key) and (is_binary(path) or is_list(path)) do
-        forced_single_key_quorum(ctx, key, {:json_clear, key, path})
-      end
-
       defp forced_single_key_quorum(ctx, key, command) do
         idx = shard_for(ctx, key)
         forced_quorum_write(ctx, idx, command, node())

@@ -647,7 +647,6 @@ Included in phase 1:
 - `APPEND`, `SETRANGE`, `SETBIT`
 - `HINCRBY`, `HINCRBYFLOAT`, `ZINCRBY`
 - `PFADD`
-- JSON mutations: `JSON.SET`, `JSON.DEL`, `JSON.NUMINCRBY`, `JSON.ARRAPPEND`, `JSON.TOGGLE`, `JSON.CLEAR`
 
 Explicitly excluded:
 

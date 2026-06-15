@@ -18,6 +18,11 @@ defmodule Ferricstore.Flow.ManyItemOpts do
     {:ok, id, [payload: payload]}
   end
 
+  def create({:id, id, :partition_key, partition_key, :payload, payload})
+      when is_binary(id) do
+    {:ok, id, [partition_key: partition_key, payload: payload]}
+  end
+
   def create({:id, id, :partition_key, partition_key, :payload_ref, payload_ref})
       when is_binary(id) do
     {:ok, id, [partition_key: partition_key, payload_ref: payload_ref]}

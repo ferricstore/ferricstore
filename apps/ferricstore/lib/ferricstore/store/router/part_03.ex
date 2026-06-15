@@ -62,7 +62,7 @@ defmodule Ferricstore.Store.Router.Part03 do
              cold_count,
              waraft_entries,
              waraft_count,
-             hot_hits,
+             bookkeeping,
              now
            )
            when value_size >= min_file_ref_size do
@@ -70,14 +70,14 @@ defmodule Ferricstore.Store.Router.Part03 do
           entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
 
           {{:cold, cold_count},
-           {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, hot_hits}}
+           {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, bookkeeping}}
         else
           case file_ref_from_cold_location(ctx, idx, path, offset, key, value_size, true) do
             {:ok, {file_ref_path, value_offset, size}} ->
               Stats.record_cold_read(ctx, key)
 
               {{:file_ref, file_ref_path, value_offset, size},
-               {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+               {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
             nil ->
               case retry_changed_file_ref(
@@ -92,17 +92,17 @@ defmodule Ferricstore.Store.Router.Part03 do
                   Stats.record_cold_read(ctx, key)
 
                   {{:file_ref, retry_path, value_offset, retry_size},
-                   {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                   {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
                 {:hot, value} ->
                   {{:value, value},
-                   {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                   {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
                 :miss ->
                   record_keyspace_miss(ctx, key)
 
                   {{:value, nil},
-                   {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                   {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
               end
           end
         end
@@ -122,13 +122,13 @@ defmodule Ferricstore.Store.Router.Part03 do
              cold_count,
              waraft_entries,
              waraft_count,
-             hot_hits,
+             bookkeeping,
              _now
            ) do
         entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
 
         {{:cold, cold_count},
-         {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, hot_hits}}
+         {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, bookkeeping}}
       end
 
       defp read_cold_batch_async([], _now), do: []

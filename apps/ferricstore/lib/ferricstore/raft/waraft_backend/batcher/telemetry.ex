@@ -52,8 +52,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher.Telemetry do
     :telemetry.execute(
       [:ferricstore, :batcher, :quorum_submit],
       measurements
-      |> Map.put(:caller_count, caller_count)
-      |> Map.put_new(:command_bytes, 0),
+      |> Map.put(:caller_count, caller_count),
       %{
         backend: :waraft,
         shard_index: state.shard_index,

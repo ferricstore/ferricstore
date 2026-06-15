@@ -7,21 +7,30 @@ defmodule FerricstoreServer.Native.IntegrationTest do
   alias FerricstoreServer.Native.{Codec, Listener}
 
   @op_auth 0x0002
+  @op_ping 0x0003
   @op_client_set_name 0x0004
   @op_client_info 0x0005
   @op_startup 0x000C
   @op_route_batch 0x000F
   @op_window_update 0x000D
-  @op_batch 0x000E
+  @op_pipeline 0x000E
   @op_options 0x000B
   @op_subscribe_events 0x0011
   @op_get 0x0101
   @op_set 0x0102
+  @op_mget 0x0104
+  @op_zadd 0x0140
+  @op_zrange 0x0142
 
   setup do
     Config.set("requirepass", "")
     old_response_chunk_bytes = Application.get_env(:ferricstore, :native_response_chunk_bytes)
+
+    old_response_coalesce_bytes =
+      Application.get_env(:ferricstore, :native_response_coalesce_bytes)
+
     old_max_pending_chunks = Application.get_env(:ferricstore, :native_max_pending_chunks)
+    old_idle_timeout_ms = Application.get_env(:ferricstore, :native_idle_timeout_ms)
 
     old_max_pending_chunk_bytes =
       Application.get_env(:ferricstore, :native_max_pending_chunk_bytes)
@@ -47,7 +56,9 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     on_exit(fn ->
       Config.set("requirepass", "")
       restore_env(:native_response_chunk_bytes, old_response_chunk_bytes)
+      restore_env(:native_response_coalesce_bytes, old_response_coalesce_bytes)
       restore_env(:native_max_pending_chunks, old_max_pending_chunks)
+      restore_env(:native_idle_timeout_ms, old_idle_timeout_ms)
       restore_env(:native_max_pending_chunk_bytes, old_max_pending_chunk_bytes)
       restore_env(:native_trace_enabled, old_trace_enabled)
       restore_env(:native_request_compression_enabled, old_request_compression_enabled)
@@ -65,6 +76,28 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     assert {0, payload} = recv_response(sock)
     assert payload["protocol_versions"] == [1]
     assert payload["multiplexing"]["ordered_per_lane"] == true
+
+    :gen_tcp.close(sock)
+  end
+
+  test "idle native clients are closed after configured timeout", %{port: port} do
+    Application.put_env(:ferricstore, :native_idle_timeout_ms, 25)
+    sock = connect(port)
+
+    assert {:error, :closed} = :gen_tcp.recv(sock, 0, 500)
+  end
+
+  test "PING heartbeat keeps native idle timeout alive", %{port: port} do
+    Application.put_env(:ferricstore, :native_idle_timeout_ms, 80)
+    sock = connect(port)
+
+    Process.sleep(40)
+    send_request(sock, @op_ping, 0, 101, %{})
+    assert {0, "PONG"} = recv_response(sock)
+
+    Process.sleep(40)
+    send_request(sock, @op_ping, 0, 102, %{})
+    assert {0, "PONG"} = recv_response(sock)
 
     :gen_tcp.close(sock)
   end
@@ -119,6 +152,33 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     :gen_tcp.close(sock)
   end
 
+  test "standard KV read opcodes return compact custom payloads over TCP", %{port: port} do
+    sock = connect(port)
+    key = "native:compact-kv:#{System.unique_integer([:positive])}"
+    missing = key <> ":missing"
+
+    send_request(sock, @op_set, 1, 501, %{"key" => key, "value" => "v"})
+    assert {0, "OK"} = recv_response(sock)
+
+    send_request(sock, @op_get, 1, 502, %{"key" => key})
+    assert {:raw, 0, <<0x82, 1, 1::unsigned-32, "v">>} = recv_raw_response(sock)
+
+    send_request(sock, @op_get, 1, 503, %{"key" => missing})
+    assert {:raw, 0, <<0x82, 0>>} = recv_raw_response(sock)
+
+    send_request(sock, @op_mget, 1, 504, %{"keys" => [key, missing]})
+
+    assert {:raw, 0, <<0x83, 2::unsigned-32, 1, 1::unsigned-32, "v", 0>>} =
+             recv_raw_response(sock)
+
+    send_request(sock, @op_mget, 1, 505, %{"keys" => [key, key]})
+
+    assert {:raw, 0, <<0x89, 2::unsigned-32, 1::unsigned-32, "v", "v">>} =
+             recv_raw_response(sock)
+
+    :gen_tcp.close(sock)
+  end
+
   test "ROUTE_BATCH returns shard and lane hints for client-side routing", %{port: port} do
     sock = connect(port)
 
@@ -146,6 +206,8 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     assert payload["credits"] == 128
     assert payload["limits"]["window_update"] == true
     assert is_integer(payload["limits"]["max_inflight_per_lane"])
+    assert is_integer(payload["limits"]["response_coalesce_bytes"])
+    assert payload["limits"]["response_coalesce_bytes"] > 0
 
     :gen_tcp.close(sock)
   end
@@ -189,11 +251,11 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     :gen_tcp.close(sock)
   end
 
-  test "BATCH executes data commands and returns per-command results", %{port: port} do
+  test "PIPELINE executes data commands and returns per-command results", %{port: port} do
     sock = connect(port)
-    key = "native:batch:#{System.unique_integer([:positive])}"
+    key = "native:pipeline:#{System.unique_integer([:positive])}"
 
-    send_request(sock, @op_batch, 0, 12, %{
+    send_request(sock, @op_pipeline, 1, 12, %{
       "atomicity" => "none",
       "commands" => [
         %{
@@ -516,6 +578,58 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     :gen_tcp.close(sock)
   end
 
+  test "closing native connection terminates active lane processes", %{port: port} do
+    sock = connect(port)
+    key = "native:close-lane:#{System.unique_integer([:positive])}"
+
+    send_request(sock, @op_set, 1, 51, %{"key" => key, "value" => "value"})
+    assert {0, "OK"} = recv_response(sock)
+
+    send_request(sock, @op_client_info, 0, 52, %{})
+    assert {0, info} = recv_response(sock)
+    {:ok, connection_pid} = ConnRegistry.lookup(info["client_id"])
+    lane_pid = linked_native_lane!(connection_pid)
+    ref = Process.monitor(lane_pid)
+
+    :gen_tcp.close(sock)
+
+    assert_receive {:DOWN, ^ref, :process, ^lane_pid, :shutdown}, 500
+  end
+
+  test "closing native connection terminates lane with queued large ZRANGE responses", %{
+    port: port
+  } do
+    sock = connect(port)
+    key = "native:close-zrange:#{System.unique_integer([:positive])}"
+
+    items = for score <- 1..512, do: [score, "m#{score}"]
+
+    send_request(sock, @op_zadd, 1, 60, %{"key" => key, "items" => items})
+    assert {0, 512} = recv_response(sock)
+
+    send_request(sock, @op_client_info, 0, 61, %{})
+    assert {0, info} = recv_response(sock)
+    {:ok, connection_pid} = ConnRegistry.lookup(info["client_id"])
+    lane_pid = linked_native_lane!(connection_pid)
+    ref = Process.monitor(lane_pid)
+
+    frames =
+      for request_id <- 62..81 do
+        @op_zrange
+        |> Codec.encode_frame(
+          1,
+          request_id,
+          Codec.encode_value(%{"key" => key, "start" => 0, "stop" => -1})
+        )
+        |> IO.iodata_to_binary()
+      end
+
+    :ok = :gen_tcp.send(sock, frames)
+    :gen_tcp.close(sock)
+
+    assert_receive {:DOWN, ^ref, :process, ^lane_pid, :shutdown}, 1_000
+  end
+
   test "subscribed native clients receive topology change events", %{port: port} do
     sock = connect(port)
 
@@ -574,6 +688,12 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     {status, value}
   end
 
+  defp recv_raw_response(sock) do
+    %{status: status, flags: flags, raw_value_body: raw_value_body} = recv_response_meta(sock)
+    assert Bitwise.band(flags, Codec.flags().custom_payload) != 0
+    {:raw, status, raw_value_body}
+  end
+
   defp recv_response_meta(sock) do
     {:ok, header} = :gen_tcp.recv(sock, 24, 5_000)
 
@@ -588,7 +708,8 @@ defmodule FerricstoreServer.Native.IntegrationTest do
 
     body = maybe_uncompress(flags, body)
     <<status::unsigned-16, value_body::binary>> = body
-    {:ok, value} = Codec.decode_body(value_body)
+
+    value = decode_response_value(flags, opcode, value_body)
 
     %{
       lane_id: lane_id,
@@ -597,7 +718,8 @@ defmodule FerricstoreServer.Native.IntegrationTest do
       flags: flags,
       status: status,
       value: value,
-      chunks: chunks
+      chunks: chunks,
+      raw_value_body: value_body
     }
   end
 
@@ -630,5 +752,71 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     else
       body
     end
+  end
+
+  defp decode_response_value(flags, opcode, value_body) do
+    if Bitwise.band(flags, Codec.flags().custom_payload) != 0 do
+      case decode_custom_response_value(opcode, value_body) do
+        {:ok, value} ->
+          value
+
+        :error ->
+          value_body
+      end
+    else
+      {:ok, decoded} = Codec.decode_body(value_body)
+      decoded
+    end
+  end
+
+  defp decode_custom_response_value(@op_get, <<0x82, 0>>), do: {:ok, nil}
+
+  defp decode_custom_response_value(@op_get, <<0x82, 1, size::unsigned-32, value::binary>>)
+       when byte_size(value) == size,
+       do: {:ok, value}
+
+  defp decode_custom_response_value(@op_mget, <<0x83, count::unsigned-32, rest::binary>>),
+    do: decode_compact_mget_values(count, rest, [])
+
+  defp decode_custom_response_value(
+         @op_mget,
+         <<0x89, count::unsigned-32, size::unsigned-32, rest::binary>>
+       ) do
+    if byte_size(rest) == count * size do
+      {:ok, for(<<value::binary-size(size) <- rest>>, do: value)}
+    else
+      :error
+    end
+  end
+
+  defp decode_custom_response_value(_opcode, <<0x81, 1::unsigned-32>>), do: {:ok, "OK"}
+
+  defp decode_custom_response_value(_opcode, <<0x81, count::unsigned-32>>),
+    do: {:ok, List.duplicate("OK", count)}
+
+  defp decode_custom_response_value(_opcode, _value_body), do: :error
+
+  defp decode_compact_mget_values(0, "", acc), do: {:ok, Enum.reverse(acc)}
+
+  defp decode_compact_mget_values(count, <<0, rest::binary>>, acc) when count > 0,
+    do: decode_compact_mget_values(count - 1, rest, [nil | acc])
+
+  defp decode_compact_mget_values(count, <<1, size::unsigned-32, rest::binary>>, acc)
+       when count > 0 and byte_size(rest) >= size do
+    <<value::binary-size(size), rest::binary>> = rest
+    decode_compact_mget_values(count - 1, rest, [value | acc])
+  end
+
+  defp decode_compact_mget_values(_count, _rest, _acc), do: :error
+
+  defp linked_native_lane!(connection_pid) do
+    {:links, links} = Process.info(connection_pid, :links)
+
+    Enum.find_value(links, fn linked_pid ->
+      case Process.info(linked_pid, :current_function) do
+        {:current_function, {FerricstoreServer.Native.Lane, :loop, 3}} -> linked_pid
+        _ -> nil
+      end
+    end) || flunk("expected native connection to link an active lane")
   end
 end

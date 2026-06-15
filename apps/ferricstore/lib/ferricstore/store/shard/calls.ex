@@ -696,6 +696,7 @@ defmodule Ferricstore.Store.Shard.Calls do
                 else: 0
               ),
             active_file_preallocated_to: state.active_file_preallocated_to,
+            compound_member_index_name: state.compound_member_index,
             zset_score_index_name: state.zset_score_index,
             zset_score_lookup_name: state.zset_score_lookup,
             flow_index_name: state.flow_index,

@@ -116,12 +116,7 @@ defmodule FerricStore.Impl do
 
   @spec mset(FerricStore.Instance.t(), [{binary(), binary()}]) :: :ok | {:error, term()}
   def mset(ctx, pairs) do
-    Enum.reduce_while(pairs, :ok, fn {key, value}, :ok ->
-      case Router.put(ctx, key, value, 0) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
+    Router.batch_quorum_put_status(ctx, pairs)
   end
 
   @spec append(FerricStore.Instance.t(), binary(), binary()) :: {:ok, non_neg_integer()}
@@ -278,6 +273,18 @@ defmodule FerricStore.Impl do
 
       _ ->
         {:ok, %{}}
+    end
+  end
+
+  @spec hmget(FerricStore.Instance.t(), binary(), [binary()]) ::
+          {:ok, [binary() | nil]} | {:error, binary()}
+  def hmget(ctx, key, fields) when is_list(fields) do
+    store = build_store(ctx)
+    str_fields = Enum.map(fields, &to_string/1)
+
+    case Hash.handle_ast({:hmget, [key | str_fields]}, store) do
+      {:error, _} = err -> err
+      values -> {:ok, values}
     end
   end
 
@@ -461,8 +468,17 @@ defmodule FerricStore.Impl do
   def flow_complete(ctx, id, lease_token, opts \\ []),
     do: Ferricstore.Flow.complete(ctx, id, lease_token, opts)
 
+  def flow_run_steps_many(ctx, items, opts \\ []),
+    do: Ferricstore.Flow.run_steps_many(ctx, items, opts)
+
   def flow_transition(ctx, id, from_state, to_state, opts \\ []),
     do: Ferricstore.Flow.transition(ctx, id, from_state, to_state, opts)
+
+  def flow_start_and_claim(ctx, id, type, initial_state, opts \\ []),
+    do: Ferricstore.Flow.start_and_claim(ctx, id, type, initial_state, opts)
+
+  def flow_step_continue(ctx, id, lease_token, from_state, to_state, opts \\ []),
+    do: Ferricstore.Flow.step_continue(ctx, id, lease_token, from_state, to_state, opts)
 
   def flow_transition_many(ctx, partition_key, from_state, to_state, items, opts \\ []),
     do: Ferricstore.Flow.transition_many(ctx, partition_key, from_state, to_state, items, opts)

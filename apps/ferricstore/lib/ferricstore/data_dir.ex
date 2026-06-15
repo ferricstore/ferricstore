@@ -26,6 +26,7 @@ defmodule Ferricstore.DataDir do
 
   require Logger
 
+  @waraft_storage_root "ferricstore_waraft_backend"
   @top_level_dirs ~w(data dedicated blob prob waraft registry hints)
   @sharded_dirs ~w(data dedicated blob prob)
 
@@ -67,6 +68,19 @@ defmodule Ferricstore.DataDir do
           maybe_create_dir(shard_acc, Path.join([data_dir, dir, "shard_#{i}"]), :create_shard_dir)
         end)
       end)
+
+    created_dirs =
+      if shard_count > 0 do
+        Enum.reduce(1..shard_count, created_dirs, fn partition, acc ->
+          root = Path.join([data_dir, "waraft", "#{@waraft_storage_root}.#{partition}"])
+
+          acc
+          |> maybe_create_dir(root, :create_waraft_partition_dir)
+          |> maybe_create_dir(Path.join(root, "segment_log"), :create_waraft_segment_log_dir)
+        end)
+      else
+        created_dirs
+      end
 
     fsync_created_dir_parents!(created_dirs)
 

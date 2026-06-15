@@ -222,10 +222,7 @@ defmodule Ferricstore.Store.Router.Part06 do
         keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
         now_ms = CommandTime.now_ms()
 
-        blocked_keys =
-          keys
-          |> Enum.filter(&flow_state_expired_or_deleted?(ctx, &1, now_ms))
-          |> MapSet.new()
+        blocked_keys = flow_blocked_state_keys(ctx, keys, now_ms)
 
         values =
           Stats.with_cache_tracking_disabled(fn ->
@@ -234,7 +231,7 @@ defmodule Ferricstore.Store.Router.Part06 do
 
         missing_keys =
           for {key, nil} <- Enum.zip(keys, values),
-              not MapSet.member?(blocked_keys, key),
+              not flow_state_key_blocked?(blocked_keys, key),
               not flow_state_expired_or_deleted?(ctx, key, CommandTime.now_ms()),
               do: key
 
@@ -245,7 +242,7 @@ defmodule Ferricstore.Store.Router.Part06 do
           |> Enum.zip(values)
           |> Enum.map_reduce(missing_values, fn {key, value}, remaining ->
             cond do
-              MapSet.member?(blocked_keys, key) ->
+              flow_state_key_blocked?(blocked_keys, key) ->
                 {nil, remaining}
 
               is_binary(value) ->
@@ -266,6 +263,18 @@ defmodule Ferricstore.Store.Router.Part06 do
 
         merged
       end
+
+      defp flow_blocked_state_keys(ctx, keys, now_ms) do
+        case Enum.reduce(keys, [], fn key, acc ->
+               if flow_state_expired_or_deleted?(ctx, key, now_ms), do: [key | acc], else: acc
+             end) do
+          [] -> :none
+          blocked -> MapSet.new(blocked)
+        end
+      end
+
+      defp flow_state_key_blocked?(:none, _key), do: false
+      defp flow_state_key_blocked?(blocked_keys, key), do: MapSet.member?(blocked_keys, key)
 
       @doc false
       def flow_lmdb_batch_get_state_keys(ctx, state_keys) when is_list(state_keys) do
@@ -702,27 +711,32 @@ defmodule Ferricstore.Store.Router.Part06 do
                   :flow_cancel_many,
                   :flow_fail_many,
                   :flow_retry_many,
-                  :flow_transition_many
+                  :flow_transition_many,
+                  :flow_run_steps_many
                 ] do
         {buckets, count} =
-          Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
-            %{id: id} = attrs, {buckets, idx} when is_binary(id) ->
-              partition_key = Map.get(attrs, :partition_key)
-              key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-              shard_idx = shard_for(ctx, key)
+          Ferricstore.LatencyTrace.span("server_flow_many_bucket_us", fn ->
+            Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+              %{id: id} = attrs, {buckets, idx} when is_binary(id) ->
+                partition_key = Map.get(attrs, :partition_key)
+                key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+                shard_idx = shard_for(ctx, key)
 
-              {flow_put_shard_bucket(buckets, shard_idx, {idx, key, attrs}), idx + 1}
+                {flow_put_shard_bucket(buckets, shard_idx, {idx, key, attrs}), idx + 1}
+            end)
           end)
 
         groups =
-          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
-            group = Enum.reverse(entries)
-            route_key = group |> hd() |> elem(1)
-            attrs = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
-            original_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
-            command_attrs = flow_many_command_attrs(command, attrs)
-            command_attrs = flow_stamp_shard(command_attrs, shard_idx)
-            {shard_idx, route_key, original_indices, {command, route_key, command_attrs}}
+          Ferricstore.LatencyTrace.span("server_flow_many_groups_us", fn ->
+            flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+              group = Enum.reverse(entries)
+              route_key = group |> hd() |> elem(1)
+              attrs = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
+              original_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
+              command_attrs = flow_many_command_attrs(command, attrs)
+              command_attrs = flow_stamp_shard(command_attrs, shard_idx)
+              {shard_idx, route_key, original_indices, {command, route_key, command_attrs}}
+            end)
           end)
 
         case Enum.find(groups, fn {_shard_idx, key, _indices, _cmd} ->
@@ -734,10 +748,18 @@ defmodule Ferricstore.Store.Router.Part06 do
 
           nil ->
             keyed_commands =
-              Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
+              Ferricstore.LatencyTrace.span("server_flow_many_keyed_commands_us", fn ->
+                Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
+              end)
 
-            group_results = batch_quorum_commands(ctx, keyed_commands)
-            expand_flow_many_results(count, groups, group_results)
+            group_results =
+              Ferricstore.LatencyTrace.span("server_flow_many_quorum_us", fn ->
+                batch_quorum_commands(ctx, keyed_commands)
+              end)
+
+            Ferricstore.LatencyTrace.span("server_flow_many_expand_us", fn ->
+              expand_flow_many_results(count, groups, group_results)
+            end)
         end
       end
 

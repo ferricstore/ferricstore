@@ -568,6 +568,22 @@ defmodule Ferricstore.Store.Router.Part10 do
         end
       end
 
+      @spec compound_scan_raw(FerricStore.Instance.t(), binary(), binary()) :: [
+              {binary(), binary()}
+            ]
+      def compound_scan_raw(ctx, redis_key, prefix) do
+        idx = shard_for(ctx, redis_key)
+
+        if selected_waraft_ctx?(ctx) do
+          direct_compound_scan(idx, ctx, prefix)
+        else
+          case safe_read_call(ctx, idx, {:compound_scan, redis_key, prefix}) do
+            {:ok, results} -> results
+            :unavailable -> []
+          end
+        end
+      end
+
       @spec compound_fields(FerricStore.Instance.t(), binary(), binary()) :: [binary()]
       def compound_fields(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
@@ -617,7 +633,10 @@ defmodule Ferricstore.Store.Router.Part10 do
       defp direct_compound_read_state(ctx, idx) do
         %{
           keydir: resolve_keydir(ctx, idx),
+          compound_member_index:
+            Ferricstore.Store.Shard.CompoundMemberIndex.table_name(ctx.name, idx),
           data_dir: ctx.data_dir,
+          shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx),
           index: idx,
           instance_ctx: ctx
         }

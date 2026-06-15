@@ -88,7 +88,8 @@ defmodule FerricstoreServer.Native.TlsListener do
 
   defp native_protocol_opts do
     %{
-      max_frame_bytes: Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024),
+      max_frame_bytes:
+        Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024),
       max_lanes: Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
       lane_max_queue: Application.get_env(:ferricstore, :native_lane_max_queue, 1024)
     }

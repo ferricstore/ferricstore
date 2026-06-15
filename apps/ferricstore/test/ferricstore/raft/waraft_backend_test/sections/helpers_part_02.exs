@@ -75,6 +75,29 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart02 do
         end
       end
 
+      defp assert_receive_storage_metadata_fsync(timeout \\ 1_000) do
+        deadline = System.monotonic_time(:millisecond) + timeout
+        assert_receive_storage_metadata_fsync(deadline, [])
+      end
+
+      defp assert_receive_storage_metadata_fsync(deadline, seen) do
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+        receive do
+          {:storage_metadata_fsync, path} ->
+            path_string = to_string(path)
+
+            if String.contains?(path_string, "ferricstore_storage.term") do
+              path
+            else
+              assert_receive_storage_metadata_fsync(deadline, [path_string | seen])
+            end
+        after
+          remaining ->
+            flunk("expected storage metadata fsync, saw: #{inspect(Enum.reverse(seen))}")
+        end
+      end
+
       defp flush_segment_append_telemetry do
         receive do
           {:waraft_segment_log_telemetry, [:ferricstore, :waraft, :segment_log, :append],

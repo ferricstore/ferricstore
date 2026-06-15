@@ -178,75 +178,6 @@ fn make_command_ast<'a>(
         CommandAstKind::Xack => {
             (atom(env, "xack"), args[0], args[1], args[2..].to_vec()).encode(env)
         }
-        CommandAstKind::JsonSet => make_json_set_command_ast(env, args, arg_bytes),
-        CommandAstKind::JsonGet => make_json_get_command_ast(env, args, arg_bytes),
-        CommandAstKind::JsonDel => make_json_path_command_ast(
-            env,
-            atom(env, "json_del"),
-            args,
-            arg_bytes,
-            b"json.del",
-            true,
-        ),
-        CommandAstKind::JsonNumincrby => make_json_numincrby_command_ast(env, args, arg_bytes),
-        CommandAstKind::JsonType => make_json_path_command_ast(
-            env,
-            atom(env, "json_type"),
-            args,
-            arg_bytes,
-            b"json.type",
-            true,
-        ),
-        CommandAstKind::JsonStrlen => make_json_path_command_ast(
-            env,
-            atom(env, "json_strlen"),
-            args,
-            arg_bytes,
-            b"json.strlen",
-            true,
-        ),
-        CommandAstKind::JsonObjkeys => make_json_path_command_ast(
-            env,
-            atom(env, "json_objkeys"),
-            args,
-            arg_bytes,
-            b"json.objkeys",
-            true,
-        ),
-        CommandAstKind::JsonObjlen => make_json_path_command_ast(
-            env,
-            atom(env, "json_objlen"),
-            args,
-            arg_bytes,
-            b"json.objlen",
-            true,
-        ),
-        CommandAstKind::JsonArrappend => make_json_arrappend_command_ast(env, args, arg_bytes),
-        CommandAstKind::JsonArrlen => make_json_path_command_ast(
-            env,
-            atom(env, "json_arrlen"),
-            args,
-            arg_bytes,
-            b"json.arrlen",
-            true,
-        ),
-        CommandAstKind::JsonToggle => make_json_path_command_ast(
-            env,
-            atom(env, "json_toggle"),
-            args,
-            arg_bytes,
-            b"json.toggle",
-            false,
-        ),
-        CommandAstKind::JsonClear => make_json_path_command_ast(
-            env,
-            atom(env, "json_clear"),
-            args,
-            arg_bytes,
-            b"json.clear",
-            true,
-        ),
-        CommandAstKind::JsonMget => make_json_mget_command_ast(env, args, arg_bytes),
         CommandAstKind::Geoadd => make_geoadd_command_ast(env, args, arg_bytes),
         CommandAstKind::Geopos => make_geo_members_command_ast(env, atom(env, "geopos"), args),
         CommandAstKind::Geodist => make_geodist_command_ast(env, args, arg_bytes),
@@ -647,4 +578,3 @@ fn make_native_typed_ast<'a>(
         _ => (atoms::unknown(), make_binary_term(env, cmd), args).encode(env),
     }
 }
-

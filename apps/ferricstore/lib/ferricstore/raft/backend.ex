@@ -6,6 +6,7 @@ defmodule Ferricstore.Raft.Backend do
   so deploys and benchmarks cannot drift through config flags.
   """
 
+  alias Ferricstore.LatencyTrace
   alias Ferricstore.Raft.WARaftBackend
 
   @running_backend_key {__MODULE__, :running_backend}
@@ -53,27 +54,72 @@ defmodule Ferricstore.Raft.Backend do
   def waraft?, do: true
 
   @spec write(non_neg_integer(), tuple()) :: term()
-  def write(shard_index, command),
-    do: WARaftBackend.write(shard_index, normalize_command(command))
+  def write(shard_index, command) do
+    trace_ra_wait(fn ->
+      WARaftBackend.write(shard_index, command |> normalize_command() |> trace_command())
+    end)
+  end
 
   @spec write_many([{non_neg_integer(), tuple()}]) :: [term()]
   def write_many(shard_commands) when is_list(shard_commands) do
-    shard_commands
-    |> Enum.map(fn {shard_index, command} -> {shard_index, normalize_command(command)} end)
-    |> WARaftBackend.write_many()
+    trace_ra_wait(fn ->
+      trace_enabled? = LatencyTrace.enabled?()
+
+      shard_commands
+      |> Enum.map(fn {shard_index, command} ->
+        {shard_index, command |> normalize_command() |> trace_command(trace_enabled?)}
+      end)
+      |> WARaftBackend.write_many()
+    end)
   end
 
   @spec write_put_batch(non_neg_integer(), [{binary(), binary(), non_neg_integer()}]) :: term()
-  def write_put_batch(shard_index, entries),
-    do: WARaftBackend.write_put_batch(shard_index, entries)
+  def write_put_batch(shard_index, entries) do
+    trace_ra_wait(fn ->
+      if LatencyTrace.enabled?() do
+        WARaftBackend.write(shard_index, LatencyTrace.maybe_wrap_command({:put_batch, entries}))
+      else
+        WARaftBackend.write_put_batch(shard_index, entries)
+      end
+    end)
+  end
 
   @spec write_delete_batch(non_neg_integer(), [binary()]) :: term()
-  def write_delete_batch(shard_index, keys),
-    do: WARaftBackend.write_delete_batch(shard_index, keys)
+  def write_delete_batch(shard_index, keys) do
+    trace_ra_wait(fn ->
+      if LatencyTrace.enabled?() do
+        WARaftBackend.write(shard_index, LatencyTrace.maybe_wrap_command({:delete_batch, keys}))
+      else
+        WARaftBackend.write_delete_batch(shard_index, keys)
+      end
+    end)
+  end
 
   @spec write_batch(non_neg_integer(), [tuple()]) :: term()
   def write_batch(shard_index, commands),
-    do: WARaftBackend.write_batch(shard_index, Enum.map(commands, &normalize_command/1))
+    do:
+      trace_ra_wait(fn ->
+        trace_enabled? = LatencyTrace.enabled?()
+
+        WARaftBackend.write_batch(
+          shard_index,
+          Enum.map(commands, &(&1 |> normalize_command() |> trace_command(trace_enabled?)))
+        )
+      end)
+
+  defp trace_command(command), do: trace_command(command, LatencyTrace.enabled?())
+  defp trace_command(command, true), do: LatencyTrace.wrap_command(command)
+  defp trace_command(command, false), do: command
+
+  defp trace_ra_wait(fun) do
+    if LatencyTrace.enabled?() do
+      LatencyTrace.span("server_ra_wait_us", fn ->
+        fun.() |> LatencyTrace.merge_result()
+      end)
+    else
+      fun.()
+    end
+  end
 
   # Router/Shard-forwarded compound commands may include the parent redis_key.
   # WARaft applies straight through the state machine, whose compact command

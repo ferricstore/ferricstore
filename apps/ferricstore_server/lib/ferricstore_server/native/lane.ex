@@ -8,11 +8,16 @@ defmodule FerricstoreServer.Native.Lane do
   frame.
   """
 
-  alias Ferricstore.LatencyTrace
+  alias Ferricstore.{LatencyTrace, Stats}
+  alias Ferricstore.Store.Router
   alias FerricstoreServer.Native.{Codec, Commands}
 
   @flag_trace 0x01
+  @flag_custom_payload 0x02
   @flag_no_reply 0x10
+  @op_get 0x0101
+  @op_set 0x0102
+  @op_mget 0x0104
 
   @spec start_link(pid(), non_neg_integer(), map()) :: {:ok, pid()}
   def start_link(owner, lane_id, command_state)
@@ -36,6 +41,13 @@ defmodule FerricstoreServer.Native.Lane do
 
   def enqueue_many(pid, frames) when is_pid(pid) and is_list(frames) do
     send(pid, {:native_lane_frames, frames})
+    :ok
+  end
+
+  @spec stop(pid()) :: :ok
+  def stop(pid) when is_pid(pid) do
+    Process.unlink(pid)
+    Process.exit(pid, :shutdown)
     :ok
   end
 
@@ -77,16 +89,248 @@ defmodule FerricstoreServer.Native.Lane do
   end
 
   defp execute_frames(frames, command_state) do
-    {responses, done_count} =
-      Enum.reduce(frames, {[], 0}, fn frame, {responses, done_count} ->
-        case execute_frame(frame, command_state) do
-          :noreply -> {responses, done_count + 1}
-          iodata -> {[iodata | responses], done_count + 1}
+    case try_compact_mget_batch(frames, command_state) do
+      {:ok, responses} ->
+        {responses, length(frames)}
+
+      :fallback ->
+        case try_plain_get_batch(frames, command_state) do
+          {:ok, responses} ->
+            {responses, length(frames)}
+
+          :fallback ->
+            case try_plain_set_batch(frames, command_state) do
+              {:ok, responses} ->
+                {responses, length(frames)}
+
+              :fallback ->
+                {responses, done_count} =
+                  Enum.reduce(frames, {[], 0}, fn frame, {responses, done_count} ->
+                    case execute_frame(frame, command_state) do
+                      :noreply -> {responses, done_count + 1}
+                      iodata -> {[iodata | responses], done_count + 1}
+                    end
+                  end)
+
+                {Enum.reverse(responses), done_count}
+            end
         end
+    end
+  end
+
+  defp try_compact_mget_batch(frames, command_state) do
+    with true <- plain_set_batch_allowed?(command_state),
+         {:ok, requests, keys} <- extract_compact_mget_frames(frames, [], []) do
+      Stats.incr_commands_by(command_state.stats_counter, length(requests))
+
+      responses =
+        command_state.instance_ctx
+        |> Router.batch_get(keys)
+        |> encode_compact_mget_batch_responses(requests, command_state)
+
+      {:ok, responses}
+    else
+      _ -> :fallback
+    end
+  rescue
+    _ -> :fallback
+  end
+
+  defp extract_compact_mget_frames([], requests, key_chunks) do
+    {:ok, Enum.reverse(requests), key_chunks |> Enum.reverse() |> List.flatten()}
+  end
+
+  defp extract_compact_mget_frames(
+         [{lane_id, @op_mget, request_id, @flag_custom_payload, body} | rest],
+         requests,
+         key_chunks
+       ) do
+    case Codec.decode_body(@op_mget, @flag_custom_payload, body) do
+      {:ok, %{"keys" => keys}} when is_list(keys) ->
+        extract_compact_mget_frames(
+          rest,
+          [{lane_id, request_id, length(keys)} | requests],
+          [keys | key_chunks]
+        )
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp extract_compact_mget_frames(_frames, _requests, _key_chunks), do: :fallback
+
+  defp encode_compact_mget_batch_responses(values, requests, command_state) do
+    {responses, []} =
+      Enum.map_reduce(requests, values, fn {lane_id, request_id, count}, remaining ->
+        {frame_values, rest} = Enum.split(remaining, count)
+
+        response =
+          Codec.encode_command_response_frames(@op_mget, lane_id, request_id, :ok, frame_values,
+            compression: Map.get(command_state, :compression, :none),
+            compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+          )
+
+        {response, rest}
       end)
 
-    {Enum.reverse(responses), done_count}
+    responses
   end
+
+  defp try_plain_get_batch(frames, command_state) do
+    with true <- plain_set_batch_allowed?(command_state),
+         {:ok, requests, keys} <- extract_plain_get_frames(frames, [], []) do
+      Stats.incr_commands_by(command_state.stats_counter, length(keys))
+
+      responses =
+        command_state.instance_ctx
+        |> Router.batch_get(keys)
+        |> encode_plain_get_batch_responses(requests, command_state)
+
+      {:ok, responses}
+    else
+      _ -> :fallback
+    end
+  rescue
+    _ -> :fallback
+  end
+
+  defp extract_plain_get_frames([], requests, keys),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(keys)}
+
+  defp extract_plain_get_frames(
+         [{lane_id, opcode, request_id, 0, body} | rest],
+         requests,
+         keys
+       )
+       when opcode == @op_get do
+    case Codec.decode_body(opcode, 0, body) do
+      {:ok, %{"key" => key} = payload} when is_binary(key) ->
+        if map_size(payload) == 1 do
+          extract_plain_get_frames(rest, [{opcode, lane_id, request_id} | requests], [key | keys])
+        else
+          :fallback
+        end
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp extract_plain_get_frames(_frames, _requests, _keys), do: :fallback
+
+  defp encode_plain_get_batch_responses(values, requests, command_state) do
+    requests
+    |> Enum.zip(values)
+    |> Enum.map(fn {{opcode, lane_id, request_id}, value} ->
+      Codec.encode_command_response_frames(opcode, lane_id, request_id, :ok, value,
+        compression: Map.get(command_state, :compression, :none),
+        compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+        chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+      )
+    end)
+  end
+
+  defp try_plain_set_batch(frames, command_state) do
+    with true <- plain_set_batch_allowed?(command_state),
+         true <- pressure_ok?(command_state),
+         {:ok, requests, kv_pairs} <- extract_plain_set_frames(frames, [], []) do
+      Stats.incr_commands_by(command_state.stats_counter, length(kv_pairs))
+
+      responses =
+        command_state.instance_ctx
+        |> Router.batch_quorum_put(kv_pairs)
+        |> encode_plain_set_batch_responses(requests, command_state)
+
+      {:ok, responses}
+    else
+      _ -> :fallback
+    end
+  rescue
+    _ -> :fallback
+  end
+
+  defp plain_set_batch_allowed?(%{
+         acl_cache: :full_access,
+         require_auth: false,
+         instance_ctx: ctx
+       })
+       when not is_nil(ctx),
+       do: true
+
+  defp plain_set_batch_allowed?(_command_state), do: false
+
+  defp pressure_ok?(%{instance_ctx: %{pressure_flags: flags}}) when not is_nil(flags) do
+    :atomics.get(flags, 1) == 0 and :atomics.get(flags, 2) == 0
+  end
+
+  defp pressure_ok?(_command_state), do: true
+
+  defp extract_plain_set_frames([], requests, kv_pairs),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(kv_pairs)}
+
+  defp extract_plain_set_frames(
+         [{lane_id, @op_set, request_id, 0, body} | rest],
+         requests,
+         kv_pairs
+       ) do
+    case Codec.decode_body(@op_set, 0, body) do
+      {:ok, %{"key" => key, "value" => value} = payload}
+      when is_binary(key) and is_binary(value) ->
+        if plain_set_payload?(payload) do
+          extract_plain_set_frames(rest, [{lane_id, request_id} | requests], [
+            {key, value} | kv_pairs
+          ])
+        else
+          :fallback
+        end
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp extract_plain_set_frames(_frames, _requests, _kv_pairs), do: :fallback
+
+  defp plain_set_payload?(payload) when is_map(payload) do
+    not (Map.has_key?(payload, "ttl") or Map.has_key?(payload, "nx") or
+           Map.has_key?(payload, "xx") or Map.has_key?(payload, "get") or
+           Map.has_key?(payload, "keepttl") or Map.has_key?(payload, "exat") or
+           Map.has_key?(payload, "pxat") or Map.has_key?(payload, "deadline_ms"))
+  end
+
+  defp encode_plain_set_batch_responses(results, requests, command_state) do
+    requests
+    |> Enum.zip(results)
+    |> Enum.map(fn {{lane_id, request_id}, result} ->
+      {status, value} = plain_set_response(result)
+
+      Codec.encode_command_response_frames(@op_set, lane_id, request_id, status, value,
+        compression: Map.get(command_state, :compression, :none),
+        compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+        chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+      )
+    end)
+  end
+
+  defp plain_set_response(:ok), do: {:ok, "OK"}
+  defp plain_set_response({:ok, :ok}), do: {:ok, "OK"}
+  defp plain_set_response({:ok, value}), do: {:ok, value}
+
+  defp plain_set_response({:error, reason}) when is_binary(reason) do
+    status =
+      cond do
+        String.starts_with?(reason, "BUSY") -> :busy
+        String.starts_with?(reason, "OOM") -> :busy
+        true -> :error
+      end
+
+    {status, reason}
+  end
+
+  defp plain_set_response({:error, reason}), do: {:error, inspect(reason)}
+  defp plain_set_response(value), do: {:ok, value}
 
   defp execute_frame({:native_trace, frame, trace}, command_state) do
     response = execute_frame_with_response({:native_trace, frame, trace}, command_state)

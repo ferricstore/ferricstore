@@ -8,6 +8,9 @@ const FLAG_CUSTOM_PAYLOAD: u8 = 0x02;
 const STATUS_OK: u16 = 0;
 const COMPACT_FLOW_CLAIM_JOBS: u8 = 0x80;
 const COMPACT_OK_LIST: u8 = 0x81;
+const COMPACT_KV_GET: u8 = 0x82;
+const COMPACT_KV_MGET: u8 = 0x83;
+const COMPACT_KV_MGET_FIXED: u8 = 0x89;
 
 #[derive(Debug, PartialEq, Eq)]
 struct FrameSlice<'a> {
@@ -121,6 +124,54 @@ fn encode_compact_ok_list_response_frame<'a>(
     };
 
     Ok(Binary::from_owned(frame, env).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+fn encode_compact_kv_get_response_frame<'a>(
+    env: Env<'a>,
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    value: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let frame = match build_compact_kv_get_response_frame(opcode, lane_id, request_id, value) {
+        Some(frame) => frame,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+
+    Ok(Binary::from_owned(frame, env).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+fn encode_compact_kv_mget_response_frame<'a>(
+    env: Env<'a>,
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    values: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let payload = match build_compact_kv_mget_payload(values) {
+        Some(payload) => payload,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+
+    let frame =
+        match build_custom_ok_response_frame(opcode, lane_id, request_id, payload.as_slice()) {
+            Some(frame) => frame,
+            None => return Ok(atoms::nil().encode(env)),
+        };
+
+    Ok(Binary::from_owned(frame, env).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+fn encode_compact_kv_mget<'a>(env: Env<'a>, values: Term<'a>) -> NifResult<Term<'a>> {
+    let payload = match build_compact_kv_mget_payload(values) {
+        Some(payload) => payload,
+        None => return Ok(atoms::nil().encode(env)),
+    };
+
+    Ok(Binary::from_owned(payload, env).encode(env))
 }
 
 fn scan_frames(bytes: &[u8], max_frame_bytes: u32) -> Result<(Vec<FrameSlice<'_>>, usize), String> {
@@ -261,6 +312,118 @@ fn build_compact_ok_list_response_frame<'a>(
     payload[0] = COMPACT_OK_LIST;
     payload[1..5].copy_from_slice(&count.to_be_bytes());
     build_custom_ok_response_frame(opcode, lane_id, request_id, &payload)
+}
+
+fn build_compact_kv_get_response_frame<'a>(
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    value: Term<'a>,
+) -> Option<OwnedBinary> {
+    let value = value.decode::<Option<Binary<'a>>>().ok()?;
+    let payload = build_compact_kv_get_payload(value.as_ref().map(|binary| binary.as_slice()))?;
+
+    build_custom_ok_response_frame(opcode, lane_id, request_id, &payload)
+}
+
+fn build_compact_kv_get_payload(value: Option<&[u8]>) -> Option<Vec<u8>> {
+    let mut payload = Vec::with_capacity(32);
+    payload.push(COMPACT_KV_GET);
+
+    match value {
+        Some(value) => {
+            payload.push(1);
+            append_compact_binary(&mut payload, value)?;
+        }
+        None => payload.push(0),
+    }
+
+    Some(payload)
+}
+
+fn build_compact_kv_mget_payload<'a>(values: Term<'a>) -> Option<OwnedBinary> {
+    let mut values_iter: ListIterator<'a> = values.decode().ok()?;
+    let mut values = Vec::new();
+
+    let mut count = 0u32;
+    let mut all_present = true;
+    let mut fixed_size: Option<usize> = None;
+    let mut total_value_bytes = 0usize;
+
+    for value in &mut values_iter {
+        let value = value.decode::<Option<Binary<'a>>>().ok()?;
+        count = count.checked_add(1)?;
+
+        match value {
+            Some(value) => {
+                let size = value.as_slice().len();
+                total_value_bytes = total_value_bytes.checked_add(size)?;
+
+                if let Some(existing_size) = fixed_size {
+                    if existing_size != size {
+                        all_present = false;
+                    }
+                } else {
+                    fixed_size = Some(size);
+                }
+
+                values.push(Some(value));
+            }
+            None => {
+                all_present = false;
+                values.push(None);
+            }
+        }
+    }
+
+    if all_present {
+        let size = fixed_size.unwrap_or(0);
+        let size_u32 = u32::try_from(size).ok()?;
+        let payload_len = 9usize.checked_add(total_value_bytes)?;
+        let mut out = OwnedBinary::new(payload_len)?;
+        let out_bytes = out.as_mut_slice();
+
+        out_bytes[0] = COMPACT_KV_MGET_FIXED;
+        out_bytes[1..5].copy_from_slice(&count.to_be_bytes());
+        out_bytes[5..9].copy_from_slice(&size_u32.to_be_bytes());
+
+        let mut offset = 9usize;
+        for value in &values {
+            let value = value.as_ref()?;
+            let value_bytes = value.as_slice();
+            let end = offset.checked_add(size)?;
+            out_bytes[offset..end].copy_from_slice(value_bytes);
+            offset = end;
+        }
+
+        return Some(out);
+    }
+
+    let payload_len = values.iter().try_fold(5usize, |acc, value| {
+        let acc = acc.checked_add(1)?;
+        match value {
+            Some(value) => acc.checked_add(4)?.checked_add(value.as_slice().len()),
+            None => Some(acc),
+        }
+    })?;
+
+    let mut payload = Vec::with_capacity(payload_len);
+    payload.push(COMPACT_KV_MGET);
+    payload.extend_from_slice(&count.to_be_bytes());
+
+    for value in values {
+        match value {
+            Some(value) => {
+                payload.push(1);
+                append_compact_binary(&mut payload, value.as_slice())?;
+            }
+            None => payload.push(0),
+        }
+    }
+
+    let mut out = OwnedBinary::new(payload.len())?;
+    out.as_mut_slice().copy_from_slice(&payload);
+    Some(out)
 }
 
 fn is_ok_binary(value: &[u8]) -> bool {
@@ -427,5 +590,24 @@ mod tests {
         assert_eq!(&bytes[20..24], &7u32.to_be_bytes());
         assert_eq!(&bytes[24..26], &STATUS_OK.to_be_bytes());
         assert_eq!(&bytes[26..31], &[COMPACT_FLOW_CLAIM_JOBS, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn compact_kv_get_response_frame_wraps_payload() {
+        let payload = build_compact_kv_get_payload(Some(b"value")).expect("payload builds");
+        let frame = build_custom_ok_response_bytes(0x0101, 2, 99, &payload)
+            .expect("frame allocation succeeds");
+        let bytes = frame.as_slice();
+
+        assert_eq!(&bytes[0..4], MAGIC);
+        assert_eq!(bytes[4], VERSION | RESPONSE_DIRECTION);
+        assert_eq!(bytes[5], FLAG_CUSTOM_PAYLOAD);
+        assert_eq!(&bytes[10..12], &0x0101u16.to_be_bytes());
+        assert_eq!(&bytes[12..20], &99u64.to_be_bytes());
+        assert_eq!(&bytes[24..26], &STATUS_OK.to_be_bytes());
+        assert_eq!(bytes[26], COMPACT_KV_GET);
+        assert_eq!(bytes[27], 1);
+        assert_eq!(&bytes[28..32], &5u32.to_be_bytes());
+        assert_eq!(&bytes[32..37], b"value");
     }
 }

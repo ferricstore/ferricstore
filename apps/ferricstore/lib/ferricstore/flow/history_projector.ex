@@ -304,13 +304,13 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
     state =
       Config.initial_state(
-       projector_name,
-       shard_index,
-       shard_data_path,
-       instance_ctx,
-       pending_counter,
-       max_pending_entries,
-       flushed_index
+        projector_name,
+        shard_index,
+        shard_data_path,
+        instance_ctx,
+        pending_counter,
+        max_pending_entries,
+        flushed_index
       )
 
     Process.send_after(self(), :drain_overflow, 0)
@@ -642,7 +642,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
        ) do
     with {:ok, file_id, file_path} <- Storage.history_active_file(shard_data_path),
          keydir <- keydir_override || keydir(instance_ctx, shard_index),
-         encoded_entries <- Enum.map(entries, &Storage.encode_entry/1),
+         expanded_entries <- Storage.expand_entries(entries),
+         encoded_entries <- Enum.map(expanded_entries, &Storage.encode_entry/1),
          batch <- Enum.map(encoded_entries, &{&1.key, &1.value, &1.expire_at_ms}),
          {:ok, locations} <- Storage.append_batch(file_path, batch),
          :ok <- Storage.validate_locations(encoded_entries, locations),

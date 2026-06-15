@@ -117,6 +117,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
       defp restore_waraft_app_env(key, value),
         do: Application.put_env(:ferricstore_waraft_backend, key, value)
 
+      defp restore_ra_env(key, nil), do: Application.delete_env(:ra, key)
+      defp restore_ra_env(key, value), do: Application.put_env(:ra, key, value)
+
       defp waraft_storage_label(shard_index) do
         :ferricstore_waraft_backend
         |> :wa_raft_storage.registered_name(shard_index + 1)

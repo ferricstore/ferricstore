@@ -965,6 +965,11 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       @doc false
+      def flow_complete_many_local(ctx, attrs_list) when is_list(attrs_list) do
+        flow_many_by_shard(ctx, attrs_list, :flow_complete_many, "__complete_batch__")
+      end
+
+      @doc false
       def flow_transition(ctx, %{id: id} = attrs) when is_binary(id) do
         key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 
@@ -973,6 +978,37 @@ defmodule Ferricstore.Store.Router.Part07 do
         else
           idx = shard_for(ctx, key)
           raft_write(ctx, idx, key, {:flow_transition, key, attrs})
+        end
+      end
+
+      @doc false
+      def flow_start_and_claim(ctx, %{id: id} = attrs) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_start_and_claim, key, attrs})
+        end
+      end
+
+      @doc false
+      def flow_run_steps_many(_ctx, []), do: :ok
+
+      def flow_run_steps_many(ctx, attrs_list) when is_list(attrs_list) do
+        flow_many_by_shard(ctx, attrs_list, :flow_run_steps_many, "__run_steps_batch__")
+      end
+
+      @doc false
+      def flow_step_continue(ctx, %{id: id} = attrs) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_step_continue, key, attrs})
         end
       end
 
@@ -1046,6 +1082,164 @@ defmodule Ferricstore.Store.Router.Part07 do
               |> flow_stamp_shard(shard_idx)
 
             {key, local_indices, {:flow_transition_many, key, command_attrs}}
+          end)
+
+        keyed_commands = Enum.map(groups, fn {key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+        expand_flow_transition_batch_results(count, groups, group_results)
+      end
+
+      def flow_step_continue_batch(_ctx, []), do: []
+
+      def flow_step_continue_batch(ctx, attrs_list) when is_list(attrs_list) do
+        if ctx.name == :default do
+          {valid, indexed_results} =
+            attrs_list
+            |> Enum.with_index()
+            |> Enum.reduce({[], %{}}, fn
+              {%{id: id} = attrs, idx}, {valid_acc, result_acc} when is_binary(id) ->
+                key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+                if byte_size(key) > @max_key_size do
+                  {valid_acc,
+                   Map.put(
+                     result_acc,
+                     idx,
+                     {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+                   )}
+                else
+                  {[{idx, key, {:flow_step_continue, key, attrs}} | valid_acc], result_acc}
+                end
+
+              {_attrs, idx}, {valid_acc, result_acc} ->
+                {valid_acc,
+                 Map.put(result_acc, idx, {:error, "ERR flow id must be a non-empty string"})}
+            end)
+
+          valid = Enum.reverse(valid)
+          valid_results = flow_step_continue_batch_valid_results(ctx, valid)
+
+          indexed_results =
+            valid
+            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
+            |> Enum.zip(valid_results)
+            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+          for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
+        else
+          attrs_list
+          |> Enum.map(fn attrs ->
+            key =
+              Ferricstore.Flow.Keys.state_key(Map.get(attrs, :id), Map.get(attrs, :partition_key))
+
+            raft_write(ctx, shard_for(ctx, key), key, {:flow_step_continue, key, attrs})
+          end)
+        end
+      end
+
+      defp flow_step_continue_batch_valid_results(_ctx, []), do: []
+
+      defp flow_step_continue_batch_valid_results(ctx, valid) do
+        {buckets, count} =
+          valid
+          |> Enum.with_index()
+          |> Enum.reduce({flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+            {{_idx, key, {:flow_step_continue, _key, attrs}}, local_idx}, {buckets, count} ->
+              shard_idx = shard_for(ctx, key)
+              {flow_put_shard_bucket(buckets, shard_idx, {local_idx, key, attrs}), count + 1}
+          end)
+
+        groups =
+          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+            group = Enum.reverse(entries)
+            key = group |> hd() |> elem(1)
+            local_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
+            attrs_list = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
+
+            command_attrs =
+              %{records: attrs_list, independent: true}
+              |> flow_stamp_shard(shard_idx)
+
+            {key, local_indices, {:flow_step_continue_many, key, command_attrs}}
+          end)
+
+        keyed_commands = Enum.map(groups, fn {key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+        expand_flow_transition_batch_results(count, groups, group_results)
+      end
+
+      def flow_signal_batch(_ctx, []), do: []
+
+      def flow_signal_batch(ctx, attrs_list) when is_list(attrs_list) do
+        if ctx.name == :default do
+          {valid, indexed_results} =
+            attrs_list
+            |> Enum.with_index()
+            |> Enum.reduce({[], %{}}, fn
+              {%{id: id} = attrs, idx}, {valid_acc, result_acc} when is_binary(id) ->
+                key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+                if byte_size(key) > @max_key_size do
+                  {valid_acc,
+                   Map.put(
+                     result_acc,
+                     idx,
+                     {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+                   )}
+                else
+                  {[{idx, key, {:flow_signal, key, attrs}} | valid_acc], result_acc}
+                end
+
+              {_attrs, idx}, {valid_acc, result_acc} ->
+                {valid_acc,
+                 Map.put(result_acc, idx, {:error, "ERR flow id must be a non-empty string"})}
+            end)
+
+          valid = Enum.reverse(valid)
+          valid_results = flow_signal_batch_valid_results(ctx, valid)
+
+          indexed_results =
+            valid
+            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
+            |> Enum.zip(valid_results)
+            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+          for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
+        else
+          attrs_list
+          |> Enum.map(fn attrs ->
+            key =
+              Ferricstore.Flow.Keys.state_key(Map.get(attrs, :id), Map.get(attrs, :partition_key))
+
+            raft_write(ctx, shard_for(ctx, key), key, {:flow_signal, key, attrs})
+          end)
+        end
+      end
+
+      defp flow_signal_batch_valid_results(_ctx, []), do: []
+
+      defp flow_signal_batch_valid_results(ctx, valid) do
+        {buckets, count} =
+          valid
+          |> Enum.with_index()
+          |> Enum.reduce({flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+            {{_idx, key, {:flow_signal, _key, attrs}}, local_idx}, {buckets, count} ->
+              shard_idx = shard_for(ctx, key)
+              {flow_put_shard_bucket(buckets, shard_idx, {local_idx, key, attrs}), count + 1}
+          end)
+
+        groups =
+          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+            group = Enum.reverse(entries)
+            key = group |> hd() |> elem(1)
+            local_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
+            attrs_list = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
+
+            command_attrs =
+              %{records: attrs_list, independent: true}
+              |> flow_stamp_shard(shard_idx)
+
+            {key, local_indices, {:flow_signal_many, key, command_attrs}}
           end)
 
         keyed_commands = Enum.map(groups, fn {key, _indices, cmd} -> {key, cmd} end)

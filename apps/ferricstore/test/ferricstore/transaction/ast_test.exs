@@ -30,9 +30,6 @@ defmodule Ferricstore.Transaction.AstTest do
     assert {:bitop, :band, "sb:dst", ["sb:a", "sb:b"]} =
              TxAst.namespace_first_key({:bitop, :band, "dst", ["a", "b"]}, ns)
 
-    assert {:json_mget, ["sb:a", "sb:b"], ["name"]} =
-             TxAst.namespace_first_key({:json_mget, ["a", "b"], ["name"]}, ns)
-
     assert {:sintercard, ["sb:s1", "sb:s2"], 0} =
              TxAst.namespace_first_key({:sintercard, ["s1", "s2"], 0}, ns)
   end

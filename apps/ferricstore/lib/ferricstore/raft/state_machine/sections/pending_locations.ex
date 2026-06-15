@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -41,6 +40,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       }
 
       alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -106,6 +106,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
                 {key, expected_value, expire_at_ms, lfu, file_id, offset, value_size}
               )
 
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
               refs
 
             _other ->
@@ -152,6 +153,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
                 {key, nil, expire_at_ms, lfu, file_id, offset, value_size}
               )
 
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
               refs
 
             _other ->
@@ -291,6 +293,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           delete_apply_projection_cache_for_pending_original(state, key)
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
+          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
@@ -308,6 +311,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           delete_apply_projection_cache_for_pending_original(state, key)
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
+          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
@@ -329,6 +333,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           delete_apply_projection_cache_for_pending_original(state, key, file_id)
           track_keydir_binary_delta(state, key, nil, expire_at_ms)
           :ets.insert(state.ets, {key, nil, expire_at_ms, lfu, file_id, offset, value_size})
+          CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
         else
           expected_staged_size = byte_size(to_disk_binary(value))
 
@@ -346,6 +351,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
           if replaced > 0 do
             delete_apply_projection_cache_for_pending_original(state, key, file_id)
+            CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
           end
         end
 
@@ -372,6 +378,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             state.ets,
             {key, expected_value, expire_at_ms, LFU.initial(), file_id, offset, value_size}
           )
+
+          CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
         else
           replaced =
             replace_pending_location(
@@ -402,10 +410,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
             if fallback_replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
             end
           else
             if replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
             end
           end
         end
@@ -680,7 +690,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       defp record_waraft_replay_dependency(kind, shard_index, index)
            when kind in [:history] and is_integer(shard_index) and shard_index >= 0 and
                   is_integer(index) and index > 0 do
-        dependencies = apply_state_get(:waraft_replay_dependencies, %{history: %{}})
+        dependencies =
+          apply_state_get(:waraft_replay_dependencies, %{history: %{}, apply_projection: %{}})
 
         updated =
           dependencies

@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -329,7 +328,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
 
       @doc false
       def consume_waraft_replay_dependencies do
-        apply_state_pop(:waraft_replay_dependencies, %{history: %{}})
+        apply_state_pop(:waraft_replay_dependencies, %{history: %{}, apply_projection: %{}})
       end
 
       defp apply_standalone(fun) when is_function(fun, 0) do
@@ -604,7 +603,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       end
 
       defp flow_history_projector_replay_safe?(state, instance_ctx, release_index) do
-        HistoryProjector.durable?(instance_ctx, state.shard_index, state.shard_data_path, release_index)
+        HistoryProjector.durable?(
+          instance_ctx,
+          state.shard_index,
+          state.shard_data_path,
+          release_index
+        )
       end
 
       defp request_replay_safe_indexes(

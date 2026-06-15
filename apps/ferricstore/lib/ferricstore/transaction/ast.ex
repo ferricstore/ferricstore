@@ -132,9 +132,6 @@ defmodule Ferricstore.Transaction.Ast do
   def namespace_first_key({:blmpop, keys, direction, count, timeout_ms}, ns) when is_list(keys),
     do: {:blmpop, namespace_keys(keys, ns), direction, count, timeout_ms}
 
-  def namespace_first_key({:json_mget, keys, path}, ns) when is_list(keys),
-    do: {:json_mget, namespace_keys(keys, ns), path}
-
   def namespace_first_key({tag, dest, source_keys, tail}, ns)
       when tag in [:cms_merge, :tdigest_merge] and is_list(source_keys),
       do: {tag, namespace_key(dest, ns), namespace_keys(source_keys, ns), tail}

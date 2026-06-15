@@ -9,12 +9,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       import Bitwise
 
       require Logger
+      require Ferricstore.LatencyTrace
 
       alias Ferricstore.Bitcask.NIF
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -41,6 +41,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       }
 
       alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -180,7 +181,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
 
         case Process.put(:sm_pending_writes, []) do
           [] ->
-            flush_pending_flow_native_indexes(state)
+            Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
+              flush_pending_flow_native_indexes(state)
+            end
 
           pending when is_list(pending) ->
             batch = Enum.reverse(pending)
@@ -217,7 +220,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
 
           {file_path, file_id} ->
             started_at = System.monotonic_time()
-            append_result = append_pending_batch(file_path, batch)
+
+            append_result =
+              Ferricstore.LatencyTrace.maybe_span "server_bitcask_append_us" do
+                append_pending_batch(file_path, batch)
+              end
+
             validated_append_result = validate_append_result(batch, append_result)
 
             emit_bitcask_append_telemetry(
@@ -232,9 +240,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             case validated_append_result do
               {:ok, locations} ->
                 clear_disk_pressure(state)
-                apply_pending_locations(state, file_id, batch, locations)
-                flush_pending_flow_native_indexes(state)
-                flush_pending_zset_indexes(state)
+
+                Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
+                  apply_pending_locations(state, file_id, batch, locations)
+                end
+
+                Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
+                  flush_pending_flow_native_indexes(state)
+                end
+
+                Ferricstore.LatencyTrace.maybe_span "server_zset_index_update_us" do
+                  flush_pending_zset_indexes(state)
+                end
+
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
                 apply_state_put(:pending_state, state)
@@ -249,14 +267,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       end
 
       defp flush_pending_waraft_projection(state, batch, projection_writer) do
-        case projection_writer.(batch) do
+        projection_result =
+          Ferricstore.LatencyTrace.maybe_span "server_bitcask_append_us" do
+            projection_writer.(batch)
+          end
+
+        case projection_result do
           {:ok, file_id, locations} ->
             case validate_append_result(batch, {:ok, locations}) do
               {:ok, ^locations} ->
                 clear_disk_pressure(state)
-                apply_pending_locations(state, file_id, batch, locations)
-                flush_pending_flow_native_indexes(state)
-                flush_pending_zset_indexes(state)
+
+                Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
+                  apply_pending_locations(state, file_id, batch, locations)
+                end
+
+                Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
+                  flush_pending_flow_native_indexes(state)
+                end
+
+                Ferricstore.LatencyTrace.maybe_span "server_zset_index_update_us" do
+                  flush_pending_zset_indexes(state)
+                end
+
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 :ok
 
@@ -809,6 +842,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           {key, ets_val, expire_at_ms, LFU.initial(), file_id, offset, value_size}
         )
 
+        CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
         apply_fast_put_pending_locations(state, file_id, batch, locations, hot_threshold)
       end
 
@@ -822,6 +856,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         delete_apply_projection_cache_for_pending_original(state, key)
         track_keydir_binary_remove(state, key)
         :ets.delete(state.ets, key)
+        CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
         maybe_queue_lmdb_state_delete_after_publish(state, key)
         maybe_delete_prob_file_path(state, prob_path)
 

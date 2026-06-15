@@ -3,6 +3,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
 
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BlobValue, ColdRead}
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS.Accounting
 
   @cold_batch_read_timeout_ms 10_000
@@ -25,12 +26,32 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
         ]
   @doc false
   def prefix_scan_entries(%{keydir: keydir} = state, prefix, shard_data_path),
-    do: do_prefix_scan_entries(state, keydir, prefix, shard_data_path)
+    do: maybe_compound_index_scan_entries(state, keydir, prefix, shard_data_path)
+
+  def prefix_scan_entries(%{ets: keydir} = state, prefix, shard_data_path),
+    do:
+      state
+      |> Map.put(:keydir, keydir)
+      |> maybe_compound_index_scan_entries(keydir, prefix, shard_data_path)
 
   def prefix_scan_entries(keydir, prefix, shard_data_path),
     do: do_prefix_scan_entries(nil, keydir, prefix, shard_data_path)
 
+  defp maybe_compound_index_scan_entries(state, keydir, prefix, shard_data_path) do
+    case CompoundMemberIndex.scan_entries(compound_member_index_ref(state), state, prefix) do
+      {:ok, entries} -> entries
+      :unavailable -> do_prefix_scan_entries(state, keydir, prefix, shard_data_path)
+    end
+  end
+
+  defp compound_member_index_ref(state),
+    do: Map.get(state, :compound_member_index) || Map.get(state, :compound_member_index_name)
+
   def do_prefix_scan_entries(state, keydir, prefix, shard_data_path) do
+    do_select_prefix_scan_entries(state, keydir, prefix, shard_data_path)
+  end
+
+  defp do_select_prefix_scan_entries(state, keydir, prefix, shard_data_path) do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     # Select all 7-tuple fields so we can cold-read nil values
@@ -83,6 +104,10 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
         end
       end)
 
+    prefix_scan_tokens_to_results(tokens, cold_entries, state)
+  end
+
+  defp prefix_scan_tokens_to_results(tokens, cold_entries, state) do
     cold_values =
       cold_entries
       |> Enum.reverse()

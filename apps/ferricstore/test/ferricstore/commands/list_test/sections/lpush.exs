@@ -263,9 +263,16 @@ defmodule Ferricstore.Commands.ListTest.Sections.Lpush do
           meta_key = CompoundKey.list_meta_key("mylist")
 
           store =
-            Map.put(base, :compound_delete, fn
-              "mylist", ^meta_key -> {:error, :disk_full}
-              key, compound_key -> base.compound_delete.(key, compound_key)
+            Map.put(base, :compound_batch_delete, fn
+              "mylist", compound_keys ->
+                if meta_key in compound_keys do
+                  {:error, :disk_full}
+                else
+                  base.compound_batch_delete.("mylist", compound_keys)
+                end
+
+              key, compound_keys ->
+                base.compound_batch_delete.(key, compound_keys)
             end)
 
           assert {:error, :disk_full} == List.handle("LPOP", ["mylist"], store)

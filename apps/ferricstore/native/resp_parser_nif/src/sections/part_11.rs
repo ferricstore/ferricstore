@@ -356,9 +356,6 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
                 Vec::new()
             }
         }
-        b"JSON.MGET" => argc
-            .checked_sub(1)
-            .map_or_else(Vec::new, |end| range_indices(0, end)),
         b"CMS.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
@@ -504,18 +501,6 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         | b"XTRIM"
         | b"XDEL"
         | b"XACK"
-        | b"JSON.SET"
-        | b"JSON.GET"
-        | b"JSON.DEL"
-        | b"JSON.NUMINCRBY"
-        | b"JSON.TYPE"
-        | b"JSON.STRLEN"
-        | b"JSON.OBJKEYS"
-        | b"JSON.OBJLEN"
-        | b"JSON.ARRAPPEND"
-        | b"JSON.ARRLEN"
-        | b"JSON.TOGGLE"
-        | b"JSON.CLEAR"
         | b"CAS"
         | b"LOCK"
         | b"UNLOCK"
@@ -617,4 +602,3 @@ fn flow_partition_key_indices_until(
 
     keys
 }
-

@@ -30,7 +30,10 @@ config :ferricstore,
   native_max_inflight_per_connection: 4096,
   native_max_inflight_per_lane: 1024,
   native_response_chunk_bytes: 0,
-  native_max_pending_chunks: 1024
+  native_max_pending_chunks: 1024,
+  native_max_collection_response_items: 10_000,
+  native_trace_enabled: false,
+  native_idle_timeout_ms: 90_000
 
 # Data directory for Bitcask shards
 config :ferricstore, :data_dir, "data"
@@ -43,8 +46,13 @@ config :ferricstore, :shard_count, 0
 config :ferricstore,
   flow_async_history: true,
   wal_commit_delay_us: 6_000,
+  waraft_commit_batch_adaptive: true,
   waraft_commit_batch_max: 10_000,
-  waraft_apply_log_batch_size: 4_096
+  waraft_commit_priority: :high,
+  waraft_generic_batch_window_ms: 0,
+  waraft_generic_batch_during_flush: true,
+  waraft_apply_log_batch_size: 4_096,
+  ra_low_priority_commands_flush_size: 512
 
 # Flow retention cleanup is correctness-safe as a normal durable Flow command,
 # but it can be storage-heavy. Run it on a maintenance cadence by default so

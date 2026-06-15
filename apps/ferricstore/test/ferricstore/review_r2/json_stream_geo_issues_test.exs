@@ -3,28 +3,16 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
   Regression tests proving issues found in code review R2:
 
     * R2-C4: GEOSEARCH BYBOX incorrect distance calculation
-    * R2-M2: JSON path quoted string parsing accepts malformed paths
-    * R2-M3: JSON unquoted integer as object key -- type confusion
     * R2-M4: XREADGROUP doesn't support BLOCK
   """
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.Json
   alias Ferricstore.Commands.Stream
   alias Ferricstore.Commands.Geo
   alias Ferricstore.Test.MockStore
 
   # Unique key helper to avoid collisions
   defp ukey(prefix), do: "#{prefix}_#{:erlang.unique_integer([:positive])}"
-
-  # Store a JSON document in MockStore
-  defp store_with_json(key, json_value) do
-    store = MockStore.make()
-    json_str = Jason.encode!(json_value)
-    raw = :erlang.term_to_binary({:json, json_str})
-    store.put.(key, raw, 0)
-    {store, key}
-  end
 
   # Clean up stream ETS tables between tests
   setup do
@@ -198,124 +186,6 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
       # Whether it's inside or outside depends on the dx calculation correctness.
       # Just assert the result is a list (no crash), documenting current behavior.
       assert is_list(box_result)
-    end
-  end
-
-  # ===========================================================================
-  # R2-M2: JSON path quoted string parsing accepts malformed paths
-  #
-  # The bug: parse_path/1 for a path like `$["unclosed` (missing closing bracket
-  # and quote) does not return an error. Instead:
-  #   1. parse_path_segments sees "["
-  #   2. read_bracket looks for "]" and doesn't find one, returns :error
-  #   3. parse_path_segments falls through to the catch-all which returns
-  #      Enum.reverse(acc) -- an empty list
-  #   4. get_at_path(root, []) returns {:ok, root} -- the entire document
-  #
-  # So a malformed path silently returns the root document instead of an error.
-  # ===========================================================================
-
-  describe "R2-M2: JSON malformed path parsing" do
-    @tag :review_r2
-    test "JSON.GET with unclosed bracket path returns error" do
-      key = ukey("json_m2")
-      doc = %{"secret" => "data", "public" => "info"}
-      {store, key} = store_with_json(key, doc)
-
-      result = Json.handle("JSON.GET", [key, ~s($["unclosed)], store)
-
-      assert {:error, msg} = result
-      assert msg =~ "invalid JSONPath"
-    end
-
-    @tag :review_r2
-    test "JSON.GET with unclosed single-quote bracket returns error" do
-      key = ukey("json_m2b")
-      doc = %{"key" => "value"}
-      {store, key} = store_with_json(key, doc)
-
-      result = Json.handle("JSON.GET", [key, "$['unclosed"], store)
-
-      assert {:error, msg} = result
-      assert msg =~ "invalid JSONPath"
-    end
-
-    @tag :review_r2
-    test "JSON.GET with properly formed bracket path works correctly" do
-      key = ukey("json_m2c")
-      doc = %{"name" => "Alice", "age" => 30}
-      {store, key} = store_with_json(key, doc)
-
-      # Properly quoted bracket notation should work
-      result = Json.handle("JSON.GET", [key, ~s($["name"])], store)
-      assert result == ~s("Alice")
-    end
-  end
-
-  # ===========================================================================
-  # R2-M3: JSON unquoted integer as object key -- type confusion
-  #
-  # The bug: `$[0]` is parsed as an integer index (0) by parse_bracket_content.
-  # When the root is an object (map) like {"0": "value", "arr": [1,2,3]},
-  # get_at_path expects a binary key for map access. Since 0 is an integer,
-  # it falls through to the catch-all and returns :not_found.
-  #
-  # Redis/JSONPath spec says $[0] on an object should access key "0".
-  # FerricStore incorrectly returns nil/not_found because integer 0 doesn't
-  # match the is_binary(key) guard in get_at_path for maps.
-  # ===========================================================================
-
-  describe "R2-M3: JSON integer key type confusion" do
-    @tag :review_r2
-    test "$[0] on object with key '0' returns nil instead of the value" do
-      key = ukey("json_m3")
-      doc = %{"0" => "zero_value", "arr" => [1, 2, 3]}
-      {store, key} = store_with_json(key, doc)
-
-      # $[0] should access key "0" in the object per JSONPath spec
-      result = Json.handle("JSON.GET", [key, "$[0]"], store)
-
-      # BUG MANIFESTATION: parse_bracket_content parses "0" as integer 0,
-      # then get_at_path tries to match on is_list(list) and is_integer(idx)
-      # which fails because root is a map. Falls through to :not_found => nil.
-      assert result == nil,
-             "R2-M3 BUG: $[0] on an object returns nil because 0 is parsed as integer, " <>
-               "not string key \"0\". A correct implementation would try string key fallback."
-    end
-
-    @tag :review_r2
-    test "$.arr[0] on array within object works correctly" do
-      key = ukey("json_m3b")
-      doc = %{"0" => "zero_value", "arr" => [1, 2, 3]}
-      {store, key} = store_with_json(key, doc)
-
-      # $.arr[0] should navigate to the "arr" key (string), then index 0 (integer)
-      result = Json.handle("JSON.GET", [key, "$.arr[0]"], store)
-
-      # This works correctly because "arr" is a string key and [0] is applied to an array
-      assert result == "1"
-    end
-
-    @tag :review_r2
-    test "$[0] on an array returns the first element correctly" do
-      key = ukey("json_m3c")
-      doc = ["first", "second", "third"]
-      {store, key} = store_with_json(key, doc)
-
-      # $[0] on an array should return the first element
-      result = Json.handle("JSON.GET", [key, "$[0]"], store)
-      assert result == ~s("first")
-    end
-
-    @tag :review_r2
-    test "quoted bracket $[\"0\"] works on object" do
-      key = ukey("json_m3d")
-      doc = %{"0" => "zero_value"}
-      {store, key} = store_with_json(key, doc)
-
-      # $["0"] should work because the quotes force string key interpretation
-      result = Json.handle("JSON.GET", [key, ~s($["0"])], store)
-      assert result == ~s("zero_value")
     end
   end
 

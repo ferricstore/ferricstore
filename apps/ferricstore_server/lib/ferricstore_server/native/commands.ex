@@ -14,10 +14,19 @@ defmodule FerricstoreServer.Native.Commands do
 
   alias Ferricstore.{AuditLog, Stats}
   alias Ferricstore.Flow.{ClaimDueAPI, ClaimWaiters}
-  alias Ferricstore.Store.{Ops, Router}
+  alias Ferricstore.Flow.Codec, as: FlowCodec
+  alias Ferricstore.Flow.Keys, as: FlowKeys
+  alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
+  alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
+  alias Ferricstore.Store.{CompoundKey, Ops, Router}
+  alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.SlotMap
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
+
+  @list_position_step 1_000_000_000
+  @default_max_collection_response_items 10_000
+  @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
   @op_hello 0x0001
   @op_auth 0x0002
@@ -32,7 +41,7 @@ defmodule FerricstoreServer.Native.Commands do
   @op_options 0x000B
   @op_startup 0x000C
   @op_window_update 0x000D
-  @op_batch 0x000E
+  @op_pipeline 0x000E
   @op_route_batch 0x000F
   @op_event 0x0010
   @op_subscribe_events 0x0011
@@ -51,6 +60,23 @@ defmodule FerricstoreServer.Native.Commands do
   @op_fetch_or_compute 0x010B
   @op_fetch_or_compute_result 0x010C
   @op_fetch_or_compute_error 0x010D
+  @op_hset 0x0110
+  @op_hget 0x0111
+  @op_hmget 0x0112
+  @op_hgetall 0x0113
+  @op_lpush 0x0120
+  @op_rpush 0x0121
+  @op_lpop 0x0122
+  @op_rpop 0x0123
+  @op_lrange 0x0124
+  @op_sadd 0x0130
+  @op_srem 0x0131
+  @op_smembers 0x0132
+  @op_sismember 0x0133
+  @op_zadd 0x0140
+  @op_zrem 0x0141
+  @op_zrange 0x0142
+  @op_zscore 0x0143
 
   @op_cluster_health 0x0301
   @op_cluster_stats 0x0302
@@ -102,6 +128,9 @@ defmodule FerricstoreServer.Native.Commands do
   @op_flow_policy_get 0x021F
   @op_flow_spawn_children 0x0220
   @op_flow_retention_cleanup 0x0221
+  @op_flow_step_continue 0x0222
+  @op_flow_start_and_claim 0x0223
+  @op_flow_run_steps_many 0x0224
 
   @control_commands %{
     @op_hello => "HELLO",
@@ -117,7 +146,6 @@ defmodule FerricstoreServer.Native.Commands do
     @op_options => "OPTIONS",
     @op_startup => "STARTUP",
     @op_window_update => "WINDOW_UPDATE",
-    @op_batch => "BATCH",
     @op_route_batch => "ROUTE_BATCH",
     @op_event => "EVENT",
     @op_subscribe_events => "SUBSCRIBE_EVENTS",
@@ -125,6 +153,7 @@ defmodule FerricstoreServer.Native.Commands do
   }
 
   @kv_commands %{
+    @op_pipeline => "PIPELINE",
     @op_get => "GET",
     @op_set => "SET",
     @op_del => "DEL",
@@ -137,7 +166,24 @@ defmodule FerricstoreServer.Native.Commands do
     @op_ratelimit_add => "RATELIMIT.ADD",
     @op_fetch_or_compute => "FETCH_OR_COMPUTE",
     @op_fetch_or_compute_result => "FETCH_OR_COMPUTE_RESULT",
-    @op_fetch_or_compute_error => "FETCH_OR_COMPUTE_ERROR"
+    @op_fetch_or_compute_error => "FETCH_OR_COMPUTE_ERROR",
+    @op_hset => "HSET",
+    @op_hget => "HGET",
+    @op_hmget => "HMGET",
+    @op_hgetall => "HGETALL",
+    @op_lpush => "LPUSH",
+    @op_rpush => "RPUSH",
+    @op_lpop => "LPOP",
+    @op_rpop => "RPOP",
+    @op_lrange => "LRANGE",
+    @op_sadd => "SADD",
+    @op_srem => "SREM",
+    @op_smembers => "SMEMBERS",
+    @op_sismember => "SISMEMBER",
+    @op_zadd => "ZADD",
+    @op_zrem => "ZREM",
+    @op_zrange => "ZRANGE",
+    @op_zscore => "ZSCORE"
   }
 
   @admin_commands %{
@@ -192,7 +238,10 @@ defmodule FerricstoreServer.Native.Commands do
     @op_flow_policy_set => "FLOW.POLICY.SET",
     @op_flow_policy_get => "FLOW.POLICY.GET",
     @op_flow_spawn_children => "FLOW.SPAWN_CHILDREN",
-    @op_flow_retention_cleanup => "FLOW.RETENTION_CLEANUP"
+    @op_flow_retention_cleanup => "FLOW.RETENTION_CLEANUP",
+    @op_flow_step_continue => "FLOW.STEP_CONTINUE",
+    @op_flow_start_and_claim => "FLOW.START_AND_CLAIM",
+    @op_flow_run_steps_many => "FLOW.RUN_STEPS_MANY"
   }
 
   @commands @control_commands
@@ -220,6 +269,7 @@ defmodule FerricstoreServer.Native.Commands do
     "children" => :children,
     "consistent_projection" => :consistent_projection,
     "correlation_id" => :correlation_id,
+    "count" => :count,
     "delay_ms" => :delay_ms,
     "drop_values" => :drop_values,
     "due_after_ms" => :due_after_ms,
@@ -230,11 +280,18 @@ defmodule FerricstoreServer.Native.Commands do
     "fencing_token" => :fencing_token,
     "from_state" => :from_state,
     "full" => :full,
+    "from_event" => :from_event,
+    "from_ms" => :from_ms,
+    "from_version" => :from_version,
     "group_id" => :group_id,
     "history_hot_max_events" => :history_hot_max_events,
     "history_max_events" => :history_max_events,
     "id" => :id,
+    "idempotency_key" => :idempotency_key,
+    "if_state" => :if_state,
+    "include_cold" => :include_cold,
     "independent" => :independent,
+    "initial_state" => :initial_state,
     "lease_ms" => :lease_ms,
     "lease_token" => :lease_token,
     "limit" => :limit,
@@ -268,10 +325,14 @@ defmodule FerricstoreServer.Native.Commands do
     "retry_at_ms" => :retry_at_ms,
     "root_id" => :root_id,
     "run_at_ms" => :run_at_ms,
+    "signal" => :signal,
     "state" => :state,
     "states" => :states,
+    "steps" => :steps,
     "success" => :success,
     "to_state" => :to_state,
+    "to_ms" => :to_ms,
+    "transition_to" => :transition_to,
     "ttl_ms" => :ttl_ms,
     "type" => :type,
     "value" => :value,
@@ -287,7 +348,9 @@ defmodule FerricstoreServer.Native.Commands do
     "all" => :all,
     "exponential" => :exponential,
     "linear" => :linear,
+    "meta" => :meta,
     "none" => :none,
+    "ok_on_success" => :ok_on_success,
     "running" => :running
   }
 
@@ -366,9 +429,11 @@ defmodule FerricstoreServer.Native.Commands do
         |> maybe_set_client_name(Map.get(payload, "client_name"))
         |> maybe_set_client_name(Map.get(payload, "driver_name"))
         |> maybe_set_compact_flow_responses(Map.get(payload, "compact_flow_responses"))
-        |> maybe_subscribe_events(Map.get(payload, "events", []))
 
-      {:ok, hello_payload(state), state}
+      case maybe_startup_subscribe_events(state, Map.get(payload, "events", []), payload) do
+        {:ok, state} -> {:ok, hello_payload(state), state}
+        {:error, status, reason} -> {status, reason, state}
+      end
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -464,18 +529,13 @@ defmodule FerricstoreServer.Native.Commands do
      }, state}
   end
 
-  defp do_execute(@op_batch, payload, state) do
-    with {:ok, commands} <- batch_commands(payload),
-         {:ok, atomicity} <- batch_atomicity(payload),
-         :ok <- validate_batch_atomicity(commands, atomicity, state) do
-      {results, state} =
-        Enum.map_reduce(commands, state, fn command, acc_state ->
-          execute_batch_command(command, acc_state)
-        end)
+  defp do_execute(@op_pipeline, payload, state) do
+    case Map.get(payload, "compact_pipeline") do
+      {mode, items} ->
+        execute_compact_pipeline(mode, items, payload, state)
 
-      {:ok, results, state}
-    else
-      {:error, reason} -> {:bad_request, reason, state}
+      _not_compact ->
+        execute_typed_pipeline(payload, state)
     end
   end
 
@@ -512,7 +572,9 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_mget, payload, state) do
     with {:ok, keys} <- require_binary_list(payload, "keys") do
-      result_to_reply(FerricStore.Impl.mget(state.instance_ctx, keys), state)
+      requested_collection_result_to_reply(length(keys), state, fn ->
+        FerricStore.Impl.mget(state.instance_ctx, keys)
+      end)
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -613,6 +675,150 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp do_execute(@op_hset, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, fields} <- require_nonempty_map(payload, "fields") do
+      result_to_reply(FerricStore.Impl.hset(state.instance_ctx, key, fields), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_hget, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, field} <- require_binary(payload, "field") do
+      result_to_reply(FerricStore.Impl.hget(state.instance_ctx, key, field), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_hmget, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, fields} <- require_nonempty_binary_list(payload, "fields") do
+      requested_collection_result_to_reply(length(fields), state, fn ->
+        FerricStore.Impl.hmget(state.instance_ctx, key, fields)
+      end)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_hgetall, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key") do
+      counted_collection_result_to_reply(
+        FerricStore.Impl.hlen(state.instance_ctx, key),
+        state,
+        fn ->
+          FerricStore.Impl.hgetall(state.instance_ctx, key)
+        end
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(opcode, payload, state) when opcode in [@op_lpush, @op_rpush] do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, values} <- require_nonempty_binary_list(payload, "values") do
+      fun = if opcode == @op_lpush, do: &FerricStore.Impl.lpush/3, else: &FerricStore.Impl.rpush/3
+      result_to_reply(fun.(state.instance_ctx, key, values), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(opcode, payload, state) when opcode in [@op_lpop, @op_rpop] do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, count} <- optional_pos_integer(payload, "count", 1) do
+      fun = if opcode == @op_lpop, do: &FerricStore.Impl.lpop/3, else: &FerricStore.Impl.rpop/3
+      list_pop_result_to_reply(state.instance_ctx, key, count, state, fun)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_lrange, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, start} <- require_integer(payload, "start"),
+         {:ok, stop} <- require_integer(payload, "stop") do
+      lrange_result_to_reply(state.instance_ctx, key, start, stop, state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(opcode, payload, state) when opcode in [@op_sadd, @op_srem] do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, members} <- require_nonempty_binary_list(payload, "members") do
+      fun = if opcode == @op_sadd, do: &FerricStore.Impl.sadd/3, else: &FerricStore.Impl.srem/3
+      result_to_reply(fun.(state.instance_ctx, key, members), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_smembers, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key") do
+      counted_collection_result_to_reply(
+        FerricStore.Impl.scard(state.instance_ctx, key),
+        state,
+        fn ->
+          FerricStore.Impl.smembers(state.instance_ctx, key)
+        end
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_sismember, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, member} <- require_binary(payload, "member") do
+      result_to_reply(FerricStore.Impl.sismember(state.instance_ctx, key, member), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_zadd, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, items} <- zadd_items(payload) do
+      result_to_reply(FerricStore.Impl.zadd(state.instance_ctx, key, items), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_zrem, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, members} <- require_nonempty_binary_list(payload, "members") do
+      result_to_reply(FerricStore.Impl.zrem(state.instance_ctx, key, members), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_zrange, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, start} <- require_integer(payload, "start"),
+         {:ok, stop} <- require_integer(payload, "stop"),
+         {:ok, opts} <- zrange_opts(payload) do
+      zrange_result_to_reply(state.instance_ctx, key, start, stop, opts, state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_zscore, payload, state) do
+    with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, member} <- require_binary(payload, "member") do
+      result_to_reply(FerricStore.Impl.zscore(state.instance_ctx, key, member), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
   defp do_execute(opcode, payload, state)
        when opcode in [
               @op_cluster_health,
@@ -691,7 +897,7 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp do_execute(@op_flow_get, payload, state),
-    do: flow_id_opts_call(payload, state, &FerricStore.Impl.flow_get/3)
+    do: flow_get_call(payload, state)
 
   defp do_execute(@op_flow_claim_due, payload, state) do
     with {:ok, type} <- require_binary(payload, "type"),
@@ -712,6 +918,42 @@ defmodule FerricstoreServer.Native.Commands do
          {:ok, opts} <- flow_opts(payload, ["id", "from_state", "to_state"]) do
       result_to_reply(
         FerricStore.Impl.flow_transition(state.instance_ctx, id, from_state, to_state, opts),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_step_continue, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, lease_token} <- require_binary(payload, "lease_token"),
+         {:ok, from_state} <- require_binary(payload, "from_state"),
+         {:ok, to_state} <- require_binary(payload, "to_state"),
+         {:ok, opts} <- flow_opts(payload, ["id", "lease_token", "from_state", "to_state"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_step_continue(
+          state.instance_ctx,
+          id,
+          lease_token,
+          from_state,
+          to_state,
+          opts
+        ),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_start_and_claim, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, type} <- require_binary(payload, "type"),
+         {:ok, initial_state} <- require_binary(payload, "initial_state"),
+         {:ok, opts} <- flow_opts(payload, ["id", "type", "initial_state"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_start_and_claim(state.instance_ctx, id, type, initial_state, opts),
         state
       )
     else
@@ -756,7 +998,7 @@ defmodule FerricstoreServer.Native.Commands do
     do: flow_id_opts_call(payload, state, &Ferricstore.Flow.signal/3)
 
   defp do_execute(@op_flow_list, payload, state),
-    do: flow_type_opts_call(payload, state, &FerricStore.Impl.flow_list/3)
+    do: flow_list_call(payload, state)
 
   defp do_execute(@op_flow_create_many, payload, state) do
     with {:ok, items} <- flow_items(payload, "items", :create),
@@ -777,6 +1019,26 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_flow_complete_many, payload, state),
     do: flow_many_items_call(payload, state, &Ferricstore.Flow.complete_many/4, :claimed)
+
+  defp do_execute(@op_flow_run_steps_many, payload, state) do
+    with {:ok, items} <-
+           Ferricstore.LatencyTrace.span("server_flow_run_steps_items_us", fn ->
+             flow_items(payload, "items", :run_steps)
+           end),
+         {:ok, opts} <-
+           Ferricstore.LatencyTrace.span("server_flow_run_steps_opts_us", fn ->
+             flow_opts(payload, ["items"])
+           end) do
+      result_to_reply(
+        Ferricstore.LatencyTrace.span("server_flow_run_steps_impl_us", fn ->
+          FerricStore.Impl.flow_run_steps_many(state.instance_ctx, items, opts)
+        end),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
 
   defp do_execute(@op_flow_transition_many, payload, state) do
     with {:ok, from_state} <- require_binary(payload, "from_state"),
@@ -904,6 +1166,34 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp flow_get_call(payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, opts} <- flow_opts(payload, ["id"]) do
+      read_opts = Keyword.delete(opts, :return)
+
+      state.instance_ctx
+      |> FerricStore.Impl.flow_get(id, read_opts)
+      |> FlowRecordProjection.maybe_meta_result(opts)
+      |> result_to_reply(state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp flow_list_call(payload, state) do
+    with {:ok, type} <- require_binary(payload, "type"),
+         {:ok, opts} <- flow_opts(payload, ["type"]) do
+      read_opts = Keyword.delete(opts, :return)
+
+      state.instance_ctx
+      |> FerricStore.Impl.flow_list(type, read_opts)
+      |> FlowRecordProjection.maybe_meta_result(opts)
+      |> result_to_reply(state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
   defp flow_lease_call(payload, state, fun) do
     with {:ok, id} <- require_binary(payload, "id"),
          {:ok, lease_token} <- require_binary(payload, "lease_token"),
@@ -943,6 +1233,77 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp result_to_reply({:error, reason}, state), do: {:error, inspect(reason), state}
   defp result_to_reply(value, state), do: {:ok, value, state}
+
+  defp collection_result_to_reply({:ok, value}, state) do
+    if collection_items_exceeds_limit?(collection_result_items(value), state) do
+      collection_response_limit_reply(state)
+    else
+      {:ok, value, state}
+    end
+  end
+
+  defp collection_result_to_reply(result, state), do: result_to_reply(result, state)
+
+  defp requested_collection_result_to_reply(requested_count, state, fun) do
+    if collection_items_exceeds_limit?(requested_count, state) do
+      collection_response_limit_reply(state)
+    else
+      collection_result_to_reply(fun.(), state)
+    end
+  end
+
+  defp counted_collection_result_to_reply(count_result, state, fun) do
+    case count_result do
+      {:ok, count} when is_integer(count) ->
+        requested_collection_result_to_reply(count, state, fun)
+
+      {:error, reason} ->
+        result_to_reply({:error, reason}, state)
+
+      _other ->
+        collection_result_to_reply(fun.(), state)
+    end
+  end
+
+  defp list_pop_result_to_reply(ctx, key, count, state, fun) do
+    limit = native_max_collection_response_items(state)
+
+    if limit > 0 and count > limit do
+      case FerricStore.Impl.llen(ctx, key) do
+        {:ok, len} when is_integer(len) and min(count, len) > limit ->
+          collection_response_limit_reply(state)
+
+        _other ->
+          collection_result_to_reply(fun.(ctx, key, count), state)
+      end
+    else
+      collection_result_to_reply(fun.(ctx, key, count), state)
+    end
+  end
+
+  defp lrange_result_to_reply(ctx, key, start, stop, state) do
+    limit = native_max_collection_response_items(state)
+    remaining = compact_collection_remaining(limit, 0)
+
+    with :ok <- compact_lrange_fallback_limit(ctx, key, start, stop, remaining) do
+      collection_result_to_reply(FerricStore.Impl.lrange(ctx, key, start, stop), state)
+    else
+      :collection_response_limit_exceeded ->
+        collection_response_limit_reply(state)
+    end
+  end
+
+  defp zrange_result_to_reply(ctx, key, start, stop, opts, state) do
+    limit = native_max_collection_response_items(state)
+    remaining = compact_collection_remaining(limit, 0)
+
+    with :ok <- compact_zrange_fallback_limit(ctx, key, start, stop, remaining) do
+      collection_result_to_reply(FerricStore.Impl.zrange(ctx, key, start, stop, opts), state)
+    else
+      :collection_response_limit_exceeded ->
+        collection_response_limit_reply(state)
+    end
+  end
 
   defp fetch_command(opcode) do
     case Map.fetch(@commands, opcode) do
@@ -1000,6 +1361,23 @@ defmodule FerricstoreServer.Native.Commands do
               @op_fetch_or_compute,
               @op_fetch_or_compute_result,
               @op_fetch_or_compute_error,
+              @op_hset,
+              @op_hget,
+              @op_hmget,
+              @op_hgetall,
+              @op_lpush,
+              @op_rpush,
+              @op_lpop,
+              @op_rpop,
+              @op_lrange,
+              @op_sadd,
+              @op_srem,
+              @op_smembers,
+              @op_sismember,
+              @op_zadd,
+              @op_zrem,
+              @op_zrange,
+              @op_zscore,
               @op_cluster_keyslot,
               @op_ferricstore_key_info
             ],
@@ -1019,6 +1397,8 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_get,
               @op_flow_complete,
               @op_flow_transition,
+              @op_flow_step_continue,
+              @op_flow_start_and_claim,
               @op_flow_retry,
               @op_flow_fail,
               @op_flow_cancel,
@@ -1037,7 +1417,8 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_transition_many,
               @op_flow_retry_many,
               @op_flow_fail_many,
-              @op_flow_cancel_many
+              @op_flow_cancel_many,
+              @op_flow_run_steps_many
             ],
        do: flow_item_ids(payload)
 
@@ -1051,6 +1432,14 @@ defmodule FerricstoreServer.Native.Commands do
               @op_get,
               @op_mget,
               @op_route,
+              @op_hget,
+              @op_hmget,
+              @op_hgetall,
+              @op_lrange,
+              @op_smembers,
+              @op_sismember,
+              @op_zrange,
+              @op_zscore,
               @op_flow_get,
               @op_flow_history,
               @op_flow_list,
@@ -1074,13 +1463,52 @@ defmodule FerricstoreServer.Native.Commands do
   defp flow_item_ids(%{"items" => items}) when is_list(items) do
     items
     |> Enum.map(fn
-      %{"id" => id} -> id
-      %{id: id} -> id
-      [id | _rest] -> id
-      {id, _payload} -> id
-      {id, _partition_key, _payload} -> id
-      {id, _partition_key, _lease_token, _fencing_token} -> id
-      _ -> nil
+      %{"id" => id} ->
+        id
+
+      %{id: id} ->
+        id
+
+      [id | _rest] ->
+        id
+
+      {:id, id, :payload, _payload} ->
+        id
+
+      {:id, id, :partition_key, _partition_key, :payload, _payload} ->
+        id
+
+      {:id, id, :lease_token, _lease_token, :fencing_token, _fencing_token} ->
+        id
+
+      {:id, id, :fencing_token, _fencing_token} ->
+        id
+
+      {:id, id, :fencing_token, _fencing_token, :lease_token, _lease_token} ->
+        id
+
+      {:id, id, :partition_key, _partition_key, :lease_token, _lease_token, :fencing_token,
+       _fencing_token} ->
+        id
+
+      {:id, id, :partition_key, _partition_key, :fencing_token, _fencing_token} ->
+        id
+
+      {:id, id, :partition_key, _partition_key, :fencing_token, _fencing_token, :lease_token,
+       _lease_token} ->
+        id
+
+      {id, _payload} ->
+        id
+
+      {id, _partition_key, _payload} ->
+        id
+
+      {id, _partition_key, _lease_token, _fencing_token} ->
+        id
+
+      _ ->
+        nil
     end)
     |> binary_list()
   end
@@ -1184,10 +1612,14 @@ defmodule FerricstoreServer.Native.Commands do
         max_frame_bytes:
           Map.get(state, :max_frame_bytes) ||
             Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024),
+        max_collection_response_items:
+          Map.get(state, :max_collection_response_items) ||
+            native_max_collection_response_items(),
         max_lane_queue:
           Map.get(state, :lane_max_queue) ||
             Application.get_env(:ferricstore, :native_lane_max_queue, 1024),
-        max_batch_commands: Application.get_env(:ferricstore, :native_max_batch_commands, 1024)
+        max_pipeline_commands:
+          Application.get_env(:ferricstore, :native_max_pipeline_commands, 1024)
       },
       flow_control: flow_control_payload(),
       chunking: %{
@@ -1218,6 +1650,7 @@ defmodule FerricstoreServer.Native.Commands do
   defp schema_payload do
     %{
       "GET" => %{"required" => ["key"], "fields" => ["key", "deadline_ms"]},
+      "MGET" => %{"required" => ["keys"], "fields" => ["keys", "deadline_ms"]},
       "SET" => %{
         "required" => ["key", "value"],
         "fields" => ["key", "value", "ttl", "nx", "xx", "get", "deadline_ms"]
@@ -1253,6 +1686,62 @@ defmodule FerricstoreServer.Native.Commands do
       "FETCH_OR_COMPUTE_ERROR" => %{
         "required" => ["key", "message"],
         "fields" => ["key", "message", "deadline_ms"]
+      },
+      "HSET" => %{
+        "required" => ["key", "fields"],
+        "fields" => ["key", "fields", "deadline_ms"]
+      },
+      "HGET" => %{
+        "required" => ["key", "field"],
+        "fields" => ["key", "field", "deadline_ms"]
+      },
+      "HMGET" => %{
+        "required" => ["key", "fields"],
+        "fields" => ["key", "fields", "deadline_ms"]
+      },
+      "HGETALL" => %{"required" => ["key"], "fields" => ["key", "deadline_ms"]},
+      "LPUSH" => %{
+        "required" => ["key", "values"],
+        "fields" => ["key", "values", "deadline_ms"]
+      },
+      "RPUSH" => %{
+        "required" => ["key", "values"],
+        "fields" => ["key", "values", "deadline_ms"]
+      },
+      "LPOP" => %{"required" => ["key"], "fields" => ["key", "count", "deadline_ms"]},
+      "RPOP" => %{"required" => ["key"], "fields" => ["key", "count", "deadline_ms"]},
+      "LRANGE" => %{
+        "required" => ["key", "start", "stop"],
+        "fields" => ["key", "start", "stop", "deadline_ms"]
+      },
+      "SADD" => %{
+        "required" => ["key", "members"],
+        "fields" => ["key", "members", "deadline_ms"]
+      },
+      "SREM" => %{
+        "required" => ["key", "members"],
+        "fields" => ["key", "members", "deadline_ms"]
+      },
+      "SMEMBERS" => %{"required" => ["key"], "fields" => ["key", "deadline_ms"]},
+      "SISMEMBER" => %{
+        "required" => ["key", "member"],
+        "fields" => ["key", "member", "deadline_ms"]
+      },
+      "ZADD" => %{
+        "required" => ["key", "items"],
+        "fields" => ["key", "items", "deadline_ms"]
+      },
+      "ZREM" => %{
+        "required" => ["key", "members"],
+        "fields" => ["key", "members", "deadline_ms"]
+      },
+      "ZRANGE" => %{
+        "required" => ["key", "start", "stop"],
+        "fields" => ["key", "start", "stop", "withscores", "deadline_ms"]
+      },
+      "ZSCORE" => %{
+        "required" => ["key", "member"],
+        "fields" => ["key", "member", "deadline_ms"]
       },
       "CLUSTER.HEALTH" => %{"required" => [], "fields" => ["args", "deadline_ms"]},
       "CLUSTER.STATS" => %{"required" => [], "fields" => ["args", "deadline_ms"]},
@@ -1333,6 +1822,69 @@ defmodule FerricstoreServer.Native.Commands do
           "deadline_ms"
         ]
       },
+      "FLOW.STEP_CONTINUE" => %{
+        "required" => ["id", "lease_token", "from_state", "to_state", "fencing_token"],
+        "fields" => [
+          "id",
+          "lease_token",
+          "from_state",
+          "to_state",
+          "fencing_token",
+          "partition_key",
+          "lease_ms",
+          "worker",
+          "payload",
+          "payload_ref",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values",
+          "now_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.START_AND_CLAIM" => %{
+        "required" => ["id", "type", "initial_state", "worker"],
+        "fields" => [
+          "id",
+          "type",
+          "initial_state",
+          "worker",
+          "lease_ms",
+          "payload",
+          "payload_ref",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values",
+          "partition_key",
+          "parent_id",
+          "root_id",
+          "correlation_id",
+          "priority",
+          "retention_ttl_ms",
+          "history_hot_max_events",
+          "history_max_events",
+          "now_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.RUN_STEPS_MANY" => %{
+        "required" => ["items", "type", "worker"],
+        "fields" => [
+          "items",
+          "type",
+          "states",
+          "steps",
+          "worker",
+          "lease_ms",
+          "payload",
+          "result",
+          "retention_ttl_ms",
+          "now_ms",
+          "deadline_ms"
+        ]
+      },
       "FLOW.VALUE.PUT" => %{
         "required" => ["value"],
         "fields" => [
@@ -1389,6 +1941,9 @@ defmodule FerricstoreServer.Native.Commands do
       max_inflight_per_lane:
         Map.get(state, :max_inflight_per_lane) ||
           Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024),
+      response_coalesce_bytes:
+        Map.get(state, :response_coalesce_bytes) ||
+          Application.get_env(:ferricstore, :native_response_coalesce_bytes, 8 * 1024 * 1024),
       enforced: true,
       window_update: true
     }
@@ -1576,6 +2131,23 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp require_map(payload, key) do
+    case Map.get(payload, key) do
+      value when is_map(value) -> {:ok, value}
+      _ -> {:error, "ERR native field #{key} must be a map"}
+    end
+  end
+
+  defp require_nonempty_map(payload, key) do
+    with {:ok, value} <- require_map(payload, key) do
+      if map_size(value) > 0 do
+        {:ok, value}
+      else
+        {:error, "ERR native field #{key} must not be empty"}
+      end
+    end
+  end
+
   defp optional_binary(payload, key, default) do
     case Map.get(payload, key, default) do
       value when is_binary(value) -> {:ok, value}
@@ -1587,6 +2159,13 @@ defmodule FerricstoreServer.Native.Commands do
     case Map.get(payload, key) do
       value when is_integer(value) and value > 0 -> {:ok, value}
       _ -> {:error, "ERR native field #{key} must be a positive integer"}
+    end
+  end
+
+  defp require_integer(payload, key) do
+    case Map.get(payload, key) do
+      value when is_integer(value) -> {:ok, value}
+      _ -> {:error, "ERR native field #{key} must be an integer"}
     end
   end
 
@@ -1613,9 +2192,20 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp require_binary_list(payload, key) do
-    case Map.get(payload, key) do
-      values when is_list(values) -> require_all_binaries(values, key)
+    case {Map.get(payload, :__wire_compact_validated__), Map.get(payload, key)} do
+      {true, values} when is_list(values) -> {:ok, values}
+      {_validated, values} when is_list(values) -> require_all_binaries(values, key)
       _ -> {:error, "ERR native field #{key} must be a binary list"}
+    end
+  end
+
+  defp require_nonempty_binary_list(payload, key) do
+    with {:ok, values} <- require_binary_list(payload, key) do
+      if values != [] do
+        {:ok, values}
+      else
+        {:error, "ERR native field #{key} must not be empty"}
+      end
     end
   end
 
@@ -1624,6 +2214,38 @@ defmodule FerricstoreServer.Native.Commands do
       {:ok, values}
     else
       {:error, "ERR native field #{key} must be a binary list"}
+    end
+  end
+
+  defp zadd_items(%{"items" => items}) when is_list(items) do
+    items =
+      Enum.map(items, fn
+        [score, member] when is_number(score) and is_binary(member) ->
+          {score, member}
+
+        {score, member} when is_number(score) and is_binary(member) ->
+          {score, member}
+
+        %{"score" => score, "member" => member} when is_number(score) and is_binary(member) ->
+          {score, member}
+
+        _ ->
+          :bad_item
+      end)
+
+    if Enum.any?(items, &(&1 == :bad_item)) do
+      {:error, "ERR native zadd items must be [score, member] pairs"}
+    else
+      {:ok, items}
+    end
+  end
+
+  defp zadd_items(_payload), do: {:error, "ERR native field items must be a list"}
+
+  defp zrange_opts(payload) do
+    case Map.get(payload, "withscores", false) do
+      value when value in [true, false] -> {:ok, [withscores: value]}
+      _ -> {:error, "ERR native field withscores must be boolean"}
     end
   end
 
@@ -1654,7 +2276,17 @@ defmodule FerricstoreServer.Native.Commands do
   defp unlock_result({:error, _reason} = error), do: error
   defp unlock_result(other), do: {:error, "ERR native lock command failed: #{inspect(other)}"}
 
-  defp kv_pairs(%{"pairs" => pairs}) when is_list(pairs) do
+  defp kv_pairs(%{"pairs" => pairs} = payload) when is_list(pairs) do
+    if Map.get(payload, :__wire_compact_validated__) do
+      {:ok, pairs}
+    else
+      kv_pairs_validate(pairs)
+    end
+  end
+
+  defp kv_pairs(_payload), do: {:error, "ERR native field pairs must be a list"}
+
+  defp kv_pairs_validate(pairs) do
     pairs =
       Enum.map(pairs, fn
         %{"key" => key, "value" => value} when is_binary(key) -> {key, value}
@@ -1669,8 +2301,6 @@ defmodule FerricstoreServer.Native.Commands do
       {:ok, pairs}
     end
   end
-
-  defp kv_pairs(_payload), do: {:error, "ERR native field pairs must be a list"}
 
   defp native_args(%{"args" => args}) when is_list(args) do
     {:ok, Enum.map(args, &native_arg/1)}
@@ -1696,16 +2326,28 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp event_list(_payload), do: {:error, "ERR native field events must be a list"}
 
-  defp maybe_subscribe_events(state, []), do: state
+  defp maybe_startup_subscribe_events(state, events, payload) do
+    requested? =
+      (is_list(events) and events != []) or
+        (is_map(payload) and Map.has_key?(payload, "flow_wake"))
 
-  defp maybe_subscribe_events(state, events) when is_list(events) do
-    case event_list(%{"events" => events}) do
-      {:ok, normalized} -> subscribe_events(state, normalized)
-      {:error, _reason} -> state
+    cond do
+      requested? and state.require_auth and not state.authenticated ->
+        {:error, :auth, "NOAUTH Authentication required before event subscription."}
+
+      requested? ->
+        with {:ok, events} <- event_list(%{"events" => events}),
+             {:ok, state} <-
+               maybe_subscribe_flow_wake(state, events, Map.get(payload, "flow_wake")) do
+          {:ok, subscribe_events(state, events)}
+        else
+          {:error, reason} -> {:error, :bad_request, reason}
+        end
+
+      true ->
+        {:ok, state}
     end
   end
-
-  defp maybe_subscribe_events(state, _events), do: state
 
   defp subscribe_events(state, events) do
     current = Map.get(state, :event_subscriptions, MapSet.new())
@@ -1804,12 +2446,63 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp normalize_event(_event), do: nil
 
-  defp batch_commands(%{"commands" => commands}) when is_list(commands) do
-    max = Application.get_env(:ferricstore, :native_max_batch_commands, 1024)
+  defp execute_typed_pipeline(payload, state) do
+    with {:ok, commands} <- pipeline_commands(payload),
+         {:ok, atomicity} <- pipeline_atomicity(payload),
+         :ok <- validate_pipeline_atomicity(commands, atomicity, state) do
+      execute_pipeline_commands(commands, pipeline_return_format(payload), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp execute_compact_pipeline(mode, items, payload, state) do
+    with :ok <- validate_compact_pipeline(mode, items, payload, state) do
+      return_format = compact_pipeline_return_format(payload)
+
+      case execute_compact_pipeline_fast_path(mode, items, return_format, state) do
+        {:ok, result} ->
+          {:ok, result, state}
+
+        {:error, reason} ->
+          {:bad_request, reason, state}
+
+        :fallback ->
+          with {:ok, commands} <- compact_pipeline_commands(mode, items) do
+            execute_pipeline_commands(commands, return_format, state)
+          else
+            {:error, reason} -> {:bad_request, reason, state}
+          end
+      end
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp compact_pipeline_return_format(%{"compact_values" => true}), do: :values
+  defp compact_pipeline_return_format(payload), do: pipeline_return_format(payload)
+
+  defp execute_pipeline_commands(commands, return_format, state) do
+    case execute_pipeline_fast_path(commands, state) do
+      {:ok, results} ->
+        {:ok, format_pipeline_results(results, return_format), state}
+
+      :fallback ->
+        {results, state} =
+          Enum.map_reduce(commands, state, fn command, acc_state ->
+            execute_pipeline_command(command, acc_state)
+          end)
+
+        {:ok, format_pipeline_results(results, return_format), state}
+    end
+  end
+
+  defp pipeline_commands(%{"commands" => commands}) when is_list(commands) do
+    max = Application.get_env(:ferricstore, :native_max_pipeline_commands, 1024)
 
     cond do
       length(commands) > max ->
-        {:error, "ERR native batch exceeds max commands"}
+        {:error, "ERR native pipeline exceeds max commands"}
 
       true ->
         commands
@@ -1820,7 +2513,7 @@ defmodule FerricstoreServer.Native.Commands do
             request_id = Map.get(command, "request_id", 0)
 
             if control_opcode?(opcode) do
-              {:halt, {:error, "ERR native batch cannot contain control commands"}}
+              {:halt, {:error, "ERR native pipeline cannot contain control commands"}}
             else
               {:cont,
                {:ok,
@@ -1828,7 +2521,7 @@ defmodule FerricstoreServer.Native.Commands do
             end
 
           _command, _acc ->
-            {:halt, {:error, "ERR native batch commands require opcode and body"}}
+            {:halt, {:error, "ERR native pipeline commands require opcode and body"}}
         end)
         |> case do
           {:ok, values} -> {:ok, Enum.reverse(values)}
@@ -1837,23 +2530,778 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
-  defp batch_commands(_payload), do: {:error, "ERR native batch requires commands list"}
+  defp pipeline_commands(_payload), do: {:error, "ERR native pipeline requires commands list"}
 
-  defp batch_atomicity(payload) do
+  defp validate_compact_pipeline(mode, items, payload, state)
+       when mode in [
+              1,
+              2,
+              3,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33
+            ] and is_list(items) do
+    max = Application.get_env(:ferricstore, :native_max_pipeline_commands, 1024)
+    count = Map.get(payload, "compact_count")
+    decoded_from_wire? = is_integer(count) and count >= 0
+    count = if decoded_from_wire?, do: count, else: length(items)
+
+    cond do
+      count > max ->
+        {:error, "ERR native pipeline exceeds max commands"}
+
+      not decoded_from_wire? and not valid_compact_pipeline_items?(mode, items) ->
+        {:error, "ERR native compact PIPELINE payload is invalid"}
+
+      mode == 5 and not safe_compact_mixed_pipeline?(items) ->
+        {:error, "ERR native compact mixed PIPELINE cannot reorder dependent keys"}
+
+      true ->
+        with {:ok, atomicity} <- pipeline_atomicity(payload),
+             :ok <- validate_compact_pipeline_atomicity(mode, items, atomicity, state) do
+          :ok
+        end
+    end
+  end
+
+  defp validate_compact_pipeline(_mode, _items, _payload, _state),
+    do: {:error, "ERR native compact PIPELINE payload is invalid"}
+
+  defp valid_compact_pipeline_items?(1, items),
+    do:
+      Enum.all?(items, fn
+        {key, value} -> is_binary(key) and is_binary(value)
+        _item -> false
+      end)
+
+  defp valid_compact_pipeline_items?(2, items),
+    do: Enum.all?(items, &is_binary/1)
+
+  defp valid_compact_pipeline_items?(27, items),
+    do: Enum.all?(items, &is_binary/1)
+
+  defp valid_compact_pipeline_items?(30, items),
+    do: Enum.all?(items, &is_binary/1)
+
+  defp valid_compact_pipeline_items?(mode, items) when mode in [18, 19] do
+    Enum.all?(items, fn
+      {key, item} -> is_binary(key) and is_binary(item)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(28, items) do
+    Enum.all?(items, fn
+      {key, fields} when is_binary(key) and is_list(fields) and fields != [] ->
+        Enum.all?(fields, &is_binary/1)
+
+      _item ->
+        false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(29, items) do
+    Enum.all?(items, fn
+      {key, member} -> is_binary(key) and is_binary(member)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(20, items) do
+    Enum.all?(items, fn
+      {key, start, stop} -> is_binary(key) and is_integer(start) and is_integer(stop)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(21, items) do
+    Enum.all?(items, fn
+      {key, start, stop, with_scores} ->
+        is_binary(key) and is_integer(start) and is_integer(stop) and is_boolean(with_scores)
+
+      _item ->
+        false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(22, items) do
+    Enum.all?(items, fn
+      {key, field, value} -> is_binary(key) and is_binary(field) and is_binary(value)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(mode, items) when mode in [23, 24, 25, 31, 32] do
+    Enum.all?(items, fn
+      {key, item} -> is_binary(key) and is_binary(item)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(26, items) do
+    Enum.all?(items, fn
+      {key, score, member} -> is_binary(key) and is_float(score) and is_binary(member)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(5, items) do
+    Enum.all?(items, fn
+      {:set, key, value} -> is_binary(key) and is_binary(value)
+      {:get, key} -> is_binary(key)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(mode, items) when mode in [6, 33] do
+    Enum.all?(items, fn
+      {:flow_step_continue, id, lease_token, from_state, to_state, opts} ->
+        is_binary(id) and is_binary(lease_token) and is_binary(from_state) and
+          is_binary(to_state) and is_list(opts)
+
+      _item ->
+        false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(7, items) do
+    Enum.all?(items, fn
+      {value, opts} -> is_binary(value) and is_list(opts)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(8, items) do
+    Enum.all?(items, fn
+      {:flow_named_value_put, value, opts} -> is_binary(value) and is_list(opts)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(14, items), do: valid_compact_pipeline_items?(8, items)
+
+  defp valid_compact_pipeline_items?(15, items), do: valid_compact_pipeline_items?(7, items)
+
+  defp valid_compact_pipeline_items?(9, items) do
+    Enum.all?(items, fn
+      {:flow_get, id, opts} -> is_binary(id) and opts == []
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(16, items) do
+    Enum.all?(items, fn
+      {:flow_get, id, opts} -> is_binary(id) and valid_flow_get_partition_opts?(opts)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(17, items) do
+    Enum.all?(items, fn
+      {:flow_get, id, opts} -> is_binary(id) and valid_flow_get_meta_opts?(opts)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(10, items) do
+    Enum.all?(items, fn
+      {:flow_history, id, opts} -> is_binary(id) and is_list(opts)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(11, items) do
+    Enum.all?(items, fn
+      {:flow_signal, id, opts} -> is_binary(id) and is_list(opts)
+      _item -> false
+    end)
+  end
+
+  defp valid_compact_pipeline_items?(mode, items) when mode in [12, 13] do
+    Enum.all?(items, fn
+      {:flow_start_and_claim, id, type, initial_state, opts} ->
+        is_binary(id) and is_binary(type) and is_binary(initial_state) and is_list(opts)
+
+      _item ->
+        false
+    end)
+  end
+
+  defp valid_flow_get_partition_opts?(opts) when is_list(opts) do
+    Keyword.keyword?(opts) and
+      Enum.all?(opts, fn
+        {:partition_key, value} -> is_binary(value)
+        _other -> false
+      end)
+  end
+
+  defp valid_flow_get_partition_opts?(_opts), do: false
+
+  defp valid_flow_get_meta_opts?(opts) when is_list(opts) do
+    Keyword.keyword?(opts) and Keyword.get(opts, :return) == :meta and
+      opts
+      |> Keyword.delete(:return)
+      |> valid_flow_get_partition_opts?()
+  end
+
+  defp valid_flow_get_meta_opts?(_opts), do: false
+
+  defp safe_compact_mixed_pipeline?(items),
+    do: safe_compact_mixed_pipeline?(items, MapSet.new(), MapSet.new())
+
+  defp safe_compact_mixed_pipeline?([], _read_keys, _written_keys), do: true
+
+  defp safe_compact_mixed_pipeline?([{:set, key, _value} | rest], read_keys, written_keys) do
+    not MapSet.member?(read_keys, key) and not MapSet.member?(written_keys, key) and
+      safe_compact_mixed_pipeline?(rest, read_keys, MapSet.put(written_keys, key))
+  end
+
+  defp safe_compact_mixed_pipeline?([{:get, key} | rest], read_keys, written_keys) do
+    not MapSet.member?(written_keys, key) and
+      safe_compact_mixed_pipeline?(rest, MapSet.put(read_keys, key), written_keys)
+  end
+
+  defp safe_compact_mixed_pipeline?(_items, _read_keys, _written_keys), do: false
+
+  defp validate_compact_pipeline_atomicity(_mode, _items, atomicity, _state)
+       when atomicity in ["none", "per_shard"],
+       do: :ok
+
+  defp validate_compact_pipeline_atomicity(mode, items, "same_shard", state) do
+    shards =
+      mode
+      |> compact_pipeline_keys(items)
+      |> Enum.map(&Router.shard_for(state.instance_ctx, &1))
+      |> Enum.uniq()
+
+    case shards do
+      [] -> :ok
+      [_one] -> :ok
+      _ -> {:error, "ERR native same_shard pipeline contains multiple shards"}
+    end
+  end
+
+  defp compact_pipeline_keys(1, kv_pairs), do: Enum.map(kv_pairs, fn {key, _value} -> key end)
+  defp compact_pipeline_keys(2, keys), do: keys
+  defp compact_pipeline_keys(27, keys), do: keys
+  defp compact_pipeline_keys(30, keys), do: keys
+  defp compact_pipeline_keys(mode, items) when mode in [18, 19], do: Enum.map(items, &elem(&1, 0))
+  defp compact_pipeline_keys(mode, items) when mode in [28, 29], do: Enum.map(items, &elem(&1, 0))
+  defp compact_pipeline_keys(20, items), do: Enum.map(items, &elem(&1, 0))
+  defp compact_pipeline_keys(21, items), do: Enum.map(items, &elem(&1, 0))
+  defp compact_pipeline_keys(22, items), do: Enum.map(items, &elem(&1, 0))
+
+  defp compact_pipeline_keys(mode, items) when mode in [23, 24, 25, 26, 31, 32],
+    do: Enum.map(items, &elem(&1, 0))
+
+  defp compact_pipeline_keys(5, ops), do: Enum.map(ops, &compact_mixed_key/1)
+
+  defp compact_pipeline_keys(mode, ops) when mode in [6, 33],
+    do:
+      Enum.map(ops, fn {:flow_step_continue, id, _lease_token, _from_state, _to_state, _opts} ->
+        id
+      end)
+
+  defp compact_pipeline_keys(7, _ops), do: []
+  defp compact_pipeline_keys(15, _ops), do: []
+
+  defp compact_pipeline_keys(8, ops) do
+    Enum.flat_map(ops, fn {:flow_named_value_put, _value, opts} ->
+      case Keyword.fetch(opts, :owner_flow_id) do
+        {:ok, owner_flow_id} -> [owner_flow_id]
+        :error -> []
+      end
+    end)
+  end
+
+  defp compact_pipeline_keys(14, ops), do: compact_pipeline_keys(8, ops)
+
+  defp compact_pipeline_keys(9, ops),
+    do: Enum.map(ops, fn {:flow_get, id, []} -> id end)
+
+  defp compact_pipeline_keys(16, ops),
+    do: Enum.map(ops, fn {:flow_get, id, _opts} -> id end)
+
+  defp compact_pipeline_keys(17, ops),
+    do: Enum.map(ops, fn {:flow_get, id, _opts} -> id end)
+
+  defp compact_pipeline_keys(10, ops),
+    do: Enum.map(ops, fn {:flow_history, id, _opts} -> id end)
+
+  defp compact_pipeline_keys(11, ops),
+    do: Enum.map(ops, fn {:flow_signal, id, _opts} -> id end)
+
+  defp compact_pipeline_keys(mode, ops) when mode in [12, 13],
+    do: Enum.map(ops, fn {:flow_start_and_claim, id, _type, _initial_state, _opts} -> id end)
+
+  defp compact_mixed_key({:set, key, _value}), do: key
+  defp compact_mixed_key({_op, key}), do: key
+
+  defp compact_pipeline_commands(1, kv_pairs) do
+    commands =
+      kv_pairs
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, value}, request_id} ->
+        %{
+          opcode: @op_set,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "value" => value}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(2, keys) do
+    commands =
+      keys
+      |> Enum.with_index(1)
+      |> Enum.map(fn {key, request_id} ->
+        %{opcode: @op_get, lane_id: 1, request_id: request_id, body: %{"key" => key}}
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(27, keys) do
+    commands =
+      keys
+      |> Enum.with_index(1)
+      |> Enum.map(fn {key, request_id} ->
+        %{opcode: @op_smembers, lane_id: 1, request_id: request_id, body: %{"key" => key}}
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(30, keys) do
+    commands =
+      keys
+      |> Enum.with_index(1)
+      |> Enum.map(fn {key, request_id} ->
+        %{opcode: @op_hgetall, lane_id: 1, request_id: request_id, body: %{"key" => key}}
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(18, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, field}, request_id} ->
+        %{
+          opcode: @op_hget,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "field" => field}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(19, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, member}, request_id} ->
+        %{
+          opcode: @op_sismember,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "member" => member}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(28, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, fields}, request_id} ->
+        %{
+          opcode: @op_hmget,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "fields" => fields}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(29, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, member}, request_id} ->
+        %{
+          opcode: @op_zscore,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "member" => member}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(20, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, start, stop}, request_id} ->
+        %{
+          opcode: @op_lrange,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "start" => start, "stop" => stop}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(21, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, start, stop, with_scores}, request_id} ->
+        body = %{"key" => key, "start" => start, "stop" => stop}
+        body = if with_scores, do: Map.put(body, "withscores", true), else: body
+
+        %{
+          opcode: @op_zrange,
+          lane_id: 1,
+          request_id: request_id,
+          body: body
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(22, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, field, value}, request_id} ->
+        %{
+          opcode: @op_hset,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "fields" => %{field => value}}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(mode, items) when mode in [23, 24] do
+    opcode = if mode == 23, do: @op_lpush, else: @op_rpush
+
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, value}, request_id} ->
+        %{
+          opcode: opcode,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "values" => [value]}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(25, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, member}, request_id} ->
+        %{
+          opcode: @op_sadd,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "members" => [member]}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(26, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{key, score, member}, request_id} ->
+        %{
+          opcode: @op_zadd,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"key" => key, "items" => [[score, member]]}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(5, ops) do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn
+        {{:set, key, value}, request_id} ->
+          %{
+            opcode: @op_set,
+            lane_id: 1,
+            request_id: request_id,
+            body: %{"key" => key, "value" => value}
+          }
+
+        {{:get, key}, request_id} ->
+          %{opcode: @op_get, lane_id: 1, request_id: request_id, body: %{"key" => key}}
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(mode, ops) when mode in [6, 33] do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn
+        {{:flow_step_continue, id, lease_token, from_state, to_state, opts}, request_id} ->
+          %{
+            opcode: @op_flow_step_continue,
+            lane_id: 1,
+            request_id: request_id,
+            body:
+              opts
+              |> compact_flow_opts_body()
+              |> Map.put("id", id)
+              |> Map.put("lease_token", lease_token)
+              |> Map.put("from_state", from_state)
+              |> Map.put("to_state", to_state)
+          }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(7, items) do
+    commands =
+      items
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{value, opts}, request_id} ->
+        %{
+          opcode: @op_flow_value_put,
+          lane_id: 1,
+          request_id: request_id,
+          body: opts |> compact_flow_opts_body() |> Map.put("value", value)
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(15, items), do: compact_pipeline_commands(7, items)
+
+  defp compact_pipeline_commands(8, ops) do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{:flow_named_value_put, value, opts}, request_id} ->
+        %{
+          opcode: @op_flow_value_put,
+          lane_id: 1,
+          request_id: request_id,
+          body: opts |> compact_flow_opts_body() |> Map.put("value", value)
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(14, ops), do: compact_pipeline_commands(8, ops)
+
+  defp compact_pipeline_commands(9, ops) do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{:flow_get, id, []}, request_id} ->
+        %{
+          opcode: @op_flow_get,
+          lane_id: 1,
+          request_id: request_id,
+          body: %{"id" => id}
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(16, ops) do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{:flow_get, id, opts}, request_id} ->
+        %{
+          opcode: @op_flow_get,
+          lane_id: 1,
+          request_id: request_id,
+          body: opts |> compact_flow_opts_body() |> Map.put("id", id)
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(17, ops) do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{:flow_get, id, opts}, request_id} ->
+        %{
+          opcode: @op_flow_get,
+          lane_id: 1,
+          request_id: request_id,
+          body:
+            opts
+            |> Keyword.delete(:return)
+            |> compact_flow_opts_body()
+            |> Map.put("id", id)
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(10, ops) do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{:flow_history, id, opts}, request_id} ->
+        %{
+          opcode: @op_flow_history,
+          lane_id: 1,
+          request_id: request_id,
+          body: opts |> compact_flow_opts_body() |> Map.put("id", id)
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(11, ops) do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{:flow_signal, id, opts}, request_id} ->
+        %{
+          opcode: @op_flow_signal,
+          lane_id: 1,
+          request_id: request_id,
+          body: opts |> compact_flow_opts_body() |> Map.put("id", id)
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(mode, ops) when mode in [12, 13] do
+    commands =
+      ops
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{:flow_start_and_claim, id, type, initial_state, opts}, request_id} ->
+        %{
+          opcode: @op_flow_start_and_claim,
+          lane_id: 1,
+          request_id: request_id,
+          body:
+            opts
+            |> compact_flow_opts_body()
+            |> Map.put("id", id)
+            |> Map.put("type", type)
+            |> Map.put("initial_state", initial_state)
+        }
+      end)
+
+    {:ok, commands}
+  end
+
+  defp compact_pipeline_commands(_mode, _items),
+    do: {:error, "ERR native compact PIPELINE payload is invalid"}
+
+  defp compact_flow_opts_body(opts) do
+    Map.new(opts, fn {key, value} -> {Atom.to_string(key), value} end)
+  end
+
+  defp pipeline_atomicity(payload) do
     atomicity = Map.get(payload, "atomicity", "none")
 
     if atomicity in @supported_atomicity do
       {:ok, atomicity}
     else
-      {:error, "ERR native unsupported batch atomicity #{atomicity}"}
+      {:error, "ERR native unsupported pipeline atomicity #{atomicity}"}
     end
   end
 
-  defp validate_batch_atomicity(_commands, atomicity, _state)
+  defp pipeline_return_format(%{"return" => "pairs"}), do: :pairs
+  defp pipeline_return_format(%{"return" => "compact"}), do: :compact
+  defp pipeline_return_format(_payload), do: :maps
+
+  defp format_pipeline_results(results, :maps), do: results
+
+  defp format_pipeline_results(results, :pairs) do
+    Enum.map(results, fn %{"status" => status, "value" => value} -> [status, value] end)
+  end
+
+  defp format_pipeline_results(results, :compact) do
+    pairs = format_pipeline_results(results, :pairs)
+
+    case FerricstoreServer.Native.Codec.encode_compact_pipeline_response(pairs) do
+      payload when is_binary(payload) -> payload
+      nil -> pairs
+    end
+  end
+
+  defp validate_pipeline_atomicity(_commands, atomicity, _state)
        when atomicity in ["none", "per_shard"],
        do: :ok
 
-  defp validate_batch_atomicity(commands, "same_shard", state) do
+  defp validate_pipeline_atomicity(commands, "same_shard", state) do
     shards =
       commands
       |> Enum.flat_map(fn command -> keys(command.opcode, command.body) end)
@@ -1863,36 +3311,2188 @@ defmodule FerricstoreServer.Native.Commands do
     case shards do
       [] -> :ok
       [_one] -> :ok
-      _ -> {:error, "ERR native same_shard batch contains multiple shards"}
+      _ -> {:error, "ERR native same_shard pipeline contains multiple shards"}
     end
   end
 
-  defp execute_batch_command(command, state) do
-    {status, value, state} = execute(command.opcode, command.body, state)
+  defp execute_pipeline_fast_path(
+         commands,
+         %{
+           acl_cache: :full_access,
+           require_auth: false,
+           instance_ctx: ctx
+         } = state
+       )
+       when not is_nil(ctx) do
+    case pipeline_plain_sets(commands, [], []) do
+      {:ok, requests, kv_pairs} ->
+        Stats.incr_commands_by(state.stats_counter, length(commands))
 
-    result = %{
-      "opcode" => command.opcode,
-      "request_id" => command.request_id,
-      "lane_id" => command.lane_id,
+        results =
+          ctx
+          |> Router.batch_quorum_put(kv_pairs)
+          |> pipeline_set_results(requests)
+
+        {:ok, results}
+
+      :fallback ->
+        case pipeline_plain_gets(commands, [], []) do
+          {:ok, requests, keys} ->
+            Stats.incr_commands_by(state.stats_counter, length(commands))
+
+            results =
+              ctx
+              |> Router.batch_get(keys)
+              |> pipeline_get_results(requests)
+
+            {:ok, results}
+
+          :fallback ->
+            case pipeline_data_writes(commands) do
+              {:ok, requests, ops} ->
+                Stats.incr_commands_by(state.stats_counter, length(commands))
+
+                results =
+                  ctx
+                  |> Router.pipeline_write_batch(ops)
+                  |> pipeline_flow_results(requests)
+
+                {:ok, results}
+
+              :fallback ->
+                case pipeline_flow_create_many(commands, [], [], nil) do
+                  {:ok, requests, items, opts} ->
+                    Stats.incr_commands_by(state.stats_counter, length(commands))
+
+                    results =
+                      state.instance_ctx
+                      |> Ferricstore.Flow.create_many(
+                        nil,
+                        items,
+                        opts
+                        |> Keyword.put(:independent, true)
+                        |> Keyword.put(:return, :ok_on_success)
+                      )
+                      |> pipeline_create_many_results(requests)
+
+                    {:ok, results}
+
+                  :fallback ->
+                    case pipeline_flow_shared_value_puts(commands, [], []) do
+                      {:ok, requests, items} ->
+                        Stats.incr_commands_by(state.stats_counter, length(commands))
+
+                        results =
+                          state.instance_ctx
+                          |> Ferricstore.Flow.ValueStore.shared_value_put_batch(items)
+                          |> pipeline_flow_results(requests)
+
+                        {:ok, results}
+
+                      :fallback ->
+                        case pipeline_flow_writes(commands, [], []) do
+                          {:ok, requests, ops} ->
+                            Stats.incr_commands_by(state.stats_counter, length(commands))
+
+                            results =
+                              state.instance_ctx
+                              |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+                              |> pipeline_flow_results(requests)
+
+                            {:ok, results}
+
+                          :fallback ->
+                            case pipeline_flow_reads(commands, [], []) do
+                              {:ok, requests, ops} ->
+                                Stats.incr_commands_by(state.stats_counter, length(commands))
+
+                                results =
+                                  state.instance_ctx
+                                  |> Ferricstore.Flow.pipeline_read_batch(ops)
+                                  |> pipeline_flow_results(requests)
+
+                                {:ok, results}
+
+                              :fallback ->
+                                :fallback
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+  end
+
+  defp execute_pipeline_fast_path(_commands, _state), do: :fallback
+
+  defp execute_compact_pipeline_fast_path(
+         1,
+         kv_pairs,
+         :values,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(kv_pairs) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
+
+    case Router.batch_quorum_put_status(ctx, kv_pairs) do
+      :ok ->
+        {:ok, FerricstoreServer.Native.Codec.encode_compact_ok_count(length(kv_pairs))}
+
+      {:error, _reason} = error ->
+        {:ok, format_compact_set_results([error], :values)}
+    end
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         1,
+         kv_pairs,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(kv_pairs) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
+
+    results = Router.batch_quorum_put(ctx, kv_pairs)
+
+    {:ok, format_compact_set_results(results, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         keys,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode == 2 and is_list(keys) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(keys))
+
+    pairs =
+      ctx
+      |> Router.batch_get(keys)
+      |> compact_pipeline_get_result(return_format)
+
+    {:ok, format_compact_pipeline_get_result(pairs, @op_get, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         18,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    pairs =
+      ctx
+      |> compact_hget_results(items)
+
+    {:ok, format_compact_pipeline_results(pairs, @op_hget, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         19,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    pairs =
+      ctx
+      |> compact_sismember_results(items)
+
+    {:ok, format_compact_pipeline_results(pairs, @op_sismember, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         28,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    pairs =
+      ctx
+      |> compact_hmget_results(items)
+
+    {:ok, format_compact_pipeline_results(pairs, @op_hmget, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         29,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    pairs =
+      ctx
+      |> compact_zscore_results(items)
+
+    {:ok, format_compact_pipeline_results(pairs, @op_zscore, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         20,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    with {:ok, results} <- compact_lrange_results(ctx, items, state) do
+      {:ok, format_compact_pipeline_results(results, @op_lrange, return_format)}
+    end
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         21,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+
+    with {:ok, results} <- compact_zrange_results(ctx, items, state) do
+      {:ok, format_compact_pipeline_results(results, @op_zrange, return_format)}
+    end
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         27,
+         keys,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(keys) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(keys))
+
+    with {:ok, results} <- guarded_collection_map(keys, state, &compact_smembers_result(ctx, &1)) do
+      {:ok, format_compact_pipeline_results(results, @op_smembers, return_format)}
+    end
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         30,
+         keys,
+         :compact,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(keys) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(keys))
+
+    with {:ok, results} <-
+           guarded_collection_map(keys, state, &compact_hgetall_entry_result(ctx, &1)) do
+      case compact_hgetall_entry_values_payload(results) do
+        payload when is_binary(payload) ->
+          {:ok, payload}
+
+        nil ->
+          pairs =
+            results
+            |> Enum.map(&compact_hgetall_entry_result_to_map_result/1)
+            |> compact_pipeline_result_pairs()
+
+          {:ok, format_compact_pipeline_pairs(pairs, @op_hgetall, :compact)}
+      end
+    end
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         30,
+         keys,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(keys) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(keys))
+
+    with {:ok, results} <- guarded_collection_map(keys, state, &compact_hgetall_result(ctx, &1)) do
+      {:ok, format_compact_pipeline_results(results, @op_hgetall, return_format)}
+    end
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode in [23, 24] and is_list(items) and not is_nil(ctx) do
+    opcode = if mode == 23, do: @op_lpush, else: @op_rpush
+    push_fun = if mode == 23, do: &FerricStore.Impl.lpush/3, else: &FerricStore.Impl.rpush/3
+
+    case compact_list_push_grouped_results(ctx, items, push_fun) do
+      :fallback ->
+        execute_compact_data_write_pipeline(mode, items, return_format, state)
+
+      results ->
+        Stats.incr_commands_by(state.stats_counter, length(items))
+
+        {:ok, format_compact_pipeline_results(results, opcode, return_format)}
+    end
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode in [22, 23, 24, 25, 26, 31, 32] and is_list(items) and not is_nil(ctx) do
+    execute_compact_data_write_pipeline(mode, items, return_format, state)
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         5,
+         ops,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(ops) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+    {get_keys, set_pairs} = compact_mixed_collect(ops, [], [])
+    get_values = Router.batch_get(ctx, Enum.reverse(get_keys))
+    set_results = Router.batch_quorum_put(ctx, Enum.reverse(set_pairs))
+
+    pairs =
+      compact_mixed_pairs(
+        ops,
+        get_values,
+        Enum.map(set_results, &pipeline_set_result_pair/1),
+        []
+      )
+
+    {:ok, format_compact_pipeline_pairs(pairs, @op_pipeline, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         ops,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode in [6, 33] and is_list(ops) and not is_nil(ctx) do
+    count = length(ops)
+    Stats.incr_commands_by(state.stats_counter, count)
+    requests = compact_pipeline_requests(@op_flow_step_continue, count)
+
+    results =
+      ctx
+      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> compact_pipeline_flow_pairs(requests)
+
+    {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         items,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode in [7, 15] and is_list(items) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(items))
+    requests = compact_pipeline_requests(@op_flow_value_put, length(items))
+
+    results =
+      ctx
+      |> Ferricstore.Flow.ValueStore.shared_value_put_batch(items)
+      |> compact_pipeline_flow_pairs(requests)
+
+    {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         ops,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode in [8, 14] and is_list(ops) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+    requests = compact_pipeline_requests(@op_flow_value_put, length(ops))
+
+    results =
+      ctx
+      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> compact_pipeline_flow_pairs(requests)
+
+    {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         11,
+         ops,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(ops) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+    requests = compact_pipeline_requests(@op_flow_signal, length(ops))
+
+    results =
+      ctx
+      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> compact_pipeline_flow_pairs(requests)
+
+    {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         ops,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode in [9, 16, 17] and is_list(ops) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+
+    results =
+      ctx
+      |> compact_flow_get_results(mode, ops)
+      |> maybe_compact_flow_get_meta_results(mode)
+
+    payload =
+      case return_format do
+        :values ->
+          compact_pipeline_flow_values(results)
+
+        _other ->
+          requests = compact_pipeline_requests(@op_flow_get, length(ops))
+
+          results
+          |> compact_pipeline_flow_pairs(requests)
+          |> format_compact_pipeline_pairs(@op_pipeline, return_format)
+      end
+
+    {:ok, payload}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         10,
+         ops,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when is_list(ops) and not is_nil(ctx) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+    requests = compact_pipeline_requests(@op_flow_history, length(ops))
+
+    results =
+      ctx
+      |> Ferricstore.Flow.pipeline_read_batch(ops)
+      |> compact_pipeline_flow_pairs(requests)
+
+    {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(
+         mode,
+         ops,
+         return_format,
+         %{acl_cache: :full_access, require_auth: false, instance_ctx: ctx} = state
+       )
+       when mode in [12, 13] and is_list(ops) and not is_nil(ctx) do
+    count = length(ops)
+    Stats.incr_commands_by(state.stats_counter, count)
+    requests = compact_pipeline_requests(@op_flow_start_and_claim, count)
+
+    results =
+      ctx
+      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> compact_pipeline_flow_pairs(requests)
+
+    {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
+  end
+
+  defp execute_compact_pipeline_fast_path(_mode, _items, _return_format, _state), do: :fallback
+
+  defp compact_hget_results(ctx, items) do
+    lookups =
+      Enum.flat_map(items, fn {key, field} ->
+        [
+          {key, Ferricstore.Store.CompoundKey.type_key(key)},
+          {key, Ferricstore.Store.CompoundKey.hash_field(key, field)}
+        ]
+      end)
+
+    values = Router.batch_get_on_route_keys(ctx, lookups)
+
+    {results, plain_checks} =
+      items
+      |> Enum.zip(Enum.chunk_every(values, 2))
+      |> Enum.with_index()
+      |> Enum.map_reduce([], fn {{{key, _field}, [type, field_value]}, index}, checks ->
+        case type do
+          "hash" ->
+            {{:ok, field_value}, checks}
+
+          nil ->
+            {{:check_plain, index}, [{index, {key, key}} | checks]}
+
+          _other_type ->
+            {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+             checks}
+        end
+      end)
+
+    fill_compact_missing_type_results(ctx, results, plain_checks, nil_value: nil)
+  end
+
+  defp compact_hmget_results(ctx, items) do
+    if Enum.all?(items, fn
+         {_key, [_field]} -> true
+         _other -> false
+       end) do
+      hget_items = Enum.map(items, fn {key, [field]} -> {key, field} end)
+
+      ctx
+      |> compact_hget_results(hget_items)
+      |> Enum.map(fn
+        {:ok, value} -> {:ok, [value]}
+        {:error, _reason} = error -> error
+      end)
+    else
+      Enum.map(items, fn {key, fields} -> compact_hmget_result(ctx, key, fields) end)
+    end
+  end
+
+  defp compact_sismember_results(ctx, items) do
+    lookups =
+      Enum.flat_map(items, fn {key, member} ->
+        [
+          {key, Ferricstore.Store.CompoundKey.type_key(key)},
+          {key, Ferricstore.Store.CompoundKey.set_member(key, member)}
+        ]
+      end)
+
+    values = Router.batch_get_on_route_keys(ctx, lookups)
+
+    {results, plain_checks} =
+      items
+      |> Enum.zip(Enum.chunk_every(values, 2))
+      |> Enum.with_index()
+      |> Enum.map_reduce([], fn {{{key, _member}, [type, member_value]}, index}, checks ->
+        case type do
+          "set" ->
+            {{:ok, member_value != nil}, checks}
+
+          nil ->
+            {{:check_plain, index}, [{index, {key, key}} | checks]}
+
+          _other_type ->
+            {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+             checks}
+        end
+      end)
+
+    fill_compact_missing_type_results(ctx, results, plain_checks, nil_value: false)
+  end
+
+  defp compact_zscore_results(ctx, items) do
+    lookups =
+      Enum.flat_map(items, fn {key, member} ->
+        [
+          {key, Ferricstore.Store.CompoundKey.type_key(key)},
+          {key, Ferricstore.Store.CompoundKey.zset_member(key, member)}
+        ]
+      end)
+
+    values = Router.batch_get_on_route_keys(ctx, lookups)
+
+    {results, plain_checks} =
+      items
+      |> Enum.zip(Enum.chunk_every(values, 2))
+      |> Enum.with_index()
+      |> Enum.map_reduce([], fn {{{key, _member}, [type, score]}, index}, checks ->
+        case type do
+          "zset" ->
+            {{:ok, score}, checks}
+
+          nil ->
+            {{:check_plain, index}, [{index, {key, key}} | checks]}
+
+          _other_type ->
+            {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+             checks}
+        end
+      end)
+
+    fill_compact_missing_type_results(ctx, results, plain_checks, nil_value: nil)
+  end
+
+  defp fill_compact_missing_type_results(_ctx, results, [], _opts), do: results
+
+  defp fill_compact_missing_type_results(ctx, results, plain_checks, opts) do
+    plain_checks = Enum.reverse(plain_checks)
+
+    plain_values =
+      Router.batch_get_on_route_keys(ctx, Enum.map(plain_checks, fn {_index, pair} -> pair end))
+
+    nil_value = Keyword.fetch!(opts, :nil_value)
+    result_tuple = List.to_tuple(results)
+
+    plain_checks
+    |> Enum.zip(plain_values)
+    |> Enum.reduce(result_tuple, fn {{index, _pair}, value}, acc ->
+      result =
+        if value == nil,
+          do: {:ok, nil_value},
+          else: {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
+      put_elem(acc, index, result)
+    end)
+    |> Tuple.to_list()
+  end
+
+  defp execute_compact_data_write_pipeline(mode, items, return_format, state) do
+    ctx = state.instance_ctx
+    {opcode, ops} = compact_data_write_ops(mode, items)
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+
+    results =
+      ctx
+      |> Router.pipeline_write_batch(ops)
+
+    case return_format do
+      :values ->
+        {:ok, compact_pipeline_flow_values(results)}
+
+      _ ->
+        requests = compact_pipeline_requests(opcode, length(ops))
+
+        results =
+          results
+          |> compact_pipeline_flow_pairs(requests)
+
+        {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
+    end
+  end
+
+  defp compact_data_write_ops(22, items) do
+    {@op_hset,
+     Enum.map(items, fn {key, field, value} -> {key, {:hset_single, key, field, value}} end)}
+  end
+
+  defp compact_data_write_ops(23, items) do
+    {@op_lpush, Enum.map(items, fn {key, value} -> {key, {:lpush_single, key, value}} end)}
+  end
+
+  defp compact_data_write_ops(24, items) do
+    {@op_rpush, Enum.map(items, fn {key, value} -> {key, {:rpush_single, key, value}} end)}
+  end
+
+  defp compact_data_write_ops(25, items) do
+    {@op_sadd, Enum.map(items, fn {key, member} -> {key, {:sadd_single, key, member}} end)}
+  end
+
+  defp compact_data_write_ops(26, items) do
+    {@op_zadd,
+     Enum.map(items, fn {key, score, member} ->
+       {key, {:zadd_single, key, score, member}}
+     end)}
+  end
+
+  defp compact_data_write_ops(31, items) do
+    {@op_srem, Enum.map(items, fn {key, member} -> {key, {:srem_single, key, member}} end)}
+  end
+
+  defp compact_data_write_ops(32, items) do
+    {@op_zrem, Enum.map(items, fn {key, member} -> {key, {:zrem_single, key, member}} end)}
+  end
+
+  defp compact_list_push_grouped_results(_ctx, [], _push_fun), do: []
+
+  defp compact_list_push_grouped_results(ctx, items, push_fun) do
+    case compact_list_push_single_key_items(items) do
+      :fallback ->
+        :fallback
+
+      {key, indices, values} ->
+        indices = Enum.reverse(indices)
+        values = Enum.reverse(values)
+
+        push_fun.(ctx, key, values)
+        |> compact_list_push_group_result(indices, length(values))
+        |> compact_list_push_results(length(items))
+    end
+  end
+
+  defp compact_list_push_single_key_items([{key, value} | rest]) do
+    compact_list_push_single_key_items(rest, key, [0], [value], 1)
+  end
+
+  defp compact_list_push_single_key_items([], key, indices, values, _index),
+    do: {key, indices, values}
+
+  defp compact_list_push_single_key_items([{key, value} | rest], key, indices, values, index) do
+    compact_list_push_single_key_items(rest, key, [index | indices], [value | values], index + 1)
+  end
+
+  defp compact_list_push_single_key_items(
+         [{other_key, _value} | _rest],
+         key,
+         _indices,
+         _values,
+         _index
+       )
+       when other_key != key,
+       do: :fallback
+
+  defp compact_list_push_group_result({:ok, final_count}, indices, count)
+       when is_integer(final_count) do
+    base_count = final_count - count
+
+    indices
+    |> Enum.with_index(1)
+    |> Map.new(fn {index, offset} -> {index, {:ok, base_count + offset}} end)
+  end
+
+  defp compact_list_push_group_result(result, indices, _count) do
+    Map.new(indices, fn index -> {index, result} end)
+  end
+
+  defp compact_list_push_results(result_map, count) do
+    Enum.map(0..(count - 1), &Map.fetch!(result_map, &1))
+  end
+
+  defp compact_smembers_result(ctx, key) do
+    case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      nil ->
+        []
+
+      "set" ->
+        prefix = CompoundKey.set_prefix(key)
+
+        ctx
+        |> Router.compound_scan_raw(key, prefix)
+        |> Enum.map(fn {member, _value} -> member end)
+
+      _other_type ->
+        @wrongtype_error
+    end
+  end
+
+  defp compact_hmget_result(ctx, key, [field]) do
+    case FerricStore.Impl.hget(ctx, key, field) do
+      {:ok, value} -> {:ok, [value]}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp compact_hmget_result(ctx, key, fields) do
+    FerricStore.Impl.hmget(ctx, key, fields)
+  end
+
+  defp compact_hgetall_result(ctx, key) do
+    case compact_hgetall_entry_result(ctx, key) do
+      {:ok, entries} -> Map.new(entries)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp compact_hgetall_entry_result(ctx, key) do
+    case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      nil ->
+        {:ok, []}
+
+      "hash" ->
+        prefix = CompoundKey.hash_prefix(key)
+        {:ok, Router.compound_scan_raw(ctx, key, prefix)}
+
+      _other_type ->
+        @wrongtype_error
+    end
+  end
+
+  defp compact_hgetall_entry_values_payload(results) do
+    values =
+      Enum.reduce_while(results, [], fn
+        {:ok, entries}, acc -> {:cont, [entries | acc]}
+        _error, _acc -> {:halt, :error}
+      end)
+
+    case values do
+      :error ->
+        nil
+
+      values ->
+        values
+        |> Enum.reverse()
+        |> FerricstoreServer.Native.Codec.encode_compact_binary_map_entry_list()
+    end
+  end
+
+  defp guarded_collection_map(items, state, mapper) do
+    limit = native_max_collection_response_items(state)
+    guarded_collection_map(items, mapper, limit, 0, [])
+  end
+
+  defp guarded_collection_map([item | rest], mapper, limit, count, acc) do
+    result = mapper.(item)
+    count = count + collection_result_items(result)
+
+    if limit > 0 and count > limit do
+      collection_response_limit_error()
+    else
+      guarded_collection_map(rest, mapper, limit, count, [result | acc])
+    end
+  end
+
+  defp guarded_collection_map([], _mapper, _limit, _count, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp collection_result_items({:ok, value}), do: collection_result_items(value)
+  defp collection_result_items({:error, _reason}), do: 0
+  defp collection_result_items(value) when is_map(value), do: map_size(value)
+  defp collection_result_items(value) when is_list(value), do: length(value)
+  defp collection_result_items(_value), do: 1
+
+  defp native_max_collection_response_items(state) do
+    Map.get(state, :max_collection_response_items) ||
+      native_max_collection_response_items()
+  end
+
+  defp native_max_collection_response_items do
+    Application.get_env(
+      :ferricstore,
+      :native_max_collection_response_items,
+      @default_max_collection_response_items
+    )
+  end
+
+  defp collection_items_exceeds_limit?(count, state) do
+    limit = native_max_collection_response_items(state)
+    limit > 0 and count > limit
+  end
+
+  defp collection_response_limit_reply(state) do
+    {:bad_request, "ERR native collection response item limit exceeded", state}
+  end
+
+  defp collection_response_limit_error,
+    do: {:error, "ERR native collection response item limit exceeded"}
+
+  defp compact_hgetall_entry_result_to_map_result({:ok, entries}), do: Map.new(entries)
+  defp compact_hgetall_entry_result_to_map_result({:error, _reason} = error), do: error
+
+  defp compact_lrange_results(ctx, items, state) do
+    limit = native_max_collection_response_items(state)
+    compact_lrange_results(items, ctx, limit, 0, [])
+  end
+
+  defp compact_lrange_results([{key, start, stop} | rest], ctx, limit, count, acc) do
+    remaining = compact_collection_remaining(limit, count)
+    result = compact_lrange_result(ctx, key, start, stop, remaining)
+
+    case result do
+      :collection_response_limit_exceeded ->
+        collection_response_limit_error()
+
+      result ->
+        count = count + collection_result_items(result)
+
+        if limit > 0 and count > limit do
+          collection_response_limit_error()
+        else
+          compact_lrange_results(rest, ctx, limit, count, [result | acc])
+        end
+    end
+  end
+
+  defp compact_lrange_results([], _ctx, _limit, _count, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp compact_lrange_result(ctx, key, start, stop, remaining) do
+    case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      nil ->
+        []
+
+      "list" ->
+        compact_lrange_list_result(ctx, key, start, stop, remaining)
+
+      _other_type ->
+        @wrongtype_error
+    end
+  end
+
+  defp compact_lrange_list_result(ctx, key, start, stop, remaining) do
+    case compact_lrange_meta(ctx, key) do
+      nil ->
+        []
+
+      {0, _left_pos, _right_pos} ->
+        []
+
+      {len, left_pos, _right_pos} = meta ->
+        if compact_regular_list_meta?(meta) do
+          compact_regular_lrange(ctx, key, len, left_pos, start, stop, remaining)
+        else
+          compact_lrange_fallback(ctx, key, start, stop, remaining)
+        end
+
+      :invalid ->
+        compact_lrange_fallback(ctx, key, start, stop, remaining)
+    end
+  end
+
+  defp compact_lrange_meta(ctx, key) do
+    case Router.compound_get(ctx, key, CompoundKey.list_meta_key(key)) do
+      nil -> nil
+      binary when is_binary(binary) -> decode_compact_lrange_meta(binary)
+      _other -> :invalid
+    end
+  end
+
+  defp decode_compact_lrange_meta(binary) do
+    case :erlang.binary_to_term(binary, [:safe]) do
+      {len, left_pos, right_pos}
+      when is_integer(len) and len >= 0 and is_integer(left_pos) and is_integer(right_pos) ->
+        {len, left_pos, right_pos}
+
+      _other ->
+        :invalid
+    end
+  rescue
+    _ -> :invalid
+  end
+
+  defp compact_regular_list_meta?({len, left_pos, right_pos}) do
+    right_pos - left_pos == (len + 1) * @list_position_step
+  end
+
+  defp compact_regular_lrange(ctx, key, len, left_pos, start, stop, remaining) do
+    {start_idx, stop_idx} = compact_lrange_bounds(start, stop, len)
+
+    cond do
+      start_idx > stop_idx ->
+        []
+
+      start_idx >= len ->
+        []
+
+      true ->
+        stop_idx = min(stop_idx, len - 1)
+
+        if compact_lrange_window_exceeds_remaining?(start_idx, stop_idx, remaining) do
+          :collection_response_limit_exceeded
+        else
+          keys = compact_lrange_element_keys(key, left_pos, start_idx, stop_idx)
+          values = Router.compound_batch_get(ctx, key, keys)
+
+          if Enum.any?(values, &is_nil/1) do
+            compact_lrange_fallback(ctx, key, start, stop, remaining)
+          else
+            values
+          end
+        end
+    end
+  end
+
+  defp compact_lrange_fallback(ctx, key, start, stop, remaining) do
+    with :ok <- compact_lrange_fallback_limit(ctx, key, start, stop, remaining) do
+      FerricStore.Impl.lrange(ctx, key, start, stop)
+    end
+  end
+
+  defp compact_lrange_fallback_limit(_ctx, _key, _start, _stop, :unlimited), do: :ok
+
+  defp compact_lrange_fallback_limit(ctx, key, start, stop, remaining) do
+    if start >= 0 and stop >= 0 and
+         not compact_lrange_window_exceeds_remaining?(start, stop, remaining) do
+      :ok
+    else
+      case FerricStore.Impl.llen(ctx, key) do
+        {:ok, len} when is_integer(len) ->
+          {start_idx, stop_idx} = compact_lrange_bounds(start, stop, len)
+
+          cond do
+            start_idx > stop_idx ->
+              :ok
+
+            start_idx >= len ->
+              :ok
+
+            compact_lrange_window_exceeds_remaining?(start_idx, min(stop_idx, len - 1), remaining) ->
+              :collection_response_limit_exceeded
+
+            true ->
+              :ok
+          end
+
+        _other ->
+          :ok
+      end
+    end
+  end
+
+  defp compact_lrange_window_exceeds_remaining?(_start_idx, _stop_idx, :unlimited), do: false
+
+  defp compact_lrange_window_exceeds_remaining?(start_idx, stop_idx, _remaining)
+       when start_idx > stop_idx,
+       do: false
+
+  defp compact_lrange_window_exceeds_remaining?(start_idx, stop_idx, remaining),
+    do: stop_idx - start_idx + 1 > remaining
+
+  defp compact_lrange_bounds(start, stop, len) do
+    {normalize_compact_lrange_index(start, len), normalize_compact_lrange_index(stop, len)}
+  end
+
+  defp normalize_compact_lrange_index(index, len) when index < 0, do: max(0, len + index)
+  defp normalize_compact_lrange_index(index, _len), do: index
+
+  defp compact_lrange_element_keys(key, left_pos, start_idx, stop_idx) do
+    first_pos = left_pos + @list_position_step + start_idx * @list_position_step
+
+    Enum.map(0..(stop_idx - start_idx), fn offset ->
+      CompoundKey.list_element(key, first_pos + offset * @list_position_step)
+    end)
+  end
+
+  defp compact_zrange_results(ctx, items, state) do
+    routed =
+      Enum.map(items, fn {key, start, stop, with_scores} ->
+        {Router.shard_for(ctx, key), key, start, stop, with_scores}
+      end)
+
+    table_cache = compact_zrange_table_cache(ctx, routed)
+
+    limit = native_max_collection_response_items(state)
+
+    compact_zrange_results(routed, table_cache, ctx, limit, 0, [])
+  end
+
+  defp compact_zrange_results(
+         [{idx, key, start, stop, with_scores} | rest],
+         table_cache,
+         ctx,
+         limit,
+         count,
+         acc
+       ) do
+    remaining = compact_collection_remaining(limit, count)
+
+    result =
+      case Map.get(table_cache, idx, :unavailable) do
+        {index, lookup} ->
+          compact_zrange_index_result(
+            ctx,
+            index,
+            lookup,
+            key,
+            start,
+            stop,
+            with_scores,
+            remaining
+          )
+
+        :unavailable ->
+          compact_zrange_fallback(ctx, key, start, stop, with_scores, remaining)
+      end
+
+    case result do
+      :collection_response_limit_exceeded ->
+        collection_response_limit_error()
+
+      result ->
+        count = count + collection_result_items(result)
+
+        if limit > 0 and count > limit do
+          collection_response_limit_error()
+        else
+          compact_zrange_results(rest, table_cache, ctx, limit, count, [result | acc])
+        end
+    end
+  end
+
+  defp compact_zrange_results([], _table_cache, _ctx, _limit, _count, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp compact_zrange_table_cache(ctx, routed) do
+    Enum.reduce(routed, %{}, fn {idx, _key, _start, _stop, _with_scores}, acc ->
+      if Map.has_key?(acc, idx) do
+        acc
+      else
+        Map.put(acc, idx, compact_zrange_tables(ctx, idx))
+      end
+    end)
+  end
+
+  defp compact_zrange_tables(ctx, idx) do
+    {index, lookup} = ZSetIndex.table_names(ctx.name, idx)
+
+    if :ets.info(index) != :undefined and :ets.info(lookup) != :undefined do
+      {index, lookup}
+    else
+      :unavailable
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  defp compact_zrange_index_result(ctx, index, lookup, key, start, stop, with_scores, remaining) do
+    if ZSetIndex.ready?(lookup, key) do
+      compact_zrange_ready_index_result(index, lookup, key, start, stop, with_scores, remaining)
+    else
+      compact_zrange_not_ready_result(ctx, key, start, stop, with_scores, remaining)
+    end
+  end
+
+  defp compact_zrange_ready_index_result(index, lookup, key, start, stop, with_scores, remaining)
+       when start >= 0 and stop >= 0 do
+    if compact_zrange_window_exceeds_remaining?(start, stop, remaining) do
+      count = ZSetIndex.count(index, lookup, key, :neg_inf, :inf)
+      {start_idx, stop_idx} = compact_zrange_bounds(start, stop, count)
+
+      if compact_zrange_window_exceeds_remaining?(start_idx, stop_idx, remaining) do
+        :collection_response_limit_exceeded
+      else
+        compact_zrange_rank_result(index, key, start_idx, stop_idx, with_scores)
+      end
+    else
+      compact_zrange_rank_result(index, key, start, stop, with_scores)
+    end
+  end
+
+  defp compact_zrange_ready_index_result(index, lookup, key, start, stop, with_scores, remaining) do
+    count = ZSetIndex.count(index, lookup, key, :neg_inf, :inf)
+    {start_idx, stop_idx} = compact_zrange_bounds(start, stop, count)
+
+    cond do
+      start_idx > stop_idx ->
+        {:ok, []}
+
+      compact_zrange_window_exceeds_remaining?(start_idx, stop_idx, remaining) ->
+        :collection_response_limit_exceeded
+
+      true ->
+        compact_zrange_rank_result(index, key, start_idx, stop_idx, with_scores)
+    end
+  end
+
+  defp compact_collection_remaining(limit, _count) when limit <= 0, do: :unlimited
+  defp compact_collection_remaining(limit, count), do: max(limit - count, 0)
+
+  defp compact_zrange_window_exceeds_remaining?(_start_idx, _stop_idx, :unlimited), do: false
+
+  defp compact_zrange_window_exceeds_remaining?(start_idx, stop_idx, _remaining)
+       when start_idx > stop_idx,
+       do: false
+
+  defp compact_zrange_window_exceeds_remaining?(start_idx, stop_idx, remaining),
+    do: stop_idx - start_idx + 1 > remaining
+
+  defp compact_zrange_rank_result(index, key, start_idx, stop_idx, with_scores) do
+    if start_idx > stop_idx do
+      {:ok, []}
+    else
+      index
+      |> ZSetIndex.rank_range(key, start_idx, stop_idx, false)
+      |> maybe_strip_zrange_scores(with_scores)
+      |> then(&{:ok, &1})
+    end
+  end
+
+  defp compact_zrange_not_ready_result(ctx, key, start, stop, with_scores, remaining) do
+    case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      nil ->
+        case Router.batch_get(ctx, [key]) do
+          [nil] -> {:ok, []}
+          [_value] -> @wrongtype_error
+        end
+
+      "zset" ->
+        compact_zrange_fallback(ctx, key, start, stop, with_scores, remaining)
+
+      _other_type ->
+        @wrongtype_error
+    end
+  end
+
+  defp compact_zrange_bounds(start, _stop, count) when count <= 0 do
+    {normalize_compact_zrange_index(start, count), -1}
+  end
+
+  defp compact_zrange_bounds(start, stop, count) do
+    start_idx = normalize_compact_zrange_index(start, count)
+    stop_idx = normalize_compact_zrange_index(stop, count)
+
+    cond do
+      start_idx >= count -> {1, 0}
+      true -> {start_idx, min(stop_idx, count - 1)}
+    end
+  end
+
+  defp normalize_compact_zrange_index(index, count) when index < 0, do: max(0, count + index)
+  defp normalize_compact_zrange_index(index, _count), do: index
+
+  defp compact_zrange_fallback(ctx, key, start, stop, with_scores, remaining) do
+    with :ok <- compact_zrange_fallback_limit(ctx, key, start, stop, remaining) do
+      opts = if with_scores, do: [withscores: true], else: []
+      FerricStore.Impl.zrange(ctx, key, start, stop, opts)
+    end
+  end
+
+  defp compact_zrange_fallback_limit(_ctx, _key, _start, _stop, :unlimited), do: :ok
+
+  defp compact_zrange_fallback_limit(ctx, key, start, stop, remaining) do
+    if start >= 0 and stop >= 0 and
+         not compact_zrange_window_exceeds_remaining?(start, stop, remaining) do
+      :ok
+    else
+      case FerricStore.Impl.zcard(ctx, key) do
+        {:ok, count} when is_integer(count) ->
+          {start_idx, stop_idx} = compact_zrange_bounds(start, stop, count)
+
+          if compact_zrange_window_exceeds_remaining?(start_idx, stop_idx, remaining) do
+            :collection_response_limit_exceeded
+          else
+            :ok
+          end
+
+        _other ->
+          :ok
+      end
+    end
+  end
+
+  defp maybe_strip_zrange_scores(members, true), do: members
+
+  defp maybe_strip_zrange_scores(members, false),
+    do: Enum.map(members, fn {member, _score} -> member end)
+
+  defp flow_get_read_ops(17, ops) do
+    Enum.map(ops, fn {:flow_get, id, opts} ->
+      {:flow_get, id, Keyword.delete(opts, :return)}
+    end)
+  end
+
+  defp flow_get_read_ops(_mode, ops), do: ops
+
+  defp compact_flow_get_results(ctx, mode, ops) do
+    started = FlowTelemetry.start_time()
+    read_ops = flow_get_read_ops(mode, ops)
+
+    if compact_flow_get_valid_ops?(read_ops) do
+      results =
+        case read_ops do
+          [] ->
+            []
+
+          [{:flow_get, _id, opts} | rest] ->
+            partition_key = Keyword.get(opts, :partition_key)
+
+            if compact_flow_get_same_partition?(rest, partition_key) do
+              compact_flow_get_same_partition_results(ctx, read_ops, partition_key, mode)
+            else
+              compact_flow_get_partitioned_results(ctx, read_ops, mode)
+            end
+        end
+
+      FlowTelemetry.observe_pipeline_read_batch(started, read_ops)
+      results
+    else
+      Ferricstore.Flow.pipeline_read_batch(ctx, read_ops)
+    end
+  end
+
+  defp compact_flow_get_valid_ops?(ops), do: Enum.all?(ops, &compact_flow_get_valid_op?/1)
+
+  defp compact_flow_get_valid_op?({:flow_get, id, opts}) when is_binary(id) and id != "" do
+    partition_key = Keyword.get(opts, :partition_key)
+    max_key_size = Router.max_key_size()
+
+    cond do
+      is_binary(partition_key) and partition_key == "" ->
+        false
+
+      byte_size(id) + 53 <= max_key_size ->
+        true
+
+      true ->
+        byte_size(FlowKeys.state_key(id, partition_key)) <= max_key_size
+    end
+  end
+
+  defp compact_flow_get_valid_op?(_op), do: false
+
+  defp compact_flow_get_same_partition?([], _partition_key), do: true
+
+  defp compact_flow_get_same_partition?([{:flow_get, _id, opts} | rest], partition_key),
+    do:
+      Keyword.get(opts, :partition_key) == partition_key and
+        compact_flow_get_same_partition?(rest, partition_key)
+
+  defp compact_flow_get_same_partition?(_ops, _partition_key), do: false
+
+  defp compact_flow_get_same_partition_results(ctx, ops, partition_key, mode) do
+    ids = Enum.map(ops, fn {:flow_get, id, _opts} -> id end)
+
+    ctx
+    |> Router.flow_batch_get(ids, partition_key)
+    |> Enum.map(&compact_flow_get_decode(&1, mode))
+  end
+
+  defp compact_flow_get_partitioned_results(ctx, ops, mode) do
+    indexed_pairs =
+      ops
+      |> Enum.with_index()
+      |> Enum.group_by(fn {{:flow_get, _id, opts}, _idx} -> Keyword.get(opts, :partition_key) end)
+      |> Enum.flat_map(fn {partition_key, group} ->
+        ids = Enum.map(group, fn {{:flow_get, id, _opts}, _idx} -> id end)
+        values = Router.flow_batch_get(ctx, ids, partition_key)
+
+        group
+        |> Enum.zip(values)
+        |> Enum.map(fn {{{:flow_get, _id, _opts}, idx}, value} ->
+          {idx, compact_flow_get_decode(value, mode)}
+        end)
+      end)
+      |> Map.new()
+
+    for idx <- 0..(length(ops) - 1), do: Map.fetch!(indexed_pairs, idx)
+  end
+
+  defp compact_flow_get_decode(nil), do: {:ok, nil}
+
+  defp compact_flow_get_decode(value) when is_binary(value) do
+    {:ok, FlowCodec.decode_record(value)}
+  rescue
+    _ -> {:ok, nil}
+  end
+
+  defp compact_flow_get_decode({:error, _reason} = error), do: error
+  defp compact_flow_get_decode(_value), do: {:ok, nil}
+
+  defp compact_flow_get_decode(value, 17) when is_binary(value) do
+    {:ok, FlowCodec.decode_record_meta(value)}
+  rescue
+    _ -> {:ok, nil}
+  end
+
+  defp compact_flow_get_decode(value, _mode), do: compact_flow_get_decode(value)
+
+  defp maybe_compact_flow_get_meta_results(results, 17), do: results
+
+  defp maybe_compact_flow_get_meta_results(results, _mode), do: results
+
+  defp compact_pipeline_flow_pairs(results, requests) do
+    results
+    |> pipeline_flow_results(requests)
+    |> format_pipeline_results(:pairs)
+  end
+
+  defp compact_pipeline_flow_values(results) do
+    case compact_pipeline_flow_ok_values(results, []) do
+      {:ok, values} ->
+        compact_pipeline_values_payload(values)
+
+      :error ->
+        results
+        |> compact_pipeline_result_pairs()
+        |> format_compact_pipeline_pairs(@op_pipeline, :compact)
+    end
+  end
+
+  defp compact_pipeline_flow_ok_values([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp compact_pipeline_flow_ok_values([result | rest], acc) do
+    case pipeline_flow_result(result) do
+      {:ok, value} -> compact_pipeline_flow_ok_values(rest, [value | acc])
+      _status_value -> :error
+    end
+  end
+
+  defp compact_pipeline_requests(_opcode, 0), do: []
+
+  defp compact_pipeline_requests(opcode, count) do
+    Enum.map(1..count, fn request_id -> {opcode, request_id, 1} end)
+  end
+
+  defp compact_mixed_collect([], get_keys, set_pairs), do: {get_keys, set_pairs}
+
+  defp compact_mixed_collect([{:set, key, value} | rest], get_keys, set_pairs),
+    do: compact_mixed_collect(rest, get_keys, [{key, value} | set_pairs])
+
+  defp compact_mixed_collect([{:get, key} | rest], get_keys, set_pairs),
+    do: compact_mixed_collect(rest, [key | get_keys], set_pairs)
+
+  defp compact_mixed_pairs([], [], [], acc), do: Enum.reverse(acc)
+
+  defp compact_mixed_pairs(
+         [{:set, _key, _value} | rest],
+         get_values,
+         [set_pair | set_pairs],
+         acc
+       ),
+       do: compact_mixed_pairs(rest, get_values, set_pairs, [set_pair | acc])
+
+  defp compact_mixed_pairs([{:get, _key} | rest], [value | get_values], set_pairs, acc),
+    do: compact_mixed_pairs(rest, get_values, set_pairs, [["ok", value] | acc])
+
+  defp pipeline_data_writes(commands) do
+    case pipeline_hash_hsets(commands, [], []) do
+      {:ok, _requests, _ops} = ok -> ok
+      :fallback -> pipeline_list_lpushes_or_set_writes(commands)
+    end
+  end
+
+  defp pipeline_list_lpushes_or_set_writes(commands) do
+    case pipeline_list_pushes(commands, [], []) do
+      {:ok, _requests, _ops} = ok -> ok
+      :fallback -> pipeline_list_pops_or_set_writes(commands)
+    end
+  end
+
+  defp pipeline_list_pops_or_set_writes(commands) do
+    case pipeline_list_pops(commands, [], []) do
+      {:ok, _requests, _ops} = ok -> ok
+      :fallback -> pipeline_set_sadds_or_zset_zadds(commands)
+    end
+  end
+
+  defp pipeline_set_sadds_or_zset_zadds(commands) do
+    case pipeline_set_sadds(commands, [], []) do
+      {:ok, _requests, _ops} = ok -> ok
+      :fallback -> pipeline_set_srems_or_zset_writes(commands)
+    end
+  end
+
+  defp pipeline_set_srems_or_zset_writes(commands) do
+    case pipeline_set_srems(commands, [], []) do
+      {:ok, _requests, _ops} = ok -> ok
+      :fallback -> pipeline_zset_zadds_or_rems(commands)
+    end
+  end
+
+  defp pipeline_zset_zadds_or_rems(commands) do
+    case pipeline_zset_zadds(commands, [], []) do
+      {:ok, _requests, _ops} = ok -> ok
+      :fallback -> pipeline_zset_zrems(commands, [], [])
+    end
+  end
+
+  defp pipeline_hash_hsets([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_hash_hsets(
+         [
+           %{opcode: @op_hset, body: %{"key" => key, "fields" => fields}} = command
+           | rest
+         ],
+         requests,
+         ops
+       )
+       when is_binary(key) and is_map(fields) and map_size(fields) == 1 do
+    [{field, value}] = Map.to_list(fields)
+
+    if is_binary(field) and is_binary(value) do
+      pipeline_hash_hsets(
+        rest,
+        [pipeline_request(command) | requests],
+        [{key, {:hset_single, key, field, value}} | ops]
+      )
+    else
+      :fallback
+    end
+  end
+
+  defp pipeline_hash_hsets(_commands, _requests, _ops), do: :fallback
+
+  defp pipeline_list_pushes([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_list_pushes(
+         [
+           %{opcode: opcode, body: %{"key" => key, "values" => [value]}} = command
+           | rest
+         ],
+         requests,
+         ops
+       )
+       when opcode in [@op_lpush, @op_rpush] and is_binary(key) and is_binary(value) do
+    op = if opcode == @op_lpush, do: :lpush_single, else: :rpush_single
+
+    pipeline_list_pushes(
+      rest,
+      [pipeline_request(command) | requests],
+      [{key, {op, key, value}} | ops]
+    )
+  end
+
+  defp pipeline_list_pushes(_commands, _requests, _ops), do: :fallback
+
+  defp pipeline_list_pops([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_list_pops(
+         [
+           %{opcode: opcode, body: %{"key" => key} = body} = command
+           | rest
+         ],
+         requests,
+         ops
+       )
+       when opcode in [@op_lpop, @op_rpop] and is_binary(key) do
+    if list_pop_pipeline_body?(body) do
+      op = if opcode == @op_lpop, do: :lpop, else: :rpop
+
+      pipeline_list_pops(
+        rest,
+        [pipeline_request(command) | requests],
+        [{key, {:list_op, key, {op, 1}}} | ops]
+      )
+    else
+      :fallback
+    end
+  end
+
+  defp pipeline_list_pops(_commands, _requests, _ops), do: :fallback
+
+  defp list_pop_pipeline_body?(%{"count" => 1} = body), do: map_size(body) == 2
+  defp list_pop_pipeline_body?(body), do: map_size(body) == 1
+
+  defp pipeline_set_sadds([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_set_sadds(
+         [
+           %{opcode: @op_sadd, body: %{"key" => key, "members" => [member]}} = command
+           | rest
+         ],
+         requests,
+         ops
+       )
+       when is_binary(key) and is_binary(member) do
+    pipeline_set_sadds(
+      rest,
+      [pipeline_request(command) | requests],
+      [{key, {:sadd_single, key, member}} | ops]
+    )
+  end
+
+  defp pipeline_set_sadds(_commands, _requests, _ops), do: :fallback
+
+  defp pipeline_set_srems([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_set_srems(
+         [
+           %{opcode: @op_srem, body: %{"key" => key, "members" => [member]}} = command
+           | rest
+         ],
+         requests,
+         ops
+       )
+       when is_binary(key) and is_binary(member) do
+    pipeline_set_srems(
+      rest,
+      [pipeline_request(command) | requests],
+      [{key, {:srem_single, key, member}} | ops]
+    )
+  end
+
+  defp pipeline_set_srems(_commands, _requests, _ops), do: :fallback
+
+  defp pipeline_zset_zadds([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_zset_zadds(
+         [
+           %{opcode: @op_zadd, body: %{"key" => key, "items" => [[score, member]]}} = command
+           | rest
+         ],
+         requests,
+         ops
+       )
+       when is_binary(key) and is_number(score) and is_binary(member) do
+    pipeline_zset_zadds(
+      rest,
+      [pipeline_request(command) | requests],
+      [{key, {:zadd_single, key, score * 1.0, member}} | ops]
+    )
+  end
+
+  defp pipeline_zset_zadds(_commands, _requests, _ops), do: :fallback
+
+  defp pipeline_zset_zrems([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_zset_zrems(
+         [
+           %{opcode: @op_zrem, body: %{"key" => key, "members" => [member]}} = command
+           | rest
+         ],
+         requests,
+         ops
+       )
+       when is_binary(key) and is_binary(member) do
+    pipeline_zset_zrems(
+      rest,
+      [pipeline_request(command) | requests],
+      [{key, {:zrem_single, key, member}} | ops]
+    )
+  end
+
+  defp pipeline_zset_zrems(_commands, _requests, _ops), do: :fallback
+
+  defp pipeline_plain_sets([], requests, kv_pairs),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(kv_pairs)}
+
+  defp pipeline_plain_sets(
+         [%{opcode: @op_set, body: %{"key" => key, "value" => value} = body} = command | rest],
+         requests,
+         kv_pairs
+       )
+       when is_binary(key) and is_binary(value) do
+    if map_size(body) == 2 do
+      pipeline_plain_sets(rest, [pipeline_request(command) | requests], [{key, value} | kv_pairs])
+    else
+      :fallback
+    end
+  end
+
+  defp pipeline_plain_sets(_commands, _requests, _kv_pairs), do: :fallback
+
+  defp pipeline_plain_gets([], requests, keys),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(keys)}
+
+  defp pipeline_plain_gets(
+         [%{opcode: opcode, body: %{"key" => key} = body} = command | rest],
+         requests,
+         keys
+       )
+       when opcode == @op_get and is_binary(key) do
+    if map_size(body) == 1 do
+      pipeline_plain_gets(rest, [pipeline_request(command) | requests], [key | keys])
+    else
+      :fallback
+    end
+  end
+
+  defp pipeline_plain_gets(_commands, _requests, _keys), do: :fallback
+
+  defp pipeline_request(command) do
+    {command.opcode, command.request_id, command.lane_id}
+  end
+
+  defp pipeline_flow_writes([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_flow_writes([command | rest], requests, ops) do
+    case pipeline_flow_write_op(command) do
+      {:ok, op} -> pipeline_flow_writes(rest, [pipeline_request(command) | requests], [op | ops])
+      :fallback -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_create, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, opts} <- flow_opts(body, ["id"]) do
+      {:ok, {:flow_create, id, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_start_and_claim, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, type} <- require_binary(body, "type"),
+         {:ok, initial_state} <- require_binary(body, "initial_state"),
+         {:ok, opts} <- flow_opts(body, ["id", "type", "initial_state"]) do
+      {:ok, {:flow_start_and_claim, id, type, initial_state, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_transition, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, from_state} <- require_binary(body, "from_state"),
+         {:ok, to_state} <- require_binary(body, "to_state"),
+         {:ok, opts} <- flow_opts(body, ["id", "from_state", "to_state"]) do
+      {:ok, {:flow_transition, id, from_state, to_state, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_step_continue, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, lease_token} <- require_binary(body, "lease_token"),
+         {:ok, from_state} <- require_binary(body, "from_state"),
+         {:ok, to_state} <- require_binary(body, "to_state"),
+         {:ok, opts} <- flow_opts(body, ["id", "lease_token", "from_state", "to_state"]) do
+      {:ok, {:flow_step_continue, id, lease_token, from_state, to_state, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_value_put, body: body}) do
+    with {:ok, value} <- require_any(body, "value"),
+         true <- is_binary(Map.get(body, "owner_flow_id")) and is_binary(Map.get(body, "name")),
+         {:ok, opts} <- flow_opts(body, ["value"]) do
+      {:ok, {:flow_named_value_put, value, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_signal, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, opts} <- flow_opts(body, ["id"]) do
+      {:ok, {:flow_signal, id, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_complete, body: body}) do
+    pipeline_flow_lease_op(:flow_complete, body)
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_retry, body: body}) do
+    pipeline_flow_lease_op(:flow_retry, body)
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_fail, body: body}) do
+    pipeline_flow_lease_op(:flow_fail, body)
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_cancel, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, opts} <- flow_opts(body, ["id"]) do
+      {:ok, {:flow_cancel, id, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(%{opcode: @op_flow_rewind, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, opts} <- flow_opts(body, ["id"]) do
+      {:ok, {:flow_rewind, id, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_write_op(_command), do: :fallback
+
+  defp pipeline_flow_reads([], requests, ops),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(ops)}
+
+  defp pipeline_flow_reads([command | rest], requests, ops) do
+    case pipeline_flow_read_op(command) do
+      {:ok, op} -> pipeline_flow_reads(rest, [pipeline_request(command) | requests], [op | ops])
+      :fallback -> :fallback
+    end
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_get, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, opts} <- flow_opts(body, ["id"]) do
+      {:ok, {:flow_get, id, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_history, body: body}) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, opts} <- flow_opts(body, ["id"]) do
+      {:ok, {:flow_history, id, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_list, body: body}) do
+    pipeline_flow_type_read_op(:flow_list, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_terminals, body: body}) do
+    pipeline_flow_type_read_op(:flow_terminals, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_failures, body: body}) do
+    pipeline_flow_type_read_op(:flow_failures, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_info, body: body}) do
+    pipeline_flow_type_read_op(:flow_info, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_stuck, body: body}) do
+    pipeline_flow_type_read_op(:flow_stuck, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_by_parent, body: body}) do
+    pipeline_flow_id_index_read_op(:flow_by_parent, "parent_id", body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_by_root, body: body}) do
+    pipeline_flow_id_index_read_op(:flow_by_root, "root_id", body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_by_correlation, body: body}) do
+    pipeline_flow_id_index_read_op(:flow_by_correlation, "correlation_id", body)
+  end
+
+  defp pipeline_flow_read_op(_command), do: :fallback
+
+  defp pipeline_flow_type_read_op(op, body) do
+    with {:ok, type} <- require_binary(body, "type"),
+         {:ok, opts} <- flow_opts(body, ["type"]) do
+      {:ok, {op, type, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_id_index_read_op(op, id_key, body) do
+    with {:ok, id} <- require_binary(body, id_key),
+         {:ok, opts} <- flow_opts(body, [id_key]) do
+      {:ok, {op, id, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_create_many([], requests, items, opts) when is_list(opts),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(items), opts}
+
+  defp pipeline_flow_create_many(
+         [%{opcode: @op_flow_create, body: body} = command | rest],
+         requests,
+         items,
+         base_opts
+       ) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, opts} <- flow_opts(body, ["id", "payload", "partition_key"]),
+         true <- is_nil(base_opts) or opts == base_opts do
+      item =
+        %{"id" => id}
+        |> maybe_put_flow_create_item_value("payload", Map.get(body, "payload"))
+        |> maybe_put_flow_create_item_value("partition_key", Map.get(body, "partition_key"))
+
+      pipeline_flow_create_many(
+        rest,
+        [pipeline_request(command) | requests],
+        [item | items],
+        opts
+      )
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_create_many(_commands, _requests, _items, _opts), do: :fallback
+
+  defp maybe_put_flow_create_item_value(item, _key, nil), do: item
+  defp maybe_put_flow_create_item_value(item, key, value), do: Map.put(item, key, value)
+
+  defp pipeline_flow_shared_value_puts([], requests, items),
+    do: {:ok, Enum.reverse(requests), Enum.reverse(items)}
+
+  defp pipeline_flow_shared_value_puts(
+         [%{opcode: @op_flow_value_put, body: body} = command | rest],
+         requests,
+         items
+       ) do
+    with {:ok, value} <- require_any(body, "value"),
+         true <- is_nil(Map.get(body, "name")),
+         {:ok, opts} <- flow_opts(body, ["value"]) do
+      pipeline_flow_shared_value_puts(
+        rest,
+        [pipeline_request(command) | requests],
+        [{value, opts} | items]
+      )
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_flow_shared_value_puts(_commands, _requests, _items), do: :fallback
+
+  defp pipeline_flow_lease_op(op, body) do
+    with {:ok, id} <- require_binary(body, "id"),
+         {:ok, lease_token} <- require_binary(body, "lease_token"),
+         {:ok, opts} <- flow_opts(body, ["id", "lease_token"]) do
+      {:ok, {op, id, lease_token, opts}}
+    else
+      _error -> :fallback
+    end
+  end
+
+  defp pipeline_set_results(results, requests) do
+    requests
+    |> Enum.zip(results)
+    |> Enum.map(fn {{opcode, request_id, lane_id}, result} ->
+      {status, value} = pipeline_set_result(result)
+      pipeline_result(opcode, request_id, lane_id, status, value)
+    end)
+  end
+
+  defp pipeline_get_results(values, requests) do
+    requests
+    |> Enum.zip(values)
+    |> Enum.map(fn {{opcode, request_id, lane_id}, value} ->
+      pipeline_result(opcode, request_id, lane_id, :ok, value)
+    end)
+  end
+
+  defp pipeline_flow_results(results, requests) do
+    requests
+    |> Enum.zip(results)
+    |> Enum.map(fn {{opcode, request_id, lane_id}, result} ->
+      {status, value} = pipeline_flow_result(result)
+      pipeline_result(opcode, request_id, lane_id, status, value)
+    end)
+  end
+
+  defp pipeline_create_many_results(:ok, requests), do: pipeline_ok_results(requests)
+  defp pipeline_create_many_results({:ok, :ok}, requests), do: pipeline_ok_results(requests)
+
+  defp pipeline_create_many_results({:ok, results}, requests) when is_list(results),
+    do: pipeline_flow_results(results, requests)
+
+  defp pipeline_create_many_results({:error, _reason} = error, requests),
+    do: pipeline_flow_results(List.duplicate(error, length(requests)), requests)
+
+  defp pipeline_create_many_results(result, requests),
+    do: pipeline_flow_results(List.duplicate(result, length(requests)), requests)
+
+  defp pipeline_ok_results(requests) do
+    Enum.map(requests, fn {opcode, request_id, lane_id} ->
+      pipeline_result(opcode, request_id, lane_id, :ok, "OK")
+    end)
+  end
+
+  defp pipeline_set_result(:ok), do: {:ok, "OK"}
+  defp pipeline_set_result({:ok, :ok}), do: {:ok, "OK"}
+  defp pipeline_set_result({:ok, value}), do: {:ok, value}
+
+  defp pipeline_set_result({:error, reason}) when is_binary(reason) do
+    status =
+      cond do
+        String.starts_with?(reason, "BUSY") -> :busy
+        String.starts_with?(reason, "OOM") -> :busy
+        true -> :error
+      end
+
+    {status, reason}
+  end
+
+  defp pipeline_set_result({:error, reason}), do: {:error, inspect(reason)}
+  defp pipeline_set_result(value), do: {:ok, value}
+
+  defp pipeline_flow_result(:ok), do: {:ok, "OK"}
+  defp pipeline_flow_result({:ok, :ok}), do: {:ok, "OK"}
+  defp pipeline_flow_result({:ok, value}), do: {:ok, value}
+
+  defp pipeline_flow_result({:error, reason}) when is_binary(reason) do
+    status =
+      cond do
+        String.starts_with?(reason, "BUSY") -> :busy
+        String.starts_with?(reason, "OOM") -> :busy
+        true -> :error
+      end
+
+    {status, reason}
+  end
+
+  defp pipeline_flow_result({:error, reason}), do: {:error, inspect(reason)}
+  defp pipeline_flow_result(value), do: {:ok, value}
+
+  defp compact_pipeline_result_pairs(results) do
+    Enum.map(results, fn result ->
+      {status, value} = pipeline_flow_result(result)
+      [Atom.to_string(status), value]
+    end)
+  end
+
+  defp format_compact_pipeline_results(results, _opcode, :values),
+    do: compact_pipeline_flow_values(results)
+
+  defp format_compact_pipeline_results(results, opcode, return_format) do
+    results
+    |> compact_pipeline_result_pairs()
+    |> format_compact_pipeline_pairs(opcode, return_format)
+  end
+
+  defp pipeline_set_result_pair(result) do
+    {status, value} = pipeline_set_result(result)
+    [Atom.to_string(status), value]
+  end
+
+  defp format_compact_set_results(results, :values) do
+    case compact_ok_result_count(results, 0) do
+      {:ok, count} ->
+        FerricstoreServer.Native.Codec.encode_compact_ok_count(count)
+
+      :error ->
+        results
+        |> Enum.map(&pipeline_set_result_pair/1)
+        |> format_compact_pipeline_pairs(@op_set, :compact)
+    end
+  end
+
+  defp format_compact_set_results(results, return_format) do
+    results
+    |> Enum.map(&pipeline_set_result_pair/1)
+    |> format_compact_pipeline_pairs(@op_set, return_format)
+  end
+
+  defp compact_ok_result_count([], count), do: {:ok, count}
+  defp compact_ok_result_count([:ok | rest], count), do: compact_ok_result_count(rest, count + 1)
+
+  defp compact_ok_result_count([{:ok, :ok} | rest], count),
+    do: compact_ok_result_count(rest, count + 1)
+
+  defp compact_ok_result_count([{:ok, "OK"} | rest], count),
+    do: compact_ok_result_count(rest, count + 1)
+
+  defp compact_ok_result_count([{:ok, "ok"} | rest], count),
+    do: compact_ok_result_count(rest, count + 1)
+
+  defp compact_ok_result_count(_results, _count), do: :error
+
+  defp compact_pipeline_get_result(values, :values), do: values
+  defp compact_pipeline_get_result(values, _return_format), do: Enum.map(values, &["ok", &1])
+
+  defp format_compact_pipeline_get_result(values, _opcode, :values) do
+    case FerricstoreServer.Native.Codec.encode_compact_kv_mget(values) do
+      payload when is_binary(payload) ->
+        payload
+
+      nil ->
+        format_compact_pipeline_pairs(Enum.map(values, &["ok", &1]), @op_get, :compact)
+    end
+  end
+
+  defp format_compact_pipeline_get_result(pairs, opcode, return_format),
+    do: format_compact_pipeline_pairs(pairs, opcode, return_format)
+
+  defp format_compact_pipeline_pairs(pairs, _opcode, :pairs), do: pairs
+
+  defp format_compact_pipeline_pairs(pairs, _opcode, :values) do
+    case compact_pipeline_ok_values(pairs, []) do
+      {:ok, values} -> compact_pipeline_values_payload(values)
+      :error -> format_compact_pipeline_pairs(pairs, @op_set, :compact)
+    end
+  end
+
+  defp format_compact_pipeline_pairs(pairs, opcode, :maps) do
+    pairs
+    |> Enum.with_index(1)
+    |> Enum.map(fn {[status, value], request_id} ->
+      %{
+        "opcode" => opcode,
+        "request_id" => request_id,
+        "lane_id" => 1,
+        "status" => status,
+        "value" => value
+      }
+    end)
+  end
+
+  defp format_compact_pipeline_pairs(pairs, _opcode, :compact) do
+    case FerricstoreServer.Native.Codec.encode_compact_pipeline_response(pairs) do
+      payload when is_binary(payload) -> payload
+      nil -> pairs
+    end
+  end
+
+  defp compact_pipeline_ok_values([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp compact_pipeline_ok_values([["ok", value] | rest], acc),
+    do: compact_pipeline_ok_values(rest, [value | acc])
+
+  defp compact_pipeline_ok_values(_pairs, _acc), do: :error
+
+  defp compact_pipeline_values_payload(values) do
+    cond do
+      Enum.all?(values, fn value -> value in ["OK", "ok", :ok] end) ->
+        FerricstoreServer.Native.Codec.encode_compact_ok_list(values)
+
+      payload = FerricstoreServer.Native.Codec.encode_compact_kv_mget(values) ->
+        payload
+
+      payload = FerricstoreServer.Native.Codec.encode_compact_integer_list(values) ->
+        payload
+
+      payload = FerricstoreServer.Native.Codec.encode_compact_flow_claim_jobs(values) ->
+        payload
+
+      payload = FerricstoreServer.Native.Codec.encode_compact_binary_list_list(values) ->
+        payload
+
+      payload = FerricstoreServer.Native.Codec.encode_compact_binary_map_list(values) ->
+        payload
+
+      payload = FerricstoreServer.Native.Codec.encode_compact_flow_record_list(values) ->
+        payload
+
+      true ->
+        values
+    end
+  end
+
+  defp pipeline_result(opcode, request_id, lane_id, status, value) do
+    %{
+      "opcode" => opcode,
+      "request_id" => request_id,
+      "lane_id" => lane_id,
       "status" => Atom.to_string(status),
       "value" => value
     }
+  end
+
+  defp execute_pipeline_command(command, state) do
+    {status, value, state} = execute(command.opcode, command.body, state)
+
+    result = pipeline_result(command.opcode, command.request_id, command.lane_id, status, value)
 
     {result, state}
   end
 
   defp flow_opts(payload, drop_keys) do
-    opts =
-      payload
-      |> Map.drop(["opts", "deadline_ms" | drop_keys])
-      |> Map.merge(option_map(Map.get(payload, "opts", %{})))
+    case Map.get(payload, :__wire_flow_opts__) do
+      opts when is_list(opts) ->
+        {:ok, opts}
 
-    to_flow_opts(opts)
+      _other ->
+        opts =
+          payload
+          |> Map.drop([
+            "opts",
+            "deadline_ms",
+            :__wire_flow_items_normalized__,
+            :__wire_flow_opts__ | drop_keys
+          ])
+          |> Map.merge(option_map(Map.get(payload, "opts", %{})))
+
+        to_flow_opts(opts)
+    end
   end
 
   defp flow_items(payload, key, item_kind) do
-    case Map.get(payload, key) do
-      items when is_list(items) ->
+    case {Map.get(payload, :__wire_flow_items_normalized__), Map.get(payload, key)} do
+      {true, items} when is_list(items) ->
+        {:ok, items}
+
+      {_normalized, items} when is_list(items) ->
         items
         |> Enum.reduce_while({:ok, []}, fn
           item, {:ok, acc} ->
@@ -1909,7 +5509,7 @@ defmodule FerricstoreServer.Native.Commands do
           {:error, reason} -> {:error, reason}
         end
 
-      _ ->
+      _other ->
         {:error, "ERR native field #{key} must be a list"}
     end
   end
@@ -1920,7 +5520,7 @@ defmodule FerricstoreServer.Native.Commands do
     do: {:ok, {:id, id, :payload, payload}}
 
   defp flow_item([id, partition_key, payload], :create) when is_binary(id),
-    do: {:ok, {:id, id, :partition_key, partition_key, :payload, payload}}
+    do: {:ok, %{"id" => id, "partition_key" => partition_key, "payload" => payload}}
 
   defp flow_item([id, lease_token, fencing_token], :claimed) when is_binary(id) do
     {:ok, %{"id" => id, "lease_token" => lease_token, "fencing_token" => fencing_token}}
@@ -2001,7 +5601,10 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp coerce_option_value(key, value)
        when key in [:wait, :backoff] and is_binary(value),
-       do: Map.get(@atom_values, value, value)
+       do: Map.get(@atom_values, String.downcase(value), value)
+
+  defp coerce_option_value(:return, value) when is_binary(value),
+    do: Map.get(@atom_values, String.downcase(value), value)
 
   defp coerce_option_value(_key, value), do: value
 

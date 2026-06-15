@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
       alias Ferricstore.{CommandTime, Flow, HLC}
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector

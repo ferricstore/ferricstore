@@ -41,7 +41,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
   test "state-machine command stores expose plain batch reads" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    # MGET, JSON.MGET, PFCOUNT, PFMERGE, and BITOP call Ops.batch_get/2.
+    # MGET, PFCOUNT, PFMERGE, and BITOP call Ops.batch_get/2.
     # During Raft apply the store is a map, so missing batch_get callbacks
     # make Ops fall back to one closure call and one possible cold-read waiter
     # per key. Keep this explicit to preserve batched cold reads in apply.

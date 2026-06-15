@@ -3,6 +3,7 @@ defmodule Ferricstore.FlowCodecTest do
   @moduletag :flow
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.RecordProjection
 
   test "record codec round trips small and nil fields" do
     record = base_record()
@@ -63,6 +64,51 @@ defmodule Ferricstore.FlowCodecTest do
     assert byte_size(encoded) <= 150
     assert length(:binary.matches(encoded, "flow-compact-state")) == 1
     refute String.contains?(encoded, "J{}")
+  end
+
+  test "record meta codec matches full record projection" do
+    record =
+      base_record()
+      |> Map.merge(%{
+        id: "flow-meta",
+        type: "meta-worker",
+        state: "waiting",
+        version: 42,
+        attempts: 3,
+        fencing_token: 11,
+        created_at_ms: 1_000,
+        updated_at_ms: 2_000,
+        next_run_at_ms: 3_000,
+        priority: 7,
+        partition_key: "tenant-a",
+        payload_ref: "flow/value/flow-meta/payload/1",
+        result_ref: "flow/value/flow-meta/result/2",
+        error_ref: "flow/value/flow-meta/error/3",
+        lease_owner: "worker-7",
+        lease_token: "lease-7",
+        lease_deadline_ms: 4_000,
+        run_state: "running",
+        value_refs: %{
+          "reservation" => %{
+            ref: "flow/value/flow-meta/reservation/1",
+            version: 1,
+            digest: "sha256:abc"
+          }
+        },
+        child_groups: %{
+          "children" => %{
+            "children" => %{"child-1" => "running"},
+            "child_partitions" => %{"child-1" => "tenant-a"}
+          }
+        }
+      })
+
+    encoded = Flow.encode_record(record)
+
+    assert Flow.decode_record_meta(encoded) ==
+             encoded
+             |> Flow.decode_record()
+             |> RecordProjection.meta()
   end
 
   test "terminal after noop batch NIF detects records without terminal side effects" do

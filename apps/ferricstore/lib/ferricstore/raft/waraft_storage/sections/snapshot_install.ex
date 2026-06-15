@@ -240,12 +240,51 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
           staged = Path.join(staging_root, Atom.to_string(kind))
 
           with :ok <- Ferricstore.FS.mkdir_p(Path.dirname(dest)),
-               :ok <- Ferricstore.FS.rename(staged, dest) do
+               :ok <- maybe_run_snapshot_install_hook({:before_promote, kind, dest}),
+               :ok <- promote_staged_dir(staged, dest) do
             {:cont, :ok}
           else
             {:error, reason} -> {:halt, {:error, {:promote_staged_dir, kind, reason}}}
           end
         end)
+      end
+
+      defp promote_staged_dir(staged, dest) do
+        case Ferricstore.FS.rename(staged, dest) do
+          :ok ->
+            :ok
+
+          {:error, reason} = error when reason in [:directory_not_empty, :not_empty] ->
+            replace_recreated_snapshot_dir(staged, dest, error)
+
+          {:error, {:directory_not_empty, _}} = error ->
+            replace_recreated_snapshot_dir(staged, dest, error)
+
+          {:error, {:not_empty, _}} = error ->
+            replace_recreated_snapshot_dir(staged, dest, error)
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp replace_recreated_snapshot_dir(staged, dest, original_error) do
+        case File.lstat(dest) do
+          {:ok, %{type: :directory}} ->
+            with :ok <- Ferricstore.FS.rm_rf(dest),
+                 :ok <- Ferricstore.FS.rename(staged, dest) do
+              :ok
+            end
+
+          {:ok, %{type: type}} ->
+            {:error, {:unsafe_recreated_snapshot_target, dest, type}}
+
+          {:error, :enoent} ->
+            Ferricstore.FS.rename(staged, dest)
+
+          {:error, _reason} ->
+            original_error
+        end
       end
 
       defp rollback_snapshot_swap(specs, backup_root) do

@@ -6,7 +6,7 @@ defmodule Ferricstore.Store.RouterCrossShardGuardTest do
   test "router no longer exposes legacy raw op entrypoints" do
     source = Ferricstore.Test.SourceFiles.router_source()
 
-    for helper <- ~w(json_op hll_op bitmap_op geo_op tdigest_op) do
+    for helper <- ~w(hll_op bitmap_op geo_op tdigest_op) do
       refute source =~ "def #{helper}("
     end
 

@@ -19,6 +19,23 @@ defmodule Ferricstore.Flow.RecordLoader do
     end
   end
 
+  def records_for_partitioned_entries(ctx, entries) when is_list(entries) do
+    keys =
+      Enum.map(entries, fn {id, _score, partition_key} ->
+        Keys.state_key(id, partition_key)
+      end)
+
+    case Enum.find(keys, &(byte_size(&1) > Router.max_key_size())) do
+      nil ->
+        ctx
+        |> Router.batch_get(keys)
+        |> decode_values(&safe_decode_record/1)
+
+      _too_large ->
+        {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+    end
+  end
+
   def decode_values(values, decode_fun) when is_function(decode_fun, 1) do
     case Enum.find(values, &match?({:error, _reason}, &1)) do
       nil ->

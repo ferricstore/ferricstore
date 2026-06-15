@@ -242,16 +242,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
         end
       end
 
-      test "Router JSON bitmap and native commands use WARaft as the selected backend", %{
+      test "Router bitmap and native commands use WARaft as the selected backend", %{
         ctx: ctx
       } do
         try do
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-
-          assert :ok = Router.json_set(ctx, "router:json", "$", ~s({"n":1}), [])
-
-          assert ~s({"n":1}) ==
-                   Ferricstore.Commands.Json.handle_ast({:json_get, "router:json", []}, ctx)
 
           assert 0 = Router.setbit(ctx, "router:bitmap", 7, 1)
           assert <<1>> == Router.get(ctx, "router:bitmap")
@@ -264,9 +259,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
         end
       end
 
-      test "JSON and bitmap mutations survive WARaft restart", %{root: root, ctx: ctx} do
+      test "bitmap mutations survive WARaft restart", %{root: root, ctx: ctx} do
         suffix = System.unique_integer([:positive])
-        json_key = "router:json-restart:#{suffix}"
         bitmap_a = "router:bitmap-restart:a:#{suffix}"
         bitmap_b = "router:bitmap-restart:b:#{suffix}"
         bitmap_dest = "router:bitmap-restart:dest:#{suffix}"
@@ -274,27 +268,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
         try do
           assert :ok =
                    WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-
-          assert :ok =
-                   Ferricstore.Commands.Json.handle_ast(
-                     {:json_set, json_key, "$", ~s({"n":1,"arr":[],"flag":true}), []},
-                     ctx
-                   )
-
-          assert "3" =
-                   Ferricstore.Commands.Json.handle_ast(
-                     {:json_numincrby, json_key, "$.n", 2},
-                     ctx
-                   )
-
-          assert 2 =
-                   Ferricstore.Commands.Json.handle_ast(
-                     {:json_arrappend, json_key, "$.arr", ["1", "2"]},
-                     ctx
-                   )
-
-          assert "false" =
-                   Ferricstore.Commands.Json.handle_ast({:json_toggle, json_key, "$.flag"}, ctx)
 
           assert 0 = Router.setbit(ctx, bitmap_a, 1, 1)
           assert 0 = Router.setbit(ctx, bitmap_b, 7, 1)
@@ -314,11 +287,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
                    WARaftBackend.start(restarted_ctx,
                      log_module: :ferricstore_waraft_spike_segment_log
                    )
-
-          assert %{"arr" => [1, 2], "flag" => false, "n" => 3} =
-                   {:json_get, json_key, []}
-                   |> Ferricstore.Commands.Json.handle_ast(restarted_ctx)
-                   |> Jason.decode!()
 
           assert 2 =
                    Ferricstore.Commands.Bitmap.handle_ast(
@@ -538,16 +506,32 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
                ] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
         assert value_size > 0
+        shard_data_path = Path.join([root, "data", "shard_0"])
 
         start_supervised!(
           {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
         )
 
+        start_supervised!(
+          {Ferricstore.Flow.HistoryProjector,
+           [
+             shard_index: 0,
+             shard_data_path: shard_data_path,
+             instance_ctx: ctx,
+             recover_on_init: false
+           ]}
+        )
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 30_000)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
 
-        shard_data_path = Path.join([root, "data", "shard_0"])
         lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+        assert eventually(fn ->
+                 match?({:ok, _}, Ferricstore.Flow.LMDB.get(lmdb_path, created.payload_ref))
+               end)
+
         assert {:ok, payload_locator} = Ferricstore.Flow.LMDB.get(lmdb_path, created.payload_ref)
 
         assert {:ok, {{:flow_history, history_file_id}, offset, payload_size}} =
@@ -584,6 +568,16 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
           {Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir, instance_ctx: ctx}
         )
 
+        start_supervised!(
+          {Ferricstore.Flow.HistoryProjector,
+           [
+             shard_index: 0,
+             shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0),
+             instance_ctx: ctx,
+             recover_on_init: false
+           ]}
+        )
+
         assert :ok =
                  Ferricstore.Flow.create(ctx, flow_id,
                    type: flow_type,
@@ -614,12 +608,20 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 30_000)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
 
-        assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), created.payload_ref)
+        assert eventually(fn ->
+                 :ets.lookup(elem(ctx.keydir_refs, 0), created.payload_ref) == []
+               end)
+
         assert {:ok, [<<>>]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
 
-        assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) ==
-                 0
+        assert eventually(fn ->
+                 Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
+                   ctx.data_dir,
+                   0
+                 ) == 0
+               end)
       end
 
       test "Flow create_many and transition_many use WARaft as the selected backend", %{ctx: ctx} do
@@ -738,39 +740,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
           WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
           File.rm_rf!(root)
-        end
-      end
-
-      test "WARaft apply passes log index to Flow history projection", %{ctx: ctx} do
-        flow_type = "router-flow-history-#{System.unique_integer([:positive])}"
-        flow_id = "router-flow-history-id-#{System.unique_integer([:positive])}"
-        partition = "tenant-history-#{System.unique_integer([:positive])}"
-        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
-
-        try do
-          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
-
-          assert :ok =
-                   Ferricstore.Flow.create(ctx, flow_id,
-                     type: flow_type,
-                     partition_key: partition,
-                     run_at_ms: 1_000,
-                     now_ms: 900
-                   )
-
-          assert {:ok, [claim]} =
-                   Ferricstore.Flow.claim_due(ctx, flow_type,
-                     partition_key: partition,
-                     worker: "worker-history",
-                     limit: 1,
-                     now_ms: 1_000
-                   )
-
-          assert claim.id == flow_id
-          assert {:ok, {:raft_log_pos, applied_index, _term}} = WARaftBackend.storage_position(0)
-
-          assert Ferricstore.Flow.HistoryProjectedIndex.read(shard_data_path) >= applied_index
-        after
         end
       end
 

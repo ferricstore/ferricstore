@@ -42,7 +42,10 @@ defmodule Ferricstore.Commands.ListTest do
         "mylist", ^element_key ->
           "a"
       end,
-      compound_batch_delete: fn "mylist", [^element_key] -> :ok end,
+      compound_batch_delete: fn "mylist", [^element_key, ^meta_key] ->
+        Agent.update(meta_deleted, fn _ -> true end)
+        :ok
+      end,
       compound_delete: fn
         "mylist", ^meta_key ->
           Agent.update(meta_deleted, fn _ -> true end)

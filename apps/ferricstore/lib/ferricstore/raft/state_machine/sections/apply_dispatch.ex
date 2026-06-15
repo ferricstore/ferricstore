@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -60,6 +59,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # Unwrap pre-serialized commands produced by the write Batcher.
       def apply(meta, {:ttb, binary}, state) when is_binary(binary) do
         __MODULE__.apply(meta, :erlang.binary_to_term(binary, [:safe]), state)
+      end
+
+      def apply(meta, {:ferricstore_latency_trace, inner_command}, state) do
+        previous_trace = Ferricstore.LatencyTrace.start(%{})
+
+        try do
+          result =
+            Ferricstore.LatencyTrace.span("server_apply_us", fn ->
+              __MODULE__.apply(meta, inner_command, state)
+            end)
+
+          trace = Ferricstore.LatencyTrace.finish(previous_trace)
+          wrap_latency_trace_apply_result(result, trace)
+        rescue
+          error ->
+            _ = Ferricstore.LatencyTrace.finish(previous_trace)
+            reraise error, __STACKTRACE__
+        catch
+          kind, reason ->
+            _ = Ferricstore.LatencyTrace.finish(previous_trace)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
       end
 
       # Async commands. Router on the origin node has already persisted the write
@@ -244,6 +265,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_cross_shard_tx(meta, shard_batches, %{}, state)
       end
 
+      defp wrap_latency_trace_apply_result({state, result}, trace) do
+        {state, Ferricstore.LatencyTrace.wrap_result(result, trace)}
+      end
+
+      defp wrap_latency_trace_apply_result({state, result, effects}, trace) do
+        {state, Ferricstore.LatencyTrace.wrap_result(result, trace), effects}
+      end
+
       # Legacy: list operations used to be sent as a single {:list_op} Raft entry
       # containing the entire operation. Now lists use compound keys (L:key\0pos)
       # and individual {:put}/{:delete} entries. This handler remains for WAL
@@ -261,6 +290,69 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       def apply(meta, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}, state) do
         apply_pending_with_time(meta, state, fn ->
           do_checked_lmove(state, src_key, dst_key, from_dir, to_dir)
+        end)
+      end
+
+      def apply(meta, {:hset_single, key, field, value}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_single(state, {:hset_single, key, field, value})
+        end)
+      end
+
+      def apply(meta, {:lpush_single, key, value}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_single(state, {:lpush_single, key, value})
+        end)
+      end
+
+      def apply(meta, {:rpush_single, key, value}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_single(state, {:rpush_single, key, value})
+        end)
+      end
+
+      def apply(meta, {:sadd_single, key, member}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_single(state, {:sadd_single, key, member})
+        end)
+      end
+
+      def apply(meta, {:srem_single, key, member}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_single(state, {:srem_single, key, member})
+        end)
+      end
+
+      def apply(meta, {:zadd_single, key, score, member}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_single(state, {:zadd_single, key, score, member})
+        end)
+      end
+
+      def apply(meta, {:zadd_many_single, entries}, state) when is_list(entries) do
+        with_apply_time(meta, fn ->
+          old_count = state.applied_count
+
+          write_result =
+            with_pending_writes(state, fn ->
+              {apply_zadd_many_single_entries(state, entries), old_count + length(entries)}
+            end)
+
+          case write_result do
+            {:error, _reason} = error ->
+              new_state = %{state | applied_count: old_count + length(entries)}
+              maybe_release_cursor(meta, old_count, new_state, error)
+
+            {results, new_count} ->
+              new_state = %{state | applied_count: new_count}
+              maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+          end
+        end)
+      end
+
+      def apply(meta, {:zrem_single, key, member}, state) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_single(state, {:zrem_single, key, member})
         end)
       end
 
@@ -456,45 +548,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       def apply(meta, {:pfmerge, dest_key, _source_keys, source_sketches}, state) do
         apply_pending_with_time(meta, state, fn ->
           do_pfmerge(state, dest_key, source_sketches)
-        end)
-      end
-
-      def apply(meta, {:json_set, key, path, value, flags}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          Json.handle_ast({:json_set, key, path, value, flags}, build_string_value_store(state))
-        end)
-      end
-
-      def apply(meta, {:json_del, key, path}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          Json.handle_ast({:json_del, key, path}, build_string_value_store(state))
-        end)
-      end
-
-      def apply(meta, {:json_numincrby, key, path, increment}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          Json.handle_ast(
-            {:json_numincrby, key, path, increment},
-            build_string_value_store(state)
-          )
-        end)
-      end
-
-      def apply(meta, {:json_arrappend, key, path, values}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          Json.handle_ast({:json_arrappend, key, path, values}, build_string_value_store(state))
-        end)
-      end
-
-      def apply(meta, {:json_toggle, key, path}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          Json.handle_ast({:json_toggle, key, path}, build_string_value_store(state))
-        end)
-      end
-
-      def apply(meta, {:json_clear, key, path}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          Json.handle_ast({:json_clear, key, path}, build_string_value_store(state))
         end)
       end
 
@@ -800,90 +853,186 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # -- Flow --
 
       def apply(meta, {:flow_create, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_create(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_create, attrs, fn ->
+          do_flow_create(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_create_many, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_create_many(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_create_many, attrs, fn ->
+          do_flow_create_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_create_pipeline_batch, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_create_pipeline_batch(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_create_pipeline_batch, attrs, fn ->
+          do_flow_create_pipeline_batch(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_start_and_claim_pipeline_batch, _key, attrs}, state)
+          when is_map(attrs) do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_start_and_claim_pipeline_batch,
+          attrs,
+          fn ->
+            do_flow_start_and_claim_pipeline_batch(state, attrs)
+          end
+        )
       end
 
       def apply(meta, {:flow_named_value_put, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_named_value_put(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_named_value_put, attrs, fn ->
+          do_flow_named_value_put(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_named_value_put_pipeline_batch, _key, attrs}, state)
+          when is_map(attrs) do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_named_value_put_pipeline_batch,
+          attrs,
+          fn ->
+            do_flow_named_value_put_pipeline_batch(state, attrs)
+          end
+        )
       end
 
       def apply(meta, {:flow_signal, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_signal(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_signal, attrs, fn ->
+          do_flow_signal(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_signal_many, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_signal_many, attrs, fn ->
+          do_flow_signal_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_spawn_children, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_spawn_children(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_spawn_children, attrs, fn ->
+          do_flow_spawn_children(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_claim_due, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_claim_due(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_claim_due, attrs, fn ->
+          do_flow_claim_due(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_extend_lease, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_extend_lease(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_extend_lease, attrs, fn ->
+          do_flow_extend_lease(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_complete, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_complete(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_complete, attrs, fn ->
+          do_flow_complete(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_complete_many, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_complete_many(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_complete_many, attrs, fn ->
+          do_flow_complete_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_terminal_pipeline_batch, op, _key, attrs}, state)
           when op in [:complete, :retry, :fail, :cancel] and is_map(attrs) do
-        apply_pending_with_time(meta, state, fn ->
+        apply_flow_pending_with_time(meta, state, :flow_terminal_pipeline_batch, attrs, fn ->
           do_flow_terminal_pipeline_batch(state, op, attrs)
         end)
       end
 
       def apply(meta, {:flow_transition, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_transition(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_transition, attrs, fn ->
+          do_flow_transition(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_start_and_claim, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_start_and_claim, attrs, fn ->
+          do_flow_start_and_claim(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_run_steps_many, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_run_steps_many, attrs, fn ->
+          do_flow_run_steps_many(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_step_continue, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_step_continue, attrs, fn ->
+          do_flow_step_continue(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_step_continue_many, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_step_continue_many, attrs, fn ->
+          do_flow_step_continue_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_transition_many, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_transition_many(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_transition_many, attrs, fn ->
+          do_flow_transition_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_retry, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_retry(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_retry, attrs, fn ->
+          do_flow_retry(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_retry_many, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_retry_many(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_retry_many, attrs, fn ->
+          do_flow_retry_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_fail, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_fail(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_fail, attrs, fn ->
+          do_flow_fail(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_fail_many, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_fail_many(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_fail_many, attrs, fn ->
+          do_flow_fail_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_cancel, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_cancel(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_cancel, attrs, fn ->
+          do_flow_cancel(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_cancel_many, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_cancel_many(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_cancel_many, attrs, fn ->
+          do_flow_cancel_many(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_retention_cleanup, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_retention_cleanup(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_retention_cleanup, attrs, fn ->
+          do_flow_retention_cleanup(state, attrs)
+        end)
       end
 
       def apply(meta, {:flow_rewind, _key, attrs}, state) when is_map(attrs) do
-        apply_pending_with_time(meta, state, fn -> do_flow_rewind(state, attrs) end)
+        apply_flow_pending_with_time(meta, state, :flow_rewind, attrs, fn ->
+          do_flow_rewind(state, attrs)
+        end)
       end
 
       # ---------------------------------------------------------------------------

@@ -93,7 +93,9 @@ defmodule Ferricstore.FlowWriteContractTest do
         source
       )
 
-    assert function_source =~ "transition_run_results(ctx, keyed_commands, callbacks)"
+    assert function_source =~ "start_and_claim_run_results(ctx, keyed_commands, callbacks)"
+    assert source =~ "named_value_put_run_results(ctx, keyed_commands, callbacks)"
+    assert source =~ "transition_run_results(ctx, keyed_commands, callbacks)"
     assert source =~ "defp transition_run_results(ctx, keyed_commands, callbacks)"
     assert source =~ "Router.flow_transition_batch(attrs_list)"
 
@@ -1045,6 +1047,231 @@ defmodule Ferricstore.FlowWriteContractTest do
              )
 
     assert_all_states(ids, partition, "completed")
+  end
+
+  test "independent complete_many can return single ok on full success" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-independent-complete-ok-#{suffix}"
+    type = "contract-independent-complete-ok-type-#{suffix}"
+    ids = ["independent-complete-ok-a-#{suffix}", "independent-complete-ok-b-#{suffix}"]
+    claims = create_many_and_claim(partition, ids, type, now_ms)
+
+    assert :ok =
+             FerricStore.flow_complete_many(
+               partition,
+               claim_items(claims),
+               independent: true,
+               return: :ok_on_success
+             )
+
+    assert_all_states(ids, partition, "completed")
+  end
+
+  test "independent complete_many ok-on-success preserves per-item failures" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-independent-complete-ok-error-#{suffix}"
+    type = "contract-independent-complete-ok-error-type-#{suffix}"
+
+    ids = [
+      "independent-complete-ok-error-a-#{suffix}",
+      "independent-complete-ok-error-b-#{suffix}"
+    ]
+
+    [bad_claim, good_claim] = create_many_and_claim(partition, ids, type, now_ms)
+
+    items = [
+      %{
+        id: bad_claim.id,
+        lease_token: bad_claim.lease_token,
+        fencing_token: bad_claim.fencing_token + 1
+      },
+      %{
+        id: good_claim.id,
+        lease_token: good_claim.lease_token,
+        fencing_token: good_claim.fencing_token
+      }
+    ]
+
+    assert {:ok, [{:error, "ERR stale flow lease"}, :ok]} =
+             FerricStore.flow_complete_many(
+               partition,
+               items,
+               independent: true,
+               return: :ok_on_success
+             )
+  end
+
+  test "flow step_continue atomically advances logical state and keeps a fresh running lease" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-step-continue-#{suffix}"
+    type = "contract-step-continue-type-#{suffix}"
+    id = "contract-step-continue-id-#{suffix}"
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               payload: %{step: "queued"},
+               run_at_ms: now_ms
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               limit: 1,
+               now_ms: now_ms,
+               worker: "contract-step-worker",
+               partition_key: partition
+             )
+
+    assert claimed.state == "running"
+    assert claimed.run_state == "queued"
+
+    assert {:ok, continued} =
+             FerricStore.flow_step_continue(id, claimed.lease_token, "queued", "charge_card",
+               partition_key: partition,
+               fencing_token: claimed.fencing_token,
+               lease_ms: 5_000,
+               now_ms: now_ms + 1,
+               payload: %{step: "charge_card"}
+             )
+
+    assert continued.id == id
+    assert continued.state == "running"
+    assert continued.run_state == "charge_card"
+    assert continued.lease_token != claimed.lease_token
+    assert continued.fencing_token == claimed.fencing_token + 1
+    assert continued.lease_deadline_ms == now_ms + 5_001
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: partition,
+               fencing_token: claimed.fencing_token
+             )
+
+    assert :ok =
+             FerricStore.flow_retry(id, continued.lease_token,
+               partition_key: partition,
+               fencing_token: continued.fencing_token,
+               run_at_ms: now_ms + 3_000,
+               error: %{reason: "try-again"}
+             )
+
+    assert {:ok, retried} = FerricStore.flow_get(id, partition_key: partition)
+    assert retried.state == "charge_card"
+    assert retried.run_state == nil
+    assert retried.next_run_at_ms == now_ms + 3_000
+  end
+
+  test "flow start_and_claim creates the first logical step with a running lease" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-start-and-claim-#{suffix}"
+    type = "contract-start-and-claim-type-#{suffix}"
+    id = "contract-start-and-claim-id-#{suffix}"
+
+    assert {:ok, started} =
+             FerricStore.flow_start_and_claim(id, type, "reserve_inventory",
+               partition_key: partition,
+               worker: "contract-start-worker",
+               lease_ms: 7_000,
+               now_ms: now_ms,
+               payload: %{order_id: suffix}
+             )
+
+    assert started.id == id
+    assert started.type == type
+    assert started.state == "running"
+    assert started.run_state == "reserve_inventory"
+    assert started.attempts == 1
+    assert started.fencing_token == 1
+    assert started.lease_owner == "contract-start-worker"
+    assert is_binary(started.lease_token)
+    assert started.lease_deadline_ms == now_ms + 7_000
+    assert started.next_run_at_ms == now_ms + 7_000
+
+    assert {:error, "ERR flow already exists"} =
+             FerricStore.flow_start_and_claim(id, type, "reserve_inventory",
+               partition_key: partition,
+               worker: "contract-start-worker",
+               now_ms: now_ms
+             )
+
+    assert :ok =
+             FerricStore.flow_retry(id, started.lease_token,
+               partition_key: partition,
+               fencing_token: started.fencing_token,
+               run_at_ms: now_ms + 1_000,
+               error: %{reason: "try-again"}
+             )
+
+    assert {:ok, retried} = FerricStore.flow_get(id, partition_key: partition)
+    assert retried.state == "reserve_inventory"
+    assert retried.run_state == nil
+    assert retried.next_run_at_ms == now_ms + 1_000
+  end
+
+  test "flow run_steps_many runs deterministic step chains in one public command" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-run-steps-#{suffix}"
+    type = "contract-run-steps-type-#{suffix}"
+    ids = ["contract-run-steps-a-#{suffix}", "contract-run-steps-b-#{suffix}"]
+
+    assert :ok =
+             FerricStore.flow_run_steps_many(
+               Enum.map(ids, &%{id: &1, partition_key: partition}),
+               type: type,
+               states: ["reserve_inventory", "charge_card", "send_email"],
+               worker: "contract-run-steps-worker",
+               lease_ms: 7_000,
+               now_ms: now_ms,
+               result: %{ok: true}
+             )
+
+    Enum.each(ids, fn id ->
+      assert {:ok, record} = FerricStore.flow_get(id, partition_key: partition)
+      assert record.state == "completed"
+      assert record.run_state == "send_email"
+      assert record.fencing_token == 3
+      assert record.lease_token == nil
+
+      assert {:ok, history} = FerricStore.flow_history(id, partition_key: partition, count: 10)
+      events = Enum.map(history, fn {_event_id, fields} -> fields["event"] end)
+
+      assert events == ["created", "step_continued", "step_continued", "completed"]
+    end)
+  end
+
+  test "flow run_steps_many rejects duplicate ids without partial creation" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-run-steps-dup-#{suffix}"
+    type = "contract-run-steps-dup-type-#{suffix}"
+    duplicate_id = "contract-run-steps-dup-a-#{suffix}"
+    other_id = "contract-run-steps-dup-b-#{suffix}"
+
+    assert {:ok,
+            [
+              error: "ERR flow duplicate id in batch",
+              error: "ERR flow duplicate id in batch",
+              error: "ERR flow duplicate id in batch"
+            ]} =
+             FerricStore.flow_run_steps_many(
+               [
+                 %{id: duplicate_id, partition_key: partition},
+                 %{id: duplicate_id, partition_key: partition},
+                 %{id: other_id, partition_key: partition}
+               ],
+               type: type,
+               steps: 3,
+               worker: "contract-run-steps-worker",
+               now_ms: now_ms
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(other_id, partition_key: partition)
   end
 
   defp create_many_and_claim(partition, ids, type, now_ms) do

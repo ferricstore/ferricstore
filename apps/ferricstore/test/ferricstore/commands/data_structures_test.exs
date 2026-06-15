@@ -5,7 +5,7 @@ defmodule Ferricstore.Commands.DataStructuresTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Bitmap, Dispatcher, Hash, Json, List, Set, SortedSet, Strings}
+  alias Ferricstore.Commands.{Bitmap, Dispatcher, Hash, List, Set, SortedSet, Strings}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
@@ -73,7 +73,6 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       :ok = store.compound_put.("orphan", CompoundKey.list_element("orphan", 0), "value", 0)
 
       assert {:simple, "none"} == Strings.handle("TYPE", ["orphan"], store)
-      assert nil == Json.handle("JSON.GET", ["orphan"], store)
       assert 0 == Bitmap.handle("GETBIT", ["orphan", "0"], store)
     end
 
@@ -82,7 +81,6 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       # commands must not probe LM:key as a shortcut for WRONGTYPE detection.
       checks = [
         {"lib/ferricstore/store/type_registry.ex", ~r/def get_type.*?case Ops\.get/s},
-        {"lib/ferricstore/commands/json.ex", ~r/defp compound_type_marker\?.*?end/s},
         {"lib/ferricstore/commands/bitmap/destination.ex",
          ~r/defp compound_type_marker\?.*?end/s},
         {"lib/ferricstore/commands/hyperloglog.ex", ~r/defp compound_type_marker\?.*?end/s}

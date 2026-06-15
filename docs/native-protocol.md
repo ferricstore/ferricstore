@@ -176,6 +176,29 @@ The server clamps requested windows to configured server maxima and enforces
 those windows in addition to bounded lane queues and frame limits. A closed
 window returns `busy` with `flow_control_window_exhausted`.
 
+## Heartbeats and idle close
+
+Native clients should send application-level heartbeats on idle connections,
+similar to Cassandra drivers sending protocol heartbeats over the native
+transport. FerricStore uses `PING` on the control lane for this.
+
+Recommended defaults:
+
+```text
+client heartbeat interval: 30s
+client heartbeat timeout: 30s
+server idle timeout: 90s
+```
+
+Any inbound frame resets the server idle timer. If no frame arrives before
+`FERRICSTORE_NATIVE_IDLE_TIMEOUT_MS`, the server closes the connection and
+cleans up lanes, subscriptions, and client registry state. Set
+`FERRICSTORE_NATIVE_IDLE_TIMEOUT_MS=0` to disable server idle close.
+
+SDKs should close and replace a socket if a heartbeat response is not received
+within the heartbeat timeout. Do not rely only on TCP keepalive; OS keepalive is
+too slow for application-level failure detection in many deployments.
+
 `STARTUP` may include:
 
 ```text
@@ -204,6 +227,23 @@ accepted compression is `"none"`.
 0x010B FETCH_OR_COMPUTE
 0x010C FETCH_OR_COMPUTE_RESULT
 0x010D FETCH_OR_COMPUTE_ERROR
+0x0110 HSET
+0x0111 HGET
+0x0112 HMGET
+0x0113 HGETALL
+0x0120 LPUSH
+0x0121 RPUSH
+0x0122 LPOP
+0x0123 RPOP
+0x0124 LRANGE
+0x0130 SADD
+0x0131 SREM
+0x0132 SMEMBERS
+0x0133 SISMEMBER
+0x0140 ZADD
+0x0141 ZREM
+0x0142 ZRANGE
+0x0143 ZSCORE
 ```
 
 Bodies are maps. Example:
@@ -212,7 +252,18 @@ Bodies are maps. Example:
 SET:  {"key": "k", "value": <bytes>, "ttl": 1000}
 MSET: {"pairs": [{"key": "k1", "value": "v1"}, {"key": "k2", "value": "v2"}]}
 CAS:  {"key": "k", "expected": <bytes>, "value": <bytes>, "ttl": 1000}
+HSET: {"key": "h", "fields": {"field": "value"}}
+HMGET: {"key": "h", "fields": ["field", "missing"]}
+LPUSH: {"key": "l", "values": ["a", "b"]}
+LRANGE: {"key": "l", "start": 0, "stop": -1}
+SADD: {"key": "s", "members": ["a", "b"]}
+ZADD: {"key": "z", "items": [[1.0, "a"], [2.0, "b"]]}
+ZRANGE: {"key": "z", "start": 0, "stop": -1, "withscores": true}
 ```
+
+Hash/list/set/sorted-set opcodes use the same store semantics as their RESP
+commands. The initial native support uses typed map payloads; compact binary
+fast paths can be added later for commands that show up as real bottlenecks.
 
 ## Admin/observability opcodes
 
@@ -286,6 +337,8 @@ FERRICSTORE.KEY_INFO: {"key": "k", "args": ["k"]}
 0x021F FLOW.POLICY.GET
 0x0220 FLOW.SPAWN_CHILDREN
 0x0221 FLOW.RETENTION_CLEANUP
+0x0222 FLOW.STEP_CONTINUE
+0x0223 FLOW.START_AND_CLAIM
 ```
 
 Flow bodies are maps with command fields plus options. For example:

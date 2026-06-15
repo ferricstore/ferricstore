@@ -234,6 +234,15 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert {:ok, [^payload]} = FerricStore.flow_value_mget([ref], payload_max_bytes: 64 * 1024)
   end
 
+  test "value_mget returns hot values and leaves ordinary missing refs as nil" do
+    assert {:ok, %{ref: ref}} =
+             FerricStore.flow_value_put("hot-value", partition_key: "tenant-a")
+
+    missing_ref = unique_id("ordinary-missing-flow-value-ref")
+
+    assert {:ok, ["hot-value", nil]} = FerricStore.flow_value_mget([ref, missing_ref])
+  end
+
   test "cancel terminal retention does not materialize existing generated payload value refs" do
     id = unique_id("flow-value-cancel-retention")
 

@@ -185,6 +185,83 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
         end
       end
 
+      test "WARaft generic batcher preserves singular command apply shape", %{ctx: ctx} do
+        previous_generic_window =
+          Application.get_env(:ferricstore, :waraft_generic_batch_window_ms)
+
+        previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+
+        try do
+          Application.put_env(:ferricstore, :waraft_generic_batch_window_ms, 1)
+          Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+
+          assert :ok =
+                   WARaftBackend.start(ctx,
+                     log_module: :ferricstore_waraft_spike_segment_log,
+                     commit_batch_interval_ms: 1,
+                     commit_batch_max: 10_000
+                   )
+
+          task =
+            Task.async(fn ->
+              WARaftBackend.write_batch(0, [
+                {:put, "generic-single-preserve-shape", "v1", 0}
+              ])
+            end)
+
+          assert_receive {:waraft_backend_batcher_call, :__commit_single_batch_direct__, ref,
+                          worker},
+                         1_000
+
+          send(worker, {ref, :continue})
+          assert {:ok, [:ok]} = Task.await(task, 5_000)
+          assert "v1" == Router.get(ctx, "generic-single-preserve-shape")
+        after
+          restore_env(:waraft_generic_batch_window_ms, previous_generic_window)
+          restore_env(:waraft_backend_batcher_call_hook, previous_hook)
+        end
+      end
+
+      test "WARaft Flow pipeline batches use fixed generic batch window by default", %{ctx: ctx} do
+        previous_generic_window =
+          Application.get_env(:ferricstore, :waraft_generic_batch_window_ms)
+
+        previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
+
+        try do
+          Application.put_env(:ferricstore, :waraft_generic_batch_window_ms, 500)
+          Application.put_env(:ferricstore, :waraft_backend_batcher_call_hook, {:block, self()})
+
+          assert :ok =
+                   WARaftBackend.start(ctx,
+                     log_module: :ferricstore_waraft_spike_segment_log,
+                     commit_batch_interval_ms: 1,
+                     commit_batch_max: 10_000
+                   )
+
+          task =
+            Task.async(fn ->
+              WARaftBackend.write_batch(0, [
+                {:flow_create_pipeline_batch, "flow-window-bypass", %{records: []}}
+              ])
+            end)
+
+          refute_receive {:waraft_backend_batcher_call, :__commit_single_batch_direct__, _ref,
+                          _worker},
+                         100
+
+          assert_receive {:waraft_backend_batcher_call, :__commit_single_batch_direct__, ref,
+                          worker},
+                         1_000
+
+          send(worker, {ref, :continue})
+          assert {:error, "ERR flow items must be a non-empty list"} = Task.await(task, 5_000)
+        after
+          restore_env(:waraft_generic_batch_window_ms, previous_generic_window)
+          restore_env(:waraft_backend_batcher_call_hook, previous_hook)
+        end
+      end
+
       test "WARaft hot put batcher queues the next slot while previous flush commits", %{ctx: ctx} do
         previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
         previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
@@ -367,6 +444,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
         ctx: ctx
       } do
         previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
+
         previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_call_hook)
         handler_id = {__MODULE__, :hot_put_during_flush, make_ref()}
 
@@ -522,6 +600,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
 
       test "default WARaft hot delete batches coalesce before segment append", %{ctx: ctx} do
         previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
+
         handler_id = {__MODULE__, :hot_delete_flush, make_ref()}
 
         :telemetry.attach(

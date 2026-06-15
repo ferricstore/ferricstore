@@ -722,9 +722,7 @@ defmodule FerricstoreServer.ConnectionTest.Sections.ServerAcceptsTcpConnection d
             Encoder.encode(["HINCRBYFLOAT", "#{tag}:hashf", "price", "1.5"]),
             Encoder.encode(["ZINCRBY", "#{tag}:zset", "2.5", "member"]),
             Encoder.encode(["PFADD", "#{tag}:hll", "a", "b"]),
-            Encoder.encode(["SETBIT", "#{tag}:bits", "7", "1"]),
-            Encoder.encode(["JSON.SET", "#{tag}:doc", "$", ~s({"n":1})]),
-            Encoder.encode(["JSON.NUMINCRBY", "#{tag}:doc", "$.n", "1"])
+            Encoder.encode(["SETBIT", "#{tag}:bits", "7", "1"])
           ])
 
         send_raw(sock, pipeline)
@@ -734,10 +732,8 @@ defmodule FerricstoreServer.ConnectionTest.Sections.ServerAcceptsTcpConnection d
                  hincrbyfloat,
                  zincrby,
                  1,
-                 0,
-                 {:simple, "OK"},
-                 "2"
-               ] = recv_values(sock, 7)
+                 0
+               ] = recv_values(sock, 5)
 
         assert_float_string(hincrbyfloat, 1.5)
         assert_float_string(zincrby, 2.5)

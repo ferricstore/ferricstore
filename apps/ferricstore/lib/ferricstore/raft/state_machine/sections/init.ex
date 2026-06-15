@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -114,6 +113,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
                   config.shard_index
                 ),
                 1
+              ),
+          compound_member_index_name:
+            Map.get(config, :compound_member_index_name) ||
+              Ferricstore.Store.Shard.CompoundMemberIndex.table_name(
+                Map.get(config, :instance_name, :default),
+                config.shard_index
               ),
           flow_index_name:
             Map.get(config, :flow_index_name) ||

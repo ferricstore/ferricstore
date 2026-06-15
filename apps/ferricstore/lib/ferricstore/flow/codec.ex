@@ -223,6 +223,15 @@ defmodule Ferricstore.Flow.Codec do
 
   def decode_record(_value), do: raise(ArgumentError, "invalid flow record")
 
+  def decode_record_meta(@record_bin_magic <> _rest = value) do
+    case NIF.flow_record_decode_meta(value) do
+      {:ok, fields} -> decode_record_meta_fields(fields)
+      _ -> raise(ArgumentError, "invalid flow record")
+    end
+  end
+
+  def decode_record_meta(_value), do: raise(ArgumentError, "invalid flow record")
+
   @doc false
   def decode_record_elixir(@record_bin_magic <> rest), do: decode_record_bin(rest)
 
@@ -849,6 +858,59 @@ defmodule Ferricstore.Flow.Codec do
   end
 
   defp decode_record_fields(_fields), do: raise(ArgumentError, "invalid flow record")
+
+  defp decode_record_meta_fields([
+         id,
+         type,
+         state,
+         version,
+         priority,
+         partition_key,
+         payload_ref,
+         result_ref,
+         error_ref,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         lease_deadline_ms,
+         lease_owner,
+         lease_token,
+         fencing_token,
+         attempts,
+         run_state,
+         child_groups_encoded
+       ])
+       when is_binary(child_groups_encoded) do
+    with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
+      {_child_groups, value_refs} = Support.split_record_sidecar(child_groups)
+
+      %{
+        id: id,
+        type: type,
+        state: state,
+        version: version,
+        priority: priority,
+        partition_key: partition_key,
+        payload_ref: payload_ref,
+        result_ref: result_ref,
+        error_ref: error_ref,
+        created_at_ms: created_at_ms,
+        updated_at_ms: updated_at_ms,
+        next_run_at_ms: next_run_at_ms,
+        lease_deadline_ms: lease_deadline_ms,
+        lease_owner: lease_owner,
+        lease_token: lease_token,
+        fencing_token: fencing_token,
+        attempts: attempts,
+        run_state: run_state
+      }
+      |> maybe_put_decoded_value_refs(value_refs)
+    else
+      _ -> raise ArgumentError, "invalid flow record"
+    end
+  end
+
+  defp decode_record_meta_fields(_fields), do: raise(ArgumentError, "invalid flow record")
 
   defp maybe_put_decoded_value_refs(record, refs) when is_map(refs) and map_size(refs) > 0,
     do: Map.put(record, :value_refs, refs)

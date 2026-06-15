@@ -99,6 +99,48 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWh
         )
       end
 
+      test "segment log append updates memory status across multiple appends" do
+        with_segment_log_memory_env(
+          max_bytes: 1_000_000,
+          max_entries: 10,
+          min_entries: 1,
+          records_per_segment: 64,
+          fun: fn _root, log, _log_name ->
+            assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+            assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+            view0 = {:log_view, log, 0, 0, :undefined}
+
+            assert :ok =
+                     :ferricstore_waraft_spike_segment_log.append(
+                       view0,
+                       [{1, {:cmd, "a"}}, {1, {:cmd, "b"}}],
+                       :strict,
+                       :low
+                     )
+
+            view2 = {:log_view, log, 0, 2, :undefined}
+
+            assert :ok =
+                     :ferricstore_waraft_spike_segment_log.append(
+                       view2,
+                       [{1, {:cmd, "c"}}],
+                       :strict,
+                       :low
+                     )
+
+            assert %{
+                     ets_entries: 3,
+                     disk_first_index: 1,
+                     disk_last_index: 3,
+                     ets_bytes: bytes
+                   } = :ferricstore_waraft_spike_segment_log.memory_status(log)
+
+            assert bytes > 0
+          end
+        )
+      end
+
       test "segment log reopen loads only bounded tail into ETS" do
         parent = self()
         handler_id = {:segment_log_bounded_reopen, self(), make_ref()}

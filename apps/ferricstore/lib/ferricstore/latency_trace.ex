@@ -9,11 +9,13 @@ defmodule Ferricstore.LatencyTrace do
   """
 
   @key :ferricstore_latency_trace
+  @enabled_key {__MODULE__, :enabled}
   @command_tag :ferricstore_latency_trace
   @result_tag :ferricstore_latency_trace_result
 
   @spec start(map()) :: term()
   def start(initial \\ %{}) when is_map(initial) do
+    :persistent_term.put(@enabled_key, true)
     previous = Process.get(@key, :undefined)
     Process.put(@key, initial)
     previous
@@ -27,7 +29,9 @@ defmodule Ferricstore.LatencyTrace do
   end
 
   @spec enabled?() :: boolean()
-  def enabled?, do: is_map(Process.get(@key))
+  def enabled? do
+    :persistent_term.get(@enabled_key, false) and is_map(Process.get(@key))
+  end
 
   @spec span(binary(), (-> result)) :: result when result: term()
   def span(key, fun) when is_binary(key) and is_function(fun, 0) do
@@ -42,6 +46,16 @@ defmodule Ferricstore.LatencyTrace do
       end
     else
       fun.()
+    end
+  end
+
+  defmacro maybe_span(key, do: block) do
+    quote do
+      if Ferricstore.LatencyTrace.enabled?() do
+        Ferricstore.LatencyTrace.span(unquote(key), fn -> unquote(block) end)
+      else
+        unquote(block)
+      end
     end
   end
 

@@ -613,19 +613,22 @@ defmodule Ferricstore.Store.Router.Part02 do
       @spec batch_get(FerricStore.Instance.t(), [binary()]) :: [binary() | nil]
       def batch_get(ctx, keys) do
         now = HLC.now_ms()
+        bookkeeping = hot_read_bookkeeping_start(ctx)
 
-        {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, hot_hits}} =
-          Enum.map_reduce(keys, {[], 0, [], 0, []}, fn key,
-                                                       {cold_entries, cold_count, waraft_entries,
-                                                        waraft_count, hot_hits} ->
+        {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, bookkeeping}} =
+          Enum.map_reduce(keys, {[], 0, [], 0, bookkeeping}, fn key,
+                                                                {cold_entries, cold_count,
+                                                                 waraft_entries, waraft_count,
+                                                                 bookkeeping} ->
             idx = shard_for(ctx, key)
             keydir = resolve_keydir(ctx, idx)
 
             case ets_get_full(ctx, idx, keydir, key, now) do
               {:hit, value, lfu} ->
+                bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, key, lfu)
+
                 {{:value, value},
-                 {cold_entries, cold_count, waraft_entries, waraft_count,
-                  [{keydir, key, lfu} | hot_hits]}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               {:cold, file_id, offset, value_size}
               when valid_cold_location(file_id, offset, value_size) ->
@@ -634,14 +637,16 @@ defmodule Ferricstore.Store.Router.Part02 do
                 entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
 
                 {{:cold, cold_count},
-                 {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, hot_hits}}
+                 {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count,
+                  bookkeeping}}
 
               {:cold, file_id, offset, value_size}
               when valid_waraft_segment_location(file_id, offset, value_size) ->
                 entry = {ctx, idx, keydir, key, file_id, offset, value_size}
 
                 {{:waraft, waraft_count},
-                 {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1, hot_hits}}
+                 {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1,
+                  bookkeeping}}
 
               {:cold, _file_id, _offset, _value_size} ->
                 result =
@@ -657,19 +662,19 @@ defmodule Ferricstore.Store.Router.Part02 do
                 end
 
                 {{:value, result},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :expired ->
                 record_keyspace_miss(ctx, key)
 
                 {{:value, nil},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :miss ->
                 record_keyspace_miss(ctx, key)
 
                 {{:value, nil},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :no_table ->
                 result =
@@ -685,11 +690,11 @@ defmodule Ferricstore.Store.Router.Part02 do
                 end
 
                 {{:value, result},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
             end
           end)
 
-        sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
+        hot_read_bookkeeping_finish(ctx, bookkeeping)
 
         cold_values =
           cold_entries
@@ -708,6 +713,61 @@ defmodule Ferricstore.Store.Router.Part02 do
           {:cold, index} -> elem(cold_values, index)
           {:waraft, index} -> elem(waraft_values, index)
         end)
+      end
+
+      @doc false
+      @spec batch_get_on_route_keys(FerricStore.Instance.t(), [{binary(), binary()}]) :: [
+              binary() | nil
+            ]
+      def batch_get_on_route_keys(ctx, route_lookup_pairs) do
+        now = HLC.now_ms()
+        bookkeeping = hot_read_bookkeeping_start(ctx)
+
+        {results, bookkeeping} =
+          Enum.map_reduce(route_lookup_pairs, bookkeeping, fn {route_key, lookup_key},
+                                                              bookkeeping ->
+            idx = shard_for(ctx, route_key)
+            keydir = resolve_keydir(ctx, idx)
+
+            case ets_get_full(ctx, idx, keydir, lookup_key, now) do
+              {:hit, value, lfu} ->
+                bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, lookup_key, lfu)
+                {value, bookkeeping}
+
+              {:cold, _file_id, _offset, _value_size} ->
+                {routed_get_fallback(ctx, idx, lookup_key), bookkeeping}
+
+              :expired ->
+                record_keyspace_miss(ctx, lookup_key)
+                {nil, bookkeeping}
+
+              :miss ->
+                record_keyspace_miss(ctx, lookup_key)
+                {nil, bookkeeping}
+
+              :no_table ->
+                {routed_get_fallback(ctx, idx, lookup_key), bookkeeping}
+            end
+          end)
+
+        hot_read_bookkeeping_finish(ctx, bookkeeping)
+        results
+      end
+
+      defp routed_get_fallback(ctx, idx, key) do
+        result =
+          case safe_read_call(ctx, idx, {:get, key}) do
+            {:ok, value} -> value
+            :unavailable -> nil
+          end
+
+        if result != nil do
+          Stats.record_cold_read(ctx, key)
+        else
+          record_keyspace_miss(ctx, key)
+        end
+
+        result
       end
 
       @doc false
@@ -735,19 +795,22 @@ defmodule Ferricstore.Store.Router.Part02 do
 
       defp do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, validate_blob_ref?) do
         now = HLC.now_ms()
+        bookkeeping = hot_read_bookkeeping_start(ctx)
 
-        {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, hot_hits}} =
-          Enum.map_reduce(keys, {[], 0, [], 0, []}, fn key,
-                                                       {cold_entries, cold_count, waraft_entries,
-                                                        waraft_count, hot_hits} ->
+        {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, bookkeeping}} =
+          Enum.map_reduce(keys, {[], 0, [], 0, bookkeeping}, fn key,
+                                                                {cold_entries, cold_count,
+                                                                 waraft_entries, waraft_count,
+                                                                 bookkeeping} ->
             idx = shard_for(ctx, key)
             keydir = resolve_keydir(ctx, idx)
 
             case ets_get_full(ctx, idx, keydir, key, now) do
               {:hit, value, lfu} ->
+                bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, key, lfu)
+
                 {{:value, value},
-                 {cold_entries, cold_count, waraft_entries, waraft_count,
-                  [{keydir, key, lfu} | hot_hits]}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               {:cold, file_id, offset, value_size}
               when valid_cold_location(file_id, offset, value_size) ->
@@ -767,7 +830,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                   cold_count,
                   waraft_entries,
                   waraft_count,
-                  hot_hits,
+                  bookkeeping,
                   now
                 )
 
@@ -776,7 +839,8 @@ defmodule Ferricstore.Store.Router.Part02 do
                 entry = {ctx, idx, keydir, key, file_id, offset, value_size}
 
                 {{:waraft, waraft_count},
-                 {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1, hot_hits}}
+                 {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1,
+                  bookkeeping}}
 
               {:cold, _file_id, _offset, _value_size} ->
                 result =
@@ -792,19 +856,19 @@ defmodule Ferricstore.Store.Router.Part02 do
                 end
 
                 {{:value, result},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :expired ->
                 record_keyspace_miss(ctx, key)
 
                 {{:value, nil},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :miss ->
                 record_keyspace_miss(ctx, key)
 
                 {{:value, nil},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :no_table ->
                 result =
@@ -820,11 +884,11 @@ defmodule Ferricstore.Store.Router.Part02 do
                 end
 
                 {{:value, result},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, hot_hits}}
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
             end
           end)
 
-        sampled_read_bookkeeping_batch(ctx, Enum.reverse(hot_hits), length(hot_hits))
+        hot_read_bookkeeping_finish(ctx, bookkeeping)
 
         cold_values =
           cold_entries

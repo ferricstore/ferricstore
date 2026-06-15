@@ -8,7 +8,7 @@ defmodule Ferricstore.Store.ListOps do
   `L:redis_key\\0{encoded_position} -> element_value`
 
   A metadata key stores length and position boundaries:
-  `LM:redis_key -> :erlang.term_to_binary({length, next_left_pos, next_right_pos})`
+  `LM:redis_key -> Erlang term metadata`
   """
 
   alias Ferricstore.Store.CompoundKey
@@ -130,7 +130,11 @@ defmodule Ferricstore.Store.ListOps do
     end
   end
 
-  defp decode_meta(binary) when is_binary(binary) do
+  @doc false
+  def encode_meta(meta), do: :erlang.term_to_binary(meta)
+
+  @doc false
+  def decode_meta(binary) when is_binary(binary) do
     case :erlang.binary_to_term(binary, [:safe]) do
       {len, left_pos, right_pos}
       when is_integer(len) and len >= 0 and is_integer(left_pos) and is_integer(right_pos) ->
@@ -143,10 +147,10 @@ defmodule Ferricstore.Store.ListOps do
     _ -> nil
   end
 
-  defp decode_meta(_), do: nil
+  def decode_meta(_), do: nil
 
   defp write_meta(key, store, {_len, _left, _right} = meta) do
-    Ops.compound_put(store, key, CompoundKey.list_meta_key(key), :erlang.term_to_binary(meta), 0)
+    Ops.compound_put(store, key, CompoundKey.list_meta_key(key), encode_meta(meta), 0)
     |> write_result()
   end
 
@@ -164,6 +168,19 @@ defmodule Ferricstore.Store.ListOps do
 
   defp ordered_values(key, store) do
     sorted_elements(key, store) |> Enum.map(fn {_pos, value} -> value end)
+  end
+
+  defp single_boundary_values(key, store, left_pos) do
+    single_position_values(key, store, left_pos + @position_step)
+  end
+
+  defp single_position_values(key, store, pos) do
+    compound_key = CompoundKey.list_element(key, pos)
+
+    case Ops.compound_get(store, key, compound_key) do
+      nil -> ordered_values(key, store)
+      value -> [value]
+    end
   end
 
   # Converts a position (float from old data or integer from new) to integer.
@@ -286,6 +303,25 @@ defmodule Ferricstore.Store.ListOps do
 
   # LRANGE
   defp do_execute(_key, _store, nil, {:lrange, _, _}), do: []
+
+  defp do_execute(key, store, {len, left_pos, _right_pos}, {:lrange, 0, 0}) when len > 0 do
+    single_boundary_values(key, store, left_pos)
+  end
+
+  defp do_execute(key, store, {len, _left_pos, right_pos}, {:lrange, -1, -1}) when len > 0 do
+    single_position_values(key, store, right_pos - @position_step)
+  end
+
+  defp do_execute(key, store, {1, left_pos, _right_pos}, {:lrange, start, stop}) do
+    ns = normalize_index(start, 1)
+    ne = normalize_index(stop, 1)
+
+    cond do
+      ns > ne -> []
+      ns >= 1 -> []
+      true -> single_boundary_values(key, store, left_pos)
+    end
+  end
 
   defp do_execute(key, store, {len, _, _}, {:lrange, start, stop}) do
     ns = normalize_index(start, len)
@@ -477,10 +513,16 @@ defmodule Ferricstore.Store.ListOps do
         end
 
       value ->
-        with :ok <-
-               delete_elements_and_update_meta(key, store, [{pos, value}], fn ->
-                 update_single_pop_meta(key, store, len, pos, direction, {left_pos, right_pos})
-               end) do
+        delete_result =
+          if len == 1 do
+            delete_elements_and_meta(key, store, [{pos, value}])
+          else
+            delete_elements_and_update_meta(key, store, [{pos, value}], fn ->
+              update_single_pop_meta(key, store, len, pos, direction, {left_pos, right_pos})
+            end)
+          end
+
+        with :ok <- delete_result do
           value
         end
     end
@@ -508,10 +550,16 @@ defmodule Ferricstore.Store.ListOps do
 
       popped_values = Enum.map(to_pop, fn {_, val} -> val end)
 
-      with :ok <-
-             delete_elements_and_update_meta(key, store, to_pop, fn ->
-               update_or_delete_meta(key, store, len - actual_count, remaining)
-             end) do
+      delete_result =
+        if remaining == [] do
+          delete_elements_and_meta(key, store, to_pop)
+        else
+          delete_elements_and_update_meta(key, store, to_pop, fn ->
+            update_meta_from_remaining(key, store, len - actual_count, remaining)
+          end)
+        end
+
+      with :ok <- delete_result do
         case count do
           1 -> List.first(popped_values)
           _ -> popped_values
@@ -532,10 +580,16 @@ defmodule Ferricstore.Store.ListOps do
 
       popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
 
-      with :ok <-
-             delete_elements_and_update_meta(key, store, to_pop, fn ->
-               update_or_delete_meta(key, store, len - actual_count, remaining)
-             end) do
+      delete_result =
+        if remaining == [] do
+          delete_elements_and_meta(key, store, to_pop)
+        else
+          delete_elements_and_update_meta(key, store, to_pop, fn ->
+            update_meta_from_remaining(key, store, len - actual_count, remaining)
+          end)
+        end
+
+      with :ok <- delete_result do
         case count do
           1 -> List.first(popped_values)
           _ -> popped_values
@@ -667,6 +721,17 @@ defmodule Ferricstore.Store.ListOps do
 
     store
     |> Ops.compound_batch_delete(key, compound_keys)
+    |> write_result()
+  end
+
+  defp delete_elements_and_meta(key, store, elements) do
+    compound_keys =
+      Enum.map(elements, fn {pos, _value} ->
+        CompoundKey.list_element(key, pos)
+      end)
+
+    store
+    |> Ops.compound_batch_delete(key, compound_keys ++ [CompoundKey.list_meta_key(key)])
     |> write_result()
   end
 

@@ -875,6 +875,45 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
       end
 
       defp with_segment_projection_command_time(_command, fun), do: fun.()
+
+      defp emit_segment_projection_apply_telemetry(
+             sm_state,
+             command,
+             started_at,
+             result,
+             applied_count
+           ) do
+        :telemetry.execute(
+          [:ferricstore, :waraft, :segment_projection, :apply],
+          %{
+            duration_us: segment_projection_duration_us(started_at),
+            applied_count: max(applied_count, 0)
+          },
+          %{
+            shard_index: Map.get(sm_state, :shard_index, :unknown),
+            command_shape: segment_projection_command_shape(command),
+            result: segment_projection_result_class(result)
+          }
+        )
+      rescue
+        _ -> :ok
+      end
+
+      defp segment_projection_duration_us(started_at) do
+        System.monotonic_time()
+        |> Kernel.-(started_at)
+        |> System.convert_time_unit(:native, :microsecond)
+        |> max(0)
+      end
+
+      defp segment_projection_command_shape(command)
+           when is_tuple(command) and tuple_size(command) > 0,
+           do: elem(command, 0)
+
+      defp segment_projection_command_shape(_command), do: :unknown
+
+      defp segment_projection_result_class({:error, _reason}), do: :error
+      defp segment_projection_result_class(_result), do: :ok
     end
   end
 end

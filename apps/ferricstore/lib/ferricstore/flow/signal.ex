@@ -24,7 +24,8 @@ defmodule Ferricstore.Flow.Signal do
 
   def run(_ctx, _id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
-  defp attrs(id, opts) do
+  @doc false
+  def attrs(id, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          {:ok, signal} <- required_binary(opts, :signal),

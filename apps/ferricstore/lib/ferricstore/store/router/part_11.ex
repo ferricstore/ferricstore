@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.Router.Part11 do
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
       alias Ferricstore.Store.Router
+      alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
 
@@ -141,18 +142,42 @@ defmodule Ferricstore.Store.Router.Part11 do
       end
 
       defp direct_flow_index_rank_range_many(ctx, requests) do
-        Enum.reduce_while(requests, {:ok, []}, fn {key, start_idx, stop_idx, reverse?},
-                                                  {:ok, acc} ->
-          idx = shard_for(ctx, key)
+        requests
+        |> Enum.with_index()
+        |> Enum.group_by(fn {{key, _start_idx, _stop_idx, _reverse?}, _index} ->
+          shard_for(ctx, key)
+        end)
+        |> Enum.reduce_while({:ok, %{}}, fn {idx, indexed_requests}, {:ok, acc} ->
+          shard_requests = Enum.map(indexed_requests, fn {request, _index} -> request end)
 
-          case direct_flow_index_rank_range(ctx, idx, key, start_idx, stop_idx, reverse?) do
-            {:ok, result} -> {:cont, {:ok, [result | acc]}}
-            :unavailable -> {:halt, :unavailable}
+          case direct_flow_index_read(ctx, idx, fn native ->
+                 Enum.map(shard_requests, fn {key, start_idx, stop_idx, reverse?} ->
+                   NativeFlowIndex.rank_range(native, key, start_idx, stop_idx, reverse?)
+                 end)
+               end) do
+            {:ok, results} when is_list(results) ->
+              indexed =
+                indexed_requests
+                |> Enum.zip(results)
+                |> Enum.reduce(acc, fn {{_request, original_index}, result}, next_acc ->
+                  Map.put(next_acc, original_index, result)
+                end)
+
+              {:cont, {:ok, indexed}}
+
+            :unavailable ->
+              {:halt, :unavailable}
+
+            _other ->
+              {:halt, :unavailable}
           end
         end)
         |> case do
-          {:ok, results} -> {:ok, Enum.reverse(results)}
-          :unavailable -> :unavailable
+          {:ok, indexed} ->
+            {:ok, Enum.map(0..(length(requests) - 1)//1, &Map.fetch!(indexed, &1))}
+
+          :unavailable ->
+            :unavailable
         end
       end
 
@@ -163,17 +188,38 @@ defmodule Ferricstore.Store.Router.Part11 do
       end
 
       defp direct_flow_index_count_all_many(ctx, keys) do
-        Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
-          idx = shard_for(ctx, key)
+        keys
+        |> Enum.with_index()
+        |> Enum.group_by(fn {key, _index} -> shard_for(ctx, key) end)
+        |> Enum.reduce_while({:ok, %{}}, fn {idx, indexed_keys}, {:ok, acc} ->
+          shard_keys = Enum.map(indexed_keys, fn {key, _index} -> key end)
 
-          case direct_flow_index_count_all(ctx, idx, key) do
-            {:ok, count} -> {:cont, {:ok, [count | acc]}}
-            :unavailable -> {:halt, :unavailable}
+          case direct_flow_index_read(ctx, idx, fn native ->
+                 NativeFlowIndex.count_many(native, shard_keys)
+               end) do
+            {:ok, counts} when is_list(counts) ->
+              indexed =
+                indexed_keys
+                |> Enum.zip(counts)
+                |> Enum.reduce(acc, fn {{_key, original_index}, count}, next_acc ->
+                  Map.put(next_acc, original_index, count)
+                end)
+
+              {:cont, {:ok, indexed}}
+
+            :unavailable ->
+              {:halt, :unavailable}
+
+            _other ->
+              {:halt, :unavailable}
           end
         end)
         |> case do
-          {:ok, counts} -> {:ok, Enum.reverse(counts)}
-          :unavailable -> :unavailable
+          {:ok, indexed} ->
+            {:ok, Enum.map(0..(length(keys) - 1)//1, &Map.fetch!(indexed, &1))}
+
+          :unavailable ->
+            :unavailable
         end
       end
 
@@ -199,17 +245,33 @@ defmodule Ferricstore.Store.Router.Part11 do
       end
 
       defp direct_zset_score_range(ctx, idx, redis_key, min_bound, max_bound, reverse?) do
-        ctx
-        |> direct_zset_sorted_members(idx, redis_key, reverse?)
-        |> Enum.filter(fn {_member, score} ->
-          zset_score_gte_bound?(score, min_bound) and zset_score_lte_bound?(score, max_bound)
-        end)
+        case direct_zset_index_read(ctx, idx, redis_key, fn index, _lookup ->
+               ZSetIndex.range(index, redis_key, min_bound, max_bound, reverse?)
+             end) do
+          {:ok, members} ->
+            members
+
+          :unavailable ->
+            ctx
+            |> direct_zset_sorted_members(idx, redis_key, reverse?)
+            |> Enum.filter(fn {_member, score} ->
+              zset_score_gte_bound?(score, min_bound) and zset_score_lte_bound?(score, max_bound)
+            end)
+        end
       end
 
       defp direct_zset_score_count(ctx, idx, redis_key, min_bound, max_bound) do
-        ctx
-        |> direct_zset_score_range(idx, redis_key, min_bound, max_bound, false)
-        |> length()
+        case direct_zset_index_read(ctx, idx, redis_key, fn index, lookup ->
+               ZSetIndex.count(index, lookup, redis_key, min_bound, max_bound)
+             end) do
+          {:ok, count} ->
+            count
+
+          :unavailable ->
+            ctx
+            |> direct_zset_score_range(idx, redis_key, min_bound, max_bound, false)
+            |> length()
+        end
       end
 
       defp direct_zset_rank_range(_ctx, _idx, _redis_key, start_idx, stop_idx, _reverse?)
@@ -217,15 +279,44 @@ defmodule Ferricstore.Store.Router.Part11 do
            do: []
 
       defp direct_zset_rank_range(ctx, idx, redis_key, start_idx, stop_idx, reverse?) do
-        ctx
-        |> direct_zset_sorted_members(idx, redis_key, reverse?)
-        |> Enum.slice(start_idx..stop_idx)
+        case direct_zset_index_read(ctx, idx, redis_key, fn index, _lookup ->
+               ZSetIndex.rank_range(index, redis_key, start_idx, stop_idx, reverse?)
+             end) do
+          {:ok, members} ->
+            members
+
+          :unavailable ->
+            ctx
+            |> direct_zset_sorted_members(idx, redis_key, reverse?)
+            |> Enum.slice(start_idx..stop_idx)
+        end
       end
 
       defp direct_zset_member_rank(ctx, idx, redis_key, member, reverse?) do
-        ctx
-        |> direct_zset_sorted_members(idx, redis_key, reverse?)
-        |> Enum.find_index(fn {candidate, _score} -> candidate == member end)
+        case direct_zset_index_read(ctx, idx, redis_key, fn index, lookup ->
+               ZSetIndex.member_rank(index, lookup, redis_key, member, reverse?)
+             end) do
+          {:ok, rank} ->
+            rank
+
+          :unavailable ->
+            ctx
+            |> direct_zset_sorted_members(idx, redis_key, reverse?)
+            |> Enum.find_index(fn {candidate, _score} -> candidate == member end)
+        end
+      end
+
+      defp direct_zset_index_read(ctx, idx, redis_key, fun) do
+        {index, lookup} = ZSetIndex.table_names(ctx.name, idx)
+
+        if :ets.info(index) != :undefined and :ets.info(lookup) != :undefined and
+             ZSetIndex.ready?(lookup, redis_key) do
+          {:ok, fun.(index, lookup)}
+        else
+          :unavailable
+        end
+      rescue
+        ArgumentError -> :unavailable
       end
 
       defp direct_zset_sorted_members(ctx, idx, redis_key, false) do

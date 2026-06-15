@@ -106,26 +106,19 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailActions do
           assert String.contains?(html, ~s(href="#flow-event-))
           assert String.contains?(html, ~s(id="flow-event-))
           assert String.contains?(html, "ready")
-          assert String.contains?(html, "State graph")
-          assert String.contains?(html, ~s(class="flow-timeline-graph"))
-          assert String.contains?(html, "<svg")
-          assert String.contains?(html, ~s(class="flow-timeline-path"))
-          assert String.contains?(html, ~s(class="flow-timeline-duration-segment))
-          assert String.contains?(html, ~s(class="flow-timeline-node))
-          assert String.contains?(html, ~s(class="flow-timeline-lane-label"))
-          assert String.contains?(html, ~s(class="flow-timeline-node flow-timeline-node-retry"))
-          assert String.contains?(html, ~s(class="flow-timeline-duration-segment bar-red"))
-          assert Regex.match?(~r/class="flow-timeline-node-label"[^>]*>ready<\/text>/, html)
+          assert String.contains?(html, "Step Waterfall")
+          assert String.contains?(html, "Step durations")
+          assert String.contains?(html, ~s(class="flow-step-waterfall"))
+          assert String.contains?(html, ~s(class="flow-step-waterfall-row"))
+          assert String.contains?(html, ~s(class="flow-step-waterfall-track"))
+          assert String.contains?(html, ~s(class="flow-step-waterfall-marker"))
+          assert String.contains?(html, ~s(class="flow-step-waterfall-bar bar-red"))
+          assert Regex.match?(~r/class="flow-step-waterfall-step"[^>]*>ready<\/span>/, html)
           assert String.contains?(html, "running")
           assert String.contains?(html, "100ms")
 
           refute Regex.match?(
-                   ~r/class="flow-timeline-lane-label"[^>]*>Retry<\/text>/,
-                   html
-                 )
-
-          refute Regex.match?(
-                   ~r/class="flow-timeline-node-label"[^>]*>Transitioned<\/text>/,
+                   ~r/class="flow-step-waterfall-step"[^>]*>Transitioned<\/span>/,
                    html
                  )
 
