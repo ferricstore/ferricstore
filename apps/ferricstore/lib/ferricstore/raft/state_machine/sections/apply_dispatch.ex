@@ -957,6 +957,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_reschedule, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_reschedule, attrs, fn ->
+          do_flow_reschedule(state, attrs)
+        end)
+      end
+
+      def apply(meta, {:flow_schedule_replace, _key, attrs}, state) when is_map(attrs) do
+        apply_flow_pending_with_time(meta, state, :flow_schedule_replace, attrs, fn ->
+          do_flow_schedule_replace(state, attrs)
+        end)
+      end
+
       def apply(meta, {:flow_start_and_claim, _key, attrs}, state) when is_map(attrs) do
         apply_flow_pending_with_time(meta, state, :flow_start_and_claim, attrs, fn ->
           do_flow_start_and_claim(state, attrs)

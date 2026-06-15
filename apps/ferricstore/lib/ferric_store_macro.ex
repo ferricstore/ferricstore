@@ -469,6 +469,38 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_transition(__instance__(), id, from_state, to_state, opts)
       end
 
+      def flow_schedule_create(id, opts) do
+        FerricStore.Impl.flow_schedule_create(__instance__(), id, opts)
+      end
+
+      def flow_schedule_get(id, opts \\ []) do
+        FerricStore.Impl.flow_schedule_get(__instance__(), id, opts)
+      end
+
+      def flow_schedule_fire(id, opts \\ []) do
+        FerricStore.Impl.flow_schedule_fire(__instance__(), id, opts)
+      end
+
+      def flow_schedule_pause(id, opts \\ []) do
+        FerricStore.Impl.flow_schedule_pause(__instance__(), id, opts)
+      end
+
+      def flow_schedule_resume(id, opts \\ []) do
+        FerricStore.Impl.flow_schedule_resume(__instance__(), id, opts)
+      end
+
+      def flow_schedule_list(opts \\ []) do
+        FerricStore.Impl.flow_schedule_list(__instance__(), opts)
+      end
+
+      def flow_schedule_delete(id, opts \\ []) do
+        FerricStore.Impl.flow_schedule_delete(__instance__(), id, opts)
+      end
+
+      def flow_schedule_fire_due(opts \\ []) do
+        FerricStore.Impl.flow_schedule_fire_due(__instance__(), opts)
+      end
+
       def flow_transition_many(partition_key, from_state, to_state, items, opts \\ []) do
         FerricStore.Impl.flow_transition_many(
           __instance__(),

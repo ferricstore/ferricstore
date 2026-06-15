@@ -1,0 +1,20 @@
+<% data = assigns.data %>
+<%= page_head("FerricFlow Schedules - FerricStore", nil) %>
+<body>
+  <div class="layout">
+    <%= render_sidebar_static("flow") %>
+    <main class="main-content">
+      <%= render_subpage_header("FerricFlow Schedules") %>
+      <div class="content">
+        <%= render_page_intro("FerricFlow Schedules", "Inspect durable schedules, pause/resume active campaigns, manually fire a schedule, and delete schedules that should no longer run.") %>
+        <%= render_flow_subnav("schedules") %>
+        <%= render_flow_schedules_flash(Map.get(data, :flash)) %>
+        <%= render_flow_schedules_summary(data) %>
+        <%= render_flow_schedules_filters(data) %>
+        <%= render_flow_failed_schedules(Map.get(data, :failed_schedules, [])) %>
+        <%= render_flow_schedules_table(Map.get(data, :schedules, [])) %>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

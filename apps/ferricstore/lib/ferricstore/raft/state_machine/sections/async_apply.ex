@@ -1050,6 +1050,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
+      defp apply_single(state, {:flow_reschedule, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_reschedule, attrs, fn ->
+          do_flow_reschedule(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_schedule_replace, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_schedule_replace, attrs, fn ->
+          do_flow_schedule_replace(state, attrs)
+        end)
+      end
+
       defp apply_single(state, {:flow_start_and_claim, _key, attrs}) do
         apply_flow_single_with_telemetry(state, :flow_start_and_claim, attrs, fn ->
           do_flow_start_and_claim(state, attrs)

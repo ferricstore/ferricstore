@@ -30,6 +30,7 @@ config :ferricstore, :keydir_max_ram, 100_000_000_000
 config :ferricstore, :eviction_policy, :volatile_lru
 config :ferricstore, :memory_guard_interval_ms, 5_000
 config :ferricstore, :operational_guard_enabled, false
+config :ferricstore, :flow_scheduler_enabled, false
 
 # Merge: use a very long check interval to prevent periodic merge timers
 # from firing during tests. Tests that need to trigger merges use

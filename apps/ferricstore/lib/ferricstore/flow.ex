@@ -28,6 +28,11 @@ defmodule Ferricstore.Flow do
     })
   end
 
+  @doc false
+  def create_internal(ctx, id, opts) when is_binary(id) and is_list(opts) do
+    create(ctx, id, Ferricstore.Flow.Internal.put(opts))
+  end
+
   def start_and_claim(ctx, id, type, initial_state, opts)
       when is_binary(id) and is_binary(type) and is_binary(initial_state) and is_list(opts) do
     started = flow_start_time()
@@ -347,6 +352,7 @@ defmodule Ferricstore.Flow do
   def get(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
     with :ok <- validate_id(id),
          :ok <- validate_opts(opts),
+         :ok <- Ferricstore.Flow.Internal.reject_reserved_id(id, opts),
          {:ok, payload_return} <- payload_return_opts(opts, false),
          {:ok, named_values} <- named_value_return_opts(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -870,6 +876,21 @@ defmodule Ferricstore.Flow do
       end
 
     FlowTelemetry.observe(:retry, started, result, %{flow_id: id, _count: 1})
+  end
+
+  @doc false
+  def reschedule(ctx, id, lease_token, opts)
+      when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.reschedule_attrs(id, lease_token, opts) do
+        ctx
+        |> Router.flow_reschedule(attrs)
+        |> maybe_notify_claim_waiters(attrs, :state)
+      end
+
+    FlowTelemetry.observe(:reschedule, started, result, %{flow_id: id, _count: 1})
   end
 
   def retry_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do

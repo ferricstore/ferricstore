@@ -131,6 +131,14 @@ defmodule FerricstoreServer.Native.Commands do
   @op_flow_step_continue 0x0222
   @op_flow_start_and_claim 0x0223
   @op_flow_run_steps_many 0x0224
+  @op_flow_schedule_create 0x0225
+  @op_flow_schedule_get 0x0226
+  @op_flow_schedule_delete 0x0227
+  @op_flow_schedule_fire_due 0x0228
+  @op_flow_schedule_list 0x0229
+  @op_flow_schedule_fire 0x022A
+  @op_flow_schedule_pause 0x022B
+  @op_flow_schedule_resume 0x022C
 
   @control_commands %{
     @op_hello => "HELLO",
@@ -241,7 +249,15 @@ defmodule FerricstoreServer.Native.Commands do
     @op_flow_retention_cleanup => "FLOW.RETENTION_CLEANUP",
     @op_flow_step_continue => "FLOW.STEP_CONTINUE",
     @op_flow_start_and_claim => "FLOW.START_AND_CLAIM",
-    @op_flow_run_steps_many => "FLOW.RUN_STEPS_MANY"
+    @op_flow_run_steps_many => "FLOW.RUN_STEPS_MANY",
+    @op_flow_schedule_create => "FLOW.SCHEDULE.CREATE",
+    @op_flow_schedule_get => "FLOW.SCHEDULE.GET",
+    @op_flow_schedule_delete => "FLOW.SCHEDULE.DELETE",
+    @op_flow_schedule_fire_due => "FLOW.SCHEDULE.FIRE_DUE",
+    @op_flow_schedule_list => "FLOW.SCHEDULE.LIST",
+    @op_flow_schedule_fire => "FLOW.SCHEDULE.FIRE",
+    @op_flow_schedule_pause => "FLOW.SCHEDULE.PAUSE",
+    @op_flow_schedule_resume => "FLOW.SCHEDULE.RESUME"
   }
 
   @commands @control_commands
@@ -262,6 +278,7 @@ defmodule FerricstoreServer.Native.Commands do
 
   @known_flow_options %{
     "after_ms" => :after_ms,
+    "at_ms" => :at_ms,
     "attempt" => :attempt,
     "backoff" => :backoff,
     "base_ms" => :base_ms,
@@ -270,13 +287,16 @@ defmodule FerricstoreServer.Native.Commands do
     "consistent_projection" => :consistent_projection,
     "correlation_id" => :correlation_id,
     "count" => :count,
+    "cron" => :cron,
     "delay_ms" => :delay_ms,
     "drop_values" => :drop_values,
     "due_after_ms" => :due_after_ms,
+    "end_at_ms" => :end_at_ms,
     "error" => :error,
     "error_ref" => :error_ref,
     "exhaust_to" => :exhaust_to,
     "failure" => :failure,
+    "fire_at_ms" => :fire_at_ms,
     "fencing_token" => :fencing_token,
     "from_state" => :from_state,
     "full" => :full,
@@ -287,17 +307,20 @@ defmodule FerricstoreServer.Native.Commands do
     "history_hot_max_events" => :history_hot_max_events,
     "history_max_events" => :history_max_events,
     "id" => :id,
+    "id_prefix" => :id_prefix,
     "idempotency_key" => :idempotency_key,
     "if_state" => :if_state,
     "include_cold" => :include_cold,
     "independent" => :independent,
     "initial_state" => :initial_state,
+    "kind" => :kind,
     "lease_ms" => :lease_ms,
     "lease_token" => :lease_token,
     "limit" => :limit,
     "local_cache" => :local_cache,
     "max_attempts" => :max_attempts,
     "max_bytes" => :max_bytes,
+    "max_fires" => :max_fires,
     "max_ms" => :max_ms,
     "max_retries" => :max_retries,
     "name" => :name,
@@ -306,6 +329,9 @@ defmodule FerricstoreServer.Native.Commands do
     "on_parent_closed" => :on_parent_closed,
     "override" => :override,
     "override_values" => :override_values,
+    "overlap_policy" => :overlap_policy,
+    "overlap_retry_ms" => :overlap_retry_ms,
+    "overwrite" => :overwrite,
     "owner_flow_id" => :owner_flow_id,
     "parent_id" => :parent_id,
     "partition_key" => :partition_key,
@@ -328,10 +354,14 @@ defmodule FerricstoreServer.Native.Commands do
     "signal" => :signal,
     "state" => :state,
     "states" => :states,
+    "start_at_ms" => :start_at_ms,
     "steps" => :steps,
     "success" => :success,
     "to_state" => :to_state,
     "to_ms" => :to_ms,
+    "target" => :target,
+    "target_type" => :target_type,
+    "timezone" => :timezone,
     "transition_to" => :transition_to,
     "ttl_ms" => :ttl_ms,
     "type" => :type,
@@ -346,12 +376,20 @@ defmodule FerricstoreServer.Native.Commands do
 
   @atom_values %{
     "all" => :all,
+    "allow" => :allow,
+    "cron" => :cron,
+    "delay" => :delay,
     "exponential" => :exponential,
+    "interval" => :interval,
     "linear" => :linear,
     "meta" => :meta,
     "none" => :none,
     "ok_on_success" => :ok_on_success,
-    "running" => :running
+    "one_shot" => :one_shot,
+    "fail_schedule" => :fail_schedule,
+    "queue_after_previous" => :queue_after_previous,
+    "running" => :running,
+    "skip" => :skip
   }
 
   @spec command_name(non_neg_integer()) :: binary() | nil
@@ -1145,6 +1183,46 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp do_execute(@op_flow_schedule_create, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, opts} <- flow_opts(payload, ["id"]) do
+      result_to_reply(FerricStore.Impl.flow_schedule_create(state.instance_ctx, id, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_schedule_get, payload, state),
+    do: flow_id_opts_call(payload, state, &FerricStore.Impl.flow_schedule_get/3)
+
+  defp do_execute(@op_flow_schedule_fire, payload, state),
+    do: flow_id_opts_call(payload, state, &FerricStore.Impl.flow_schedule_fire/3)
+
+  defp do_execute(@op_flow_schedule_pause, payload, state),
+    do: flow_id_opts_call(payload, state, &FerricStore.Impl.flow_schedule_pause/3)
+
+  defp do_execute(@op_flow_schedule_resume, payload, state),
+    do: flow_id_opts_call(payload, state, &FerricStore.Impl.flow_schedule_resume/3)
+
+  defp do_execute(@op_flow_schedule_list, payload, state) do
+    with {:ok, opts} <- flow_opts(payload, []) do
+      result_to_reply(FerricStore.Impl.flow_schedule_list(state.instance_ctx, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_schedule_delete, payload, state),
+    do: flow_id_opts_call(payload, state, &FerricStore.Impl.flow_schedule_delete/3)
+
+  defp do_execute(@op_flow_schedule_fire_due, payload, state) do
+    with {:ok, opts} <- flow_opts(payload, []) do
+      result_to_reply(FerricStore.Impl.flow_schedule_fire_due(state.instance_ctx, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
   defp do_execute(_opcode, _payload, state),
     do: {:bad_request, "ERR native unsupported opcode", state}
 
@@ -1406,7 +1484,13 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_history,
               @op_flow_signal,
               @op_flow_rewind,
-              @op_flow_spawn_children
+              @op_flow_spawn_children,
+              @op_flow_schedule_create,
+              @op_flow_schedule_get,
+              @op_flow_schedule_fire,
+              @op_flow_schedule_pause,
+              @op_flow_schedule_resume,
+              @op_flow_schedule_delete
             ],
        do: binary_list([Map.get(payload, "id")])
 
@@ -1445,6 +1529,8 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_list,
               @op_flow_value_mget,
               @op_flow_policy_get,
+              @op_flow_schedule_get,
+              @op_flow_schedule_list,
               @op_cluster_keyslot,
               @op_ferricstore_key_info
             ],
@@ -1929,6 +2015,64 @@ defmodule FerricstoreServer.Native.Commands do
       "FLOW.RETENTION_CLEANUP" => %{
         "required" => [],
         "fields" => ["limit", "now_ms", "deadline_ms"]
+      },
+      "FLOW.SCHEDULE.CREATE" => %{
+        "required" => ["id", "target"],
+        "fields" => [
+          "id",
+          "kind",
+          "target",
+          "at_ms",
+          "delay_ms",
+          "start_at_ms",
+          "every_ms",
+          "cron",
+          "timezone",
+          "now_ms",
+          "overwrite",
+          "overlap_policy",
+          "overlap_retry_ms",
+          "max_fires",
+          "end_at_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.SCHEDULE.GET" => %{
+        "required" => ["id"],
+        "fields" => ["id", "deadline_ms"]
+      },
+      "FLOW.SCHEDULE.FIRE" => %{
+        "required" => ["id"],
+        "fields" => ["id", "now_ms", "fire_at_ms", "deadline_ms"]
+      },
+      "FLOW.SCHEDULE.PAUSE" => %{
+        "required" => ["id"],
+        "fields" => ["id", "now_ms", "deadline_ms"]
+      },
+      "FLOW.SCHEDULE.RESUME" => %{
+        "required" => ["id"],
+        "fields" => ["id", "now_ms", "deadline_ms"]
+      },
+      "FLOW.SCHEDULE.DELETE" => %{
+        "required" => ["id"],
+        "fields" => ["id", "now_ms", "deadline_ms"]
+      },
+      "FLOW.SCHEDULE.FIRE_DUE" => %{
+        "required" => [],
+        "fields" => ["now_ms", "worker", "limit", "lease_ms", "block_ms", "deadline_ms"]
+      },
+      "FLOW.SCHEDULE.LIST" => %{
+        "required" => [],
+        "fields" => [
+          "state",
+          "kind",
+          "target_type",
+          "timezone",
+          "from_ms",
+          "to_ms",
+          "count",
+          "deadline_ms"
+        ]
       }
     }
   end
@@ -5604,6 +5748,12 @@ defmodule FerricstoreServer.Native.Commands do
        do: Map.get(@atom_values, String.downcase(value), value)
 
   defp coerce_option_value(:return, value) when is_binary(value),
+    do: Map.get(@atom_values, String.downcase(value), value)
+
+  defp coerce_option_value(:kind, value) when is_binary(value),
+    do: Map.get(@atom_values, String.downcase(value), value)
+
+  defp coerce_option_value(:overlap_policy, value) when is_binary(value),
     do: Map.get(@atom_values, String.downcase(value), value)
 
   defp coerce_option_value(_key, value), do: value

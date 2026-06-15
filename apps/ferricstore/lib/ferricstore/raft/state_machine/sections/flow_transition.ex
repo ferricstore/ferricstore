@@ -72,6 +72,49 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         end
       end
 
+      defp do_flow_reschedule(
+             state,
+             %{id: id, lease_token: lease_token, state: logical_state, run_at_ms: run_at_ms} =
+               attrs
+           ) do
+        now_ms = flow_attrs_now_ms(attrs)
+        partition_key = Map.get(attrs, :partition_key)
+
+        with {:ok, record} <- flow_require_record(state, id, partition_key),
+             {:ok, record, next} <-
+               flow_prepare_reschedule_existing_record(
+                 record,
+                 attrs,
+                 lease_token,
+                 logical_state,
+                 run_at_ms,
+                 now_ms
+               ) do
+          flow_apply_reschedule(state, record, next, partition_key, now_ms, attrs)
+        end
+      end
+
+      defp do_flow_schedule_replace(
+             state,
+             %{id: id, type: expected_type, state: logical_state, run_at_ms: run_at_ms} = attrs
+           ) do
+        now_ms = flow_attrs_now_ms(attrs)
+        partition_key = Map.get(attrs, :partition_key)
+
+        with {:ok, record} <- flow_require_record(state, id, partition_key),
+             :ok <- flow_require_schedule_replaceable(record, expected_type, now_ms),
+             {:ok, record, next} <-
+               flow_prepare_schedule_replace_existing_record(
+                 record,
+                 attrs,
+                 logical_state,
+                 run_at_ms,
+                 now_ms
+               ) do
+          flow_apply_transition(state, record, next, partition_key, now_ms, attrs)
+        end
+      end
+
       defp do_flow_step_continue(
              state,
              %{
@@ -503,6 +546,138 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         do: {:error, "ERR flow running state is only entered by FLOW.CLAIM_DUE"}
 
       defp flow_reject_running_transition(_to_state), do: :ok
+
+      defp flow_prepare_reschedule_existing_record(
+             record,
+             attrs,
+             lease_token,
+             logical_state,
+             run_at_ms,
+             now_ms
+           ) do
+        with :ok <- flow_require_running_lease(record, lease_token),
+             :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
+             :ok <- flow_require_step_run_state(record, logical_state),
+             :ok <- flow_reject_terminal_transition(logical_state) do
+          version = Map.fetch!(record, :version) + 1
+          id = Map.fetch!(record, :id)
+          partition_key = Map.get(record, :partition_key)
+
+          with {:ok, value_refs} <-
+                 flow_named_value_refs(record, attrs, id, version, partition_key) do
+            next =
+              %{
+                record
+                | state: logical_state,
+                  run_state: nil,
+                  version: version,
+                  updated_at_ms: now_ms,
+                  next_run_at_ms: run_at_ms,
+                  priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
+                  payload_ref:
+                    flow_value_ref(
+                      attrs,
+                      :payload,
+                      id,
+                      version,
+                      partition_key,
+                      Map.get(record, :payload_ref)
+                    ),
+                  ttl_ms: nil,
+                  terminal_retention_until_ms: nil,
+                  lease_owner: nil,
+                  lease_token: nil,
+                  lease_deadline_ms: 0
+              }
+              |> flow_put_record_value_refs(value_refs)
+
+            with :ok <- flow_validate_claim_next_record_keys(next) do
+              {:ok, record, next}
+            end
+          end
+        end
+      end
+
+      defp flow_require_schedule_replaceable(nil, _expected_type, _now_ms),
+        do: {:error, "ERR flow schedule not found"}
+
+      defp flow_require_schedule_replaceable(record, expected_type, now_ms) do
+        cond do
+          Map.get(record, :type) != expected_type ->
+            {:error, "ERR flow schedule not found"}
+
+          flow_live_lease?(record, now_ms) ->
+            {:error, "ERR flow schedule is currently leased"}
+
+          true ->
+            :ok
+        end
+      end
+
+      defp flow_live_lease?(record, now_ms) do
+        lease_token = Map.get(record, :lease_token)
+
+        is_binary(lease_token) and lease_token != "" and
+          Map.get(record, :lease_deadline_ms, 0) > now_ms
+      end
+
+      defp flow_prepare_schedule_replace_existing_record(
+             record,
+             attrs,
+             logical_state,
+             run_at_ms,
+             now_ms
+           ) do
+        version = Map.fetch!(record, :version) + 1
+        id = Map.fetch!(record, :id)
+        partition_key = Map.get(record, :partition_key)
+
+        with {:ok, value_refs} <-
+               flow_named_value_refs(record, attrs, id, version, partition_key) do
+          next =
+            record
+            |> Map.merge(%{
+              state: logical_state,
+              run_state: nil,
+              version: version,
+              attempts: 0,
+              fencing_token: Map.get(record, :fencing_token, 0) + 1,
+              updated_at_ms: now_ms,
+              next_run_at_ms: run_at_ms,
+              priority: Map.get(attrs, :priority) || 0,
+              payload_ref: flow_value_ref(attrs, :payload, id, version, partition_key),
+              value_refs: value_refs,
+              ttl_ms: nil,
+              terminal_retention_until_ms: nil,
+              lease_owner: nil,
+              lease_token: nil,
+              lease_deadline_ms: 0,
+              result_ref: nil,
+              error_ref: nil
+            })
+
+          with :ok <- flow_validate_claim_next_record_keys(next) do
+            {:ok, record, next}
+          end
+        end
+      end
+
+      defp flow_apply_reschedule(state, record, next, partition_key, now_ms, attrs) do
+        plans = [{record, next}]
+
+        with :ok <- flow_put_record_values(state, next, attrs),
+             :ok <- flow_transition_move_indexes(state, plans),
+             :ok <-
+               flow_put_state_record(
+                 state,
+                 FlowKeys.state_key(next.id, partition_key),
+                 next
+               ),
+             :ok <- flow_history_put_planned(state, record, next, "rescheduled", now_ms),
+             :ok <- flow_after_history_put(state, next) do
+          :ok
+        end
+      end
 
       defp flow_apply_transition(state, record, next, partition_key, now_ms, attrs) do
         plans = [{record, next}]

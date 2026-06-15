@@ -243,6 +243,7 @@ defmodule Ferricstore.Application do
             Ferricstore.PubSub,
             Ferricstore.FetchOrCompute,
             {Ferricstore.OperationalGuard, instance_ctx: default_ctx},
+            {Ferricstore.Flow.Scheduler, ctx: default_ctx},
             Ferricstore.Flow.RetentionSweeper,
             {Ferricstore.Store.BlobGCSweeper, instance_ctx: default_ctx},
             {Ferricstore.MemoryGuard, memory_guard_opts()},

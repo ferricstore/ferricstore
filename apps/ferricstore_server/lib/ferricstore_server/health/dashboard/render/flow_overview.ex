@@ -55,6 +55,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
        ]},
       {"Operate",
        [
+         {"schedules", "/dashboard/flow/schedules", "Schedules",
+          "Durable schedule list, pause/resume/delete, and manual fire"},
          {"policies", "/dashboard/flow/policies", "Policies",
           "Retry and retention policy editor"},
          {"retention", "/dashboard/flow/retention", "Retention",

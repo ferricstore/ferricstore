@@ -14,7 +14,7 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   `claim_due` tests.
   """
 
-  alias Ferricstore.Flow.ClaimWaiters
+  alias Ferricstore.Flow.{ClaimWaiters, Internal}
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Store.Router
 
@@ -65,6 +65,7 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   def result(ctx, type, opts, cold_due_mode) do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
+         :ok <- Internal.reject_reserved_type(type, opts),
          {:ok, state} <- optional_claim_states(opts),
          {:ok, worker} <- required_binary(opts, :worker),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),

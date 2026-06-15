@@ -486,6 +486,30 @@ defmodule FerricStore.Impl do
   def flow_retry(ctx, id, lease_token, opts),
     do: Ferricstore.Flow.retry(ctx, id, lease_token, opts)
 
+  def flow_schedule_create(ctx, id, opts),
+    do: Ferricstore.Flow.Schedule.create(ctx, id, opts)
+
+  def flow_schedule_get(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.Schedule.get(ctx, id, opts)
+
+  def flow_schedule_fire(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.Schedule.fire(ctx, id, opts)
+
+  def flow_schedule_pause(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.Schedule.pause(ctx, id, opts)
+
+  def flow_schedule_resume(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.Schedule.resume(ctx, id, opts)
+
+  def flow_schedule_list(ctx, opts \\ []),
+    do: Ferricstore.Flow.Schedule.list(ctx, opts)
+
+  def flow_schedule_delete(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.Schedule.delete(ctx, id, opts)
+
+  def flow_schedule_fire_due(ctx, opts \\ []),
+    do: Ferricstore.Flow.Schedule.fire_due(ctx, opts)
+
   def flow_fail(ctx, id, lease_token, opts \\ []),
     do: Ferricstore.Flow.fail(ctx, id, lease_token, opts)
 
