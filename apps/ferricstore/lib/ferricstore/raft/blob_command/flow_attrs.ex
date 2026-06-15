@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.BlobCommand.FlowAttrs do
     :flow_create,
     :flow_create_many,
     :flow_create_pipeline_batch,
+    :flow_run_steps_many,
     :flow_complete,
     :flow_complete_many,
     :flow_transition,

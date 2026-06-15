@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   @call_timeout 30_000
   @default_max_batch_size 10_000
   @default_hot_batch_window_ms 1
+  @default_generic_batch_window_ms 0
 
   defstruct [
     :shard_index,
@@ -222,7 +223,10 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       in_flight?(state, :batch) ->
         {:noreply, state}
 
-      window_ms == 0 or state.batch_slot.count >= state.hot_max_batch_size ->
+      window_ms == 0 ->
+        {:noreply, flush_hot_batch_slot(state)}
+
+      state.batch_slot.count >= state.hot_max_batch_size ->
         {:noreply, flush_hot_batch_slot(state)}
 
       true ->
@@ -558,7 +562,9 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     state =
       state.slots
       |> Map.keys()
-      |> Enum.reduce(state, fn prefix, acc -> flush_slot(acc, prefix, mode) end)
+      |> Enum.reduce(state, fn prefix, acc ->
+        flush_slot(acc, prefix, mode)
+      end)
 
     state
     |> flush_hot_batch_slot(mode)
@@ -611,39 +617,42 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   defp enqueue_hot_batch(state, from, commands, window_ms) do
     slot = state.batch_slot || new_hot_slot(window_ms, :flush_hot_batch)
+    reply_count = hot_batch_reply_count(commands)
 
     %{
       state
       | batch_slot: %{
           slot
           | groups: [{from, commands} | slot.groups],
-            count: slot.count + hot_batch_reply_count(commands)
+            count: slot.count + reply_count
         }
     }
   end
 
   defp enqueue_hot_put_batch(state, from, entries, window_ms) do
     slot = state.put_slot || new_hot_slot(window_ms, :flush_hot_put_batch)
+    count = length(entries)
 
     %{
       state
       | put_slot: %{
           slot
           | groups: [{from, entries} | slot.groups],
-            count: slot.count + length(entries)
+            count: slot.count + count
         }
     }
   end
 
   defp enqueue_hot_delete_batch(state, from, keys, window_ms) do
     slot = state.delete_slot || new_hot_slot(window_ms, :flush_hot_delete_batch)
+    count = length(keys)
 
     %{
       state
       | delete_slot: %{
           slot
           | groups: [{from, keys} | slot.groups],
-            count: slot.count + length(keys)
+            count: slot.count + count
         }
     }
   end
@@ -679,7 +688,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
       flush_fun = fn ->
         flush_started = System.monotonic_time()
-        result = safe_backend_call(:__commit_batch_direct__, [state.shard_index, commands])
+        {function, args} = generic_batch_commit(state.shard_index, commands)
+        result = safe_backend_call(function, args)
         flush_finished = System.monotonic_time()
         reply_hot_batch_groups(groups, result)
 
@@ -789,10 +799,17 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   defp in_flight?(state, kind), do: Map.has_key?(state.in_flight, kind)
 
-  defp flush_after_inflight({:prefix, prefix}, state), do: flush_slot(state, prefix)
-  defp flush_after_inflight(:batch, state), do: flush_hot_batch_slot(state)
-  defp flush_after_inflight(:put_batch, state), do: flush_hot_put_slot(state)
-  defp flush_after_inflight(:delete_batch, state), do: flush_hot_delete_slot(state)
+  defp flush_after_inflight({:prefix, prefix}, state),
+    do: flush_slot(state, prefix)
+
+  defp flush_after_inflight(:batch, state),
+    do: flush_hot_batch_slot(state)
+
+  defp flush_after_inflight(:put_batch, state),
+    do: flush_hot_put_slot(state)
+
+  defp flush_after_inflight(:delete_batch, state),
+    do: flush_hot_delete_slot(state)
 
   defp maybe_finish_control_waiters(state) do
     if batcher_idle?(state) do
@@ -912,11 +929,14 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   defp compact_delete_keys(_commands, _acc), do: :fallback
 
   defp commit_single_direct(shard_index, command) do
-    case backend_call(:__commit_batch_direct__, [shard_index, [command]]) do
-      {:ok, [reply]} -> reply
-      other -> other
-    end
+    backend_call(:__commit_single_direct__, [shard_index, command])
   end
+
+  defp generic_batch_commit(shard_index, [command]),
+    do: {:__commit_single_batch_direct__, [shard_index, command]}
+
+  defp generic_batch_commit(shard_index, commands),
+    do: {:__commit_batch_direct__, [shard_index, commands]}
 
   defp backend_call(function, args) do
     maybe_run_backend_call_hook(function)
@@ -952,7 +972,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   end
 
   defp generic_batch_window_ms do
-    Application.get_env(:ferricstore, :waraft_generic_batch_window_ms, 0)
+    Application.get_env(
+      :ferricstore,
+      :waraft_generic_batch_window_ms,
+      @default_generic_batch_window_ms
+    )
   end
 
   defp generic_batch_during_flush? do

@@ -93,7 +93,9 @@ defmodule Ferricstore.FlowWriteContractTest do
         source
       )
 
-    assert function_source =~ "transition_run_results(ctx, keyed_commands, callbacks)"
+    assert function_source =~ "start_and_claim_run_results(ctx, keyed_commands, callbacks)"
+    assert source =~ "named_value_put_run_results(ctx, keyed_commands, callbacks)"
+    assert source =~ "transition_run_results(ctx, keyed_commands, callbacks)"
     assert source =~ "defp transition_run_results(ctx, keyed_commands, callbacks)"
     assert source =~ "Router.flow_transition_batch(attrs_list)"
 
@@ -198,6 +200,67 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     refute function_source =~ "LMDBWriter.enqueue(",
            "Flow apply must not block on LMDB projection enqueue; flush/request are the sync boundary"
+  end
+
+  test "flow history projection never sync-writes from state-machine apply" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    refute source =~ "HistoryProjector.write_entries_sync",
+           "Flow apply must enqueue history projection asynchronously and gate replay/release instead of sync-writing history"
+
+    refute source =~ "with_sync_flow_history",
+           "WARaft Flow apply must not force sync history projection"
+
+    refute source =~ "raw_put_cold(state, entry.key, flow_history_entry_value",
+           "Flow history writes must not have an inline cold-write branch controlled by config"
+  end
+
+  test "flow history projection entries stay lazy on the state-machine hot path" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    [projection_entry_source] =
+      Regex.run(~r/defp flow_history_projection_entry\(.*?^      end/ms, source)
+
+    refute projection_entry_source =~ "Flow.encode_history_fields",
+           "Flow apply should not encode history values; HistoryProjector encodes lazy descriptors async"
+
+    assert projection_entry_source =~ "value: {:flow_history_fields, record, event, now_ms, meta}"
+
+    refute projection_entry_source =~ "record: record",
+           "hot-path projection entries should use one compact value descriptor instead of extra map fields"
+
+    refute projection_entry_source =~ "event: event",
+           "hot-path projection entries should use one compact value descriptor instead of extra map fields"
+
+    refute projection_entry_source =~ "now_ms: now_ms",
+           "hot-path projection entries should use one compact value descriptor instead of extra map fields"
+
+    refute source =~
+             "Flow.encode_history_fields(record, event, now_ms, Map.get(entry, :meta, %{}))",
+           "single-command history planning must also enqueue lazy descriptors"
+
+    assert source =~ "value: {:flow_history_fields, record, event, now_ms, meta}"
+  end
+
+  test "flow history projector pressure path stores overflow instead of sync-failing apply" do
+    source = File.read!("lib/ferricstore/flow/history_projector.ex")
+
+    assert [_, async_source] =
+             String.split(
+               source,
+               "\n  def enqueue_async(instance_ctx, shard_index, entries, ra_index)",
+               parts: 2
+             )
+
+    assert [async_source, _] = String.split(async_source, "\n  @spec flush", parts: 2)
+
+    assert async_source =~ "Pending.append_overflow(projector, entries)"
+
+    refute async_source =~ "GenServer.cast(pid, :drain_overflow)",
+           "queue-full overflow must not cast one drain message per apply batch; flush/retry drains it coalesced"
+
+    refute async_source =~ "{:error, :queue_full}",
+           "queue-full history projection must move to retry overflow, not fail the Ra apply path"
   end
 
   test "flow claim_due native planner owns history-ready planning without LMDB sync" do
@@ -360,6 +423,59 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     refute function_source =~ "__MODULE__.Keys.due_key",
            "claim_due can probe many partitions per poll; validation must use length math instead of allocating every generated due-index key"
+  end
+
+  test "flow claim_due AUTO skips empty shards before Raft writes" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_auto_partition",
+        "flow_claim_due_auto_empty_precheck"
+      )
+
+    assert function_source =~ "flow_claim_due_auto_empty_precheck(ctx, idx, attrs)"
+
+    precheck_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_auto_empty_precheck",
+        "NativeFlowIndex.due_keys_present"
+      )
+
+    assert precheck_source =~ "NativeFlowIndex.due_keys_present"
+    assert precheck_source =~ "flow_claim_due_auto_precheck_keys"
+    assert source =~ "flow_auto_partition_keys_for_shard"
+    assert source =~ "{__MODULE__, :flow_auto_partition_keys_for_shard, ctx.name, ctx.slot_map}"
+  end
+
+  test "flow claim_due reclaim precheck does not scan cold due rows for running leases" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_cold_precheck_present?",
+        ~s("running")
+      )
+
+    assert function_source =~ ~s("running")
+    assert function_source =~ "do: false"
+  end
+
+  test "flow claim_due AUTO cold precheck uses broad shard prefix instead of per bucket partition scans" do
+    source = Ferricstore.Test.SourceFiles.router_source()
+
+    function_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_claim_due_cold_precheck_partition_present?",
+        ":auto"
+      )
+
+    assert function_source =~ "cold_due_state_bucket_prefix"
+    refute function_source =~ "flow_auto_partition_keys_for_shard"
   end
 
   test "flow claim_due fast index path avoids generic per-plan tuple dispatch" do
@@ -931,6 +1047,231 @@ defmodule Ferricstore.FlowWriteContractTest do
              )
 
     assert_all_states(ids, partition, "completed")
+  end
+
+  test "independent complete_many can return single ok on full success" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-independent-complete-ok-#{suffix}"
+    type = "contract-independent-complete-ok-type-#{suffix}"
+    ids = ["independent-complete-ok-a-#{suffix}", "independent-complete-ok-b-#{suffix}"]
+    claims = create_many_and_claim(partition, ids, type, now_ms)
+
+    assert :ok =
+             FerricStore.flow_complete_many(
+               partition,
+               claim_items(claims),
+               independent: true,
+               return: :ok_on_success
+             )
+
+    assert_all_states(ids, partition, "completed")
+  end
+
+  test "independent complete_many ok-on-success preserves per-item failures" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-independent-complete-ok-error-#{suffix}"
+    type = "contract-independent-complete-ok-error-type-#{suffix}"
+
+    ids = [
+      "independent-complete-ok-error-a-#{suffix}",
+      "independent-complete-ok-error-b-#{suffix}"
+    ]
+
+    [bad_claim, good_claim] = create_many_and_claim(partition, ids, type, now_ms)
+
+    items = [
+      %{
+        id: bad_claim.id,
+        lease_token: bad_claim.lease_token,
+        fencing_token: bad_claim.fencing_token + 1
+      },
+      %{
+        id: good_claim.id,
+        lease_token: good_claim.lease_token,
+        fencing_token: good_claim.fencing_token
+      }
+    ]
+
+    assert {:ok, [{:error, "ERR stale flow lease"}, :ok]} =
+             FerricStore.flow_complete_many(
+               partition,
+               items,
+               independent: true,
+               return: :ok_on_success
+             )
+  end
+
+  test "flow step_continue atomically advances logical state and keeps a fresh running lease" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-step-continue-#{suffix}"
+    type = "contract-step-continue-type-#{suffix}"
+    id = "contract-step-continue-id-#{suffix}"
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               payload: %{step: "queued"},
+               run_at_ms: now_ms
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               limit: 1,
+               now_ms: now_ms,
+               worker: "contract-step-worker",
+               partition_key: partition
+             )
+
+    assert claimed.state == "running"
+    assert claimed.run_state == "queued"
+
+    assert {:ok, continued} =
+             FerricStore.flow_step_continue(id, claimed.lease_token, "queued", "charge_card",
+               partition_key: partition,
+               fencing_token: claimed.fencing_token,
+               lease_ms: 5_000,
+               now_ms: now_ms + 1,
+               payload: %{step: "charge_card"}
+             )
+
+    assert continued.id == id
+    assert continued.state == "running"
+    assert continued.run_state == "charge_card"
+    assert continued.lease_token != claimed.lease_token
+    assert continued.fencing_token == claimed.fencing_token + 1
+    assert continued.lease_deadline_ms == now_ms + 5_001
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: partition,
+               fencing_token: claimed.fencing_token
+             )
+
+    assert :ok =
+             FerricStore.flow_retry(id, continued.lease_token,
+               partition_key: partition,
+               fencing_token: continued.fencing_token,
+               run_at_ms: now_ms + 3_000,
+               error: %{reason: "try-again"}
+             )
+
+    assert {:ok, retried} = FerricStore.flow_get(id, partition_key: partition)
+    assert retried.state == "charge_card"
+    assert retried.run_state == nil
+    assert retried.next_run_at_ms == now_ms + 3_000
+  end
+
+  test "flow start_and_claim creates the first logical step with a running lease" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-start-and-claim-#{suffix}"
+    type = "contract-start-and-claim-type-#{suffix}"
+    id = "contract-start-and-claim-id-#{suffix}"
+
+    assert {:ok, started} =
+             FerricStore.flow_start_and_claim(id, type, "reserve_inventory",
+               partition_key: partition,
+               worker: "contract-start-worker",
+               lease_ms: 7_000,
+               now_ms: now_ms,
+               payload: %{order_id: suffix}
+             )
+
+    assert started.id == id
+    assert started.type == type
+    assert started.state == "running"
+    assert started.run_state == "reserve_inventory"
+    assert started.attempts == 1
+    assert started.fencing_token == 1
+    assert started.lease_owner == "contract-start-worker"
+    assert is_binary(started.lease_token)
+    assert started.lease_deadline_ms == now_ms + 7_000
+    assert started.next_run_at_ms == now_ms + 7_000
+
+    assert {:error, "ERR flow already exists"} =
+             FerricStore.flow_start_and_claim(id, type, "reserve_inventory",
+               partition_key: partition,
+               worker: "contract-start-worker",
+               now_ms: now_ms
+             )
+
+    assert :ok =
+             FerricStore.flow_retry(id, started.lease_token,
+               partition_key: partition,
+               fencing_token: started.fencing_token,
+               run_at_ms: now_ms + 1_000,
+               error: %{reason: "try-again"}
+             )
+
+    assert {:ok, retried} = FerricStore.flow_get(id, partition_key: partition)
+    assert retried.state == "reserve_inventory"
+    assert retried.run_state == nil
+    assert retried.next_run_at_ms == now_ms + 1_000
+  end
+
+  test "flow run_steps_many runs deterministic step chains in one public command" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-run-steps-#{suffix}"
+    type = "contract-run-steps-type-#{suffix}"
+    ids = ["contract-run-steps-a-#{suffix}", "contract-run-steps-b-#{suffix}"]
+
+    assert :ok =
+             FerricStore.flow_run_steps_many(
+               Enum.map(ids, &%{id: &1, partition_key: partition}),
+               type: type,
+               states: ["reserve_inventory", "charge_card", "send_email"],
+               worker: "contract-run-steps-worker",
+               lease_ms: 7_000,
+               now_ms: now_ms,
+               result: %{ok: true}
+             )
+
+    Enum.each(ids, fn id ->
+      assert {:ok, record} = FerricStore.flow_get(id, partition_key: partition)
+      assert record.state == "completed"
+      assert record.run_state == "send_email"
+      assert record.fencing_token == 3
+      assert record.lease_token == nil
+
+      assert {:ok, history} = FerricStore.flow_history(id, partition_key: partition, count: 10)
+      events = Enum.map(history, fn {_event_id, fields} -> fields["event"] end)
+
+      assert events == ["created", "step_continued", "step_continued", "completed"]
+    end)
+  end
+
+  test "flow run_steps_many rejects duplicate ids without partial creation" do
+    now_ms = System.system_time(:millisecond)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "contract-run-steps-dup-#{suffix}"
+    type = "contract-run-steps-dup-type-#{suffix}"
+    duplicate_id = "contract-run-steps-dup-a-#{suffix}"
+    other_id = "contract-run-steps-dup-b-#{suffix}"
+
+    assert {:ok,
+            [
+              error: "ERR flow duplicate id in batch",
+              error: "ERR flow duplicate id in batch",
+              error: "ERR flow duplicate id in batch"
+            ]} =
+             FerricStore.flow_run_steps_many(
+               [
+                 %{id: duplicate_id, partition_key: partition},
+                 %{id: duplicate_id, partition_key: partition},
+                 %{id: other_id, partition_key: partition}
+               ],
+               type: type,
+               steps: 3,
+               worker: "contract-run-steps-worker",
+               now_ms: now_ms
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(other_id, partition_key: partition)
   end
 
   defp create_many_and_claim(partition, ids, type, now_ms) do

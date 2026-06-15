@@ -28,8 +28,213 @@ defmodule Ferricstore.Flow do
     })
   end
 
+  def start_and_claim(ctx, id, type, initial_state, opts)
+      when is_binary(id) and is_binary(type) and is_binary(initial_state) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, return_mode} <- start_and_claim_return_mode(opts),
+           {:ok, attrs} <-
+             Ferricstore.Flow.MutationAttrs.start_and_claim_attrs(
+               id,
+               type,
+               initial_state,
+               opts
+             ) do
+        Router.flow_start_and_claim(ctx, attrs)
+        |> maybe_return_start_and_claim(ctx, return_mode)
+      end
+
+    FlowTelemetry.observe(:start_and_claim, started, result, %{
+      flow_id: id,
+      flow_type: type,
+      from_state: initial_state,
+      _count: 1
+    })
+  end
+
+  def start_and_claim(_ctx, _id, _type, _initial_state, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc false
+  def run_steps_many(_ctx, [], _opts), do: :ok
+
+  def run_steps_many(ctx, items, opts) when is_list(items) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, attrs_list} <- run_steps_many_attrs(items, opts) do
+        Router.flow_run_steps_many(ctx, attrs_list)
+      end
+
+    FlowTelemetry.observe(:run_steps_many, started, result, %{
+      flow_id: nil,
+      flow_type: Keyword.get(opts, :type),
+      _count: if(is_list(items), do: length(items), else: 0)
+    })
+  end
+
+  def run_steps_many(_ctx, _items, _opts),
+    do: {:error, "ERR flow run_steps_many opts must be a keyword list"}
+
+  defp run_steps_many_attrs(items, opts) do
+    with {:ok, type} <- run_steps_many_type(opts),
+         {:ok, worker} <- run_steps_many_worker(opts),
+         {:ok, states} <- run_steps_many_states(opts),
+         {:ok, lease_ms} <- run_steps_many_pos_integer(opts, :lease_ms, 30_000),
+         {:ok, now_ms} <- run_steps_many_now_ms(opts) do
+      base_start_opts =
+        [
+          worker: worker,
+          lease_ms: lease_ms,
+          now_ms: now_ms
+        ]
+        |> run_steps_many_maybe_put(:payload, Keyword.get(opts, :payload))
+        |> run_steps_many_maybe_put(:retention_ttl_ms, Keyword.get(opts, :retention_ttl_ms))
+
+      result = Keyword.get(opts, :result)
+      step_count = length(states)
+      final_run_state = List.last(states)
+
+      items
+      |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+        with {:ok, id, partition_key} <- run_steps_many_item(item),
+             start_opts <- Keyword.put(base_start_opts, :partition_key, partition_key),
+             {:ok, attrs} <-
+               Ferricstore.Flow.MutationAttrs.start_and_claim_attrs(
+                 id,
+                 type,
+                 hd(states),
+                 start_opts
+               ) do
+          attrs =
+            attrs
+            |> Map.put(:step_states, states)
+            |> Map.put(:step_count, step_count)
+            |> Map.put(:final_run_state, final_run_state)
+            |> Map.put(:step_now_ms, now_ms)
+            |> run_steps_many_maybe_put_attr(:result, result)
+
+          {:cont, {:ok, [attrs | acc]}}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, attrs_list} -> {:ok, Enum.reverse(attrs_list)}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp run_steps_many_item(%{id: id} = item) when is_binary(id) and id != "" do
+    partition_key = Map.get(item, :partition_key) || Ferricstore.Flow.Keys.auto_partition_key(id)
+    {:ok, id, partition_key}
+  end
+
+  defp run_steps_many_item(%{"id" => id} = item) when is_binary(id) and id != "" do
+    partition_key = Map.get(item, "partition_key") || Ferricstore.Flow.Keys.auto_partition_key(id)
+    {:ok, id, partition_key}
+  end
+
+  defp run_steps_many_item(id) when is_binary(id) and id != "" do
+    {:ok, id, Ferricstore.Flow.Keys.auto_partition_key(id)}
+  end
+
+  defp run_steps_many_item(_item), do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp run_steps_many_type(opts) do
+    case Keyword.fetch(opts, :type) do
+      {:ok, type} when is_binary(type) and type != "" -> {:ok, type}
+      _ -> {:error, "ERR flow type must be a non-empty string"}
+    end
+  end
+
+  defp run_steps_many_worker(opts) do
+    case Keyword.fetch(opts, :worker) do
+      {:ok, worker} when is_binary(worker) and worker != "" -> {:ok, worker}
+      _ -> {:error, "ERR flow worker must be a non-empty string"}
+    end
+  end
+
+  defp run_steps_many_states(opts) do
+    cond do
+      is_list(Keyword.get(opts, :states)) ->
+        states = Keyword.fetch!(opts, :states)
+
+        if states != [] and Enum.all?(states, &(is_binary(&1) and &1 != "")) do
+          {:ok, states}
+        else
+          {:error, "ERR flow states must be a non-empty list of strings"}
+        end
+
+      true ->
+        with {:ok, steps} <- run_steps_many_pos_integer(opts, :steps, 1) do
+          {:ok, Enum.map(1..steps, &("step_" <> Integer.to_string(&1)))}
+        end
+    end
+  end
+
+  defp run_steps_many_now_ms(opts) do
+    case Keyword.fetch(opts, :now_ms) do
+      {:ok, now_ms} when is_integer(now_ms) and now_ms >= 0 -> {:ok, now_ms}
+      :error -> {:ok, System.system_time(:millisecond)}
+      _ -> {:error, "ERR flow now_ms must be a non-negative integer"}
+    end
+  end
+
+  defp run_steps_many_pos_integer(opts, key, default) do
+    case Keyword.fetch(opts, key) do
+      {:ok, value} when is_integer(value) and value > 0 -> {:ok, value}
+      :error -> {:ok, default}
+      _ -> {:error, "ERR flow #{key} must be a positive integer"}
+    end
+  end
+
+  defp run_steps_many_maybe_put(opts, _key, nil), do: opts
+  defp run_steps_many_maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp run_steps_many_maybe_put_attr(attrs, _key, nil), do: attrs
+  defp run_steps_many_maybe_put_attr(attrs, key, value), do: Map.put(attrs, key, value)
+
+  defp start_and_claim_return_mode(opts) do
+    case Keyword.get(opts, :return, :record) do
+      value when value in [nil, :record, :records, :full] ->
+        {:ok, :record}
+
+      value when value in [:jobs_compact, :job_compact] ->
+        {:ok, :jobs_compact}
+
+      value when is_binary(value) ->
+        parse_start_and_claim_return_string(value)
+
+      _ ->
+        {:error, "ERR flow start_and_claim return must be record or jobs_compact"}
+    end
+  end
+
+  defp parse_start_and_claim_return_string(value) do
+    case String.upcase(value) do
+      "RECORD" -> {:ok, :record}
+      "RECORDS" -> {:ok, :record}
+      "FULL" -> {:ok, :record}
+      "JOBS_COMPACT" -> {:ok, :jobs_compact}
+      "JOB_COMPACT" -> {:ok, :jobs_compact}
+      _ -> {:error, "ERR flow start_and_claim return must be record or jobs_compact"}
+    end
+  end
+
+  defp maybe_return_start_and_claim({:ok, record}, _ctx, :record), do: {:ok, record}
+
+  defp maybe_return_start_and_claim({:ok, record}, ctx, :jobs_compact) do
+    [job] = Ferricstore.Flow.ClaimDueAPI.return_records(ctx, [record], nil, :jobs_compact, [])
+    {:ok, job}
+  end
+
+  defp maybe_return_start_and_claim(result, _ctx, _return_mode), do: result
+
   defdelegate value_put(ctx, value, opts \\ []), to: Ferricstore.Flow.ValueStore
-  defdelegate value_mget(ctx, refs), to: Ferricstore.Flow.ValueStore
+  defdelegate value_mget(ctx, refs, opts \\ []), to: Ferricstore.Flow.ValueStore
 
   defdelegate signal(ctx, id, opts), to: Ferricstore.Flow.Signal, as: :run
 
@@ -81,7 +286,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
-           :ok <- validate_opts(opts),
+           :ok <- validate_opts(opts, return: true),
+           {:ok, return_mode} <- many_return_mode(opts),
            {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- Ferricstore.Flow.MutationAttrs.validate_create_many_items(items),
            {:ok, attrs_list} <-
@@ -89,8 +295,14 @@ defmodule Ferricstore.Flow do
            :ok <-
              Ferricstore.Flow.MutationAttrs.validate_unique_create_ids(attrs_list, independent?) do
         if independent? do
-          ctx
-          |> Router.flow_create_many_independent(attrs_list)
+          result =
+            if return_mode == :ok_on_success do
+              Router.flow_create_pipeline_batch_ok_on_success(ctx, attrs_list)
+            else
+              Router.flow_create_many_independent(ctx, attrs_list)
+            end
+
+          result
           |> then(&{:ok, &1})
           |> maybe_notify_claim_waiters(attrs_list, :state)
         else
@@ -265,7 +477,7 @@ defmodule Ferricstore.Flow do
     if claim_ready_hint_now?(attrs) do
       type = Map.get(attrs, :type)
       state = claim_ready_state(attrs, state_key)
-      priority = Map.get(attrs, :priority)
+      priority = Map.get(attrs, :priority, @default_priority)
       partition_key = Map.get(attrs, :partition_key)
       limit = max(Map.get(attrs, :limit, 1), 1)
 
@@ -318,8 +530,10 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
-           :ok <- validate_opts(opts),
+           :ok <- validate_opts(opts, return: true),
+           {:ok, return_mode} <- many_return_mode(opts),
            {:ok, independent?} <- optional_boolean(opts, :independent, false),
+           {:ok, terminal_local_only?} <- optional_boolean(opts, :terminal_local_only, false),
            :ok <- Ferricstore.Flow.MutationAttrs.validate_complete_many_items(items),
            {:ok, attrs_list} <-
              Ferricstore.Flow.MutationAttrs.complete_many_attrs(items, opts, partition_key),
@@ -328,11 +542,19 @@ defmodule Ferricstore.Flow do
                attrs_list,
                independent?
              ) do
-        if independent? do
-          flow_terminal_many_independent(ctx, :complete, attrs_list)
-        else
-          Router.flow_complete_many(ctx, partition_key, attrs_list)
-        end
+        complete_result =
+          cond do
+            independent? ->
+              flow_terminal_many_independent(ctx, :complete, attrs_list)
+
+            terminal_local_only? ->
+              Router.flow_complete_many_local(ctx, attrs_list)
+
+            true ->
+              Router.flow_complete_many(ctx, partition_key, attrs_list)
+          end
+
+        maybe_return_many_ok_on_success(complete_result, return_mode)
       end
 
     FlowTelemetry.observe(:complete, started, result, %{flow_id: nil, _count: length(items)})
@@ -367,7 +589,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
-           :ok <- validate_opts(opts),
+           :ok <- validate_opts(opts, return: true),
+           {:ok, return_mode} <- many_return_mode(opts),
            {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- Ferricstore.Flow.MutationAttrs.validate_transition_many_items(items),
            {:ok, attrs_list} <-
@@ -383,16 +606,19 @@ defmodule Ferricstore.Flow do
                attrs_list,
                independent?
              ) do
-        if independent? do
-          ctx
-          |> Router.flow_transition_batch(attrs_list)
-          |> then(&{:ok, &1})
-          |> maybe_notify_claim_waiters(attrs_list, :to_state)
-        else
-          ctx
-          |> Router.flow_transition_many(partition_key, attrs_list)
-          |> maybe_notify_claim_waiters(attrs_list, :to_state)
-        end
+        transition_result =
+          if independent? do
+            ctx
+            |> Router.flow_transition_batch(attrs_list)
+            |> then(&{:ok, &1})
+            |> maybe_notify_claim_waiters(attrs_list, :to_state)
+          else
+            ctx
+            |> Router.flow_transition_many(partition_key, attrs_list)
+            |> maybe_notify_claim_waiters(attrs_list, :to_state)
+          end
+
+        maybe_return_many_ok_on_success(transition_result, return_mode)
       end
 
     FlowTelemetry.observe(:transition, started, result, %{
@@ -405,6 +631,57 @@ defmodule Ferricstore.Flow do
 
   def transition_many(_ctx, _partition_key, _from_state, _to_state, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
+
+  def step_continue(ctx, id, lease_token, from_state, to_state, opts \\ [])
+
+  def step_continue(ctx, id, lease_token, from_state, to_state, opts)
+      when is_binary(id) and is_binary(lease_token) and is_binary(from_state) and
+             is_binary(to_state) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, return_mode} <- step_continue_return_mode(opts),
+           {:ok, attrs} <-
+             Ferricstore.Flow.MutationAttrs.step_continue_attrs(
+               id,
+               lease_token,
+               from_state,
+               to_state,
+               opts
+             ) do
+        Router.flow_step_continue(ctx, attrs)
+        |> maybe_return_step_continue(ctx, return_mode)
+      end
+
+    FlowTelemetry.observe(:step_continue, started, result, %{
+      flow_id: id,
+      from_state: from_state,
+      to_state: to_state,
+      _count: 1
+    })
+  end
+
+  def step_continue(_ctx, _id, _lease_token, _from_state, _to_state, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  defp step_continue_return_mode(opts) do
+    case start_and_claim_return_mode(opts) do
+      {:ok, mode} ->
+        {:ok, mode}
+
+      {:error, _reason} ->
+        {:error, "ERR flow step_continue return must be record or jobs_compact"}
+    end
+  end
+
+  defp maybe_return_step_continue({:ok, record}, _ctx, :record), do: {:ok, record}
+
+  defp maybe_return_step_continue({:ok, record}, ctx, :jobs_compact) do
+    [job] = Ferricstore.Flow.ClaimDueAPI.return_records(ctx, [record], nil, :jobs_compact, [])
+    {:ok, job}
+  end
+
+  defp maybe_return_step_continue(result, _ctx, _return_mode), do: result
 
   @doc false
   def transition_batch_independent(_ctx, []), do: []
@@ -452,7 +729,11 @@ defmodule Ferricstore.Flow do
   def pipeline_write_batch_independent(ctx, ops) when is_list(ops) do
     command_callbacks = %{
       create_attrs: &Ferricstore.Flow.MutationAttrs.create_attrs/2,
+      start_and_claim_attrs: &Ferricstore.Flow.MutationAttrs.start_and_claim_attrs/4,
       transition_attrs: &Ferricstore.Flow.MutationAttrs.transition_attrs/4,
+      step_continue_attrs: &Ferricstore.Flow.MutationAttrs.step_continue_attrs/5,
+      named_value_attrs: &Ferricstore.Flow.ValueStore.named_value_attrs/2,
+      signal_attrs: &Ferricstore.Flow.Signal.attrs/2,
       complete_attrs: &Ferricstore.Flow.MutationAttrs.complete_attrs/3,
       retry_attrs: &Ferricstore.Flow.MutationAttrs.retry_attrs/3,
       fail_attrs: &Ferricstore.Flow.MutationAttrs.fail_attrs/3,
@@ -460,16 +741,76 @@ defmodule Ferricstore.Flow do
       rewind_attrs: &Ferricstore.Flow.MutationAttrs.rewind_attrs/2
     }
 
-    Ferricstore.Flow.PipelineWrite.batch_independent(ctx, ops, %{
-      start: &flow_start_time/0,
-      command: fn op -> Ferricstore.Flow.PipelineWriteCommand.command(op, command_callbacks) end,
-      notify: &maybe_notify_claim_waiters/3,
-      observe: &FlowTelemetry.observe_batch/3
-    })
+    results =
+      Ferricstore.Flow.PipelineWrite.batch_independent(ctx, ops, %{
+        start: &flow_start_time/0,
+        command: fn op -> Ferricstore.Flow.PipelineWriteCommand.command(op, command_callbacks) end,
+        notify: &maybe_notify_claim_waiters/3,
+        observe: &FlowTelemetry.observe_batch/3
+      })
+
+    pipeline_write_return_results(ctx, ops, results)
   end
 
   def pipeline_write_batch_independent(_ctx, _ops),
     do: [{:error, "ERR flow opts must be a keyword list"}]
+
+  defp pipeline_write_return_results(ctx, ops, results)
+       when is_list(ops) and is_list(results) and length(ops) == length(results) do
+    ops
+    |> Enum.zip(results)
+    |> Enum.map(fn {op, result} -> pipeline_write_return_result(ctx, op, result) end)
+  end
+
+  defp pipeline_write_return_results(_ctx, _ops, results), do: results
+
+  defp pipeline_write_return_result(
+         ctx,
+         {:flow_start_and_claim, _id, _type, _initial_state, opts},
+         {:ok, _record} = result
+       ) do
+    pipeline_start_and_claim_return_result(ctx, opts, result)
+  end
+
+  defp pipeline_write_return_result(
+         ctx,
+         {:start_and_claim, _id, _type, _initial_state, opts},
+         {:ok, _record} = result
+       ) do
+    pipeline_start_and_claim_return_result(ctx, opts, result)
+  end
+
+  defp pipeline_write_return_result(
+         ctx,
+         {:flow_step_continue, _id, _lease_token, _from_state, _to_state, opts},
+         {:ok, _record} = result
+       ) do
+    pipeline_step_continue_return_result(ctx, opts, result)
+  end
+
+  defp pipeline_write_return_result(
+         ctx,
+         {:step_continue, _id, _lease_token, _from_state, _to_state, opts},
+         {:ok, _record} = result
+       ) do
+    pipeline_step_continue_return_result(ctx, opts, result)
+  end
+
+  defp pipeline_write_return_result(_ctx, _op, result), do: result
+
+  defp pipeline_start_and_claim_return_result(ctx, opts, result) do
+    case start_and_claim_return_mode(opts) do
+      {:ok, :jobs_compact} -> maybe_return_start_and_claim(result, ctx, :jobs_compact)
+      _ -> result
+    end
+  end
+
+  defp pipeline_step_continue_return_result(ctx, opts, result) do
+    case step_continue_return_mode(opts) do
+      {:ok, :jobs_compact} -> maybe_return_step_continue(result, ctx, :jobs_compact)
+      _ -> result
+    end
+  end
 
   @doc false
   def pipeline_claim_due_batch(_ctx, []), do: []
@@ -507,6 +848,7 @@ defmodule Ferricstore.Flow do
     Ferricstore.Flow.PipelineRead.batch(ctx, ops, %{
       start: &flow_start_time/0,
       command: &Ferricstore.Flow.PipelineReadCommand.command/2,
+      batch_get: &Ferricstore.Store.Router.flow_batch_get/3,
       decode_get: &Ferricstore.Flow.PipelineReadCommand.decode_get/1,
       history_results: &Ferricstore.Flow.PipelineReadCommand.history_results/2,
       observe: &FlowTelemetry.observe_pipeline_read_batch/2
@@ -535,7 +877,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
-           :ok <- validate_opts(opts),
+           :ok <- validate_opts(opts, return: true),
+           {:ok, return_mode} <- many_return_mode(opts),
            {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- Ferricstore.Flow.MutationAttrs.validate_retry_many_items(items),
            {:ok, attrs_list} <-
@@ -545,15 +888,18 @@ defmodule Ferricstore.Flow do
                attrs_list,
                independent?
              ) do
-        if independent? do
-          ctx
-          |> flow_terminal_many_independent(:retry, attrs_list)
-          |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
-        else
-          ctx
-          |> Router.flow_retry_many(partition_key, attrs_list)
-          |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
-        end
+        retry_result =
+          if independent? do
+            ctx
+            |> flow_terminal_many_independent(:retry, attrs_list)
+            |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
+          else
+            ctx
+            |> Router.flow_retry_many(partition_key, attrs_list)
+            |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
+          end
+
+        maybe_return_many_ok_on_success(retry_result, return_mode)
       end
 
     FlowTelemetry.observe(:retry, started, result, %{flow_id: nil, _count: length(items)})
@@ -579,7 +925,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
-           :ok <- validate_opts(opts),
+           :ok <- validate_opts(opts, return: true),
+           {:ok, return_mode} <- many_return_mode(opts),
            {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- Ferricstore.Flow.MutationAttrs.validate_fail_many_items(items),
            {:ok, attrs_list} <-
@@ -589,11 +936,14 @@ defmodule Ferricstore.Flow do
                attrs_list,
                independent?
              ) do
-        if independent? do
-          flow_terminal_many_independent(ctx, :fail, attrs_list)
-        else
-          Router.flow_fail_many(ctx, partition_key, attrs_list)
-        end
+        fail_result =
+          if independent? do
+            flow_terminal_many_independent(ctx, :fail, attrs_list)
+          else
+            Router.flow_fail_many(ctx, partition_key, attrs_list)
+          end
+
+        maybe_return_many_ok_on_success(fail_result, return_mode)
       end
 
     FlowTelemetry.observe(:fail, started, result, %{flow_id: nil, _count: length(items)})
@@ -618,7 +968,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
-           :ok <- validate_opts(opts),
+           :ok <- validate_opts(opts, return: true),
+           {:ok, return_mode} <- many_return_mode(opts),
            {:ok, independent?} <- optional_boolean(opts, :independent, false),
            :ok <- Ferricstore.Flow.MutationAttrs.validate_cancel_many_items(items),
            {:ok, attrs_list} <-
@@ -628,11 +979,14 @@ defmodule Ferricstore.Flow do
                attrs_list,
                independent?
              ) do
-        if independent? do
-          flow_terminal_many_independent(ctx, :cancel, attrs_list)
-        else
-          Router.flow_cancel_many(ctx, partition_key, attrs_list)
-        end
+        cancel_result =
+          if independent? do
+            flow_terminal_many_independent(ctx, :cancel, attrs_list)
+          else
+            Router.flow_cancel_many(ctx, partition_key, attrs_list)
+          end
+
+        maybe_return_many_ok_on_success(cancel_result, return_mode)
       end
 
     FlowTelemetry.observe(:cancel, started, result, %{flow_id: nil, _count: length(items)})
@@ -710,6 +1064,8 @@ defmodule Ferricstore.Flow do
   @doc false
   defdelegate decode_record(value), to: Codec
 
+  defdelegate decode_record_meta(value), to: Codec
+
   @doc false
   defdelegate decode_record_elixir(value), to: Codec
 
@@ -752,6 +1108,32 @@ defmodule Ferricstore.Flow do
         :ok
     end
   end
+
+  defp many_return_mode(opts) do
+    case Keyword.get(opts, :return, :items) do
+      nil -> {:ok, :items}
+      :items -> {:ok, :items}
+      "items" -> {:ok, :items}
+      "ITEMS" -> {:ok, :items}
+      :ok_on_success -> {:ok, :ok_on_success}
+      "ok_on_success" -> {:ok, :ok_on_success}
+      "OK_ON_SUCCESS" -> {:ok, :ok_on_success}
+      _ -> {:error, "ERR flow return must be items or ok_on_success"}
+    end
+  end
+
+  defp maybe_return_many_ok_on_success(result, :items), do: result
+  defp maybe_return_many_ok_on_success(:ok, :ok_on_success), do: :ok
+
+  defp maybe_return_many_ok_on_success({:ok, results}, :ok_on_success) when is_list(results) do
+    if Enum.all?(results, &many_item_success?/1), do: :ok, else: {:ok, results}
+  end
+
+  defp maybe_return_many_ok_on_success(result, :ok_on_success), do: result
+
+  defp many_item_success?(:ok), do: true
+  defp many_item_success?({:ok, _value}), do: true
+  defp many_item_success?(_result), do: false
 
   defp validate_id(id) when is_binary(id) and id != "", do: :ok
   defp validate_id(_id), do: {:error, "ERR flow id must be a non-empty string"}

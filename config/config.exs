@@ -3,7 +3,7 @@ import Config
 # Repo checkouts build native crates from source by default. Packaged
 # dependency users still get RustlerPrecompiled artifacts because dependency
 # config files are not imported into the parent application.
-config :rustler_precompiled, :force_build, ferricstore: true
+config :rustler_precompiled, :force_build, ferricstore: true, ferricstore_server: true
 
 config :ferricstore, Ferricstore.Bitcask.NIF,
   skip_compilation?: false,
@@ -16,6 +16,25 @@ config :ferricstore, :ferricstore_wal_nif,
 # TCP server port (default: 6379, matches Redis)
 config :ferricstore, :port, 6379
 
+# Optional native binary SDK/data-plane listener. Disabled by default so the
+# Redis-compatible RESP listener remains the only public port unless explicitly
+# enabled with FERRICSTORE_NATIVE_ENABLED=true.
+config :ferricstore,
+  native_protocol_enabled: false,
+  native_port: 6388,
+  native_tls_port: nil,
+  native_max_frame_bytes: 16 * 1024 * 1024,
+  native_max_lanes_per_connection: 1024,
+  native_lane_max_queue: 1024,
+  native_max_batch_commands: 1024,
+  native_max_inflight_per_connection: 4096,
+  native_max_inflight_per_lane: 1024,
+  native_response_chunk_bytes: 0,
+  native_max_pending_chunks: 1024,
+  native_max_collection_response_items: 10_000,
+  native_trace_enabled: false,
+  native_idle_timeout_ms: 90_000
+
 # Data directory for Bitcask shards
 config :ferricstore, :data_dir, "data"
 
@@ -27,8 +46,13 @@ config :ferricstore, :shard_count, 0
 config :ferricstore,
   flow_async_history: true,
   wal_commit_delay_us: 6_000,
+  waraft_commit_batch_adaptive: true,
   waraft_commit_batch_max: 10_000,
-  waraft_apply_log_batch_size: 4_096
+  waraft_commit_priority: :high,
+  waraft_generic_batch_window_ms: 0,
+  waraft_generic_batch_during_flush: true,
+  waraft_apply_log_batch_size: 4_096,
+  ra_low_priority_commands_flush_size: 512
 
 # Flow retention cleanup is correctness-safe as a normal durable Flow command,
 # but it can be storage-heavy. Run it on a maintenance cadence by default so

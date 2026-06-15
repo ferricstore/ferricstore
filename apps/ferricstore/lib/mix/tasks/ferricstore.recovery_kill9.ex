@@ -17,7 +17,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
     * `--batch-size N` - keys per quorum batch during setup, default 1000
     * `--data-dir PATH` - data directory, default is a temp directory
     * `--timeout-ms N` - child marker timeout, default 120000
-    * `--release-cursor-interval N` - interval used by the child, default 200000
+    * `--release-cursor-interval N` - interval used by the child, default 500
     * `--prefix PREFIX` - key prefix, default unique kill9 prefix
     * `--keep-data` - keep the data directory after the run
   """
@@ -31,7 +31,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
   @default_writes 2_000
   @default_batch_size 1_000
   @default_timeout_ms 120_000
-  @default_release_cursor_interval 200_000
+  @default_release_cursor_interval 500
 
   @impl Mix.Task
   def run(args) do

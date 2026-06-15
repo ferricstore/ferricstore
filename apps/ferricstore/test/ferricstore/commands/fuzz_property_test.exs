@@ -7,7 +7,7 @@ defmodule Ferricstore.Commands.FuzzPropertyTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.{Bitmap, Json, SortedSet, Stream}
+  alias Ferricstore.Commands.{Bitmap, SortedSet, Stream}
   alias Ferricstore.GlobMatcher
   alias Ferricstore.Test.MockStore
 
@@ -94,47 +94,6 @@ defmodule Ferricstore.Commands.FuzzPropertyTest do
       assert {:error, _} = Stream.handle("XADD", [key, bad_id, "bad", "value"], store)
       assert Stream.handle("XLEN", [key], store) == before_len
       assert Stream.handle("XRANGE", [key, "-", "+"], store) == before_range
-    end
-  end
-
-  test "JSON command paths and payloads return errors or values, not crashes" do
-    seed_rand()
-
-    for _ <- 1..@iterations do
-      store = MockStore.make()
-      key = unique_key("json")
-      path = random_json_path()
-      payload = random_json_payload()
-
-      assert_no_crash("JSON command crashed for #{inspect({path, payload}, limit: 80)}", fn ->
-        assert_command_result(Json.handle("JSON.SET", [key, path, payload], store))
-        assert_command_result(Json.handle("JSON.GET", [key, path], store))
-        assert_command_result(Json.handle("JSON.DEL", [key, path], store))
-      end)
-    end
-  end
-
-  test "invalid JSONPath mutations return syntax errors and do not mutate documents" do
-    mutation_commands = [
-      {"JSON.SET", fn key, path -> [key, path, "9"] end},
-      {"JSON.DEL", fn key, path -> [key, path] end},
-      {"JSON.NUMINCRBY", fn key, path -> [key, path, "1"] end},
-      {"JSON.ARRAPPEND", fn key, path -> [key, path, "1"] end},
-      {"JSON.TOGGLE", fn key, path -> [key, path] end},
-      {"JSON.CLEAR", fn key, path -> [key, path] end}
-    ]
-
-    for path <- invalid_json_paths(), {cmd, build_args} <- mutation_commands do
-      store = MockStore.make()
-      key = unique_key("json_invalid_path")
-      doc = ~s({"arr":[1,2,3],"flag":true,"n":1,"obj":{"a":1}})
-
-      assert :ok = Json.handle("JSON.SET", [key, "$", doc], store)
-      before_doc = Json.handle("JSON.GET", [key], store)
-
-      assert {:error, msg} = Json.handle(cmd, build_args.(key, path), store)
-      assert msg =~ "invalid JSONPath"
-      assert Json.handle("JSON.GET", [key], store) == before_doc
     end
   end
 
@@ -278,48 +237,6 @@ defmodule Ferricstore.Commands.FuzzPropertyTest do
 
   defp stream_entry_id({id, _fields}), do: id
   defp stream_entry_id([id | _fields]), do: id
-
-  defp random_json_path do
-    Enum.random([
-      "$",
-      "$." <> random_printable(:rand.uniform(12) - 1),
-      "$[" <> random_numberish() <> "]",
-      "$['" <> random_printable(:rand.uniform(12) - 1) <> "']",
-      "$." <> random_printable(4) <> "[" <> random_numberish() <> "]",
-      random_printable(:rand.uniform(24) - 1)
-    ])
-  end
-
-  defp invalid_json_paths do
-    [
-      "",
-      "arr[0]",
-      "$.",
-      "$..a",
-      "$.arr[",
-      "$.arr[]",
-      "$.arr[abc]",
-      "$.arr[1",
-      "$.arr[1]junk",
-      "$['unterminated]",
-      "$[\"unterminated]",
-      "$.arr..x",
-      "$.arr[1].",
-      "$.arr[1]#"
-    ]
-  end
-
-  defp random_json_payload do
-    Enum.random([
-      "null",
-      "true",
-      "false",
-      Integer.to_string(:rand.uniform(10_000) - 5_000),
-      Jason.encode!(%{"v" => random_printable(:rand.uniform(20) - 1)}),
-      Jason.encode!(random_list(:rand.uniform(6) - 1, fn -> random_printable(4) end)),
-      random_printable(:rand.uniform(40) - 1)
-    ])
-  end
 
   defp bounded_offset(offset) do
     case Integer.parse(offset) do

@@ -232,6 +232,22 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     :ok
   end
 
+  @spec ready?(:ets.tid(), binary()) :: boolean()
+  def ready?(lookup_table, redis_key), do: ready_key?(lookup_table, redis_key)
+
+  @spec mark_ready_empty(:ets.tid(), :ets.tid(), binary()) :: :ok
+  def mark_ready_empty(index_table, lookup_table, redis_key) do
+    clear_key(index_table, lookup_table, redis_key)
+    mark_new_ready_empty(index_table, lookup_table, redis_key)
+  end
+
+  @spec mark_new_ready_empty(:ets.tid(), :ets.tid(), binary()) :: :ok
+  def mark_new_ready_empty(_index_table, lookup_table, redis_key) do
+    :ets.insert_new(lookup_table, {{:count, redis_key}, 0})
+    :ets.insert(lookup_table, {{:ready, redis_key}, true})
+    :ok
+  end
+
   @spec clear_ready_key(map(), binary()) :: map()
   def clear_ready_key(state, redis_key) do
     if ready_tables?(state) do

@@ -76,6 +76,46 @@ defmodule Ferricstore.FlowTest.Sections.FlowClaimDueAutomaticallyReclaimsExpired
         assert claimed.version == 2
       end
 
+      test "flow_claim_due limit one prefers ready queued work before expired lease reclaim" do
+        type = uid("lease-limit-one-normal-first")
+        expired_id = uid("flow-expired")
+        fresh_id = uid("flow-fresh")
+
+        assert {:ok, _} = flow_create_and_get(expired_id, type: type, run_at_ms: 1_000)
+
+        assert {:ok, [_]} =
+                 FerricStore.flow_claim_due(type,
+                   worker: "worker-a",
+                   lease_ms: 50,
+                   limit: 1,
+                   now_ms: 1_000
+                 )
+
+        assert {:ok, _} = flow_create_and_get(fresh_id, type: type, run_at_ms: 1_050)
+
+        assert {:ok, [claimed]} =
+                 FerricStore.flow_claim_due(type,
+                   worker: "worker-b",
+                   lease_ms: 50,
+                   limit: 1,
+                   now_ms: 1_050
+                 )
+
+        assert claimed.id == fresh_id
+        assert claimed.version == 2
+
+        assert {:ok, [reclaimed]} =
+                 FerricStore.flow_claim_due(type,
+                   worker: "worker-c",
+                   lease_ms: 50,
+                   limit: 1,
+                   now_ms: 1_050
+                 )
+
+        assert reclaimed.id == expired_id
+        assert reclaimed.version == 3
+      end
+
       test "expired running lease reclaim is partition scoped" do
         partition_a = uid("tenant-reclaim-a")
         partition_b = uid("tenant-reclaim-b")

@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -53,19 +52,214 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
         partition_key = Map.get(attrs, :partition_key)
 
-        with {:ok, record, next} <-
-               flow_prepare_transition_record(
-                 state,
+        case flow_prepare_transition_record(
+               state,
+               attrs,
+               id,
+               from_state,
+               to_state,
+               run_at_ms,
+               now_ms
+             ) do
+          {:ok, :noop} ->
+            :ok
+
+          {:ok, record, next} ->
+            flow_apply_transition(state, record, next, partition_key, now_ms, attrs)
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp do_flow_step_continue(
+             state,
+             %{
+               id: id,
+               lease_token: lease_token,
+               from_state: from_state,
+               to_state: to_state,
+               lease_ms: lease_ms
+             } = attrs
+           ) do
+        now_ms = flow_attrs_now_ms(attrs)
+        partition_key = Map.get(attrs, :partition_key)
+
+        with {:ok, record} <- flow_require_record(state, id, partition_key),
+             {:ok, record, next} <-
+               flow_prepare_step_continue_existing_record(
+                 record,
                  attrs,
-                 id,
+                 lease_token,
                  from_state,
                  to_state,
-                 run_at_ms,
+                 lease_ms,
                  now_ms
                ),
-             :ok <- flow_apply_transition(state, record, next, partition_key, now_ms, attrs) do
+             :ok <- flow_apply_step_continue(state, record, next, partition_key, now_ms, attrs) do
+          {:ok, next}
+        end
+      end
+
+      defp do_flow_step_continue_many(state, %{records: [_ | _] = records} = attrs) do
+        records
+        |> flow_expand_shared_attrs(Map.get(attrs, :shared))
+        |> Enum.map(&do_flow_step_continue(state, &1))
+      end
+
+      defp do_flow_step_continue_many(_state, _attrs),
+        do: {:error, "ERR flow step_continue_many requires records"}
+
+      defp do_flow_run_steps_many(state, %{records: [_ | _] = records} = attrs) do
+        stamped_shard = Map.get(attrs, @flow_shard_marker)
+
+        with :ok <-
+               Ferricstore.LatencyTrace.span("server_flow_run_steps_partition_validate_us", fn ->
+                 flow_many_partitions_valid?(state, records, stamped_shard)
+               end),
+             :ok <-
+               Ferricstore.LatencyTrace.span("server_flow_run_steps_unique_validate_us", fn ->
+                 flow_create_many_unique?(records)
+               end),
+             key_infos =
+               Ferricstore.LatencyTrace.span("server_flow_run_steps_key_infos_us", fn ->
+                 flow_create_fast_key_infos(records, stamped_shard)
+               end),
+             :ok <-
+               Ferricstore.LatencyTrace.span("server_flow_run_steps_shard_validate_us", fn ->
+                 flow_many_same_state_machine_shard_by_keys?(state, key_infos)
+               end),
+             {:ok, plans} <-
+               Ferricstore.LatencyTrace.span("server_flow_run_steps_prepare_us", fn ->
+                 flow_run_steps_prepare_direct_many(state, records, key_infos)
+               end),
+             :ok <-
+               Ferricstore.LatencyTrace.span("server_flow_run_steps_apply_us", fn ->
+                 flow_run_steps_apply_direct_many(state, plans)
+               end) do
           :ok
         end
+      end
+
+      defp do_flow_run_steps_many(_state, _attrs),
+        do: {:error, "ERR flow run_steps_many requires records"}
+
+      defp flow_run_steps_prepare_direct_many(state, attrs_list, key_infos) do
+        keys = Enum.map(key_infos, & &1.state_key)
+        registry_keys = Enum.map(key_infos, & &1.registry_key)
+
+        if Enum.any?(flow_registry_keys_present_hot_only(state, registry_keys), & &1) or
+             Enum.any?(flow_state_keys_present_hot_only(state, keys), & &1) do
+          {:error, "ERR flow already exists"}
+        else
+          attrs_list
+          |> Enum.zip(key_infos)
+          |> Enum.reduce_while({:ok, []}, fn {attrs, key_info}, {:ok, acc} ->
+            case flow_run_steps_prepare_direct(state, attrs, key_info) do
+              {:ok, plan} -> {:cont, {:ok, [plan | acc]}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end)
+          |> case do
+            {:ok, plans} -> {:ok, Enum.reverse(plans)}
+            {:error, _reason} = error -> error
+          end
+        end
+      end
+
+      defp flow_run_steps_prepare_direct(
+             state,
+             %{step_states: [_ | _] = step_states} = attrs,
+             key_info
+           ) do
+        with {:ok, created, final} <- flow_run_steps_build_records(state, attrs, step_states),
+             plan = flow_create_fast_plan(final, attrs, key_info),
+             :ok <- flow_validate_create_fast_plan_keys(plan) do
+          {:ok, Map.merge(plan, %{created: created, step_states: step_states})}
+        end
+      end
+
+      defp flow_run_steps_prepare_direct(_state, _attrs, _key_info),
+        do: {:error, "ERR flow run_steps_many states must be non-empty"}
+
+      defp flow_run_steps_apply_direct_many(state, plans) do
+        with :ok <- flow_many_same_state_machine_shard_by_keys?(state, plans),
+             :ok <- flow_create_fast_put_record_values(state, plans),
+             :ok <- flow_create_put_fast_state_records(state, plans),
+             :ok <- flow_create_put_fast_registry_markers(state, plans),
+             :ok <- flow_create_put_fast_indexes(state, plans),
+             :ok <- flow_run_steps_put_histories(state, plans),
+             :ok <- flow_run_steps_after_history_put(state, plans) do
+          :ok
+        end
+      end
+
+      defp flow_run_steps_build_records(state, attrs, step_states) do
+        now_ms = Map.fetch!(attrs, :step_now_ms)
+        step_count = Map.get(attrs, :step_count) || length(step_states)
+        final_version = step_count + 1
+        partition_key = Map.fetch!(attrs, :partition_key)
+        id = Map.fetch!(attrs, :id)
+        final_run_state = Map.get(attrs, :final_run_state) || List.last(step_states)
+
+        created =
+          state
+          |> flow_create_record(attrs)
+          |> flow_start_and_claim_record(attrs)
+
+        final =
+          %{
+            created
+            | state: "completed",
+              version: final_version,
+              updated_at_ms: now_ms + step_count,
+              result_ref: flow_value_ref(attrs, :result, id, final_version, partition_key),
+              ttl_ms: nil,
+              retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(created, :retention_ttl_ms),
+              terminal_retention_until_ms: nil,
+              lease_owner: nil,
+              lease_token: nil,
+              lease_deadline_ms: 0,
+              next_run_at_ms: nil,
+              run_state: final_run_state,
+              fencing_token: step_count
+          }
+          |> flow_stamp_terminal_retention(now_ms + step_count)
+
+        {:ok, created, final}
+      end
+
+      defp flow_run_steps_put_histories(state, plans) do
+        entries =
+          Enum.map(plans, fn %{created: created, record: final, step_states: step_states} ->
+            flow_run_steps_history_projection_chain(state, created, final, step_states)
+          end)
+
+        queue_pending_flow_history_projections_batch(entries)
+      end
+
+      defp flow_run_steps_after_history_put(state, plans) do
+        lmdb_mirror? = flow_lmdb_projection_enabled?(state)
+
+        if Enum.all?(plans, fn %{record: final} ->
+             flow_after_history_fast_record?(lmdb_mirror?, final)
+           end) do
+          :ok
+        else
+          plans
+          |> Enum.map(fn %{record: final} -> final end)
+          |> flow_after_history_put_many(state)
+        end
+      end
+
+      defp flow_run_steps_history_projection_chain(_state, created, final, step_states) do
+        history_key =
+          FlowKeys.history_key(Map.fetch!(created, :id), Map.get(created, :partition_key))
+
+        %{
+          history_key: history_key,
+          history_chain: {created, final, step_states}
+        }
       end
 
       defp do_flow_transition_many(state, %{records: [_ | _] = records} = attrs) do
@@ -156,26 +350,97 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
              run_at_ms,
              now_ms
            ) do
-        with id when is_binary(id) <- Map.get(record, :id),
-             :ok <- flow_require_expected_state(record, from_state),
-             :ok <- flow_reject_terminal_current(record),
+        if flow_duplicate_transition_noop?(record, attrs, to_state) do
+          {:ok, :noop}
+        else
+          with id when is_binary(id) <- Map.get(record, :id),
+               :ok <- flow_require_expected_state(record, from_state),
+               :ok <- flow_reject_terminal_current(record),
+               :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
+               :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)),
+               :ok <- flow_reject_running_transition(to_state),
+               :ok <- flow_reject_terminal_transition(to_state) do
+            version = Map.fetch!(record, :version) + 1
+            partition_key = Map.get(record, :partition_key)
+
+            with {:ok, value_refs} <-
+                   flow_named_value_refs(record, attrs, id, version, partition_key) do
+              next =
+                %{
+                  record
+                  | state: to_state,
+                    version: version,
+                    updated_at_ms: now_ms,
+                    next_run_at_ms: run_at_ms,
+                    priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
+                    payload_ref:
+                      flow_value_ref(
+                        attrs,
+                        :payload,
+                        id,
+                        version,
+                        partition_key,
+                        Map.get(record, :payload_ref)
+                      ),
+                    ttl_ms: nil,
+                    retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+                    history_hot_max_events: Map.get(record, :history_hot_max_events),
+                    history_max_events: Map.get(record, :history_max_events),
+                    lease_owner: nil,
+                    lease_token: nil,
+                    lease_deadline_ms: 0
+                }
+                |> flow_put_record_value_refs(value_refs)
+                |> flow_stamp_terminal_retention(now_ms)
+
+              with :ok <- flow_validate_record_keys(next) do
+                {:ok, record, next}
+              end
+            end
+          else
+            {:error, _reason} = error -> error
+            _ -> {:error, "ERR flow not found"}
+          end
+        end
+      end
+
+      defp flow_prepare_step_continue_existing_record(
+             record,
+             attrs,
+             lease_token,
+             from_state,
+             to_state,
+             lease_ms,
+             now_ms
+           ) do
+        with :ok <- flow_require_running_lease(record, lease_token),
              :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
-             :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)),
+             :ok <- flow_require_step_run_state(record, from_state),
+             :ok <- flow_require_step_worker(record, Map.get(attrs, :worker)),
              :ok <- flow_reject_running_transition(to_state),
              :ok <- flow_reject_terminal_transition(to_state) do
           version = Map.fetch!(record, :version) + 1
+          next_fencing_token = Map.get(record, :fencing_token, 0) + 1
+          id = Map.fetch!(record, :id)
           partition_key = Map.get(record, :partition_key)
+          worker = Map.fetch!(record, :lease_owner)
+          deadline_ms = now_ms + lease_ms
+
+          token =
+            worker <>
+              ":" <>
+              Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_fencing_token)
 
           with {:ok, value_refs} <-
                  flow_named_value_refs(record, attrs, id, version, partition_key) do
             next =
               %{
                 record
-                | state: to_state,
+                | state: "running",
+                  run_state: to_state,
                   version: version,
+                  fencing_token: next_fencing_token,
                   updated_at_ms: now_ms,
-                  next_run_at_ms: run_at_ms,
-                  priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
                   payload_ref:
                     flow_value_ref(
                       attrs,
@@ -186,25 +451,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                       Map.get(record, :payload_ref)
                     ),
                   ttl_ms: nil,
-                  retention_ttl_ms: Map.get(record, :retention_ttl_ms),
-                  history_hot_max_events: Map.get(record, :history_hot_max_events),
-                  history_max_events: Map.get(record, :history_max_events),
-                  lease_owner: nil,
-                  lease_token: nil,
-                  lease_deadline_ms: 0
+                  terminal_retention_until_ms: nil,
+                  lease_owner: worker,
+                  lease_token: token,
+                  lease_deadline_ms: deadline_ms,
+                  next_run_at_ms: deadline_ms
               }
               |> flow_put_record_value_refs(value_refs)
-              |> flow_stamp_terminal_retention(now_ms)
 
-            with :ok <- flow_validate_record_keys(next) do
+            with :ok <- flow_validate_claim_next_record_keys(next) do
               {:ok, record, next}
             end
           end
-        else
-          {:error, _reason} = error -> error
-          _ -> {:error, "ERR flow not found"}
         end
       end
+
+      defp flow_require_step_run_state(record, expected_state) do
+        case flow_retry_run_state(record) do
+          ^expected_state -> :ok
+          _other -> {:error, "ERR flow wrong state"}
+        end
+      end
+
+      defp flow_require_step_worker(%{lease_owner: worker}, nil)
+           when is_binary(worker) and worker != "",
+           do: :ok
+
+      defp flow_require_step_worker(%{lease_owner: worker}, worker)
+           when is_binary(worker) and worker != "",
+           do: :ok
+
+      defp flow_require_step_worker(_record, _worker), do: {:error, "ERR stale flow lease"}
 
       defp flow_reject_terminal_transition(to_state) do
         if Ferricstore.Flow.LMDB.terminal_state?(to_state) do
@@ -239,6 +516,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                  next
                ),
              :ok <- flow_history_put_planned(state, record, next, "transitioned", now_ms),
+             :ok <- flow_after_history_put(state, next) do
+          :ok
+        end
+      end
+
+      defp flow_apply_step_continue(state, record, next, partition_key, now_ms, attrs) do
+        plans = [{record, next}]
+
+        with :ok <- flow_put_record_values(state, next, attrs),
+             :ok <- flow_transition_move_indexes(state, plans),
+             :ok <-
+               flow_put_state_record(
+                 state,
+                 FlowKeys.state_key(next.id, partition_key),
+                 next
+               ),
+             :ok <- flow_history_put_planned(state, record, next, "step_continued", now_ms),
              :ok <- flow_after_history_put(state, next) do
           :ok
         end
@@ -281,6 +575,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                 {:cont,
                  {:ok, [{record, next, attrs} | acc],
                   flow_merge_record_value_mode(value_mode, flow_attrs_record_value_mode(attrs))}}
+
+              {:ok, :noop} ->
+                {:cont, {:ok, acc, value_mode}}
 
               {:error, _reason} = error ->
                 {:halt, error}
@@ -441,12 +738,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         now_ms = flow_attrs_now_ms(attrs)
         partition_key = Map.get(attrs, :partition_key)
 
-        with {:ok, record} <- flow_require_record(state, id, partition_key),
-             {:ok, record, next, history_meta} <-
-               flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms),
-             :ok <-
-               flow_apply_retry(state, record, next, partition_key, now_ms, history_meta, attrs) do
-          :ok
+        with {:ok, record} <- flow_require_record(state, id, partition_key) do
+          case flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms) do
+            {:ok, :noop} ->
+              :ok
+
+            {:ok, record, next, history_meta} ->
+              flow_apply_retry(state, record, next, partition_key, now_ms, history_meta, attrs)
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
@@ -465,54 +767,58 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         do: {:error, "ERR flow items must be a non-empty list"}
 
       defp flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms) do
-        with :ok <- flow_require_running_lease(record, lease_token),
-             :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
-          retry_policy = flow_retry_policy_for_record(state, record, attrs)
-          next_attempts = Map.get(record, :attempts, 0) + 1
-          version = Map.fetch!(record, :version) + 1
-          id = Map.fetch!(record, :id)
-          partition_key = Map.get(record, :partition_key)
+        if flow_duplicate_retry_noop?(state, record, attrs) do
+          {:ok, :noop}
+        else
+          with :ok <- flow_require_running_lease(record, lease_token),
+               :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+            retry_policy = flow_retry_policy_for_record(state, record, attrs)
+            next_attempts = Map.get(record, :attempts, 0) + 1
+            version = Map.fetch!(record, :version) + 1
+            id = Map.fetch!(record, :id)
+            partition_key = Map.get(record, :partition_key)
 
-          {next_state, next_run_at_ms, retry_decision} =
-            flow_retry_next_state(record, attrs, retry_policy, next_attempts, now_ms)
+            {next_state, next_run_at_ms, retry_decision} =
+              flow_retry_next_state(record, attrs, retry_policy, next_attempts, now_ms)
 
-          payload_ref =
-            flow_value_ref(
-              attrs,
-              :payload,
-              id,
-              version,
-              partition_key,
-              Map.get(record, :payload_ref)
-            )
+            payload_ref =
+              flow_value_ref(
+                attrs,
+                :payload,
+                id,
+                version,
+                partition_key,
+                Map.get(record, :payload_ref)
+              )
 
-          error_ref = flow_value_ref(attrs, :error, id, version, partition_key)
+            error_ref = flow_value_ref(attrs, :error, id, version, partition_key)
 
-          with {:ok, value_refs} <-
-                 flow_named_value_refs(record, attrs, id, version, partition_key) do
-            next =
-              %{
-                record
-                | state: next_state,
-                  version: version,
-                  attempts: next_attempts,
-                  updated_at_ms: now_ms,
-                  next_run_at_ms: next_run_at_ms,
-                  payload_ref: payload_ref,
-                  error_ref: error_ref,
-                  ttl_ms: nil,
-                  retention_ttl_ms: Map.get(record, :retention_ttl_ms),
-                  lease_owner: nil,
-                  lease_token: nil,
-                  lease_deadline_ms: 0,
-                  run_state: nil
-              }
-              |> flow_put_record_value_refs(value_refs)
-              |> flow_stamp_terminal_retention(now_ms)
+            with {:ok, value_refs} <-
+                   flow_named_value_refs(record, attrs, id, version, partition_key) do
+              next =
+                %{
+                  record
+                  | state: next_state,
+                    version: version,
+                    attempts: next_attempts,
+                    updated_at_ms: now_ms,
+                    next_run_at_ms: next_run_at_ms,
+                    payload_ref: payload_ref,
+                    error_ref: error_ref,
+                    ttl_ms: nil,
+                    retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+                    lease_owner: nil,
+                    lease_token: nil,
+                    lease_deadline_ms: 0,
+                    run_state: nil
+                }
+                |> flow_put_record_value_refs(value_refs)
+                |> flow_stamp_terminal_retention(now_ms)
 
-            with :ok <- flow_validate_claim_next_record_keys(next) do
-              {:ok, record, next,
-               flow_retry_history_meta(record, next, retry_policy, retry_decision)}
+              with :ok <- flow_validate_claim_next_record_keys(next) do
+                {:ok, record, next,
+                 flow_retry_history_meta(record, next, retry_policy, retry_decision)}
+              end
             end
           end
         end
@@ -609,6 +915,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                       has_values? or flow_attrs_have_record_values?(attrs),
                       has_after_terminal? or flow_terminal_after_required?(:retry, next)}}
 
+                  {:ok, :noop} ->
+                    {:cont, {:ok, acc, has_values?, has_after_terminal?}}
+
                   {:error, _reason} = error ->
                     {:halt, error}
                 end
@@ -670,11 +979,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         now_ms = flow_attrs_now_ms(attrs)
         partition_key = Map.get(attrs, :partition_key)
 
-        with {:ok, record} <- flow_require_record(state, id, partition_key),
-             {:ok, record, next} <-
-               flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms),
-             :ok <- flow_apply_fail(state, record, next, partition_key, now_ms, attrs) do
-          :ok
+        with {:ok, record} <- flow_require_record(state, id, partition_key) do
+          case flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
+            {:ok, :noop} ->
+              :ok
+
+            {:ok, record, next} ->
+              flow_apply_fail(state, record, next, partition_key, now_ms, attrs)
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
@@ -693,47 +1008,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         do: {:error, "ERR flow items must be a non-empty list"}
 
       defp flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
-        with :ok <- flow_require_running_lease(record, lease_token),
-             :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
-          version = Map.fetch!(record, :version) + 1
-          id = Map.fetch!(record, :id)
-          partition_key = Map.get(record, :partition_key)
+        if flow_duplicate_terminal_noop?(record, attrs, "failed") do
+          {:ok, :noop}
+        else
+          with :ok <- flow_require_running_lease(record, lease_token),
+               :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+            version = Map.fetch!(record, :version) + 1
+            id = Map.fetch!(record, :id)
+            partition_key = Map.get(record, :partition_key)
 
-          payload_ref =
-            flow_value_ref(
-              attrs,
-              :payload,
-              id,
-              version,
-              partition_key,
-              Map.get(record, :payload_ref)
-            )
+            payload_ref =
+              flow_value_ref(
+                attrs,
+                :payload,
+                id,
+                version,
+                partition_key,
+                Map.get(record, :payload_ref)
+              )
 
-          error_ref = flow_value_ref(attrs, :error, id, version, partition_key)
-          retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
+            error_ref = flow_value_ref(attrs, :error, id, version, partition_key)
+            retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
 
-          with {:ok, value_refs} <-
-                 flow_named_value_refs(record, attrs, id, version, partition_key) do
-            next =
-              %{
-                record
-                | state: "failed",
-                  version: version,
-                  updated_at_ms: now_ms,
-                  payload_ref: payload_ref,
-                  error_ref: error_ref,
-                  ttl_ms: nil,
-                  retention_ttl_ms: retention_ttl_ms,
-                  lease_owner: nil,
-                  lease_token: nil,
-                  lease_deadline_ms: 0,
-                  next_run_at_ms: nil
-              }
-              |> flow_put_record_value_refs(value_refs)
-              |> flow_stamp_terminal_retention(now_ms)
+            with {:ok, value_refs} <-
+                   flow_named_value_refs(record, attrs, id, version, partition_key) do
+              next =
+                %{
+                  record
+                  | state: "failed",
+                    version: version,
+                    updated_at_ms: now_ms,
+                    payload_ref: payload_ref,
+                    error_ref: error_ref,
+                    ttl_ms: nil,
+                    retention_ttl_ms: retention_ttl_ms,
+                    lease_owner: nil,
+                    lease_token: nil,
+                    lease_deadline_ms: 0,
+                    next_run_at_ms: nil
+                }
+                |> flow_put_record_value_refs(value_refs)
+                |> flow_stamp_terminal_retention(now_ms)
 
-            with :ok <- flow_validate_terminal_state_index_key(next) do
-              {:ok, record, next}
+              with :ok <- flow_validate_terminal_state_index_key(next) do
+                {:ok, record, next}
+              end
             end
           end
         end
@@ -779,6 +1098,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                      {:ok, [{record, next, attrs} | acc],
                       has_values? or flow_attrs_have_record_values?(attrs),
                       has_after_terminal? or flow_terminal_after_required?(:fail, next)}}
+
+                  {:ok, :noop} ->
+                    {:cont, {:ok, acc, has_values?, has_after_terminal?}}
 
                   {:error, _reason} = error ->
                     {:halt, error}

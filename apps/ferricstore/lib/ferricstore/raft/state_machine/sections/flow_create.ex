@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -758,7 +757,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_named_value_digest_value(_value), do: nil
 
       defp flow_value_digest(value) do
-        :crypto.hash(:sha256, Flow.encode_value(value))
+        value
+        |> Flow.encode_value()
+        |> flow_value_digest_encoded()
+      end
+
+      defp flow_value_digest_encoded(encoded_value) when is_binary(encoded_value) do
+        :crypto.hash(:sha256, encoded_value)
         |> Base.encode16(case: :lower)
       end
 
@@ -900,6 +905,39 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
       defp flow_validate_create_attrs(_attrs),
         do: {:error, "ERR flow id must be a non-empty string"}
+
+      defp flow_validate_start_and_claim_attrs(attrs) do
+        with :ok <- flow_validate_create_attrs(attrs),
+             :ok <- flow_validate_start_and_claim_run_state(attrs),
+             :ok <- flow_validate_start_and_claim_worker(attrs),
+             :ok <- flow_validate_start_and_claim_lease(attrs) do
+          :ok
+        end
+      end
+
+      defp flow_validate_start_and_claim_run_state(%{run_state: run_state}) do
+        with :ok <- flow_reject_running_transition(run_state),
+             :ok <- flow_reject_terminal_transition(run_state) do
+          :ok
+        end
+      end
+
+      defp flow_validate_start_and_claim_run_state(_attrs),
+        do: {:error, "ERR flow state must be a non-empty string"}
+
+      defp flow_validate_start_and_claim_worker(%{worker: worker})
+           when is_binary(worker) and worker != "",
+           do: :ok
+
+      defp flow_validate_start_and_claim_worker(_attrs),
+        do: {:error, "ERR flow worker is required"}
+
+      defp flow_validate_start_and_claim_lease(%{lease_ms: lease_ms})
+           when is_integer(lease_ms) and lease_ms > 0,
+           do: :ok
+
+      defp flow_validate_start_and_claim_lease(_attrs),
+        do: {:error, "ERR flow lease_ms must be a positive integer"}
 
       defp flow_non_empty_binary?(value), do: is_binary(value) and value != ""
 

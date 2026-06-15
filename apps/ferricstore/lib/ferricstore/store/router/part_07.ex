@@ -110,6 +110,30 @@ defmodule Ferricstore.Store.Router.Part07 do
 
       defp flow_claim_due_auto_partition(ctx, attrs, start_idx, remaining, offset, acc) do
         idx = rem(start_idx + offset, ctx.shard_count)
+
+        case flow_claim_due_auto_empty_precheck(ctx, idx, attrs) do
+          :empty ->
+            flow_claim_due_auto_partition(ctx, attrs, start_idx, remaining, offset + 1, acc)
+
+          {:non_empty, cold_due_mode} ->
+            attrs
+            |> Map.put(:cold_due_mode, cold_due_mode)
+            |> flow_claim_due_auto_partition_write(ctx, idx, start_idx, remaining, offset, acc)
+
+          _unknown ->
+            flow_claim_due_auto_partition_write(
+              attrs,
+              ctx,
+              idx,
+              start_idx,
+              remaining,
+              offset,
+              acc
+            )
+        end
+      end
+
+      defp flow_claim_due_auto_partition_write(attrs, ctx, idx, start_idx, remaining, offset, acc) do
         key = "f:{flow-claim-auto-" <> Integer.to_string(idx) <> "}:d"
         shard_attrs = Map.put(attrs, :limit, remaining)
 
@@ -151,20 +175,46 @@ defmodule Ferricstore.Store.Router.Part07 do
             rem(idx - start_idx + ctx.shard_count, ctx.shard_count)
           end)
 
-        case flow_claim_due_partition_key_commands(ctx, groups, attrs, limit) do
+        if limit == 1 do
+          flow_claim_due_partition_key_groups_one(ctx, groups, attrs)
+        else
+          case flow_claim_due_partition_key_commands(ctx, groups, attrs, limit) do
+            [] ->
+              {:ok, []}
+
+            [{key, command}] ->
+              case raft_write(ctx, shard_for(ctx, key), key, command) do
+                {:ok, records} when is_list(records) -> {:ok, Enum.take(records, limit)}
+                other -> other
+              end
+
+            commands ->
+              ctx
+              |> pipeline_write_batch(commands)
+              |> flow_claim_due_partition_key_results(limit)
+          end
+        end
+      end
+
+      defp flow_claim_due_partition_key_groups_one(_ctx, [], _attrs), do: {:ok, []}
+
+      defp flow_claim_due_partition_key_groups_one(ctx, [group | rest], attrs) do
+        case flow_claim_due_partition_key_commands(ctx, [group], attrs, 1) do
           [] ->
-            {:ok, []}
+            flow_claim_due_partition_key_groups_one(ctx, rest, attrs)
 
           [{key, command}] ->
             case raft_write(ctx, shard_for(ctx, key), key, command) do
-              {:ok, records} when is_list(records) -> {:ok, Enum.take(records, limit)}
+              {:ok, []} -> flow_claim_due_partition_key_groups_one(ctx, rest, attrs)
+              {:ok, records} when is_list(records) -> {:ok, Enum.take(records, 1)}
               other -> other
             end
 
           commands ->
-            ctx
-            |> pipeline_write_batch(commands)
-            |> flow_claim_due_partition_key_results(limit)
+            case pipeline_write_batch(ctx, commands) |> flow_claim_due_partition_key_results(1) do
+              {:ok, []} -> flow_claim_due_partition_key_groups_one(ctx, rest, attrs)
+              other -> other
+            end
         end
       end
 
@@ -285,10 +335,62 @@ defmodule Ferricstore.Store.Router.Part07 do
         _kind, _reason -> :unknown
       end
 
+      defp flow_claim_due_auto_empty_precheck(ctx, idx, attrs) do
+        type = Map.fetch!(attrs, :type)
+        state = Map.get(attrs, :state)
+        priority = Map.get(attrs, :priority)
+
+        with true <- flow_claim_due_empty_precheck_allowed?(ctx, idx),
+             {:ok, due_keys} <- flow_claim_due_auto_precheck_keys(ctx, idx, type, state, priority),
+             true <- due_keys != [],
+             {:ok, native} <- direct_flow_index_read(ctx, idx, & &1) do
+          now_ms = flow_claim_due_precheck_now_ms(attrs)
+
+          case NativeFlowIndex.due_keys_present(native, due_keys, now_ms) do
+            [] ->
+              if flow_claim_due_cold_precheck_present?(
+                   ctx,
+                   idx,
+                   type,
+                   state,
+                   priority,
+                   :auto,
+                   now_ms,
+                   Map.get(attrs, :cold_due_mode)
+                 ) do
+                {:non_empty, :allow}
+              else
+                :empty
+              end
+
+            [_ | _] ->
+              {:non_empty, :skip}
+          end
+        else
+          _other -> :unknown
+        end
+      rescue
+        _error -> :unknown
+      catch
+        _kind, _reason -> :unknown
+      end
+
       defp flow_claim_due_precheck_now_ms(%{now_ms: now_ms}) when is_integer(now_ms), do: now_ms
 
       defp flow_claim_due_precheck_now_ms(_attrs),
         do: CommandTime.now_ms() + @flow_claim_due_precheck_slack_ms
+
+      defp flow_claim_due_cold_precheck_present?(
+             _ctx,
+             _idx,
+             _type,
+             "running",
+             _priority,
+             _partition_key,
+             _now_ms,
+             _cold_due_mode
+           ),
+           do: false
 
       defp flow_claim_due_cold_precheck_present?(
              ctx,
@@ -310,19 +412,16 @@ defmodule Ferricstore.Store.Router.Part07 do
           Enum.any?(states, fn claim_state ->
             Enum.any?(priorities, fn claim_priority ->
               Enum.any?(buckets, fn bucket_ms ->
-                prefix =
-                  Ferricstore.Flow.LMDB.cold_due_claim_prefix(
-                    bucket_ms: bucket_ms,
-                    type: type,
-                    state: claim_state,
-                    partition_key: partition_key,
-                    priority: claim_priority
-                  )
-
-                case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
-                  {:ok, [_ | _]} -> true
-                  _ -> false
-                end
+                flow_claim_due_cold_precheck_partition_present?(
+                  ctx,
+                  idx,
+                  path,
+                  bucket_ms,
+                  type,
+                  claim_state,
+                  claim_priority,
+                  partition_key
+                )
               end)
             end)
           end)
@@ -363,6 +462,49 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       defp flow_claim_due_cold_precheck_buckets(_now_ms), do: []
+
+      defp flow_claim_due_cold_precheck_partition_present?(
+             _ctx,
+             _idx,
+             path,
+             bucket_ms,
+             type,
+             claim_state,
+             _claim_priority,
+             :auto
+           ) do
+        prefix = Ferricstore.Flow.LMDB.cold_due_state_bucket_prefix(bucket_ms, type, claim_state)
+
+        case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+          {:ok, [_ | _]} -> true
+          _ -> false
+        end
+      end
+
+      defp flow_claim_due_cold_precheck_partition_present?(
+             _ctx,
+             _idx,
+             path,
+             bucket_ms,
+             type,
+             claim_state,
+             claim_priority,
+             partition_key
+           ) do
+        prefix =
+          Ferricstore.Flow.LMDB.cold_due_claim_prefix(
+            bucket_ms: bucket_ms,
+            type: type,
+            state: claim_state,
+            partition_key: partition_key,
+            priority: claim_priority
+          )
+
+        case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
+          {:ok, [_ | _]} -> true
+          _ -> false
+        end
+      end
 
       defp flow_claim_due_empty_precheck_allowed?(ctx, idx) do
         selected_waraft_ctx?(ctx) and flow_claim_due_single_local_member?(idx)
@@ -409,6 +551,53 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       defp flow_claim_due_precheck_states(_state), do: :unknown
+
+      defp flow_claim_due_auto_precheck_keys(ctx, idx, type, state, priority)
+           when is_binary(type) do
+        with {:ok, states} <- flow_claim_due_precheck_states(state),
+             priorities <- flow_claim_any_priorities(priority),
+             true <- Enum.all?(priorities, &is_integer/1),
+             [_ | _] = partition_keys <- flow_auto_partition_keys_for_shard(ctx, idx) do
+          keys =
+            for state <- states,
+                priority <- priorities,
+                partition_key <- partition_keys do
+              Ferricstore.Flow.Keys.due_key(type, state, priority, partition_key)
+            end
+
+          {:ok, keys}
+        else
+          _other -> :unknown
+        end
+      end
+
+      defp flow_claim_due_auto_precheck_keys(_ctx, _idx, _type, _state, _priority), do: :unknown
+
+      defp flow_auto_partition_keys_for_shard(%{shard_count: shard_count} = ctx, idx)
+           when is_integer(shard_count) and shard_count > 0 and is_integer(idx) do
+        key = {__MODULE__, :flow_auto_partition_keys_for_shard, ctx.name, ctx.slot_map}
+
+        key
+        |> :persistent_term.get(nil)
+        |> case do
+          nil ->
+            groups =
+              Ferricstore.Flow.Keys.auto_partition_keys()
+              |> Enum.group_by(fn partition_key ->
+                "__auto_probe__"
+                |> Ferricstore.Flow.Keys.due_key("__auto_probe__", 0, partition_key)
+                |> then(&shard_for(ctx, &1))
+              end)
+
+            :persistent_term.put(key, groups)
+            Map.get(groups, idx, [])
+
+          groups ->
+            Map.get(groups, idx, [])
+        end
+      end
+
+      defp flow_auto_partition_keys_for_shard(_ctx, _idx), do: []
 
       defp flow_claim_due_partition_key_results(results, limit) do
         results
@@ -776,6 +965,11 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       @doc false
+      def flow_complete_many_local(ctx, attrs_list) when is_list(attrs_list) do
+        flow_many_by_shard(ctx, attrs_list, :flow_complete_many, "__complete_batch__")
+      end
+
+      @doc false
       def flow_transition(ctx, %{id: id} = attrs) when is_binary(id) do
         key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 
@@ -784,6 +978,37 @@ defmodule Ferricstore.Store.Router.Part07 do
         else
           idx = shard_for(ctx, key)
           raft_write(ctx, idx, key, {:flow_transition, key, attrs})
+        end
+      end
+
+      @doc false
+      def flow_start_and_claim(ctx, %{id: id} = attrs) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_start_and_claim, key, attrs})
+        end
+      end
+
+      @doc false
+      def flow_run_steps_many(_ctx, []), do: :ok
+
+      def flow_run_steps_many(ctx, attrs_list) when is_list(attrs_list) do
+        flow_many_by_shard(ctx, attrs_list, :flow_run_steps_many, "__run_steps_batch__")
+      end
+
+      @doc false
+      def flow_step_continue(ctx, %{id: id} = attrs) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+        if byte_size(key) > @max_key_size do
+          {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        else
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_step_continue, key, attrs})
         end
       end
 
@@ -857,6 +1082,164 @@ defmodule Ferricstore.Store.Router.Part07 do
               |> flow_stamp_shard(shard_idx)
 
             {key, local_indices, {:flow_transition_many, key, command_attrs}}
+          end)
+
+        keyed_commands = Enum.map(groups, fn {key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+        expand_flow_transition_batch_results(count, groups, group_results)
+      end
+
+      def flow_step_continue_batch(_ctx, []), do: []
+
+      def flow_step_continue_batch(ctx, attrs_list) when is_list(attrs_list) do
+        if ctx.name == :default do
+          {valid, indexed_results} =
+            attrs_list
+            |> Enum.with_index()
+            |> Enum.reduce({[], %{}}, fn
+              {%{id: id} = attrs, idx}, {valid_acc, result_acc} when is_binary(id) ->
+                key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+                if byte_size(key) > @max_key_size do
+                  {valid_acc,
+                   Map.put(
+                     result_acc,
+                     idx,
+                     {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+                   )}
+                else
+                  {[{idx, key, {:flow_step_continue, key, attrs}} | valid_acc], result_acc}
+                end
+
+              {_attrs, idx}, {valid_acc, result_acc} ->
+                {valid_acc,
+                 Map.put(result_acc, idx, {:error, "ERR flow id must be a non-empty string"})}
+            end)
+
+          valid = Enum.reverse(valid)
+          valid_results = flow_step_continue_batch_valid_results(ctx, valid)
+
+          indexed_results =
+            valid
+            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
+            |> Enum.zip(valid_results)
+            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+          for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
+        else
+          attrs_list
+          |> Enum.map(fn attrs ->
+            key =
+              Ferricstore.Flow.Keys.state_key(Map.get(attrs, :id), Map.get(attrs, :partition_key))
+
+            raft_write(ctx, shard_for(ctx, key), key, {:flow_step_continue, key, attrs})
+          end)
+        end
+      end
+
+      defp flow_step_continue_batch_valid_results(_ctx, []), do: []
+
+      defp flow_step_continue_batch_valid_results(ctx, valid) do
+        {buckets, count} =
+          valid
+          |> Enum.with_index()
+          |> Enum.reduce({flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+            {{_idx, key, {:flow_step_continue, _key, attrs}}, local_idx}, {buckets, count} ->
+              shard_idx = shard_for(ctx, key)
+              {flow_put_shard_bucket(buckets, shard_idx, {local_idx, key, attrs}), count + 1}
+          end)
+
+        groups =
+          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+            group = Enum.reverse(entries)
+            key = group |> hd() |> elem(1)
+            local_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
+            attrs_list = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
+
+            command_attrs =
+              %{records: attrs_list, independent: true}
+              |> flow_stamp_shard(shard_idx)
+
+            {key, local_indices, {:flow_step_continue_many, key, command_attrs}}
+          end)
+
+        keyed_commands = Enum.map(groups, fn {key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+        expand_flow_transition_batch_results(count, groups, group_results)
+      end
+
+      def flow_signal_batch(_ctx, []), do: []
+
+      def flow_signal_batch(ctx, attrs_list) when is_list(attrs_list) do
+        if ctx.name == :default do
+          {valid, indexed_results} =
+            attrs_list
+            |> Enum.with_index()
+            |> Enum.reduce({[], %{}}, fn
+              {%{id: id} = attrs, idx}, {valid_acc, result_acc} when is_binary(id) ->
+                key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+                if byte_size(key) > @max_key_size do
+                  {valid_acc,
+                   Map.put(
+                     result_acc,
+                     idx,
+                     {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+                   )}
+                else
+                  {[{idx, key, {:flow_signal, key, attrs}} | valid_acc], result_acc}
+                end
+
+              {_attrs, idx}, {valid_acc, result_acc} ->
+                {valid_acc,
+                 Map.put(result_acc, idx, {:error, "ERR flow id must be a non-empty string"})}
+            end)
+
+          valid = Enum.reverse(valid)
+          valid_results = flow_signal_batch_valid_results(ctx, valid)
+
+          indexed_results =
+            valid
+            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
+            |> Enum.zip(valid_results)
+            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+          for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
+        else
+          attrs_list
+          |> Enum.map(fn attrs ->
+            key =
+              Ferricstore.Flow.Keys.state_key(Map.get(attrs, :id), Map.get(attrs, :partition_key))
+
+            raft_write(ctx, shard_for(ctx, key), key, {:flow_signal, key, attrs})
+          end)
+        end
+      end
+
+      defp flow_signal_batch_valid_results(_ctx, []), do: []
+
+      defp flow_signal_batch_valid_results(ctx, valid) do
+        {buckets, count} =
+          valid
+          |> Enum.with_index()
+          |> Enum.reduce({flow_fixed_shard_buckets(ctx.shard_count), 0}, fn
+            {{_idx, key, {:flow_signal, _key, attrs}}, local_idx}, {buckets, count} ->
+              shard_idx = shard_for(ctx, key)
+              {flow_put_shard_bucket(buckets, shard_idx, {local_idx, key, attrs}), count + 1}
+          end)
+
+        groups =
+          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+            group = Enum.reverse(entries)
+            key = group |> hd() |> elem(1)
+            local_indices = Enum.map(group, fn {idx, _key, _attrs} -> idx end)
+            attrs_list = Enum.map(group, fn {_idx, _key, attrs} -> attrs end)
+
+            command_attrs =
+              %{records: attrs_list, independent: true}
+              |> flow_stamp_shard(shard_idx)
+
+            {key, local_indices, {:flow_signal_many, key, command_attrs}}
           end)
 
         keyed_commands = Enum.map(groups, fn {key, _indices, cmd} -> {key, cmd} end)

@@ -252,6 +252,7 @@ fn flow_complete_many_option<'a>(
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"INDEPENDENT", "independent", FlowOptType::Boolean),
+            (b"RETURN", "return", FlowOptType::Binary),
         ],
     )
 }
@@ -748,4 +749,3 @@ fn flow_option_value<'a>(
         },
     }
 }
-

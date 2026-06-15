@@ -3,7 +3,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
 
   @string_read ~w(GET MGET GETRANGE STRLEN)
   @string_write ~w(
-    SET SETNX SETEX PSETEX MSET MSETNX APPEND SETRANGE
+    SET SETNX SETEX PSETEX MSET MSETNX PIPELINE APPEND SETRANGE
     INCR DECR INCRBY DECRBY INCRBYFLOAT
     GETSET GETDEL GETEX
   )
@@ -47,13 +47,6 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   @stream_read ~w(XLEN XRANGE XREVRANGE XREAD XINFO)
   @stream_write ~w(XADD XTRIM XDEL XGROUP XREADGROUP XACK)
 
-  @json_read ~w(
-    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET
-  )
-  @json_write ~w(
-    JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
-  )
-
   @probabilistic_read ~w(
     BF.EXISTS BF.MEXISTS BF.CARD BF.INFO
     CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO
@@ -77,7 +70,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   @flow_write ~w(
     FLOW.CREATE FLOW.CREATE_MANY FLOW.VALUE.PUT FLOW.SIGNAL FLOW.SPAWN_CHILDREN FLOW.POLICY.SET FLOW.CLAIM_DUE
     FLOW.RECLAIM FLOW.EXTEND_LEASE FLOW.COMPLETE FLOW.COMPLETE_MANY FLOW.TRANSITION
-    FLOW.TRANSITION_MANY FLOW.RETRY FLOW.RETRY_MANY FLOW.FAIL FLOW.FAIL_MANY FLOW.CANCEL
+    FLOW.STEP_CONTINUE FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY FLOW.TRANSITION_MANY FLOW.RETRY FLOW.RETRY_MANY FLOW.FAIL FLOW.FAIL_MANY FLOW.CANCEL
     FLOW.CANCEL_MANY FLOW.REWIND FLOW.RETENTION_CLEANUP
   )
 
@@ -141,7 +134,6 @@ defmodule FerricstoreServer.Acl.CommandCategories do
                      @hyperloglog_read ++
                      @geo_read ++
                      @stream_read ++
-                     @json_read ++
                      @probabilistic_read ++
                      @flow_read ++ @generic_read ++ @native_read
                  )
@@ -156,7 +148,6 @@ defmodule FerricstoreServer.Acl.CommandCategories do
                       @hyperloglog_write ++
                       @geo_write ++
                       @stream_write ++
-                      @json_write ++
                       @probabilistic_write ++
                       @flow_write ++ @generic_write ++ @native_write
                   )
@@ -191,7 +182,6 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     "HYPERLOGLOG" => MapSet.new(@hyperloglog_read ++ @hyperloglog_write),
     "GEO" => MapSet.new(@geo_read ++ @geo_write),
     "STREAM" => MapSet.new(@stream_read ++ @stream_write),
-    "JSON" => MapSet.new(@json_read ++ @json_write),
     "PROBABILISTIC" => MapSet.new(@probabilistic_read ++ @probabilistic_write),
     "FLOW" => MapSet.new(@flow_read ++ @flow_write),
     "NATIVE" => MapSet.new(@native_read ++ @native_write),

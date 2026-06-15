@@ -86,6 +86,7 @@ defmodule Ferricstore.Store.Shard.Routing do
           cross_shard_intents: %{},
           instance_ctx: state.instance_ctx,
           instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
+          compound_member_index_name: state.compound_member_index,
           zset_score_index_name: state.zset_score_index,
           zset_score_lookup_name: state.zset_score_lookup,
           flow_index_name: state.flow_index,

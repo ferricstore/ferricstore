@@ -11,10 +11,16 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
       alias Ferricstore.Raft.WARaftBackend.BatcherSupervisor, as: NamespaceBatcherSupervisor
       alias Ferricstore.Raft.WARaftBackend.SyncGate
+      require Ferricstore.LatencyTrace
 
       defp submit_write_many_entry_after_pause({shard_index, command} = entry)
            when valid_shard_index_shape(shard_index) do
-        case SyncGate.enter(shard_index) do
+        enter_result =
+          Ferricstore.LatencyTrace.maybe_span "server_waraft_sync_gate_us" do
+            SyncGate.enter(shard_index)
+          end
+
+        case enter_result do
           {:ok, token} ->
             try do
               case submit_write_many_entry(entry) do
@@ -79,22 +85,24 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
            do: invalid_shard_index_error(shard_index)
 
       defp commit_or_redirect(shard_index, command, redirects_left) do
-        case cached_pre_submit_redirect_node(shard_index, redirects_left) do
-          leader_node when is_atom(leader_node) and leader_node not in [nil, node()] ->
-            leader_node
-            |> redirect_commit(shard_index, command, redirects_left)
-            |> normalize_commit_result()
+        Ferricstore.LatencyTrace.maybe_span "server_waraft_commit_or_redirect_us" do
+          case cached_pre_submit_redirect_node(shard_index, redirects_left) do
+            leader_node when is_atom(leader_node) and leader_node not in [nil, node()] ->
+              leader_node
+              |> redirect_commit(shard_index, command, redirects_left)
+              |> normalize_commit_result()
 
-          _other ->
-            case commit(shard_index, command) do
-              {:error, _reason} = error ->
-                error
-                |> maybe_redirect_commit(shard_index, command, redirects_left)
-                |> normalize_commit_result()
+            _other ->
+              case commit(shard_index, command) do
+                {:error, _reason} = error ->
+                  error
+                  |> maybe_redirect_commit(shard_index, command, redirects_left)
+                  |> normalize_commit_result()
 
-              result ->
-                result
-            end
+                result ->
+                  result
+              end
+          end
         end
       end
 
@@ -131,44 +139,81 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       end
 
       defp commit(shard_index, command) do
-        with :ok <- ensure_local_leader_connected_quorum(shard_index),
-             {:ok, acquired_bytes} <- acquire_commit_bytes(shard_index, command) do
-          try do
-            with {:ok, prepared_command, blob_protection} <-
-                   prepare_commit_command(shard_index, command) do
-              acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
-              acceptor_pid = Process.whereis(acceptor)
-              stamped = CommandStamp.to_ttb(prepared_command)
-              started_mono = System.monotonic_time()
-
-              result =
-                acceptor
-                |> commit_safely(acceptor_pid, {make_ref(), stamped})
-                |> normalize_commit_transport_result(acceptor_pid)
-
-              :ok =
-                Ferricstore.FaultInjection.maybe_pause(:after_waraft_commit, %{
-                  shard_index: shard_index,
-                  result: result
-                })
-
-              emit_commit_timeout_if_needed(
-                shard_index,
-                command,
-                result,
-                acquired_bytes,
-                started_mono,
-                :sync
-              )
-
-              release_blob_protection_after_result(blob_protection, result)
-              result
-            end
-          after
-            release_commit_bytes(shard_index, acquired_bytes)
+        quorum_result =
+          Ferricstore.LatencyTrace.maybe_span "server_waraft_quorum_check_us" do
+            ensure_local_leader_connected_quorum(shard_index)
           end
-        else
-          {:error, _reason} = error -> error
+
+        case quorum_result do
+          :ok ->
+            acquire_result =
+              Ferricstore.LatencyTrace.maybe_span "server_waraft_inflight_acquire_us" do
+                acquire_commit_bytes(shard_index, command)
+              end
+
+            case acquire_result do
+              {:ok, acquired_bytes} ->
+                try do
+                  prepare_result =
+                    Ferricstore.LatencyTrace.maybe_span "server_waraft_prepare_us" do
+                      prepare_commit_command(shard_index, command)
+                    end
+
+                  case prepare_result do
+                    {:ok, prepared_command, blob_protection} ->
+                      acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
+                      acceptor_pid = Process.whereis(acceptor)
+                      stamped = CommandStamp.to_ttb(prepared_command)
+                      started_mono = System.monotonic_time()
+
+                      result =
+                        Ferricstore.LatencyTrace.maybe_span "server_waraft_acceptor_commit_us" do
+                          acceptor
+                          |> commit_safely(acceptor_pid, {make_ref(), stamped})
+                          |> normalize_commit_transport_result(acceptor_pid)
+                        end
+
+                      emit_commit_stage(
+                        shard_index,
+                        command_shape(command),
+                        :sync,
+                        started_mono,
+                        result,
+                        acquired_bytes,
+                        :sync
+                      )
+
+                      :ok =
+                        Ferricstore.FaultInjection.maybe_pause(:after_waraft_commit, %{
+                          shard_index: shard_index,
+                          result: result
+                        })
+
+                      emit_commit_timeout_if_needed(
+                        shard_index,
+                        command,
+                        result,
+                        acquired_bytes,
+                        started_mono,
+                        :sync
+                      )
+
+                      release_blob_protection_after_result(blob_protection, result)
+                      result
+
+                    {:error, _reason} = error ->
+                      error
+                  end
+                after
+                  release_commit_bytes(shard_index, acquired_bytes)
+                end
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -176,11 +221,28 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
         do: {:immediate, invalid_shard_index_error(shard_index)}
 
       defp submit_commit_async(shard_index, command) do
-        with :ok <- ensure_local_leader_connected_quorum(shard_index),
-             {:ok, acquired_bytes} <- acquire_commit_bytes(shard_index, command) do
-          submit_acquired_commit_async(shard_index, command, acquired_bytes)
-        else
-          {:error, _reason} = error -> {:immediate, error}
+        quorum_result =
+          Ferricstore.LatencyTrace.maybe_span "server_waraft_quorum_check_us" do
+            ensure_local_leader_connected_quorum(shard_index)
+          end
+
+        case quorum_result do
+          :ok ->
+            acquire_result =
+              Ferricstore.LatencyTrace.maybe_span "server_waraft_inflight_acquire_us" do
+                acquire_commit_bytes(shard_index, command)
+              end
+
+            case acquire_result do
+              {:ok, acquired_bytes} ->
+                submit_acquired_commit_async(shard_index, command, acquired_bytes)
+
+              {:error, _reason} = error ->
+                {:immediate, error}
+            end
+
+          {:error, _reason} = error ->
+            {:immediate, error}
         end
       end
 
@@ -261,7 +323,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       defp config_voter_nodes(_config), do: []
 
       defp submit_acquired_commit_async(shard_index, command, acquired_bytes) do
-        case prepare_commit_command(shard_index, command) do
+        prepare_result =
+          Ferricstore.LatencyTrace.maybe_span "server_waraft_prepare_us" do
+            prepare_commit_command(shard_index, command)
+          end
+
+        case prepare_result do
           {:ok, prepared_command, blob_protection} ->
             acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
 
@@ -273,12 +340,28 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
                 stamped = CommandStamp.to_ttb(prepared_command)
                 command_shape = command_shape(command)
                 started_mono = System.monotonic_time()
+                submit_started_mono = System.monotonic_time()
 
-                case commit_async_safely(
-                       acceptor,
-                       {reply_alias, reply_ref},
-                       {command_ref, stamped}
-                     ) do
+                submit_result =
+                  Ferricstore.LatencyTrace.maybe_span "server_waraft_acceptor_submit_us" do
+                    commit_async_safely(
+                      acceptor,
+                      {reply_alias, reply_ref},
+                      {command_ref, stamped}
+                    )
+                  end
+
+                emit_commit_stage(
+                  shard_index,
+                  command_shape,
+                  :submit,
+                  submit_started_mono,
+                  submit_result,
+                  acquired_bytes,
+                  :async
+                )
+
+                case submit_result do
                   :ok ->
                     {:submitted, shard_index, reply_alias, reply_ref, pid, acquired_bytes,
                      command_shape, started_mono, blob_protection}
@@ -304,7 +387,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       end
 
       defp commit_async_safely(acceptor, reply_to, command) do
-        :wa_raft_acceptor.commit_async(acceptor, reply_to, command, :low)
+        :wa_raft_acceptor.commit_async(acceptor, reply_to, command, waraft_commit_priority())
       catch
         kind, reason -> {:error, {:commit_call_failed_after_submit, {kind, reason}}}
       end
@@ -312,9 +395,18 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       defp commit_safely(_acceptor, nil, _command), do: {:error, :unreachable}
 
       defp commit_safely(acceptor, _acceptor_pid, command) do
-        :wa_raft_acceptor.commit(acceptor, command, @timeout, :low)
+        :wa_raft_acceptor.commit(acceptor, command, @timeout, waraft_commit_priority())
       catch
         kind, reason -> {:error, {:commit_call_failed_after_submit, {kind, reason}}}
+      end
+
+      defp waraft_commit_priority do
+        case Application.get_env(:ferricstore, :waraft_commit_priority, :high) do
+          :low -> :low
+          "low" -> :low
+          "LOW" -> :low
+          _other -> :high
+        end
       end
 
       defp await_commit_async({:immediate, result}), do: result
@@ -323,26 +415,40 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
              {:submitted, shard_index, reply_alias, reply_ref, acceptor_pid, acquired_bytes,
               command_shape, started_mono, blob_protection}
            ) do
-        result =
-          try do
-            receive do
-              {^reply_ref, result} -> normalize_commit_transport_result(result, acceptor_pid)
-            after
-              @timeout ->
-                emit_commit_timeout(
-                  shard_index,
-                  command_shape,
-                  acquired_bytes,
-                  started_mono,
-                  :async
-                )
+        wait_started_mono = System.monotonic_time()
 
-                {:error, :timeout}
+        result =
+          Ferricstore.LatencyTrace.maybe_span "server_waraft_acceptor_wait_us" do
+            try do
+              receive do
+                {^reply_ref, result} -> normalize_commit_transport_result(result, acceptor_pid)
+              after
+                @timeout ->
+                  emit_commit_timeout(
+                    shard_index,
+                    command_shape,
+                    acquired_bytes,
+                    started_mono,
+                    :async
+                  )
+
+                  {:error, :timeout}
+              end
+            after
+              flush_reply_alias(reply_alias, reply_ref)
+              release_commit_bytes(shard_index, acquired_bytes)
             end
-          after
-            flush_reply_alias(reply_alias, reply_ref)
-            release_commit_bytes(shard_index, acquired_bytes)
           end
+
+        emit_commit_stage(
+          shard_index,
+          command_shape,
+          :wait,
+          wait_started_mono,
+          result,
+          acquired_bytes,
+          :async
+        )
 
         :ok =
           Ferricstore.FaultInjection.maybe_pause(:after_waraft_commit, %{
@@ -358,25 +464,42 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
              {:submitted, shard_index, reply_alias, reply_ref, acceptor_pid, acquired_bytes,
               command_shape, started_mono}
            ) do
-        try do
-          receive do
-            {^reply_ref, result} -> normalize_commit_transport_result(result, acceptor_pid)
-          after
-            @timeout ->
-              emit_commit_timeout(
-                shard_index,
-                command_shape,
-                acquired_bytes,
-                started_mono,
-                :async
-              )
+        wait_started_mono = System.monotonic_time()
 
-              {:error, :timeout}
+        result =
+          Ferricstore.LatencyTrace.maybe_span "server_waraft_acceptor_wait_us" do
+            try do
+              receive do
+                {^reply_ref, result} -> normalize_commit_transport_result(result, acceptor_pid)
+              after
+                @timeout ->
+                  emit_commit_timeout(
+                    shard_index,
+                    command_shape,
+                    acquired_bytes,
+                    started_mono,
+                    :async
+                  )
+
+                  {:error, :timeout}
+              end
+            after
+              flush_reply_alias(reply_alias, reply_ref)
+              release_commit_bytes(shard_index, acquired_bytes)
+            end
           end
-        after
-          flush_reply_alias(reply_alias, reply_ref)
-          release_commit_bytes(shard_index, acquired_bytes)
-        end
+
+        emit_commit_stage(
+          shard_index,
+          command_shape,
+          :wait,
+          wait_started_mono,
+          result,
+          acquired_bytes,
+          :async
+        )
+
+        result
       end
 
       defp flush_reply_alias(reply_alias, reply_ref) do
@@ -591,8 +714,10 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
            do: :ok
 
       defp await_local_storage_applied(shard_index, target_index, timeout_ms) do
-        deadline = System.monotonic_time(:millisecond) + max(timeout_ms, 0)
-        do_await_local_storage_applied(shard_index, target_index, deadline)
+        Ferricstore.LatencyTrace.maybe_span "server_waraft_local_apply_wait_us" do
+          deadline = System.monotonic_time(:millisecond) + max(timeout_ms, 0)
+          do_await_local_storage_applied(shard_index, target_index, deadline)
+        end
       end
 
       defp do_await_local_storage_applied(shard_index, target_index, deadline) do

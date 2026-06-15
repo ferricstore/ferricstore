@@ -750,7 +750,7 @@ append(View, Entries, _Mode, _Priority) ->
                 ok ->
                     true = ets:insert(Name, Records),
                     update_latest_config_from_records(Dir, Records),
-                    refresh_memory_stats(Name, Dir),
+                    append_memory_stats(Name, Dir, Records),
                     enforce_ets_memory_limit(Name, Dir),
                     ok;
                 {error, _Reason} = Error ->

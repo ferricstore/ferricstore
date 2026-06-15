@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -420,6 +419,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           exists?: fn key ->
             live_key?(state, key)
           end
+        }
+      end
+
+      defp build_zset_compound_store(state) do
+        %{
+          build_compound_store(state)
+          | compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+              case do_put(state, compound_key, value, expire_at_ms) do
+                :ok ->
+                  maybe_queue_zset_ready_empty_after_flush(state, redis_key, compound_key, value)
+                  :ok
+
+                other ->
+                  other
+              end
+            end,
+            compound_batch_put: fn redis_key, entries ->
+              do_compound_batch_put(state, redis_key, entries)
+            end,
+            compound_delete: fn redis_key, compound_key ->
+              do_compound_delete(state, redis_key, compound_key)
+            end,
+            compound_batch_delete: fn redis_key, compound_keys ->
+              do_compound_batch_delete(state, redis_key, compound_keys)
+            end
         }
       end
 

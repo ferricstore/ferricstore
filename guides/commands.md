@@ -1038,32 +1038,6 @@ Geo is implemented on top of Sorted Sets. Members are stored with 52-bit interle
 
 ---
 
-## JSON Commands
-
-JSON commands use JSONPath (subset) for traversal. JSON values are stored as tagged tuples `{:json, json_string}` in Bitcask. Every operation deserializes, mutates, and re-serializes.
-
-| Command | Syntax | Return | Notes |
-|---------|--------|--------|-------|
-| `JSON.SET` | `JSON.SET key path value [NX\|XX]` | `+OK` or null | NX/XX conditions |
-| `JSON.GET` | `JSON.GET key [path ...]` | JSON string | Multiple paths returns object |
-| `JSON.DEL` | `JSON.DEL key [path]` | Integer (1 deleted, 0 not found) | Omit path = delete entire key |
-| `JSON.NUMINCRBY` | `JSON.NUMINCRBY key path number` | String (new number) | |
-| `JSON.TYPE` | `JSON.TYPE key [path]` | String: `object`, `array`, `string`, `number`, `boolean`, `null` | |
-| `JSON.STRLEN` | `JSON.STRLEN key [path]` | Integer or null | |
-| `JSON.OBJKEYS` | `JSON.OBJKEYS key [path]` | Array of strings | |
-| `JSON.OBJLEN` | `JSON.OBJLEN key [path]` | Integer | |
-| `JSON.ARRAPPEND` | `JSON.ARRAPPEND key path value [value ...]` | Integer (new length) | |
-| `JSON.ARRLEN` | `JSON.ARRLEN key [path]` | Integer | |
-| `JSON.TOGGLE` | `JSON.TOGGLE key path` | Integer (0/1 for false/true) | |
-| `JSON.CLEAR` | `JSON.CLEAR key [path]` | Integer (1 cleared, 0 not) | Sets numbers to 0, arrays/objects to empty |
-| `JSON.MGET` | `JSON.MGET key [key ...] path` | Array of JSON strings | |
-
-**JSONPath subset (v1):** `$`, `$.field`, `$.field.subfield`, `$[0]`, `$.field[0].name`.
-
-**Redis compat:** Compatible with Redis 8 / RedisJSON syntax for the supported subset.
-
----
-
 ## FerricStore-Native Commands
 
 These commands extend beyond the Redis command set with operations not available in standard Redis.

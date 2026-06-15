@@ -145,6 +145,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def stop do
         shard_count = registered_partition_count()
         stop_namespace_batchers(shard_count)
+        flush_storage_before_stop(shard_count)
         _ = Supervisor.terminate_child(:kernel_sup, @sup_id)
         _ = Supervisor.delete_child(:kernel_sup, @sup_id)
         _ = stop_orphaned_waraft_sup()
@@ -158,6 +159,18 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         :persistent_term.erase(@shard_count_key)
         :ok
       end
+
+      defp flush_storage_before_stop(shard_count)
+           when is_integer(shard_count) and shard_count > 0 do
+        Enum.each(0..(shard_count - 1), fn shard_index ->
+          _ = create_snapshot(shard_index)
+          :ok
+        end)
+      catch
+        _kind, _reason -> :ok
+      end
+
+      defp flush_storage_before_stop(_shard_count), do: :ok
 
       @doc false
       @spec __registered_names_for_test__(pos_integer()) :: [atom()]
@@ -261,6 +274,21 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       @spec __commit_batch_direct__(non_neg_integer(), [tuple()]) :: term()
       def __commit_batch_direct__(shard_index, commands) when is_list(commands) do
         commit_or_redirect(shard_index, {:batch, commands}, 2)
+      end
+
+      @doc false
+      @spec __commit_single_direct__(non_neg_integer(), tuple()) :: term()
+      def __commit_single_direct__(shard_index, command) when is_tuple(command) do
+        commit_or_redirect(shard_index, command, 2)
+      end
+
+      @doc false
+      @spec __commit_single_batch_direct__(non_neg_integer(), tuple()) :: term()
+      def __commit_single_batch_direct__(shard_index, command) when is_tuple(command) do
+        case commit_or_redirect(shard_index, command, 2) do
+          {:error, _reason} = error -> error
+          result -> {:ok, [result]}
+        end
       end
 
       @spec write_put_batch(non_neg_integer(), [{binary(), binary(), non_neg_integer()}]) ::

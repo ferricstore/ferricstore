@@ -401,46 +401,6 @@ defmodule Ferricstore.Commands.DispatcherTest do
              )
   end
 
-  test "dispatches Rust typed JSON ASTs" do
-    store = MockStore.make()
-
-    assert :ok =
-             Dispatcher.dispatch_ast(
-               {:json_set, "doc", [], ~s({"name":"Ada","n":1,"arr":[]}), []},
-               store
-             )
-
-    assert ~s("Ada") == Dispatcher.dispatch_ast({:json_get, "doc", [{"$.name", ["name"]}]}, store)
-
-    assert "2.5" ==
-             Dispatcher.dispatch_ast({:json_numincrby, "doc", ["n"], 1.5}, store)
-
-    assert 2 ==
-             Dispatcher.dispatch_ast(
-               {:json_arrappend, "doc", ["arr"], ["1", ~s("x")]},
-               store
-             )
-
-    assert ["object", 2] = [
-             Dispatcher.dispatch_ast({:json_type, "doc", []}, store),
-             Dispatcher.dispatch_ast({:json_arrlen, "doc", ["arr"]}, store)
-           ]
-  end
-
-  test "dispatches Rust JSON parse errors" do
-    assert {:error, "ERR syntax error"} =
-             Dispatcher.dispatch_ast(
-               {:json_clear, "doc", {:error, "ERR syntax error"}},
-               MockStore.make()
-             )
-
-    assert {:error, "ERR value is not a number"} =
-             Dispatcher.dispatch_ast(
-               {:json_numincrby, "doc", {:error, "ERR value is not a number"}},
-               MockStore.make()
-             )
-  end
-
   test "dispatches Rust typed Geo ASTs" do
     store = MockStore.make()
 

@@ -17,6 +17,7 @@ defmodule Ferricstore.Store.Shard.Startup do
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.NativeOps, as: ShardNativeOps
       alias Ferricstore.Store.Shard.Reads, as: ShardReads
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
@@ -60,6 +61,8 @@ defmodule Ferricstore.Store.Shard.Startup do
           end
 
           instance_name = if ctx, do: ctx.name, else: :default
+          compound_member_index = CompoundMemberIndex.table_name(instance_name, index)
+          CompoundMemberIndex.ensure_table!(compound_member_index)
           {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
           ensure_zset_index_table!(zset_score_index, :ordered_set)
           ensure_zset_index_table!(zset_score_lookup, :set)
@@ -75,6 +78,14 @@ defmodule Ferricstore.Store.Shard.Startup do
           profile_startup_phase(index, :recover_keydir, fn ->
             unless raft_projection_owner?(ctx) do
               ShardLifecycle.recover_keydir(path, keydir, index, ctx)
+            end
+
+            :ok
+          end)
+
+          profile_startup_phase(index, :compound_member_index_rebuild, fn ->
+            unless raft_projection_owner?(ctx) do
+              CompoundMemberIndex.rebuild(compound_member_index, keydir)
             end
 
             :ok
@@ -180,6 +191,7 @@ defmodule Ferricstore.Store.Shard.Startup do
              merge_config: merge_config,
              raft?: raft?,
              max_active_file_size: max_file_size,
+             compound_member_index: compound_member_index,
              zset_score_index: zset_score_index,
              zset_score_lookup: zset_score_lookup,
              flow_index: flow_index,

@@ -443,6 +443,39 @@ refresh_memory_stats(Name, Dir) ->
         end,
     set_memory_stats(Name, Dir, Count, Bytes, First, Last).
 
+append_memory_stats(_Name, _Dir, []) ->
+    ok;
+append_memory_stats(Name, Dir, Records) ->
+    case memory_registry_lookup(Name) of
+        {ok, #{count := Count, bytes := Bytes, first := First, last := Last}} ->
+            {RecordCount, RecordBytes, RecordFirst, RecordLast} = record_memory_usage(Records),
+            set_memory_stats(
+                Name,
+                Dir,
+                Count + RecordCount,
+                Bytes + RecordBytes,
+                choose_first(First, RecordFirst),
+                choose_last(Last, RecordLast)
+            );
+        not_found ->
+            refresh_memory_stats(Name, Dir)
+    end.
+
+record_memory_usage(Records) ->
+    record_memory_usage(Records, 0, 0, undefined, undefined).
+
+record_memory_usage([], Count, Bytes, First, Last) ->
+    {Count, Bytes, First, Last};
+record_memory_usage([{Index, _Entry} = Record | Rest], Count, Bytes, First, _Last)
+  when is_integer(Index) ->
+    record_memory_usage(
+        Rest,
+        Count + 1,
+        Bytes + record_memory_bytes(Record),
+        choose_first(First, Index),
+        Index
+    ).
+
 set_memory_boundaries_and_refresh(Name, Dir, First, Last) ->
     {SafeFirst, SafeLast} =
         case {First, Last} of

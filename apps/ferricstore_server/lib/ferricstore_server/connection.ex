@@ -587,72 +587,6 @@ defmodule FerricstoreServer.Connection do
     )
   end
 
-  defp dispatch_store_command(
-         _cmd,
-         _args,
-         {:json_set, key, path, value, flags},
-         _store,
-         ctx,
-         namespace
-       ) do
-    Router.json_set(ctx, namespace_key(namespace, key), path, value, flags)
-  end
-
-  defp dispatch_store_command(
-         _cmd,
-         _args,
-         {:json_del, key, path},
-         _store,
-         ctx,
-         namespace
-       ) do
-    Router.json_del(ctx, namespace_key(namespace, key), path)
-  end
-
-  defp dispatch_store_command(
-         _cmd,
-         _args,
-         {:json_numincrby, key, path, increment},
-         _store,
-         ctx,
-         namespace
-       ) do
-    Router.json_numincrby(ctx, namespace_key(namespace, key), path, increment)
-  end
-
-  defp dispatch_store_command(
-         _cmd,
-         _args,
-         {:json_arrappend, key, path, values},
-         _store,
-         ctx,
-         namespace
-       ) do
-    Router.json_arrappend(ctx, namespace_key(namespace, key), path, values)
-  end
-
-  defp dispatch_store_command(
-         _cmd,
-         _args,
-         {:json_toggle, key, path},
-         _store,
-         ctx,
-         namespace
-       ) do
-    Router.json_toggle(ctx, namespace_key(namespace, key), path)
-  end
-
-  defp dispatch_store_command(
-         _cmd,
-         _args,
-         {:json_clear, key, path},
-         _store,
-         ctx,
-         namespace
-       ) do
-    Router.json_clear(ctx, namespace_key(namespace, key), path)
-  end
-
   defp dispatch_store_command(cmd, args, ast, store, _ctx, _namespace) do
     if ast_store_command?(ast) do
       Dispatcher.dispatch_ast(ast, store)
@@ -817,19 +751,19 @@ defmodule FerricstoreServer.Connection do
     do: {:continue, Encoder.encode({:error, "ERR unsupported blocking command AST"}), state}
 
   defp ast_store_command?({tag, _})
-       when tag in ~w(get del exists mget mset incr decr strlen getdel getex msetnx ttl pttl persist lpush rpush lpop rpop llen lpos lpushx rpushx hset hdel hmget hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel sadd srem smembers smismember scard sinter sunion sdiff sdiffstore sinterstore sunionstore sintercard srandmember spop zrem zcard zpopmin zpopmax zrandmember zmscore bitcount bitop type unlink randomkey expiretime pexpiretime object xadd xlen xread xinfo_stream xinfo xgroup xreadgroup json_set json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrappend json_arrlen json_toggle json_clear json_mget geoadd geopos geohash pfadd pfcount pfmerge bf_reserve bf_add bf_madd bf_exists bf_mexists bf_card bf_info cf_reserve cf_add cf_addnx cf_del cf_exists cf_mexists cf_count cf_info cms_initbydim cms_initbyprob cms_incrby cms_query cms_merge cms_info topk_reserve topk_add topk_incrby topk_query topk_list topk_count topk_info tdigest_create tdigest_add tdigest_reset tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_min tdigest_max tdigest_info tdigest_merge ping echo dbsize keys flushdb flushall info command select lolwut debug slowlog save bgsave lastsave config module waitaof cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness ferricstore_config ferricstore_metrics memory publish pubsub flow_create flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_info flow_stuck flow_history)a,
+       when tag in ~w(get del exists mget mset incr decr strlen getdel getex msetnx ttl pttl persist lpush rpush lpop rpop llen lpos lpushx rpushx hset hdel hmget hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel sadd srem smembers smismember scard sinter sunion sdiff sdiffstore sinterstore sunionstore sintercard srandmember spop zrem zcard zpopmin zpopmax zrandmember zmscore bitcount bitop type unlink randomkey expiretime pexpiretime object xadd xlen xread xinfo_stream xinfo xgroup xreadgroup geoadd geopos geohash pfadd pfcount pfmerge bf_reserve bf_add bf_madd bf_exists bf_mexists bf_card bf_info cf_reserve cf_add cf_addnx cf_del cf_exists cf_mexists cf_count cf_info cms_initbydim cms_initbyprob cms_incrby cms_query cms_merge cms_info topk_reserve topk_add topk_incrby topk_query topk_list topk_count topk_info tdigest_create tdigest_add tdigest_reset tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_min tdigest_max tdigest_info tdigest_merge ping echo dbsize keys flushdb flushall info command select lolwut debug slowlog save bgsave lastsave config module waitaof cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness ferricstore_config ferricstore_metrics memory publish pubsub flow_create flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_info flow_stuck flow_history)a,
        do: true
 
   defp ast_store_command?({tag, _, _})
-       when tag in ~w(set incrby decrby incrbyfloat append getset getex setnx expire pexpire expireat pexpireat lpop rpop lindex lpos rpoplpush hget hexists hstrlen hrandfield hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex sismember srandmember spop sscan sintercard zscore zrank zrevrank zadd zcount zpopmin zpopmax zscan zrangebyscore zrevrangebyscore getbit bitcount bitpos rename renamenx scan object wait xadd xrange xrevrange xtrim xdel xgroup json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrlen json_toggle json_clear json_mget geosearch bf_reserve cf_reserve cms_initbydim cms_initbyprob cms_incrby cms_merge topk_reserve topk_incrby topk_list tdigest_create tdigest_add tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_merge cas lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error ferricstore_key_info ratelimit_add flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
+       when tag in ~w(set incrby decrby incrbyfloat append getset getex setnx expire pexpire expireat pexpireat lpop rpop lindex lpos rpoplpush hget hexists hstrlen hrandfield hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex sismember srandmember spop sscan sintercard zscore zrank zrevrank zadd zcount zpopmin zpopmax zscan zrangebyscore zrevrangebyscore getbit bitcount bitpos rename renamenx scan object wait xadd xrange xrevrange xtrim xdel xgroup geosearch bf_reserve cf_reserve cms_initbydim cms_initbyprob cms_incrby cms_merge topk_reserve topk_incrby topk_list tdigest_create tdigest_add tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_merge cas lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error ferricstore_key_info ratelimit_add flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
        do: true
 
   defp ast_store_command?({tag, _, _, _})
-       when tag in ~w(set setex psetex getrange setrange expire pexpire expireat pexpireat lrange lset lrem ltrim hincrby hincrbyfloat hsetnx hrandfield hscan hexpire hpexpire hgetex hsetex smove sscan zadd zincrby zcount zrange zrevrange zrandmember zscan zrangebyscore zrevrangebyscore setbit bitpos bitop copy object xadd xread xreadgroup xack json_numincrby json_arrappend geoadd geosearchstore bf_reserve cms_initbydim cms_initbyprob cms_merge tdigest_trimmed_mean tdigest_merge lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error flow_create_many flow_spawn_children flow_extend_lease flow_complete flow_complete_many flow_retry flow_retry_many flow_fail flow_fail_many flow_cancel_many)a,
+       when tag in ~w(set setex psetex getrange setrange expire pexpire expireat pexpireat lrange lset lrem ltrim hincrby hincrbyfloat hsetnx hrandfield hscan hexpire hpexpire hgetex hsetex smove sscan zadd zincrby zcount zrange zrevrange zrandmember zscan zrangebyscore zrevrangebyscore setbit bitpos bitop copy object xadd xread xreadgroup xack geoadd geosearchstore bf_reserve cms_initbydim cms_initbyprob cms_merge tdigest_trimmed_mean tdigest_merge lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error flow_create_many flow_spawn_children flow_extend_lease flow_complete flow_complete_many flow_retry flow_retry_many flow_fail flow_fail_many flow_cancel_many)a,
        do: true
 
   defp ast_store_command?({tag, _, _, _, _})
-       when tag in ~w(linsert lmove zrange zrevrange zrangebyscore zrevrangebyscore xrange xrevrange xgroup_create json_set geodist cas ratelimit_add flow_transition flow_transition_many)a,
+       when tag in ~w(linsert lmove zrange zrevrange zrangebyscore zrevrangebyscore xrange xrevrange xgroup_create geodist cas ratelimit_add flow_transition flow_transition_many)a,
        do: true
 
   defp ast_store_command?({tag, _, _, _, _, _})

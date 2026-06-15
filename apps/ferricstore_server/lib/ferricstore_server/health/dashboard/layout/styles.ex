@@ -147,29 +147,29 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .bar-yellow { background: #d29922; }
       .bar-red { background: #f85149; }
       .bar-blue { background: #58a6ff; }
-      .flow-timeline-graph { display: grid; gap: 8px; min-width: 0; }
-      .flow-timeline-scroll { overflow-x: auto; overflow-y: hidden; border: 1px solid #30363d; border-radius: 8px; background: #0d1117; }
-      .flow-timeline-svg { display: block; min-width: 100%; }
-      .flow-timeline-bg { fill: #0d1117; }
-      .flow-timeline-lane line { stroke: #21262d; stroke-width: 1; }
-      .flow-timeline-lane-label { fill: #c9d1d9; font-size: 12px; font-weight: 700; }
-      .flow-timeline-axis line { stroke: #21262d; stroke-width: 1; stroke-dasharray: 3 6; }
-      .flow-timeline-axis-label { fill: #6e7681; font-size: 10px; font-variant-numeric: tabular-nums; }
-      .flow-timeline-path { fill: none; stroke: rgba(121, 192, 255, 0.24); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-      .flow-timeline-transition { fill: none; stroke: rgba(139, 148, 158, 0.34); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 4 5; }
-      .flow-timeline-duration-segment { stroke-width: 7; stroke-linecap: round; opacity: 0.86; }
-      .flow-timeline-duration-segment.bar-green { stroke: #3fb950; }
-      .flow-timeline-duration-segment.bar-yellow { stroke: #d29922; }
-      .flow-timeline-duration-segment.bar-red { stroke: #f85149; }
-      .flow-timeline-duration-segment.bar-blue { stroke: #58a6ff; }
-      .flow-timeline-node { stroke: #0d1117; stroke-width: 3; transition: r 0.12s ease, stroke 0.12s ease; }
-      .flow-timeline-node-link:hover .flow-timeline-node, .flow-timeline-node-link:focus .flow-timeline-node { r: 10; stroke: #f0f6fc; }
-      .flow-timeline-node-normal { fill: #58a6ff; }
-      .flow-timeline-node-terminal { fill: #3fb950; }
-      .flow-timeline-node-retry { fill: #f85149; }
-      .flow-timeline-node-failed { fill: #f85149; }
-      .flow-timeline-node-label { fill: #9da7b3; font-size: 10px; font-weight: 600; pointer-events: none; }
       .flow-timeline-caption { color: #8b949e; font-size: 0.74rem; }
+      .flow-step-waterfall { display: grid; gap: 8px; min-width: 0; }
+      .flow-step-waterfall-scroll { overflow-x: auto; border: 1px solid #30363d; border-radius: 8px; background: #0d1117; }
+      .flow-step-waterfall-header, .flow-step-waterfall-row { min-width: 820px; display: grid; grid-template-columns: minmax(180px, 240px) minmax(420px, 1fr) 92px; gap: 12px; align-items: center; }
+      .flow-step-waterfall-header { min-height: 42px; padding: 0 12px; border-bottom: 1px solid #30363d; color: #8b949e; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+      .flow-step-waterfall-row { min-height: 50px; padding: 8px 12px; border-bottom: 1px solid rgba(48, 54, 61, 0.72); color: #f0f6fc; text-decoration: none; }
+      .flow-step-waterfall-row:last-child { border-bottom: none; }
+      .flow-step-waterfall-row:hover, .flow-step-waterfall-row:focus { background: #10243a; }
+      .flow-step-waterfall-label { display: grid; gap: 3px; min-width: 0; }
+      .flow-step-waterfall-step { color: #f0f6fc; font-weight: 700; overflow-wrap: anywhere; }
+      .flow-step-waterfall-state { color: #8b949e; font-size: 0.72rem; overflow-wrap: anywhere; }
+      .flow-step-waterfall-axis, .flow-step-waterfall-track { position: relative; min-width: 0; }
+      .flow-step-waterfall-axis { align-self: stretch; }
+      .flow-step-waterfall-axis-label { position: absolute; top: 50%; transform: translate(-50%, -50%); color: #6e7681; font-size: 0.66rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .flow-step-waterfall-track { height: 28px; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; background: linear-gradient(to right, rgba(48, 54, 61, 0.84) 1px, transparent 1px) 0 0 / 25% 100%, #010409; }
+      .flow-step-waterfall-bar { position: absolute; top: 6px; bottom: 6px; min-width: 4px; border-radius: 4px; opacity: 0.92; box-shadow: 0 0 0 1px rgba(240, 246, 252, 0.16); }
+      .flow-step-waterfall-bar.bar-green { background: #3fb950; }
+      .flow-step-waterfall-bar.bar-yellow { background: #d29922; }
+      .flow-step-waterfall-bar.bar-red { background: #f85149; }
+      .flow-step-waterfall-bar.bar-blue { background: #58a6ff; }
+      .flow-step-waterfall-marker { position: absolute; top: 4px; bottom: 4px; width: 2px; transform: translateX(-1px); background: rgba(240, 246, 252, 0.72); z-index: 1; }
+      .flow-step-waterfall-duration { display: grid; gap: 3px; justify-items: end; color: #f0f6fc; font-size: 0.76rem; font-variant-numeric: tabular-nums; }
+      .flow-step-waterfall-duration span + span { color: #8b949e; font-size: 0.68rem; }
       .timeline-event-row:target { outline: 2px solid #58a6ff; outline-offset: -2px; background: #10243a; }
       .flow-history-controls { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 8px 0 12px; flex-wrap: wrap; }
       .flow-history-pages, .flow-history-counts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

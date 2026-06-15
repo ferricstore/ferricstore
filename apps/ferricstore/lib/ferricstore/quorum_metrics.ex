@@ -21,8 +21,11 @@ defmodule Ferricstore.QuorumMetrics do
     [:ferricstore, :batcher, :local_apply_gate],
     [:ferricstore, :batcher, :local_apply_timeout],
     [:ferricstore, :wal, :sync],
+    [:ferricstore, :waraft, :commit, :stage],
     [:ferricstore, :raft, :apply],
-    [:ferricstore, :bitcask, :append]
+    [:ferricstore, :bitcask, :append],
+    [:ferricstore, :flow, :apply],
+    [:ferricstore, :waraft, :segment_projection, :apply]
   ]
 
   @metric_defs [
@@ -117,6 +120,18 @@ defmodule Ferricstore.QuorumMetrics do
     wal_sync_queued_batches_max:
       {"ferricstore_wal_sync_queued_batches_max", :gauge,
        "Maximum observed number of WARaft batches left queued behind one async sync completion"},
+    waraft_commit_stage_total:
+      {"ferricstore_waraft_commit_stage_total", :counter,
+       "Total WARaft commit stage observations"},
+    waraft_commit_stage_duration_us_total:
+      {"ferricstore_waraft_commit_stage_duration_us_total", :counter,
+       "Total microseconds spent in WARaft commit stages"},
+    waraft_commit_stage_duration_us_max:
+      {"ferricstore_waraft_commit_stage_duration_us_max", :gauge,
+       "Maximum microseconds spent in a WARaft commit stage"},
+    waraft_commit_stage_acquired_bytes_total:
+      {"ferricstore_waraft_commit_stage_acquired_bytes_total", :counter,
+       "Total inflight bytes acquired by WARaft commit stage observations"},
     apply_total:
       {"ferricstore_quorum_apply_total", :counter,
        "Total number of Raft state-machine apply calls"},
@@ -140,7 +155,34 @@ defmodule Ferricstore.QuorumMetrics do
        "Total records appended to Bitcask from Raft apply"},
     bitcask_append_batch_bytes_total:
       {"ferricstore_quorum_bitcask_append_batch_bytes_total", :counter,
-       "Total key/value bytes appended to Bitcask from Raft apply"}
+       "Total key/value bytes appended to Bitcask from Raft apply"},
+    flow_apply_total:
+      {"ferricstore_flow_apply_total", :counter,
+       "Total Flow command apply calls observed inside Raft apply"},
+    flow_apply_duration_us_total:
+      {"ferricstore_flow_apply_duration_us_total", :counter,
+       "Total microseconds spent applying Flow commands"},
+    flow_apply_duration_us_max:
+      {"ferricstore_flow_apply_duration_us_max", :gauge,
+       "Maximum microseconds spent applying a Flow command"},
+    flow_apply_items_total:
+      {"ferricstore_flow_apply_items_total", :counter,
+       "Total requested Flow items represented by applied commands"},
+    flow_apply_result_items_total:
+      {"ferricstore_flow_apply_result_items_total", :counter,
+       "Total Flow result items returned by applied commands"},
+    segment_projection_apply_total:
+      {"ferricstore_waraft_segment_projection_apply_total", :counter,
+       "Total WARaft segment-projection apply calls"},
+    segment_projection_apply_duration_us_total:
+      {"ferricstore_waraft_segment_projection_apply_duration_us_total", :counter,
+       "Total microseconds spent applying WARaft segment projections"},
+    segment_projection_apply_duration_us_max:
+      {"ferricstore_waraft_segment_projection_apply_duration_us_max", :gauge,
+       "Maximum microseconds spent applying a WARaft segment projection"},
+    segment_projection_apply_batch_size_total:
+      {"ferricstore_waraft_segment_projection_apply_batch_size_total", :counter,
+       "Total records applied through WARaft segment projection"}
   ]
 
   @type metric_id :: atom()
@@ -324,6 +366,63 @@ defmodule Ferricstore.QuorumMetrics do
     )
   end
 
+  def handle_event([:ferricstore, :waraft, :commit, :stage], measurements, metadata, _config) do
+    labels = [
+      shard_index: shard_label(Map.get(metadata, :shard_index)),
+      stage: enum_label(Map.get(metadata, :stage), [:submit, :wait, :sync]),
+      command_shape:
+        enum_label(Map.get(metadata, :command_shape), [
+          :put,
+          :put_blob_ref,
+          :delete,
+          :locked_put,
+          :locked_delete,
+          :compound_put,
+          :compound_delete,
+          :put_batch,
+          :delete_batch,
+          :batch,
+          :flow_create,
+          :flow_create_many,
+          :flow_create_pipeline_batch,
+          :flow_claim_due,
+          :flow_complete,
+          :flow_complete_many,
+          :flow_terminal_pipeline_batch,
+          :flow_transition,
+          :flow_transition_many,
+          :flow_retry,
+          :flow_retry_many,
+          :flow_fail,
+          :flow_fail_many,
+          :flow_cancel,
+          :flow_cancel_many
+        ]),
+      path: enum_label(Map.get(metadata, :path), [:sync, :async]),
+      result: enum_label(Map.get(metadata, :result), [:ok, :error, :timeout, :unknown])
+    ]
+
+    increment(:waraft_commit_stage_total, labels, 1)
+
+    increment(
+      :waraft_commit_stage_duration_us_total,
+      labels,
+      measurement(measurements, :duration_us)
+    )
+
+    max_metric(
+      :waraft_commit_stage_duration_us_max,
+      labels,
+      measurement(measurements, :duration_us)
+    )
+
+    increment(
+      :waraft_commit_stage_acquired_bytes_total,
+      labels,
+      measurement(measurements, :acquired_bytes)
+    )
+  end
+
   def handle_event([:ferricstore, :raft, :apply], measurements, metadata, _config) do
     labels = [
       shard_index: shard_label(Map.get(metadata, :shard_index)),
@@ -366,6 +465,100 @@ defmodule Ferricstore.QuorumMetrics do
       :bitcask_append_batch_bytes_total,
       labels,
       measurement(measurements, :batch_bytes)
+    )
+  end
+
+  def handle_event(
+        [:ferricstore, :waraft, :segment_projection, :apply],
+        measurements,
+        metadata,
+        _config
+      ) do
+    labels = [
+      shard_index: shard_label(Map.get(metadata, :shard_index)),
+      command_shape:
+        enum_label(Map.get(metadata, :command_shape), [
+          :put,
+          :put_blob_ref,
+          :locked_put,
+          :locked_delete,
+          :compound_put,
+          :compound_delete,
+          :put_batch,
+          :put_blob_batch,
+          :delete_batch,
+          :compound_batch_put,
+          :compound_batch_delete,
+          :compound_delete_prefix,
+          :batch
+        ]),
+      result: enum_label(Map.get(metadata, :result), [:ok, :error, :unsupported])
+    ]
+
+    increment(:segment_projection_apply_total, labels, 1)
+
+    increment(
+      :segment_projection_apply_duration_us_total,
+      labels,
+      measurement(measurements, :duration_us)
+    )
+
+    max_metric(
+      :segment_projection_apply_duration_us_max,
+      labels,
+      measurement(measurements, :duration_us)
+    )
+
+    increment(
+      :segment_projection_apply_batch_size_total,
+      labels,
+      measurement(measurements, :applied_count)
+    )
+  end
+
+  def handle_event([:ferricstore, :flow, :apply], measurements, metadata, _config) do
+    labels = [
+      shard_index: shard_label(Map.get(metadata, :shard_index)),
+      command_shape:
+        enum_label(Map.get(metadata, :command_shape), [
+          :flow_create,
+          :flow_create_many,
+          :flow_create_pipeline_batch,
+          :flow_start_and_claim_pipeline_batch,
+          :flow_named_value_put,
+          :flow_named_value_put_pipeline_batch,
+          :flow_signal,
+          :flow_spawn_children,
+          :flow_claim_due,
+          :flow_extend_lease,
+          :flow_complete,
+          :flow_complete_many,
+          :flow_terminal_pipeline_batch,
+          :flow_transition,
+          :flow_start_and_claim,
+          :flow_step_continue,
+          :flow_transition_many,
+          :flow_retry,
+          :flow_retry_many,
+          :flow_fail,
+          :flow_fail_many,
+          :flow_cancel,
+          :flow_cancel_many,
+          :flow_retention_cleanup,
+          :flow_rewind
+        ]),
+      result: enum_label(Map.get(metadata, :result), [:ok, :error, :partial])
+    ]
+
+    increment(:flow_apply_total, labels, 1)
+    increment(:flow_apply_duration_us_total, labels, measurement(measurements, :duration_us))
+    max_metric(:flow_apply_duration_us_max, labels, measurement(measurements, :duration_us))
+    increment(:flow_apply_items_total, labels, measurement(measurements, :item_count))
+
+    increment(
+      :flow_apply_result_items_total,
+      labels,
+      measurement(measurements, :result_count)
     )
   end
 

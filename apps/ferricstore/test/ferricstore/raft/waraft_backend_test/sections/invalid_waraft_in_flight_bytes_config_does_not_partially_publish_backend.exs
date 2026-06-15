@@ -172,6 +172,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytes
         previous_commit_max = Application.get_env(:ferricstore, :waraft_commit_batch_max)
         previous_async_append = Application.get_env(:ferricstore, :waraft_async_log_append)
 
+        previous_ra_flush_size =
+          Application.get_env(:ferricstore, :ra_low_priority_commands_flush_size)
+
+        previous_ra_app_flush_size =
+          Application.get_env(:ra, :low_priority_commands_flush_size)
+
         previous_backend_pending_reads =
           Application.get_env(:ferricstore_waraft_backend, :raft_max_pending_reads)
 
@@ -189,6 +195,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytes
           Application.put_env(:ferricstore, :waraft_commit_batch_interval_ms, 7)
           Application.put_env(:ferricstore, :waraft_commit_batch_max, 2048)
           Application.put_env(:ferricstore, :waraft_async_log_append, true)
+          Application.put_env(:ferricstore, :ra_low_priority_commands_flush_size, 768)
 
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -206,11 +213,15 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytes
 
           assert true ==
                    Application.get_env(:ferricstore_waraft_backend, :raft_async_log_append)
+
+          assert 768 == Application.get_env(:ra, :low_priority_commands_flush_size)
         after
           restore_env(:waraft_max_pending_reads, previous_pending_reads)
           restore_env(:waraft_commit_batch_interval_ms, previous_commit_interval)
           restore_env(:waraft_commit_batch_max, previous_commit_max)
           restore_env(:waraft_async_log_append, previous_async_append)
+          restore_env(:ra_low_priority_commands_flush_size, previous_ra_flush_size)
+          restore_ra_env(:low_priority_commands_flush_size, previous_ra_app_flush_size)
           restore_waraft_app_env(:raft_max_pending_reads, previous_backend_pending_reads)
           restore_waraft_app_env(:raft_commit_batch_interval_ms, previous_backend_commit_interval)
           restore_waraft_app_env(:raft_commit_batch_max, previous_backend_commit_max)
@@ -224,6 +235,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytes
 
       test "WARaft production commit batch cap uses the production server config" do
         assert 10_000 == WARaftBackend.default_commit_batch_max()
+      end
+
+      test "WARaft production Ra low-priority flush size uses sustained default" do
+        assert 512 == Application.get_env(:ferricstore, :ra_low_priority_commands_flush_size)
       end
 
       test "WARaft redirect timeouts keep unknown-outcome semantics" do

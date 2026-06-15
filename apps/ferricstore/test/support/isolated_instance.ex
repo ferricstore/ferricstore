@@ -59,6 +59,13 @@ defmodule Ferricstore.Test.IsolatedInstance do
           data_dir: tmp_dir,
           instance_ctx: ctx
         )
+
+      {:ok, _pid} =
+        Ferricstore.Flow.HistoryProjector.start_link(
+          shard_index: i,
+          shard_data_path: Ferricstore.DataDir.shard_data_path(tmp_dir, i),
+          instance_ctx: ctx
+        )
     end
 
     # Custom instance shards are local/direct; only the default application
@@ -125,6 +132,22 @@ defmodule Ferricstore.Test.IsolatedInstance do
     end
 
     Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    for i <- 0..(ctx.shard_count - 1) do
+      _ = Ferricstore.Flow.HistoryProjector.flush(ctx, i, 5_000)
+
+      case Process.whereis(Ferricstore.Flow.HistoryProjector.name(ctx, i)) do
+        nil ->
+          :ok
+
+        pid ->
+          try do
+            GenServer.stop(pid, :normal, 5000)
+          catch
+            :exit, _ -> :ok
+          end
+      end
+    end
 
     for i <- 0..(ctx.shard_count - 1) do
       case Process.whereis(Ferricstore.Flow.LMDBWriter.name(ctx.name, i)) do

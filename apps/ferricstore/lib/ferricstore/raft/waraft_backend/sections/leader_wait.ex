@@ -337,8 +337,22 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
         :ok =
           Application.put_env(
             @app,
+            :raft_commit_batch_adaptive,
+            config.commit_batch_adaptive
+          )
+
+        :ok =
+          Application.put_env(
+            @app,
             :raft_async_log_append,
             config.async_log_append
+          )
+
+        :ok =
+          Application.put_env(
+            :ra,
+            :low_priority_commands_flush_size,
+            config.ra_low_priority_commands_flush_size
           )
 
         :ok =
@@ -588,7 +602,21 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
               :waraft_commit_batch_max,
               default_commit_batch_max()
             ),
-          async_log_append: true
+          commit_batch_adaptive:
+            boolean_option(
+              opts,
+              :commit_batch_adaptive,
+              :waraft_commit_batch_adaptive,
+              true
+            ),
+          async_log_append: true,
+          ra_low_priority_commands_flush_size:
+            throughput_option(
+              opts,
+              :ra_low_priority_commands_flush_size,
+              :ra_low_priority_commands_flush_size,
+              512
+            )
         }
       end
 
@@ -635,6 +663,18 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
       defp non_negative_integer_option!(source, value) do
         raise ArgumentError,
               "#{inspect(source)} must be a non-negative integer, got: #{inspect(value)}"
+      end
+
+      defp boolean_option(opts, opt_key, app_key, default) do
+        {source, value} = config_option(opts, opt_key, app_key, default)
+        boolean_option!(source, value)
+      end
+
+      defp boolean_option!(_source, value) when is_boolean(value), do: value
+
+      defp boolean_option!(source, value) do
+        raise ArgumentError,
+              "#{inspect(source)} must be a boolean, got: #{inspect(value)}"
       end
 
       defp registered_partition_count do

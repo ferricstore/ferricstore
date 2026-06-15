@@ -12,7 +12,9 @@ defmodule Ferricstore.ProductionDefaultsTest do
     # production path should not require per-run WARAFT_* or FLOW_* env flags.
     assert config_exs =~ "flow_async_history: true"
     assert config_exs =~ "wal_commit_delay_us: 6_000"
+    assert config_exs =~ "waraft_commit_batch_adaptive: true"
     assert config_exs =~ "waraft_commit_batch_max: 10_000"
+    assert bench_exs =~ "waraft_commit_batch_adaptive: true"
     assert bench_exs =~ "wal_commit_delay_us: 6_000"
     assert bench_exs =~ "waraft_commit_batch_max: 10_000"
     assert config_exs =~ "flow_retention_sweeper_initial_delay_ms: 600_000"
@@ -26,6 +28,8 @@ defmodule Ferricstore.ProductionDefaultsTest do
     assert bench_exs =~ "flow_retention_sweeper_pressure_limit: 10_000"
     assert bench_exs =~ "flow_retention_sweeper_pressure_compaction_interval_ms: 60_000"
     assert runtime_exs =~ "flow_async_history: true"
+    assert runtime_exs =~ "FERRICSTORE_WARAFT_COMMIT_BATCH_ADAPTIVE"
+    assert runtime_exs =~ "FERRICSTORE_WARAFT_COMMIT_BATCH_ADAPTIVE\", \"true\""
     assert runtime_exs =~ "\"6000\""
     assert runtime_exs =~ "\"10000\""
     backend_mode_key = "raft_" <> "backend"
@@ -302,20 +306,21 @@ defmodule Ferricstore.ProductionDefaultsTest do
       "apps/ferricstore/lib/ferricstore/flow/lmdb_rebuilder.ex"
     ]
 
-    for path <- paths do
-      source =
-        case path do
-          "apps/ferricstore/lib/ferricstore/raft/state_machine.ex" ->
-            Ferricstore.Test.SourceFiles.state_machine_source()
+    sources =
+      Enum.map(paths, fn
+        "apps/ferricstore/lib/ferricstore/raft/state_machine.ex" ->
+          Ferricstore.Test.SourceFiles.state_machine_source()
 
-          "apps/ferricstore/lib/ferricstore/store/shard.ex" ->
-            Ferricstore.Test.SourceFiles.shard_source()
+        "apps/ferricstore/lib/ferricstore/store/shard.ex" ->
+          Ferricstore.Test.SourceFiles.shard_source()
 
-          _ ->
-            File.read!(Path.join(@repo_root, path))
-        end
+        path ->
+          File.read!(Path.join(@repo_root, path))
+      end)
 
-      assert source =~ ":flow_async_history"
+    assert Enum.any?(sources, &String.contains?(&1, ":flow_async_history"))
+
+    for source <- sources do
       refute source =~ "System.get_env(\"FLOW_ASYNC_HISTORY\""
     end
   end
@@ -379,5 +384,54 @@ defmodule Ferricstore.ProductionDefaultsTest do
     assert bench_exs =~ "waraft_apply_log_batch_size: 4_096"
     assert runtime_exs =~ ~s(FERRICSTORE_WARAFT_APPLY_LOG_BATCH_SIZE", "4096")
     assert backend_source =~ ":waraft_apply_log_batch_size, 4096"
+  end
+
+  test "WARaft commit priority defaults to immediate high priority" do
+    config_exs = File.read!(Path.join(@repo_root, "config/config.exs"))
+    bench_exs = File.read!(Path.join(@repo_root, "config/bench.exs"))
+    runtime_exs = File.read!(Path.join(@repo_root, "config/runtime.exs"))
+    backend_source = Ferricstore.Test.SourceFiles.waraft_backend_source()
+
+    assert config_exs =~ "waraft_commit_priority: :high"
+    assert bench_exs =~ "waraft_commit_priority: :high"
+    assert runtime_exs =~ "FERRICSTORE_WARAFT_COMMIT_PRIORITY"
+    assert backend_source =~ "waraft_commit_priority()"
+
+    assert backend_source =~
+             ":wa_raft_acceptor.commit(acceptor, command, @timeout, waraft_commit_priority())"
+
+    assert backend_source =~
+             ":wa_raft_acceptor.commit_async(acceptor, reply_to, command, waraft_commit_priority())"
+  end
+
+  test "WARaft generic batch window defaults to no extra write delay" do
+    config_exs = File.read!(Path.join(@repo_root, "config/config.exs"))
+    bench_exs = File.read!(Path.join(@repo_root, "config/bench.exs"))
+    runtime_exs = File.read!(Path.join(@repo_root, "config/runtime.exs"))
+
+    batcher_source =
+      File.read!(
+        Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/raft/waraft_backend/batcher.ex")
+      )
+
+    assert config_exs =~ "waraft_generic_batch_window_ms: 0"
+    assert bench_exs =~ "waraft_generic_batch_window_ms: 0"
+    assert runtime_exs =~ ~s(FERRICSTORE_WARAFT_GENERIC_BATCH_WINDOW_MS", "0")
+    assert batcher_source =~ "@default_generic_batch_window_ms 0"
+  end
+
+  test "release cursor default avoids hot write-path checkpoint churn" do
+    runtime_exs = File.read!(Path.join(@repo_root, "config/runtime.exs"))
+
+    state_machine_ex =
+      File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/raft/state_machine.ex"))
+
+    routing_ex =
+      File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/store/shard/routing.ex"))
+
+    assert runtime_exs =~ ~s(FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")
+    assert state_machine_ex =~ "@default_release_cursor_interval 200_000"
+    assert routing_ex =~ "Application.get_env(:ferricstore, :release_cursor_interval, 200_000)"
+    refute runtime_exs =~ ~s(FERRICSTORE_RELEASE_CURSOR_INTERVAL", "500")
   end
 end

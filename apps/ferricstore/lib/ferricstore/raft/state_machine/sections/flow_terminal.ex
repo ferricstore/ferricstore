@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -50,13 +49,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         partition_key = Map.get(attrs, :partition_key)
         child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
-        with {:ok, record} <- flow_require_record(child_state, id, partition_key),
-             {:ok, record, next} <-
-               flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms),
-             :ok <-
-               flow_apply_complete_local(child_state, record, next, partition_key, now_ms, attrs),
-             :ok <- flow_apply_child_terminal_chain(state, next, "completed", now_ms) do
-          :ok
+        with {:ok, record} <- flow_require_record(child_state, id, partition_key) do
+          case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
+            {:ok, :noop} ->
+              :ok
+
+            {:ok, record, next} ->
+              with :ok <-
+                     flow_apply_complete_local(
+                       child_state,
+                       record,
+                       next,
+                       partition_key,
+                       now_ms,
+                       attrs
+                     ) do
+                flow_apply_child_terminal_chain(state, next, "completed", now_ms)
+              end
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
@@ -65,12 +78,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         partition_key = Map.get(attrs, :partition_key)
         child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
-        with {:ok, record} <- flow_require_record(child_state, id, partition_key),
-             {:ok, record, next} <-
-               flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms),
-             :ok <- flow_apply_fail_local(child_state, record, next, partition_key, now_ms, attrs),
-             :ok <- flow_apply_child_terminal_chain(state, next, "failed", now_ms) do
-          :ok
+        with {:ok, record} <- flow_require_record(child_state, id, partition_key) do
+          case flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
+            {:ok, :noop} ->
+              :ok
+
+            {:ok, record, next} ->
+              with :ok <-
+                     flow_apply_fail_local(
+                       child_state,
+                       record,
+                       next,
+                       partition_key,
+                       now_ms,
+                       attrs
+                     ) do
+                flow_apply_child_terminal_chain(state, next, "failed", now_ms)
+              end
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
@@ -79,21 +107,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         partition_key = Map.get(attrs, :partition_key)
         child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
-        with {:ok, record} <- flow_require_record(child_state, id, partition_key),
-             {:ok, record, next, history_meta} <-
-               flow_prepare_retry_existing_record(child_state, record, attrs, lease_token, now_ms),
-             :ok <-
-               flow_apply_retry_local(
-                 child_state,
-                 record,
-                 next,
-                 partition_key,
-                 now_ms,
-                 history_meta,
-                 attrs
-               ),
-             :ok <- flow_maybe_apply_cross_terminal_chain(state, next, now_ms) do
-          :ok
+        with {:ok, record} <- flow_require_record(child_state, id, partition_key) do
+          case flow_prepare_retry_existing_record(child_state, record, attrs, lease_token, now_ms) do
+            {:ok, :noop} ->
+              :ok
+
+            {:ok, record, next, history_meta} ->
+              with :ok <-
+                     flow_apply_retry_local(
+                       child_state,
+                       record,
+                       next,
+                       partition_key,
+                       now_ms,
+                       history_meta,
+                       attrs
+                     ) do
+                flow_maybe_apply_cross_terminal_chain(state, next, now_ms)
+              end
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 
@@ -136,6 +171,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         attrs_list
         |> Enum.reduce_while({:ok, []}, fn attrs, {:ok, acc} ->
           case flow_cross_terminal_prepare(state, op, attrs) do
+            {:ok, :noop} -> {:cont, {:ok, acc}}
             {:ok, plan} -> {:cont, {:ok, [plan | acc]}}
             {:error, _reason} = error -> {:halt, error}
           end
@@ -160,6 +196,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
              {:ok, record, next} <-
                flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
           {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
+        else
+          {:ok, :noop} -> {:ok, :noop}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -173,6 +212,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
              {:ok, record, next} <-
                flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
           {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
+        else
+          {:ok, :noop} -> {:ok, :noop}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -186,6 +228,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
              {:ok, record, next, history_meta} <-
                flow_prepare_retry_existing_record(child_state, record, attrs, lease_token, now_ms) do
           {:ok, {child_state, record, next, attrs, partition_key, now_ms, history_meta}}
+        else
+          {:ok, :noop} -> {:ok, :noop}
+          {:error, _reason} = error -> error
         end
       end
 

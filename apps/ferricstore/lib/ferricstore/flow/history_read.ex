@@ -175,6 +175,20 @@ defmodule Ferricstore.Flow.HistoryRead do
     end
   end
 
+  def hot_range_for_max(ctx, history_key, count, max) when is_integer(max) and max > 0 do
+    case Ferricstore.Flow.IndexZSet.card(ctx, history_key) do
+      {:ok, total} ->
+        oldest_hot_idx = max(total - max, 0)
+        start_idx = max(total - count, oldest_hot_idx)
+        {start_idx, total - 1}
+
+      _ ->
+        {0, count - 1}
+    end
+  end
+
+  def hot_range_for_max(_ctx, _history_key, count, _max), do: {0, count - 1}
+
   defp hot_max(ctx, id, partition_key) do
     case Router.flow_get(ctx, id, partition_key) do
       value when is_binary(value) ->
@@ -315,13 +329,32 @@ defmodule Ferricstore.Flow.HistoryRead do
   end
 
   def from_event_ids(ctx, id, partition_key, history_key, event_ids, value_return) do
+    from_event_ids_with_context(
+      ctx,
+      id,
+      partition_key,
+      history_key,
+      event_ids,
+      value_return,
+      decode_context(ctx, id, partition_key)
+    )
+  end
+
+  def from_event_ids_with_context(
+        ctx,
+        id,
+        partition_key,
+        history_key,
+        event_ids,
+        value_return,
+        decode_context
+      ) do
     compound_keys =
       Enum.map(event_ids, &Ferricstore.Flow.Keys.stream_entry_key(id, &1, partition_key))
 
     values = Router.compound_batch_get(ctx, history_key, compound_keys)
     hot_values = hot_values_by_event(event_ids, values)
     cold_values = cold_values_by_event(ctx, history_key, event_ids, hot_values)
-    decode_context = decode_context(ctx, id, partition_key)
 
     entries =
       Enum.flat_map(event_ids, fn event_id ->

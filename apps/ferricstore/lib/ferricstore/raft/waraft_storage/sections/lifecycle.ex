@@ -74,6 +74,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           end)
 
         sm_state =
+          profile_startup_phase(
+            shard_index,
+            root_dir,
+            :recover_apply_projection_value_locators,
+            fn ->
+              recover_apply_projection_value_locators!(sm_state, root_dir)
+            end
+          )
+
+        sm_state =
           profile_startup_phase(shard_index, root_dir, :rebuild_segment_indexes, fn ->
             rebuild_indexes_from_segment_keydir(sm_state, ctx, shard_index)
           end)
@@ -109,7 +119,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         try do
           handle = flush_replay_dependencies_before_close(handle)
 
-          with :ok <- maybe_fsync_payload_before_metadata(handle) do
+          with :ok <- drain_apply_projection_cache_compaction_for_snapshot(handle),
+               :ok <- flush_apply_projection_snapshot_payload(handle),
+               :ok <- maybe_fsync_payload_before_metadata(handle) do
             clean_handle =
               handle
               |> Map.put(:bitcask_dirty?, false)
@@ -643,8 +655,18 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
              handle,
              label_update
            ) do
+        started_at = System.monotonic_time()
+
         case segment_project_command(decoded_command, position, handle.sm_state) do
           {:ok, new_sm_state, result, applied_increment} ->
+            emit_segment_projection_apply_telemetry(
+              handle.sm_state,
+              decoded_command,
+              started_at,
+              result,
+              applied_increment
+            )
+
             finish_apply_result(
               command,
               position,

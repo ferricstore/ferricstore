@@ -66,6 +66,138 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
     end
   end
 
+  def expand_entries(entries) when is_list(entries), do: Enum.flat_map(entries, &expand_entry/1)
+
+  def expand_entry(
+        %{history_chain: {created, final, step_states}, history_key: history_key} = entry
+      ) do
+    expand_history_chain(history_key, created, final, step_states, Map.get(entry, :ra_index))
+  end
+
+  def expand_entry(entry), do: [entry]
+
+  defp expand_history_chain(history_key, created, final, step_states, ra_index) do
+    now_ms = Map.fetch!(created, :updated_at_ms)
+
+    {created_entry, previous_ms} =
+      chain_history_entry(created, history_key, "created", now_ms, nil, ra_index)
+
+    {step_entries, previous_ms} =
+      step_states
+      |> Enum.drop(1)
+      |> Enum.with_index(2)
+      |> Enum.reduce({[], previous_ms}, fn {run_state, version}, {entries, previous_history_ms} ->
+        event_ms = now_ms + version - 1
+
+        record = %{
+          created
+          | version: version,
+            updated_at_ms: event_ms,
+            run_state: run_state,
+            fencing_token: version
+        }
+
+        {step_entry, next_previous_ms} =
+          chain_history_entry(
+            record,
+            history_key,
+            "step_continued",
+            event_ms,
+            previous_history_ms,
+            ra_index
+          )
+
+        {[step_entry | entries], next_previous_ms}
+      end)
+
+    {completed_entry, _event_ms} =
+      chain_history_entry(
+        final,
+        history_key,
+        "completed",
+        Map.fetch!(final, :updated_at_ms),
+        previous_ms,
+        ra_index
+      )
+
+    [created_entry | Enum.reverse(step_entries)] ++ [completed_entry]
+  end
+
+  defp chain_history_entry(record, history_key, event, now_ms, previous_history_ms, ra_index) do
+    version = Map.fetch!(record, :version)
+    {event_id, event_ms} = chain_history_next_event(now_ms, version, previous_history_ms)
+
+    entry =
+      %{
+        key: Ferricstore.Flow.Keys.stream_entry_key_from_history_key(history_key, event_id),
+        expire_at_ms: 0,
+        history_key: history_key,
+        event_id: event_id,
+        event_ms: event_ms,
+        version: version,
+        history_hot_max_events: Map.get(record, :history_hot_max_events),
+        history_max_events: Map.get(record, :history_max_events),
+        terminal?: Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)),
+        value: {:flow_history_fields, record, event, now_ms, %{}}
+      }
+      |> maybe_put_ra_index(ra_index)
+      |> maybe_put_hot_evict_event_ids(
+        chain_history_hot_evict_event_ids(record, event_id, version, previous_history_ms)
+      )
+
+    {entry, entry.event_ms}
+  end
+
+  defp chain_history_next_event(now_ms, 1, _previous_history_ms) do
+    {Integer.to_string(trunc(now_ms)) <> "-1", trunc(now_ms)}
+  end
+
+  defp chain_history_next_event(now_ms, version, previous_history_ms)
+       when is_integer(previous_history_ms) do
+    ms = max(trunc(now_ms), previous_history_ms)
+    {Integer.to_string(ms) <> "-" <> Integer.to_string(version), ms}
+  end
+
+  defp chain_history_next_event(now_ms, version, _previous_history_ms) do
+    {Integer.to_string(trunc(now_ms)) <> "-" <> Integer.to_string(version), trunc(now_ms)}
+  end
+
+  defp chain_history_hot_evict_event_ids(record, event_id, version, previous_history_ms) do
+    []
+    |> maybe_add_terminal_hot_evict_event_id(record, event_id)
+    |> maybe_add_previous_hot_evict_event_id(record, version, previous_history_ms)
+    |> Enum.uniq()
+  end
+
+  defp maybe_add_terminal_hot_evict_event_id(ids, record, event_id) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) and is_binary(event_id) and
+         event_id != "" do
+      [event_id | ids]
+    else
+      ids
+    end
+  end
+
+  defp maybe_add_previous_hot_evict_event_id(ids, record, version, previous_history_ms) do
+    if Map.get(record, :history_hot_max_events) == 1 and is_integer(version) and version > 1 and
+         is_integer(previous_history_ms) do
+      previous_id =
+        Integer.to_string(previous_history_ms) <> "-" <> Integer.to_string(version - 1)
+
+      [previous_id | ids]
+    else
+      ids
+    end
+  end
+
+  defp maybe_put_hot_evict_event_ids(entry, []), do: entry
+  defp maybe_put_hot_evict_event_ids(entry, ids), do: Map.put(entry, :hot_evict_event_ids, ids)
+
+  defp maybe_put_ra_index(entry, nil), do: entry
+
+  defp maybe_put_ra_index(entry, ra_index) when is_integer(ra_index),
+    do: Map.put(entry, :ra_index, ra_index)
+
   def maybe_persist_projected_index(
         _instance_ctx,
         _shard_index,
@@ -89,6 +221,11 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
   end
 
   def encode_entry(%{value: value} = entry) when is_binary(value), do: entry
+
+  def encode_entry(%{value: {:flow_history_fields, record, event, now_ms, meta}} = entry) do
+    value = flow_call(:encode_history_fields, [record, event, now_ms, meta])
+    Map.put(entry, :value, value)
+  end
 
   def encode_entry(%{snapshot: snapshot} = entry) do
     Map.put(entry, :value, flow_call(:encode_history_snapshot, [snapshot]))

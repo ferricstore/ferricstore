@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -41,6 +40,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       }
 
       alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -106,6 +106,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
                 {key, expected_value, expire_at_ms, lfu, file_id, offset, value_size}
               )
 
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
               refs
 
             _other ->
@@ -152,6 +153,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
                 {key, nil, expire_at_ms, lfu, file_id, offset, value_size}
               )
 
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
               refs
 
             _other ->
@@ -291,6 +293,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           delete_apply_projection_cache_for_pending_original(state, key)
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
+          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
@@ -308,6 +311,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           delete_apply_projection_cache_for_pending_original(state, key)
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
+          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
@@ -329,6 +333,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           delete_apply_projection_cache_for_pending_original(state, key, file_id)
           track_keydir_binary_delta(state, key, nil, expire_at_ms)
           :ets.insert(state.ets, {key, nil, expire_at_ms, lfu, file_id, offset, value_size})
+          CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
         else
           expected_staged_size = byte_size(to_disk_binary(value))
 
@@ -346,6 +351,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
           if replaced > 0 do
             delete_apply_projection_cache_for_pending_original(state, key, file_id)
+            CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
           end
         end
 
@@ -372,6 +378,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             state.ets,
             {key, expected_value, expire_at_ms, LFU.initial(), file_id, offset, value_size}
           )
+
+          CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
         else
           replaced =
             replace_pending_location(
@@ -402,10 +410,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
             if fallback_replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
             end
           else
             if replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
             end
           end
         end
@@ -650,32 +660,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
              ra_index
            ) do
         result =
-          if sync_flow_history_projection?() do
-            # history projection, otherwise crash recovery can skip committed
-            # commands whose Flow history was still only in projector memory.
-            HistoryProjector.write_entries_sync(
-              ctx,
-              shard_index,
-              flow_history_projection_shard_data_path(state, ctx, shard_index),
-              entries,
-              ra_index,
-              flow_history_projection_opts(state, ctx)
-            )
-          else
-            case HistoryProjector.enqueue_async(ctx, shard_index, entries, ra_index) do
-              :ok ->
-                :ok
-
-              {:error, _reason} ->
-                HistoryProjector.write_entries_sync(
-                  ctx,
-                  shard_index,
-                  flow_history_projection_shard_data_path(state, ctx, shard_index),
-                  entries,
-                  ra_index,
-                  flow_history_projection_opts(state, ctx)
-                )
-            end
+          case HistoryProjector.enqueue_async(ctx, shard_index, entries, ra_index) do
+            :ok -> :ok
+            {:error, reason} -> {:error, reason}
           end
 
         case result do
@@ -703,7 +690,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       defp record_waraft_replay_dependency(kind, shard_index, index)
            when kind in [:history] and is_integer(shard_index) and shard_index >= 0 and
                   is_integer(index) and index > 0 do
-        dependencies = apply_state_get(:waraft_replay_dependencies, %{history: %{}})
+        dependencies =
+          apply_state_get(:waraft_replay_dependencies, %{history: %{}, apply_projection: %{}})
 
         updated =
           dependencies
@@ -715,17 +703,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       end
 
       defp record_waraft_replay_dependency(_kind, _shard_index, _index), do: :ok
-
-      defp flow_history_projection_shard_data_path(_state, %{data_dir: data_dir}, shard_index)
-           when is_binary(data_dir) do
-        Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
-      end
-
-      defp flow_history_projection_shard_data_path(state, _ctx, _shard_index),
-        do: state.shard_data_path
-
-      defp flow_history_projection_opts(%{ets: keydir}, nil), do: [keydir: keydir]
-      defp flow_history_projection_opts(_state, _ctx), do: []
 
       defp queue_pending_delete(key, prob_path) do
         pending = Process.get(:sm_pending_writes, [])
@@ -742,14 +719,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       end
 
       defp standalone_staged_apply?, do: Process.get(@sm_standalone_staged_key) == true
-
-      defp sync_flow_history_projection?,
-        # The standalone staging flag is also used by WARaft segment apply to delay
-        # ETS publication until segment projection succeeds. That must not make
-        # async Flow history synchronous; WARaft gates replay on the projected index.
-        do:
-          (standalone_staged_apply?() and not waraft_segment_projection_apply?()) or
-            Process.get(@sm_force_sync_flow_history_key) == true
 
       defp waraft_segment_projection_apply?,
         do: is_function(Process.get(@sm_waraft_projection_writer_key))
@@ -895,20 +864,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
         }
       end
 
-      defp flow_async_history_config(config) do
-        Map.get_lazy(config, :flow_async_history, fn ->
-          case Application.get_env(:ferricstore, :flow_async_history, true) do
-            value when value in [true, "1", "true"] ->
-              true
-
-            value when value in [false, "0", "false"] ->
-              false
-
-            _ ->
-              true
-          end
-        end)
-      end
+      defp flow_async_history_config(_config), do: true
 
       defp duration_us(started_at) do
         System.monotonic_time()

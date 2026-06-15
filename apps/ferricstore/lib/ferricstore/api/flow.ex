@@ -39,12 +39,17 @@ defmodule FerricStore.API.Flow do
   @doc """
   Reads reusable Flow values by reference, preserving request order.
   """
-  @spec flow_value_mget([binary()]) :: {:ok, [term()]} | {:error, binary()}
-  def flow_value_mget(refs) when is_list(refs) do
-    Ferricstore.Flow.value_mget(default_ctx(), refs)
+  @spec flow_value_mget([binary()], keyword()) :: {:ok, [term()]} | {:error, binary()}
+  def flow_value_mget(refs, opts \\ [])
+
+  def flow_value_mget(refs, opts) when is_list(refs) and is_list(opts) do
+    Ferricstore.Flow.value_mget(default_ctx(), refs, opts)
   end
 
-  def flow_value_mget(_refs), do: {:error, "ERR flow refs must be a list"}
+  def flow_value_mget(_refs, opts) when not is_list(opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  def flow_value_mget(_refs, _opts), do: {:error, "ERR flow refs must be a list"}
 
   @doc """
   Records an external Flow signal and optionally attaches named values or moves
@@ -245,6 +250,24 @@ defmodule FerricStore.API.Flow do
   def flow_complete_many(_partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Runs deterministic in-process Flow step chains and completes them.
+
+  This is for no-external-IO workflow segments where the states can be advanced
+  durably inside one shard-local Raft apply. Each item may be an id, `%{id: id}`,
+  or `%{id: id, partition_key: partition_key}`. Missing partitions use the same
+  deterministic auto partitioning as normal Flow creation.
+  """
+  @spec flow_run_steps_many(list(), keyword()) :: :ok | {:ok, list()} | {:error, binary()}
+  def flow_run_steps_many(items, opts \\ [])
+
+  def flow_run_steps_many(items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.run_steps_many(default_ctx(), items, opts)
+  end
+
+  def flow_run_steps_many(_items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Moves a Flow record from one state to another, optionally guarded by a lease token."
   @spec flow_transition(binary(), binary(), binary(), keyword()) ::
           {:ok, map()} | {:error, binary()}
@@ -265,6 +288,72 @@ defmodule FerricStore.API.Flow do
     do: {:error, "ERR flow to must be a non-empty string"}
 
   def flow_transition(_id, _from_state, _to_state, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
+  Creates a Flow and immediately leases its first logical step to a worker.
+
+  This is the "start execution now" primitive for step-style workflows. It
+  creates the record in physical `"running"` state, stores `initial_state` as
+  `:run_state`, and returns the fresh running record with `:lease_token` and
+  `:fencing_token`.
+  """
+  @spec flow_start_and_claim(binary(), binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary()}
+  def flow_start_and_claim(id, type, initial_state, opts \\ [])
+
+  def flow_start_and_claim(id, type, initial_state, opts)
+      when is_binary(id) and is_binary(type) and is_binary(initial_state) and is_list(opts) do
+    Ferricstore.Flow.start_and_claim(default_ctx(), id, type, initial_state, opts)
+  end
+
+  def flow_start_and_claim(id, _type, _initial_state, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_start_and_claim(_id, type, _initial_state, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_start_and_claim(_id, _type, initial_state, _opts)
+      when not is_binary(initial_state),
+      do: {:error, "ERR flow state must be a non-empty string"}
+
+  def flow_start_and_claim(_id, _type, _initial_state, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
+  Advances a claimed Flow to the next logical step and keeps execution leased
+  to the same worker.
+
+  Unlike `flow_transition/4`, this returns the fresh running Flow record because
+  the caller needs the new `:lease_token` and `:fencing_token` for the next
+  step. On handler failure, call `flow_retry/3` with that fresh lease instead.
+  """
+  @spec flow_step_continue(binary(), binary(), binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary()}
+  def flow_step_continue(id, lease_token, from_state, to_state, opts \\ [])
+
+  def flow_step_continue(id, lease_token, from_state, to_state, opts)
+      when is_binary(id) and is_binary(lease_token) and is_binary(from_state) and
+             is_binary(to_state) and is_list(opts) do
+    Ferricstore.Flow.step_continue(default_ctx(), id, lease_token, from_state, to_state, opts)
+  end
+
+  def flow_step_continue(id, _lease_token, _from_state, _to_state, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_step_continue(_id, lease_token, _from_state, _to_state, _opts)
+      when not is_binary(lease_token),
+      do: {:error, "ERR flow lease_token must be a string"}
+
+  def flow_step_continue(_id, _lease_token, from_state, _to_state, _opts)
+      when not is_binary(from_state),
+      do: {:error, "ERR flow from must be a non-empty string"}
+
+  def flow_step_continue(_id, _lease_token, _from_state, to_state, _opts)
+      when not is_binary(to_state),
+      do: {:error, "ERR flow to must be a non-empty string"}
+
+  def flow_step_continue(_id, _lease_token, _from_state, _to_state, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """

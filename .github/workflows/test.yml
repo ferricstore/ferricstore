@@ -48,7 +48,8 @@ jobs:
             apps/ferricstore/native/ferricstore_bitcask/target
             apps/ferricstore/native/ferricstore_wal_nif/target
             apps/ferricstore/native/resp_parser_nif/target
-          key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore/native/resp_parser_nif/Cargo.lock') }}
+            apps/ferricstore_server/native/native_protocol_nif/target
+          key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore/native/resp_parser_nif/Cargo.lock', 'apps/ferricstore_server/native/native_protocol_nif/Cargo.lock') }}
           restore-keys: cargo-Linux-
 
       - name: Install dependencies
@@ -59,12 +60,14 @@ jobs:
           cargo fmt --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml -- --check
           cargo fmt --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml -- --check
           cargo fmt --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml -- --check
+          cargo fmt --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml -- --check
 
       - name: Run Clippy
         run: |
           cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust tests (bitcask)
         run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
@@ -75,18 +78,25 @@ jobs:
       - name: Run Rust tests (resp_parser_nif)
         run: cargo test --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml
 
+      - name: Run Rust tests (native_protocol_nif)
+        run: cargo test --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
+
       - name: Build NIF (release)
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
           cargo build --release --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
+          mkdir -p apps/ferricstore_server/priv/native
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/libferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/libferricstore_wal_nif.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/ferricstore_wal_nif.so
           cp apps/ferricstore/native/resp_parser_nif/target/release/libresp_parser_nif.so apps/ferricstore/priv/native/libresp_parser_nif.so
           cp apps/ferricstore/native/resp_parser_nif/target/release/libresp_parser_nif.so apps/ferricstore/priv/native/resp_parser_nif.so
+          cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/libnative_protocol_nif.so
+          cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/native_protocol_nif.so
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
@@ -111,6 +121,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-Linux-${{ github.sha }}
 
   # ===========================================================================
@@ -148,7 +159,8 @@ jobs:
             apps/ferricstore/native/ferricstore_bitcask/target
             apps/ferricstore/native/ferricstore_wal_nif/target
             apps/ferricstore/native/resp_parser_nif/target
-          key: cargo-macOS-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore/native/resp_parser_nif/Cargo.lock') }}
+            apps/ferricstore_server/native/native_protocol_nif/target
+          key: cargo-macOS-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore/native/resp_parser_nif/Cargo.lock', 'apps/ferricstore_server/native/native_protocol_nif/Cargo.lock') }}
           restore-keys: cargo-macOS-
 
       - name: Install dependencies
@@ -159,12 +171,14 @@ jobs:
           cargo fmt --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml -- --check
           cargo fmt --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml -- --check
           cargo fmt --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml -- --check
+          cargo fmt --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml -- --check
 
       - name: Run Clippy
         run: |
           cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust tests (bitcask)
         run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
@@ -175,18 +189,25 @@ jobs:
       - name: Run Rust tests (resp_parser_nif)
         run: cargo test --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml
 
+      - name: Run Rust tests (native_protocol_nif)
+        run: cargo test --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
+
       - name: Build NIF (release)
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
           cargo build --release --manifest-path apps/ferricstore/native/resp_parser_nif/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
+          mkdir -p apps/ferricstore_server/priv/native
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/libferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/ferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.dylib apps/ferricstore/priv/native/libferricstore_wal_nif.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.dylib apps/ferricstore/priv/native/ferricstore_wal_nif.so
           cp apps/ferricstore/native/resp_parser_nif/target/release/libresp_parser_nif.dylib apps/ferricstore/priv/native/libresp_parser_nif.so
           cp apps/ferricstore/native/resp_parser_nif/target/release/libresp_parser_nif.dylib apps/ferricstore/priv/native/resp_parser_nif.so
+          cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.dylib apps/ferricstore_server/priv/native/libnative_protocol_nif.so
+          cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.dylib apps/ferricstore_server/priv/native/native_protocol_nif.so
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
@@ -201,6 +222,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-macOS-${{ github.sha }}
 
   # ===========================================================================

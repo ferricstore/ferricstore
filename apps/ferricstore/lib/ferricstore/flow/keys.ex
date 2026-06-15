@@ -8,6 +8,8 @@ defmodule Ferricstore.Flow.Keys do
   @auto_partition_tags 0..(@auto_partition_buckets - 1)
                        |> Enum.map(&("{fa:" <> Integer.to_string(&1) <> "}"))
                        |> List.to_tuple()
+  @auto_partition_keys 0..(@auto_partition_buckets - 1)
+                       |> Enum.map(&(@auto_partition_prefix <> Integer.to_string(&1)))
 
   def state_key(id, partition_key \\ nil)
 
@@ -173,9 +175,7 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def auto_partition_keys do
-    Enum.map(0..(@auto_partition_buckets - 1), fn bucket ->
-      @auto_partition_prefix <> Integer.to_string(bucket)
-    end)
+    @auto_partition_keys
   end
 
   def auto_partition_key?(<<@auto_partition_prefix, bucket::binary>>) do

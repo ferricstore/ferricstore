@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -125,6 +124,89 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end)
         end)
       end
+
+      defp apply_flow_pending_with_time(meta, state, command_shape, attrs, fun) do
+        with_apply_time(meta, fn ->
+          with_current_ra_index(meta, fn ->
+            item_count = flow_apply_item_count(attrs)
+            started_at = System.monotonic_time()
+            result = with_pending_writes(state, fun)
+
+            emit_flow_apply_telemetry(
+              state,
+              command_shape,
+              started_at,
+              item_count,
+              result
+            )
+
+            bump_applied(meta, state, result)
+          end)
+        end)
+      end
+
+      defp apply_flow_single_with_telemetry(state, command_shape, attrs, fun) do
+        item_count = flow_apply_item_count(attrs)
+        started_at = System.monotonic_time()
+        result = fun.()
+
+        emit_flow_apply_telemetry(
+          state,
+          command_shape,
+          started_at,
+          item_count,
+          result
+        )
+
+        result
+      end
+
+      defp emit_flow_apply_telemetry(state, command_shape, started_at, item_count, result) do
+        :telemetry.execute(
+          [:ferricstore, :flow, :apply],
+          %{
+            duration_us: duration_us(started_at),
+            item_count: item_count,
+            result_count: flow_apply_result_count(result, item_count)
+          },
+          %{
+            shard_index: Map.get(state, :shard_index),
+            command_shape: command_shape,
+            result: flow_apply_result_class(result)
+          }
+        )
+      end
+
+      defp flow_apply_item_count(%{records: records}) when is_list(records), do: length(records)
+
+      defp flow_apply_item_count(%{children: children}) when is_list(children),
+        do: length(children)
+
+      defp flow_apply_item_count(_attrs), do: 1
+
+      defp flow_apply_result_count({:ok, records}, _item_count) when is_list(records),
+        do: length(records)
+
+      defp flow_apply_result_count(results, _item_count) when is_list(results),
+        do: length(results)
+
+      defp flow_apply_result_count(result, item_count) when result in [:ok, nil], do: item_count
+      defp flow_apply_result_count({:ok, _value}, item_count), do: item_count
+      defp flow_apply_result_count({:error, _reason}, _item_count), do: 0
+      defp flow_apply_result_count(_result, _item_count), do: 0
+
+      defp flow_apply_result_class({:error, _reason}), do: :error
+      defp flow_apply_result_class({:ok, _value}), do: :ok
+      defp flow_apply_result_class(result) when result in [:ok, nil], do: :ok
+
+      defp flow_apply_result_class(results) when is_list(results) do
+        if Enum.any?(results, &flow_apply_error_result?/1), do: :partial, else: :ok
+      end
+
+      defp flow_apply_result_class(_result), do: :error
+
+      defp flow_apply_error_result?({:error, _reason}), do: true
+      defp flow_apply_error_result?(_result), do: false
 
       defp apply_control_with_time(meta, state, fun) do
         with_apply_time(meta, fn ->

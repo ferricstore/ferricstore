@@ -8,7 +8,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
       alias Ferricstore.Flow.NativeOrderedIndex
       alias Ferricstore.Flow.OrderedIndex
 
-      test "async enqueue rejects above configured pending cap so apply can fall back to sync projection" do
+      test "async enqueue stores overflow above configured pending cap and drains it on flush" do
         unique = System.unique_integer([:positive])
 
         old_max_pending =
@@ -65,7 +65,12 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
           end
 
           assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry.(1)], 1)
-          assert {:error, :queue_full} = HistoryProjector.enqueue_async(ctx, 0, [entry.(2)], 2)
+          assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry.(2)], 2)
+
+          assert :ok = HistoryProjector.flush(ctx, 0)
+          assert :requested = HistoryProjector.request(ctx, 0, dir, 2)
+          assert :ok = HistoryProjector.flush(ctx, 0)
+          assert HistoryProjector.durable?(ctx, 0, dir, 2)
 
           assert Process.alive?(pid)
         after

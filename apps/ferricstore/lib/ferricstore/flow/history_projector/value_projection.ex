@@ -562,6 +562,10 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
 
   def entry_flow_value_refs(%{value_refs: refs}), do: entry_value_refs(refs)
 
+  def entry_flow_value_refs(%{value: {:flow_history_fields, record, _event, _now_ms, _meta}})
+      when is_map(record),
+      do: record_flow_value_refs(record)
+
   def entry_flow_value_refs(%{record: record}) when is_map(record),
     do: record_flow_value_refs(record)
 

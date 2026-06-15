@@ -265,8 +265,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
           refute_receive {:storage_metadata_fsync, _path}, 100
 
           assert :ok = WARaftBackend.stop()
-          assert_receive {:storage_metadata_fsync, metadata_path}, 1_000
-          assert String.contains?(metadata_path, "ferricstore_storage.term")
+          assert_receive_storage_metadata_fsync()
 
           assert %{position: {:raft_log_pos, durable_index, _term}} =
                    waraft_latest_storage_metadata(root, 0)

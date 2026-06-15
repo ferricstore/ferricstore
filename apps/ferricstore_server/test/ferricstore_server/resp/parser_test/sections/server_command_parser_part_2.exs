@@ -103,51 +103,6 @@ defmodule FerricstoreServer.Resp.ParserTest.Sections.ServerCommandParserPart2 do
                    )
         end
 
-        test "parses JSON command grammar into typed Rust AST" do
-          assert {:ok,
-                  [
-                    {:command, "JSON.SET", ["doc", "$.a[0]", ~s({"x":1}), "NX"],
-                     {:json_set, "doc", ["a", 0], ~s({"x":1}), [:nx]}, ["doc"]},
-                    {:command, "JSON.GET", ["doc", "$.a", "$['b']"],
-                     {:json_get, "doc", [{"$.a", ["a"]}, {"$['b']", ["b"]}]}, ["doc"]},
-                    {:command, "JSON.NUMINCRBY", ["doc", "$.n", "1.5"],
-                     {:json_numincrby, "doc", ["n"], 1.5}, ["doc"]},
-                    {:command, "JSON.ARRAPPEND", ["doc", "$.arr", "1", "x"],
-                     {:json_arrappend, "doc", ["arr"], ["1", "x"]}, ["doc"]},
-                    {:command, "JSON.MGET", ["a", "b", "$.name"],
-                     {:json_mget, ["a", "b"], ["name"]}, ["a", "b"]}
-                  ], ""} =
-                   Parser.parse_commands(
-                     "json.set doc $.a[0] {\"x\":1} NX\r\n" <>
-                       "json.get doc $.a $['b']\r\n" <>
-                       "json.numincrby doc $.n 1.5\r\n" <>
-                       "json.arrappend doc $.arr 1 \"x\"\r\n" <>
-                       "json.mget a b $.name\r\n"
-                   )
-        end
-
-        test "keeps JSON semantic parse errors inside AST" do
-          assert {:ok,
-                  [
-                    {:command, "JSON.SET", ["doc", "$.a", "1", "BAD"],
-                     {:json_set, {:error, "ERR syntax error, option 'BAD' not recognized"}},
-                     ["doc"]},
-                    {:command, "JSON.GET", ["doc", "$["],
-                     {:json_get, "doc", {:error, "ERR invalid JSONPath syntax"}}, ["doc"]},
-                    {:command, "JSON.NUMINCRBY", ["doc", "$.n", "nan"],
-                     {:json_numincrby, "doc", {:error, "ERR value is not a number"}}, ["doc"]},
-                    {:command, "JSON.MGET", ["a"],
-                     {:json_mget,
-                      {:error, "ERR wrong number of arguments for 'json.mget' command"}}, []}
-                  ], ""} =
-                   Parser.parse_commands(
-                     "json.set doc $.a 1 BAD\r\n" <>
-                       "json.get doc $[\r\n" <>
-                       "json.numincrby doc $.n nan\r\n" <>
-                       "json.mget a\r\n"
-                   )
-        end
-
         test "parses Geo command grammar into typed Rust AST" do
           assert {:ok,
                   [
@@ -328,14 +283,11 @@ defmodule FerricstoreServer.Resp.ParserTest.Sections.ServerCommandParserPart2 do
                     {:command, "MSET", ["a", "1", "b", "2"], {:mset, ["a", "1", "b", "2"]},
                      ["a", "b"]},
                     {:command, "BITOP", ["AND", "dst", "a", "b"],
-                     {:bitop, :band, "dst", ["a", "b"]}, ["dst", "a", "b"]},
-                    {:command, "JSON.MGET", ["a", "b", "$"], {:json_mget, ["a", "b"], []},
-                     ["a", "b"]}
+                     {:bitop, :band, "dst", ["a", "b"]}, ["dst", "a", "b"]}
                   ], ""} =
                    Parser.parse_commands(
                      "*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n" <>
-                       "*5\r\n$5\r\nBITOP\r\n$3\r\nAND\r\n$3\r\ndst\r\n$1\r\na\r\n$1\r\nb\r\n" <>
-                       "*4\r\n$9\r\nJSON.MGET\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\n$\r\n"
+                       "*5\r\n$5\r\nBITOP\r\n$3\r\nAND\r\n$3\r\ndst\r\n$1\r\na\r\n$1\r\nb\r\n"
                    )
         end
 

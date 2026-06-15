@@ -31,7 +31,6 @@ defmodule Ferricstore.Commands.Dispatcher do
     Geo,
     Hash,
     HyperLogLog,
-    Json,
     List,
     Memory,
     Namespace,
@@ -179,19 +178,6 @@ defmodule Ferricstore.Commands.Dispatcher do
     xgroup: "xgroup",
     xreadgroup: "xreadgroup",
     xack: "xack",
-    json_set: "json.set",
-    json_get: "json.get",
-    json_del: "json.del",
-    json_numincrby: "json.numincrby",
-    json_type: "json.type",
-    json_strlen: "json.strlen",
-    json_objkeys: "json.objkeys",
-    json_objlen: "json.objlen",
-    json_arrappend: "json.arrappend",
-    json_arrlen: "json.arrlen",
-    json_toggle: "json.toggle",
-    json_clear: "json.clear",
-    json_mget: "json.mget",
     geoadd: "geoadd",
     geopos: "geopos",
     geodist: "geodist",
@@ -425,20 +411,6 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({tag, _, _, _, _} = ast, store)
       when tag in ~w(xrange xrevrange xgroup_create)a,
       do: Stream.handle_ast(ast, store)
-
-  def dispatch_ast({tag, _} = ast, store)
-      when tag in ~w(json_set json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrappend json_arrlen json_toggle json_clear json_mget)a,
-      do: Json.handle_ast(ast, store)
-
-  def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrlen json_toggle json_clear json_mget)a,
-      do: Json.handle_ast(ast, store)
-
-  def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(json_numincrby json_arrappend)a,
-      do: Json.handle_ast(ast, store)
-
-  def dispatch_ast({:json_set, _, _, _, _} = ast, store), do: Json.handle_ast(ast, store)
 
   def dispatch_ast({tag, _} = ast, store)
       when tag in ~w(geoadd geopos geohash)a,

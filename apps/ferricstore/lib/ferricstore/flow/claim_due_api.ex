@@ -283,6 +283,21 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
     router_maybe(ctx, normal_attrs(attrs, normal_state, Map.fetch!(attrs, :limit)))
   end
 
+  defp router_result(ctx, %{limit: 1} = attrs, true, reclaim_ratio) when reclaim_ratio > 0 do
+    normal_state = normal_state_filter(Map.fetch!(attrs, :state))
+
+    case router_maybe(ctx, normal_attrs(attrs, normal_state, 1)) do
+      {:ok, [_ | _]} = claimed ->
+        claimed
+
+      {:ok, []} ->
+        router_maybe(ctx, %{attrs | state: "running", limit: 1})
+
+      other ->
+        other
+    end
+  end
+
   defp router_result(ctx, attrs, true, reclaim_ratio) when reclaim_ratio > 0 do
     limit = Map.fetch!(attrs, :limit)
     initial_reclaim_limit = max(1, div(limit * reclaim_ratio + 99, 100))

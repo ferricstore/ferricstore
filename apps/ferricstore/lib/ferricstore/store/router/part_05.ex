@@ -22,6 +22,77 @@ defmodule Ferricstore.Store.Router.Part05 do
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
+
+      defp hot_read_bookkeeping_start(ctx) do
+        if Stats.cache_tracking_enabled?() do
+          case Stats.start_keyspace_hit_batch(ctx, 0) do
+            {:exact, 0} ->
+              {:exact, 0, []}
+
+            {:sampled_no_touch, rate, previous, 0} ->
+              {:sampled, rate, previous, 0, rate - previous, []}
+
+            {:sampled_touch, rate, previous, 0, next_sample_offset} ->
+              {:sampled, rate, previous, 0, next_sample_offset, []}
+          end
+        else
+          :disabled
+        end
+      end
+
+      defp hot_read_bookkeeping_add(:disabled, _keydir, _key, _lfu), do: :disabled
+
+      defp hot_read_bookkeeping_add({:exact, count, hits} = state, keydir, key, lfu) do
+        if Stats.cache_tracking_key?(key) do
+          {:exact, count + 1, [{keydir, key, lfu} | hits]}
+        else
+          state
+        end
+      end
+
+      defp hot_read_bookkeeping_add(
+             {:sampled, rate, previous, count, next_sample_offset, hits} = state,
+             keydir,
+             key,
+             lfu
+           ) do
+        if Stats.cache_tracking_key?(key) do
+          count = count + 1
+
+          hits =
+            if count >= next_sample_offset and rem(count - next_sample_offset, rate) == 0 do
+              [{keydir, key, lfu} | hits]
+            else
+              hits
+            end
+
+          {:sampled, rate, previous, count, next_sample_offset, hits}
+        else
+          state
+        end
+      end
+
+      defp hot_read_bookkeeping_finish(_ctx, :disabled), do: :ok
+
+      defp hot_read_bookkeeping_finish(ctx, {:exact, count, hits}) do
+        :ok = Stats.finish_keyspace_hit_batch(ctx, {:exact, count})
+        touch_hot_read_entries(ctx, hits)
+      end
+
+      defp hot_read_bookkeeping_finish(ctx, {:sampled, rate, previous, count, offset, hits}) do
+        :ok =
+          Stats.finish_keyspace_hit_batch(ctx, {:sampled_touch, rate, previous, count, offset})
+
+        touch_hot_read_entries(ctx, hits)
+      end
+
+      defp touch_hot_read_entries(ctx, hits) do
+        Enum.each(hits, fn {keydir, key, lfu} ->
+          LFU.touch(ctx, keydir, key, lfu)
+          Stats.record_hot_read(ctx, key)
+        end)
+      end
+
       defp sampled_read_bookkeeping_batch(_ctx, [], _max_hits), do: :ok
 
       defp sampled_read_bookkeeping_batch(ctx, hot_hits, max_hits)
@@ -248,6 +319,16 @@ defmodule Ferricstore.Store.Router.Part05 do
         batch_quorum_put(ctx, kv_pairs, nil)
       end
 
+      @doc false
+      @spec batch_quorum_put_status(FerricStore.Instance.t(), [{binary(), binary()}]) ::
+              :ok | {:error, term()}
+      def batch_quorum_put_status(ctx, kv_pairs) do
+        batch_quorum_put_status(ctx, kv_pairs, nil)
+      end
+
+      @doc false
+      def __batch_result_status_for_test__(results), do: batch_results_status(results)
+
       defp batch_quorum_commands(ctx, keyed_commands) do
         batch_quorum_commands(ctx, keyed_commands, nil)
       end
@@ -265,6 +346,7 @@ defmodule Ferricstore.Store.Router.Part05 do
           case direct_batch_command_shape(keyed_commands) do
             {:put, entries} -> do_batch_quorum_put_entries(ctx, entries, nil)
             {:delete, keys} -> do_batch_quorum_delete_keys(ctx, keys, nil)
+            {:zadd_many_single, entries} -> batch_quorum_zadd_many_single(ctx, entries)
             :generic -> batch_quorum_commands(ctx, keyed_commands)
           end
         else
@@ -286,6 +368,10 @@ defmodule Ferricstore.Store.Router.Part05 do
 
       defp direct_batch_command_shape([], :put, acc), do: {:put, Enum.reverse(acc)}
       defp direct_batch_command_shape([], :delete, acc), do: {:delete, Enum.reverse(acc)}
+
+      defp direct_batch_command_shape([], :zadd_many_single, acc),
+        do: {:zadd_many_single, Enum.reverse(acc)}
+
       defp direct_batch_command_shape([], _mode, _acc), do: :generic
 
       defp direct_batch_command_shape(
@@ -303,12 +389,77 @@ defmodule Ferricstore.Store.Router.Part05 do
         direct_batch_command_shape(rest, :delete, [key | acc])
       end
 
+      defp direct_batch_command_shape(
+             [{_route_key, {:zadd_single, key, score, member}} | rest],
+             mode,
+             acc
+           )
+           when mode in [:unknown, :zadd_many_single] and is_binary(key) and is_number(score) and
+                  is_binary(member) do
+        direct_batch_command_shape(rest, :zadd_many_single, [{key, score * 1.0, member} | acc])
+      end
+
       defp direct_batch_command_shape(_commands, _mode, _acc), do: :generic
 
       defp batch_quorum_commands(_ctx, [], _origin_node), do: []
 
       defp batch_quorum_commands(ctx, keyed_commands, origin_node) do
         do_batch_quorum_commands(ctx, keyed_commands, origin_node)
+      end
+
+      defp batch_quorum_zadd_many_single(_ctx, []), do: []
+
+      defp batch_quorum_zadd_many_single(ctx, entries) do
+        if selected_waraft_ctx?(ctx) do
+          {by_shard, count} =
+            Enum.reduce(entries, {%{}, 0}, fn {key, _score, _member} = entry, {shards, i} ->
+              idx = shard_for(ctx, key)
+              {shard_entries, indices} = Map.get(shards, idx, {[], []})
+
+              {Map.put(shards, idx, {[entry | shard_entries], [i | indices]}), i + 1}
+            end)
+
+          initial_results = new_waraft_result_tuple(count)
+
+          shard_batches =
+            Enum.map(by_shard, fn {shard_idx, {shard_entries, indices}} ->
+              {shard_idx, Enum.reverse(indices), Enum.reverse(shard_entries)}
+            end)
+
+          shard_results =
+            case shard_batches do
+              [{shard_idx, indices, shard_entries}] ->
+                [
+                  {shard_idx, indices,
+                   Ferricstore.Raft.Backend.write(shard_idx, {:zadd_many_single, shard_entries})}
+                ]
+
+              batches ->
+                commands =
+                  Enum.map(batches, fn {shard_idx, _indices, shard_entries} ->
+                    {shard_idx, {:zadd_many_single, shard_entries}}
+                  end)
+
+                batches
+                |> Enum.zip(Ferricstore.Raft.Backend.write_many(commands))
+                |> Enum.map(fn {{shard_idx, indices, _shard_entries}, result} ->
+                  {shard_idx, indices, result}
+                end)
+            end
+
+          shard_results
+          |> Enum.reduce(initial_results, fn {shard_idx, indices, result}, acc ->
+            merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
+          end)
+          |> Tuple.to_list()
+        else
+          keyed_commands =
+            Enum.map(entries, fn {key, score, member} ->
+              {key, {:zadd_single, key, score, member}}
+            end)
+
+          batch_quorum_commands(ctx, keyed_commands)
+        end
       end
 
       defp do_batch_quorum_commands(ctx, keyed_commands, origin_node) do
@@ -467,6 +618,22 @@ defmodule Ferricstore.Store.Router.Part05 do
         )
       end
 
+      defp waraft_batch_put_entries_status(_ctx, []), do: :ok
+
+      defp waraft_batch_put_entries_status(ctx, entries) do
+        buckets =
+          Enum.reduce(entries, new_waraft_item_buckets(ctx.shard_count), fn entry, buckets ->
+            {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
+            idx = shard_for(ctx, key)
+            put_waraft_item_bucket(buckets, idx, {key, value, expire_at_ms})
+          end)
+
+        collect_waraft_hot_shard_batch_status(
+          ctx,
+          waraft_item_groups(buckets, ctx.shard_count)
+        )
+      end
+
       defp waraft_batch_delete_keys(_ctx, []), do: []
 
       defp waraft_batch_delete_keys(ctx, keys) do
@@ -494,6 +661,14 @@ defmodule Ferricstore.Store.Router.Part05 do
         put_elem(buckets, shard_idx, {[item | items], [index | indices]})
       end
 
+      defp new_waraft_item_buckets(shard_count) when is_integer(shard_count) and shard_count > 0,
+        do: :erlang.make_tuple(shard_count, {[], 0})
+
+      defp put_waraft_item_bucket(buckets, shard_idx, item) do
+        {items, count} = elem(buckets, shard_idx)
+        put_elem(buckets, shard_idx, {[item | items], count + 1})
+      end
+
       defp waraft_batch_groups(buckets, shard_count) do
         0..(shard_count - 1)
         |> Enum.reduce([], fn shard_idx, acc ->
@@ -503,6 +678,17 @@ defmodule Ferricstore.Store.Router.Part05 do
 
             {items, indices} ->
               [{shard_idx, Enum.reverse(items), Enum.reverse(indices)} | acc]
+          end
+        end)
+        |> Enum.reverse()
+      end
+
+      defp waraft_item_groups(buckets, shard_count) do
+        0..(shard_count - 1)
+        |> Enum.reduce([], fn shard_idx, acc ->
+          case elem(buckets, shard_idx) do
+            {[], 0} -> acc
+            {items, count} -> [{shard_idx, Enum.reverse(items), count} | acc]
           end
         end)
         |> Enum.reverse()
@@ -525,15 +711,48 @@ defmodule Ferricstore.Store.Router.Part05 do
             _ ->
               groups
               |> Enum.map(fn {shard_idx, items, indices} ->
-                {shard_idx, indices, Task.async(fn -> submit_fun.(shard_idx, items) end)}
+                {shard_idx, indices, async_waraft_shard_submit(shard_idx, items, submit_fun)}
               end)
               |> Enum.reduce(new_waraft_result_tuple(count), fn {shard_idx, indices, task}, acc ->
-                result = Task.await(task, 30_000)
+                result = await_waraft_shard_submit(task)
                 merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
               end)
           end
 
         Tuple.to_list(results)
+      end
+
+      defp async_waraft_shard_submit(shard_idx, items, submit_fun) do
+        trace_enabled? = Ferricstore.LatencyTrace.enabled?()
+
+        Task.async(fn ->
+          if trace_enabled? do
+            previous_trace = Ferricstore.LatencyTrace.start(%{})
+
+            try do
+              result = submit_fun.(shard_idx, items)
+              trace = Ferricstore.LatencyTrace.finish(previous_trace)
+              {result, trace}
+            catch
+              kind, reason ->
+                _ = Ferricstore.LatencyTrace.finish(previous_trace)
+                :erlang.raise(kind, reason, __STACKTRACE__)
+            end
+          else
+            submit_fun.(shard_idx, items)
+          end
+        end)
+      end
+
+      defp await_waraft_shard_submit(task) do
+        case Task.await(task, 30_000) do
+          {result, trace} when is_map(trace) ->
+            Ferricstore.LatencyTrace.merge(trace)
+            result
+
+          result ->
+            result
+        end
       end
 
       defp collect_waraft_hot_shard_batches(ctx, groups, count, submit_async_fun, submit_sync_fun) do
@@ -584,6 +803,62 @@ defmodule Ferricstore.Store.Router.Part05 do
         Tuple.to_list(results)
       end
 
+      defp collect_waraft_hot_shard_batch_status(_ctx, []), do: :ok
+
+      defp collect_waraft_hot_shard_batch_status(ctx, [{shard_idx, items, count}]) do
+        ctx
+        |> merge_waraft_hot_batch_status(
+          shard_idx,
+          count,
+          Ferricstore.Raft.Backend.write_put_batch(shard_idx, items)
+        )
+      end
+
+      defp collect_waraft_hot_shard_batch_status(ctx, groups) do
+        {token_meta_pairs, status} =
+          Enum.reduce(groups, {[], :ok}, fn {shard_idx, items, count}, {tokens, status} ->
+            {from, token} = ReplyAwaiter.new()
+
+            case Ferricstore.Raft.WARaftBackend.write_put_batch_async(shard_idx, items, from) do
+              :ok ->
+                {[{token, {shard_idx, count}} | tokens], status}
+
+              {:direct, result} ->
+                {tokens,
+                 combine_batch_status(
+                   status,
+                   merge_waraft_hot_batch_status(ctx, shard_idx, count, result)
+                 )}
+
+              result ->
+                {tokens,
+                 combine_batch_status(
+                   status,
+                   merge_waraft_hot_batch_status(ctx, shard_idx, count, result)
+                 )}
+            end
+          end)
+
+        {_status, replies, unresolved} =
+          token_meta_pairs
+          |> Enum.reverse()
+          |> ReplyAwaiter.collect_tagged(30_000)
+
+        status =
+          if unresolved == [] do
+            status
+          else
+            combine_batch_status(status, ErrorReasons.write_timeout_unknown())
+          end
+
+        Enum.reduce(replies, status, fn {{shard_idx, count}, result}, status ->
+          combine_batch_status(
+            status,
+            merge_waraft_hot_batch_status(ctx, shard_idx, count, result)
+          )
+        end)
+      end
+
       defp merge_waraft_hot_batch_results(ctx, shard_idx, indices, {:ok, values}, acc)
            when is_list(values) do
         case put_waraft_hot_batch_results(indices, values, acc) do
@@ -607,6 +882,35 @@ defmodule Ferricstore.Store.Router.Part05 do
 
       defp merge_waraft_hot_batch_results(ctx, shard_idx, indices, result, acc) do
         merge_waraft_batch_results(ctx, shard_idx, indices, result, acc)
+      end
+
+      defp merge_waraft_hot_batch_status(ctx, shard_idx, expected_count, {:ok, values})
+           when is_list(values) do
+        case batch_values_status(values, expected_count) do
+          {:ok, ok_count} ->
+            bump_write_version_if_needed(ctx, shard_idx, ok_count)
+            :ok
+
+          {:error, error, ok_count} ->
+            bump_write_version_if_needed(ctx, shard_idx, ok_count)
+            error
+        end
+      end
+
+      defp merge_waraft_hot_batch_status(_ctx, _shard_idx, _expected_count, {:error, _} = error),
+        do: error
+
+      defp merge_waraft_hot_batch_status(ctx, shard_idx, expected_count, :ok) do
+        bump_write_version_if_needed(ctx, shard_idx, expected_count)
+        :ok
+      end
+
+      defp merge_waraft_hot_batch_status(_ctx, _shard_idx, _expected_count, other), do: other
+
+      defp bump_write_version_if_needed(_ctx, _shard_idx, 0), do: :ok
+
+      defp bump_write_version_if_needed(ctx, shard_idx, count) do
+        bump_write_version(ctx, shard_idx, count)
       end
 
       defp put_waraft_hot_batch_results(indices, values, acc) do
@@ -660,6 +964,77 @@ defmodule Ferricstore.Store.Router.Part05 do
       defp new_waraft_result_tuple(count) when is_integer(count) and count >= 0 do
         :erlang.make_tuple(count, ErrorReasons.write_timeout_unknown())
       end
+
+      defp batch_quorum_put_status(_ctx, [], _origin_node), do: :ok
+
+      defp batch_quorum_put_status(ctx, kv_pairs, origin_node) do
+        cond do
+          not durable_raft_ctx?(ctx) ->
+            ctx
+            |> local_batch_put_entries(kv_pairs)
+            |> batch_results_status()
+
+          selected_waraft_ctx?(ctx) and is_nil(origin_node) ->
+            waraft_batch_put_entries_status(ctx, kv_pairs)
+
+          true ->
+            ctx
+            |> do_ra_batch_quorum_put_entries(kv_pairs, origin_node)
+            |> batch_results_status()
+        end
+      end
+
+      defp batch_results_status(results) when is_list(results) do
+        batch_results_status(results, :ok)
+      end
+
+      defp batch_results_status({:error, _reason} = error), do: error
+      defp batch_results_status(:ok), do: :ok
+      defp batch_results_status(other), do: other
+
+      defp batch_results_status([], status), do: status
+      defp batch_results_status([{:error, _reason} = error | _rest], _status), do: error
+      defp batch_results_status([_ok | rest], status), do: batch_results_status(rest, status)
+
+      defp batch_values_status(values, expected_count) do
+        batch_values_status(values, expected_count, 0, 0, nil)
+      end
+
+      defp batch_values_status([], expected_count, seen, ok_count, nil)
+           when seen == expected_count,
+           do: {:ok, ok_count}
+
+      defp batch_values_status([], expected_count, seen, ok_count, nil),
+        do: {:error, {:error, {:batch_result_mismatch, expected_count, seen}}, ok_count}
+
+      defp batch_values_status([], expected_count, seen, ok_count, first_error)
+           when seen == expected_count,
+           do: {:error, first_error, ok_count}
+
+      defp batch_values_status([], expected_count, seen, ok_count, _first_error),
+        do: {:error, {:error, {:batch_result_mismatch, expected_count, seen}}, ok_count}
+
+      defp batch_values_status([value | rest], expected_count, seen, ok_count, first_error) do
+        ok? = value == :ok or not match?({:error, _reason}, value)
+
+        first_error =
+          case {first_error, value} do
+            {nil, {:error, _reason} = error} -> error
+            {existing, _value} -> existing
+          end
+
+        batch_values_status(
+          rest,
+          expected_count,
+          seen + 1,
+          if(ok?, do: ok_count + 1, else: ok_count),
+          first_error
+        )
+      end
+
+      defp combine_batch_status(:ok, next), do: next
+      defp combine_batch_status({:error, _reason} = error, _next), do: error
+      defp combine_batch_status(other, _next), do: other
 
       defp do_batch_quorum_put_entries(ctx, entries, origin_node) do
         if selected_waraft_ctx?(ctx) do

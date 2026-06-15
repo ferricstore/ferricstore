@@ -27,6 +27,20 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
         try do
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
+          for shard_index <- 0..1 do
+            spec =
+              Supervisor.child_spec(
+                {Ferricstore.Flow.LMDBWriter,
+                 shard_index: shard_index, data_dir: ctx.data_dir, instance_ctx: ctx},
+                id: {Ferricstore.Flow.LMDBWriter, ctx.name, shard_index}
+              )
+
+            case start_supervised(spec) do
+              {:ok, _pid} -> :ok
+              {:error, {:already_started, _pid}} -> :ok
+            end
+          end
+
           for {id, partition, worker} <- [
                 {flow_a, partition_a, "worker-retention-a"},
                 {flow_b, partition_b, "worker-retention-b"}
@@ -60,6 +74,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
           end
 
           cleanup_now_ms = System.system_time(:millisecond) + 60_000
+
+          assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+          assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 1)
 
           assert {:ok, cleaned} =
                    Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)

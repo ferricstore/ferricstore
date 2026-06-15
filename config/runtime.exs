@@ -202,6 +202,33 @@ if config_env() == :prod do
     flow_lmdb_max_concurrent_flushes:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
     flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
+    flow_retention_sweeper_enabled:
+      boolean_env.("FERRICSTORE_FLOW_RETENTION_SWEEPER_ENABLED", true),
+    flow_retention_sweeper_initial_delay_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_INITIAL_DELAY_MS", "600000")
+      ),
+    flow_retention_sweeper_interval_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_INTERVAL_MS", "600000")
+      ),
+    flow_retention_sweeper_limit:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_LIMIT", "1000")),
+    flow_retention_sweeper_pressure_interval_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_PRESSURE_INTERVAL_MS", "1000")
+      ),
+    flow_retention_sweeper_pressure_limit:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_PRESSURE_LIMIT", "10000")
+      ),
+    flow_retention_sweeper_pressure_compaction_interval_ms:
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_FLOW_RETENTION_SWEEPER_PRESSURE_COMPACTION_INTERVAL_MS",
+          "60000"
+        )
+      ),
     flow_async_history: true,
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
@@ -295,6 +322,39 @@ if config_env() == :prod do
          "once" -> :once
          n -> String.to_integer(n)
        end),
+    native_protocol_enabled: boolean_env.("FERRICSTORE_NATIVE_ENABLED", false),
+    native_port: String.to_integer(System.get_env("FERRICSTORE_NATIVE_PORT", "6388")),
+    native_tls_port:
+      (case System.get_env("FERRICSTORE_NATIVE_TLS_PORT") do
+         nil -> nil
+         value -> String.to_integer(value)
+       end),
+    native_tls_cert_file: System.get_env("FERRICSTORE_NATIVE_TLS_CERT_FILE"),
+    native_tls_key_file: System.get_env("FERRICSTORE_NATIVE_TLS_KEY_FILE"),
+    native_tls_ca_cert_file: System.get_env("FERRICSTORE_NATIVE_TLS_CA_CERT_FILE"),
+    native_max_frame_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_FRAME_BYTES", "16777216")),
+    native_max_lanes_per_connection:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_LANES_PER_CONNECTION", "1024")),
+    native_lane_max_queue:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_LANE_MAX_QUEUE", "1024")),
+    native_max_batch_commands:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_BATCH_COMMANDS", "1024")),
+    native_max_inflight_per_connection:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_CONNECTION", "4096")),
+    native_max_inflight_per_lane:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_LANE", "1024")),
+    native_response_chunk_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_RESPONSE_CHUNK_BYTES", "0")),
+    native_max_pending_chunks:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_PENDING_CHUNKS", "1024")),
+    native_max_collection_response_items:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_COLLECTION_RESPONSE_ITEMS", "10000")
+      ),
+    native_trace_enabled: boolean_env.("FERRICSTORE_NATIVE_TRACE_ENABLED", false),
+    native_idle_timeout_ms:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_IDLE_TIMEOUT_MS", "90000")),
     tcp_nodelay: boolean_env.("FERRICSTORE_TCP_NODELAY", true),
     tcp_recbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_RECBUF", "131072")),
     tcp_sndbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_SNDBUF", "131072"))
@@ -313,8 +373,33 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_MAX_RETAINED_ENTRIES", "100000")),
     waraft_commit_batch_max:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_COMMIT_BATCH_MAX", "10000")),
+    waraft_commit_batch_adaptive:
+      System.get_env("FERRICSTORE_WARAFT_COMMIT_BATCH_ADAPTIVE", "true") in [
+        "1",
+        "true",
+        "TRUE",
+        "yes",
+        "YES"
+      ],
+    waraft_commit_priority:
+      (case System.get_env("FERRICSTORE_WARAFT_COMMIT_PRIORITY", "high") do
+         value when value in ["low", "LOW"] -> :low
+         _other -> :high
+       end),
+    waraft_generic_batch_window_ms:
+      String.to_integer(System.get_env("FERRICSTORE_WARAFT_GENERIC_BATCH_WINDOW_MS", "0")),
+    waraft_generic_batch_during_flush:
+      System.get_env("FERRICSTORE_WARAFT_GENERIC_BATCH_DURING_FLUSH", "true") in [
+        "1",
+        "true",
+        "TRUE",
+        "yes",
+        "YES"
+      ],
     waraft_apply_log_batch_size:
       String.to_integer(System.get_env("FERRICSTORE_WARAFT_APPLY_LOG_BATCH_SIZE", "4096")),
+    ra_low_priority_commands_flush_size:
+      String.to_integer(System.get_env("FERRICSTORE_RA_LOW_PRIORITY_COMMANDS_FLUSH_SIZE", "512")),
     promotion_threshold:
       String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100")),
     wal_commit_delay_us:

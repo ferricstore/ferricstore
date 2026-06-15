@@ -65,6 +65,46 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Telemetry do
         _ -> :ok
       end
 
+      defp emit_commit_stage(
+             shard_index,
+             command_shape,
+             stage,
+             started_mono,
+             result,
+             acquired_bytes,
+             path
+           ) do
+        duration_us =
+          System.monotonic_time()
+          |> Kernel.-(started_mono)
+          |> System.convert_time_unit(:native, :microsecond)
+
+        :telemetry.execute(
+          [:ferricstore, :waraft, :commit, :stage],
+          %{
+            count: 1,
+            duration_us: max(duration_us, 0),
+            acquired_bytes: max(acquired_bytes || 0, 0)
+          },
+          %{
+            shard_index: shard_index,
+            command_shape: command_shape,
+            stage: stage,
+            path: path,
+            result: commit_stage_result(result)
+          }
+        )
+      rescue
+        _ -> :ok
+      end
+
+      defp commit_stage_result(:ok), do: :ok
+      defp commit_stage_result({:ok, _value}), do: :ok
+      defp commit_stage_result(result) when is_list(result), do: :ok
+      defp commit_stage_result({:error, :timeout}), do: :timeout
+      defp commit_stage_result({:error, _reason}), do: :error
+      defp commit_stage_result(_result), do: :unknown
+
       defp command_shape({:put_batch, _entries}), do: :put_batch
       defp command_shape({:delete_batch, _keys}), do: :delete_batch
       defp command_shape({:batch, _commands}), do: :batch

@@ -254,6 +254,24 @@ defmodule Ferricstore.MetricsTest do
         %{status: :ok}
       )
 
+      :telemetry.execute(
+        [:ferricstore, :waraft, :commit, :stage],
+        %{duration_us: 29, acquired_bytes: 128},
+        %{shard_index: 2, stage: :wait, command_shape: :put_batch, path: :async, result: :ok}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :waraft, :segment_projection, :apply],
+        %{duration_us: 13, applied_count: 3},
+        %{shard_index: 2, command_shape: :put_batch, result: :ok}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :flow, :apply],
+        %{duration_us: 37, item_count: 100, result_count: 96},
+        %{shard_index: 2, command_shape: :flow_complete_many, result: :partial}
+      )
+
       text = Metrics.handle("FERRICSTORE.METRICS", [])
 
       assert String.contains?(text, "# TYPE ferricstore_quorum_submit_total counter")
@@ -381,6 +399,56 @@ defmodule Ferricstore.MetricsTest do
       assert String.contains?(
                text,
                ~s(ferricstore_wal_sync_queued_batches_max{status="ok"} 2)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_waraft_commit_stage_total{shard_index="2",stage="wait",command_shape="put_batch",path="async",result="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_waraft_commit_stage_duration_us_total{shard_index="2",stage="wait",command_shape="put_batch",path="async",result="ok"} 29)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_waraft_commit_stage_acquired_bytes_total{shard_index="2",stage="wait",command_shape="put_batch",path="async",result="ok"} 128)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_waraft_segment_projection_apply_total{shard_index="2",command_shape="put_batch",result="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_waraft_segment_projection_apply_duration_us_total{shard_index="2",command_shape="put_batch",result="ok"} 13)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_waraft_segment_projection_apply_batch_size_total{shard_index="2",command_shape="put_batch",result="ok"} 3)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_flow_apply_total{shard_index="2",command_shape="flow_complete_many",result="partial"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_flow_apply_duration_us_total{shard_index="2",command_shape="flow_complete_many",result="partial"} 37)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_flow_apply_items_total{shard_index="2",command_shape="flow_complete_many",result="partial"} 100)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_flow_apply_result_items_total{shard_index="2",command_shape="flow_complete_many",result="partial"} 96)
              )
     end
 

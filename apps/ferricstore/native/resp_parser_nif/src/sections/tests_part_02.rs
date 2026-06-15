@@ -42,7 +42,6 @@
     #[test]
     fn ast_knows_catalog_commands_even_when_semantic_shape_is_generic() {
         assert_eq!(command_tag_name(b"XADD"), Some("xadd"));
-        assert_eq!(command_tag_name(b"JSON.SET"), Some("json_set"));
         assert_eq!(command_tag_name(b"BF.ADD"), Some("bf_add"));
         assert_eq!(command_tag_name(b"TDIGEST.MERGE"), Some("tdigest_merge"));
         assert_eq!(command_tag_name(b"CLUSTER.HEALTH"), Some("cluster_health"));
@@ -57,70 +56,6 @@
         assert_eq!(command_tag_name(b"CLUSTER.ENABLE"), None);
         assert_eq!(command_tag_name(b"CLUSTER.DURABILITY"), None);
         assert_eq!(command_tag_name(b"NO_SUCH_COMMAND"), None);
-    }
-
-    #[test]
-    fn ast_classifies_json_commands_even_for_error_arity() {
-        assert_eq!(
-            classify_command_ast(b"JSON.SET", 4),
-            CommandAstKind::JsonSet
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.SET", 1),
-            CommandAstKind::JsonSet
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.GET", 2),
-            CommandAstKind::JsonGet
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.GET", 0),
-            CommandAstKind::JsonGet
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.DEL", 2),
-            CommandAstKind::JsonDel
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.NUMINCRBY", 3),
-            CommandAstKind::JsonNumincrby
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.TYPE", 2),
-            CommandAstKind::JsonType
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.STRLEN", 2),
-            CommandAstKind::JsonStrlen
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.OBJKEYS", 2),
-            CommandAstKind::JsonObjkeys
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.OBJLEN", 2),
-            CommandAstKind::JsonObjlen
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.ARRAPPEND", 4),
-            CommandAstKind::JsonArrappend
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.ARRLEN", 2),
-            CommandAstKind::JsonArrlen
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.TOGGLE", 2),
-            CommandAstKind::JsonToggle
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.CLEAR", 2),
-            CommandAstKind::JsonClear
-        );
-        assert_eq!(
-            classify_command_ast(b"JSON.MGET", 1),
-            CommandAstKind::JsonMget
-        );
     }
 
     #[test]
@@ -560,10 +495,6 @@
         );
         assert_eq!(
             command_key_indices(b"SMOVE", &[b"src", b"dst", b"member"]),
-            vec![0, 1]
-        );
-        assert_eq!(
-            command_key_indices(b"JSON.MGET", &[b"a", b"b", b"$"]),
             vec![0, 1]
         );
     }

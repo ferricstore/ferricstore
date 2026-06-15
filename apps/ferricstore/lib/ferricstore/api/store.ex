@@ -65,81 +65,8 @@ defmodule FerricStore.API.Store do
     end
   end
 
-  def parse_json_number(value) when is_number(value), do: value
-
-  def parse_json_number(value) when is_binary(value) do
-    if String.contains?(value, ".") do
-      case Float.parse(value) do
-        {number, ""} -> number
-        _ -> {:error, "ERR value is not a valid float"}
-      end
-    else
-      case Integer.parse(value) do
-        {number, ""} -> number
-        _ -> {:error, "ERR value is not a valid float"}
-      end
-    end
-  end
-
-  def parse_json_path("$"), do: []
-
-  def parse_json_path(<<"$", rest::binary>>) do
-    parse_json_path_segments(rest, [])
-  end
-
-  def parse_json_path(_path), do: :error
-
-  def parse_json_path_segments("", acc), do: Enum.reverse(acc)
-
-  def parse_json_path_segments("." <> rest, acc) do
-    case :binary.match(rest, [".", "["]) do
-      {0, _} ->
-        :error
-
-      {pos, _} ->
-        segment = binary_part(rest, 0, pos)
-        parse_json_path_segments(binary_part(rest, pos, byte_size(rest) - pos), [segment | acc])
-
-      :nomatch ->
-        if rest == "", do: :error, else: Enum.reverse([rest | acc])
-    end
-  end
-
-  def parse_json_path_segments("[" <> rest, acc) do
-    case :binary.match(rest, "]") do
-      {pos, 1} ->
-        inner = binary_part(rest, 0, pos)
-        tail = binary_part(rest, pos + 1, byte_size(rest) - pos - 1)
-
-        case parse_json_bracket_segment(inner) do
-          :error -> :error
-          segment -> parse_json_path_segments(tail, [segment | acc])
-        end
-
-      :nomatch ->
-        :error
-    end
-  end
-
-  def parse_json_path_segments(_rest, _acc), do: :error
-
-  defp parse_json_bracket_segment(<<"\"", inner::binary>>) do
-    if String.ends_with?(inner, "\""), do: String.slice(inner, 0..-2//1), else: :error
-  end
-
-  defp parse_json_bracket_segment(<<"'", inner::binary>>) do
-    if String.ends_with?(inner, "'"), do: String.slice(inner, 0..-2//1), else: :error
-  end
-
-  defp parse_json_bracket_segment(inner) do
-    case Integer.parse(inner) do
-      {idx, ""} -> idx
-      _ -> :error
-    end
-  end
-
   # ---------------------------------------------------------------------------
-  # Private — string store builder for bitmap/json/hyperloglog operations
+  # Private — string store builder for bitmap/hyperloglog operations
   # ---------------------------------------------------------------------------
 
   def build_string_store(_key) do

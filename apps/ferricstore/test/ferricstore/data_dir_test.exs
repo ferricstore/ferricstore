@@ -63,6 +63,8 @@ defmodule Ferricstore.DataDirTest do
       assert :ok = DataDir.ensure_layout!(root, 2)
       assert File.dir?(Path.join([root, "blob", "shard_0"]))
       assert File.dir?(Path.join([root, "blob", "shard_1"]))
+      assert File.dir?(Path.join([root, "waraft", "ferricstore_waraft_backend.1", "segment_log"]))
+      assert File.dir?(Path.join([root, "waraft", "ferricstore_waraft_backend.2", "segment_log"]))
     after
       File.rm_rf!(root)
     end

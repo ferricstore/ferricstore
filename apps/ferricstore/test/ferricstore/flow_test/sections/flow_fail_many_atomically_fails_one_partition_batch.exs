@@ -514,6 +514,61 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
         end
       end
 
+      test "terminal local-only mixed complete_many skips cross-shard pre-read" do
+        owner = self()
+        flow_type = uid("terminal-local-only-no-preread")
+        partition_a = uid("tenant-terminal-local-only-a")
+        partition_b = uid("tenant-terminal-local-only-b")
+
+        claimed_a =
+          create_claimed_flow(
+            uid("complete-terminal-local-only-a"),
+            partition_a,
+            flow_type,
+            "worker-terminal-local-only"
+          )
+
+        claimed_b =
+          create_claimed_flow(
+            uid("complete-terminal-local-only-b"),
+            partition_b,
+            flow_type,
+            "worker-terminal-local-only"
+          )
+
+        Process.put(:ferricstore_flow_terminal_many_values_hook, fn keys ->
+          send(owner, {:terminal_pre_read, keys})
+        end)
+
+        try do
+          assert {:ok, completed} =
+                   FerricStore.flow_complete_many(
+                     nil,
+                     [
+                       %{
+                         id: claimed_a.id,
+                         partition_key: partition_a,
+                         lease_token: claimed_a.lease_token,
+                         fencing_token: claimed_a.fencing_token
+                       },
+                       %{
+                         id: claimed_b.id,
+                         partition_key: partition_b,
+                         lease_token: claimed_b.lease_token,
+                         fencing_token: claimed_b.fencing_token
+                       }
+                     ],
+                     now_ms: 2_000,
+                     terminal_local_only: true
+                   )
+
+          assert length(completed) == 2
+          refute_received {:terminal_pre_read, _keys}
+        after
+          Process.delete(:ferricstore_flow_terminal_many_values_hook)
+        end
+      end
+
       test "flow_cancel_many spans shards and rolls back failing shard group" do
         {same_a, same_b, other} = mixed_partition_keys()
         type = uid("bulk-mixed-cancel")

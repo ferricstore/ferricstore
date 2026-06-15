@@ -26,25 +26,36 @@ defmodule Ferricstore.Flow.ValueStore do
            {:ok, now} <- optional_now_ms(opts),
            {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms) do
         if is_binary(owner_flow_id) and is_binary(name) do
-          attrs = %{
-            id: owner_flow_id,
-            name: name,
-            value: value,
-            partition_key: partition_key,
-            override: override?
-          }
+          with {:ok, return_mode} <- optional_value_put_return_mode(opts) do
+            attrs =
+              named_value_attrs_from_parts(
+                value,
+                owner_flow_id,
+                name,
+                partition_key,
+                override?,
+                now,
+                return_mode
+              )
 
-          attrs = maybe_put_attr(attrs, :now_ms, now)
-          Router.flow_named_value_put(ctx, attrs)
+            Router.flow_named_value_put(ctx, attrs)
+          end
         else
           ref_id = shared_value_ref_id()
           ref = Keys.value_key(ref_id, :shared, 1, partition_key)
 
-          with :ok <- validate_key_size(ref),
+          with {:ok, return_mode} <- optional_value_put_return_mode(opts),
+               :ok <- validate_key_size(ref),
                expire_at = flow_value_expire_at(now, ttl_ms),
                :ok <- Router.put(ctx, ref, Codec.encode_value(value), expire_at) do
-            response = %{ref: ref, partition_key: partition_key}
-            {:ok, maybe_put_attr(response, :owner_flow_id, owner_flow_id)}
+            response = %{
+              ref: ref,
+              partition_key: partition_key,
+              owner_flow_id: owner_flow_id,
+              return: return_mode
+            }
+
+            {:ok, shared_value_put_response(response)}
           end
         end
       end
@@ -56,15 +67,136 @@ defmodule Ferricstore.Flow.ValueStore do
 
   def value_put(_ctx, _value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
-  def value_mget(ctx, refs) when is_list(refs) do
-    case raw_mget(ctx, refs) do
-      values when is_list(values) -> {:ok, Enum.map(values, &Codec.decode_value/1)}
+  @doc false
+  def named_value_attrs(value, opts) when is_list(opts) do
+    with :ok <- validate_opts(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, owner_flow_id} <- optional_binary_or_nil(opts, :owner_flow_id, nil),
+         :ok <- validate_ref_size(:owner_flow_id, owner_flow_id),
+         {:ok, name} <- optional_binary_or_nil(opts, :name, nil),
+         :ok <- validate_ref_size(:name, name),
+         true <- is_binary(owner_flow_id) and is_binary(name),
+         {:ok, override?} <- optional_boolean(opts, :override, false),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, return_mode} <- optional_value_put_return_mode(opts) do
+      {:ok,
+       named_value_attrs_from_parts(
+         value,
+         owner_flow_id,
+         name,
+         partition_key,
+         override?,
+         now,
+         return_mode
+       )}
+    else
+      false -> {:error, "ERR flow named value put requires owner_flow_id and name"}
       {:error, _reason} = error -> error
-      other -> {:error, "ERR flow value mget failed: #{inspect(other)}"}
     end
   end
 
-  def value_mget(_ctx, _refs), do: {:error, "ERR flow refs must be a list"}
+  def named_value_attrs(_value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc false
+  def shared_value_put_batch(_ctx, []), do: []
+
+  def shared_value_put_batch(ctx, items) when is_list(items) do
+    prepared =
+      Enum.map(items, fn
+        {value, opts} when is_list(opts) -> shared_value_put_attrs(value, opts)
+        _other -> {:error, "ERR flow opts must be a keyword list"}
+      end)
+
+    commands =
+      prepared
+      |> Enum.flat_map(fn
+        {:ok, %{ref: ref, encoded: encoded, expire_at: expire_at}} ->
+          [{ref, {:put, ref, encoded, expire_at}}]
+
+        {:error, _reason} ->
+          []
+      end)
+
+    write_results =
+      case commands do
+        [] -> []
+        _ -> Router.pipeline_write_batch(ctx, commands)
+      end
+
+    {results, _remaining_writes} =
+      Enum.map_reduce(prepared, write_results, fn
+        {:ok, attrs}, [:ok | rest] ->
+          {{:ok, shared_value_put_response(attrs)}, rest}
+
+        {:ok, attrs}, [{:ok, :ok} | rest] ->
+          {{:ok, shared_value_put_response(attrs)}, rest}
+
+        {:ok, _attrs}, [{:error, _reason} = error | rest] ->
+          {error, rest}
+
+        {:ok, _attrs}, [other | rest] ->
+          {{:error, "ERR flow value put failed: #{inspect(other)}"}, rest}
+
+        {:ok, _attrs}, [] ->
+          {{:error, "ERR flow value put failed"}, []}
+
+        {:error, _reason} = error, writes ->
+          {error, writes}
+      end)
+
+    results
+  end
+
+  def shared_value_put_batch(_ctx, _items), do: [{:error, "ERR flow opts must be a keyword list"}]
+  def value_mget(ctx, refs, opts \\ [])
+
+  def value_mget(ctx, refs, opts) when is_list(refs) and is_list(opts) do
+    with {:ok, max_bytes} <- optional_value_mget_max_bytes(opts) do
+      case raw_mget(ctx, refs) do
+        values when is_list(values) ->
+          {:ok,
+           refs
+           |> Enum.zip(values)
+           |> Enum.map(fn {ref, value} -> decode_or_omit_value(ref, value, max_bytes) end)}
+
+        {:error, _reason} = error ->
+          error
+
+        other ->
+          {:error, "ERR flow value mget failed: #{inspect(other)}"}
+      end
+    end
+  end
+
+  def value_mget(_ctx, _refs, opts) when not is_list(opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  def value_mget(_ctx, _refs, _opts), do: {:error, "ERR flow refs must be a list"}
+
+  defp optional_value_mget_max_bytes(opts) do
+    value =
+      Keyword.get(
+        opts,
+        :max_bytes,
+        Keyword.get(opts, :value_max_bytes, Keyword.get(opts, :payload_max_bytes))
+      )
+
+    case value do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> {:error, "ERR flow max_bytes must be a non-negative integer"}
+    end
+  end
+
+  defp decode_or_omit_value(_ref, nil, _max_bytes), do: nil
+
+  defp decode_or_omit_value(ref, value, max_bytes)
+       when is_binary(ref) and is_binary(value) and is_integer(max_bytes) and
+              byte_size(value) > max_bytes do
+    %{ref: ref, value_omitted: true, value_size: byte_size(value)}
+  end
+
+  defp decode_or_omit_value(_ref, value, _max_bytes), do: Codec.decode_value(value)
 
   def raw_mget(_ctx, []), do: []
 
@@ -402,6 +534,16 @@ defmodule Ferricstore.Flow.ValueStore do
     end
   end
 
+  defp optional_value_put_return_mode(opts) do
+    case Keyword.get(opts, :return) do
+      nil -> {:ok, nil}
+      :ok_on_success -> {:ok, :ok_on_success}
+      "ok_on_success" -> {:ok, :ok_on_success}
+      "OK_ON_SUCCESS" -> {:ok, :ok_on_success}
+      _ -> {:error, "ERR flow value put return must be ok_on_success"}
+    end
+  end
+
   defp shared_value_ref_id do
     :crypto.strong_rand_bytes(18)
     |> Base.url_encode64(padding: false)
@@ -409,6 +551,65 @@ defmodule Ferricstore.Flow.ValueStore do
 
   defp flow_value_expire_at(_now, nil), do: 0
   defp flow_value_expire_at(now, ttl_ms), do: now + ttl_ms
+
+  defp shared_value_put_attrs(value, opts) do
+    with :ok <- validate_opts(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, owner_flow_id} <- optional_binary_or_nil(opts, :owner_flow_id, nil),
+         :ok <- validate_ref_size(:owner_flow_id, owner_flow_id),
+         {:ok, name} <- optional_binary_or_nil(opts, :name, nil),
+         :ok <- validate_ref_size(:name, name),
+         true <- is_nil(name),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
+         {:ok, return_mode} <- optional_value_put_return_mode(opts) do
+      ref_id = shared_value_ref_id()
+      ref = Keys.value_key(ref_id, :shared, 1, partition_key)
+      now = now || now_ms()
+
+      with :ok <- validate_key_size(ref) do
+        {:ok,
+         %{
+           ref: ref,
+           partition_key: partition_key,
+           owner_flow_id: owner_flow_id,
+           return: return_mode,
+           encoded: Codec.encode_value(value),
+           expire_at: flow_value_expire_at(now, ttl_ms)
+         }}
+      end
+    else
+      false -> {:error, "ERR flow named value put requires owner_flow_id and name"}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp shared_value_put_response(%{return: :ok_on_success}), do: :ok
+
+  defp shared_value_put_response(attrs) do
+    %{ref: Map.fetch!(attrs, :ref), partition_key: Map.get(attrs, :partition_key)}
+    |> maybe_put_attr(:owner_flow_id, Map.get(attrs, :owner_flow_id))
+  end
+
+  defp named_value_attrs_from_parts(
+         value,
+         owner_flow_id,
+         name,
+         partition_key,
+         override?,
+         now,
+         return_mode
+       ) do
+    %{
+      id: owner_flow_id,
+      name: name,
+      value: value,
+      partition_key: partition_key,
+      override: override?
+    }
+    |> maybe_put_attr(:now_ms, now)
+    |> maybe_put_attr(:return, return_mode)
+  end
 
   defp validate_key_size(key) do
     if byte_size(key) <= Router.max_key_size() do

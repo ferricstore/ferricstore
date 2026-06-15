@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.Router.Part08 do
   @moduledoc false
 
-  # Extracted from Router: expand_flow_transition_batch_results .. json_del
+  # Extracted from Router: expand_flow_transition_batch_results .. zpopmax
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.CommandTime
@@ -500,6 +500,187 @@ defmodule Ferricstore.Store.Router.Part08 do
         Tuple.to_list(results)
       end
 
+      @doc false
+      def flow_start_and_claim_pipeline_batch(_ctx, []), do: []
+
+      def flow_start_and_claim_pipeline_batch(ctx, attrs_list) when is_list(attrs_list) do
+        {buckets, count, rejected} =
+          Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0, %{}}, fn
+            %{id: id} = attrs, {buckets, index, rejected} ->
+              key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+              if flow_create_admission_rejected?(ctx, key) do
+                {buckets, index + 1, Map.put(rejected, index, flow_create_overloaded_error())}
+              else
+                shard_idx = shard_for(ctx, key)
+
+                {flow_put_shard_bucket(buckets, shard_idx, {index, key, attrs}), index + 1,
+                 rejected}
+              end
+          end)
+
+        groups =
+          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+            entries = Enum.reverse(entries)
+            {indices, keys, attrs} = flow_create_pipeline_entries(entries, [], [], [])
+            route_key = List.first(keys)
+
+            {shard_idx, route_key, indices,
+             {:flow_start_and_claim_pipeline_batch, route_key,
+              flow_stamp_shard(%{records: attrs}, shard_idx)}}
+          end)
+
+        keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+
+        results =
+          groups
+          |> Enum.zip(group_results)
+          |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key, indices,
+                                                                  _cmd}, result},
+                                                                results ->
+            group_results =
+              case result do
+                result when is_list(result) and length(result) == length(indices) -> result
+                result -> List.duplicate(result, length(indices))
+              end
+
+            indices
+            |> Enum.zip(group_results)
+            |> Enum.reduce(results, fn {index, result}, results ->
+              put_elem(results, index, result)
+            end)
+          end)
+
+        Tuple.to_list(results)
+      end
+
+      @doc false
+      def flow_named_value_put_pipeline_batch(_ctx, []), do: []
+
+      def flow_named_value_put_pipeline_batch(ctx, attrs_list) when is_list(attrs_list) do
+        {buckets, count, rejected} =
+          Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0, %{}}, fn
+            %{id: id} = attrs, {buckets, index, rejected} when is_binary(id) ->
+              key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+              if byte_size(key) > @max_key_size do
+                {buckets, index + 1,
+                 Map.put(
+                   rejected,
+                   index,
+                   {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+                 )}
+              else
+                shard_idx = shard_for(ctx, key)
+
+                {flow_put_shard_bucket(buckets, shard_idx, {index, key, attrs}), index + 1,
+                 rejected}
+              end
+          end)
+
+        groups =
+          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+            entries = Enum.reverse(entries)
+            {indices, keys, attrs} = flow_create_pipeline_entries(entries, [], [], [])
+            route_key = List.first(keys)
+
+            {shard_idx, route_key, indices,
+             {:flow_named_value_put_pipeline_batch, route_key,
+              flow_stamp_shard(%{records: attrs}, shard_idx)}}
+          end)
+
+        keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+
+        results =
+          groups
+          |> Enum.zip(group_results)
+          |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key, indices,
+                                                                  _cmd}, result},
+                                                                results ->
+            group_results =
+              case result do
+                result when is_list(result) and length(result) == length(indices) -> result
+                result -> List.duplicate(result, length(indices))
+              end
+
+            indices
+            |> Enum.zip(group_results)
+            |> Enum.reduce(results, fn {index, result}, results ->
+              put_elem(results, index, result)
+            end)
+          end)
+
+        Tuple.to_list(results)
+      end
+
+      @doc false
+      def flow_create_pipeline_batch_ok_on_success(_ctx, []), do: :ok
+
+      def flow_create_pipeline_batch_ok_on_success(ctx, attrs_list) when is_list(attrs_list) do
+        {buckets, count, rejected} =
+          Enum.reduce(attrs_list, {flow_fixed_shard_buckets(ctx.shard_count), 0, %{}}, fn
+            %{id: id} = attrs, {buckets, index, rejected} ->
+              key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+              if flow_create_admission_rejected?(ctx, key) do
+                {buckets, index + 1, Map.put(rejected, index, flow_create_overloaded_error())}
+              else
+                shard_idx = shard_for(ctx, key)
+
+                {flow_put_shard_bucket(buckets, shard_idx, {index, key, attrs}), index + 1,
+                 rejected}
+              end
+          end)
+
+        groups =
+          flow_nonempty_shard_buckets(buckets, ctx.shard_count, fn shard_idx, entries ->
+            entries = Enum.reverse(entries)
+            {indices, keys, attrs} = flow_create_pipeline_entries(entries, [], [], [])
+            route_key = List.first(keys)
+
+            {shard_idx, route_key, indices,
+             {:flow_create_pipeline_batch, route_key,
+              flow_stamp_shard(%{records: attrs}, shard_idx)}}
+          end)
+
+        keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+
+        if map_size(rejected) == 0 and Enum.all?(group_results, &flow_create_group_success?/1) do
+          :ok
+        else
+          results =
+            groups
+            |> Enum.zip(group_results)
+            |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key,
+                                                                    indices, _cmd}, result},
+                                                                  results ->
+              group_results =
+                case result do
+                  result when is_list(result) and length(result) == length(indices) -> result
+                  result -> List.duplicate(result, length(indices))
+                end
+
+              indices
+              |> Enum.zip(group_results)
+              |> Enum.reduce(results, fn {index, result}, results ->
+                put_elem(results, index, result)
+              end)
+            end)
+
+          Tuple.to_list(results)
+        end
+      end
+
+      defp flow_create_group_success?(:ok), do: true
+
+      defp flow_create_group_success?(results) when is_list(results),
+        do: Enum.all?(results, &(&1 == :ok))
+
+      defp flow_create_group_success?(_result), do: false
+
       defp flow_create_pipeline_entries([], indices, keys, attrs) do
         {Enum.reverse(indices), Enum.reverse(keys), Enum.reverse(attrs)}
       end
@@ -869,17 +1050,6 @@ defmodule Ferricstore.Store.Router.Part08 do
         forced_single_key_quorum(ctx, key, {:zpop, key, count, :max})
       end
 
-      @doc false
-      def json_set(ctx, key, path, value, flags)
-          when is_binary(key) and (is_binary(path) or is_list(path)) and is_binary(value) and
-                 is_list(flags) do
-        forced_single_key_quorum(ctx, key, {:json_set, key, path, value, flags})
-      end
-
-      @doc false
-      def json_del(ctx, key, path) when is_binary(key) and (is_binary(path) or is_list(path)) do
-        forced_single_key_quorum(ctx, key, {:json_del, key, path})
-      end
     end
   end
 end

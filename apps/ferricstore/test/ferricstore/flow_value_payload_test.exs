@@ -217,6 +217,32 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert large_blob_after_terminal_expiry == String.duplicate("x", 256)
   end
 
+  test "value_mget can omit values larger than max_bytes without decoding them" do
+    payload = %{large: String.duplicate("x", 512)}
+
+    assert {:ok, %{ref: ref}} =
+             FerricStore.flow_value_put(payload, partition_key: "tenant-a")
+
+    assert {:ok, [%{ref: ^ref, value_omitted: true, value_size: size}]} =
+             FerricStore.flow_value_mget([ref], max_bytes: 1)
+
+    assert is_integer(size)
+    assert size > 1
+
+    assert {:ok, [^payload]} = FerricStore.flow_value_mget([ref], max_bytes: 64 * 1024)
+    assert {:ok, [^payload]} = FerricStore.flow_value_mget([ref], value_max_bytes: 64 * 1024)
+    assert {:ok, [^payload]} = FerricStore.flow_value_mget([ref], payload_max_bytes: 64 * 1024)
+  end
+
+  test "value_mget returns hot values and leaves ordinary missing refs as nil" do
+    assert {:ok, %{ref: ref}} =
+             FerricStore.flow_value_put("hot-value", partition_key: "tenant-a")
+
+    missing_ref = unique_id("ordinary-missing-flow-value-ref")
+
+    assert {:ok, ["hot-value", nil]} = FerricStore.flow_value_mget([ref, missing_ref])
+  end
+
   test "cancel terminal retention does not materialize existing generated payload value refs" do
     id = unique_id("flow-value-cancel-retention")
 

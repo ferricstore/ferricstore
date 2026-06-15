@@ -87,23 +87,10 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
 
         shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
 
-        {:ok, projector} =
-          Ferricstore.Flow.HistoryProjector.start_link(
-            shard_index: 0,
-            shard_data_path: shard_data_path,
-            instance_ctx: ctx
-          )
-
         lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
         held_lmdb_path = lmdb_path <> ".held"
 
         on_exit(fn ->
-          try do
-            if Process.alive?(projector), do: GenServer.stop(projector, :normal, 5_000)
-          catch
-            :exit, _ -> :ok
-          end
-
           if File.exists?(held_lmdb_path) do
             File.rm_rf!(lmdb_path)
             File.rename(held_lmdb_path, lmdb_path)

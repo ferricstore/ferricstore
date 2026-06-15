@@ -132,13 +132,80 @@ defmodule Ferricstore.Flow.MutationAttrs do
     end
   end
 
+  def start_and_claim_attrs(id, type, initial_state, opts) do
+    with :ok <- validate_opts(opts, return: true),
+         :ok <- reject_start_and_claim_create_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- validate_state(:type, type),
+         :ok <- validate_state(:state, initial_state),
+         :ok <- reject_running_state_transition(initial_state),
+         {:ok, worker} <- required_binary(opts, :worker),
+         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
+         {:ok, parent_flow_id} <- optional_binary_or_nil(opts, :parent_flow_id, nil),
+         :ok <- validate_ref_size(:parent_flow_id, parent_flow_id),
+         {:ok, root_flow_id} <- optional_binary_or_nil(opts, :root_flow_id, nil),
+         :ok <- validate_ref_size(:root_flow_id, root_flow_id),
+         root_flow_id = root_flow_id || id,
+         {:ok, correlation_id} <- optional_binary_or_nil(opts, :correlation_id, nil),
+         :ok <- validate_ref_size(:correlation_id, correlation_id),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, retention_ttl_ms} <- optional_retention_ttl_ms(opts),
+         {:ok, history_hot_max_events} <- optional_history_hot_max_events(opts),
+         {:ok, history_max_events} <- optional_history_max_events(opts),
+         :ok <- validate_history_event_caps(history_hot_max_events, history_max_events),
+         {:ok, priority} <- optional_priority(opts, @default_priority),
+         {:ok, partition_key} <- optional_partition_key(opts) do
+      partition_key = partition_key || Ferricstore.Flow.Keys.auto_partition_key(id)
+
+      attrs =
+        %{
+          id: id,
+          type: type,
+          state: "running",
+          run_state: initial_state,
+          worker: worker,
+          lease_ms: lease_ms,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:parent_flow_id, parent_flow_id)
+        |> maybe_put_attr(:root_flow_id, if(root_flow_id == id, do: nil, else: root_flow_id))
+        |> maybe_put_attr(:correlation_id, correlation_id)
+        |> maybe_put_attr(:retention_ttl_ms, retention_ttl_ms)
+        |> maybe_put_attr(:history_hot_max_events, history_hot_max_events)
+        |> maybe_put_attr(:history_max_events, history_max_events)
+        |> maybe_put_default_attr(:priority, priority, @default_priority)
+        |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value_ref(opts, :payload_ref)
+        |> maybe_put_named_value_opts(opts)
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
+  defp reject_start_and_claim_create_opts(opts) do
+    cond do
+      Keyword.has_key?(opts, :idempotent) ->
+        {:error, "ERR flow idempotent start_and_claim is not supported"}
+
+      Keyword.has_key?(opts, :run_at_ms) ->
+        {:error, "ERR flow run_at_ms is not supported by start_and_claim"}
+
+      true ->
+        :ok
+    end
+  end
+
   def create_many_attrs(
         items,
         opts,
         partition_key,
         mismatch_error \\ "ERR flow partition_key mismatch in batch"
       ) do
-    base_opts = Keyword.delete(opts, :partition_key)
+    base_opts =
+      opts
+      |> Keyword.delete(:partition_key)
+      |> Keyword.delete(:return)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- create_many_item_opts(item),
@@ -257,6 +324,39 @@ defmodule Ferricstore.Flow.MutationAttrs do
     end
   end
 
+  def step_continue_attrs(id, lease_token, from_state, to_state, opts) do
+    with :ok <- validate_opts(opts, return: true),
+         :ok <- validate_id(id),
+         :ok <- validate_lease_token(lease_token),
+         :ok <- validate_state(:from, from_state),
+         :ok <- validate_state(:to, to_state),
+         :ok <- reject_running_state_transition(to_state),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
+         {:ok, worker} <- optional_binary_or_nil(opts, :worker, nil) do
+      attrs =
+        %{
+          id: id,
+          lease_token: lease_token,
+          from_state: from_state,
+          to_state: to_state,
+          fencing_token: fencing_token,
+          lease_ms: lease_ms,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:worker, worker)
+        |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value_ref(opts, :payload_ref)
+        |> maybe_put_named_value_opts(opts)
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
   def retry_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
          :ok <- reject_public_value_ref_input(opts, :error_ref, :error),
@@ -336,7 +436,10 @@ defmodule Ferricstore.Flow.MutationAttrs do
   end
 
   def complete_many_attrs(items, opts, partition_key) do
-    base_opts = Keyword.delete(opts, :partition_key)
+    base_opts =
+      opts
+      |> Keyword.delete(:partition_key)
+      |> Keyword.delete(:return)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, lease_token, item_opts} <- complete_many_item_opts(item),
@@ -509,7 +612,10 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def maybe_put_default_attr(attrs, key, value, _default), do: Map.put(attrs, key, value)
 
   def fail_many_attrs(items, opts, partition_key) do
-    base_opts = Keyword.delete(opts, :partition_key)
+    base_opts =
+      opts
+      |> Keyword.delete(:partition_key)
+      |> Keyword.delete(:return)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, lease_token, item_opts} <- fail_many_item_opts(item),
@@ -532,7 +638,10 @@ defmodule Ferricstore.Flow.MutationAttrs do
   end
 
   def cancel_many_attrs(items, opts, partition_key) do
-    base_opts = Keyword.delete(opts, :partition_key)
+    base_opts =
+      opts
+      |> Keyword.delete(:partition_key)
+      |> Keyword.delete(:return)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- cancel_many_item_opts(item),
@@ -551,7 +660,10 @@ defmodule Ferricstore.Flow.MutationAttrs do
   end
 
   def retry_many_attrs(items, opts, partition_key) do
-    base_opts = Keyword.delete(opts, :partition_key)
+    base_opts =
+      opts
+      |> Keyword.delete(:partition_key)
+      |> Keyword.delete(:return)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, lease_token, item_opts} <- retry_many_item_opts(item),
@@ -582,7 +694,10 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def cancel_many_item_opts(item), do: Ferricstore.Flow.ManyItemOpts.cancel(item)
 
   def transition_many_attrs(items, opts, partition_key, from_state, to_state) do
-    base_opts = Keyword.delete(opts, :partition_key)
+    base_opts =
+      opts
+      |> Keyword.delete(:partition_key)
+      |> Keyword.delete(:return)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- transition_many_item_opts(item),

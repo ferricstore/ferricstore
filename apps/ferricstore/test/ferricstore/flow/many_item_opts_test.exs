@@ -11,6 +11,9 @@ defmodule Ferricstore.Flow.ManyItemOptsTest do
     assert ManyItemOpts.create({:id, "flow-1", :payload_ref, "ref"}) ==
              {:ok, "flow-1", [payload_ref: "ref"]}
 
+    assert ManyItemOpts.create({:id, "flow-1", :partition_key, "p", :payload, "payload"}) ==
+             {:ok, "flow-1", [partition_key: "p", payload: "payload"]}
+
     assert {:ok, "flow-1", opts} =
              ManyItemOpts.create(%{"id" => "flow-1", "type" => "email", "partition_key" => "p"})
 

@@ -14,6 +14,46 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     {:ok, index: index, lookup: lookup}
   end
 
+  test "native range slice stays isolated by key with offset and reverse", %{
+    index: index,
+    lookup: lookup
+  } do
+    native = NativeOrderedIndex.get(index, lookup)
+
+    :ok =
+      NativeOrderedIndex.put_entries(native, [
+        {"state:a", "a-1", 1},
+        {"state:a", "a-2", 2},
+        {"state:a", "a-3", 3},
+        {"state:a:child", "child-1", 0},
+        {"state:b", "b-1", 0}
+      ])
+
+    assert NativeOrderedIndex.rank_range(native, "state:a", 1, 2, false) == [
+             {"a-2", 2.0},
+             {"a-3", 3.0}
+           ]
+
+    assert NativeOrderedIndex.rank_range(native, "state:a", 0, 1, true) == [
+             {"a-3", 3.0},
+             {"a-2", 2.0}
+           ]
+
+    assert NativeOrderedIndex.range_slice(
+             native,
+             "state:a",
+             {:inclusive, 1},
+             {:inclusive, 3},
+             false,
+             0,
+             :all
+           ) == [
+             {"a-1", 1.0},
+             {"a-2", 2.0},
+             {"a-3", 3.0}
+           ]
+  end
+
   test "native bulk delete removes members across keys in one call", %{
     index: index,
     lookup: lookup

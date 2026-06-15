@@ -608,6 +608,53 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
                  FerricStore.flow_get(id_c, partition_key: partition_key)
       end
 
+      test "pipeline_write_batch_independent terminal commands skip cross-terminal pre-read" do
+        ctx = FerricStore.Instance.get(:default)
+        partition_key = uid("flow-pipeline-terminal-fast-partition")
+        type = uid("flow-pipeline-terminal-fast")
+        now_ms = 1_000
+        id = uid("flow-pipeline-terminal-fast")
+        owner = self()
+
+        assert {:ok, _} =
+                 flow_create_and_get(id,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition_key,
+                   now_ms: now_ms,
+                   run_at_ms: now_ms
+                 )
+
+        assert {:ok, [claim]} =
+                 FerricStore.flow_claim_due(type,
+                   partition_key: partition_key,
+                   worker: "pipeline-terminal-fast",
+                   limit: 1,
+                   now_ms: now_ms,
+                   lease_ms: 30_000
+                 )
+
+        Process.put(:ferricstore_flow_terminal_many_values_hook, fn keys ->
+          send(owner, {:terminal_pre_read, keys})
+        end)
+
+        try do
+          assert [:ok] =
+                   Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
+                     {:complete, id, claim.lease_token,
+                      [
+                        partition_key: partition_key,
+                        fencing_token: claim.fencing_token,
+                        now_ms: now_ms + 1
+                      ]}
+                   ])
+
+          refute_received {:terminal_pre_read, _keys}
+        after
+          Process.delete(:ferricstore_flow_terminal_many_values_hook)
+        end
+      end
+
       test "pipeline_write_batch_independent terminal commands preserve duplicate flow order" do
         ctx = FerricStore.Instance.get(:default)
         partition_key = uid("flow-pipeline-terminal-dup-partition")
@@ -641,11 +688,17 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
              now_ms: now_ms + 1
            ]}
 
-        assert [:ok, {:error, _reason}] =
+        assert [:ok, :ok] =
                  Ferricstore.Flow.pipeline_write_batch_independent(ctx, [command, command])
 
         assert {:ok, %{state: "completed"}} =
                  FerricStore.flow_get(id, partition_key: partition_key)
+
+        assert {:ok, history} = FerricStore.flow_history(id, partition_key: partition_key)
+
+        assert Enum.count(history, fn {_event_id, fields} ->
+                 Map.get(fields, "event") == "completed" or Map.get(fields, :event) == "completed"
+               end) == 1
       end
 
       test "pipeline_write_batch_independent transitions preserve duplicate flow order" do

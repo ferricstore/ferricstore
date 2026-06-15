@@ -17,6 +17,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       alias Ferricstore.Store.CompoundKey
       alias Ferricstore.Store.Promotion
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.ZSetIndex
 
@@ -161,6 +162,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
             threshold
           )
 
+        segment_project_put_compound_member_index(sm_state, key)
         sm_state
       end
 
@@ -184,6 +186,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
             previous
           )
 
+        segment_project_put_compound_member_index(sm_state, key)
         sm_state
       end
 
@@ -285,10 +288,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp segment_project_delete(sm_state, key) do
         true = ShardETS.ets_delete_key(shard_ets_state_from_sm(sm_state), key)
+        segment_project_delete_compound_member_index(sm_state, key)
         sm_state
       end
 
       defp segment_project_delete_prefix(sm_state, redis_key, prefix) do
+        CompoundMemberIndex.delete_prefix(Map.get(sm_state, :compound_member_index_name), prefix)
+
         sm_state.ets
         |> segment_project_prefix_keys(prefix)
         |> Enum.reduce(sm_state, fn key, acc ->
@@ -296,6 +302,52 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         end)
         |> ZSetIndex.clear_ready_key(redis_key)
       end
+
+      defp segment_project_put_compound_member_index(sm_state, <<"H:", _rest::binary>> = key),
+        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_put_compound_member_index(sm_state, <<"L:", _rest::binary>> = key),
+        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_put_compound_member_index(sm_state, <<"S:", _rest::binary>> = key),
+        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_put_compound_member_index(sm_state, <<"Z:", _rest::binary>> = key),
+        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_put_compound_member_index(sm_state, <<"X:", _rest::binary>> = key),
+        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_put_compound_member_index(sm_state, <<"XM:", _rest::binary>> = key),
+        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_put_compound_member_index(sm_state, <<"XG:", _rest::binary>> = key),
+        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_put_compound_member_index(_sm_state, _key), do: :ok
+
+      defp segment_project_delete_compound_member_index(sm_state, <<"H:", _rest::binary>> = key),
+        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_delete_compound_member_index(sm_state, <<"L:", _rest::binary>> = key),
+        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_delete_compound_member_index(sm_state, <<"S:", _rest::binary>> = key),
+        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_delete_compound_member_index(sm_state, <<"Z:", _rest::binary>> = key),
+        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_delete_compound_member_index(sm_state, <<"X:", _rest::binary>> = key),
+        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_delete_compound_member_index(sm_state, <<"XM:", _rest::binary>> = key),
+        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_delete_compound_member_index(sm_state, <<"XG:", _rest::binary>> = key),
+        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+
+      defp segment_project_delete_compound_member_index(_sm_state, _key), do: :ok
 
       defp segment_project_prefix_keys(keydir, prefix) do
         prefix_len = byte_size(prefix)
@@ -524,6 +576,88 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         else
           {:error, {:bad_waraft_projection_position, position}}
         end
+      end
+
+      defp recover_apply_projection_value_locators!(sm_state, root_dir) do
+        projection_root = apply_projection_root(root_dir)
+
+        case :ferricstore_waraft_spike_segment_log.fold_disk(
+               to_charlist(projection_root),
+               &recover_apply_projection_value_locator_record/3,
+               %{sm_state: sm_state, error: nil}
+             ) do
+          {:ok, %{error: nil, sm_state: recovered_sm_state}} ->
+            recovered_sm_state
+
+          {:ok, %{error: reason}} ->
+            raise "failed to recover WARaft apply projection value locators: #{inspect(reason)}"
+
+          {:error, :enoent} ->
+            sm_state
+
+          {:error, reason} ->
+            raise "failed to recover WARaft apply projection value locators: #{inspect(reason)}"
+        end
+      end
+
+      defp recover_apply_projection_value_locator_record(
+             _log_index,
+             _entry,
+             %{error: reason} = acc
+           )
+           when not is_nil(reason),
+           do: acc
+
+      defp recover_apply_projection_value_locator_record(
+             _log_index,
+             {0, {:ferricstore_segment_apply_projection_batch, position, entries}},
+             acc
+           )
+           when is_list(entries) do
+        case position_index(position) do
+          index when is_integer(index) and index > 0 ->
+            case recover_apply_projection_value_locator_entries(acc.sm_state, index, entries) do
+              :ok -> acc
+              {:error, reason} -> %{acc | error: reason}
+            end
+
+          _bad_index ->
+            %{acc | error: {:bad_apply_projection_position, position}}
+        end
+      end
+
+      defp recover_apply_projection_value_locator_record(_log_index, _entry, acc), do: acc
+
+      defp recover_apply_projection_value_locator_entries(sm_state, index, entries) do
+        now = HLC.now_ms()
+
+        entries =
+          Enum.flat_map(entries, fn
+            {key, value, expire_at_ms}
+            when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
+              if live_expire_at?(expire_at_ms, now) and generated_flow_value_ref?(key) do
+                [{key, expire_at_ms, {:waraft_apply_projection, index}, 0, byte_size(value)}]
+              else
+                []
+              end
+
+            _invalid ->
+              []
+          end)
+
+        case entries do
+          [] ->
+            :ok
+
+          [_ | _] ->
+            sm_state.shard_data_path
+            |> FlowLMDB.path()
+            |> FlowLMDB.write_batch(FlowLMDB.segment_value_pin_batch_put_ops(entries))
+        end
+      end
+
+      defp generated_flow_value_ref?(key) do
+        Ferricstore.Flow.HistoryProjector.ValueProjection.generated_flow_value_ref?(key)
       end
 
       defp consume_apply_projection_replay_dependencies do

@@ -56,7 +56,7 @@ defmodule Ferricstore.Commands.AstPurityAuditTest do
       for path <- paths,
           source = read!(path),
           Regex.match?(~r/Ferricstore\.Commands\.[A-Za-z0-9_]+\.handle\(/, source) or
-            Regex.match?(~r/Router\.(json_op|hll_op|bitmap_op|geo_op|tdigest_op)\(/, source) do
+          Regex.match?(~r/Router\.(hll_op|bitmap_op|geo_op|tdigest_op)\(/, source) do
         path
       end
 

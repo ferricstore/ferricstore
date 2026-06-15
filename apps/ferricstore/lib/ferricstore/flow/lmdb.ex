@@ -112,6 +112,9 @@ defmodule Ferricstore.Flow.LMDB do
   def cold_due_type_bucket_prefix(bucket_ms, type),
     do: Ferricstore.Flow.LMDB.Cold.due_type_bucket_prefix(bucket_ms, type)
 
+  def cold_due_state_bucket_prefix(bucket_ms, type, state),
+    do: Ferricstore.Flow.LMDB.Cold.due_state_bucket_prefix(bucket_ms, type, state)
+
   def cold_due_claim_prefix(attrs), do: Ferricstore.Flow.LMDB.Cold.due_claim_prefix(attrs)
 
   def cold_by_segment_key(locator), do: Ferricstore.Flow.LMDB.Cold.by_segment_key(locator)

@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -316,7 +315,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
 
       @doc false
       def apply_waraft_storage_command(command, meta, state) when is_map(meta) do
-        with_sync_flow_history(fn -> apply(meta, command, state) end)
+        apply(meta, command, state)
       end
 
       @doc false
@@ -329,7 +328,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
 
       @doc false
       def consume_waraft_replay_dependencies do
-        apply_state_pop(:waraft_replay_dependencies, %{history: %{}})
+        apply_state_pop(:waraft_replay_dependencies, %{history: %{}, apply_projection: %{}})
       end
 
       defp apply_standalone(fun) when is_function(fun, 0) do
@@ -342,20 +341,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
           case previous do
             :undefined -> Process.delete(@sm_standalone_staged_key)
             value -> Process.put(@sm_standalone_staged_key, value)
-          end
-        end
-      end
-
-      defp with_sync_flow_history(fun) when is_function(fun, 0) do
-        previous = Process.get(@sm_force_sync_flow_history_key, :undefined)
-        Process.put(@sm_force_sync_flow_history_key, true)
-
-        try do
-          fun.()
-        after
-          case previous do
-            :undefined -> Process.delete(@sm_force_sync_flow_history_key)
-            value -> Process.put(@sm_force_sync_flow_history_key, value)
           end
         end
       end
@@ -618,21 +603,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       end
 
       defp flow_history_projector_replay_safe?(state, instance_ctx, release_index) do
-        not flow_history_projector_required?(state) or
-          HistoryProjector.durable?(
-            instance_ctx,
-            state.shard_index,
-            state.shard_data_path,
-            release_index
-          )
+        HistoryProjector.durable?(
+          instance_ctx,
+          state.shard_index,
+          state.shard_data_path,
+          release_index
+        )
       end
-
-      defp flow_history_projector_required?(state) do
-        flow_async_history?(state) or flow_claim_async_history?(state)
-      end
-
-      defp flow_claim_async_history?(state),
-        do: Map.get(state, :flow_claim_async_history, true) == true
 
       defp request_replay_safe_indexes(
              state,

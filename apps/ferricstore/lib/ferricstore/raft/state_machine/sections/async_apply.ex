@@ -14,7 +14,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
-      alias Ferricstore.Commands.Json
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -143,6 +142,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       # Single-node mode (no Erlang distribution) reports `node() == :nonode@nohost`,
       # which equals the originating node by the same name — so the origin-skip
       # still fires correctly and avoids the double-write.
+
+      defp apply_single(state, {:ferricstore_latency_trace, inner_command}) do
+        previous_trace = Ferricstore.LatencyTrace.start(%{})
+
+        try do
+          result =
+            Ferricstore.LatencyTrace.span("server_apply_us", fn ->
+              apply_single(state, inner_command)
+            end)
+
+          trace = Ferricstore.LatencyTrace.finish(previous_trace)
+          Ferricstore.LatencyTrace.wrap_result(result, trace)
+        rescue
+          error ->
+            _ = Ferricstore.LatencyTrace.finish(previous_trace)
+            reraise error, __STACKTRACE__
+        catch
+          kind, reason ->
+            _ = Ferricstore.LatencyTrace.finish(previous_trace)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+      end
 
       # Async PUT, origin: skip ETS (Router already inserted) but accumulate
       # disk write only for small values (file_id == :pending means Router
@@ -349,6 +370,436 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
+      defp apply_single(state, {:hset_single, key, field, value}) do
+        case check_key_lock(state, key, nil) do
+          :ok ->
+            apply_hset_single(state, key, field, value)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
+      defp apply_hset_single(state, key, field, value) do
+        type_key = CompoundKey.type_key(key)
+        field_key = CompoundKey.hash_field(key, field)
+
+        case do_get(state, type_key) do
+          nil ->
+            apply_hset_single_new_hash(state, key, type_key, field_key, value)
+
+          "hash" ->
+            apply_hset_single_existing_hash(state, field_key, value)
+
+          _other_type ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp apply_hset_single_new_hash(state, key, type_key, field_key, value) do
+        if live_key?(state, key) do
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        else
+          with :ok <- do_put(state, type_key, "hash", 0) do
+            case do_put(state, field_key, value, 0) do
+              :ok ->
+                1
+
+              {:error, _reason} = error ->
+                rollback_hset_single_type_marker(state, type_key, error)
+            end
+          end
+        end
+      end
+
+      defp apply_hset_single_existing_hash(state, field_key, value) do
+        existed? = do_get(state, field_key) != nil
+
+        case do_put(state, field_key, value, 0) do
+          :ok -> if existed?, do: 0, else: 1
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp rollback_hset_single_type_marker(state, type_key, write_error) do
+        case do_delete(state, type_key) do
+          :ok ->
+            write_error
+
+          {:error, _reason} = rollback_error ->
+            {:error, {:hash_type_marker_rollback_failed, write_error, rollback_error}}
+        end
+      end
+
+      defp apply_single(state, {:lpush_single, key, value}) do
+        case check_key_lock(state, key, nil) do
+          :ok ->
+            apply_list_push_single(state, key, value, :left)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
+      defp apply_single(state, {:rpush_single, key, value}) do
+        case check_key_lock(state, key, nil) do
+          :ok ->
+            apply_list_push_single(state, key, value, :right)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
+      defp apply_list_push_single(state, key, value, direction) do
+        type_key = CompoundKey.type_key(key)
+
+        case do_get(state, type_key) do
+          nil ->
+            apply_list_push_single_new_type(state, key, type_key, value, direction)
+
+          "list" ->
+            apply_list_push_single_with_meta(
+              state,
+              key,
+              value,
+              direction,
+              decode_list_push_meta(do_get(state, CompoundKey.list_meta_key(key))),
+              false,
+              type_key
+            )
+
+          _other_type ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp apply_list_push_single_new_type(state, key, type_key, value, direction) do
+        if live_key?(state, key) do
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        else
+          with :ok <- do_put(state, type_key, "list", 0) do
+            apply_list_push_single_with_meta(state, key, value, direction, nil, true, type_key)
+          end
+        end
+      end
+
+      defp apply_list_push_single_with_meta(
+             state,
+             key,
+             value,
+             _direction,
+             nil,
+             type_created?,
+             type_key
+           ) do
+        apply_list_push_single_write(
+          state,
+          key,
+          value,
+          0,
+          {1, -1_000_000_000, 1_000_000_000},
+          type_created?,
+          type_key
+        )
+      end
+
+      defp apply_list_push_single_with_meta(
+             state,
+             key,
+             value,
+             :left,
+             {len, left_pos, right_pos},
+             type_created?,
+             type_key
+           ) do
+        apply_list_push_single_write(
+          state,
+          key,
+          value,
+          left_pos,
+          {len + 1, left_pos - 1_000_000_000, right_pos},
+          type_created?,
+          type_key
+        )
+      end
+
+      defp apply_list_push_single_with_meta(
+             state,
+             key,
+             value,
+             :right,
+             {len, left_pos, right_pos},
+             type_created?,
+             type_key
+           ) do
+        apply_list_push_single_write(
+          state,
+          key,
+          value,
+          right_pos,
+          {len + 1, left_pos, right_pos + 1_000_000_000},
+          type_created?,
+          type_key
+        )
+      end
+
+      defp apply_list_push_single_write(
+             state,
+             key,
+             value,
+             pos,
+             {_len, _left_pos, _right_pos} = meta,
+             type_created?,
+             type_key
+           ) do
+        element_key = CompoundKey.list_element(key, pos)
+        meta_key = CompoundKey.list_meta_key(key)
+
+        with :ok <- do_put(state, element_key, value, 0) do
+          case do_put(state, meta_key, ListOps.encode_meta(meta), 0) do
+            :ok ->
+              elem(meta, 0)
+
+            {:error, _reason} = error ->
+              _ = do_delete(state, element_key)
+              maybe_rollback_list_push_type_marker(state, type_created?, type_key, error)
+          end
+        else
+          {:error, _reason} = error ->
+            maybe_rollback_list_push_type_marker(state, type_created?, type_key, error)
+        end
+      end
+
+      defp maybe_rollback_list_push_type_marker(state, true, type_key, write_error) do
+        case do_delete(state, type_key) do
+          :ok ->
+            write_error
+
+          {:error, _reason} = rollback_error ->
+            {:error, {:list_type_marker_rollback_failed, write_error, rollback_error}}
+        end
+      end
+
+      defp maybe_rollback_list_push_type_marker(_state, false, _type_key, write_error),
+        do: write_error
+
+      defp decode_list_push_meta(value), do: ListOps.decode_meta(value)
+
+      defp apply_single(state, {:sadd_single, key, member}) do
+        case check_key_lock(state, key, nil) do
+          :ok ->
+            Ferricstore.Commands.Set.handle_ast(
+              {:sadd, [key, member]},
+              build_compound_store(state)
+            )
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
+      defp apply_single(state, {:srem_single, key, member}) do
+        case check_key_lock(state, key, nil) do
+          :ok ->
+            apply_srem_single(state, key, member)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
+      defp apply_single(state, {:zadd_single, key, score, member}) do
+        case check_key_lock(state, key, nil) do
+          :ok ->
+            apply_zadd_single(state, key, score, member)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
+      defp apply_single(state, {:zrem_single, key, member}) do
+        case check_key_lock(state, key, nil) do
+          :ok ->
+            apply_zrem_single(state, key, member)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
+      defp apply_srem_single(state, key, member) do
+        type_key = CompoundKey.type_key(key)
+
+        case pending_aware_get(state, type_key) do
+          "set" ->
+            member_key = CompoundKey.set_member(key, member)
+
+            case pending_aware_get(state, member_key) do
+              nil ->
+                0
+
+              _present ->
+                with :ok <- do_delete(state, member_key),
+                     :ok <- maybe_delete_empty_compound_type(state, key, type_key, :set) do
+                  1
+                end
+            end
+
+          nil ->
+            if live_key?(state, key),
+              do: {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+              else: 0
+
+          _other_type ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp apply_zadd_single(state, key, score, member) do
+        type_key = CompoundKey.type_key(key)
+        member_key = CompoundKey.zset_member(key, member)
+        score_str = Float.to_string(score * 1.0)
+
+        case do_get(state, type_key) do
+          nil ->
+            apply_zadd_single_new_zset(state, key, type_key, member_key, member, score, score_str)
+
+          "zset" ->
+            apply_zadd_single_existing_zset(state, key, member_key, score_str)
+
+          _other_type ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp apply_zadd_many_single_entries(state, entries) do
+        Enum.map(entries, fn {key, score, member} ->
+          case check_key_lock(state, key, nil) do
+            :ok ->
+              apply_zadd_single(state, key, score, member)
+
+            {:error, :key_locked} ->
+              {:error, :key_locked}
+          end
+        end)
+      end
+
+      defp apply_zadd_single_new_zset(
+             state,
+             key,
+             type_key,
+             member_key,
+             member,
+             score,
+             score_str
+           ) do
+        if live_key?(state, key) do
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        else
+          with :ok <- do_put(state, type_key, "zset", 0),
+               :ok <- do_put(state, member_key, score_str, 0) do
+            queue_zset_index_new_put_after_flush(state, key, member, score)
+            1
+          end
+        end
+      end
+
+      defp apply_zadd_single_existing_zset(state, key, member_key, score_str) do
+        current_score = do_get(state, member_key)
+
+        if current_score == score_str do
+          0
+        else
+          case do_put(state, member_key, score_str, 0) do
+            :ok ->
+              queue_zset_index_put_after_flush(state, key, member_key, score_str)
+
+              if current_score == nil, do: 1, else: 0
+
+            {:error, _reason} = error ->
+              error
+          end
+        end
+      end
+
+      defp apply_zrem_single(state, key, member) do
+        type_key = CompoundKey.type_key(key)
+
+        case pending_aware_get(state, type_key) do
+          "zset" ->
+            member_key = CompoundKey.zset_member(key, member)
+
+            case pending_aware_get(state, member_key) do
+              nil ->
+                0
+
+              _score ->
+                with :ok <- do_delete(state, member_key),
+                     :ok <- queue_zset_index_delete_after_flush_ok(state, key, member_key),
+                     :ok <- maybe_delete_empty_compound_type(state, key, type_key, :zset) do
+                  1
+                end
+            end
+
+          nil ->
+            if live_key?(state, key),
+              do: {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+              else: 0
+
+          _other_type ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp pending_aware_get(state, key) do
+        if pending_deleted?(key), do: nil, else: do_get(state, key)
+      end
+
+      defp pending_deleted?(key) do
+        Process.get(:sm_pending_values, %{}) |> Map.get(key) == :deleted
+      end
+
+      defp queue_zset_index_delete_after_flush_ok(state, key, member_key) do
+        _pending = queue_zset_index_delete_after_flush(state, key, member_key)
+        :ok
+      end
+
+      defp maybe_delete_empty_compound_type(state, key, type_key, :set) do
+        maybe_delete_empty_compound_type(state, type_key, CompoundKey.set_prefix(key))
+      end
+
+      defp maybe_delete_empty_compound_type(state, key, type_key, :zset) do
+        maybe_delete_empty_compound_type(state, type_key, CompoundKey.zset_prefix(key))
+      end
+
+      defp maybe_delete_empty_compound_type(state, type_key, prefix) do
+        case Ferricstore.Store.Shard.CompoundMemberIndex.any_live?(
+               Map.get(state, :compound_member_index_name),
+               shard_ets_state(state),
+               prefix,
+               Process.get(:sm_pending_values, %{})
+             ) do
+          false ->
+            do_delete(state, type_key)
+
+          true ->
+            :ok
+
+          :unavailable ->
+            maybe_delete_empty_compound_type_fallback(state, type_key, prefix)
+        end
+      end
+
+      defp maybe_delete_empty_compound_type_fallback(state, type_key, prefix) do
+        if Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix) == 0 do
+          do_delete(state, type_key)
+        else
+          :ok
+        end
+      end
+
       defp apply_single(state, {:compound_blob_batch_put, redis_key, entries}) do
         case apply_compound_blob_batch_put_entries(state, redis_key, entries) do
           results when is_list(results) -> :ok
@@ -391,30 +842,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
       defp apply_single(state, {:pfmerge, dest_key, _source_keys, source_sketches}) do
         do_pfmerge(state, dest_key, source_sketches)
-      end
-
-      defp apply_single(state, {:json_set, key, path, value, flags}) do
-        Json.handle_ast({:json_set, key, path, value, flags}, build_string_value_store(state))
-      end
-
-      defp apply_single(state, {:json_del, key, path}) do
-        Json.handle_ast({:json_del, key, path}, build_string_value_store(state))
-      end
-
-      defp apply_single(state, {:json_numincrby, key, path, increment}) do
-        Json.handle_ast({:json_numincrby, key, path, increment}, build_string_value_store(state))
-      end
-
-      defp apply_single(state, {:json_arrappend, key, path, values}) do
-        Json.handle_ast({:json_arrappend, key, path, values}, build_string_value_store(state))
-      end
-
-      defp apply_single(state, {:json_toggle, key, path}) do
-        Json.handle_ast({:json_toggle, key, path}, build_string_value_store(state))
-      end
-
-      defp apply_single(state, {:json_clear, key, path}) do
-        Json.handle_ast({:json_clear, key, path}, build_string_value_store(state))
       end
 
       defp apply_single(state, {:incr, key, delta}) do
@@ -527,88 +954,172 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_single(state, {:flow_create, _key, attrs}) do
-        do_flow_create(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_create, attrs, fn ->
+          do_flow_create(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_create_many, _key, attrs}) do
-        do_flow_create_many(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_create_many, attrs, fn ->
+          do_flow_create_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_create_pipeline_batch, _key, attrs}) do
-        do_flow_create_pipeline_batch(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_create_pipeline_batch, attrs, fn ->
+          do_flow_create_pipeline_batch(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_start_and_claim_pipeline_batch, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_start_and_claim_pipeline_batch, attrs, fn ->
+          do_flow_start_and_claim_pipeline_batch(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_run_steps_many, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_run_steps_many, attrs, fn ->
+          do_flow_run_steps_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_named_value_put, _key, attrs}) do
-        do_flow_named_value_put(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_named_value_put, attrs, fn ->
+          do_flow_named_value_put(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_named_value_put_pipeline_batch, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_named_value_put_pipeline_batch, attrs, fn ->
+          do_flow_named_value_put_pipeline_batch(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_signal, _key, attrs}) do
-        do_flow_signal(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_signal, attrs, fn ->
+          do_flow_signal(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_signal_many, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_signal_many, attrs, fn ->
+          do_flow_signal_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_spawn_children, _key, attrs}) do
-        do_flow_spawn_children(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_spawn_children, attrs, fn ->
+          do_flow_spawn_children(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_claim_due, _key, attrs}) do
-        do_flow_claim_due(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_claim_due, attrs, fn ->
+          do_flow_claim_due(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_extend_lease, _key, attrs}) do
-        do_flow_extend_lease(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_extend_lease, attrs, fn ->
+          do_flow_extend_lease(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_complete, _key, attrs}) do
-        do_flow_complete(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_complete, attrs, fn ->
+          do_flow_complete(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_complete_many, _key, attrs}) do
-        do_flow_complete_many(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_complete_many, attrs, fn ->
+          do_flow_complete_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_terminal_pipeline_batch, op, _key, attrs})
            when op in [:complete, :retry, :fail, :cancel] do
-        do_flow_terminal_pipeline_batch(state, op, attrs)
+        apply_flow_single_with_telemetry(state, :flow_terminal_pipeline_batch, attrs, fn ->
+          do_flow_terminal_pipeline_batch(state, op, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_transition, _key, attrs}) do
-        do_flow_transition(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_transition, attrs, fn ->
+          do_flow_transition(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_start_and_claim, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_start_and_claim, attrs, fn ->
+          do_flow_start_and_claim(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_step_continue, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_step_continue, attrs, fn ->
+          do_flow_step_continue(state, attrs)
+        end)
+      end
+
+      defp apply_single(state, {:flow_step_continue_many, _key, attrs}) do
+        apply_flow_single_with_telemetry(state, :flow_step_continue_many, attrs, fn ->
+          do_flow_step_continue_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_transition_many, _key, attrs}) do
-        do_flow_transition_many(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_transition_many, attrs, fn ->
+          do_flow_transition_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_retry, _key, attrs}) do
-        do_flow_retry(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_retry, attrs, fn ->
+          do_flow_retry(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_retry_many, _key, attrs}) do
-        do_flow_retry_many(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_retry_many, attrs, fn ->
+          do_flow_retry_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_fail, _key, attrs}) do
-        do_flow_fail(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_fail, attrs, fn ->
+          do_flow_fail(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_fail_many, _key, attrs}) do
-        do_flow_fail_many(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_fail_many, attrs, fn ->
+          do_flow_fail_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_cancel, _key, attrs}) do
-        do_flow_cancel(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_cancel, attrs, fn ->
+          do_flow_cancel(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_cancel_many, _key, attrs}) do
-        do_flow_cancel_many(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_cancel_many, attrs, fn ->
+          do_flow_cancel_many(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_retention_cleanup, _key, attrs}) do
-        do_flow_retention_cleanup(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_retention_cleanup, attrs, fn ->
+          do_flow_retention_cleanup(state, attrs)
+        end)
       end
 
       defp apply_single(state, {:flow_rewind, _key, attrs}) do
-        do_flow_rewind(state, attrs)
+        apply_flow_single_with_telemetry(state, :flow_rewind, attrs, fn ->
+          do_flow_rewind(state, attrs)
+        end)
       end
 
       # -- Probabilistic data structure commands in batch/cross_shard_tx --

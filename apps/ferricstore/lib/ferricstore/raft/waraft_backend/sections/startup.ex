@@ -279,7 +279,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       defp backend_unavailable_error, do: {:error, :backend_unavailable}
 
       defp with_sync_write(shard_index, fun) when is_function(fun, 0) do
-        case SyncGate.enter(shard_index) do
+        enter_result =
+          Ferricstore.LatencyTrace.span("server_waraft_sync_gate_us", fn ->
+            SyncGate.enter(shard_index)
+          end)
+
+        case enter_result do
           {:ok, token} ->
             try do
               fun.()

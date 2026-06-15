@@ -111,7 +111,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitState
         assert after_first.child_groups["fanout-1"]["summary"]["completed"] == 1
         parent_version = after_first.version
 
-        assert {:error, _reason} =
+        assert {:ok, _same_child_done_a} =
                  flow_complete_and_get(child_a, claimed_a.lease_token,
                    partition_key: partition,
                    fencing_token: claimed_a.fencing_token,

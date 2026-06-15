@@ -1211,6 +1211,37 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
 }
 
 #[rustler::nif(schedule = "Normal")]
+pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+    let Some(record) = decode_flow_record(value.as_slice()) else {
+        return Ok(crate::atoms::error().encode(env));
+    };
+
+    let fields = vec![
+        binary_term(env, record.id)?,
+        binary_term(env, record.flow_type)?,
+        binary_term(env, record.state)?,
+        option_u64_term(env, record.version),
+        option_u64_term(env, record.priority),
+        option_binary_term(env, record.partition_key)?,
+        option_binary_term(env, record.payload_ref)?,
+        option_binary_term(env, record.result_ref)?,
+        option_binary_term(env, record.error_ref)?,
+        option_u64_term(env, record.created_at_ms),
+        option_u64_term(env, record.updated_at_ms),
+        option_u64_term(env, record.next_run_at_ms),
+        option_u64_term(env, record.lease_deadline_ms),
+        option_binary_term(env, record.lease_owner)?,
+        option_binary_term(env, record.lease_token)?,
+        option_u64_term(env, record.fencing_token),
+        option_u64_term(env, record.attempts),
+        option_binary_term(env, record.run_state)?,
+        binary_term(env, record.child_groups_encoded)?,
+    ];
+
+    Ok((crate::atoms::ok(), fields).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
 pub fn flow_records_terminal_after_noop(values: Vec<Binary<'_>>) -> Vec<bool> {
     values
         .iter()
@@ -1668,9 +1699,15 @@ impl FlowOrderedIndex {
         };
 
         if reverse {
-            for entry in self.ordered.iter().rev() {
+            let upper = OrderedEntry {
+                key: upper_key_for_exact_key(key),
+                score: Score(f64::NEG_INFINITY),
+                member: Vec::new(),
+            };
+
+            for entry in self.ordered.range((Unbounded, Excluded(upper))).rev() {
                 if entry.key.as_slice() != key {
-                    continue;
+                    break;
                 }
 
                 if !max.matches_upper(entry.score.0) || !min.matches_lower(entry.score.0) {
@@ -1689,9 +1726,15 @@ impl FlowOrderedIndex {
                 rows.push((entry.member.as_slice(), entry.score.0));
             }
         } else {
-            for entry in &self.ordered {
+            let lower = OrderedEntry {
+                key: key.to_vec(),
+                score: Score(f64::NEG_INFINITY),
+                member: Vec::new(),
+            };
+
+            for entry in self.ordered.range(lower..) {
                 if entry.key.as_slice() != key {
-                    continue;
+                    break;
                 }
 
                 if !min.matches_lower(entry.score.0) || !max.matches_upper(entry.score.0) {
@@ -2102,6 +2145,13 @@ fn decode_flow_record(value: &[u8]) -> Option<FlowRecordParts<'_>> {
         rewound_to_event_id,
         child_groups_encoded,
     })
+}
+
+fn upper_key_for_exact_key(key: &[u8]) -> Vec<u8> {
+    let mut upper = Vec::with_capacity(key.len() + 1);
+    upper.extend_from_slice(key);
+    upper.push(0);
+    upper
 }
 
 fn decode_varint(input: &[u8]) -> Option<(u64, &[u8])> {

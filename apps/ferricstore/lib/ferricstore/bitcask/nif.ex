@@ -301,6 +301,9 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec flow_record_decode(binary()) :: {:ok, list()} | :error
   def flow_record_decode(_value), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_record_decode_meta(binary()) :: {:ok, list()} | :error
+  def flow_record_decode_meta(_value), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_records_terminal_after_noop([binary()]) :: [boolean()]
   def flow_records_terminal_after_noop(_values), do: :erlang.nif_error(:nif_not_loaded)
 

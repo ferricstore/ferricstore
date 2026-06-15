@@ -114,10 +114,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       |> Enum.reverse()
 
     """
-    <div class="section-title">Timeline Chart</div>
+    <div class="section-title">Step Waterfall</div>
     <div class="chart-grid">
       <div class="chart-card">
-        <div class="chart-title">State graph</div>
+        <div class="chart-title">Step durations</div>
         #{render_timeline_sequence(timeline)}
       </div>
     </div>
@@ -165,243 +165,128 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
 
   def render_timeline_sequence(timeline) do
     rows = flow_timeline_duration_rows(timeline)
-    states = flow_timeline_states(rows)
-    layout = flow_timeline_graph_layout(rows, states)
-    points = flow_timeline_graph_points(rows, states, layout)
-
-    lane_html = render_flow_timeline_lanes(states, layout)
-    axis_html = render_flow_timeline_axis(layout)
-    path_html = render_flow_timeline_path(points)
-    duration_html = render_flow_timeline_duration_segments(points)
-    transition_html = render_flow_timeline_transition_segments(points)
-    node_html = render_flow_timeline_nodes(points)
-    caption = "#{length(rows)} events on this page · click a node to jump to the event row"
+    range = flow_step_waterfall_range(rows)
+    axis_html = render_flow_step_waterfall_axis(range)
+    row_html = Enum.map_join(rows, "\n", &render_flow_step_waterfall_row(&1, range))
+    caption = "#{length(rows)} events on this page · click a row to jump to the event row"
 
     """
-    <div class="flow-timeline-graph">
-      <div class="flow-timeline-scroll">
-        <svg class="flow-timeline-svg" viewBox="0 0 #{layout.width} #{layout.height}" width="#{layout.width}" height="#{layout.height}" role="img" aria-label="Flow state timeline graph">
-          <rect class="flow-timeline-bg" x="0" y="0" width="#{layout.width}" height="#{layout.height}" rx="8"></rect>
-          #{lane_html}
-          #{axis_html}
-          #{duration_html}
-          #{transition_html}
-          #{path_html}
-          #{node_html}
-        </svg>
+    <div class="flow-step-waterfall">
+      <div class="flow-step-waterfall-scroll">
+        <div class="flow-step-waterfall-header">
+          <span>Step</span>
+          <span class="flow-step-waterfall-axis">#{axis_html}</span>
+          <span>Elapsed</span>
+        </div>
+        <div class="flow-step-waterfall-rows">
+          #{row_html}
+        </div>
       </div>
       <div class="flow-timeline-caption">#{escape(caption)}</div>
     </div>
     """
   end
 
-  def flow_timeline_states(rows) do
-    states =
-      rows
-      |> Enum.map(&flow_timeline_state_label/1)
-      |> Enum.reject(&(&1 in ["", "-"]))
-      |> Enum.uniq()
-
-    case states do
-      [] -> ["event"]
-      _ -> states
-    end
-  end
-
-  def flow_timeline_graph_layout(rows, states) do
-    count = length(rows)
-    lane_count = max(length(states), 1)
-    left = 132
-    right = 52
-    top = 42
-    bottom = 52
-    lane_gap = 66
-    step = flow_timeline_graph_step(count)
-    plot_width = max(640, max(count - 1, 1) * step)
-
+  def flow_step_waterfall_range(rows) do
     times =
       rows
       |> Enum.map(& &1.time_ms)
       |> Enum.filter(&is_integer/1)
 
     min_time = Enum.min(times, fn -> nil end)
-    max_time = Enum.max(times, fn -> nil end)
 
-    %{
-      width: left + plot_width + right,
-      height: top + bottom + max(lane_count - 1, 0) * lane_gap,
-      left: left,
-      right: right,
-      top: top,
-      bottom: bottom,
-      lane_gap: lane_gap,
-      plot_width: plot_width,
-      count: count,
-      min_time: min_time,
-      max_time: max_time
-    }
-  end
+    max_time =
+      rows
+      |> Enum.map(fn row ->
+        case row.time_ms do
+          time when is_integer(time) -> time + max(Map.get(row, :duration_ms, 0), 0)
+          _ -> nil
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.max(fn -> min_time end)
 
-  def flow_timeline_graph_step(count) when count > 60, do: 38
-  def flow_timeline_graph_step(count) when count > 40, do: 46
-  def flow_timeline_graph_step(count) when count > 20, do: 58
-  def flow_timeline_graph_step(_count), do: 88
+    total_ms =
+      case {min_time, max_time} do
+        {start_ms, end_ms} when is_integer(start_ms) and is_integer(end_ms) ->
+          max(end_ms - start_ms, 1)
 
-  def flow_timeline_graph_points(rows, states, layout) do
-    state_index = states |> Enum.with_index() |> Map.new()
-    count = length(rows)
-
-    rows
-    |> Enum.with_index()
-    |> Enum.map(fn {row, index} ->
-      state = flow_timeline_state_label(row)
-      lane = Map.get(state_index, state, 0)
-
-      row
-      |> Map.put(:state, state)
-      |> Map.put(:x, flow_timeline_x(row, index, count, layout))
-      |> Map.put(:y, flow_timeline_y(lane, layout))
-    end)
-  end
-
-  def flow_timeline_x(row, index, count, %{min_time: min_time, max_time: max_time} = layout)
-      when is_integer(min_time) and is_integer(max_time) and max_time > min_time do
-    case row.time_ms do
-      time when is_integer(time) ->
-        layout.left + round((time - min_time) / max(max_time - min_time, 1) * layout.plot_width)
-
-      _ ->
-        flow_timeline_index_x(index, count, layout)
-    end
-  end
-
-  def flow_timeline_x(_row, index, count, layout),
-    do: flow_timeline_index_x(index, count, layout)
-
-  def flow_timeline_index_x(index, count, layout) do
-    layout.left + round(index / max(count - 1, 1) * layout.plot_width)
-  end
-
-  def flow_timeline_y(lane, layout), do: layout.top + lane * layout.lane_gap
-
-  def render_flow_timeline_lanes(states, layout) do
-    states
-    |> Enum.with_index()
-    |> Enum.map_join("\n", fn {state, index} ->
-      y = flow_timeline_y(index, layout)
-      x2 = layout.width - layout.right + 12
-
-      """
-      <g class="flow-timeline-lane">
-        <line x1="#{layout.left}" y1="#{y}" x2="#{x2}" y2="#{y}"></line>
-        <text class="flow-timeline-lane-label" x="#{layout.left - 14}" y="#{y + 4}" text-anchor="end">#{escape(state)}</text>
-      </g>
-      """
-    end)
-  end
-
-  def render_flow_timeline_axis(%{min_time: nil}), do: ""
-
-  def render_flow_timeline_axis(%{min_time: min_time, max_time: max_time} = layout) do
-    baseline_y = layout.height - layout.bottom + 20
-    max_time = max_time || min_time
-
-    ticks =
-      if max_time > min_time do
-        [min_time, min_time + div(max_time - min_time, 2), max_time]
-      else
-        [min_time]
+        _ ->
+          1
       end
 
-    ticks
+    %{min_time: min_time, max_time: max_time, total_ms: total_ms}
+  end
+
+  def render_flow_step_waterfall_axis(%{min_time: nil}) do
+    ~s(<span class="flow-step-waterfall-axis-label" style="left: 0%">event order</span>)
+  end
+
+  def render_flow_step_waterfall_axis(%{total_ms: total_ms}) do
+    [0, div(total_ms, 4), div(total_ms, 2), div(total_ms * 3, 4), total_ms]
     |> Enum.uniq()
-    |> Enum.map_join("\n", fn tick ->
-      x =
-        layout.left +
-          if max_time > min_time do
-            round((tick - min_time) / max(max_time - min_time, 1) * layout.plot_width)
-          else
-            0
-          end
+    |> Enum.map_join("\n", fn offset_ms ->
+      left = flow_step_waterfall_percent(offset_ms, total_ms)
+      label = "+" <> format_duration_ms(offset_ms)
 
-      """
-      <g class="flow-timeline-axis">
-        <line x1="#{x}" y1="#{layout.top - 16}" x2="#{x}" y2="#{baseline_y - 8}"></line>
-        <text class="flow-timeline-axis-label" x="#{x}" y="#{baseline_y}" text-anchor="middle">#{escape(format_timeline_timestamp_ms(tick))}</text>
-      </g>
-      """
+      ~s(<span class="flow-step-waterfall-axis-label" style="left: #{left}%">#{escape(label)}</span>)
     end)
   end
 
-  def render_flow_timeline_path([]), do: ""
+  def render_flow_step_waterfall_row(row, range) do
+    anchor = flow_history_event_anchor(row.event_id)
+    title = flow_timeline_event_title(row)
+    label = flow_timeline_node_label_text(row)
+    state_move = flow_history_state_move(row)
+    action = flow_history_event_label(row.fields)
+    duration_ms = max(Map.get(row, :duration_ms, 0), 0)
+    offset_ms = flow_step_waterfall_offset_ms(row, range)
+    left = flow_step_waterfall_percent(offset_ms, range.total_ms)
+    width = flow_step_waterfall_width_percent(duration_ms, range.total_ms, left)
+    class = flow_timeline_bar_class(row)
+    duration = format_duration_ms(duration_ms)
+    offset = "+" <> format_duration_ms(offset_ms)
 
-  def render_flow_timeline_path(points) do
-    d =
-      points
-      |> Enum.with_index()
-      |> Enum.map_join(" ", fn {point, index} ->
-        prefix = if index == 0, do: "M", else: "L"
-        "#{prefix} #{point.x} #{point.y}"
-      end)
-
-    ~s(<path class="flow-timeline-path" d="#{d}"></path>)
+    """
+    <a class="flow-step-waterfall-row" href="##{anchor}" title="#{escape_attr(title)}">
+      <span class="flow-step-waterfall-label">
+        <span class="flow-step-waterfall-step">#{escape(label)}</span>
+        <span class="flow-step-waterfall-state">#{escape(action)} · #{escape(state_move)}</span>
+      </span>
+      <span class="flow-step-waterfall-track">
+        <span class="flow-step-waterfall-marker" style="left: #{left}%"></span>
+        <span class="flow-step-waterfall-bar #{class}" style="left: #{left}%; width: #{width}%"></span>
+      </span>
+      <span class="flow-step-waterfall-duration">
+        <span>#{escape(duration)}</span>
+        <span>#{escape(offset)}</span>
+      </span>
+    </a>
+    """
   end
 
-  def render_flow_timeline_duration_segments(points) do
-    points
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.map_join("\n", fn [point, next_point] ->
-      class = flow_timeline_bar_class(point)
-      duration = format_duration_ms(Map.get(point, :duration_ms, 0))
-      title = flow_timeline_event_title(point)
-
-      """
-      <line class="flow-timeline-duration-segment #{class}" x1="#{point.x}" y1="#{point.y}" x2="#{next_point.x}" y2="#{point.y}">
-        <title>#{escape(title <> " · held " <> duration)}</title>
-      </line>
-      """
-    end)
+  def flow_step_waterfall_offset_ms(%{time_ms: time_ms}, %{min_time: min_time})
+      when is_integer(time_ms) and is_integer(min_time) do
+    max(time_ms - min_time, 0)
   end
 
-  def render_flow_timeline_transition_segments(points) do
-    points
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.map_join("\n", fn [point, next_point] ->
-      mid_x = round((point.x + next_point.x) / 2)
+  def flow_step_waterfall_offset_ms(_row, _range), do: 0
 
-      d =
-        "M #{point.x} #{point.y} C #{mid_x} #{point.y} #{mid_x} #{next_point.y} #{next_point.x} #{next_point.y}"
+  def flow_step_waterfall_width_percent(duration_ms, total_ms, left_percent) do
+    width = flow_step_waterfall_percent(duration_ms, total_ms)
 
-      ~s(<path class="flow-timeline-transition" d="#{d}"></path>)
-    end)
+    width
+    |> max(0.6)
+    |> min(max(100.0 - left_percent, 0.6))
   end
 
-  def render_flow_timeline_nodes(points) do
-    dense? = length(points) > 28
+  def flow_step_waterfall_percent(value, total_ms) do
+    percent = max(value, 0) / max(total_ms, 1) * 100.0
 
-    points
-    |> Enum.map_join("\n", fn point ->
-      anchor = flow_history_event_anchor(point.event_id)
-      title = flow_timeline_event_title(point)
-      label = flow_timeline_node_label_text(point)
-      node_class = flow_timeline_node_class(point)
-      label_html = if dense?, do: "", else: render_flow_timeline_node_label(point, label)
-
-      """
-      <a href="##{anchor}" class="flow-timeline-node-link">
-        <circle class="flow-timeline-node #{node_class}" cx="#{point.x}" cy="#{point.y}" r="7">
-          <title>#{escape(title)}</title>
-        </circle>
-      </a>
-      #{label_html}
-      """
-    end)
-  end
-
-  def render_flow_timeline_node_label(point, label) do
-    y = point.y - 13
-
-    ~s(<text class="flow-timeline-node-label" x="#{point.x + 10}" y="#{y}">#{escape(label)}</text>)
+    percent
+    |> max(0.0)
+    |> min(100.0)
+    |> Float.round(2)
   end
 
   def flow_timeline_node_label_text(row) do
@@ -413,17 +298,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowCharts do
       "Completed" -> "Completed"
       "Cancelled" -> "Cancelled"
       _ -> flow_timeline_state_label(row)
-    end
-  end
-
-  def flow_timeline_node_class(row) do
-    fields = row.fields
-
-    cond do
-      flow_history_terminal_event?(fields) -> "flow-timeline-node-terminal"
-      flow_history_event_label(fields) == "Retry" -> "flow-timeline-node-retry"
-      flow_history_event_label(fields) == "Failed" -> "flow-timeline-node-failed"
-      true -> "flow-timeline-node-normal"
     end
   end
 
