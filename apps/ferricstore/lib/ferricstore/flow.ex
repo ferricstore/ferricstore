@@ -1032,6 +1032,7 @@ defmodule Ferricstore.Flow do
   end
 
   defdelegate list(ctx, type, opts \\ []), to: Ferricstore.Flow.ReadAPI
+  defdelegate stats(ctx, type, opts \\ []), to: Ferricstore.Flow.ReadAPI
   defdelegate terminals(ctx, type, opts \\ []), to: Ferricstore.Flow.ReadAPI
   defdelegate failures(ctx, type, opts \\ []), to: Ferricstore.Flow.ReadAPI
 

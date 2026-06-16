@@ -76,7 +76,10 @@ defmodule Ferricstore.Cluster.FlowScheduleClusterTest do
     end)
 
     assert {:ok, %{fired: 0, claimed: 0, errors: []}} =
-             remote_schedule_fire_due(reader.name, now_ms: now_ms + 1, worker: "cluster-scheduler")
+             remote_schedule_fire_due(reader.name,
+               now_ms: now_ms + 1,
+               worker: "cluster-scheduler"
+             )
   end
 
   defp remote_schedule_create(node_name, id, opts),

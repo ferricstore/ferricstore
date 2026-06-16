@@ -34,7 +34,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   end
 
   def render_flow_query_state_field(%{state: state} = filters) do
-    kinds = ~w(list terminals failures)
+    kinds = ~w(list stats terminals failures)
     hidden = flow_query_hidden_attr(filters, kinds)
     disabled = flow_query_disabled_attr(filters, kinds)
 
@@ -43,6 +43,27 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
       State
       <input class="flow-search-input mono" name="state" value="#{escape_attr(state || "")}" placeholder="optional"#{disabled}>
       <span class="flow-field-help">Optional state filter for this type.</span>
+    </label>
+    """
+  end
+
+  def render_flow_query_attribute_fields(filters) do
+    kinds = ~w(list stats)
+    hidden = flow_query_hidden_attr(filters, kinds)
+    disabled = flow_query_disabled_attr(filters, kinds)
+    attribute_key = Map.get(filters, :attribute_key) || ""
+    attribute_value = Map.get(filters, :attribute_value) || ""
+
+    """
+    <label class="flow-query-field" data-flow-query-field="attribute_key" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
+      Attribute key
+      <input class="flow-search-input mono" name="attribute_key" value="#{escape_attr(attribute_key)}" placeholder="tenant"#{disabled}>
+      <span class="flow-field-help">Optional indexed attribute filter.</span>
+    </label>
+    <label class="flow-query-field" data-flow-query-field="attribute_value" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
+      Attribute value
+      <input class="flow-search-input mono" name="attribute_value" value="#{escape_attr(attribute_value)}" placeholder="acme"#{disabled}>
+      <span class="flow-field-help">Used only when attribute key is present.</span>
     </label>
     """
   end
@@ -197,6 +218,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   def flow_query_kind_options do
     [
       {"list", "FLOW.LIST"},
+      {"stats", "FLOW.STATS"},
       {"terminals", "FLOW.TERMINALS"},
       {"failures", "FLOW.FAILURES"},
       {"stuck", "FLOW.STUCK"},
@@ -218,7 +240,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         command: "FLOW.LIST",
         purpose: "List workflows by type.",
         detail:
-          "Use optional state, partition, time range, and direction filters to keep the result bounded."
+          "Use optional state, partition, time range, direction, and attribute filters to keep the result bounded."
+      },
+      "stats" => %{
+        command: "FLOW.STATS",
+        purpose: "Count workflows by type and optional filters.",
+        detail:
+          "Use this before fetching rows when you only need a bounded count for state or attribute filters."
       },
       "terminals" => %{
         command: "FLOW.TERMINALS",

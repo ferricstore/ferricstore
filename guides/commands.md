@@ -43,10 +43,26 @@ compatibility commands. They are exposed through RESP3 and the embedded API:
 `FLOW.EXTEND_LEASE`, `FLOW.COMPLETE`, `FLOW.COMPLETE_MANY`, `FLOW.RETRY`,
 `FLOW.RETRY_MANY`, `FLOW.FAIL`, `FLOW.FAIL_MANY`, `FLOW.CANCEL`,
 `FLOW.CANCEL_MANY`, `FLOW.TRANSITION`, `FLOW.TRANSITION_MANY`,
-`FLOW.REWIND`, `FLOW.LIST`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`,
+`FLOW.REWIND`, `FLOW.LIST`, `FLOW.STATS`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`,
 `FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`, `FLOW.HISTORY`,
 `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.POLICY.SET`, `FLOW.POLICY.GET`,
 and `FLOW.RETENTION_CLEANUP`.
+
+Flow attributes are small indexed metadata fields for query and dashboard
+filters. They are separate from payload and named value refs:
+
+```text
+FLOW.CREATE order-1 TYPE order STATE queued ATTRIBUTE tenant acme ATTRIBUTE region us
+FLOW.TRANSITION order-1 queued charged LEASE_TOKEN <token> FENCING 1 ATTRIBUTE_MERGE phase charge
+FLOW.LIST order STATE queued ATTRIBUTE tenant acme COUNT 100
+FLOW.STATS order STATE queued ATTRIBUTE tenant acme
+```
+
+Use attributes for values you want to filter or count by, such as tenant,
+region, campaign, device group, or model. Use value refs for large bytes or
+state-specific data. Attribute query projection is asynchronous, so use
+`CONSISTENT_PROJECTION true` when an admin/debug read must wait for projection
+catch-up.
 
 Production semantics, retry policy, history caps, LMDB cold projection, and
 operator metrics are documented in `docs/flow-production-readiness.md` and

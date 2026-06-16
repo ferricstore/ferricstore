@@ -339,6 +339,7 @@ FERRICSTORE.KEY_INFO: {"key": "k", "args": ["k"]}
 0x0221 FLOW.RETENTION_CLEANUP
 0x0222 FLOW.STEP_CONTINUE
 0x0223 FLOW.START_AND_CLAIM
+0x022D FLOW.STATS
 ```
 
 Flow bodies are maps with command fields plus options. For example:
@@ -355,11 +356,18 @@ FLOW.COMPLETE:
 
 FLOW.VALUE.MGET:
 {"refs": ["ref-a", "ref-b"], "max_bytes": 65536}
+
+FLOW.STATS:
+{"type": "email", "state": "queued", "attributes": {"tenant": "acme"}}
 ```
 
 Typed `payload`, `result`, and `error` values stay binary-safe and structured at
 the protocol layer. Storage behavior is unchanged: commands still use current
 FerricFlow value/ref rules.
+
+Flow `attributes` are small indexed metadata values for list/stats/dashboard
+filters. They are not payload bytes and are projected asynchronously for query
+use.
 
 ## Client management and reroute behavior
 

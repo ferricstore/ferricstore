@@ -110,7 +110,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
            Map.fetch!(record, :state), Map.get(record, :partition_key),
            Map.get(record, :updated_at_ms, 0), state_key, expire_at_ms,
            Map.get(record, :parent_flow_id), Map.get(record, :root_flow_id),
-           Map.get(record, :correlation_id)},
+           Map.get(record, :correlation_id), Ferricstore.Flow.Attributes.record(record)},
           acc
         )
       end
@@ -127,7 +127,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         acc =
           acc
           |> put_in([:active_reverse_values, state_key], reverse_value)
-          |> prepend_ops(active_ops)
+          |> prepend_ops(
+            stale_attribute_query_delete_ops(path, state_key, record) ++
+              active_ops ++ flow_attribute_query_ops(record, expire_at_ms, state_key)
+          )
 
         {:ok, acc}
       end
@@ -366,7 +369,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_path_op(
         path,
         {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
-         expire_at_ms, parent_flow_id, root_flow_id, correlation_id},
+         expire_at_ms, parent_flow_id, root_flow_id, correlation_id, attributes},
         acc
       )
       when is_binary(id) and is_binary(type) and is_binary(terminal_state) and
@@ -389,16 +392,27 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       {:ok,
        prepend_ops(
          acc,
-         terminal_project_metadata_ops(
-           id,
-           partition_key,
-           updated_at_ms,
-           expire_at_ms,
-           state_key,
-           parent_flow_id,
-           root_flow_id,
-           correlation_id
-         )
+         stale_attribute_query_delete_ops(path, state_key, %{
+           id: id,
+           type: type,
+           state: terminal_state,
+           partition_key: partition_key,
+           updated_at_ms: updated_at_ms,
+           attributes: attributes
+         }) ++
+           terminal_project_metadata_ops(
+             id,
+             partition_key,
+             updated_at_ms,
+             expire_at_ms,
+             state_key,
+             parent_flow_id,
+             root_flow_id,
+             correlation_id,
+             type,
+             terminal_state,
+             attributes
+           )
        )}
     end
   end
@@ -716,7 +730,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         state_key,
         parent_flow_id,
         root_flow_id,
-        correlation_id
+        correlation_id,
+        type,
+        terminal_state,
+        attributes \\ %{}
       ) do
     []
     |> terminal_project_metadata_op(
@@ -746,6 +763,90 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       expire_at_ms,
       state_key
     )
+    |> terminal_project_attribute_ops(
+      attributes,
+      type,
+      terminal_state,
+      partition_key,
+      id,
+      score,
+      expire_at_ms,
+      state_key
+    )
+  end
+
+  def terminal_project_attribute_ops(
+        ops,
+        attributes,
+        type,
+        terminal_state,
+        partition_key,
+        id,
+        score,
+        expire_at_ms,
+        state_key
+      ) do
+    record = %{
+      id: id,
+      type: type,
+      state: terminal_state,
+      partition_key: partition_key,
+      updated_at_ms: score,
+      attributes: attributes
+    }
+
+    flow_attribute_query_ops(record, expire_at_ms, state_key) ++ ops
+  end
+
+  def flow_attribute_query_ops(record, expire_at_ms, state_key) do
+    id = Map.get(record, :id)
+
+    record
+    |> Ferricstore.Flow.Attributes.index_entries()
+    |> Enum.map(fn {index_key, _id, score} ->
+      query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
+      value = Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms, state_key)
+      {:put, query_key, value}
+    end)
+  end
+
+  def stale_attribute_query_delete_ops(path, state_key, next_record) do
+    next_keys =
+      next_record
+      |> flow_attribute_query_keys()
+      |> MapSet.new()
+
+    path
+    |> old_projected_flow_record(state_key)
+    |> flow_attribute_query_keys()
+    |> MapSet.new()
+    |> MapSet.difference(next_keys)
+    |> Enum.map(&{:delete, &1})
+  end
+
+  def old_projected_flow_record(path, state_key) do
+    case Ferricstore.Flow.LMDB.get(path, state_key) do
+      {:ok, value} ->
+        case decode_flow_record_value(value) do
+          {:ok, record} -> record
+          :error -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  def flow_attribute_query_keys(nil), do: []
+
+  def flow_attribute_query_keys(record) do
+    id = Map.get(record, :id)
+
+    record
+    |> Ferricstore.Flow.Attributes.index_entries()
+    |> Enum.map(fn {index_key, _id, score} ->
+      Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
+    end)
   end
 
   def terminal_project_metadata_op(

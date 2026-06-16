@@ -375,7 +375,16 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             Map.update(counts, count_key, 1, &(&1 + 1))
           }
         else
-          {lmdb_ops, prunes, [{key, record} | active], counts}
+          projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
+
+          attribute_ops =
+            Ferricstore.Flow.LMDBWriter.ProjectionOps.flow_attribute_query_ops(
+              record,
+              projection_expire_at_ms,
+              key
+            )
+
+          {attribute_ops ++ lmdb_ops, prunes, [{key, record} | active], counts}
         end
       end)
 

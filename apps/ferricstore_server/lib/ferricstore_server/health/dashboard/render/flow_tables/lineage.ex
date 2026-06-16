@@ -107,6 +107,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Lineage do
     end)
   end
 
+  def render_flow_query_rows(%{command: "FLOW.STATS", rows: rows}) do
+    rows
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      row when is_map(row) -> Map.to_list(row)
+      other -> [{"value", other}]
+    end)
+    |> Enum.map_join("\n", fn {key, value} ->
+      """
+      <tr>
+        <td class="mono">#{escape(to_string(key))}</td>
+        <td colspan="5" class="mono">#{escape(inspect(value, limit: 20))}</td>
+      </tr>
+      """
+    end)
+  end
+
   def render_flow_query_rows(%{rows: rows}) do
     Enum.map_join(rows, "\n", fn
       record when is_map(record) ->

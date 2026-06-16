@@ -84,6 +84,25 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
     |> normalize_flow_named_value_refs()
   end
 
+  def flow_record_attributes(record) do
+    record
+    |> flow_field(:attributes, %{})
+    |> normalize_flow_attributes()
+  end
+
+  def normalize_flow_attributes(attrs) when is_map(attrs) do
+    Map.new(attrs, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  def normalize_flow_attributes(attrs) when is_binary(attrs) do
+    case Jason.decode(attrs) do
+      {:ok, decoded} -> normalize_flow_attributes(decoded)
+      _ -> %{}
+    end
+  end
+
+  def normalize_flow_attributes(_attrs), do: %{}
+
   def normalize_flow_named_value_refs(refs) when is_map(refs) do
     Enum.flat_map(refs, fn {name, ref} ->
       case normalize_flow_value_ref(ref) do

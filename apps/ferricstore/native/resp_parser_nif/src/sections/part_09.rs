@@ -1,6 +1,70 @@
 type FlowOptionParser<'a> =
     fn(Env<'a>, &[Term<'a>], &[&[u8]], usize) -> Result<Option<Term<'a>>, Term<'a>>;
 
+fn parse_flow_attribute_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+    attributes: &mut Term<'a>,
+    has_attributes: &mut bool,
+    attributes_merge: &mut Term<'a>,
+    has_attributes_merge: &mut bool,
+    attributes_delete: &mut Vec<Term<'a>>,
+) -> Result<Option<usize>, Term<'a>> {
+    if ascii_eq_ignore_case(arg_bytes[idx], b"ATTRIBUTE") {
+        if idx + 2 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+        *attributes = attributes
+            .map_put(args[idx + 1], args[idx + 2])
+            .map_err(|_| generic_ast_error(env, b"ERR syntax error"))?;
+        *has_attributes = true;
+        return Ok(Some(idx + 3));
+    }
+
+    if ascii_eq_ignore_case(arg_bytes[idx], b"ATTRIBUTE_MERGE") {
+        if idx + 2 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+        *attributes_merge = attributes_merge
+            .map_put(args[idx + 1], args[idx + 2])
+            .map_err(|_| generic_ast_error(env, b"ERR syntax error"))?;
+        *has_attributes_merge = true;
+        return Ok(Some(idx + 3));
+    }
+
+    if ascii_eq_ignore_case(arg_bytes[idx], b"ATTRIBUTE_DELETE") {
+        if idx + 1 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+        attributes_delete.push(args[idx + 1]);
+        return Ok(Some(idx + 2));
+    }
+
+    Ok(None)
+}
+
+fn append_flow_attribute_opts<'a>(
+    env: Env<'a>,
+    opts: &mut Vec<Term<'a>>,
+    attributes: Term<'a>,
+    has_attributes: bool,
+    attributes_merge: Term<'a>,
+    has_attributes_merge: bool,
+    attributes_delete: Vec<Term<'a>>,
+) {
+    if has_attributes {
+        opts.push((atom(env, "attributes"), attributes).encode(env));
+    }
+    if has_attributes_merge {
+        opts.push((atom(env, "attributes_merge"), attributes_merge).encode(env));
+    }
+    if !attributes_delete.is_empty() {
+        opts.push((atom(env, "attributes_delete"), attributes_delete).encode(env));
+    }
+}
+
 fn parse_flow_options<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -8,18 +72,45 @@ fn parse_flow_options<'a>(
     start: usize,
     parser: FlowOptionParser<'a>,
 ) -> Result<Vec<Term<'a>>, Term<'a>> {
-    if (args.len() - start) % 2 != 0 {
-        return Err(generic_ast_error(env, b"ERR syntax error"));
-    }
-
-    let mut opts = Vec::with_capacity((args.len() - start) / 2);
+    let mut opts = Vec::with_capacity((args.len() - start) / 2 + 3);
+    let mut attributes = Term::map_new(env);
+    let mut has_attributes = false;
+    let mut attributes_merge = Term::map_new(env);
+    let mut has_attributes_merge = false;
+    let mut attributes_delete = Vec::new();
     let mut idx = start;
     while idx < args.len() {
+        if let Some(next_idx) = parse_flow_attribute_option(
+            env,
+            args,
+            arg_bytes,
+            idx,
+            &mut attributes,
+            &mut has_attributes,
+            &mut attributes_merge,
+            &mut has_attributes_merge,
+            &mut attributes_delete,
+        )? {
+            idx = next_idx;
+            continue;
+        }
+        if idx + 1 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
         if let Some(opt) = parser(env, args, arg_bytes, idx)? {
             opts.push(opt);
         }
         idx += 2;
     }
+    append_flow_attribute_opts(
+        env,
+        &mut opts,
+        attributes,
+        has_attributes,
+        attributes_merge,
+        has_attributes_merge,
+        attributes_delete,
+    );
     Ok(opts)
 }
 
@@ -30,10 +121,30 @@ fn parse_flow_read_options<'a>(
     start: usize,
     parser: FlowOptionParser<'a>,
 ) -> Result<Vec<Term<'a>>, Term<'a>> {
-    let mut opts = Vec::with_capacity((args.len().saturating_sub(start)) / 2 + 2);
+    let mut opts = Vec::with_capacity((args.len().saturating_sub(start)) / 2 + 5);
+    let mut attributes = Term::map_new(env);
+    let mut has_attributes = false;
+    let mut attributes_merge = Term::map_new(env);
+    let mut has_attributes_merge = false;
+    let mut attributes_delete = Vec::new();
     let mut idx = start;
 
     while idx < args.len() {
+        if let Some(next_idx) = parse_flow_attribute_option(
+            env,
+            args,
+            arg_bytes,
+            idx,
+            &mut attributes,
+            &mut has_attributes,
+            &mut attributes_merge,
+            &mut has_attributes_merge,
+            &mut attributes_delete,
+        )? {
+            idx = next_idx;
+            continue;
+        }
+
         if ascii_eq_ignore_case(arg_bytes[idx], b"FULL") {
             let full = if idx + 1 < args.len() {
                 match parse_bool_bytes(arg_bytes[idx + 1]) {
@@ -136,6 +247,16 @@ fn parse_flow_read_options<'a>(
         idx += 2;
     }
 
+    append_flow_attribute_opts(
+        env,
+        &mut opts,
+        attributes,
+        has_attributes,
+        attributes_merge,
+        has_attributes_merge,
+        attributes_delete,
+    );
+
     Ok(opts)
 }
 
@@ -147,18 +268,48 @@ fn parse_flow_options_until<'a>(
     end: usize,
     parser: FlowOptionParser<'a>,
 ) -> Result<Vec<Term<'a>>, Term<'a>> {
-    if (end - start) % 2 != 0 {
-        return Err(generic_ast_error(env, b"ERR syntax error"));
-    }
-
-    let mut opts = Vec::with_capacity((end - start) / 2);
+    let mut opts = Vec::with_capacity((end - start) / 2 + 3);
+    let mut attributes = Term::map_new(env);
+    let mut has_attributes = false;
+    let mut attributes_merge = Term::map_new(env);
+    let mut has_attributes_merge = false;
+    let mut attributes_delete = Vec::new();
     let mut idx = start;
     while idx < end {
+        if let Some(next_idx) = parse_flow_attribute_option(
+            env,
+            args,
+            arg_bytes,
+            idx,
+            &mut attributes,
+            &mut has_attributes,
+            &mut attributes_merge,
+            &mut has_attributes_merge,
+            &mut attributes_delete,
+        )? {
+            if next_idx > end {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            idx = next_idx;
+            continue;
+        }
+        if idx + 1 >= end {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
         if let Some(opt) = parser(env, args, arg_bytes, idx)? {
             opts.push(opt);
         }
         idx += 2;
     }
+    append_flow_attribute_opts(
+        env,
+        &mut opts,
+        attributes,
+        has_attributes,
+        attributes_merge,
+        has_attributes_merge,
+        attributes_delete,
+    );
     Ok(opts)
 }
 
@@ -180,16 +331,37 @@ fn parse_flow_options_until_with_retry_policy<'a>(
     end: usize,
     parser: FlowOptionParser<'a>,
 ) -> Result<Vec<Term<'a>>, Term<'a>> {
-    if (end - start) % 2 != 0 {
-        return Err(generic_ast_error(env, b"ERR syntax error"));
-    }
-
-    let mut opts = Vec::with_capacity((end - start) / 2);
+    let mut opts = Vec::with_capacity((end - start) / 2 + 3);
     let mut retry_opts = Vec::new();
     let mut backoff_opts = Vec::new();
+    let mut attributes = Term::map_new(env);
+    let mut has_attributes = false;
+    let mut attributes_merge = Term::map_new(env);
+    let mut has_attributes_merge = false;
+    let mut attributes_delete = Vec::new();
     let mut idx = start;
 
     while idx < end {
+        if let Some(next_idx) = parse_flow_attribute_option(
+            env,
+            args,
+            arg_bytes,
+            idx,
+            &mut attributes,
+            &mut has_attributes,
+            &mut attributes_merge,
+            &mut has_attributes_merge,
+            &mut attributes_delete,
+        )? {
+            if next_idx > end {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+            idx = next_idx;
+            continue;
+        }
+        if idx + 1 >= end {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
         if flow_retry_policy_option_name(arg_bytes[idx]) {
             let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
             if is_backoff {
@@ -203,6 +375,16 @@ fn parse_flow_options_until_with_retry_policy<'a>(
 
         idx += 2;
     }
+
+    append_flow_attribute_opts(
+        env,
+        &mut opts,
+        attributes,
+        has_attributes,
+        attributes_merge,
+        has_attributes_merge,
+        attributes_delete,
+    );
 
     if !backoff_opts.is_empty() {
         retry_opts.push((atom(env, "backoff"), backoff_opts).encode(env));

@@ -50,6 +50,11 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
              "GET",
              "/dashboard/flow/query?kind=history&id=flow-1"
            ) == {"FLOW.HISTORY", key: {"flow-1", :read}}
+
+    assert RouteRequirements.dashboard_route_requirement(
+             "GET",
+             "/dashboard/flow/query?kind=stats&type=email&partition_key=tenant-a"
+           ) == {"FLOW.STATS", key: {"tenant-a", :read}}
   end
 
   test "dashboard_route_requirement scopes flow detail and value requests" do

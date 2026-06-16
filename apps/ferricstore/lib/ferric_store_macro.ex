@@ -532,6 +532,10 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_list(__instance__(), type, opts)
       end
 
+      def flow_stats(type, opts \\ []) do
+        FerricStore.Impl.flow_stats(__instance__(), type, opts)
+      end
+
       def flow_by_parent(parent_flow_id, opts \\ []) do
         FerricStore.Impl.flow_by_parent(__instance__(), parent_flow_id, opts)
       end

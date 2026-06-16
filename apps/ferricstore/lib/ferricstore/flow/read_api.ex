@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   @moduledoc false
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.Flow.Attributes
   alias Ferricstore.Flow.HistoryQuery
   alias Ferricstore.Flow.LMDBIndexRead
   alias Ferricstore.Flow.RecordProjection
@@ -22,19 +23,19 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, state} <- flow_state(opts),
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, attributes} <- Attributes.from_opts(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          {:ok, records} <-
-           RecordRead.list_records(
+           list_records(
              ctx,
              type,
              state,
              partition_key,
              count,
-             include_cold? or consistent_projection?,
-             consistent_projection?,
-             @terminal_states,
-             @default_lmdb_query_scan_limit
+             attributes,
+             include_cold?,
+             consistent_projection?
            ) do
       {:ok, maybe_project_meta(records, opts)}
     end
@@ -246,6 +247,170 @@ defmodule Ferricstore.Flow.ReadAPI do
 
   def stuck(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  def stats(ctx, type, opts \\ [])
+
+  def stats(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, state} <- flow_state(opts),
+         {:ok, partition_key} <- optional_auto_partition_key(opts),
+         {:ok, attributes} <- Attributes.from_opts(opts),
+         {:ok, count} <- flow_stats_count(opts),
+         {:ok, records} <-
+           list_records(ctx, type, state, partition_key, count, attributes, true, true) do
+      {:ok,
+       %{
+         type: type,
+         state: state,
+         attributes: attributes,
+         count: length(records)
+       }}
+    end
+  end
+
+  def stats(_ctx, type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def stats(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  defp list_records(
+         ctx,
+         type,
+         state,
+         partition_key,
+         count,
+         attributes,
+         include_cold?,
+         consistent_projection?
+       )
+       when map_size(attributes) == 0 do
+    RecordRead.list_records(
+      ctx,
+      type,
+      state,
+      partition_key,
+      count,
+      include_cold? or consistent_projection?,
+      consistent_projection?,
+      @terminal_states,
+      @default_lmdb_query_scan_limit
+    )
+  end
+
+  defp list_records(
+         ctx,
+         type,
+         state,
+         partition_key,
+         count,
+         attributes,
+         _include_cold?,
+         consistent_projection?
+       ) do
+    with {:ok, {name, value}} <- first_attribute_filter(attributes),
+         {:ok, records} <-
+           list_records_for_attribute(
+             ctx,
+             type,
+             state,
+             partition_key,
+             name,
+             value,
+             count,
+             consistent_projection?
+           ) do
+      {:ok,
+       records
+       |> Enum.filter(&(Map.get(&1, :type) == type and Map.get(&1, :state) == state))
+       |> Enum.filter(&Attributes.matches?(&1, attributes))
+       |> RecordQuery.sort_by_update()
+       |> Enum.take(count)}
+    end
+  end
+
+  defp first_attribute_filter(attributes) do
+    case Map.to_list(attributes) do
+      [{name, value} | _rest] -> {:ok, {name, attribute_filter_value(value)}}
+      [] -> {:error, "ERR flow attributes must not be empty"}
+    end
+  end
+
+  defp attribute_filter_value([value | _rest]), do: value
+  defp attribute_filter_value(value), do: value
+
+  defp list_records_for_attribute(
+         ctx,
+         type,
+         state,
+         :auto,
+         name,
+         value,
+         count,
+         consistent_projection?
+       ) do
+    Ferricstore.Flow.Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
+      case list_records_for_attribute(
+             ctx,
+             type,
+             state,
+             partition_key,
+             name,
+             value,
+             count,
+             consistent_projection?
+           ) do
+        {:ok, records} -> {:cont, {:ok, RecordQuery.prepend_chunk(records, acc)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, chunks} -> {:ok, RecordQuery.flatten_chunks(chunks)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp list_records_for_attribute(
+         ctx,
+         type,
+         state,
+         partition_key,
+         name,
+         value,
+         count,
+         consistent_projection?
+       ) do
+    query = %{
+      count: count,
+      from_ms: nil,
+      to_ms: nil,
+      rev?: false,
+      state: nil,
+      terminal_only?: false
+    }
+
+    index_key =
+      Ferricstore.Flow.Keys.attribute_index_key(
+        type,
+        state,
+        name,
+        Attributes.index_value(value),
+        partition_key
+      )
+
+    with :ok <- validate_key_size(index_key) do
+      RecordRead.records_for_index(
+        ctx,
+        index_key,
+        partition_key,
+        query,
+        true,
+        consistent_projection?,
+        @default_lmdb_query_scan_limit
+      )
+    end
+  end
+
   defp validate_opts(opts) do
     if Keyword.keyword?(opts), do: :ok, else: {:error, "ERR flow opts must be a keyword list"}
   end
@@ -311,6 +476,8 @@ defmodule Ferricstore.Flow.ReadAPI do
         {:error, "ERR flow count must be a positive integer"}
     end
   end
+
+  defp flow_stats_count(opts), do: flow_count(Keyword.put_new(opts, :count, flow_max_count()))
 
   defp flow_max_count do
     case Application.get_env(:ferricstore, :flow_max_count, @default_max_count) do

@@ -22,6 +22,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
+
       defp forced_single_key_quorum(ctx, key, command) do
         idx = shard_for(ctx, key)
         forced_quorum_write(ctx, idx, command, node())

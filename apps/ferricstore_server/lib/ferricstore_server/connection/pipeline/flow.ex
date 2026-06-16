@@ -127,6 +127,10 @@ defmodule FerricstoreServer.Connection.Pipeline.Flow do
            when is_binary(type) and is_list(opts),
            do: {:ok, ast}
 
+      defp flow_read_op({:command, "FLOW.STATS", _args, {:flow_stats, type, opts} = ast, _keys})
+           when is_binary(type) and is_list(opts),
+           do: {:ok, ast}
+
       defp flow_read_op(
              {:command, "FLOW.TERMINALS", _args, {:flow_terminals, type, opts} = ast, _keys}
            )

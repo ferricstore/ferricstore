@@ -126,5 +126,4 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   # ===========================================================================
   # STREAM commands
   # ===========================================================================
-
 end

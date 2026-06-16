@@ -1049,7 +1049,6 @@ defmodule Ferricstore.Store.Router.Part08 do
       def zpopmax(ctx, key, count) when is_binary(key) and is_integer(count) do
         forced_single_key_quorum(ctx, key, {:zpop, key, count, :max})
       end
-
     end
   end
 end

@@ -7,7 +7,7 @@
 
 **FerricStore is a durable server with Redis-compatible storage and FerricFlow workflow state built in.**
 
-FerricStore gives applications a durable key-value/data-structure store and a workflow layer for worker queues, explicit state machines, retries, leases, history, observability, value refs, signals, and fanout.
+FerricStore gives applications a durable key-value/data-structure store and a workflow layer for worker queues, explicit state machines, retries, leases, history, observability, indexed attributes, value refs, signals, and fanout.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. Applications keep running normal business code; FerricFlow records ownership, lease tokens, attempts, retry timing, history, terminal state, retention metadata, and repair data instead of asking application code to rebuild those pieces around a generic queue.
 
@@ -39,6 +39,7 @@ A Flow is one durable workflow record:
 | `type` | Workflow or queue type, such as `email` or `order`. |
 | `id` | Application-defined Flow id. |
 | `state` | Current durable state, such as `queued`, `created`, or `charged`. |
+| `attributes` | Small indexed metadata for Flow query, stats, and dashboard filters. |
 | `payload` / value refs | Small routing payload plus optional named values stored separately. |
 | lease | Worker claim ownership with fencing. |
 | history | State changes, signals, retries, and terminal events. |

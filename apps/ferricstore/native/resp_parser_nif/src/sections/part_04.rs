@@ -351,6 +351,7 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCancelMany => make_flow_cancel_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowRewind => make_flow_rewind_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowList => make_flow_list_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowStats => make_flow_stats_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowTerminals => make_flow_terminals_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowFailures => make_flow_failures_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowByParent => make_flow_index_query_command_ast(

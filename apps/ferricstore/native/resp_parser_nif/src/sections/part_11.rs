@@ -379,8 +379,8 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"FLOW.BY_PARENT" | b"FLOW.BY_ROOT" | b"FLOW.BY_CORRELATION" => {
             flow_partition_or_first_key_indices(arg_bytes, 1)
         }
-        b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" | b"FLOW.LIST" | b"FLOW.TERMINALS"
-        | b"FLOW.FAILURES" | b"FLOW.INFO" | b"FLOW.STUCK" => {
+        b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" | b"FLOW.LIST" | b"FLOW.STATS"
+        | b"FLOW.TERMINALS" | b"FLOW.FAILURES" | b"FLOW.INFO" | b"FLOW.STUCK" => {
             flow_partition_or_first_key_indices(arg_bytes, 1)
         }
         b"FLOW.POLICY.SET" | b"FLOW.POLICY.GET" => first_n_indices(arg_bytes.len(), 1),

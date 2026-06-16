@@ -57,20 +57,33 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
     partition_key = Map.get(record, :partition_key)
     score = Map.get(record, :updated_at_ms, 0)
 
-    metadata_index_entries(record)
-    |> Enum.map(fn {kind, value} ->
-      key =
-        case kind do
-          :parent -> Flow.Keys.parent_index_key(value, partition_key)
-          :root -> Flow.Keys.root_index_key(value, partition_key)
-          :correlation -> Flow.Keys.correlation_index_key(value, partition_key)
-        end
+    metadata_ops =
+      metadata_index_entries(record)
+      |> Enum.map(fn {kind, value} ->
+        key =
+          case kind do
+            :parent -> Flow.Keys.parent_index_key(value, partition_key)
+            :root -> Flow.Keys.root_index_key(value, partition_key)
+            :correlation -> Flow.Keys.correlation_index_key(value, partition_key)
+          end
 
-      query_key = LMDB.query_index_key(key, record.id, score)
-      state_key = Flow.Keys.state_key(record.id, partition_key)
-      value = LMDB.encode_query_index_value(record.id, score, expire_at_ms, state_key)
-      {:put, query_key, value}
-    end)
+        query_key = LMDB.query_index_key(key, record.id, score)
+        state_key = Flow.Keys.state_key(record.id, partition_key)
+        value = LMDB.encode_query_index_value(record.id, score, expire_at_ms, state_key)
+        {:put, query_key, value}
+      end)
+
+    attribute_ops =
+      record
+      |> Ferricstore.Flow.Attributes.index_entries()
+      |> Enum.map(fn {key, _id, _score} ->
+        query_key = LMDB.query_index_key(key, record.id, score)
+        state_key = Flow.Keys.state_key(record.id, partition_key)
+        value = LMDB.encode_query_index_value(record.id, score, expire_at_ms, state_key)
+        {:put, query_key, value}
+      end)
+
+    metadata_ops ++ attribute_ops
   end
 
   defp do_persist_terminal_counts(stats, counts, lmdb_path) do

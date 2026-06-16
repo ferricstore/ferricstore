@@ -113,7 +113,10 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
     ShardHelpers.wait_default_quorum_writable(60_000)
 
     assert {:ok, %{fired: 1, claimed: 1, errors: []}} =
-             FerricStore.flow_schedule_fire_due(now_ms: now_ms + 100, worker: "scheduler-after-crash")
+             FerricStore.flow_schedule_fire_due(
+               now_ms: now_ms + 100,
+               worker: "scheduler-after-crash"
+             )
 
     assert {:ok, target} =
              FerricStore.flow_get(target_id, partition_key: target_partition, payload: true)
@@ -128,7 +131,10 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
   defp schedule_shard(schedule_id) do
     ctx = FerricStore.Instance.get(:default)
     flow_id = Ferricstore.Flow.Schedule.flow_id(schedule_id)
-    partition_key = "__ferricstore_schedule__:" <> Integer.to_string(:erlang.phash2(schedule_id, 256))
+
+    partition_key =
+      "__ferricstore_schedule__:" <> Integer.to_string(:erlang.phash2(schedule_id, 256))
+
     state_key = Ferricstore.Flow.Keys.state_key(flow_id, partition_key)
 
     Router.shard_for(ctx, state_key)

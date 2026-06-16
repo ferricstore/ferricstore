@@ -117,6 +117,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
       {"Parent", flow_field(record, :parent_flow_id, "-")},
       {"Root", flow_field(record, :root_flow_id, "-")},
       {"Correlation", flow_field(record, :correlation_id, "-")},
+      {"Attributes", {:safe, render_flow_attribute_badges(record)}},
       {"Value Refs", {:safe, render_flow_value_ref_badges(record)}}
     ]
 
@@ -147,6 +148,26 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     </table>
     """
   end
+
+  def render_flow_attribute_badges(record) do
+    attrs = flow_record_attributes(record)
+
+    if map_size(attrs) == 0 do
+      ~s(<span class="badge badge-idle">none</span>)
+    else
+      attrs
+      |> Enum.sort_by(fn {name, _value} -> name end)
+      |> Enum.map_join(" ", fn {name, value} ->
+        label = "#{name}=#{flow_attribute_display_value(value)}"
+        ~s(<span class="badge badge-idle">#{escape(label)}</span>)
+      end)
+    end
+  end
+
+  defp flow_attribute_display_value(value) when is_binary(value), do: value
+  defp flow_attribute_display_value(value) when is_integer(value), do: Integer.to_string(value)
+  defp flow_attribute_display_value(value) when is_boolean(value), do: to_string(value)
+  defp flow_attribute_display_value(value), do: inspect(value)
 
   def render_flow_rewind_action(%{record: %{} = record} = data) do
     targets = flow_rewind_targets(Map.get(data, :history, []))

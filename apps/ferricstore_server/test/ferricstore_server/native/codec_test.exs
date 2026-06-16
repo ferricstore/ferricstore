@@ -128,6 +128,23 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert <<^tag, 2::unsigned-32, _rest::binary>> = payload
   end
 
+  test "compact Flow claim jobs response can include attributes" do
+    attrs = %{"tenant" => "acme"}
+
+    payload =
+      Codec.encode_compact_flow_claim_jobs([
+        ["flow-1", "bucket-1", "lease-1", 42, attrs],
+        ["flow-2", nil, "lease-2", 43, "running:step", %{}]
+      ])
+
+    tag = Codec.compact_tags().flow_claim_jobs
+    encoded_attrs = Codec.encode_value(attrs)
+
+    assert <<^tag, 2::unsigned-32, _rest::binary>> = payload
+    assert :binary.match(payload, encoded_attrs) != :nomatch
+    assert :binary.match(payload, "running:step") != :nomatch
+  end
+
   test "compact Flow record response encodes known atom fields" do
     tag = Codec.compact_tags().flow_record
 

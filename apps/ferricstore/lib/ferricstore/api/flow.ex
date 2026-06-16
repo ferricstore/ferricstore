@@ -663,6 +663,19 @@ defmodule FerricStore.API.Flow do
 
   def flow_list(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Returns bounded Flow stats for `type`, `:state`, and optional `:attributes` filters."
+  @spec flow_stats(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_stats(type, opts \\ [])
+
+  def flow_stats(type, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.stats(default_ctx(), type, opts)
+  end
+
+  def flow_stats(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_stats(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Lists terminal Flow records for `type`, optionally bounded by terminal update time."
   @spec flow_terminals(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
   def flow_terminals(type, opts \\ [])

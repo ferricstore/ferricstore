@@ -667,7 +667,6 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest.Sections.GeoaddOver
           :gen_tcp.close(sock)
         end
       end
-
     end
   end
 end

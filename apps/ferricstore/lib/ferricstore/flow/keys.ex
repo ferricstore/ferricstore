@@ -128,6 +128,14 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> tag(partition_key) <> ":i:c:" <> correlation_id
   end
 
+  def attribute_index_key(type, state, name, value, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:a:" <> type <> ":" <> state <> ":" <> name <> "=" <> value
+  end
+
+  def attribute_index_prefix(type, state, name, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:a:" <> type <> ":" <> state <> ":" <> name <> "="
+  end
+
   def stream_entry_key(id, event_id, partition_key \\ nil) do
     stream_entry_key_from_history_key(history_key(id, partition_key), event_id)
   end

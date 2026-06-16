@@ -172,6 +172,7 @@ defmodule Ferricstore.Commands.Catalog do
               "FLOW.CLAIM_DUE",
               "FLOW.RECLAIM",
               "FLOW.LIST",
+              "FLOW.STATS",
               "FLOW.TERMINALS",
               "FLOW.FAILURES",
               "FLOW.INFO",

@@ -569,6 +569,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
                     next_run_at_ms: nil
                 }
                 |> flow_put_record_value_refs(value_refs)
+                |> flow_apply_attribute_updates(attrs)
                 |> flow_stamp_terminal_retention(now_ms)
 
               with :ok <- flow_validate_terminal_state_index_key(next) do

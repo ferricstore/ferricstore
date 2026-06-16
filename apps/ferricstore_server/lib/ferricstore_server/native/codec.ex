@@ -100,7 +100,8 @@ defmodule FerricstoreServer.Native.Codec do
     "result_size" => 37,
     "error_omitted" => 38,
     "error_size" => 39,
-    "max_attempts" => 40
+    "max_attempts" => 40,
+    "attributes" => 41
   }
 
   @compact_flow_record_atom_field_ids %{
@@ -143,7 +144,8 @@ defmodule FerricstoreServer.Native.Codec do
     result_size: 37,
     error_omitted: 38,
     error_size: 39,
-    max_attempts: 40
+    max_attempts: 40,
+    attributes: 41
   }
 
   @type frame ::
@@ -691,6 +693,30 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
+  defp compact_claim_job_item([id, partition_key, lease_token, fencing_token, attrs])
+       when is_binary(id) and is_binary(lease_token) and is_integer(fencing_token) and
+              is_map(attrs) do
+    case compact_claim_job_item([id, partition_key, lease_token, fencing_token]) do
+      {:ok, item} -> {:ok, [item, encode_value(attrs)]}
+      :error -> :error
+    end
+  end
+
+  defp compact_claim_job_item([id, partition_key, lease_token, fencing_token, run_state, attrs])
+       when is_binary(id) and is_binary(lease_token) and is_integer(fencing_token) and
+              is_map(attrs) do
+    case compact_claim_job_item([id, partition_key, lease_token, fencing_token]) do
+      {:ok, item} when is_binary(run_state) ->
+        {:ok, [item, compact_binary(run_state), encode_value(attrs)]}
+
+      {:ok, item} when is_nil(run_state) ->
+        {:ok, [item, compact_optional_binary(nil), encode_value(attrs)]}
+
+      _ ->
+        :error
+    end
+  end
+
   defp compact_claim_job_item({id, partition_key, lease_token, fencing_token}),
     do: compact_claim_job_item([id, partition_key, lease_token, fencing_token])
 
@@ -699,7 +725,9 @@ defmodule FerricstoreServer.Native.Codec do
       id,
       Map.get(job, "partition_key"),
       Map.get(job, "lease_token"),
-      Map.get(job, "fencing_token")
+      Map.get(job, "fencing_token"),
+      Map.get(job, "run_state") || Map.get(job, "state"),
+      Map.get(job, "attributes", %{})
     ])
   end
 
@@ -708,7 +736,9 @@ defmodule FerricstoreServer.Native.Codec do
       id,
       Map.get(job, :partition_key),
       Map.get(job, :lease_token),
-      Map.get(job, :fencing_token)
+      Map.get(job, :fencing_token),
+      Map.get(job, :run_state) || Map.get(job, :state),
+      Map.get(job, :attributes, %{})
     ])
   end
 
@@ -1784,6 +1814,8 @@ defmodule FerricstoreServer.Native.Codec do
   defp put_return_mode(payload, 0), do: payload
   defp put_return_mode(payload, 1), do: Map.put(payload, "return", "jobs_compact")
   defp put_return_mode(payload, 2), do: Map.put(payload, "return", "jobs_compact_state")
+  defp put_return_mode(payload, 3), do: Map.put(payload, "return", "jobs_compact_attrs")
+  defp put_return_mode(payload, 4), do: Map.put(payload, "return", "jobs_compact_state_attrs")
   defp put_return_mode(payload, _mode), do: payload
 
   defp put_flow_list_return_mode(payload, 0), do: payload

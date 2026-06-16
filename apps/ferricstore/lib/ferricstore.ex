@@ -427,6 +427,7 @@ defmodule FerricStore do
   defdelegate flow_retention_cleanup(opts \\ []), to: FlowAPI
   defdelegate flow_rewind(id, opts), to: FlowAPI
   defdelegate flow_list(type, opts \\ []), to: FlowAPI
+  defdelegate flow_stats(type, opts \\ []), to: FlowAPI
   defdelegate flow_terminals(type, opts \\ []), to: FlowAPI
   defdelegate flow_failures(type, opts \\ []), to: FlowAPI
   defdelegate flow_by_parent(parent_flow_id, opts \\ []), to: FlowAPI

@@ -352,6 +352,9 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
       value when value in [:jobs_compact, :job_compact] ->
         {:ok, :jobs_compact}
 
+      value when value in [:jobs_compact_attrs, :job_compact_attrs] ->
+        {:ok, :jobs_compact_attrs}
+
       value
       when value in [
              :jobs_compact_state,
@@ -360,6 +363,15 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
              :job_compact_with_state
            ] ->
         {:ok, :jobs_compact_state}
+
+      value
+      when value in [
+             :jobs_compact_state_attrs,
+             :job_compact_state_attrs,
+             :jobs_compact_with_state_attrs,
+             :job_compact_with_state_attrs
+           ] ->
+        {:ok, :jobs_compact_state_attrs}
 
       value when is_binary(value) ->
         case String.upcase(value) do
@@ -370,16 +382,28 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
           "JOB" -> {:ok, :jobs}
           "JOBS_COMPACT" -> {:ok, :jobs_compact}
           "JOB_COMPACT" -> {:ok, :jobs_compact}
+          "JOBS_COMPACT_ATTRS" -> {:ok, :jobs_compact_attrs}
+          "JOB_COMPACT_ATTRS" -> {:ok, :jobs_compact_attrs}
+          "JOBS_COMPACT_ATTRIBUTES" -> {:ok, :jobs_compact_attrs}
+          "JOB_COMPACT_ATTRIBUTES" -> {:ok, :jobs_compact_attrs}
           "JOBS_COMPACT_STATE" -> {:ok, :jobs_compact_state}
           "JOB_COMPACT_STATE" -> {:ok, :jobs_compact_state}
           "JOBS_COMPACT_WITH_STATE" -> {:ok, :jobs_compact_state}
           "JOB_COMPACT_WITH_STATE" -> {:ok, :jobs_compact_state}
-          _ -> {:error, "ERR flow claim return must be records, jobs, or jobs_compact"}
+          "JOBS_COMPACT_STATE_ATTRS" -> {:ok, :jobs_compact_state_attrs}
+          "JOB_COMPACT_STATE_ATTRS" -> {:ok, :jobs_compact_state_attrs}
+          "JOBS_COMPACT_WITH_STATE_ATTRS" -> {:ok, :jobs_compact_state_attrs}
+          "JOB_COMPACT_WITH_STATE_ATTRS" -> {:ok, :jobs_compact_state_attrs}
+          "JOBS_COMPACT_STATE_ATTRIBUTES" -> {:ok, :jobs_compact_state_attrs}
+          "JOB_COMPACT_STATE_ATTRIBUTES" -> {:ok, :jobs_compact_state_attrs}
+          "JOBS_COMPACT_WITH_STATE_ATTRIBUTES" -> {:ok, :jobs_compact_state_attrs}
+          "JOB_COMPACT_WITH_STATE_ATTRIBUTES" -> {:ok, :jobs_compact_state_attrs}
+          _ -> {:error, "ERR flow claim return must be records, jobs, or compact jobs"}
         end
 
       _ ->
         {:error,
-         "ERR flow claim return must be records, jobs, jobs_compact, or jobs_compact_state"}
+         "ERR flow claim return must be records, jobs, jobs_compact, jobs_compact_attrs, jobs_compact_state, or jobs_compact_state_attrs"}
     end
   end
 

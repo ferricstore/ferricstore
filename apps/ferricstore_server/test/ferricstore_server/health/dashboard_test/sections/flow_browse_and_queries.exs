@@ -603,6 +603,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(idle, "Enter an id")
           assert String.contains?(idle, "FLOW.HISTORY")
           assert String.contains?(idle, "Flow ID")
+          assert String.contains?(idle, "Attribute key")
+          assert String.contains?(idle, "Attribute value")
+          assert String.contains?(idle, "FLOW.STATS")
           assert String.contains?(idle, ~s(data-flow-query-form))
           assert String.contains?(idle, ~s(data-flow-query-kind))
           assert idle =~ ~r/data-flow-query-field="type"[^>]*hidden/
@@ -649,6 +652,45 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert html =~ ~r/data-flow-query-field="id"[^>]*hidden/
           assert html =~ ~r/name="id"[^>]*disabled/
           assert String.contains?(html, "query-flow")
+        end
+
+        test "query explorer renders stats with attribute filters" do
+          html =
+            Dashboard.render_flow_query_page(%{
+              filters: %{
+                kind: "stats",
+                type: "email",
+                state: "queued",
+                id: nil,
+                partition_key: "tenant-a",
+                attribute_key: "tenant",
+                attribute_value: "acme",
+                limit: 40,
+                from_ms: nil,
+                to_ms: nil,
+                rev: false
+              },
+              available_types: ["email"],
+              total_sampled: 1,
+              sample_limit: 400,
+              result: %{
+                status: :ok,
+                command: "FLOW.STATS",
+                message: "1 matching row",
+                rows: %{
+                  type: "email",
+                  state: "queued",
+                  attributes: %{"tenant" => "acme"},
+                  count: 1
+                }
+              }
+            })
+
+          assert String.contains?(html, "FLOW.STATS")
+          assert String.contains?(html, "Attribute key")
+          assert String.contains?(html, "tenant")
+          assert String.contains?(html, "acme")
+          assert String.contains?(html, "count")
         end
 
         test "query explorer only renders fields relevant to lineage query kind" do

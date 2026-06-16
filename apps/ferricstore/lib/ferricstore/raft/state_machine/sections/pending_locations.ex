@@ -932,25 +932,45 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       defp maybe_queue_lmdb_indexes_for_state_record(
              state,
              state_key,
-             _value,
-             _expire_at_ms,
+             value,
+             expire_at_ms,
              record
            )
            when is_map(record) do
         with_lmdb_mirror_shard(state, fn ->
-          if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-            case Ferricstore.Flow.LMDB.mode() do
-              :lagged ->
-                :ok
+          cond do
+            flow_record_has_indexed_attributes?(record) and is_binary(value) and
+                is_integer(expire_at_ms) ->
+              queue_pending_lmdb_flow_state_projection(state_key, value, expire_at_ms)
 
-              _mode ->
-                queue_pending_lmdb_projection_outbox(state_key, Map.fetch!(record, :version))
-            end
+            Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) ->
+              case Ferricstore.Flow.LMDB.mode() do
+                :lagged ->
+                  :ok
+
+                _mode ->
+                  queue_pending_lmdb_projection_outbox(state_key, Map.fetch!(record, :version))
+              end
+
+            flow_record_has_indexed_attributes?(record) ->
+              queue_pending_lmdb_flow_state_projection_from_source(state_key)
+
+            true ->
+              :ok
           end
         end)
 
         :ok
       end
+
+      defp flow_record_has_indexed_attributes?(record) when is_map(record) do
+        case Map.get(record, :attributes) do
+          attrs when is_map(attrs) -> map_size(attrs) > 0
+          _other -> false
+        end
+      end
+
+      defp flow_record_has_indexed_attributes?(_record), do: false
     end
   end
 end

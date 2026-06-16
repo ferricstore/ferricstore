@@ -316,6 +316,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "terminals" -> "FLOW.TERMINALS"
       "failures" -> "FLOW.FAILURES"
       "stuck" -> "FLOW.STUCK"
+      "stats" -> "FLOW.STATS"
       "history" -> "FLOW.HISTORY"
       "by_parent" -> "FLOW.BY_PARENT"
       "by_root" -> "FLOW.BY_ROOT"

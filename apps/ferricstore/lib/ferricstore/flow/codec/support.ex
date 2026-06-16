@@ -7,7 +7,9 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   @value_bin_magic "FSV2"
   @record_value_refs_key "__value_refs__"
+  @record_attributes_key "__attributes__"
   @history_value_refs_key "value_refs"
+  @history_attributes_key "attributes"
   @record_flag_attempts 1 <<< 0
   @record_flag_fencing_token 1 <<< 1
   @record_flag_next_run_at_ms 1 <<< 2
@@ -157,15 +159,24 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def record_history_meta(record, meta) when is_map(record) and is_map(meta) do
     refs = flow_record_value_refs(record)
+    attributes = Ferricstore.Flow.Attributes.record(record)
 
-    if map_size(refs) == 0 do
-      meta
-    else
-      Map.put_new(meta, @history_value_refs_key, Jason.encode!(encode_value_refs(refs)))
-    end
+    meta
+    |> maybe_put_history_value_refs(refs)
+    |> maybe_put_history_attributes(attributes)
   end
 
   def record_history_meta(_record, meta), do: meta
+
+  defp maybe_put_history_value_refs(meta, refs) when is_map(refs) and map_size(refs) > 0,
+    do: Map.put_new(meta, @history_value_refs_key, Jason.encode!(encode_value_refs(refs)))
+
+  defp maybe_put_history_value_refs(meta, _refs), do: meta
+
+  defp maybe_put_history_attributes(meta, attrs) when is_map(attrs) and map_size(attrs) > 0,
+    do: Map.put_new(meta, @history_attributes_key, Jason.encode!(attrs))
+
+  defp maybe_put_history_attributes(meta, _attrs), do: meta
 
   def history_meta_pair(key, nil), do: [{key, ""}]
   def history_meta_pair(key, value) when is_binary(value), do: [{key, value}]
@@ -226,12 +237,14 @@ defmodule Ferricstore.Flow.Codec.Support do
       |> normalize_child_groups()
 
     refs = flow_record_value_refs(record)
+    attributes = Ferricstore.Flow.Attributes.record(record)
 
-    if map_size(refs) == 0 do
+    if map_size(refs) == 0 and map_size(attributes) == 0 do
       encode_child_groups(child_groups)
     else
       child_groups
-      |> Map.put(@record_value_refs_key, encode_value_refs(refs))
+      |> maybe_put_record_refs(refs)
+      |> maybe_put_record_attributes(attributes)
       |> encode_child_groups()
     end
   end
@@ -246,10 +259,23 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def split_record_sidecar(groups) when is_map(groups) do
     {encoded_refs, child_groups} = Map.pop(groups, @record_value_refs_key, %{})
-    {child_groups, decode_value_refs(encoded_refs)}
+    {encoded_attributes, child_groups} = Map.pop(child_groups, @record_attributes_key, %{})
+
+    {child_groups, decode_value_refs(encoded_refs),
+     Ferricstore.Flow.Attributes.decode_sidecar(encoded_attributes)}
   end
 
-  def split_record_sidecar(_groups), do: {%{}, %{}}
+  def split_record_sidecar(_groups), do: {%{}, %{}, %{}}
+
+  def maybe_put_record_refs(groups, refs) when is_map(refs) and map_size(refs) > 0,
+    do: Map.put(groups, @record_value_refs_key, encode_value_refs(refs))
+
+  def maybe_put_record_refs(groups, _refs), do: groups
+
+  def maybe_put_record_attributes(groups, attrs) when is_map(attrs) and map_size(attrs) > 0,
+    do: Map.put(groups, @record_attributes_key, Ferricstore.Flow.Attributes.encode_sidecar(attrs))
+
+  def maybe_put_record_attributes(groups, _attrs), do: groups
 
   def flow_record_value_refs(record) when is_map(record) do
     record

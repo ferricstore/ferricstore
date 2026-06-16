@@ -434,6 +434,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                     lease_deadline_ms: 0
                 }
                 |> flow_put_record_value_refs(value_refs)
+                |> flow_apply_attribute_updates(attrs)
                 |> flow_stamp_terminal_retention(now_ms)
 
               with :ok <- flow_validate_record_keys(next) do
@@ -501,6 +502,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                   next_run_at_ms: deadline_ms
               }
               |> flow_put_record_value_refs(value_refs)
+              |> flow_apply_attribute_updates(attrs)
 
             with :ok <- flow_validate_claim_next_record_keys(next) do
               {:ok, record, next}
@@ -590,6 +592,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                   lease_deadline_ms: 0
               }
               |> flow_put_record_value_refs(value_refs)
+              |> flow_apply_attribute_updates(attrs)
 
             with :ok <- flow_validate_claim_next_record_keys(next) do
               {:ok, record, next}
@@ -988,6 +991,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                     run_state: nil
                 }
                 |> flow_put_record_value_refs(value_refs)
+                |> flow_apply_attribute_updates(attrs)
                 |> flow_stamp_terminal_retention(now_ms)
 
               with :ok <- flow_validate_claim_next_record_keys(next) do
@@ -1223,6 +1227,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                     next_run_at_ms: nil
                 }
                 |> flow_put_record_value_refs(value_refs)
+                |> flow_apply_attribute_updates(attrs)
                 |> flow_stamp_terminal_retention(now_ms)
 
               with :ok <- flow_validate_terminal_state_index_key(next) do
@@ -1371,6 +1376,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                   next_run_at_ms: nil
               }
               |> flow_put_record_value_refs(value_refs)
+              |> flow_apply_attribute_updates(attrs)
               |> flow_stamp_terminal_retention(now_ms)
 
             with :ok <- flow_validate_terminal_state_index_key(next) do

@@ -847,6 +847,22 @@ fn make_flow_list_command_ast<'a>(
     }
 }
 
+fn make_flow_stats_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_stats");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.stats")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_list_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_failures_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -957,4 +973,3 @@ fn make_flow_retention_cleanup_command_ast<'a>(
         Err(err) => (tag, err).encode(env),
     }
 }
-

@@ -488,6 +488,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
             maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
             maybe_queue_flow_hibernation_candidate(state, key, record, value)
 
+          flow_record_has_indexed_attributes?(record) ->
+            with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
+              maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
+              maybe_queue_flow_hibernation_candidate(state, key, record, value)
+            end
+
           Ferricstore.Flow.LMDB.mode() == :lagged and
               Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) ->
             with :ok <- flow_put_hot(state, key, value, expire_at_ms) do

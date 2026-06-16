@@ -139,6 +139,7 @@ defmodule FerricstoreServer.Native.Commands do
   @op_flow_schedule_fire 0x022A
   @op_flow_schedule_pause 0x022B
   @op_flow_schedule_resume 0x022C
+  @op_flow_stats 0x022D
 
   @control_commands %{
     @op_hello => "HELLO",
@@ -257,7 +258,8 @@ defmodule FerricstoreServer.Native.Commands do
     @op_flow_schedule_list => "FLOW.SCHEDULE.LIST",
     @op_flow_schedule_fire => "FLOW.SCHEDULE.FIRE",
     @op_flow_schedule_pause => "FLOW.SCHEDULE.PAUSE",
-    @op_flow_schedule_resume => "FLOW.SCHEDULE.RESUME"
+    @op_flow_schedule_resume => "FLOW.SCHEDULE.RESUME",
+    @op_flow_stats => "FLOW.STATS"
   }
 
   @commands @control_commands
@@ -280,6 +282,9 @@ defmodule FerricstoreServer.Native.Commands do
     "after_ms" => :after_ms,
     "at_ms" => :at_ms,
     "attempt" => :attempt,
+    "attributes" => :attributes,
+    "attributes_delete" => :attributes_delete,
+    "attributes_merge" => :attributes_merge,
     "backoff" => :backoff,
     "base_ms" => :base_ms,
     "block_ms" => :block_ms,
@@ -1038,6 +1043,9 @@ defmodule FerricstoreServer.Native.Commands do
   defp do_execute(@op_flow_list, payload, state),
     do: flow_list_call(payload, state)
 
+  defp do_execute(@op_flow_stats, payload, state),
+    do: flow_type_opts_call(payload, state, &FerricStore.Impl.flow_stats/3)
+
   defp do_execute(@op_flow_create_many, payload, state) do
     with {:ok, items} <- flow_items(payload, "items", :create),
          {:ok, opts} <- flow_opts(payload, ["partition_key", "items"]) do
@@ -1527,6 +1535,7 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_get,
               @op_flow_history,
               @op_flow_list,
+              @op_flow_stats,
               @op_flow_value_mget,
               @op_flow_policy_get,
               @op_flow_schedule_get,
@@ -1858,6 +1867,7 @@ defmodule FerricstoreServer.Native.Commands do
           "payload_ref",
           "payload_refs",
           "value_refs",
+          "attributes",
           "partition_key",
           "parent_id",
           "root_id",
@@ -1893,6 +1903,9 @@ defmodule FerricstoreServer.Native.Commands do
           "lease_token",
           "result",
           "result_ref",
+          "attributes",
+          "attributes_merge",
+          "attributes_delete",
           "deadline_ms"
         ]
       },
@@ -1904,7 +1917,22 @@ defmodule FerricstoreServer.Native.Commands do
           "to_state",
           "payload",
           "payload_ref",
+          "attributes",
+          "attributes_merge",
+          "attributes_delete",
           "delay_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.STATS" => %{
+        "required" => ["type"],
+        "fields" => [
+          "type",
+          "state",
+          "attributes",
+          "partition_key",
+          "count",
+          "consistent_projection",
           "deadline_ms"
         ]
       },
@@ -1925,6 +1953,9 @@ defmodule FerricstoreServer.Native.Commands do
           "value_refs",
           "drop_values",
           "override_values",
+          "attributes",
+          "attributes_merge",
+          "attributes_delete",
           "now_ms",
           "deadline_ms"
         ]
@@ -1943,6 +1974,7 @@ defmodule FerricstoreServer.Native.Commands do
           "value_refs",
           "drop_values",
           "override_values",
+          "attributes",
           "partition_key",
           "parent_id",
           "root_id",
@@ -5263,6 +5295,10 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp pipeline_flow_read_op(%{opcode: @op_flow_list, body: body}) do
     pipeline_flow_type_read_op(:flow_list, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_stats, body: body}) do
+    pipeline_flow_type_read_op(:flow_stats, body)
   end
 
   defp pipeline_flow_read_op(%{opcode: @op_flow_terminals, body: body}) do

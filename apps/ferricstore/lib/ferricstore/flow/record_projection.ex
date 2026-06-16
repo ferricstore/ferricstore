@@ -20,7 +20,8 @@ defmodule Ferricstore.Flow.RecordProjection do
     :fencing_token,
     :attempts,
     :run_state,
-    :value_refs
+    :value_refs,
+    :attributes
   ]
 
   def meta(record) when is_map(record), do: :maps.with(@meta_keys, record)

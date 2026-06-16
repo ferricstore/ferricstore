@@ -695,7 +695,7 @@ defmodule Ferricstore.Flow.Codec do
          {:ok, rewound_to_event_id, rest} <-
            decode_flagged_bin(flags, @record_flag_rewound_to_event_id, rest, nil),
          {:ok, child_groups, ""} <- decode_record_sidecar(flags, rest) do
-      {child_groups, value_refs} = Support.split_record_sidecar(child_groups)
+      {child_groups, value_refs, attributes} = Support.split_record_sidecar(child_groups)
 
       record =
         %{
@@ -729,6 +729,7 @@ defmodule Ferricstore.Flow.Codec do
           child_groups: Support.normalize_child_groups(child_groups)
         }
         |> maybe_put_decoded_value_refs(value_refs)
+        |> maybe_put_decoded_attributes(attributes)
 
       if is_nil(rewound_to_event_id) do
         record
@@ -812,7 +813,7 @@ defmodule Ferricstore.Flow.Codec do
        ])
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
-      {child_groups, value_refs} = Support.split_record_sidecar(child_groups)
+      {child_groups, value_refs, attributes} = Support.split_record_sidecar(child_groups)
 
       record =
         %{
@@ -846,6 +847,7 @@ defmodule Ferricstore.Flow.Codec do
           child_groups: Support.normalize_child_groups(child_groups)
         }
         |> maybe_put_decoded_value_refs(value_refs)
+        |> maybe_put_decoded_attributes(attributes)
 
       if is_nil(rewound_to_event_id) do
         record
@@ -882,7 +884,7 @@ defmodule Ferricstore.Flow.Codec do
        ])
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
-      {_child_groups, value_refs} = Support.split_record_sidecar(child_groups)
+      {_child_groups, value_refs, attributes} = Support.split_record_sidecar(child_groups)
 
       %{
         id: id,
@@ -905,6 +907,7 @@ defmodule Ferricstore.Flow.Codec do
         run_state: run_state
       }
       |> maybe_put_decoded_value_refs(value_refs)
+      |> maybe_put_decoded_attributes(attributes)
     else
       _ -> raise ArgumentError, "invalid flow record"
     end
@@ -916,6 +919,11 @@ defmodule Ferricstore.Flow.Codec do
     do: Map.put(record, :value_refs, refs)
 
   defp maybe_put_decoded_value_refs(record, _refs), do: record
+
+  defp maybe_put_decoded_attributes(record, attrs) when is_map(attrs) and map_size(attrs) > 0,
+    do: Map.put(record, :attributes, attrs)
+
+  defp maybe_put_decoded_attributes(record, _attrs), do: record
 
   defp decode_history_fields_bin(rest, context) do
     with {:ok, flags, rest} <- decode_int(rest),

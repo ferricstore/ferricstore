@@ -269,6 +269,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           run_state: nil,
           child_groups: %{}
         }
+        |> flow_put_record_attributes(Map.get(attrs, :attributes))
         |> flow_stamp_terminal_retention(now_ms)
       end
 
@@ -629,6 +630,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         do: Map.put(record, :value_refs, refs)
 
       defp flow_put_record_value_refs(record, _refs), do: Map.delete(record, :value_refs)
+
+      defp flow_apply_attribute_updates(record, attrs) do
+        Ferricstore.Flow.Attributes.apply_update(
+          record,
+          Map.get(attrs, :attributes_merge, %{}),
+          Map.get(attrs, :attributes_delete, [])
+        )
+      end
+
+      defp flow_put_record_attributes(record, attrs) when is_map(attrs) and map_size(attrs) > 0,
+        do: Map.put(record, :attributes, attrs)
+
+      defp flow_put_record_attributes(record, _attrs), do: Map.delete(record, :attributes)
 
       defp flow_normalize_value_refs(refs) when is_map(refs) do
         Enum.reduce(refs, %{}, fn
