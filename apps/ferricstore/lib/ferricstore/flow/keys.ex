@@ -136,6 +136,30 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> tag(partition_key) <> ":i:a:" <> type <> ":" <> state <> ":" <> name <> "="
   end
 
+  def attribute_type_index_key(type, name, value, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:at:" <> type <> ":" <> name <> "=" <> value
+  end
+
+  def attribute_type_index_prefix(type, name, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:at:" <> type <> ":" <> name <> "="
+  end
+
+  def attribute_state_index_key(state, name, value, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:as:" <> state <> ":" <> name <> "=" <> value
+  end
+
+  def attribute_state_index_prefix(state, name, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:as:" <> state <> ":" <> name <> "="
+  end
+
+  def attribute_partition_index_key(name, value, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:ap:" <> name <> "=" <> value
+  end
+
+  def attribute_partition_index_prefix(name, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:ap:" <> name <> "="
+  end
+
   def stream_entry_key(id, event_id, partition_key \\ nil) do
     stream_entry_key_from_history_key(history_key(id, partition_key), event_id)
   end

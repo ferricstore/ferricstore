@@ -179,15 +179,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         priority = Map.get(attrs, :priority, 0)
         retention = flow_retention_for_create(state, attrs)
 
-        flow_create_record_with_retention(
-          attrs,
-          id,
-          type,
-          flow_state,
-          now_ms,
-          run_at_ms,
-          priority,
-          retention
+        record =
+          flow_create_record_with_retention(
+            attrs,
+            id,
+            type,
+            flow_state,
+            now_ms,
+            run_at_ms,
+            priority,
+            retention
+          )
+
+        flow_put_record_indexed_attributes(
+          record,
+          flow_indexed_attributes_for_record(state, record)
         )
       end
 
@@ -196,13 +202,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
         case Map.fetch(retention_cache, key) do
           {:ok, retention} ->
-            {flow_create_record_with_resolved_retention(attrs, retention), retention_cache}
+            record = flow_create_record_with_resolved_retention(attrs, retention)
+
+            {flow_put_record_indexed_attributes(
+               record,
+               flow_indexed_attributes_for_record(state, record)
+             ), retention_cache}
 
           :error ->
             retention = flow_retention_for_create(state, attrs)
+            record = flow_create_record_with_resolved_retention(attrs, retention)
 
-            {flow_create_record_with_resolved_retention(attrs, retention),
-             Map.put(retention_cache, key, retention)}
+            {flow_put_record_indexed_attributes(
+               record,
+               flow_indexed_attributes_for_record(state, record)
+             ), Map.put(retention_cache, key, retention)}
         end
       end
 
@@ -632,10 +646,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_put_record_value_refs(record, _refs), do: Map.delete(record, :value_refs)
 
       defp flow_apply_attribute_updates(record, attrs) do
-        Ferricstore.Flow.Attributes.apply_update(
+        record =
+          Ferricstore.Flow.Attributes.apply_update(
+            record,
+            Map.get(attrs, :attributes_merge, %{}),
+            Map.get(attrs, :attributes_delete, [])
+          )
+
+        flow_put_record_indexed_attributes(
           record,
-          Map.get(attrs, :attributes_merge, %{}),
-          Map.get(attrs, :attributes_delete, [])
+          Ferricstore.Flow.Attributes.indexed_names(record)
         )
       end
 
@@ -643,6 +663,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         do: Map.put(record, :attributes, attrs)
 
       defp flow_put_record_attributes(record, _attrs), do: Map.delete(record, :attributes)
+
+      defp flow_put_record_indexed_attributes(record, names),
+        do: Ferricstore.Flow.Attributes.put_indexed_names(record, names)
+
+      defp flow_refresh_indexed_attributes(state, record),
+        do:
+          flow_put_record_indexed_attributes(
+            record,
+            flow_indexed_attributes_for_record(state, record)
+          )
+
+      defp flow_indexed_attributes_for_record(state, record) do
+        case Map.get(record, :attributes) do
+          attrs when is_map(attrs) and map_size(attrs) > 0 ->
+            state
+            |> flow_read_policy(Map.get(record, :type))
+            |> RetryPolicy.indexed_attributes()
+
+          _other ->
+            []
+        end
+      end
 
       defp flow_normalize_value_refs(refs) when is_map(refs) do
         Enum.reduce(refs, %{}, fn

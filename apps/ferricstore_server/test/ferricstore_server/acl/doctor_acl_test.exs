@@ -11,4 +11,14 @@ defmodule FerricstoreServer.ACL.DoctorACLTest do
     assert MapSet.member?(admin, "FERRICSTORE.DOCTOR")
     assert MapSet.member?(dangerous, "FERRICSTORE.DOCTOR")
   end
+
+  test "flow attribute discovery commands are read ACL commands" do
+    assert {:ok, read} = CommandCategories.category_commands("READ")
+    assert {:ok, flow} = CommandCategories.category_commands("FLOW")
+
+    assert MapSet.member?(read, "FLOW.ATTRIBUTES")
+    assert MapSet.member?(read, "FLOW.ATTRIBUTE_VALUES")
+    assert MapSet.member?(flow, "FLOW.ATTRIBUTES")
+    assert MapSet.member?(flow, "FLOW.ATTRIBUTE_VALUES")
+  end
 end

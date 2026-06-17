@@ -663,6 +663,55 @@ defmodule FerricStore.API.Flow do
 
   def flow_list(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Searches Flow records by policy-indexed attributes across optional `:type` and `:state` filters.
+
+  Broad search uses the projected indexes configured by `flow_policy_set/2` `:indexed_attributes`.
+  When `:type` is supplied, every queried attribute key must be indexed by that type policy or the
+  call fails clearly. Use `flow_list/2` with a concrete type/state when you want to filter by normal
+  non-indexed attributes.
+
+  Changing `:indexed_attributes` is future-only for broad indexes: newly created or later-updated
+  records receive the new broad indexes. Existing records remain exact-queryable by `flow_list/2`
+  until a future explicit reprojection/reindex command is added.
+  """
+  @spec flow_search(keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_search(opts \\ [])
+
+  def flow_search(opts) when is_list(opts) do
+    Ferricstore.Flow.search(default_ctx(), opts)
+  end
+
+  def flow_search(_opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Lists policy-indexed Flow attribute keys for `type` and `:state`."
+  @spec flow_attributes(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_attributes(type, opts \\ [])
+
+  def flow_attributes(type, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.attributes(default_ctx(), type, opts)
+  end
+
+  def flow_attributes(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_attributes(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Lists top projected values for a policy-indexed Flow attribute."
+  @spec flow_attribute_values(binary(), binary(), keyword()) ::
+          {:ok, [map()]} | {:error, binary()}
+  def flow_attribute_values(type, attr_name, opts \\ [])
+
+  def flow_attribute_values(type, attr_name, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.attribute_values(default_ctx(), type, attr_name, opts)
+  end
+
+  def flow_attribute_values(type, _attr_name, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_attribute_values(_type, _attr_name, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Returns bounded Flow stats for `type`, `:state`, and optional `:attributes` filters."
   @spec flow_stats(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_stats(type, opts \\ [])

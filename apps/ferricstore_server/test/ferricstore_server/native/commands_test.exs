@@ -47,6 +47,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_signal 0x020D
   @op_flow_list 0x020E
   @op_flow_stats 0x022D
+  @op_flow_attributes 0x022E
+  @op_flow_attribute_values 0x022F
   @op_flow_create_many 0x020F
   @op_flow_transition_many 0x0211
   @op_flow_retry_many 0x0212
@@ -110,6 +112,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "reclaim_expired" in payload.schemas["FLOW.CLAIM_DUE"]["fields"]
     assert "reclaim_ratio" in payload.schemas["FLOW.CLAIM_DUE"]["fields"]
     assert "attributes" in payload.schemas["FLOW.STATS"]["fields"]
+    assert payload.schemas["FLOW.ATTRIBUTES"]["required"] == ["type"]
+    assert payload.schemas["FLOW.ATTRIBUTE_VALUES"]["required"] == ["type", "attribute"]
     assert "AUTH_INVALIDATED" in payload.events
     assert Enum.any?(payload.opcodes, &(&1["name"] == "PIPELINE"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "ROUTE_BATCH"))
@@ -118,6 +122,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.COMPLETE"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SIGNAL"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.STATS"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.ATTRIBUTES"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.ATTRIBUTE_VALUES"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "CAS"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "GET"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "MGET"))
@@ -496,6 +502,147 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert Map.fetch!(stats, :count) == 1
     assert Map.fetch!(stats, :attributes) == %{"tenant" => "acme"}
+  end
+
+  test "native FLOW.ATTRIBUTES and FLOW.ATTRIBUTE_VALUES expose indexed discovery" do
+    ctx = FerricStore.Instance.get(:default)
+    prefix = "native-flow-attrs-#{System.unique_integer([:positive])}"
+    flow_type = prefix <> ":type"
+    partition = prefix <> ":partition"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _policy} =
+             FerricStore.Impl.flow_policy_set(ctx, flow_type, indexed_attributes: ["tenant"])
+
+    for {id, tenant} <- [{"a", "acme"}, {"b", "acme"}, {"c", "beta"}] do
+      assert {:ok, _record, _state} =
+               Commands.execute(
+                 @op_flow_create,
+                 %{
+                   "id" => prefix <> ":" <> id,
+                   "type" => flow_type,
+                   "state" => "queued",
+                   "partition_key" => partition,
+                   "attributes" => %{"tenant" => tenant},
+                   "now_ms" => now,
+                   "run_at_ms" => now
+                 },
+                 state(instance_ctx: ctx)
+               )
+    end
+
+    Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
+
+    assert {:ok, keys, _state} =
+             Commands.execute(
+               @op_flow_attributes,
+               %{
+                 "type" => flow_type,
+                 "state" => "queued",
+                 "partition_key" => partition,
+                 "consistent_projection" => true
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert %{name: "tenant", count: 3} in keys
+
+    assert {:ok, values, _state} =
+             Commands.execute(
+               @op_flow_attribute_values,
+               %{
+                 "type" => flow_type,
+                 "attribute" => "tenant",
+                 "state" => "queued",
+                 "partition_key" => partition,
+                 "consistent_projection" => true
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert values == [%{value: "acme", count: 2}, %{value: "beta", count: 1}]
+  end
+
+  test "PIPELINE dispatches FLOW.STATS and attribute discovery through Flow read pipeline" do
+    ctx = FerricStore.Instance.get(:default)
+    prefix = "native-pipeline-flow-attrs-#{System.unique_integer([:positive])}"
+    flow_type = prefix <> ":type"
+    partition = prefix <> ":partition"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _policy} =
+             FerricStore.Impl.flow_policy_set(ctx, flow_type, indexed_attributes: ["tenant"])
+
+    for {id, tenant} <- [{"a", "acme"}, {"b", "acme"}, {"c", "beta"}] do
+      assert {:ok, _record, _state} =
+               Commands.execute(
+                 @op_flow_create,
+                 %{
+                   "id" => prefix <> ":" <> id,
+                   "type" => flow_type,
+                   "state" => "queued",
+                   "partition_key" => partition,
+                   "attributes" => %{"tenant" => tenant},
+                   "now_ms" => now,
+                   "run_at_ms" => now
+                 },
+                 state(instance_ctx: ctx)
+               )
+    end
+
+    Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
+
+    {status, reply, _state} =
+      Commands.execute(
+        @op_pipeline,
+        %{
+          "return" => "pairs",
+          "commands" => [
+            %{
+              "opcode" => @op_flow_stats,
+              "lane_id" => 1,
+              "request_id" => 1,
+              "body" => %{
+                "type" => flow_type,
+                "state" => "queued",
+                "partition_key" => partition,
+                "attributes" => %{"tenant" => "acme"},
+                "consistent_projection" => true
+              }
+            },
+            %{
+              "opcode" => @op_flow_attributes,
+              "lane_id" => 1,
+              "request_id" => 2,
+              "body" => %{
+                "type" => flow_type,
+                "state" => "queued",
+                "partition_key" => partition,
+                "consistent_projection" => true
+              }
+            },
+            %{
+              "opcode" => @op_flow_attribute_values,
+              "lane_id" => 1,
+              "request_id" => 3,
+              "body" => %{
+                "type" => flow_type,
+                "attribute" => "tenant",
+                "state" => "queued",
+                "partition_key" => partition,
+                "consistent_projection" => true
+              }
+            }
+          ]
+        },
+        state(instance_ctx: ctx, stats_counter: test_stats_counter())
+      )
+
+    assert status == :ok
+    assert [["ok", stats], ["ok", keys], ["ok", values]] = reply
+    assert Map.fetch!(stats, :count) == 2
+    assert %{name: "tenant", count: 3} in keys
+    assert values == [%{value: "acme", count: 2}, %{value: "beta", count: 1}]
   end
 
   test "native FLOW.RUN_STEPS_MANY dispatches deterministic chains" do

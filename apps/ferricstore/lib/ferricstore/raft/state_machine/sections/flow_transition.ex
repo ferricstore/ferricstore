@@ -89,7 +89,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                  logical_state,
                  run_at_ms,
                  now_ms
-               ) do
+               ),
+             next = flow_refresh_indexed_attributes(state, next) do
           flow_apply_reschedule(state, record, next, partition_key, now_ms, attrs)
         end
       end
@@ -110,7 +111,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                  logical_state,
                  run_at_ms,
                  now_ms
-               ) do
+               ),
+             next = flow_refresh_indexed_attributes(state, next) do
           flow_apply_transition(state, record, next, partition_key, now_ms, attrs)
         end
       end
@@ -139,6 +141,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                  lease_ms,
                  now_ms
                ),
+             next = flow_refresh_indexed_attributes(state, next),
              :ok <- flow_apply_step_continue(state, record, next, partition_key, now_ms, attrs) do
           {:ok, next}
         end
@@ -369,7 +372,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                  run_at_ms,
                  now_ms
                ) do
-          {:ok, record, next}
+          {:ok, record, flow_refresh_indexed_attributes(state, next)}
         end
       end
 
@@ -750,6 +753,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                    now_ms
                  ) do
               {:ok, record, next} ->
+                next = flow_refresh_indexed_attributes(state, next)
+
                 {:cont,
                  {:ok, [{record, next, attrs} | acc],
                   flow_merge_record_value_mode(value_mode, flow_attrs_record_value_mode(attrs))}}
@@ -994,6 +999,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                 |> flow_apply_attribute_updates(attrs)
                 |> flow_stamp_terminal_retention(now_ms)
 
+              next = flow_refresh_indexed_attributes(state, next)
+
               with :ok <- flow_validate_claim_next_record_keys(next) do
                 {:ok, record, next,
                  flow_retry_history_meta(record, next, retry_policy, retry_decision)}
@@ -1164,6 +1171,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
               :ok
 
             {:ok, record, next} ->
+              next = flow_refresh_indexed_attributes(state, next)
               flow_apply_fail(state, record, next, partition_key, now_ms, attrs)
 
             {:error, _reason} = error ->
@@ -1315,6 +1323,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
 
         with {:ok, record} <- flow_require_record(state, id, partition_key),
              {:ok, record, next} <- flow_prepare_cancel_existing_record(record, attrs, now_ms),
+             next = flow_refresh_indexed_attributes(state, next),
              :ok <- flow_apply_cancel(state, record, next, attrs, partition_key, now_ms) do
           :ok
         end

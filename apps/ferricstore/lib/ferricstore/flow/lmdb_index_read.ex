@@ -121,8 +121,61 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
     end
   end
 
+  def query_count(ctx, index_key, partition_key, consistent?) do
+    with :ok <- maybe_flush_lmdb_for_index(ctx, index_key, partition_key, consistent?),
+         :ok <- LMDBMirror.require_healthy(ctx, index_key, partition_key) do
+      prefix = LMDB.query_index_prefix(index_key)
+
+      count_lmdb_prefix(ctx, index_key, partition_key, prefix)
+    end
+  end
+
+  def query_prefix_raw_entries(ctx, index_key_prefix, partition_key, count, consistent?)
+      when is_integer(count) and count > 0 do
+    with :ok <- maybe_flush_lmdb_for_index(ctx, index_key_prefix, partition_key, consistent?),
+         :ok <- LMDBMirror.require_healthy(ctx, index_key_prefix, partition_key) do
+      prefix = LMDB.query_index_raw_prefix(index_key_prefix)
+
+      ctx
+      |> lmdb_paths_for_index(index_key_prefix, partition_key)
+      |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
+        case LMDB.prefix_entries(path, prefix, count) do
+          {:ok, entries} -> {:cont, {:ok, [{path, entries} | acc]}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, chunks} -> {:ok, Enum.reverse(chunks)}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  def query_prefix_raw_entries(_ctx, _index_key_prefix, _partition_key, _count, _consistent?),
+    do: {:ok, []}
+
+  def query_prefix_count(ctx, index_key_prefix, partition_key, consistent?) do
+    with :ok <- maybe_flush_lmdb_for_index(ctx, index_key_prefix, partition_key, consistent?),
+         :ok <- LMDBMirror.require_healthy(ctx, index_key_prefix, partition_key) do
+      prefix = LMDB.query_index_raw_prefix(index_key_prefix)
+
+      count_lmdb_prefix(ctx, index_key_prefix, partition_key, prefix)
+    end
+  end
+
   def query_scan_count(count, default_scan_limit) when is_integer(count) and count > 0 do
     LMDBQueryWindow.query_scan_count(count, default_scan_limit)
+  end
+
+  defp count_lmdb_prefix(ctx, index_key, partition_key, prefix) do
+    ctx
+    |> lmdb_paths_for_index(index_key, partition_key)
+    |> Enum.reduce_while({:ok, 0}, fn path, {:ok, acc} ->
+      case LMDB.prefix_count(path, prefix) do
+        {:ok, count} -> {:cont, {:ok, acc + count}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp lmdb_terminal_entries(

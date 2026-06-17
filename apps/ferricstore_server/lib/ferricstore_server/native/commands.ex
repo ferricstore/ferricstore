@@ -140,6 +140,8 @@ defmodule FerricstoreServer.Native.Commands do
   @op_flow_schedule_pause 0x022B
   @op_flow_schedule_resume 0x022C
   @op_flow_stats 0x022D
+  @op_flow_attributes 0x022E
+  @op_flow_attribute_values 0x022F
 
   @control_commands %{
     @op_hello => "HELLO",
@@ -259,7 +261,9 @@ defmodule FerricstoreServer.Native.Commands do
     @op_flow_schedule_fire => "FLOW.SCHEDULE.FIRE",
     @op_flow_schedule_pause => "FLOW.SCHEDULE.PAUSE",
     @op_flow_schedule_resume => "FLOW.SCHEDULE.RESUME",
-    @op_flow_stats => "FLOW.STATS"
+    @op_flow_stats => "FLOW.STATS",
+    @op_flow_attributes => "FLOW.ATTRIBUTES",
+    @op_flow_attribute_values => "FLOW.ATTRIBUTE_VALUES"
   }
 
   @commands @control_commands
@@ -1046,6 +1050,12 @@ defmodule FerricstoreServer.Native.Commands do
   defp do_execute(@op_flow_stats, payload, state),
     do: flow_type_opts_call(payload, state, &FerricStore.Impl.flow_stats/3)
 
+  defp do_execute(@op_flow_attributes, payload, state),
+    do: flow_type_opts_call(payload, state, &FerricStore.Impl.flow_attributes/3)
+
+  defp do_execute(@op_flow_attribute_values, payload, state),
+    do: flow_attribute_values_call(payload, state)
+
   defp do_execute(@op_flow_create_many, payload, state) do
     with {:ok, items} <- flow_items(payload, "items", :create),
          {:ok, opts} <- flow_opts(payload, ["partition_key", "items"]) do
@@ -1275,6 +1285,19 @@ defmodule FerricstoreServer.Native.Commands do
       |> FerricStore.Impl.flow_list(type, read_opts)
       |> FlowRecordProjection.maybe_meta_result(opts)
       |> result_to_reply(state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp flow_attribute_values_call(payload, state) do
+    with {:ok, type} <- require_binary(payload, "type"),
+         {:ok, attr_name} <- require_binary(payload, "attribute"),
+         {:ok, opts} <- flow_opts(payload, ["type", "attribute"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_attribute_values(state.instance_ctx, type, attr_name, opts),
+        state
+      )
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1536,6 +1559,8 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_history,
               @op_flow_list,
               @op_flow_stats,
+              @op_flow_attributes,
+              @op_flow_attribute_values,
               @op_flow_value_mget,
               @op_flow_policy_get,
               @op_flow_schedule_get,
@@ -1930,6 +1955,29 @@ defmodule FerricstoreServer.Native.Commands do
           "type",
           "state",
           "attributes",
+          "partition_key",
+          "count",
+          "consistent_projection",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.ATTRIBUTES" => %{
+        "required" => ["type"],
+        "fields" => [
+          "type",
+          "state",
+          "partition_key",
+          "count",
+          "consistent_projection",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.ATTRIBUTE_VALUES" => %{
+        "required" => ["type", "attribute"],
+        "fields" => [
+          "type",
+          "attribute",
+          "state",
           "partition_key",
           "count",
           "consistent_projection",
@@ -5299,6 +5347,20 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp pipeline_flow_read_op(%{opcode: @op_flow_stats, body: body}) do
     pipeline_flow_type_read_op(:flow_stats, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_attributes, body: body}) do
+    pipeline_flow_type_read_op(:flow_attributes, body)
+  end
+
+  defp pipeline_flow_read_op(%{opcode: @op_flow_attribute_values, body: body}) do
+    with {:ok, type} <- require_binary(body, "type"),
+         {:ok, attr_name} <- require_binary(body, "attribute"),
+         {:ok, opts} <- flow_opts(body, ["type", "attribute"]) do
+      {:ok, {:flow_attribute_values, type, attr_name, opts}}
+    else
+      _error -> :fallback
+    end
   end
 
   defp pipeline_flow_read_op(%{opcode: @op_flow_terminals, body: body}) do

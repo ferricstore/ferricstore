@@ -48,6 +48,31 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
     command(ctx, {:list, type, opts})
   end
 
+  def command(ctx, {:stats, type, opts}) when is_binary(type) and is_list(opts),
+    do: read_result({:stats, type, opts}, fn -> ReadAPI.stats(ctx, type, opts) end)
+
+  def command(ctx, {:flow_stats, type, opts}) do
+    command(ctx, {:stats, type, opts})
+  end
+
+  def command(ctx, {:attributes, type, opts}) when is_binary(type) and is_list(opts),
+    do: read_result({:attributes, type, opts}, fn -> ReadAPI.attributes(ctx, type, opts) end)
+
+  def command(ctx, {:flow_attributes, type, opts}) do
+    command(ctx, {:attributes, type, opts})
+  end
+
+  def command(ctx, {:attribute_values, type, attr_name, opts})
+      when is_binary(type) and is_binary(attr_name) and is_list(opts),
+      do:
+        read_result({:attribute_values, type, attr_name, opts}, fn ->
+          ReadAPI.attribute_values(ctx, type, attr_name, opts)
+        end)
+
+  def command(ctx, {:flow_attribute_values, type, attr_name, opts}) do
+    command(ctx, {:attribute_values, type, attr_name, opts})
+  end
+
   def command(ctx, {:terminals, type, opts}) when is_binary(type) and is_list(opts),
     do: read_result({:terminals, type, opts}, fn -> ReadAPI.terminals(ctx, type, opts) end)
 

@@ -8,6 +8,7 @@ defmodule Ferricstore.Flow.Attributes do
   @max_value_bytes 256
   @max_total_bytes 2_048
   @max_list_values 16
+  @max_indexed_names 3
 
   @type attrs :: %{optional(binary()) => binary() | integer() | float() | boolean() | [binary()]}
 
@@ -106,6 +107,53 @@ defmodule Ferricstore.Flow.Attributes do
 
   def normalize_delete(_values), do: {:error, "ERR flow attributes_delete must be a list"}
 
+  def normalize_name(name), do: normalize_key(name)
+
+  def normalize_indexed_names(values) when values in [nil, []], do: {:ok, []}
+
+  def normalize_indexed_names(values) when is_list(values) do
+    values
+    |> Enum.reduce_while({:ok, []}, fn name, {:ok, acc} ->
+      case normalize_key(name) do
+        {:ok, name} -> {:cont, {:ok, [name | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, names} ->
+        names = names |> Enum.reverse() |> Enum.uniq()
+
+        if length(names) <= @max_indexed_names do
+          {:ok, names}
+        else
+          {:error, "ERR flow indexed_attributes supports at most #{@max_indexed_names} keys"}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def normalize_indexed_names(_values),
+    do: {:error, "ERR flow indexed_attributes must be a list"}
+
+  def indexed_names(record) when is_map(record) do
+    case normalize_indexed_names(Map.get(record, :indexed_attributes, [])) do
+      {:ok, names} -> names
+      {:error, _reason} -> []
+    end
+  end
+
+  def indexed_names(_record), do: []
+
+  def put_indexed_names(record, names) when is_map(record) do
+    case normalize_indexed_names(names) do
+      {:ok, []} -> Map.delete(record, :indexed_attributes)
+      {:ok, names} -> Map.put(record, :indexed_attributes, names)
+      {:error, _reason} -> Map.delete(record, :indexed_attributes)
+    end
+  end
+
   def index_entries(record) when is_map(record) do
     id = Map.get(record, :id)
     type = Map.get(record, :type)
@@ -114,14 +162,27 @@ defmodule Ferricstore.Flow.Attributes do
     score = normalize_score(Map.get(record, :updated_at_ms, 0))
 
     if is_binary(id) and is_binary(type) and is_binary(state) do
-      record
-      |> record()
+      attrs = record(record)
+      indexed = MapSet.new(indexed_names(record))
+
+      attrs
       |> Enum.flat_map(fn {name, value} ->
         value
         |> index_values()
-        |> Enum.map(fn indexed_value ->
-          {Keys.attribute_index_key(type, state, name, index_value(indexed_value), partition_key),
-           id, score}
+        |> Enum.flat_map(fn indexed_value ->
+          value = index_value(indexed_value)
+          exact = {Keys.attribute_index_key(type, state, name, value, partition_key), id, score}
+
+          if MapSet.member?(indexed, name) do
+            [
+              exact,
+              {Keys.attribute_type_index_key(type, name, value, partition_key), id, score},
+              {Keys.attribute_state_index_key(state, name, value, partition_key), id, score},
+              {Keys.attribute_partition_index_key(name, value, partition_key), id, score}
+            ]
+          else
+            [exact]
+          end
         end)
       end)
     else
@@ -265,7 +326,9 @@ defmodule Ferricstore.Flow.Attributes do
   defp index_values(values) when is_list(values), do: values
   defp index_values(value), do: [value]
 
-  def index_value(value) when is_binary(value), do: "s:" <> value
+  def index_value(value) when is_binary(value),
+    do: "s64:" <> Base.url_encode64(value, padding: false)
+
   def index_value(value) when is_integer(value), do: "i:" <> Integer.to_string(value)
 
   def index_value(value) when is_float(value),
@@ -273,6 +336,33 @@ defmodule Ferricstore.Flow.Attributes do
 
   def index_value(true), do: "b:1"
   def index_value(false), do: "b:0"
+
+  def decode_index_value("s64:" <> value) do
+    case Base.url_decode64(value, padding: false) do
+      {:ok, decoded} -> decoded
+      :error -> value
+    end
+  end
+
+  def decode_index_value("s:" <> value), do: value
+
+  def decode_index_value("i:" <> value) do
+    case Integer.parse(value) do
+      {int, ""} -> int
+      _ -> value
+    end
+  end
+
+  def decode_index_value("f:" <> value) do
+    case Float.parse(value) do
+      {float, ""} -> float
+      _ -> value
+    end
+  end
+
+  def decode_index_value("b:1"), do: true
+  def decode_index_value("b:0"), do: false
+  def decode_index_value(value), do: value
 
   defp normalize_score(value) when is_integer(value), do: value
   defp normalize_score(_value), do: 0

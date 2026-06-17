@@ -146,6 +146,15 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_list(type, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_attributes, type, opts}, _store) when is_binary(type) and is_list(opts) do
+    FerricStore.flow_attributes(type, opts) |> normalize_result()
+  end
+
+  def handle_ast({:flow_attribute_values, type, attr_name, opts}, _store)
+      when is_binary(type) and is_binary(attr_name) and is_list(opts) do
+    FerricStore.flow_attribute_values(type, attr_name, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_stats, type, opts}, _store) when is_binary(type) and is_list(opts) do
     FerricStore.flow_stats(type, opts) |> normalize_result()
   end

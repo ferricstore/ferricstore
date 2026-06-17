@@ -110,7 +110,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
            Map.fetch!(record, :state), Map.get(record, :partition_key),
            Map.get(record, :updated_at_ms, 0), state_key, expire_at_ms,
            Map.get(record, :parent_flow_id), Map.get(record, :root_flow_id),
-           Map.get(record, :correlation_id), Ferricstore.Flow.Attributes.record(record)},
+           Map.get(record, :correlation_id), Ferricstore.Flow.Attributes.record(record),
+           Ferricstore.Flow.Attributes.indexed_names(record)},
           acc
         )
       end
@@ -369,7 +370,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_path_op(
         path,
         {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
-         expire_at_ms, parent_flow_id, root_flow_id, correlation_id, attributes},
+         expire_at_ms, parent_flow_id, root_flow_id, correlation_id, attributes,
+         indexed_attributes},
         acc
       )
       when is_binary(id) and is_binary(type) and is_binary(terminal_state) and
@@ -398,7 +400,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
            state: terminal_state,
            partition_key: partition_key,
            updated_at_ms: updated_at_ms,
-           attributes: attributes
+           attributes: attributes,
+           indexed_attributes: indexed_attributes
          }) ++
            terminal_project_metadata_ops(
              id,
@@ -411,7 +414,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
              correlation_id,
              type,
              terminal_state,
-             attributes
+             attributes,
+             indexed_attributes
            )
        )}
     end
@@ -733,7 +737,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         correlation_id,
         type,
         terminal_state,
-        attributes \\ %{}
+        attributes \\ %{},
+        indexed_attributes \\ []
       ) do
     []
     |> terminal_project_metadata_op(
@@ -771,7 +776,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       id,
       score,
       expire_at_ms,
-      state_key
+      state_key,
+      indexed_attributes
     )
   end
 
@@ -784,7 +790,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         id,
         score,
         expire_at_ms,
-        state_key
+        state_key,
+        indexed_attributes
       ) do
     record = %{
       id: id,
@@ -792,7 +799,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       state: terminal_state,
       partition_key: partition_key,
       updated_at_ms: score,
-      attributes: attributes
+      attributes: attributes,
+      indexed_attributes: indexed_attributes
     }
 
     flow_attribute_query_ops(record, expire_at_ms, state_key) ++ ops

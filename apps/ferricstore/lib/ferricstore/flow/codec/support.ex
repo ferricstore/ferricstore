@@ -8,6 +8,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   @value_bin_magic "FSV2"
   @record_value_refs_key "__value_refs__"
   @record_attributes_key "__attributes__"
+  @record_indexed_attributes_key "__indexed_attributes__"
   @history_value_refs_key "value_refs"
   @history_attributes_key "attributes"
   @record_flag_attempts 1 <<< 0
@@ -238,13 +239,15 @@ defmodule Ferricstore.Flow.Codec.Support do
 
     refs = flow_record_value_refs(record)
     attributes = Ferricstore.Flow.Attributes.record(record)
+    indexed_attributes = Ferricstore.Flow.Attributes.indexed_names(record)
 
-    if map_size(refs) == 0 and map_size(attributes) == 0 do
+    if map_size(refs) == 0 and map_size(attributes) == 0 and indexed_attributes == [] do
       encode_child_groups(child_groups)
     else
       child_groups
       |> maybe_put_record_refs(refs)
       |> maybe_put_record_attributes(attributes)
+      |> maybe_put_record_indexed_attributes(indexed_attributes)
       |> encode_child_groups()
     end
   end
@@ -260,12 +263,14 @@ defmodule Ferricstore.Flow.Codec.Support do
   def split_record_sidecar(groups) when is_map(groups) do
     {encoded_refs, child_groups} = Map.pop(groups, @record_value_refs_key, %{})
     {encoded_attributes, child_groups} = Map.pop(child_groups, @record_attributes_key, %{})
+    {indexed_attributes, child_groups} = Map.pop(child_groups, @record_indexed_attributes_key, [])
 
     {child_groups, decode_value_refs(encoded_refs),
-     Ferricstore.Flow.Attributes.decode_sidecar(encoded_attributes)}
+     Ferricstore.Flow.Attributes.decode_sidecar(encoded_attributes),
+     decode_record_indexed_attributes(indexed_attributes)}
   end
 
-  def split_record_sidecar(_groups), do: {%{}, %{}, %{}}
+  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, []}
 
   def maybe_put_record_refs(groups, refs) when is_map(refs) and map_size(refs) > 0,
     do: Map.put(groups, @record_value_refs_key, encode_value_refs(refs))
@@ -276,6 +281,18 @@ defmodule Ferricstore.Flow.Codec.Support do
     do: Map.put(groups, @record_attributes_key, Ferricstore.Flow.Attributes.encode_sidecar(attrs))
 
   def maybe_put_record_attributes(groups, _attrs), do: groups
+
+  def maybe_put_record_indexed_attributes(groups, names) when is_list(names) and names != [],
+    do: Map.put(groups, @record_indexed_attributes_key, names)
+
+  def maybe_put_record_indexed_attributes(groups, _names), do: groups
+
+  def decode_record_indexed_attributes(names) do
+    case Ferricstore.Flow.Attributes.normalize_indexed_names(names) do
+      {:ok, names} -> names
+      {:error, _reason} -> []
+    end
+  end
 
   def flow_record_value_refs(record) when is_map(record) do
     record

@@ -532,6 +532,18 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_list(__instance__(), type, opts)
       end
 
+      def flow_search(opts \\ []) do
+        FerricStore.Impl.flow_search(__instance__(), opts)
+      end
+
+      def flow_attributes(type, opts \\ []) do
+        FerricStore.Impl.flow_attributes(__instance__(), type, opts)
+      end
+
+      def flow_attribute_values(type, attr_name, opts \\ []) do
+        FerricStore.Impl.flow_attribute_values(__instance__(), type, attr_name, opts)
+      end
+
       def flow_stats(type, opts \\ []) do
         FerricStore.Impl.flow_stats(__instance__(), type, opts)
       end

@@ -52,8 +52,14 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
 
   def active_by_state_global_prefix, do: "flow-active-by-state:"
 
+  def query_index_global_prefix, do: "flow-query-index:"
+
+  def query_index_raw_prefix(index_key_prefix) when is_binary(index_key_prefix) do
+    query_index_global_prefix() <> index_key_prefix
+  end
+
   def query_index_prefix(index_key) when is_binary(index_key) do
-    "flow-query-index:" <> index_key <> <<0>>
+    query_index_raw_prefix(index_key) <> <<0>>
   end
 
   def query_index_key(index_key, id, updated_at_ms)

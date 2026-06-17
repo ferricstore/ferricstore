@@ -350,6 +350,9 @@ defmodule Ferricstore.Flow.LMDB do
   def query_index_prefix(index_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.query_index_prefix(index_key)
 
+  def query_index_raw_prefix(index_key_prefix),
+    do: Ferricstore.Flow.LMDB.IndexCodec.query_index_raw_prefix(index_key_prefix)
+
   def query_index_key(index_key, id, updated_at_ms),
     do: Ferricstore.Flow.LMDB.IndexCodec.query_index_key(index_key, id, updated_at_ms)
 

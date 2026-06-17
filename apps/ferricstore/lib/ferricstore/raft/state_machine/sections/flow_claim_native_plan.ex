@@ -505,6 +505,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
               :ok
 
             {:ok, record, next} ->
+              next = flow_refresh_indexed_attributes(state, next)
               flow_apply_complete(state, record, next, partition_key, now_ms, attrs)
 
             {:error, _reason} = error ->

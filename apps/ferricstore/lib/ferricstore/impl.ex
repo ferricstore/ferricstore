@@ -516,6 +516,12 @@ defmodule FerricStore.Impl do
   def flow_cancel(ctx, id, opts \\ []), do: Ferricstore.Flow.cancel(ctx, id, opts)
   def flow_rewind(ctx, id, opts), do: Ferricstore.Flow.rewind(ctx, id, opts)
   def flow_list(ctx, type, opts \\ []), do: Ferricstore.Flow.list(ctx, type, opts)
+  def flow_search(ctx, opts \\ []), do: Ferricstore.Flow.search(ctx, opts)
+  def flow_attributes(ctx, type, opts \\ []), do: Ferricstore.Flow.attributes(ctx, type, opts)
+
+  def flow_attribute_values(ctx, type, attr_name, opts \\ []),
+    do: Ferricstore.Flow.attribute_values(ctx, type, attr_name, opts)
+
   def flow_stats(ctx, type, opts \\ []), do: Ferricstore.Flow.stats(ctx, type, opts)
   def flow_terminals(ctx, type, opts \\ []), do: Ferricstore.Flow.terminals(ctx, type, opts)
   def flow_failures(ctx, type, opts \\ []), do: Ferricstore.Flow.failures(ctx, type, opts)

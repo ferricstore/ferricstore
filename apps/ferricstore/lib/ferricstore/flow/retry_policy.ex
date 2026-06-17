@@ -53,9 +53,16 @@ defmodule Ferricstore.Flow.RetryPolicy do
   def normalize_flow_policy(type, attrs) when is_binary(type) and is_map(attrs) do
     with {:ok, retry} <- optional_retry_override(attrs),
          {:ok, retention} <- optional_retention_override(attrs),
+         {:ok, indexed_attributes} <- optional_indexed_attributes(attrs),
          {:ok, states} <- normalize_state_policies(fetch_policy(attrs, :states, "states", %{})) do
       policy =
-        %{type: type, retry: retry, retention: retention, states: states}
+        %{
+          type: type,
+          retry: retry,
+          retention: retention,
+          states: states,
+          indexed_attributes: indexed_attributes
+        }
         |> drop_nil_policy_fields()
 
       {:ok, policy}
@@ -109,6 +116,15 @@ defmodule Ferricstore.Flow.RetryPolicy do
     |> merge_retention(command_override)
     |> normalize_resolved_retention_caps()
   end
+
+  def indexed_attributes(%{indexed_attributes: names}) when is_list(names) do
+    case Ferricstore.Flow.Attributes.normalize_indexed_names(names) do
+      {:ok, names} -> names
+      {:error, _reason} -> []
+    end
+  end
+
+  def indexed_attributes(_policy), do: []
 
   def normalize_retention_override(nil), do: {:ok, nil}
 
@@ -327,6 +343,16 @@ defmodule Ferricstore.Flow.RetryPolicy do
       attrs
       |> fetch_policy(:retention, "retention", nil)
       |> normalize_retention_override()
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp optional_indexed_attributes(attrs) do
+    if has_policy_key?(attrs, :indexed_attributes, "indexed_attributes") do
+      attrs
+      |> fetch_policy(:indexed_attributes, "indexed_attributes", [])
+      |> Ferricstore.Flow.Attributes.normalize_indexed_names()
     else
       {:ok, nil}
     end
@@ -563,6 +589,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
     policy
     |> drop_nil_field(:retry)
     |> drop_nil_field(:retention)
+    |> drop_nil_field(:indexed_attributes)
   end
 
   defp drop_nil_field(policy, key) do
