@@ -96,6 +96,48 @@ defmodule Ferricstore.Store.Router.Part07 do
         end
       end
 
+      @doc false
+      def flow_claim_due_presence(ctx, %{partition_keys: [_ | _] = partition_keys} = attrs) do
+        partition_keys
+        |> Enum.uniq()
+        |> Enum.reduce_while(:empty, fn partition_key, :empty ->
+          attrs =
+            attrs
+            |> Map.delete(:partition_keys)
+            |> Map.put(:partition_key, partition_key)
+
+          case flow_claim_due_presence(ctx, attrs) do
+            :empty -> {:cont, :empty}
+            _maybe -> {:halt, :maybe}
+          end
+        end)
+      end
+
+      def flow_claim_due_presence(ctx, %{partition_key: partition_key} = attrs)
+          when partition_key not in [:any, :auto] do
+        type = Map.fetch!(attrs, :type)
+        requested_state = Map.get(attrs, :state)
+        state = flow_claim_route_state(requested_state)
+        priority = Map.get(attrs, :priority)
+        key = Ferricstore.Flow.Keys.due_key(type, state, priority || 0, partition_key)
+        idx = shard_for(ctx, key)
+
+        case flow_claim_due_empty_precheck(
+               ctx,
+               idx,
+               type,
+               requested_state,
+               priority,
+               partition_key,
+               attrs
+             ) do
+          :empty -> :empty
+          _other -> :maybe
+        end
+      end
+
+      def flow_claim_due_presence(_ctx, _attrs), do: :maybe
+
       defp flow_claim_due_auto_partition(ctx, attrs, start_idx, limit) do
         flow_claim_due_auto_partition(ctx, attrs, start_idx, limit, 0, [])
       end
