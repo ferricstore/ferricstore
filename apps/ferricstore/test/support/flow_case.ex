@@ -20,6 +20,7 @@ defmodule Ferricstore.Test.FlowCase do
       setup do
         ShardHelpers.flush_all_keys()
         ShardHelpers.reset_memory_guard_pressure()
+        Ferricstore.Flow.Governance.LimitCache.clear()
         :ok
       end
 

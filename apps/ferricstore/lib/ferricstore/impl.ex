@@ -522,6 +522,84 @@ defmodule FerricStore.Impl do
   def flow_attribute_values(ctx, type, attr_name, opts \\ []),
     do: Ferricstore.Flow.attribute_values(ctx, type, attr_name, opts)
 
+  def flow_effect_reserve(ctx, id, effect_key, effect_type, opts \\ []),
+    do: Ferricstore.Flow.effect_reserve(ctx, id, effect_key, effect_type, opts)
+
+  def flow_effect_confirm(ctx, id, effect_key, opts \\ []),
+    do: Ferricstore.Flow.effect_confirm(ctx, id, effect_key, opts)
+
+  def flow_effect_fail(ctx, id, effect_key, opts \\ []),
+    do: Ferricstore.Flow.effect_fail(ctx, id, effect_key, opts)
+
+  def flow_effect_compensate(ctx, id, effect_key, opts \\ []),
+    do: Ferricstore.Flow.effect_compensate(ctx, id, effect_key, opts)
+
+  def flow_effect_get(ctx, id, effect_key, opts \\ []),
+    do: Ferricstore.Flow.effect_get(ctx, id, effect_key, opts)
+
+  def flow_governance_ledger(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.governance_ledger(ctx, id, opts)
+
+  def flow_approval_request(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.approval_request(ctx, id, opts)
+
+  def flow_approval_approve(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.approval_approve(ctx, id, opts)
+
+  def flow_approval_reject(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.approval_reject(ctx, id, opts)
+
+  def flow_approval_get(ctx, id, opts \\ []),
+    do: Ferricstore.Flow.approval_get(ctx, id, opts)
+
+  def flow_approval_list(ctx, opts \\ []),
+    do: Ferricstore.Flow.approval_list(ctx, opts)
+
+  def flow_governance_overview(ctx, opts \\ []),
+    do: Ferricstore.Flow.governance_overview(ctx, opts)
+
+  def flow_circuit_open(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.circuit_open(ctx, scope, opts)
+
+  def flow_circuit_close(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.circuit_close(ctx, scope, opts)
+
+  def flow_circuit_get(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.circuit_get(ctx, scope, opts)
+
+  def flow_circuit_list(ctx, opts \\ []),
+    do: Ferricstore.Flow.circuit_list(ctx, opts)
+
+  def flow_budget_reserve(ctx, scope, amount, opts \\ []),
+    do: Ferricstore.Flow.budget_reserve(ctx, scope, amount, opts)
+
+  def flow_budget_commit(ctx, scope, reservation_id, actual_amount, opts \\ []),
+    do: Ferricstore.Flow.budget_commit(ctx, scope, reservation_id, actual_amount, opts)
+
+  def flow_budget_release(ctx, scope, reservation_id, opts \\ []),
+    do: Ferricstore.Flow.budget_release(ctx, scope, reservation_id, opts)
+
+  def flow_budget_get(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.budget_get(ctx, scope, opts)
+
+  def flow_budget_list(ctx, opts \\ []),
+    do: Ferricstore.Flow.budget_list(ctx, opts)
+
+  def flow_limit_lease(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.limit_lease(ctx, scope, opts)
+
+  def flow_limit_spend(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.limit_spend(ctx, scope, opts)
+
+  def flow_limit_release(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.limit_release(ctx, scope, opts)
+
+  def flow_limit_get(ctx, scope, opts \\ []),
+    do: Ferricstore.Flow.limit_get(ctx, scope, opts)
+
+  def flow_limit_list(ctx, opts \\ []),
+    do: Ferricstore.Flow.limit_list(ctx, opts)
+
   def flow_stats(ctx, type, opts \\ []), do: Ferricstore.Flow.stats(ctx, type, opts)
   def flow_terminals(ctx, type, opts \\ []), do: Ferricstore.Flow.terminals(ctx, type, opts)
   def flow_failures(ctx, type, opts \\ []), do: Ferricstore.Flow.failures(ctx, type, opts)

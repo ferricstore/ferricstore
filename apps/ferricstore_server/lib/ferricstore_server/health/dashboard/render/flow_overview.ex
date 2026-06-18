@@ -59,6 +59,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
           "Durable schedule list, pause/resume/delete, and manual fire"},
          {"policies", "/dashboard/flow/policies", "Policies",
           "Retry and retention policy editor"},
+         {"governance", "/dashboard/flow/governance", "Governance",
+          "Approvals, budgets, limits, and governed effect controls"},
          {"retention", "/dashboard/flow/retention", "Retention",
           "Terminal cleanup and disk-pressure maintenance"}
        ]}

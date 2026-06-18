@@ -430,6 +430,32 @@ defmodule FerricStore do
   defdelegate flow_search(opts \\ []), to: FlowAPI
   defdelegate flow_attributes(type, opts \\ []), to: FlowAPI
   defdelegate flow_attribute_values(type, attr_name, opts \\ []), to: FlowAPI
+  defdelegate flow_effect_reserve(id, effect_key, effect_type, opts \\ []), to: FlowAPI
+  defdelegate flow_effect_confirm(id, effect_key, opts \\ []), to: FlowAPI
+  defdelegate flow_effect_fail(id, effect_key, opts \\ []), to: FlowAPI
+  defdelegate flow_effect_compensate(id, effect_key, opts \\ []), to: FlowAPI
+  defdelegate flow_effect_get(id, effect_key, opts \\ []), to: FlowAPI
+  defdelegate flow_governance_ledger(id, opts \\ []), to: FlowAPI
+  defdelegate flow_approval_request(id, opts \\ []), to: FlowAPI
+  defdelegate flow_approval_approve(id, opts \\ []), to: FlowAPI
+  defdelegate flow_approval_reject(id, opts \\ []), to: FlowAPI
+  defdelegate flow_approval_get(id, opts \\ []), to: FlowAPI
+  defdelegate flow_approval_list(opts \\ []), to: FlowAPI
+  defdelegate flow_governance_overview(opts \\ []), to: FlowAPI
+  defdelegate flow_circuit_open(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_circuit_close(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_circuit_get(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_circuit_list(opts \\ []), to: FlowAPI
+  defdelegate flow_budget_reserve(scope, amount, opts \\ []), to: FlowAPI
+  defdelegate flow_budget_commit(scope, reservation_id, actual_amount, opts \\ []), to: FlowAPI
+  defdelegate flow_budget_release(scope, reservation_id, opts \\ []), to: FlowAPI
+  defdelegate flow_budget_get(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_budget_list(opts \\ []), to: FlowAPI
+  defdelegate flow_limit_lease(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_limit_spend(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_limit_release(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_limit_get(scope, opts \\ []), to: FlowAPI
+  defdelegate flow_limit_list(opts \\ []), to: FlowAPI
   defdelegate flow_stats(type, opts \\ []), to: FlowAPI
   defdelegate flow_terminals(type, opts \\ []), to: FlowAPI
   defdelegate flow_failures(type, opts \\ []), to: FlowAPI

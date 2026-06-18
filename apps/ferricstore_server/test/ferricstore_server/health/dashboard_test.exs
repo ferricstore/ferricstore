@@ -32,6 +32,8 @@ defmodule FerricstoreServer.Health.DashboardTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
+    {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+
     protected_mode = Application.get_env(:ferricstore, :protected_mode)
 
     Application.put_env(:ferricstore, :protected_mode, false)
@@ -48,6 +50,86 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  test "Flow governance budget table renders remaining overage and reservation columns" do
+    html =
+      FerricstoreServer.Health.Dashboard.Render.FlowGovernance.render_flow_governance_budgets([
+        %{
+          scope: "tenant-a",
+          used: 120,
+          remaining: 0,
+          limit: 100,
+          over_budget: true,
+          reservations_count: 2,
+          window_ms: 60_000,
+          window_start_ms: 1_000
+        }
+      ])
+
+    assert String.contains?(html, "Remaining")
+    assert String.contains?(html, "Reservations")
+    assert String.contains?(html, "tenant-a")
+    assert String.contains?(html, "status-bad")
+  end
+
+  test "Flow governance circuit table renders status metrics and actions" do
+    circuits = [
+      %{
+        scope: "effect:payment.charge",
+        status: :open,
+        failure_count: 5,
+        failure_threshold: 3,
+        retry_after_ms: 20_000,
+        last_failure_ms: 1_000,
+        updated_at_ms: 2_000,
+        events: [
+          %{at_ms: 2_000, kind: :opened, status: :open, failures: 5},
+          %{
+            at_ms: 1_900,
+            kind: :slow_call,
+            status: :closed,
+            failures: 4,
+            latency_ms: 2_500,
+            error_class: "TimeoutError"
+          }
+        ]
+      }
+    ]
+
+    html =
+      FerricstoreServer.Health.Dashboard.Render.FlowGovernance.render_flow_governance_circuits(
+        circuits
+      )
+
+    assert String.contains?(html, "effect:payment.charge")
+    assert String.contains?(html, "status-bad")
+    assert String.contains?(html, "20.0K ms")
+    assert String.contains?(html, "close_circuit")
+
+    timeline_html =
+      FerricstoreServer.Health.Dashboard.Render.FlowGovernance.render_flow_governance_circuit_timeline(
+        circuits
+      )
+
+    assert String.contains?(timeline_html, "Circuit Timeline")
+    assert String.contains?(timeline_html, "slow_call")
+    assert String.contains?(timeline_html, "TimeoutError")
+    assert String.contains?(timeline_html, "2.5K ms")
+  end
+
+  test "Flow governance query parser supports circuit status filters and flash" do
+    opts =
+      Dashboard.flow_governance_opts_from_query(
+        "scope=tenant-a&circuit_status=open&status=ok&message=closed"
+      )
+
+    assert Keyword.fetch!(opts, :scope) == "tenant-a"
+    assert Keyword.fetch!(opts, :circuit_status) == "open"
+    assert Keyword.fetch!(opts, :flash) == %{kind: :ok, message: "closed"}
+
+    assert Dashboard.flow_governance_form_command(%{"action" => "open_circuit"}) ==
+             "FLOW.CIRCUIT.OPEN"
+  end
 
   def handle_dashboard_flow_lookup_event(event, measurements, metadata, parent) do
     send(parent, {:dashboard_flow_lookup, event, measurements, metadata})

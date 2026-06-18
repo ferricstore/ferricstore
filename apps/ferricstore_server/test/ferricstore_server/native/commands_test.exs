@@ -41,6 +41,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_create 0x0201
   @op_flow_get 0x0202
   @op_flow_claim_due 0x0203
+  @op_flow_complete 0x0204
   @op_flow_history 0x020A
   @op_flow_value_put 0x020B
   @op_flow_value_mget 0x020C
@@ -65,6 +66,31 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_schedule_fire 0x022A
   @op_flow_schedule_pause 0x022B
   @op_flow_schedule_resume 0x022C
+  @op_flow_effect_reserve 0x0240
+  @op_flow_effect_confirm 0x0241
+  @op_flow_effect_fail 0x0242
+  @op_flow_effect_compensate 0x0243
+  @op_flow_effect_get 0x0244
+  @op_flow_governance_ledger 0x0245
+  @op_flow_approval_request 0x0246
+  @op_flow_approval_approve 0x0247
+  @op_flow_approval_reject 0x0248
+  @op_flow_approval_get 0x0249
+  @op_flow_circuit_open 0x024A
+  @op_flow_circuit_close 0x024B
+  @op_flow_circuit_get 0x024C
+  @op_flow_budget_reserve 0x024D
+  @op_flow_budget_get 0x024E
+  @op_flow_limit_lease 0x024F
+  @op_flow_limit_spend 0x0250
+  @op_flow_limit_release 0x0251
+  @op_flow_limit_get 0x0252
+  @op_flow_approval_list 0x0253
+  @op_flow_governance_overview 0x0254
+  @op_flow_budget_list 0x0255
+  @op_flow_limit_list 0x0256
+  @op_flow_budget_commit 0x0257
+  @op_flow_budget_release 0x0258
 
   setup do
     ConnRegistry.init_table()
@@ -156,6 +182,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.DELETE"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.FIRE_DUE"))
     assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.SCHEDULE.LIST"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.BUDGET.COMMIT"))
+    assert Enum.any?(payload.opcodes, &(&1["name"] == "FLOW.BUDGET.RELEASE"))
 
     assert payload.schemas["FLOW.VALUE.MGET"]["fields"] == [
              "refs",
@@ -561,6 +589,466 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert values == [%{value: "acme", count: 2}, %{value: "beta", count: 1}]
+  end
+
+  test "native FLOW.EFFECT commands reserve and update governed side effects" do
+    ctx = FerricStore.Instance.get(:default)
+    prefix = "native-flow-effect-#{System.unique_integer([:positive])}"
+    id = prefix <> ":flow"
+    flow_type = prefix <> ":type"
+    partition = prefix <> ":partition"
+
+    assert {:ok, _policy} =
+             FerricStore.Impl.flow_policy_set(ctx, flow_type,
+               governance: %{effects: %{allowed: ["email.send"]}}
+             )
+
+    assert :ok =
+             FerricStore.Impl.flow_create(ctx, id,
+               type: flow_type,
+               state: "queued",
+               partition_key: partition,
+               now_ms: 1_000,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.Impl.flow_claim_due(ctx, flow_type,
+               states: ["queued"],
+               partition_key: partition,
+               worker: "native-worker",
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    reserve_body = %{
+      "id" => id,
+      "effect_key" => "send-email",
+      "effect_type" => "email.send",
+      "partition_key" => partition,
+      "lease_token" => claimed.lease_token,
+      "fencing_token" => claimed.fencing_token,
+      "operation_digest" => "digest-1",
+      "idempotency_key" => "idem-1",
+      "now_ms" => 1_002
+    }
+
+    assert {:ok, reserved, _state} =
+             Commands.execute(@op_flow_effect_reserve, reserve_body, state(instance_ctx: ctx))
+
+    assert reserved.status == :reserved
+    assert reserved.effect_type == "email.send"
+
+    assert {:ok, confirmed, _state} =
+             Commands.execute(
+               @op_flow_effect_confirm,
+               Map.merge(reserve_body, %{
+                 "external_id" => "mail-123",
+                 "latency_ms" => 42,
+                 "now_ms" => 1_003
+               }),
+               state(instance_ctx: ctx)
+             )
+
+    assert confirmed.status == :confirmed
+    assert confirmed.external_id == "mail-123"
+    assert confirmed.latency_ms == 42
+
+    assert {:ok, fetched, _state} =
+             Commands.execute(
+               @op_flow_effect_get,
+               %{"id" => id, "effect_key" => "send-email", "partition_key" => partition},
+               state(instance_ctx: ctx)
+             )
+
+    assert fetched.status == :confirmed
+    assert fetched.external_id == "mail-123"
+
+    fail_body =
+      Map.merge(reserve_body, %{
+        "effect_key" => "send-email-fail",
+        "operation_digest" => "digest-fail",
+        "idempotency_key" => "idem-fail",
+        "now_ms" => 1_004
+      })
+
+    assert {:ok, _reserved, _state} =
+             Commands.execute(@op_flow_effect_reserve, fail_body, state(instance_ctx: ctx))
+
+    assert {:ok, failed, _state} =
+             Commands.execute(
+               @op_flow_effect_fail,
+               Map.merge(fail_body, %{"error" => "smtp timeout", "now_ms" => 1_005}),
+               state(instance_ctx: ctx)
+             )
+
+    assert failed.status == :failed
+    assert failed.error == "smtp timeout"
+
+    compensate_body =
+      Map.merge(reserve_body, %{
+        "effect_key" => "send-email-compensate",
+        "operation_digest" => "digest-compensate",
+        "idempotency_key" => "idem-compensate",
+        "now_ms" => 1_006
+      })
+
+    assert {:ok, _reserved, _state} =
+             Commands.execute(@op_flow_effect_reserve, compensate_body, state(instance_ctx: ctx))
+
+    assert {:ok, compensated, _state} =
+             Commands.execute(
+               @op_flow_effect_compensate,
+               Map.put(compensate_body, "now_ms", 1_007),
+               state(instance_ctx: ctx)
+             )
+
+    assert compensated.status == :compensated
+
+    assert {:ok, ledger, _state} =
+             Commands.execute(
+               @op_flow_governance_ledger,
+               %{
+                 "id" => id,
+                 "partition_key" => partition,
+                 "rev" => true,
+                 "limit" => 1
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert [%{kind: :effect_compensated}] = ledger
+
+    approval_id = prefix <> ":approval"
+
+    assert {:ok, approval, _state} =
+             Commands.execute(
+               @op_flow_approval_request,
+               %{
+                 "id" => approval_id,
+                 "flow_id" => id,
+                 "scope" => partition,
+                 "reason" => "manual review",
+                 "requested_by" => "native-worker",
+                 "assignees" => ["ops"],
+                 "policy_hash" => "policy-hash-1",
+                 "policy_version" => 2,
+                 "timeout_ms" => 30_000,
+                 "expires_at_ms" => 31_008,
+                 "now_ms" => 1_008
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert approval.status == :pending
+    assert approval.assignees == ["ops"]
+    assert approval.policy_hash == "policy-hash-1"
+    assert approval.policy_version == 2
+
+    assert {:ok, approved, _state} =
+             Commands.execute(
+               @op_flow_approval_approve,
+               %{"id" => approval_id, "approver" => "admin", "now_ms" => 1_009},
+               state(instance_ctx: ctx)
+             )
+
+    assert approved.status == :approved
+
+    assert {:ok, fetched_approval, _state} =
+             Commands.execute(
+               @op_flow_approval_get,
+               %{"id" => approval_id},
+               state(instance_ctx: ctx)
+             )
+
+    assert fetched_approval.status == :approved
+
+    reject_id = prefix <> ":approval-reject"
+
+    assert {:ok, _approval, _state} =
+             Commands.execute(
+               @op_flow_approval_request,
+               %{"id" => reject_id, "flow_id" => id, "scope" => partition, "now_ms" => 1_010},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, rejected, _state} =
+             Commands.execute(
+               @op_flow_approval_reject,
+               %{"id" => reject_id, "approver" => "admin", "now_ms" => 1_011},
+               state(instance_ctx: ctx)
+             )
+
+    assert rejected.status == :rejected
+
+    assert {:ok, approvals, _state} =
+             Commands.execute(
+               @op_flow_approval_list,
+               %{"scope" => partition, "limit" => 20},
+               state(instance_ctx: ctx)
+             )
+
+    assert Enum.any?(approvals, &(&1.id == approval_id))
+    assert Enum.any?(approvals, &(&1.id == reject_id))
+
+    assert {:ok, circuit, _state} =
+             Commands.execute(
+               @op_flow_circuit_open,
+               %{"scope" => "effect:email.send", "open_ms" => 1_000, "now_ms" => 1_012},
+               state(instance_ctx: ctx)
+             )
+
+    assert circuit.status == :open
+
+    assert {:ok, fetched_circuit, _state} =
+             Commands.execute(
+               @op_flow_circuit_get,
+               %{"scope" => "effect:email.send"},
+               state(instance_ctx: ctx)
+             )
+
+    assert fetched_circuit.status == :open
+
+    assert {:ok, closed_circuit, _state} =
+             Commands.execute(
+               @op_flow_circuit_close,
+               %{"scope" => "effect:email.send", "now_ms" => 1_013},
+               state(instance_ctx: ctx)
+             )
+
+    assert closed_circuit.status == :closed
+
+    budget_scope = prefix <> ":budget"
+
+    assert {:ok, budget, _state} =
+             Commands.execute(
+               @op_flow_budget_reserve,
+               %{
+                 "scope" => budget_scope,
+                 "amount" => 10,
+                 "limit" => 20,
+                 "window_ms" => 60_000,
+                 "reservation_id" => "budget-res-1",
+                 "now_ms" => 1_014
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert budget.used == 10
+    assert budget.reservation_id == "budget-res-1"
+
+    assert {:ok, budget_commit, _state} =
+             Commands.execute(
+               @op_flow_budget_commit,
+               %{
+                 "scope" => budget_scope,
+                 "reservation_id" => "budget-res-1",
+                 "actual_amount" => 7,
+                 "usage" => %{"tokens" => 7},
+                 "now_ms" => 1_015
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert budget_commit.used == 7
+    assert budget_commit.actual_amount == 7
+    assert budget_commit.status == :committed
+
+    assert {:ok, fetched_budget, _state} =
+             Commands.execute(
+               @op_flow_budget_get,
+               %{"scope" => budget_scope},
+               state(instance_ctx: ctx)
+             )
+
+    assert fetched_budget.used == 7
+
+    assert {:ok, unused_budget, _state} =
+             Commands.execute(
+               @op_flow_budget_reserve,
+               %{
+                 "scope" => budget_scope,
+                 "amount" => 5,
+                 "reservation_id" => "budget-res-unused",
+                 "now_ms" => 1_016
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert unused_budget.used == 12
+
+    assert {:ok, released_budget, _state} =
+             Commands.execute(
+               @op_flow_budget_release,
+               %{
+                 "scope" => budget_scope,
+                 "reservation_id" => "budget-res-unused",
+                 "now_ms" => 1_017
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert released_budget.used == 7
+    assert released_budget.status == :released
+
+    assert {:ok, budgets, _state} =
+             Commands.execute(
+               @op_flow_budget_list,
+               %{"limit" => 20},
+               state(instance_ctx: ctx)
+             )
+
+    assert Enum.any?(budgets, &(&1.scope == budget_scope))
+
+    limit_scope = prefix <> ":limit"
+
+    assert {:ok, limit_reply, _state} =
+             Commands.execute(
+               @op_flow_limit_lease,
+               %{
+                 "scope" => limit_scope,
+                 "shard_id" => 1,
+                 "amount" => 6,
+                 "limit" => 10,
+                 "ttl_ms" => 1_000,
+                 "now_ms" => 1_015
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert limit_reply.owner.free == 4
+    assert limit_reply.lease.available == 6
+
+    assert {:ok, spend_reply, _state} =
+             Commands.execute(
+               @op_flow_limit_spend,
+               %{"scope" => limit_scope, "shard_id" => 1, "amount" => 4, "now_ms" => 1_016},
+               state(instance_ctx: ctx)
+             )
+
+    assert spend_reply.lease.in_use == 4
+
+    assert {:ok, released_owner, _state} =
+             Commands.execute(
+               @op_flow_limit_release,
+               %{"scope" => limit_scope, "shard_id" => 1, "amount" => 4},
+               state(instance_ctx: ctx)
+             )
+
+    assert released_owner.leases[1].in_use == 0
+
+    assert {:ok, fetched_limit, _state} =
+             Commands.execute(
+               @op_flow_limit_get,
+               %{"scope" => limit_scope, "now_ms" => 1_017},
+               state(instance_ctx: ctx)
+             )
+
+    assert fetched_limit.scope == limit_scope
+
+    assert {:ok, limits, _state} =
+             Commands.execute(
+               @op_flow_limit_list,
+               %{"limit" => 20},
+               state(instance_ctx: ctx)
+             )
+
+    assert Enum.any?(limits, &(&1.scope == limit_scope))
+
+    assert {:ok, overview, _state} =
+             Commands.execute(
+               @op_flow_governance_overview,
+               %{"limit" => 50},
+               state(instance_ctx: ctx)
+             )
+
+    assert overview.counts.approvals >= 2
+    assert overview.counts.budgets >= 1
+    assert overview.counts.limits >= 1
+
+    claim_limit_scope = prefix <> ":claim-limit"
+
+    assert {:ok, _limit_reply, _state} =
+             Commands.execute(
+               @op_flow_limit_lease,
+               %{
+                 "scope" => claim_limit_scope,
+                 "shard_id" => 0,
+                 "amount" => 1,
+                 "limit" => 1,
+                 "ttl_ms" => 30_000,
+                 "now_ms" => 1_018
+               },
+               state(instance_ctx: ctx)
+             )
+
+    for suffix <- ["claim-1", "claim-2"] do
+      assert {:ok, _record, _state} =
+               Commands.execute(
+                 @op_flow_create,
+                 %{
+                   "id" => prefix <> ":" <> suffix,
+                   "type" => flow_type,
+                   "state" => "queued",
+                   "partition_key" => partition,
+                   "now_ms" => 1_018,
+                   "run_at_ms" => 1_018
+                 },
+                 state(instance_ctx: ctx)
+               )
+    end
+
+    claim_body = %{
+      "type" => flow_type,
+      "state" => "queued",
+      "worker" => "native-worker",
+      "limit" => 1,
+      "lease_ms" => 30_000,
+      "partition_key" => partition,
+      "return" => "jobs_compact",
+      "governance_limit_scope" => claim_limit_scope,
+      "governance_shard_id" => 0
+    }
+
+    assert {:ok, [job], _state} =
+             Commands.execute(
+               @op_flow_claim_due,
+               Map.put(claim_body, "now_ms", 1_019),
+               state(instance_ctx: ctx, compact_flow_responses: true)
+             )
+
+    [job_id, _job_partition, job_lease_token, job_fencing_token] = job
+
+    assert {:error, denial, _state} =
+             Commands.execute(
+               @op_flow_claim_due,
+               Map.put(claim_body, "now_ms", 1_020),
+               state(instance_ctx: ctx, compact_flow_responses: true)
+             )
+
+    assert denial.code == "GOVERNANCE_LIMIT_EXCEEDED"
+
+    assert {:ok, "OK", _state} =
+             Commands.execute(
+               @op_flow_complete,
+               %{
+                 "id" => job_id,
+                 "lease_token" => job_lease_token,
+                 "fencing_token" => job_fencing_token,
+                 "partition_key" => partition,
+                 "governance_limit_scope" => claim_limit_scope,
+                 "governance_shard_id" => 0,
+                 "now_ms" => 1_021
+               },
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, [_next_job], _state} =
+             Commands.execute(
+               @op_flow_claim_due,
+               Map.put(claim_body, "now_ms", 1_022),
+               state(instance_ctx: ctx, compact_flow_responses: true)
+             )
   end
 
   test "PIPELINE dispatches FLOW.STATS and attribute discovery through Flow read pipeline" do

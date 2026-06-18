@@ -241,6 +241,110 @@ defmodule Ferricstore.Flow do
   defdelegate value_put(ctx, value, opts \\ []), to: Ferricstore.Flow.ValueStore
   defdelegate value_mget(ctx, refs, opts \\ []), to: Ferricstore.Flow.ValueStore
 
+  defdelegate effect_reserve(ctx, id, effect_key, effect_type, opts \\ []),
+    to: Ferricstore.Flow.Governance.Effect,
+    as: :reserve
+
+  defdelegate effect_confirm(ctx, id, effect_key, opts \\ []),
+    to: Ferricstore.Flow.Governance.Effect,
+    as: :confirm
+
+  defdelegate effect_fail(ctx, id, effect_key, opts \\ []),
+    to: Ferricstore.Flow.Governance.Effect,
+    as: :fail
+
+  defdelegate effect_compensate(ctx, id, effect_key, opts \\ []),
+    to: Ferricstore.Flow.Governance.Effect,
+    as: :compensate
+
+  defdelegate effect_get(ctx, id, effect_key, opts \\ []),
+    to: Ferricstore.Flow.Governance.Effect,
+    as: :get
+
+  defdelegate governance_ledger(ctx, id, opts \\ []),
+    to: Ferricstore.Flow.Governance.Ledger,
+    as: :list
+
+  defdelegate approval_request(ctx, id, opts \\ []),
+    to: Ferricstore.Flow.Governance.ApprovalStore,
+    as: :request
+
+  defdelegate approval_approve(ctx, id, opts \\ []),
+    to: Ferricstore.Flow.Governance.ApprovalStore,
+    as: :approve
+
+  defdelegate approval_reject(ctx, id, opts \\ []),
+    to: Ferricstore.Flow.Governance.ApprovalStore,
+    as: :reject
+
+  defdelegate approval_get(ctx, id, opts \\ []),
+    to: Ferricstore.Flow.Governance.ApprovalStore,
+    as: :get
+
+  defdelegate approval_list(ctx, opts \\ []),
+    to: Ferricstore.Flow.Governance.ApprovalStore,
+    as: :list
+
+  defdelegate governance_overview(ctx, opts \\ []),
+    to: Ferricstore.Flow.Governance.Admin,
+    as: :overview
+
+  defdelegate circuit_open(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.CircuitStore,
+    as: :open
+
+  defdelegate circuit_close(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.CircuitStore,
+    as: :close
+
+  defdelegate circuit_get(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.CircuitStore,
+    as: :get
+
+  defdelegate circuit_list(ctx, opts \\ []),
+    to: Ferricstore.Flow.Governance.CircuitStore,
+    as: :list
+
+  defdelegate budget_reserve(ctx, scope, amount, opts \\ []),
+    to: Ferricstore.Flow.Governance.BudgetStore,
+    as: :reserve
+
+  defdelegate budget_commit(ctx, scope, reservation_id, actual_amount, opts \\ []),
+    to: Ferricstore.Flow.Governance.BudgetStore,
+    as: :commit
+
+  defdelegate budget_release(ctx, scope, reservation_id, opts \\ []),
+    to: Ferricstore.Flow.Governance.BudgetStore,
+    as: :release
+
+  defdelegate budget_get(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.BudgetStore,
+    as: :get
+
+  defdelegate budget_list(ctx, opts \\ []),
+    to: Ferricstore.Flow.Governance.BudgetStore,
+    as: :list
+
+  defdelegate limit_lease(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.LimitStore,
+    as: :lease
+
+  defdelegate limit_spend(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.LimitStore,
+    as: :spend
+
+  defdelegate limit_release(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.LimitStore,
+    as: :release
+
+  defdelegate limit_list(ctx, opts \\ []),
+    to: Ferricstore.Flow.Governance.LimitStore,
+    as: :list
+
+  defdelegate limit_get(ctx, scope, opts \\ []),
+    to: Ferricstore.Flow.Governance.LimitStore,
+    as: :get
+
   defdelegate signal(ctx, id, opts), to: Ferricstore.Flow.Signal, as: :run
 
   @doc false
@@ -526,6 +630,7 @@ defmodule Ferricstore.Flow do
       with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.complete_attrs(id, lease_token, opts) do
         Router.flow_complete(ctx, attrs)
       end
+      |> maybe_release_governance_limit(ctx, opts)
 
     FlowTelemetry.observe(:complete, started, result, %{flow_id: id, _count: 1})
   end
@@ -554,13 +659,17 @@ defmodule Ferricstore.Flow do
               flow_terminal_many_independent(ctx, :complete, attrs_list)
 
             terminal_local_only? ->
-              Router.flow_complete_many_local(ctx, attrs_list)
+              ctx
+              |> Router.flow_complete_many_local(attrs_list)
+              |> maybe_return_terminal_local_items(ctx, attrs_list, return_mode)
 
             true ->
               Router.flow_complete_many(ctx, partition_key, attrs_list)
           end
 
-        maybe_return_many_ok_on_success(complete_result, return_mode)
+        complete_result
+        |> maybe_release_many_governance_limit(ctx, opts, length(attrs_list))
+        |> maybe_return_many_ok_on_success(return_mode)
       end
 
     FlowTelemetry.observe(:complete, started, result, %{flow_id: nil, _count: length(items)})
@@ -874,6 +983,7 @@ defmodule Ferricstore.Flow do
         |> Router.flow_retry(attrs)
         |> maybe_notify_retry_claim_waiters(ctx, attrs)
       end
+      |> maybe_release_governance_limit(ctx, opts)
 
     FlowTelemetry.observe(:retry, started, result, %{flow_id: id, _count: 1})
   end
@@ -920,7 +1030,9 @@ defmodule Ferricstore.Flow do
             |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
           end
 
-        maybe_return_many_ok_on_success(retry_result, return_mode)
+        retry_result
+        |> maybe_release_many_governance_limit(ctx, opts, length(attrs_list))
+        |> maybe_return_many_ok_on_success(return_mode)
       end
 
     FlowTelemetry.observe(:retry, started, result, %{flow_id: nil, _count: length(items)})
@@ -937,6 +1049,7 @@ defmodule Ferricstore.Flow do
       with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.fail_attrs(id, lease_token, opts) do
         Router.flow_fail(ctx, attrs)
       end
+      |> maybe_release_governance_limit(ctx, opts)
 
     FlowTelemetry.observe(:fail, started, result, %{flow_id: id, _count: 1})
   end
@@ -964,7 +1077,9 @@ defmodule Ferricstore.Flow do
             Router.flow_fail_many(ctx, partition_key, attrs_list)
           end
 
-        maybe_return_many_ok_on_success(fail_result, return_mode)
+        fail_result
+        |> maybe_release_many_governance_limit(ctx, opts, length(attrs_list))
+        |> maybe_return_many_ok_on_success(return_mode)
       end
 
     FlowTelemetry.observe(:fail, started, result, %{flow_id: nil, _count: length(items)})
@@ -980,6 +1095,7 @@ defmodule Ferricstore.Flow do
       with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.cancel_attrs(id, opts) do
         Router.flow_cancel(ctx, attrs)
       end
+      |> maybe_release_governance_limit(ctx, opts)
 
     FlowTelemetry.observe(:cancel, started, result, %{flow_id: id, _count: 1})
   end
@@ -1007,7 +1123,9 @@ defmodule Ferricstore.Flow do
             Router.flow_cancel_many(ctx, partition_key, attrs_list)
           end
 
-        maybe_return_many_ok_on_success(cancel_result, return_mode)
+        cancel_result
+        |> maybe_release_many_governance_limit(ctx, opts, length(attrs_list))
+        |> maybe_return_many_ok_on_success(return_mode)
       end
 
     FlowTelemetry.observe(:cancel, started, result, %{flow_id: nil, _count: length(items)})
@@ -1134,6 +1252,56 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp maybe_release_governance_limit(result, ctx, opts) do
+    if terminal_success?(result) do
+      case {Keyword.get(opts, :governance_limit_scope), Keyword.get(opts, :governance_shard_id)} do
+        {scope, shard_id} when is_binary(scope) and scope != "" and is_integer(shard_id) ->
+          Ferricstore.Flow.Governance.LimitCache.release(ctx, scope,
+            shard_id: shard_id,
+            amount: 1,
+            now_ms: Keyword.get(opts, :now_ms)
+          )
+
+          result
+
+        _other ->
+          result
+      end
+    else
+      result
+    end
+  end
+
+  defp maybe_release_many_governance_limit(result, ctx, opts, expected_count) do
+    case {governance_limit_release_count(result, expected_count),
+          Keyword.get(opts, :governance_limit_scope), Keyword.get(opts, :governance_shard_id)} do
+      {amount, scope, shard_id}
+      when amount > 0 and is_binary(scope) and scope != "" and is_integer(shard_id) ->
+        Ferricstore.Flow.Governance.LimitCache.release(ctx, scope,
+          shard_id: shard_id,
+          amount: amount,
+          now_ms: Keyword.get(opts, :now_ms)
+        )
+
+        result
+
+      _other ->
+        result
+    end
+  end
+
+  defp governance_limit_release_count(:ok, expected_count), do: expected_count
+
+  defp governance_limit_release_count({:ok, results}, _expected_count) when is_list(results) do
+    Enum.count(results, &many_item_success?/1)
+  end
+
+  defp governance_limit_release_count(_result, _expected_count), do: 0
+
+  defp terminal_success?(:ok), do: true
+  defp terminal_success?({:ok, _value}), do: true
+  defp terminal_success?(_result), do: false
+
   defp many_return_mode(opts) do
     case Keyword.get(opts, :return, :items) do
       nil -> {:ok, :items}
@@ -1155,6 +1323,27 @@ defmodule Ferricstore.Flow do
   end
 
   defp maybe_return_many_ok_on_success(result, :ok_on_success), do: result
+
+  defp maybe_return_terminal_local_items(:ok, ctx, attrs_list, :items) do
+    results =
+      Enum.map(attrs_list, fn attrs ->
+        opts =
+          case Map.get(attrs, :partition_key) do
+            nil -> []
+            partition_key -> [partition_key: partition_key]
+          end
+
+        case get(ctx, Map.fetch!(attrs, :id), opts) do
+          {:ok, nil} -> {:error, "ERR flow not found"}
+          {:ok, record} -> record
+          {:error, _reason} = error -> error
+        end
+      end)
+
+    {:ok, results}
+  end
+
+  defp maybe_return_terminal_local_items(result, _ctx, _attrs_list, _return_mode), do: result
 
   defp many_item_success?(:ok), do: true
   defp many_item_success?({:ok, _value}), do: true

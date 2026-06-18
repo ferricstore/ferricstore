@@ -1,0 +1,24 @@
+<% data = assigns.data %>
+<%= page_head("FerricFlow Governance - FerricStore", nil) %>
+<body>
+  <div class="layout">
+    <%= render_sidebar_static("flow") %>
+    <main class="main-content">
+      <%= render_subpage_header("FerricFlow Governance") %>
+      <div class="content">
+        <%= render_page_intro("FerricFlow Governance", "Inspect approval requests, durable budget counters, and distributed credit-limit leases used by governed workflows.") %>
+        <%= render_flow_subnav("governance") %>
+        <%= render_flow_governance_summary(data) %>
+        <%= render_flow_governance_filters(data) %>
+        <%= render_flow_governance_circuit_actions() %>
+        <%= render_flow_governance_circuit_graph(Map.get(data, :circuits, [])) %>
+        <%= render_flow_governance_circuits(Map.get(data, :circuits, [])) %>
+        <%= render_flow_governance_circuit_timeline(Map.get(data, :circuits, [])) %>
+        <%= render_flow_governance_approvals(Map.get(data, :approvals, [])) %>
+        <%= render_flow_governance_budgets(Map.get(data, :budgets, [])) %>
+        <%= render_flow_governance_limits(Map.get(data, :limits, [])) %>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

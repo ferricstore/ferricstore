@@ -270,6 +270,21 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
     end
   end
 
+  def handle_flow_governance(socket, transport, peer, headers, query) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data =
+        query
+        |> Dashboard.flow_governance_opts_from_query()
+        |> Auth.dashboard_flow_collect_opts(peer, headers)
+        |> Dashboard.collect_flow_governance_page()
+
+      body = Dashboard.render_flow_governance_page(data)
+      Response.send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
   def handle_flow_retention(socket, transport, peer, headers, query) do
     unless Auth.observability_authorized?(peer, headers) do
       Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))

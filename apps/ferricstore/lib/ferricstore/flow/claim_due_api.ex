@@ -77,6 +77,7 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
          {:ok, named_values} <- named_value_return_opts(opts),
          {:ok, reclaim_expired?} <- optional_boolean(opts, :reclaim_expired, true),
          {:ok, reclaim_ratio} <- optional_reclaim_ratio(opts),
+         {:ok, governance_limit} <- optional_governance_limit(opts, limit, now),
          {:ok, partition_key, partition_keys} <- optional_claim_partitions(opts),
          :ok <- validate_claim_due_keys(type, state, priority, partition_keys || partition_key) do
       attrs =
@@ -93,7 +94,13 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:cold_due_mode, cold_due_mode)
 
-      case router_result(ctx, attrs, reclaim_expired?, reclaim_ratio) do
+      case router_result_with_governance_limit(
+             ctx,
+             attrs,
+             reclaim_expired?,
+             reclaim_ratio,
+             governance_limit
+           ) do
         {:ok, records} when is_list(records) ->
           {:ok, return_records(ctx, records, payload_return, return_mode, named_values)}
 
@@ -326,6 +333,90 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
     Router.flow_claim_due(ctx, attrs)
   end
 
+  defp router_result_with_governance_limit(ctx, attrs, reclaim_expired?, reclaim_ratio, nil) do
+    router_result(ctx, attrs, reclaim_expired?, reclaim_ratio)
+  end
+
+  defp router_result_with_governance_limit(
+         ctx,
+         attrs,
+         reclaim_expired?,
+         reclaim_ratio,
+         %{scope: scope, shard_id: shard_id, amount: amount, now_ms: now_ms}
+       ) do
+    case Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+           shard_id: shard_id,
+           amount: amount,
+           now_ms: now_ms
+         ) do
+      {:ok, _spent} ->
+        result = router_result(ctx, attrs, reclaim_expired?, reclaim_ratio)
+        release_unused_claim_limit(ctx, scope, shard_id, amount, result)
+        result
+
+      {:error, _reason} = error ->
+        if governed_claim_definitely_empty?(ctx, attrs, reclaim_expired?, reclaim_ratio) do
+          {:ok, []}
+        else
+          error
+        end
+    end
+  end
+
+  defp governed_claim_definitely_empty?(
+         ctx,
+         %{state: "running"} = attrs,
+         _reclaim_expired?,
+         _ratio
+       ) do
+    Router.flow_claim_due_presence(ctx, attrs) == :empty
+  end
+
+  defp governed_claim_definitely_empty?(ctx, attrs, false, _ratio) do
+    normal_state = normal_state_filter(Map.fetch!(attrs, :state))
+
+    case normal_attrs(attrs, normal_state, Map.fetch!(attrs, :limit)) do
+      nil -> true
+      normal_attrs -> Router.flow_claim_due_presence(ctx, normal_attrs) == :empty
+    end
+  end
+
+  defp governed_claim_definitely_empty?(ctx, attrs, true, reclaim_ratio) when reclaim_ratio > 0 do
+    normal_state = normal_state_filter(Map.fetch!(attrs, :state))
+    normal_attrs = normal_attrs(attrs, normal_state, Map.fetch!(attrs, :limit))
+
+    normal_empty? =
+      case normal_attrs do
+        nil -> true
+        normal_attrs -> Router.flow_claim_due_presence(ctx, normal_attrs) == :empty
+      end
+
+    running_empty? =
+      Router.flow_claim_due_presence(ctx, Map.put(attrs, :state, "running")) == :empty
+
+    normal_empty? and running_empty?
+  end
+
+  defp governed_claim_definitely_empty?(_ctx, _attrs, _reclaim_expired?, _ratio), do: false
+
+  defp release_unused_claim_limit(ctx, scope, shard_id, amount, {:ok, records})
+       when is_list(records) do
+    unused = amount - length(records)
+
+    if unused > 0 do
+      Ferricstore.Flow.Governance.LimitCache.release(ctx, scope,
+        shard_id: shard_id,
+        amount: unused
+      )
+    end
+  end
+
+  defp release_unused_claim_limit(ctx, scope, shard_id, amount, {:error, _reason}) do
+    Ferricstore.Flow.Governance.LimitCache.release(ctx, scope, shard_id: shard_id, amount: amount)
+  end
+
+  defp release_unused_claim_limit(_ctx, _scope, _shard_id, _amount, _result), do: :ok
+
   defp router_maybe(_ctx, nil), do: {:ok, []}
   defp router_maybe(_ctx, %{limit: limit}) when limit <= 0, do: {:ok, []}
   defp router_maybe(ctx, attrs), do: Router.flow_claim_due(ctx, attrs)
@@ -416,6 +507,29 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
     case Keyword.get(opts, key, default) do
       value when is_integer(value) and value > 0 -> {:ok, value}
       _ -> {:error, "ERR flow #{key} must be a positive integer"}
+    end
+  end
+
+  defp optional_governance_limit(opts, limit, now_ms) do
+    scope = Keyword.get(opts, :governance_limit_scope)
+    shard_id = Keyword.get(opts, :governance_shard_id)
+
+    cond do
+      is_nil(scope) and is_nil(shard_id) ->
+        {:ok, nil}
+
+      is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
+        {:ok,
+         %{
+           scope: scope,
+           shard_id: shard_id,
+           amount: limit,
+           now_ms: now_ms || Ferricstore.CommandTime.now_ms()
+         }}
+
+      true ->
+        {:error,
+         "ERR flow governance_limit_scope and governance_shard_id must be provided together"}
     end
   end
 

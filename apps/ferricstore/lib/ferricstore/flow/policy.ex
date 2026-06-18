@@ -41,6 +41,9 @@ defmodule Ferricstore.Flow.Policy do
 
   def get(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  def raw(ctx, type) when is_binary(type), do: read(ctx, type)
+  def raw(_ctx, _type), do: {:error, "ERR flow type must be a non-empty string"}
+
   defp read(ctx, type) do
     case Stats.with_cache_tracking_disabled(fn ->
            Router.get(ctx, Keys.policy_key(type))
@@ -64,15 +67,18 @@ defmodule Ferricstore.Flow.Policy do
 
     %{
       type: type,
+      version: Map.get(policy || %{}, :version),
       retry: RetryPolicy.resolve(policy, nil, nil),
       retention: response_retention(policy, nil),
       indexed_attributes: RetryPolicy.indexed_attributes(policy),
+      governance: RetryPolicy.governance(policy),
       states:
         Map.new(states, fn {state, _state_policy} ->
           {state,
            %{
              retry: RetryPolicy.resolve(policy, state, nil),
-             retention: response_retention(policy, state)
+             retention: response_retention(policy, state),
+             governance: state_governance(policy, state)
            }}
         end)
     }
@@ -82,11 +88,22 @@ defmodule Ferricstore.Flow.Policy do
     %{
       type: type,
       state: state,
+      version: Map.get(policy || %{}, :version),
       retry: RetryPolicy.resolve(policy, state, nil),
       retention: response_retention(policy, state),
-      indexed_attributes: RetryPolicy.indexed_attributes(policy)
+      indexed_attributes: RetryPolicy.indexed_attributes(policy),
+      governance: state_governance(policy, state) || RetryPolicy.governance(policy)
     }
   end
+
+  defp state_governance(%{states: states}, state) when is_map(states) and is_binary(state) do
+    case Map.get(states, state) do
+      %{governance: governance} -> governance
+      _other -> nil
+    end
+  end
+
+  defp state_governance(_policy, _state), do: nil
 
   defp response_retention(policy, state) do
     policy

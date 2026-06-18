@@ -51,17 +51,21 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   def normalize_flow_policy(type, attrs) when is_binary(type) and is_map(attrs) do
-    with {:ok, retry} <- optional_retry_override(attrs),
+    with {:ok, version} <- optional_policy_version(attrs),
+         {:ok, retry} <- optional_retry_override(attrs),
          {:ok, retention} <- optional_retention_override(attrs),
          {:ok, indexed_attributes} <- optional_indexed_attributes(attrs),
+         {:ok, governance} <- optional_governance(attrs),
          {:ok, states} <- normalize_state_policies(fetch_policy(attrs, :states, "states", %{})) do
       policy =
         %{
           type: type,
+          version: version,
           retry: retry,
           retention: retention,
           states: states,
-          indexed_attributes: indexed_attributes
+          indexed_attributes: indexed_attributes,
+          governance: governance
         }
         |> drop_nil_policy_fields()
 
@@ -125,6 +129,25 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   def indexed_attributes(_policy), do: []
+
+  defp optional_policy_version(attrs) do
+    case fetch_policy(attrs, :version, "version", nil) do
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) and value != "" ->
+        {:ok, value}
+
+      value when is_integer(value) and value >= 0 ->
+        {:ok, value}
+
+      _other ->
+        {:error, "ERR flow policy version must be a non-empty string or non-negative integer"}
+    end
+  end
+
+  def governance(%{governance: governance}) when is_map(governance), do: governance
+  def governance(_policy), do: nil
 
   def normalize_retention_override(nil), do: {:ok, nil}
 
@@ -358,14 +381,30 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
+  defp optional_governance(attrs) do
+    if has_policy_key?(attrs, :governance, "governance") do
+      attrs
+      |> fetch_policy(:governance, "governance", nil)
+      |> Ferricstore.Flow.Governance.Policy.normalize()
+    else
+      {:ok, nil}
+    end
+  end
+
   defp normalize_state_policies(states) when is_map(states) do
     Enum.reduce_while(states, {:ok, %{}}, fn {state, policy}, {:ok, acc} ->
       with {:ok, state} <- normalize_state_name(state),
            policy = policy_map(policy),
            {:ok, retry} <- optional_retry_override(policy),
-           {:ok, retention} <- optional_retention_override(policy) do
+           {:ok, retention} <- optional_retention_override(policy),
+           {:ok, governance} <- optional_governance(policy) do
         {:cont,
-         {:ok, Map.put(acc, state, drop_nil_policy_fields(%{retry: retry, retention: retention}))}}
+         {:ok,
+          Map.put(
+            acc,
+            state,
+            drop_nil_policy_fields(%{retry: retry, retention: retention, governance: governance})
+          )}}
       else
         {:error, _reason} = error -> {:halt, error}
       end
@@ -590,6 +629,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
     |> drop_nil_field(:retry)
     |> drop_nil_field(:retention)
     |> drop_nil_field(:indexed_attributes)
+    |> drop_nil_field(:governance)
   end
 
   defp drop_nil_field(policy, key) do

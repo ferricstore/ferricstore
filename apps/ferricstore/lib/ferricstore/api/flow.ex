@@ -712,6 +712,308 @@ defmodule FerricStore.API.Flow do
   def flow_attribute_values(_type, _attr_name, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Reserves a governed side effect for the current leased Flow worker."
+  @spec flow_effect_reserve(binary(), binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary() | map()}
+  def flow_effect_reserve(id, effect_key, effect_type, opts \\ [])
+
+  def flow_effect_reserve(id, effect_key, effect_type, opts)
+      when is_binary(id) and is_binary(effect_key) and is_binary(effect_type) and is_list(opts) do
+    Ferricstore.Flow.effect_reserve(default_ctx(), id, effect_key, effect_type, opts)
+  end
+
+  def flow_effect_reserve(_id, _effect_key, _effect_type, _opts),
+    do: {:error, "ERR flow effect opts must be a keyword list"}
+
+  @doc "Marks a governed side effect as confirmed."
+  @spec flow_effect_confirm(binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary() | map()}
+  def flow_effect_confirm(id, effect_key, opts \\ [])
+
+  def flow_effect_confirm(id, effect_key, opts)
+      when is_binary(id) and is_binary(effect_key) and is_list(opts) do
+    Ferricstore.Flow.effect_confirm(default_ctx(), id, effect_key, opts)
+  end
+
+  def flow_effect_confirm(_id, _effect_key, _opts),
+    do: {:error, "ERR flow effect opts must be a keyword list"}
+
+  @doc "Marks a governed side effect as failed."
+  @spec flow_effect_fail(binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary() | map()}
+  def flow_effect_fail(id, effect_key, opts \\ [])
+
+  def flow_effect_fail(id, effect_key, opts)
+      when is_binary(id) and is_binary(effect_key) and is_list(opts) do
+    Ferricstore.Flow.effect_fail(default_ctx(), id, effect_key, opts)
+  end
+
+  def flow_effect_fail(_id, _effect_key, _opts),
+    do: {:error, "ERR flow effect opts must be a keyword list"}
+
+  @doc "Marks a governed side effect as compensated."
+  @spec flow_effect_compensate(binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary() | map()}
+  def flow_effect_compensate(id, effect_key, opts \\ [])
+
+  def flow_effect_compensate(id, effect_key, opts)
+      when is_binary(id) and is_binary(effect_key) and is_list(opts) do
+    Ferricstore.Flow.effect_compensate(default_ctx(), id, effect_key, opts)
+  end
+
+  def flow_effect_compensate(_id, _effect_key, _opts),
+    do: {:error, "ERR flow effect opts must be a keyword list"}
+
+  @doc "Fetches a governed side-effect record."
+  @spec flow_effect_get(binary(), binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_effect_get(id, effect_key, opts \\ [])
+
+  def flow_effect_get(id, effect_key, opts)
+      when is_binary(id) and is_binary(effect_key) and is_list(opts) do
+    Ferricstore.Flow.effect_get(default_ctx(), id, effect_key, opts)
+  end
+
+  def flow_effect_get(_id, _effect_key, _opts),
+    do: {:error, "ERR flow effect opts must be a keyword list"}
+
+  @doc "Returns per-flow governance ledger events."
+  @spec flow_governance_ledger(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_governance_ledger(id, opts \\ [])
+
+  def flow_governance_ledger(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.governance_ledger(default_ctx(), id, opts)
+  end
+
+  def flow_governance_ledger(_id, _opts),
+    do: {:error, "ERR flow governance ledger opts must be a keyword list"}
+
+  @doc "Creates a durable Flow approval request."
+  @spec flow_approval_request(binary(), keyword()) :: {:ok, map()} | {:error, binary() | map()}
+  def flow_approval_request(id, opts \\ [])
+
+  def flow_approval_request(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.approval_request(default_ctx(), id, opts)
+  end
+
+  def flow_approval_request(_id, _opts),
+    do: {:error, "ERR flow approval opts must be a keyword list"}
+
+  @doc "Approves a durable Flow approval request."
+  @spec flow_approval_approve(binary(), keyword()) :: {:ok, map()} | {:error, binary() | map()}
+  def flow_approval_approve(id, opts \\ [])
+
+  def flow_approval_approve(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.approval_approve(default_ctx(), id, opts)
+  end
+
+  def flow_approval_approve(_id, _opts),
+    do: {:error, "ERR flow approval opts must be a keyword list"}
+
+  @doc "Rejects a durable Flow approval request."
+  @spec flow_approval_reject(binary(), keyword()) :: {:ok, map()} | {:error, binary() | map()}
+  def flow_approval_reject(id, opts \\ [])
+
+  def flow_approval_reject(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.approval_reject(default_ctx(), id, opts)
+  end
+
+  def flow_approval_reject(_id, _opts),
+    do: {:error, "ERR flow approval opts must be a keyword list"}
+
+  @doc "Fetches a durable Flow approval request."
+  @spec flow_approval_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_approval_get(id, opts \\ [])
+
+  def flow_approval_get(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.approval_get(default_ctx(), id, opts)
+  end
+
+  def flow_approval_get(_id, _opts),
+    do: {:error, "ERR flow approval opts must be a keyword list"}
+
+  @doc "Lists durable Flow approval requests for dashboard/admin use."
+  @spec flow_approval_list(keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_approval_list(opts \\ [])
+
+  def flow_approval_list(opts) when is_list(opts) do
+    Ferricstore.Flow.approval_list(default_ctx(), opts)
+  end
+
+  def flow_approval_list(_opts),
+    do: {:error, "ERR flow approval opts must be a keyword list"}
+
+  @doc "Returns a bounded governance overview for approvals, budgets, limits, and circuits."
+  @spec flow_governance_overview(keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_governance_overview(opts \\ [])
+
+  def flow_governance_overview(opts) when is_list(opts) do
+    Ferricstore.Flow.governance_overview(default_ctx(), opts)
+  end
+
+  def flow_governance_overview(_opts),
+    do: {:error, "ERR flow governance opts must be a keyword list"}
+
+  @doc "Opens a durable Flow governance circuit."
+  @spec flow_circuit_open(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_circuit_open(scope, opts \\ [])
+
+  def flow_circuit_open(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.circuit_open(default_ctx(), scope, opts)
+  end
+
+  def flow_circuit_open(_scope, _opts),
+    do: {:error, "ERR flow circuit opts must be a keyword list"}
+
+  @doc "Closes a durable Flow governance circuit."
+  @spec flow_circuit_close(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_circuit_close(scope, opts \\ [])
+
+  def flow_circuit_close(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.circuit_close(default_ctx(), scope, opts)
+  end
+
+  def flow_circuit_close(_scope, _opts),
+    do: {:error, "ERR flow circuit opts must be a keyword list"}
+
+  @doc "Fetches a durable Flow governance circuit."
+  @spec flow_circuit_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_circuit_get(scope, opts \\ [])
+
+  def flow_circuit_get(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.circuit_get(default_ctx(), scope, opts)
+  end
+
+  def flow_circuit_get(_scope, _opts),
+    do: {:error, "ERR flow circuit opts must be a keyword list"}
+
+  @doc "Lists durable Flow governance circuits for dashboard/admin use."
+  @spec flow_circuit_list(keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_circuit_list(opts \\ [])
+
+  def flow_circuit_list(opts) when is_list(opts) do
+    Ferricstore.Flow.circuit_list(default_ctx(), opts)
+  end
+
+  def flow_circuit_list(_opts),
+    do: {:error, "ERR flow circuit opts must be a keyword list"}
+
+  @doc "Reserves units from a durable Flow governance budget."
+  @spec flow_budget_reserve(binary(), pos_integer(), keyword()) ::
+          {:ok, map()} | {:error, binary() | map()}
+  def flow_budget_reserve(scope, amount, opts \\ [])
+
+  def flow_budget_reserve(scope, amount, opts)
+      when is_binary(scope) and is_integer(amount) and is_list(opts) do
+    Ferricstore.Flow.budget_reserve(default_ctx(), scope, amount, opts)
+  end
+
+  def flow_budget_reserve(_scope, _amount, _opts),
+    do: {:error, "ERR flow budget opts must be a keyword list"}
+
+  @doc "Commits actual usage for a prior durable Flow governance budget reservation."
+  @spec flow_budget_commit(binary(), binary(), non_neg_integer(), keyword()) ::
+          {:ok, map()} | {:error, binary() | map()}
+  def flow_budget_commit(scope, reservation_id, actual_amount, opts \\ [])
+
+  def flow_budget_commit(scope, reservation_id, actual_amount, opts)
+      when is_binary(scope) and is_binary(reservation_id) and is_integer(actual_amount) and
+             is_list(opts) do
+    Ferricstore.Flow.budget_commit(default_ctx(), scope, reservation_id, actual_amount, opts)
+  end
+
+  def flow_budget_commit(_scope, _reservation_id, _actual_amount, _opts),
+    do: {:error, "ERR flow budget commit opts must be a keyword list"}
+
+  @doc "Releases an unused durable Flow governance budget reservation."
+  @spec flow_budget_release(binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary() | map()}
+  def flow_budget_release(scope, reservation_id, opts \\ [])
+
+  def flow_budget_release(scope, reservation_id, opts)
+      when is_binary(scope) and is_binary(reservation_id) and is_list(opts) do
+    Ferricstore.Flow.budget_release(default_ctx(), scope, reservation_id, opts)
+  end
+
+  def flow_budget_release(_scope, _reservation_id, _opts),
+    do: {:error, "ERR flow budget release opts must be a keyword list"}
+
+  @doc "Fetches a durable Flow governance budget."
+  @spec flow_budget_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_budget_get(scope, opts \\ [])
+
+  def flow_budget_get(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.budget_get(default_ctx(), scope, opts)
+  end
+
+  def flow_budget_get(_scope, _opts),
+    do: {:error, "ERR flow budget opts must be a keyword list"}
+
+  @doc "Lists durable Flow governance budgets for dashboard/admin use."
+  @spec flow_budget_list(keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_budget_list(opts \\ [])
+
+  def flow_budget_list(opts) when is_list(opts) do
+    Ferricstore.Flow.budget_list(default_ctx(), opts)
+  end
+
+  def flow_budget_list(_opts),
+    do: {:error, "ERR flow budget opts must be a keyword list"}
+
+  @doc "Leases credits from a durable Flow governance limit."
+  @spec flow_limit_lease(binary(), keyword()) :: {:ok, map()} | {:error, binary() | map()}
+  def flow_limit_lease(scope, opts \\ [])
+
+  def flow_limit_lease(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.limit_lease(default_ctx(), scope, opts)
+  end
+
+  def flow_limit_lease(_scope, _opts),
+    do: {:error, "ERR flow limit opts must be a keyword list"}
+
+  @doc "Spends credits from a durable Flow governance limit lease."
+  @spec flow_limit_spend(binary(), keyword()) :: {:ok, map()} | {:error, binary() | map()}
+  def flow_limit_spend(scope, opts \\ [])
+
+  def flow_limit_spend(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.limit_spend(default_ctx(), scope, opts)
+  end
+
+  def flow_limit_spend(_scope, _opts),
+    do: {:error, "ERR flow limit opts must be a keyword list"}
+
+  @doc "Releases in-use credits back to a durable Flow governance limit lease."
+  @spec flow_limit_release(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_limit_release(scope, opts \\ [])
+
+  def flow_limit_release(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.limit_release(default_ctx(), scope, opts)
+  end
+
+  def flow_limit_release(_scope, _opts),
+    do: {:error, "ERR flow limit opts must be a keyword list"}
+
+  @doc "Fetches a durable Flow governance limit."
+  @spec flow_limit_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_limit_get(scope, opts \\ [])
+
+  def flow_limit_get(scope, opts) when is_binary(scope) and is_list(opts) do
+    Ferricstore.Flow.limit_get(default_ctx(), scope, opts)
+  end
+
+  def flow_limit_get(_scope, _opts),
+    do: {:error, "ERR flow limit opts must be a keyword list"}
+
+  @doc "Lists durable Flow governance limits for dashboard/admin use."
+  @spec flow_limit_list(keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_limit_list(opts \\ [])
+
+  def flow_limit_list(opts) when is_list(opts) do
+    Ferricstore.Flow.limit_list(default_ctx(), opts)
+  end
+
+  def flow_limit_list(_opts),
+    do: {:error, "ERR flow limit opts must be a keyword list"}
+
   @doc "Returns bounded Flow stats for `type`, `:state`, and optional `:attributes` filters."
   @spec flow_stats(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_stats(type, opts \\ [])

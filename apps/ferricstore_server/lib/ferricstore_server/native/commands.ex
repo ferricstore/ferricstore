@@ -142,6 +142,31 @@ defmodule FerricstoreServer.Native.Commands do
   @op_flow_stats 0x022D
   @op_flow_attributes 0x022E
   @op_flow_attribute_values 0x022F
+  @op_flow_effect_reserve 0x0240
+  @op_flow_effect_confirm 0x0241
+  @op_flow_effect_fail 0x0242
+  @op_flow_effect_compensate 0x0243
+  @op_flow_effect_get 0x0244
+  @op_flow_governance_ledger 0x0245
+  @op_flow_approval_request 0x0246
+  @op_flow_approval_approve 0x0247
+  @op_flow_approval_reject 0x0248
+  @op_flow_approval_get 0x0249
+  @op_flow_circuit_open 0x024A
+  @op_flow_circuit_close 0x024B
+  @op_flow_circuit_get 0x024C
+  @op_flow_budget_reserve 0x024D
+  @op_flow_budget_get 0x024E
+  @op_flow_limit_lease 0x024F
+  @op_flow_limit_spend 0x0250
+  @op_flow_limit_release 0x0251
+  @op_flow_limit_get 0x0252
+  @op_flow_approval_list 0x0253
+  @op_flow_governance_overview 0x0254
+  @op_flow_budget_list 0x0255
+  @op_flow_limit_list 0x0256
+  @op_flow_budget_commit 0x0257
+  @op_flow_budget_release 0x0258
 
   @control_commands %{
     @op_hello => "HELLO",
@@ -263,7 +288,32 @@ defmodule FerricstoreServer.Native.Commands do
     @op_flow_schedule_resume => "FLOW.SCHEDULE.RESUME",
     @op_flow_stats => "FLOW.STATS",
     @op_flow_attributes => "FLOW.ATTRIBUTES",
-    @op_flow_attribute_values => "FLOW.ATTRIBUTE_VALUES"
+    @op_flow_attribute_values => "FLOW.ATTRIBUTE_VALUES",
+    @op_flow_effect_reserve => "FLOW.EFFECT.RESERVE",
+    @op_flow_effect_confirm => "FLOW.EFFECT.CONFIRM",
+    @op_flow_effect_fail => "FLOW.EFFECT.FAIL",
+    @op_flow_effect_compensate => "FLOW.EFFECT.COMPENSATE",
+    @op_flow_effect_get => "FLOW.EFFECT.GET",
+    @op_flow_governance_ledger => "FLOW.GOVERNANCE.LEDGER",
+    @op_flow_approval_request => "FLOW.APPROVAL.REQUEST",
+    @op_flow_approval_approve => "FLOW.APPROVAL.APPROVE",
+    @op_flow_approval_reject => "FLOW.APPROVAL.REJECT",
+    @op_flow_approval_get => "FLOW.APPROVAL.GET",
+    @op_flow_circuit_open => "FLOW.CIRCUIT.OPEN",
+    @op_flow_circuit_close => "FLOW.CIRCUIT.CLOSE",
+    @op_flow_circuit_get => "FLOW.CIRCUIT.GET",
+    @op_flow_budget_reserve => "FLOW.BUDGET.RESERVE",
+    @op_flow_budget_get => "FLOW.BUDGET.GET",
+    @op_flow_limit_lease => "FLOW.LIMIT.LEASE",
+    @op_flow_limit_spend => "FLOW.LIMIT.SPEND",
+    @op_flow_limit_release => "FLOW.LIMIT.RELEASE",
+    @op_flow_limit_get => "FLOW.LIMIT.GET",
+    @op_flow_approval_list => "FLOW.APPROVAL.LIST",
+    @op_flow_governance_overview => "FLOW.GOVERNANCE.OVERVIEW",
+    @op_flow_budget_list => "FLOW.BUDGET.LIST",
+    @op_flow_limit_list => "FLOW.LIMIT.LIST",
+    @op_flow_budget_commit => "FLOW.BUDGET.COMMIT",
+    @op_flow_budget_release => "FLOW.BUDGET.RELEASE"
   }
 
   @commands @control_commands
@@ -284,6 +334,9 @@ defmodule FerricstoreServer.Native.Commands do
 
   @known_flow_options %{
     "after_ms" => :after_ms,
+    "actual_amount" => :actual_amount,
+    "amount" => :amount,
+    "assignees" => :assignees,
     "at_ms" => :at_ms,
     "attempt" => :attempt,
     "attributes" => :attributes,
@@ -313,6 +366,8 @@ defmodule FerricstoreServer.Native.Commands do
     "from_ms" => :from_ms,
     "from_version" => :from_version,
     "group_id" => :group_id,
+    "half_open_max_probes" => :half_open_max_probes,
+    "half_open_success_threshold" => :half_open_success_threshold,
     "history_hot_max_events" => :history_hot_max_events,
     "history_max_events" => :history_max_events,
     "id" => :id,
@@ -322,7 +377,21 @@ defmodule FerricstoreServer.Native.Commands do
     "include_cold" => :include_cold,
     "independent" => :independent,
     "initial_state" => :initial_state,
+    "effect_key" => :effect_key,
+    "effect_type" => :effect_type,
+    "error_class" => :error_class,
+    "error_classes" => :error_classes,
+    "external_id" => :external_id,
+    "expires_at_ms" => :expires_at_ms,
+    "failure_threshold" => :failure_threshold,
+    "failure_rate_pct" => :failure_rate_pct,
+    "flow_id" => :flow_id,
+    "governance_limit_scope" => :governance_limit_scope,
+    "governance_shard_id" => :governance_shard_id,
+    "governance_scope" => :governance_scope,
     "kind" => :kind,
+    "latency_ms" => :latency_ms,
+    "latency_threshold_ms" => :latency_threshold_ms,
     "lease_ms" => :lease_ms,
     "lease_token" => :lease_token,
     "limit" => :limit,
@@ -332,14 +401,18 @@ defmodule FerricstoreServer.Native.Commands do
     "max_fires" => :max_fires,
     "max_ms" => :max_ms,
     "max_retries" => :max_retries,
+    "min_calls" => :min_calls,
     "name" => :name,
     "now_ms" => :now_ms,
     "on_child_failed" => :on_child_failed,
     "on_parent_closed" => :on_parent_closed,
+    "open_ms" => :open_ms,
     "override" => :override,
     "override_values" => :override_values,
     "overlap_policy" => :overlap_policy,
     "overlap_retry_ms" => :overlap_retry_ms,
+    "operation_digest" => :operation_digest,
+    "approver" => :approver,
     "overwrite" => :overwrite,
     "owner_flow_id" => :owner_flow_id,
     "parent_id" => :parent_id,
@@ -350,18 +423,26 @@ defmodule FerricstoreServer.Native.Commands do
     "payload_ref" => :payload_ref,
     "payload_refs" => :payload_refs,
     "priority" => :priority,
+    "policy_hash" => :policy_hash,
+    "policy_version" => :policy_version,
     "reason" => :reason,
+    "reservation_id" => :reservation_id,
+    "requested_by" => :requested_by,
     "reclaim_expired" => :reclaim_expired,
     "reclaim_ratio" => :reclaim_ratio,
     "result" => :result,
     "result_ref" => :result_ref,
     "return" => :return,
     "retention_ttl_ms" => :retention_ttl_ms,
+    "rev" => :rev,
     "retry_at_ms" => :retry_at_ms,
     "root_id" => :root_id,
     "run_at_ms" => :run_at_ms,
+    "scope" => :scope,
     "signal" => :signal,
+    "shard_id" => :shard_id,
     "state" => :state,
+    "status" => :status,
     "states" => :states,
     "start_at_ms" => :start_at_ms,
     "steps" => :steps,
@@ -373,13 +454,16 @@ defmodule FerricstoreServer.Native.Commands do
     "timezone" => :timezone,
     "transition_to" => :transition_to,
     "ttl_ms" => :ttl_ms,
+    "timeout_ms" => :timeout_ms,
     "type" => :type,
+    "usage" => :usage,
     "value" => :value,
     "value_max_bytes" => :value_max_bytes,
     "value_refs" => :value_refs,
     "values" => :values,
     "wait" => :wait,
     "wait_state" => :wait_state,
+    "window_ms" => :window_ms,
     "worker" => :worker
   }
 
@@ -1056,6 +1140,48 @@ defmodule FerricstoreServer.Native.Commands do
   defp do_execute(@op_flow_attribute_values, payload, state),
     do: flow_attribute_values_call(payload, state)
 
+  defp do_execute(@op_flow_effect_reserve, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, effect_key} <- require_binary(payload, "effect_key"),
+         {:ok, effect_type} <- require_binary(payload, "effect_type"),
+         {:ok, opts} <- flow_opts(payload, ["id", "effect_key", "effect_type"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_effect_reserve(
+          state.instance_ctx,
+          id,
+          effect_key,
+          effect_type,
+          opts
+        ),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_effect_confirm, payload, state),
+    do: flow_effect_status_call(payload, state, &FerricStore.Impl.flow_effect_confirm/4)
+
+  defp do_execute(@op_flow_effect_fail, payload, state),
+    do: flow_effect_status_call(payload, state, &FerricStore.Impl.flow_effect_fail/4)
+
+  defp do_execute(@op_flow_effect_compensate, payload, state),
+    do: flow_effect_status_call(payload, state, &FerricStore.Impl.flow_effect_compensate/4)
+
+  defp do_execute(@op_flow_effect_get, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, effect_key} <- require_binary(payload, "effect_key"),
+         {:ok, opts} <- flow_opts(payload, ["id", "effect_key"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_effect_get(state.instance_ctx, id, effect_key, opts),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
   defp do_execute(@op_flow_create_many, payload, state) do
     with {:ok, items} <- flow_items(payload, "items", :create),
          {:ok, opts} <- flow_opts(payload, ["partition_key", "items"]) do
@@ -1163,6 +1289,144 @@ defmodule FerricstoreServer.Native.Commands do
         FerricStore.Impl.flow_by_correlation(state.instance_ctx, correlation_id, opts),
         state
       )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_governance_ledger, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, opts} <- flow_opts(payload, ["id"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_governance_ledger(state.instance_ctx, id, opts),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_approval_request, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, opts} <- flow_opts(payload, ["id"]) do
+      result_to_reply(FerricStore.Impl.flow_approval_request(state.instance_ctx, id, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_approval_approve, payload, state),
+    do: flow_approval_status_call(payload, state, &FerricStore.Impl.flow_approval_approve/3)
+
+  defp do_execute(@op_flow_approval_reject, payload, state),
+    do: flow_approval_status_call(payload, state, &FerricStore.Impl.flow_approval_reject/3)
+
+  defp do_execute(@op_flow_approval_get, payload, state) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, opts} <- flow_opts(payload, ["id"]) do
+      result_to_reply(FerricStore.Impl.flow_approval_get(state.instance_ctx, id, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_approval_list, payload, state) do
+    with {:ok, opts} <- flow_opts(payload, []) do
+      result_to_reply(FerricStore.Impl.flow_approval_list(state.instance_ctx, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_governance_overview, payload, state) do
+    with {:ok, opts} <- flow_opts(payload, []) do
+      result_to_reply(FerricStore.Impl.flow_governance_overview(state.instance_ctx, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_circuit_open, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_circuit_open/3)
+
+  defp do_execute(@op_flow_circuit_close, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_circuit_close/3)
+
+  defp do_execute(@op_flow_circuit_get, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_circuit_get/3)
+
+  defp do_execute(@op_flow_budget_reserve, payload, state) do
+    with {:ok, scope} <- require_binary(payload, "scope"),
+         {:ok, amount} <- require_pos_integer(payload, "amount"),
+         {:ok, opts} <- flow_opts(payload, ["scope", "amount"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_budget_reserve(state.instance_ctx, scope, amount, opts),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_budget_commit, payload, state) do
+    with {:ok, scope} <- require_binary(payload, "scope"),
+         {:ok, reservation_id} <- require_binary(payload, "reservation_id"),
+         {:ok, actual_amount} <- require_non_neg_integer(payload, "actual_amount"),
+         {:ok, opts} <- flow_opts(payload, ["scope", "reservation_id", "actual_amount"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_budget_commit(
+          state.instance_ctx,
+          scope,
+          reservation_id,
+          actual_amount,
+          opts
+        ),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_budget_release, payload, state) do
+    with {:ok, scope} <- require_binary(payload, "scope"),
+         {:ok, reservation_id} <- require_binary(payload, "reservation_id"),
+         {:ok, opts} <- flow_opts(payload, ["scope", "reservation_id"]) do
+      result_to_reply(
+        FerricStore.Impl.flow_budget_release(state.instance_ctx, scope, reservation_id, opts),
+        state
+      )
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_budget_get, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_budget_get/3)
+
+  defp do_execute(@op_flow_budget_list, payload, state) do
+    with {:ok, opts} <- flow_opts(payload, []) do
+      result_to_reply(FerricStore.Impl.flow_budget_list(state.instance_ctx, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_flow_limit_lease, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_limit_lease/3)
+
+  defp do_execute(@op_flow_limit_spend, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_limit_spend/3)
+
+  defp do_execute(@op_flow_limit_release, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_limit_release/3)
+
+  defp do_execute(@op_flow_limit_get, payload, state),
+    do: flow_scope_call(payload, state, &FerricStore.Impl.flow_limit_get/3)
+
+  defp do_execute(@op_flow_limit_list, payload, state) do
+    with {:ok, opts} <- flow_opts(payload, []) do
+      result_to_reply(FerricStore.Impl.flow_limit_list(state.instance_ctx, opts), state)
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1313,6 +1577,34 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp flow_effect_status_call(payload, state, fun) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, effect_key} <- require_binary(payload, "effect_key"),
+         {:ok, opts} <- flow_opts(payload, ["id", "effect_key"]) do
+      result_to_reply(fun.(state.instance_ctx, id, effect_key, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp flow_approval_status_call(payload, state, fun) do
+    with {:ok, id} <- require_binary(payload, "id"),
+         {:ok, opts} <- flow_opts(payload, ["id"]) do
+      result_to_reply(fun.(state.instance_ctx, id, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp flow_scope_call(payload, state, fun) do
+    with {:ok, scope} <- require_binary(payload, "scope"),
+         {:ok, opts} <- flow_opts(payload, ["scope"]) do
+      result_to_reply(fun.(state.instance_ctx, scope, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
   defp flow_many_items_call(payload, state, fun, item_kind) do
     with {:ok, items} <- flow_items(payload, "items", item_kind),
          {:ok, opts} <- flow_opts(payload, ["partition_key", "items"]) do
@@ -1328,6 +1620,7 @@ defmodule FerricstoreServer.Native.Commands do
   defp result_to_reply(:ok, state), do: {:ok, "OK", state}
   defp result_to_reply({:ok, :ok}, state), do: {:ok, "OK", state}
   defp result_to_reply({:ok, value}, state), do: {:ok, value, state}
+  defp result_to_reply({:error, %{code: _code} = reason}, state), do: {:error, reason, state}
 
   defp result_to_reply({:error, reason}, state) when is_binary(reason) do
     status =
@@ -2383,6 +2676,13 @@ defmodule FerricstoreServer.Native.Commands do
     case Map.get(payload, key) do
       value when is_integer(value) and value > 0 -> {:ok, value}
       _ -> {:error, "ERR native field #{key} must be a positive integer"}
+    end
+  end
+
+  defp require_non_neg_integer(payload, key) do
+    case Map.get(payload, key) do
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> {:error, "ERR native field #{key} must be a non-negative integer"}
     end
   end
 

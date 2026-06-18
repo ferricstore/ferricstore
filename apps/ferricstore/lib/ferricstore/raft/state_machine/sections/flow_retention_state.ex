@@ -314,6 +314,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                {:ok, values_count} <- flow_retention_delete_keys(state, value_refs),
                {:ok, _shared_link_count} <- flow_retention_delete_keys(state, shared_link_keys),
                {:ok, _registry_count} <- flow_retention_delete_keys(state, [registry_key]),
+               {:ok, _governance_count} <-
+                 flow_retention_delete_keys(state, flow_retention_governance_keys(state, record)),
                :ok <- do_delete(state, state_key) do
             maybe_queue_terminal_lmdb_index_delete(state, record)
             queue_lmdb_metadata_index_deletes(state, record)
@@ -327,6 +329,43 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
             {:ok, %{flows: 0, history: history_count, values: values_count}}
           end
         end
+      end
+
+      defp flow_retention_governance_keys(state, record) do
+        id = Map.fetch!(record, :id)
+        partition_key = Map.get(record, :partition_key)
+
+        [
+          FlowKeys.governance_ledger_index_key(id, partition_key)
+          | flow_retention_keys_with_prefix(
+              state,
+              FlowKeys.governance_effect_key_prefix(id, partition_key)
+            )
+        ]
+        |> Kernel.++(
+          flow_retention_keys_with_prefix(
+            state,
+            FlowKeys.governance_ledger_key_prefix(id, partition_key)
+          )
+        )
+        |> Enum.uniq()
+      end
+
+      defp flow_retention_keys_with_prefix(%{ets: ets}, prefix) when is_binary(prefix) do
+        :ets.foldl(
+          fn
+            {key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, acc
+            when is_binary(key) ->
+              if String.starts_with?(key, prefix), do: [key | acc], else: acc
+
+            _entry, acc ->
+              acc
+          end,
+          [],
+          ets
+        )
+      rescue
+        _ -> []
       end
 
       defp flow_retention_deletable_owned_value_refs(refs, state, owner_record) do

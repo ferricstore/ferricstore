@@ -544,6 +544,122 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_attribute_values(__instance__(), type, attr_name, opts)
       end
 
+      def flow_effect_reserve(id, effect_key, effect_type, opts \\ []) do
+        FerricStore.Impl.flow_effect_reserve(
+          __instance__(),
+          id,
+          effect_key,
+          effect_type,
+          opts
+        )
+      end
+
+      def flow_effect_confirm(id, effect_key, opts \\ []) do
+        FerricStore.Impl.flow_effect_confirm(__instance__(), id, effect_key, opts)
+      end
+
+      def flow_effect_fail(id, effect_key, opts \\ []) do
+        FerricStore.Impl.flow_effect_fail(__instance__(), id, effect_key, opts)
+      end
+
+      def flow_effect_compensate(id, effect_key, opts \\ []) do
+        FerricStore.Impl.flow_effect_compensate(__instance__(), id, effect_key, opts)
+      end
+
+      def flow_effect_get(id, effect_key, opts \\ []) do
+        FerricStore.Impl.flow_effect_get(__instance__(), id, effect_key, opts)
+      end
+
+      def flow_governance_ledger(id, opts \\ []) do
+        FerricStore.Impl.flow_governance_ledger(__instance__(), id, opts)
+      end
+
+      def flow_approval_request(id, opts \\ []) do
+        FerricStore.Impl.flow_approval_request(__instance__(), id, opts)
+      end
+
+      def flow_approval_approve(id, opts \\ []) do
+        FerricStore.Impl.flow_approval_approve(__instance__(), id, opts)
+      end
+
+      def flow_approval_reject(id, opts \\ []) do
+        FerricStore.Impl.flow_approval_reject(__instance__(), id, opts)
+      end
+
+      def flow_approval_get(id, opts \\ []) do
+        FerricStore.Impl.flow_approval_get(__instance__(), id, opts)
+      end
+
+      def flow_approval_list(opts \\ []) do
+        FerricStore.Impl.flow_approval_list(__instance__(), opts)
+      end
+
+      def flow_governance_overview(opts \\ []) do
+        FerricStore.Impl.flow_governance_overview(__instance__(), opts)
+      end
+
+      def flow_circuit_open(scope, opts \\ []) do
+        FerricStore.Impl.flow_circuit_open(__instance__(), scope, opts)
+      end
+
+      def flow_circuit_close(scope, opts \\ []) do
+        FerricStore.Impl.flow_circuit_close(__instance__(), scope, opts)
+      end
+
+      def flow_circuit_get(scope, opts \\ []) do
+        FerricStore.Impl.flow_circuit_get(__instance__(), scope, opts)
+      end
+
+      def flow_circuit_list(opts \\ []) do
+        FerricStore.Impl.flow_circuit_list(__instance__(), opts)
+      end
+
+      def flow_budget_reserve(scope, amount, opts \\ []) do
+        FerricStore.Impl.flow_budget_reserve(__instance__(), scope, amount, opts)
+      end
+
+      def flow_budget_commit(scope, reservation_id, actual_amount, opts \\ []) do
+        FerricStore.Impl.flow_budget_commit(
+          __instance__(),
+          scope,
+          reservation_id,
+          actual_amount,
+          opts
+        )
+      end
+
+      def flow_budget_release(scope, reservation_id, opts \\ []) do
+        FerricStore.Impl.flow_budget_release(__instance__(), scope, reservation_id, opts)
+      end
+
+      def flow_budget_get(scope, opts \\ []) do
+        FerricStore.Impl.flow_budget_get(__instance__(), scope, opts)
+      end
+
+      def flow_budget_list(opts \\ []) do
+        FerricStore.Impl.flow_budget_list(__instance__(), opts)
+      end
+
+      def flow_limit_lease(scope, opts \\ []) do
+        FerricStore.Impl.flow_limit_lease(__instance__(), scope, opts)
+      end
+
+      def flow_limit_spend(scope, opts \\ []) do
+        FerricStore.Impl.flow_limit_spend(__instance__(), scope, opts)
+      end
+
+      def flow_limit_release(scope, opts \\ []) do
+        FerricStore.Impl.flow_limit_release(__instance__(), scope, opts)
+      end
+
+      def flow_limit_get(scope, opts \\ []) do
+        FerricStore.Impl.flow_limit_get(__instance__(), scope, opts)
+      end
+
+      def flow_limit_list(opts \\ []) do
+        FerricStore.Impl.flow_limit_list(__instance__(), opts)
+      end
+
       def flow_stats(type, opts \\ []) do
         FerricStore.Impl.flow_stats(__instance__(), type, opts)
       end

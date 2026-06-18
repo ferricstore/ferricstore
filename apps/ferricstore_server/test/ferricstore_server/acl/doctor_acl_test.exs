@@ -21,4 +21,50 @@ defmodule FerricstoreServer.ACL.DoctorACLTest do
     assert MapSet.member?(flow, "FLOW.ATTRIBUTES")
     assert MapSet.member?(flow, "FLOW.ATTRIBUTE_VALUES")
   end
+
+  test "flow effect governance commands have read/write ACL categories" do
+    assert {:ok, read} = CommandCategories.category_commands("READ")
+    assert {:ok, write} = CommandCategories.category_commands("WRITE")
+    assert {:ok, flow} = CommandCategories.category_commands("FLOW")
+
+    assert MapSet.member?(read, "FLOW.EFFECT.GET")
+    assert MapSet.member?(flow, "FLOW.EFFECT.GET")
+    assert MapSet.member?(read, "FLOW.GOVERNANCE.LEDGER")
+    assert MapSet.member?(flow, "FLOW.GOVERNANCE.LEDGER")
+    assert MapSet.member?(read, "FLOW.GOVERNANCE.OVERVIEW")
+    assert MapSet.member?(flow, "FLOW.GOVERNANCE.OVERVIEW")
+    assert MapSet.member?(read, "FLOW.APPROVAL.GET")
+    assert MapSet.member?(flow, "FLOW.APPROVAL.GET")
+    assert MapSet.member?(read, "FLOW.APPROVAL.LIST")
+    assert MapSet.member?(flow, "FLOW.APPROVAL.LIST")
+    assert MapSet.member?(read, "FLOW.CIRCUIT.GET")
+    assert MapSet.member?(flow, "FLOW.CIRCUIT.GET")
+    assert MapSet.member?(read, "FLOW.BUDGET.GET")
+    assert MapSet.member?(flow, "FLOW.BUDGET.GET")
+    assert MapSet.member?(read, "FLOW.BUDGET.LIST")
+    assert MapSet.member?(flow, "FLOW.BUDGET.LIST")
+    assert MapSet.member?(read, "FLOW.LIMIT.GET")
+    assert MapSet.member?(flow, "FLOW.LIMIT.GET")
+    assert MapSet.member?(read, "FLOW.LIMIT.LIST")
+    assert MapSet.member?(flow, "FLOW.LIMIT.LIST")
+
+    for command <- [
+          "FLOW.EFFECT.RESERVE",
+          "FLOW.EFFECT.CONFIRM",
+          "FLOW.EFFECT.FAIL",
+          "FLOW.EFFECT.COMPENSATE",
+          "FLOW.APPROVAL.REQUEST",
+          "FLOW.APPROVAL.APPROVE",
+          "FLOW.APPROVAL.REJECT",
+          "FLOW.CIRCUIT.OPEN",
+          "FLOW.CIRCUIT.CLOSE",
+          "FLOW.BUDGET.RESERVE",
+          "FLOW.LIMIT.LEASE",
+          "FLOW.LIMIT.SPEND",
+          "FLOW.LIMIT.RELEASE"
+        ] do
+      assert MapSet.member?(write, command)
+      assert MapSet.member?(flow, command)
+    end
+  end
 end

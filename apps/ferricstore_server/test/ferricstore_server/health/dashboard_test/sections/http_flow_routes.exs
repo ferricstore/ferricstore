@@ -157,6 +157,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
                 {"/dashboard/flow/query", "Flow Query Explorer"},
                 {"/dashboard/flow/signals", "Flow Signals"},
                 {"/dashboard/flow/policies", "FerricFlow Policies"},
+                {"/dashboard/flow/governance", "FerricFlow Governance"},
                 {"/dashboard/flow/retention", "FerricFlow Retention"}
               ] do
             response = http_get(port, path)

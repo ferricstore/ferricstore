@@ -45,6 +45,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/flow/query" -> flow_query_requirement(query)
       "/dashboard/flow/signals" -> {"FLOW.HISTORY", []}
       "/dashboard/flow/policies" -> {"FLOW.POLICY.GET", []}
+      "/dashboard/flow/governance" -> {"FLOW.GOVERNANCE.OVERVIEW", []}
       "/dashboard/flow/retention" -> {"FLOW.LIST", []}
       "/dashboard/flow/config" -> {"CONFIG", []}
       "/dashboard/flow/projections" -> {"FLOW.LIST", []}
@@ -84,6 +85,9 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
       "/dashboard/flow/schedules" ->
         {"FLOW.SCHEDULE.LIST", []}
+
+      "/dashboard/flow/governance" ->
+        {"FLOW.GOVERNANCE.OVERVIEW", []}
 
       "/dashboard/doctor" ->
         {"FERRICSTORE.DOCTOR", []}

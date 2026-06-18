@@ -712,8 +712,78 @@ defmodule Ferricstore.Store.Router.Part09 do
               1 | 0 | nil
       def cas(ctx, key, expected, new_value, ttl_ms) do
         expire_at_ms = if ttl_ms, do: HLC.now_ms() + ttl_ms, else: nil
-        raft_write(ctx, shard_for(ctx, key), key, {:cas, key, expected, new_value, expire_at_ms})
+        idx = shard_for(ctx, key)
+        keydir = resolve_keydir(ctx, idx)
+        existing_expire_at_ms = existing_keydir_expire_at_ms(keydir, key)
+
+        case raft_write(ctx, idx, key, {:cas, key, expected, new_value, expire_at_ms}) do
+          1 ->
+            maybe_publish_control_cas(
+              ctx,
+              idx,
+              keydir,
+              key,
+              new_value,
+              expire_at_ms,
+              existing_expire_at_ms
+            )
+
+            1
+
+          other ->
+            other
+        end
       end
+
+      defp existing_keydir_expire_at_ms(keydir, key) do
+        case :ets.lookup(keydir, key) do
+          [{^key, _value, expire_at_ms, _lfu, _file_id, _offset, _value_size}] ->
+            expire_at_ms
+
+          _other ->
+            0
+        end
+      rescue
+        ArgumentError -> 0
+      end
+
+      defp maybe_publish_control_cas(
+             ctx,
+             idx,
+             keydir,
+             key,
+             new_value,
+             expire_at_ms,
+             existing_expire_at_ms
+           ) do
+        if flow_governance_control_key?(key) do
+          publish_cas_value(
+            ctx,
+            idx,
+            keydir,
+            key,
+            new_value,
+            expire_at_ms || existing_expire_at_ms
+          )
+        end
+      end
+
+      defp publish_cas_value(ctx, idx, keydir, key, value, expire_at_ms) do
+        clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
+        track_keydir_binary_insert(ctx, idx, keydir, key, value)
+
+        :ets.insert(
+          keydir,
+          {key, value, expire_at_ms, LFU.initial(), :pending, 0, byte_size(value)}
+        )
+      rescue
+        ArgumentError -> :ok
+      end
+
+      defp flow_governance_control_key?(<<"f:{", rest::binary>>),
+        do: :binary.match(rest, "}:gov:") != :nomatch
+
+      defp flow_governance_control_key?(_key), do: false
 
       @spec lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
               :ok | {:error, binary()}

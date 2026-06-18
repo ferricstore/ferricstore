@@ -38,6 +38,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   alias FerricstoreServer.Health.Dashboard.Flow.{
     Browse,
     Detail,
+    Governance,
     PolicyRetention,
     Projection,
     Query,
@@ -541,6 +542,32 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec render_flow_schedules_page(map()) :: binary()
   def render_flow_schedules_page(data) do
     render_template(Templates.flow_schedules(%{data: data}))
+  end
+
+  @doc """
+  Collects governance approval, budget, and limit records for the Flow admin page.
+  """
+  @spec collect_flow_governance_page(keyword()) :: map()
+  def collect_flow_governance_page(opts \\ []), do: Governance.collect_page(opts)
+
+  @doc false
+  @spec flow_governance_opts_from_query(binary()) :: keyword()
+  def flow_governance_opts_from_query(query), do: Governance.opts_from_query(query)
+
+  @doc false
+  @spec apply_flow_governance_form(map()) :: {:ok, binary()} | {:error, binary()}
+  def apply_flow_governance_form(params), do: Governance.apply_form(params)
+
+  @doc false
+  @spec flow_governance_form_command(map()) :: binary()
+  def flow_governance_form_command(params), do: Governance.form_command(params)
+
+  @doc """
+  Renders the FerricFlow governance page.
+  """
+  @spec render_flow_governance_page(map()) :: binary()
+  def render_flow_governance_page(data) do
+    render_template(Templates.flow_governance(%{data: data}))
   end
 
   @doc false

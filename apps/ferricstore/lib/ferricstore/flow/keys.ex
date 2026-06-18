@@ -81,6 +81,66 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> @global_tag <> ":policy:" <> type
   end
 
+  def governance_effect_key(id, effect_key, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":gov:e:" <> id <> ":" <> effect_key
+  end
+
+  def governance_effect_key_prefix(id, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":gov:e:" <> id <> ":"
+  end
+
+  def governance_ledger_key(id, event_id, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":gov:l:" <> id <> ":" <> event_id
+  end
+
+  def governance_ledger_key_prefix(id, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":gov:l:" <> id <> ":"
+  end
+
+  def governance_ledger_index_key(id, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":gov:li:" <> id
+  end
+
+  def governance_scope_key(scope) when is_binary(scope) do
+    "f:" <> tag(scope) <> ":gov:scope:" <> scope
+  end
+
+  def governance_approval_key(id) when is_binary(id) do
+    "f:" <> tag(id) <> ":gov:a:" <> id
+  end
+
+  def governance_approval_key?(<<"f:{", rest::binary>>),
+    do: :binary.match(rest, "}:gov:a:") != :nomatch
+
+  def governance_approval_key?(_key), do: false
+
+  def governance_circuit_key(scope) when is_binary(scope) do
+    "f:" <> tag(scope) <> ":gov:c:" <> scope
+  end
+
+  def governance_circuit_key?(<<"f:{", rest::binary>>),
+    do: :binary.match(rest, "}:gov:c:") != :nomatch
+
+  def governance_circuit_key?(_key), do: false
+
+  def governance_budget_key(scope) when is_binary(scope) do
+    "f:" <> tag(scope) <> ":gov:b:" <> scope
+  end
+
+  def governance_budget_key?(<<"f:{", rest::binary>>),
+    do: :binary.match(rest, "}:gov:b:") != :nomatch
+
+  def governance_budget_key?(_key), do: false
+
+  def governance_limit_key(scope) when is_binary(scope) do
+    "f:" <> tag(scope) <> ":gov:limit:" <> scope
+  end
+
+  def governance_limit_key?(<<"f:{", rest::binary>>),
+    do: :binary.match(rest, "}:gov:limit:") != :nomatch
+
+  def governance_limit_key?(_key), do: false
+
   def policy_key?(key) when is_binary(key),
     do: String.starts_with?(key, "f:" <> @global_tag <> ":policy:")
 

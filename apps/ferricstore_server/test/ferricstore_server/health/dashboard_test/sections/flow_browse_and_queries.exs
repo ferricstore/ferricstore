@@ -721,6 +721,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           refute String.contains?(html, "LMDB Mode")
           refute String.contains?(String.downcase(html), "mirror")
           refute String.contains?(html, ~s(href="/dashboard/flow/projections"))
+          assert String.contains?(html, ~s(href="/dashboard/flow/governance"))
         end
 
         test "renders grouped projection health instead of raw metric names" do
