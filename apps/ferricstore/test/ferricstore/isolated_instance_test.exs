@@ -3,7 +3,7 @@ defmodule Ferricstore.IsolatedInstanceTest do
   Tests proving that isolated instances provide true test isolation.
   Each test gets its own FerricStore instance — no shared state.
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Ferricstore.Test.IsolatedInstance
 
@@ -72,8 +72,11 @@ defmodule Ferricstore.IsolatedInstanceTest do
     end
 
     @tag timeout: 120_000
-    test "concurrent isolated instances (async: true proof)" do
-      # This test runs async: true — proving instances don't interfere
+    test "concurrent isolated instances do not interfere" do
+      # Keep the module non-async so CI resource pressure from unrelated test
+      # modules does not starve the isolated instance supervisors. The test
+      # still proves concurrent isolated instances by running multiple checked
+      # out instances at the same time.
       tasks =
         for i <- 1..5 do
           Task.async(fn ->
