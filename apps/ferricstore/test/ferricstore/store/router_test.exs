@@ -3,6 +3,7 @@ defmodule Ferricstore.Store.RouterTest do
 
   alias Ferricstore.Store.{CompoundKey, LFU, Router, SlotMap}
   alias Ferricstore.Test.IsolatedInstance
+  alias Ferricstore.Test.ShardHelpers
 
   describe "shard_for/1" do
     test "returns integer in valid range" do
@@ -151,6 +152,16 @@ defmodule Ferricstore.Store.RouterTest do
   end
 
   describe "default quorum write ingress" do
+    setup do
+      ShardHelpers.flush_all_keys()
+
+      on_exit(fn ->
+        ShardHelpers.flush_all_keys()
+      end)
+
+      :ok
+    end
+
     test "remote forwarding does not use shard forwarded_quorum calls" do
       source = Ferricstore.Test.SourceFiles.router_source()
 
