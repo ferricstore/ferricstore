@@ -31,11 +31,16 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
   # Reset config to defaults after each test to avoid cross-test contamination.
   setup do
     orig_eviction = Application.get_env(:ferricstore, :eviction_policy)
-    orig_slowlog_us = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-    orig_slowlog_max = Application.get_env(:ferricstore, :slowlog_max_len)
+    orig_slowlog_us = app_env_snapshot(:slowlog_log_slower_than_us)
+    orig_slowlog_us_pt = persistent_term_snapshot(:ferricstore_slowlog_threshold)
+    orig_slowlog_max = app_env_snapshot(:slowlog_max_len)
+    orig_slowlog_max_pt = persistent_term_snapshot(:ferricstore_slowlog_max_len)
     orig_log_level = Logger.level()
 
     ConfigLocal.reset_all()
+    Ferricstore.SlowLog.reset()
+    Ferricstore.SlowLog.set_threshold(10_000)
+    Ferricstore.SlowLog.set_max_len(128)
 
     on_exit(fn ->
       # Restore Config GenServer state for read-write params
@@ -54,8 +59,11 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
       # Restore Application env
       if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
 
-      if orig_slowlog_us, do: Ferricstore.SlowLog.set_threshold(orig_slowlog_us)
-      if orig_slowlog_max, do: Ferricstore.SlowLog.set_max_len(orig_slowlog_max)
+      restore_app_env(:slowlog_log_slower_than_us, orig_slowlog_us)
+      restore_persistent_term(:ferricstore_slowlog_threshold, orig_slowlog_us_pt)
+      restore_app_env(:slowlog_max_len, orig_slowlog_max)
+      restore_persistent_term(:ferricstore_slowlog_max_len, orig_slowlog_max_pt)
+      Ferricstore.SlowLog.reset()
 
       ConfigLocal.reset_all()
       Logger.configure(level: orig_log_level)
@@ -123,6 +131,25 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
   # ===========================================================================
   # Helpers
   # ===========================================================================
+
+  defp app_env_snapshot(key) do
+    case Application.fetch_env(:ferricstore, key) do
+      {:ok, value} -> {:set, value}
+      :error -> :unset
+    end
+  end
+
+  defp restore_app_env(key, {:set, value}), do: Application.put_env(:ferricstore, key, value)
+  defp restore_app_env(key, :unset), do: Application.delete_env(:ferricstore, key)
+
+  defp persistent_term_snapshot(key) do
+    {:set, :persistent_term.get(key)}
+  rescue
+    ArgumentError -> :unset
+  end
+
+  defp restore_persistent_term(key, {:set, value}), do: :persistent_term.put(key, value)
+  defp restore_persistent_term(key, :unset), do: :persistent_term.erase(key)
 
   # Extract every other element from a flat list starting at the given offset.
 
