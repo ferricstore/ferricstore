@@ -271,7 +271,7 @@ defmodule FerricstoreServer.Connection.Pipeline.PureBatch do
         Stats.incr_commands_by(state.stats_counter, length(ops))
 
         case safe_dispatch(fn ->
-               Ferricstore.Flow.pipeline_write_batch_independent(state.instance_ctx, ops)
+               Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(state.instance_ctx, ops)
              end) do
           {:ok, results} ->
             Enum.map(results, fn result -> {:encoded, encode_flow_result(result)} end)

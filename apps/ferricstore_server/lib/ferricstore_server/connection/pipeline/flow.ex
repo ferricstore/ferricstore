@@ -28,7 +28,7 @@ defmodule FerricstoreServer.Connection.Pipeline.Flow do
 
                 response =
                   case safe_dispatch(fn ->
-                         Ferricstore.Flow.pipeline_write_batch_independent(
+                         Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(
                            state.instance_ctx,
                            writes
                          )

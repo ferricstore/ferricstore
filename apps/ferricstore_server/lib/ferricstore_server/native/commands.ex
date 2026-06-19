@@ -3920,7 +3920,7 @@ defmodule FerricstoreServer.Native.Commands do
 
                             results =
                               state.instance_ctx
-                              |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+                              |> Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(ops)
                               |> pipeline_flow_results(requests)
 
                             {:ok, results}
@@ -4212,7 +4212,7 @@ defmodule FerricstoreServer.Native.Commands do
 
     results =
       ctx
-      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(ops)
       |> compact_pipeline_flow_pairs(requests)
 
     {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
@@ -4248,7 +4248,7 @@ defmodule FerricstoreServer.Native.Commands do
 
     results =
       ctx
-      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(ops)
       |> compact_pipeline_flow_pairs(requests)
 
     {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
@@ -4266,7 +4266,7 @@ defmodule FerricstoreServer.Native.Commands do
 
     results =
       ctx
-      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(ops)
       |> compact_pipeline_flow_pairs(requests)
 
     {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}
@@ -4333,7 +4333,7 @@ defmodule FerricstoreServer.Native.Commands do
 
     results =
       ctx
-      |> Ferricstore.Flow.pipeline_write_batch_independent(ops)
+      |> Ferricstore.Flow.pipeline_write_batch_cross_shard_safe(ops)
       |> compact_pipeline_flow_pairs(requests)
 
     {:ok, format_compact_pipeline_pairs(results, @op_pipeline, return_format)}

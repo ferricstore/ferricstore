@@ -842,6 +842,23 @@ defmodule Ferricstore.Flow do
   def pipeline_write_batch_independent(_ctx, []), do: []
 
   def pipeline_write_batch_independent(ctx, ops) when is_list(ops) do
+    pipeline_write_batch_with(ctx, ops, &Router.flow_terminal_command_batch_independent/2)
+  end
+
+  def pipeline_write_batch_independent(_ctx, _ops),
+    do: [{:error, "ERR flow opts must be a keyword list"}]
+
+  @doc false
+  def pipeline_write_batch_cross_shard_safe(_ctx, []), do: []
+
+  def pipeline_write_batch_cross_shard_safe(ctx, ops) when is_list(ops) do
+    pipeline_write_batch_with(ctx, ops, &Router.flow_terminal_command_batch/2)
+  end
+
+  def pipeline_write_batch_cross_shard_safe(_ctx, _ops),
+    do: [{:error, "ERR flow opts must be a keyword list"}]
+
+  defp pipeline_write_batch_with(ctx, ops, terminal_batch) do
     command_callbacks = %{
       create_attrs: &Ferricstore.Flow.MutationAttrs.create_attrs/2,
       start_and_claim_attrs: &Ferricstore.Flow.MutationAttrs.start_and_claim_attrs/4,
@@ -853,7 +870,8 @@ defmodule Ferricstore.Flow do
       retry_attrs: &Ferricstore.Flow.MutationAttrs.retry_attrs/3,
       fail_attrs: &Ferricstore.Flow.MutationAttrs.fail_attrs/3,
       cancel_attrs: &Ferricstore.Flow.MutationAttrs.cancel_attrs/2,
-      rewind_attrs: &Ferricstore.Flow.MutationAttrs.rewind_attrs/2
+      rewind_attrs: &Ferricstore.Flow.MutationAttrs.rewind_attrs/2,
+      terminal_batch: terminal_batch
     }
 
     results =
@@ -861,14 +879,12 @@ defmodule Ferricstore.Flow do
         start: &flow_start_time/0,
         command: fn op -> Ferricstore.Flow.PipelineWriteCommand.command(op, command_callbacks) end,
         notify: &maybe_notify_claim_waiters/3,
-        observe: &FlowTelemetry.observe_batch/3
+        observe: &FlowTelemetry.observe_batch/3,
+        terminal_batch: terminal_batch
       })
 
     pipeline_write_return_results(ctx, ops, results)
   end
-
-  def pipeline_write_batch_independent(_ctx, _ops),
-    do: [{:error, "ERR flow opts must be a keyword list"}]
 
   defp pipeline_write_return_results(ctx, ops, results)
        when is_list(ops) and is_list(results) and length(ops) == length(results) do

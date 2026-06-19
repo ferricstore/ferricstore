@@ -63,8 +63,15 @@ defmodule Ferricstore.Flow.PipelineWrite do
     state_run_results(ctx, run, callbacks)
   end
 
-  defp run_results(:terminal, run, ctx, _callbacks) do
-    Router.flow_terminal_command_batch_independent(ctx, run)
+  defp run_results(:terminal, run, ctx, callbacks) do
+    terminal_batch =
+      Map.get(
+        callbacks,
+        :terminal_batch,
+        &Router.flow_terminal_command_batch_independent/2
+      )
+
+    terminal_batch.(ctx, run)
   end
 
   defp state_run_results(ctx, keyed_commands, callbacks) do
