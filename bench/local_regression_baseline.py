@@ -74,6 +74,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--create-batch-size", type=int, default=500)
     parser.add_argument("--complete-async-depth", type=int, default=4)
     parser.add_argument("--transport", default="many")
+    parser.add_argument(
+        "--adaptive-producer-backpressure",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable producer latency protection for DBOS runs. Disabled by default "
+            "because this regression runner measures max-throughput baseline."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -258,7 +267,7 @@ def dbos_command(args: argparse.Namespace) -> list[str]:
     venv_python = args.python_sdk_repo / ".venv" / "bin" / "python"
     python = str(venv_python if venv_python.exists() else Path(sys.executable))
 
-    return [
+    argv = [
         python,
         "examples/dbos_style_benchmark.py",
         "--url",
@@ -295,6 +304,11 @@ def dbos_command(args: argparse.Namespace) -> list[str]:
         str(args.server_shards),
         "--claim-job-only",
     ]
+    if args.adaptive_producer_backpressure:
+        argv.append("--adaptive-producer-backpressure")
+    else:
+        argv.append("--no-adaptive-producer-backpressure")
+    return argv
 
 
 def parse_memtier_totals(text: str) -> str | None:
