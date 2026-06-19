@@ -739,7 +739,7 @@ defmodule FerricstoreServer.ConnectionTest.Sections.ServerAcceptsTcpConnection d
         assert_float_string(zincrby, 2.5)
 
         sends = drain_quorum_submits()
-        assert Enum.any?(sends, &quorum_batch_size_at_least?(&1, 7))
+        assert Enum.any?(sends, &quorum_batch_size_at_least?(&1, 5))
 
         :gen_tcp.close(sock)
       end

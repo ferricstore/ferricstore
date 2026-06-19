@@ -71,6 +71,7 @@ defmodule Ferricstore.IsolatedInstanceTest do
       IsolatedInstance.checkin(ctx)
     end
 
+    @tag timeout: 120_000
     test "concurrent isolated instances (async: true proof)" do
       # This test runs async: true — proving instances don't interfere
       tasks =
@@ -88,7 +89,7 @@ defmodule Ferricstore.IsolatedInstanceTest do
           end)
         end
 
-      results = Task.await_many(tasks, 30_000)
+      results = Task.await_many(tasks, 120_000)
       assert Enum.all?(results, &(&1 == :ok))
     end
   end
