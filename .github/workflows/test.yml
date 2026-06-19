@@ -115,13 +115,11 @@ jobs:
       - name: Credo
         run: mix credo --min-priority high --mute-exit-status
 
-      - name: Upload build artifacts
+      - name: Upload native artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-Linux
           path: |
-            _build
-            deps
             apps/ferricstore/priv/native
             apps/ferricstore_server/priv/native
           retention-days: 1
@@ -217,13 +215,11 @@ jobs:
       - name: Credo
         run: mix credo --min-priority high --mute-exit-status
 
-      - name: Upload build artifacts
+      - name: Upload native artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-macOS
           path: |
-            _build
-            deps
             apps/ferricstore/priv/native
             apps/ferricstore_server/priv/native
           retention-days: 1
