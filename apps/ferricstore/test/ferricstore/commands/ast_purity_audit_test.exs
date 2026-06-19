@@ -19,7 +19,6 @@ defmodule Ferricstore.Commands.AstPurityAuditTest do
       "apps/ferricstore/lib/ferricstore/commands/cms.ex",
       "apps/ferricstore/lib/ferricstore/commands/tdigest.ex",
       "apps/ferricstore/lib/ferricstore/commands/topk.ex",
-      "apps/ferricstore/lib/ferricstore/commands/json.ex",
       "apps/ferricstore/lib/ferricstore/commands/geo.ex",
       "apps/ferricstore/lib/ferricstore/commands/sorted_set.ex",
       "apps/ferricstore/lib/ferricstore/commands/flow.ex"

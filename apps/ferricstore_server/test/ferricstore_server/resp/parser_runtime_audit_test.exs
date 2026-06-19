@@ -19,9 +19,10 @@ defmodule FerricstoreServer.Resp.ParserRuntimeAuditTest do
     assert mix_source =~ ":rustler_precompiled"
 
     assert release_workflow =~
-             ~s(crate: ["ferricstore_bitcask", "ferricstore_wal_nif", "resp_parser_nif"])
+             ~s(crate: ["ferricstore_bitcask", "ferricstore_wal_nif", "resp_parser_nif", "native_protocol_nif"])
 
     assert hex_publish_workflow =~ "RESP_COUNT"
+    assert hex_publish_workflow =~ "NATIVE_COUNT"
     assert hex_publish_workflow =~ "checksum-Elixir.Ferricstore.Resp.ParserNif.exs"
   end
 

@@ -321,11 +321,14 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
           )
         )
 
-        assert [] = :ets.lookup(keydir, payload_key)
+        assert [{^payload_key, nil, 0, _lfu, file_id, offset, value_size}] =
+                 :ets.lookup(keydir, payload_key)
 
-        lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
-        assert {:ok, lmdb_value} = Ferricstore.Flow.LMDB.get(lmdb_path, payload_key)
-        assert {:ok, encoded_ref} = Ferricstore.Flow.LMDB.decode_value(lmdb_value, 1_000)
+        assert is_integer(file_id) and file_id >= 0
+        assert is_integer(offset) and offset >= 0
+        assert value_size > 0
+
+        assert {:ok, encoded_ref, _raw_ref} = raw_disk_blob_ref(ctx, keydir, payload_key)
         assert {:ok, ref} = BlobRef.decode(encoded_ref)
         assert {:ok, encoded_payload} = BlobStore.get(ctx.data_dir, 0, ref)
         assert Ferricstore.Flow.decode_value(encoded_payload) == payload

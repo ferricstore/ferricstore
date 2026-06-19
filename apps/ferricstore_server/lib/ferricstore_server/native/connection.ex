@@ -13,6 +13,7 @@ defmodule FerricstoreServer.Native.Connection do
 
   alias Ferricstore.Stats
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
+  alias FerricstoreServer.Connection.Send
   alias FerricstoreServer.Native.{Codec, Commands, Lane}
 
   @max_buffer_size 134_217_728
@@ -212,7 +213,7 @@ defmodule FerricstoreServer.Native.Connection do
         transport.close(socket)
 
       {:native_goaway, payload} ->
-        transport.send(socket, encode_event_for_state(state, @op_goaway, payload))
+        native_send(state, encode_event_for_state(state, @op_goaway, payload), :event)
         loop(state)
 
       {:native_topology_changed, payload} ->
@@ -292,7 +293,7 @@ defmodule FerricstoreServer.Native.Connection do
 
           case responses do
             [] -> :ok
-            _ -> state.transport.send(state.socket, Enum.reverse(responses))
+            _ -> native_send(state, Enum.reverse(responses), :response)
           end
 
           if state.close_after_reply do
@@ -663,7 +664,15 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp send_native_error(socket, transport, reason) do
-    transport.send(socket, Codec.encode_response(0, 0, 0, :error, reason))
+    native_send(socket, transport, Codec.encode_response(0, 0, 0, :error, reason), :error)
+  end
+
+  defp native_send(%__MODULE__{} = state, iodata, phase) do
+    native_send(state.socket, state.transport, iodata, phase)
+  end
+
+  defp native_send(socket, transport, iodata, phase) do
+    Send.send(socket, transport, iodata, phase, %{protocol: :native})
   end
 
   defp maxclients_exceeded? do
@@ -822,13 +831,14 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp maybe_send_event(state, event, payload) do
     if MapSet.member?(state.event_subscriptions, event) do
-      state.transport.send(
-        state.socket,
+      native_send(
+        state,
         Codec.encode_event(Commands.event_opcode(), %{
           event: event,
           payload: payload,
           at_ms: System.system_time(:millisecond)
-        })
+        }),
+        :event
       )
     end
 
@@ -851,7 +861,7 @@ defmodule FerricstoreServer.Native.Connection do
         response_coalesce_iodata_size(state, responses)
       )
 
-    state.transport.send(state.socket, Enum.reverse(responses))
+    native_send(state, Enum.reverse(responses), :response)
     state
   end
 

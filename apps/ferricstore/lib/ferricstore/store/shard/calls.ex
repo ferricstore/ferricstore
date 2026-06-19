@@ -48,7 +48,9 @@ defmodule Ferricstore.Store.Shard.Calls do
       def handle_call({:scan_prefix, prefix}, _from, state) do
         state =
           if ShardETS.prefix_has_pending_cold?(state.keydir, prefix) do
-            ShardFlush.flush_pending_for_read(state)
+            state
+            |> ShardFlush.await_in_flight()
+            |> ShardFlush.flush_pending_sync()
           else
             state
           end

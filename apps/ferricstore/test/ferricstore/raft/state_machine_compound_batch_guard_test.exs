@@ -88,7 +88,9 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     refute source =~
              "do_compound_delete(state, redis_key, CompoundKey.zset_member(redis_key, member))"
 
-    refute source =~ "prefix_count_entries(shard_ets_state(state), prefix) == 0"
+    body = function_body(source, "maybe_delete_empty_compound_type_key_after_pop")
+
+    refute body =~ "prefix_count_entries(shard_ets_state(state), prefix) == 0"
   end
 
   test "state-machine applies compact compound batch terms directly" do

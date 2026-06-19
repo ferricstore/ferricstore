@@ -123,6 +123,13 @@ defmodule FerricstoreServer.Health.Dashboard.Layout.Styles do
       .flow-alert { border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; font-size: 0.8rem; }
       .flow-alert-ok { background: rgba(35, 134, 54, 0.18); border: 1px solid rgba(35, 134, 54, 0.55); color: #a5d6a7; }
       .flow-alert-error { background: rgba(248, 81, 73, 0.14); border: 1px solid rgba(248, 81, 73, 0.55); color: #ffb3ad; }
+      .flow-bars { display: grid; gap: 8px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; margin-bottom: 16px; }
+      .flow-bar-row { display: grid; grid-template-columns: 92px 1fr 64px; align-items: center; gap: 10px; color: #8b949e; font-size: 0.78rem; }
+      .flow-bar-track { height: 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 999px; overflow: hidden; }
+      .flow-bar-track span { display: block; min-width: 2px; height: 100%; border-radius: 999px; }
+      .flow-bar-track .status-good { background: #3fb950; }
+      .flow-bar-track .status-warn { background: #d29922; }
+      .flow-bar-track .status-bad { background: #f85149; }
       .flow-issue-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
       .flow-issue { display: flex; align-items: center; gap: 8px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; font-size: 0.82rem; color: #c9d1d9; }
       .flow-pill { display: inline-block; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 999px; padding: 1px 7px; font-size: 0.68rem; margin: 1px 2px 1px 0; white-space: nowrap; }

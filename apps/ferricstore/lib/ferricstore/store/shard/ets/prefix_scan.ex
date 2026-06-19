@@ -39,6 +39,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
 
   defp maybe_compound_index_scan_entries(state, keydir, prefix, shard_data_path) do
     case CompoundMemberIndex.scan_entries(compound_member_index_ref(state), state, prefix) do
+      {:ok, []} -> do_prefix_scan_entries(state, keydir, prefix, shard_data_path)
       {:ok, entries} -> entries
       :unavailable -> do_prefix_scan_entries(state, keydir, prefix, shard_data_path)
     end

@@ -650,7 +650,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterrupte
         assert :ok =
                  WARaftBackend.start(ctx,
                    log_module: :ferricstore_waraft_spike_segment_log,
-                   max_pending_low_priority_commits: 0
+                   max_pending_high_priority_commits: 0
                  )
 
         assert {:error, :overloaded} = WARaftBackend.write(0, {:put, "blocked:k", "v", 0})
@@ -661,7 +661,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterrupte
         assert :ok =
                  WARaftBackend.start(ctx,
                    log_module: :ferricstore_waraft_spike_segment_log,
-                   max_pending_low_priority_commits: 0,
+                   max_pending_high_priority_commits: 0,
                    max_inflight_commit_bytes: 256
                  )
 

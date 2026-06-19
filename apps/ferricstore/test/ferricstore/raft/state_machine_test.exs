@@ -265,9 +265,32 @@ defmodule Ferricstore.Raft.StateMachineTest do
   end
 
   defp assert_flow_history_event!(state, id, partition_key, event_id, event) do
-    fields = flow_history_fields!(state, id, partition_key, event_id)
-    assert flow_history_field(fields, "event") == event
-    assert flow_history_field(fields, "id") == id
+    Ferricstore.Test.Eventually.assert_eventually(fn ->
+      fields = flow_history_fields!(state, id, partition_key, event_id)
+      assert flow_history_field(fields, "event") == event
+      assert flow_history_field(fields, "id") == id
+    end)
+  end
+
+  defp start_flow_history_projector!(state) do
+    {:ok, pid} =
+      Ferricstore.Flow.HistoryProjector.start_link(
+        shard_index: state.shard_index,
+        shard_data_path: state.shard_data_path,
+        instance_ctx: Map.get(state, :instance_ctx)
+      )
+
+    on_exit(fn ->
+      try do
+        if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
+      rescue
+        _ -> :ok
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    :ok
   end
 
   defp flow_history_field([key, value | _rest], key), do: value

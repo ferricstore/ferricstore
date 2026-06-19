@@ -162,6 +162,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           state: state,
           shard_index: shard_index
         } do
+          start_flow_history_projector!(state)
+
           :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
           :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
           :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
@@ -232,6 +234,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           state: state,
           shard_index: shard_index
         } do
+          start_flow_history_projector!(state)
+
           :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
           :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
           :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])

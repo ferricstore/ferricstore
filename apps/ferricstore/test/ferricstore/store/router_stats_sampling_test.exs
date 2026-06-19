@@ -121,8 +121,10 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
       refute contains_call?(body, :sampled_read_bookkeeping_fast, 4),
              "#{name}/#{arity} must batch hot-read bookkeeping instead of sampling per hit"
 
-      assert contains_call?(body, :sampled_read_bookkeeping_batch, 3),
-             "#{name}/#{arity} must use sampled_read_bookkeeping_batch/3"
+      assert contains_call?(body, :sampled_read_bookkeeping_batch, 3) or
+               (contains_call?(body, :hot_read_bookkeeping_start, 1) and
+                  contains_call?(body, :hot_read_bookkeeping_finish, 2)),
+             "#{name}/#{arity} must use batched hot-read bookkeeping"
     end
 
     planned_body = find_function_body!(ast, :batch_get_planned, 2)

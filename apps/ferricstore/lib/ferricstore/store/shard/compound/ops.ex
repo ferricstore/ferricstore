@@ -69,7 +69,9 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
       nil ->
         state =
           if ShardETS.prefix_has_pending_cold?(state.keydir, prefix) do
-            ShardFlush.flush_pending_for_read(state)
+            state
+            |> ShardFlush.await_in_flight()
+            |> ShardFlush.flush_pending_sync()
           else
             state
           end

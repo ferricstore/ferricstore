@@ -185,25 +185,28 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
         entries =
           tid
           |> scan_keys(prefix)
-          |> Enum.reduce([], fn compound_key, acc ->
+          |> Enum.reduce_while([], fn compound_key, acc ->
             case ShardETS.ets_lookup_warm(lookup_state, compound_key) do
               {:hit, value, _expire_at_ms} when is_binary(value) ->
-                [{member_from_key(compound_key, prefix), value} | acc]
+                {:cont, [{member_from_key(compound_key, prefix), value} | acc]}
 
               {:hit, value, _expire_at_ms} ->
-                [{member_from_key(compound_key, prefix), to_string(value)} | acc]
+                {:cont, [{member_from_key(compound_key, prefix), to_string(value)} | acc]}
 
               :expired ->
                 delete(tid, compound_key)
-                acc
+                {:cont, acc}
 
               :miss ->
                 delete(tid, compound_key)
-                acc
+                {:cont, acc}
             end
           end)
 
-        {:ok, Enum.reverse(entries)}
+        case entries do
+          :unavailable -> :unavailable
+          entries -> {:ok, Enum.reverse(entries)}
+        end
     end
   end
 
