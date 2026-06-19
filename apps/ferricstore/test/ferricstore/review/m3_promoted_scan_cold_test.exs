@@ -154,7 +154,7 @@ defmodule Ferricstore.Review.M3PromotedScanColdTest do
       [{_, val, _, _, _, _, _}] = :ets.lookup(keydir, "H:#{key}\0f_1")
       assert val == nil, "expected nil after eviction"
 
-      # HGETALL should still return all fields — cold reads from dedicated file
+      # HGETALL should still return all fields — cold reads from dedicated file.
       all_after = Hash.handle("HGETALL", [key], store)
       field_count = div(length(all_after), 2)
 

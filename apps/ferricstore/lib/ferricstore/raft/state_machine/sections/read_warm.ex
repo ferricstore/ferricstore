@@ -405,11 +405,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               end
             end)
           end,
-          compound_scan: fn _redis_key, prefix ->
+          compound_scan: fn redis_key, prefix ->
+            data_path =
+              Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
+                state.shard_data_path
+
             Ferricstore.Store.Shard.ETS.prefix_scan_entries(
               shard_ets_state(state),
               prefix,
-              state.shard_data_path
+              data_path
             )
             |> Enum.sort_by(fn {field, _} -> field end)
           end,
