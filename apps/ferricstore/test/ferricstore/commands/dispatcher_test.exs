@@ -366,25 +366,27 @@ defmodule Ferricstore.Commands.DispatcherTest do
 
   test "dispatches Rust typed stream ASTs" do
     store = MockStore.make()
+    stream_key = "dispatcher-stream-#{System.unique_integer([:positive])}"
 
     assert "1-0" ==
              Dispatcher.dispatch_ast(
-               {:xadd, "s", {{:explicit, 1, 0}, ["f", "v"], nil, false}},
+               {:xadd, stream_key, {{:explicit, 1, 0}, ["f", "v"], nil, false}},
                store
              )
 
-    assert 1 == Dispatcher.dispatch_ast({:xlen, "s"}, store)
+    assert 1 == Dispatcher.dispatch_ast({:xlen, stream_key}, store)
 
     assert [["1-0", "f", "v"]] ==
-             Dispatcher.dispatch_ast({:xrange, "s", :min, :max, :infinity}, store)
+             Dispatcher.dispatch_ast({:xrange, stream_key, :min, :max, :infinity}, store)
 
-    assert [["1-0", "f", "v"]] == Dispatcher.dispatch_ast({:xrevrange, "s", :min, :max, 1}, store)
+    assert [["1-0", "f", "v"]] ==
+             Dispatcher.dispatch_ast({:xrevrange, stream_key, :min, :max, 1}, store)
 
-    assert [["s", [["1-0", "f", "v"]]]] ==
-             Dispatcher.dispatch_ast({:xread, :infinity, :no_block, [{"s", "0"}]}, store)
+    assert [[stream_key, [["1-0", "f", "v"]]]] ==
+             Dispatcher.dispatch_ast({:xread, :infinity, :no_block, [{stream_key, "0"}]}, store)
 
-    assert 0 == Dispatcher.dispatch_ast({:xtrim, "s", {:maxlen, false, 10}}, store)
-    assert 1 == Dispatcher.dispatch_ast({:xdel, "s", ["1-0"]}, store)
+    assert 0 == Dispatcher.dispatch_ast({:xtrim, stream_key, {:maxlen, false, 10}}, store)
+    assert 1 == Dispatcher.dispatch_ast({:xdel, stream_key, ["1-0"]}, store)
   end
 
   test "dispatches Rust stream parse errors" do
