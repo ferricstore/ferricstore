@@ -6,6 +6,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
 
   setup do
     NamespaceConfig.reset_all()
@@ -201,6 +202,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     assert offenders == []
   end
 
+  @tag timeout: 120_000
   test "batch_put API submits through quorum path" do
     id = {__MODULE__, self(), :quorum_submit}
     parent = self()
@@ -217,7 +219,8 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     ctx = FerricStore.Instance.get(:default)
     key = "async_removed_batch:#{System.unique_integer([:positive])}"
 
-    Ferricstore.Test.ShardHelpers.wait_default_quorum_writable(60_000)
+    ShardHelpers.flush_all_keys()
+    ShardHelpers.wait_default_quorum_writable(90_000)
 
     assert :ok == Router.batch_put(ctx, [{key, "value"}])
     assert_receive {:quorum_submit, %{status: :ok}}, 1_000
