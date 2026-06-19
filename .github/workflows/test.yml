@@ -259,6 +259,7 @@ jobs:
 
       - name: Upload architecture test results
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: test-results-architecture
@@ -298,6 +299,7 @@ jobs:
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: test-results-core-ubuntu-${{ matrix.partition }}
           path: test-results/
@@ -333,6 +335,7 @@ jobs:
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: test-results-core-macos-${{ matrix.partition }}
           path: test-results/
@@ -371,6 +374,7 @@ jobs:
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: test-results-server-ubuntu-${{ matrix.partition }}
           path: test-results/
@@ -406,6 +410,7 @@ jobs:
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: test-results-server-macos-${{ matrix.partition }}
           path: test-results/
@@ -477,6 +482,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: test-results-durability
           path: test-results/
@@ -564,6 +570,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: test-results-cluster
           path: |

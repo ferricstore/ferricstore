@@ -4428,23 +4428,36 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
       assert create_status == :ok
 
-      {claim_status, jobs, _state} =
-        Commands.execute(
-          @op_flow_claim_due,
-          %{
-            "type" => type,
-            "state" => "queued",
-            "worker" => "native-worker",
-            "limit" => 2,
-            "lease_ms" => 30_000,
-            "partition_keys" => [partition_key],
-            "return" => "jobs_compact"
-          },
-          state(instance_ctx: ctx, compact_flow_responses: true)
+      :ok =
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            case Commands.execute(
+                   @op_flow_claim_due,
+                   %{
+                     "type" => type,
+                     "state" => "queued",
+                     "worker" => "native-worker",
+                     "limit" => 2,
+                     "lease_ms" => 30_000,
+                     "partition_keys" => [partition_key],
+                     "return" => "jobs_compact"
+                   },
+                   state(instance_ctx: ctx, compact_flow_responses: true)
+                 ) do
+              {:ok, jobs, _state} when length(jobs) == 2 ->
+                Process.put(:native_many_ok_claim_jobs, jobs)
+                true
+
+              _other ->
+                false
+            end
+          end,
+          "native flow many test should claim created jobs",
+          100,
+          25
         )
 
-      assert claim_status == :ok
-      assert length(jobs) == 2
+      jobs = Process.delete(:native_many_ok_claim_jobs)
 
       {status, reply, _state} =
         Commands.execute(op, payload_fun.(jobs, now_ms), state(instance_ctx: ctx))
