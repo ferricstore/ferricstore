@@ -115,15 +115,16 @@ jobs:
       - name: Credo
         run: mix credo --min-priority high --mute-exit-status
 
-      - name: Cache build artifacts
-        uses: actions/cache/save@v4
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
+          name: build-Linux
           path: |
             _build
             deps
             apps/ferricstore/priv/native
             apps/ferricstore_server/priv/native
-          key: build-Linux-${{ github.sha }}
+          retention-days: 1
 
   # ===========================================================================
   # Build (macOS)
@@ -216,15 +217,16 @@ jobs:
       - name: Credo
         run: mix credo --min-priority high --mute-exit-status
 
-      - name: Cache build artifacts
-        uses: actions/cache/save@v4
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
+          name: build-macOS
           path: |
             _build
             deps
             apps/ferricstore/priv/native
             apps/ferricstore_server/priv/native
-          key: build-macOS-${{ github.sha }}
+          retention-days: 1
 
   # ===========================================================================
   # Architecture tests (visible guardrail)
@@ -244,13 +246,13 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-Linux-${{ github.sha }}
+          name: build-Linux
+          path: .
+
+      - name: Ensure dependencies
+        run: mix deps.get
 
       - name: Run architecture tests
         run: |
@@ -289,13 +291,12 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-Linux-${{ github.sha }}
+          name: build-Linux
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 45
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
@@ -325,13 +326,12 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-macOS-${{ github.sha }}
+          name: build-macOS
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 45
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
@@ -364,13 +364,12 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-Linux-${{ github.sha }}
+          name: build-Linux
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
       - name: Run ferricstore_server tests
         timeout-minutes: 45
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
@@ -400,13 +399,12 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-macOS-${{ github.sha }}
+          name: build-macOS
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
       - name: Run ferricstore_server tests
         timeout-minutes: 45
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
@@ -434,13 +432,13 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-Linux-${{ github.sha }}
+          name: build-Linux
+          path: .
+
+      - name: Ensure dependencies
+        run: mix deps.get
 
       - name: "Shard-kill + Jepsen + large alloc tests (max 5 failures allowed)"
         run: |
@@ -505,13 +503,13 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-Linux-${{ github.sha }}
+          name: build-Linux
+          path: .
+
+      - name: Ensure dependencies
+        run: mix deps.get
 
       - name: "Cluster tests (max 5 failures allowed)"
         run: |
