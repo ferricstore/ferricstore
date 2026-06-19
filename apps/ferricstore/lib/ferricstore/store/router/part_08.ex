@@ -739,9 +739,7 @@ defmodule Ferricstore.Store.Router.Part08 do
             results
 
           :fallback ->
-            commands
-            |> flow_terminal_command_batch_independent(ctx, [], [])
-            |> Enum.reverse()
+            flow_terminal_command_batch(ctx, commands)
         end
       end
 
@@ -757,7 +755,8 @@ defmodule Ferricstore.Store.Router.Part08 do
 
       defp flow_terminal_pipeline_independent_batch(ctx, commands) do
         with {:ok, op, attrs_list} <- flow_terminal_homogeneous_attrs(commands),
-             :ok <- flow_terminal_pipeline_keys_valid?(attrs_list) do
+             :ok <- flow_terminal_pipeline_keys_valid?(attrs_list),
+             :same_or_none <- flow_cross_terminal_many_keys(ctx, attrs_list) do
           {:ok, flow_terminal_pipeline_same_shard(ctx, op, attrs_list)}
         else
           _other -> :fallback

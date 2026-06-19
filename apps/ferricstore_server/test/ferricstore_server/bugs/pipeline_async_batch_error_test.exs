@@ -302,6 +302,19 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     refute response =~ "-ERR"
     assert response =~ "+PONG\r\n"
 
+    :ok =
+      ShardHelpers.eventually(
+        fn ->
+          case FerricStore.flow_get(parent, partition_key: parent_partition) do
+            {:ok, %{state: "children_done"}} -> true
+            _other -> false
+          end
+        end,
+        "parent child-group terminal aggregation did not complete",
+        100,
+        50
+      )
+
     assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: parent_partition)
     assert done_parent.state == "children_done"
     assert done_parent.child_groups["fanout"]["children"][child] == "completed"
