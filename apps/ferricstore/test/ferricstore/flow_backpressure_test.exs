@@ -14,6 +14,7 @@ defmodule Ferricstore.FlowBackpressureTest do
   end
 
   setup do
+    ShardHelpers.flush_all_keys()
     OperationalGuard.reset_for_test()
     Admission.clear_create_pause()
     MemoryGuard.set_keydir_full(false)
@@ -24,6 +25,7 @@ defmodule Ferricstore.FlowBackpressureTest do
       Admission.clear_create_pause()
       MemoryGuard.set_keydir_full(false)
       MemoryGuard.set_reject_writes(false)
+      ShardHelpers.flush_all_keys()
     end)
 
     :ok
