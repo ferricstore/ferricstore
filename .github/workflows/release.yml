@@ -27,6 +27,11 @@ jobs:
           - { target: x86_64-unknown-linux-gnu,    os: ubuntu-22.04, use-cross: true }
           - { target: aarch64-unknown-linux-musl,  os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-unknown-linux-musl,   os: ubuntu-22.04, use-cross: true }
+        exclude:
+          - crate: native_protocol_nif
+            job: { target: aarch64-unknown-linux-musl,  os: ubuntu-22.04, use-cross: true }
+          - crate: native_protocol_nif
+            job: { target: x86_64-unknown-linux-musl,   os: ubuntu-22.04, use-cross: true }
 
     steps:
       - uses: actions/checkout@v4

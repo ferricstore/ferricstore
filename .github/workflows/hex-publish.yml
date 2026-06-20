@@ -68,9 +68,9 @@ jobs:
       - name: Wait for all precompiled NIF artifacts
         if: steps.hex_creds.outputs.available == 'true'
         run: |
-          # Four crates x six targets = 24 tarballs. The RESP parser NIF is
-          # part of the core package because embedded and server paths share it.
-          # native_protocol_nif belongs to the server package/data plane.
+          # Core NIFs build six targets each. native_protocol_nif builds four
+          # targets because Rust cdylib is not available for the musl targets
+          # used by rustler-precompiled-action/cross here.
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           for i in $(seq 1 90); do
@@ -79,9 +79,9 @@ jobs:
             WAL_COUNT=$(echo "$ASSETS" | grep -c "ferricstore_wal_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
             RESP_COUNT=$(echo "$ASSETS" | grep -c "resp_parser_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
             NATIVE_COUNT=$(echo "$ASSETS" | grep -c "native_protocol_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
-            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6, resp=$RESP_COUNT/6, native=$NATIVE_COUNT/6"
-            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ] && [ "$RESP_COUNT" -ge 6 ] && [ "$NATIVE_COUNT" -ge 6 ]; then
-              echo "All 24 NIF artifacts present."
+            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6, resp=$RESP_COUNT/6, native=$NATIVE_COUNT/4"
+            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ] && [ "$RESP_COUNT" -ge 6 ] && [ "$NATIVE_COUNT" -ge 4 ]; then
+              echo "All 22 NIF artifacts present."
               break
             fi
             if [ "$i" = "90" ]; then
