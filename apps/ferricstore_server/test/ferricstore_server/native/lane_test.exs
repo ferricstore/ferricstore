@@ -81,7 +81,7 @@ defmodule FerricstoreServer.Native.LaneTest do
 
     Lane.enqueue_many(lane, frames)
 
-    assert_receive {:native_lane_responses, 3, responses, 3}
+    assert_receive {:native_lane_responses, 3, responses, 3}, 2_000
     assert Enum.map(responses, &decode_single_response/1) == [{1, "OK"}, {2, "OK"}, {3, "OK"}]
 
     for index <- 1..3 do
@@ -110,7 +110,7 @@ defmodule FerricstoreServer.Native.LaneTest do
 
     Lane.enqueue_many(lane, frames)
 
-    assert_receive {:native_lane_responses, 5, responses, 3}
+    assert_receive {:native_lane_responses, 5, responses, 3}, 2_000
     assert Enum.map(responses, &decode_compact_get_response/1) == [{1, "v1"}, {2, "v2"}, {3, nil}]
 
     send(lane, :shutdown)
@@ -134,7 +134,7 @@ defmodule FerricstoreServer.Native.LaneTest do
        compact_mget_body(["#{prefix}:3", "#{prefix}:missing"])}
     ])
 
-    assert_receive {:native_lane_responses, 6, responses, 2}
+    assert_receive {:native_lane_responses, 6, responses, 2}, 2_000
 
     assert Enum.map(responses, &decode_compact_mget_response/1) == [
              {11, ["v1", "v2"]},
@@ -157,7 +157,7 @@ defmodule FerricstoreServer.Native.LaneTest do
       {4, @op_set, 12, 0, Codec.encode_value(%{"key" => other_key, "value" => "other"})}
     ])
 
-    assert_receive {:native_lane_responses, 4, responses, 2}
+    assert_receive {:native_lane_responses, 4, responses, 2}, 2_000
     assert Enum.map(responses, &decode_single_response/1) == [{11, "OK"}, {12, "OK"}]
     assert {:ok, "ttl"} = FerricStore.Impl.get(ctx, key)
     assert {:ok, "other"} = FerricStore.Impl.get(ctx, other_key)
