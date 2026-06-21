@@ -16,6 +16,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_pipeline 0x000E
   @op_subscribe_events 0x0011
   @op_unsubscribe_events 0x0012
+  @op_command_exec 0x0100
   @op_get 0x0101
   @op_mget 0x0104
   @op_mset 0x0105
@@ -473,6 +474,53 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert {:ok, _record, _state} =
              Commands.execute(@op_flow_create, body, state(instance_ctx: ctx))
+  end
+
+  test "native COMMAND_EXEC routes RESP-only stream commands through canonical dispatcher" do
+    ctx = FerricStore.Instance.get(:default)
+    stream = "native-command-exec-stream-#{System.unique_integer([:positive])}"
+
+    assert {:ok, id, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XADD", "args" => [stream, "*", "field", "value"]},
+               state(instance_ctx: ctx)
+             )
+
+    assert is_binary(id)
+
+    assert {:ok, 1, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "XLEN", "args" => [stream]},
+               state(instance_ctx: ctx)
+             )
+  end
+
+  test "native COMMAND_EXEC routes module/probabilistic commands through canonical dispatcher" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "native-command-exec-bloom-#{System.unique_integer([:positive])}"
+
+    assert {:ok, "OK", _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "BF.RESERVE", "args" => [key, "0.01", "100"]},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, 1, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "BF.ADD", "args" => [key, "item"]},
+               state(instance_ctx: ctx)
+             )
+
+    assert {:ok, 1, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "BF.EXISTS", "args" => [key, "item"]},
+               state(instance_ctx: ctx)
+             )
   end
 
   test "native Flow query commands accept count and time filter options" do
@@ -4868,6 +4916,35 @@ defmodule FerricstoreServer.Native.CommandsTest do
         },
         state(
           username: "limited-flow",
+          authenticated: true,
+          acl_cache: cache,
+          instance_ctx: ctx
+        )
+      )
+
+    assert status == :noperm
+    assert reason =~ "NOPERM"
+  end
+
+  test "COMMAND_EXEC checks ACL against parsed command and keys" do
+    ctx = FerricStore.Instance.get(:default)
+
+    :ok =
+      FerricstoreServer.Acl.set_user("limited-command-exec", [
+        "on",
+        ">pass",
+        "~allowed:*",
+        "+@all"
+      ])
+
+    cache = ConnAuth.build_acl_cache("limited-command-exec")
+
+    {status, reason, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "SET", "args" => ["denied:key", "value"]},
+        state(
+          username: "limited-command-exec",
           authenticated: true,
           acl_cache: cache,
           instance_ctx: ctx

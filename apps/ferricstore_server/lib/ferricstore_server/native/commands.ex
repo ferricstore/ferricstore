@@ -46,6 +46,7 @@ defmodule FerricstoreServer.Native.Commands do
   @op_event 0x0010
   @op_subscribe_events 0x0011
   @op_unsubscribe_events 0x0012
+  @op_command_exec 0x0100
 
   @op_get 0x0101
   @op_set 0x0102
@@ -189,6 +190,7 @@ defmodule FerricstoreServer.Native.Commands do
   }
 
   @kv_commands %{
+    @op_command_exec => "COMMAND_EXEC",
     @op_pipeline => "PIPELINE",
     @op_get => "GET",
     @op_set => "SET",
@@ -653,6 +655,21 @@ defmodule FerricstoreServer.Native.Commands do
       {:ok, event_subscription_payload(state), state}
     else
       {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp do_execute(@op_command_exec, payload, state) do
+    with {:ok, command} <- require_binary(payload, "command"),
+         {:ok, args} <- raw_command_args(payload),
+         {:ok, cmd, parsed_args, _ast, keys} <-
+           Ferricstore.Commands.Dispatcher.parse_raw(command, args),
+         :ok <- authorize_raw_command(cmd, keys, state) do
+      store = state.instance_ctx
+      result = Ferricstore.Commands.Dispatcher.dispatch_raw(command, parsed_args, store)
+      result |> raw_result_to_native() |> result_to_reply(state)
+    else
+      {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
+      {:error, status, reason} -> {status, reason, state}
     end
   end
 
@@ -1619,6 +1636,19 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp raw_command_args(%{"args" => args}) when is_list(args), do: {:ok, args}
+  defp raw_command_args(%{"args" => nil}), do: {:ok, []}
+  defp raw_command_args(payload) when not is_map_key(payload, "args"), do: {:ok, []}
+  defp raw_command_args(_payload), do: {:error, "ERR native COMMAND_EXEC args must be a list"}
+
+  defp raw_result_to_native({:simple, value}), do: value
+  defp raw_result_to_native({:bulk, value}), do: value
+  defp raw_result_to_native({:integer, value}), do: value
+  defp raw_result_to_native({:array, value}), do: value
+  defp raw_result_to_native({:push, value}), do: value
+  defp raw_result_to_native({:error, _reason} = error), do: error
+  defp raw_result_to_native(value), do: value
+
   defp flow_many_items_call(payload, state, fun, item_kind) do
     with {:ok, items} <- flow_items(payload, "items", item_kind),
          {:ok, opts} <- flow_opts(payload, ["partition_key", "items"]) do
@@ -1732,6 +1762,7 @@ defmodule FerricstoreServer.Native.Commands do
   defp authorize("OPTIONS", _opcode, _payload, _state), do: :ok
   defp authorize("STARTUP", _opcode, _payload, _state), do: :ok
   defp authorize("AUTH", _opcode, _payload, _state), do: :ok
+  defp authorize("COMMAND_EXEC", _opcode, _payload, _state), do: :ok
 
   defp authorize(command, opcode, payload, state) do
     cond do
@@ -1762,6 +1793,29 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp check_key_acl_cached(cache, opcode, payload) do
     ConnAuth.check_keys_cached(cache, key_acl_command(opcode), keys(opcode, payload))
+  end
+
+  defp authorize_raw_command(command, keys, state) do
+    cond do
+      state.require_auth and not state.authenticated ->
+        {:error, :auth, "NOAUTH Authentication required."}
+
+      true ->
+        with :ok <- ConnAuth.check_command_cached(state.acl_cache, command),
+             :ok <- ConnAuth.check_keys_cached(state.acl_cache, command, keys) do
+          :ok
+        else
+          {:error, reason} ->
+            FerricstoreServer.Acl.Protection.log_command_denied(
+              state.username,
+              command,
+              format_peer(state.peer),
+              state.client_id
+            )
+
+            {:error, :noperm, reason}
+        end
+    end
   end
 
   defp keys(opcode, payload)

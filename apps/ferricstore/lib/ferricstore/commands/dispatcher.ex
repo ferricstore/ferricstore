@@ -613,54 +613,77 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp ast_command_name(:cluster_role), do: "CLUSTER.ROLE"
   defp ast_command_name(:ferricstore_hotness), do: "FERRICSTORE.HOTNESS"
 
+  @doc """
+  Parses a raw command name and argument list into the same AST used by the
+  RESP server path.
+
+  Native protocol uses this as a compatibility fallback for commands that do
+  not yet have a specialized native opcode. Hot commands should keep using
+  dedicated native opcodes.
+  """
+  @spec parse_raw(binary(), [term()]) ::
+          {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
+  def parse_raw("", _args), do: {:error, unknown_command("")}
+
+  def parse_raw(name, args) when is_binary(name) and is_list(args) do
+    frame = encode_raw_command(name, args)
+
+    case Ferricstore.Resp.Parser.parse_commands(frame) do
+      {:ok, [{:command, cmd, parsed_args, ast, keys}], ""} ->
+        {:ok, cmd, parsed_args, ast, keys}
+
+      {:ok, _other, _rest} ->
+        {:error, "ERR protocol error"}
+
+      {:error, reason} ->
+        {:error, "ERR protocol error #{inspect(reason)}"}
+    end
+  end
+
+  @doc """
+  Dispatches a raw command name and argument list through the canonical command
+  AST dispatcher.
+  """
+  @spec dispatch_raw(binary(), [term()], map()) :: term()
+  def dispatch_raw(name, args, store) do
+    start = System.monotonic_time(:microsecond)
+
+    case parse_raw(name, args) do
+      {:ok, cmd, parsed_args, ast, _keys} ->
+        dispatch_ast(ast, store)
+        |> tap(fn _ -> log_raw_dispatch(cmd, parsed_args, start) end)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   if Mix.env() == :test do
     @doc """
-    Test-only convenience wrapper. It encodes the given command as one RESP
-    frame, lets the Rust parser build the AST, then dispatches that AST.
+    Test-only convenience wrapper.
     """
     @spec dispatch(binary(), [binary()], map()) :: term()
-    def dispatch("", _args, _store), do: unknown_command("")
-
-    def dispatch(name, args, store) do
-      start = System.monotonic_time(:microsecond)
-      frame = encode_test_command(name, args)
-      parser = Ferricstore.Resp.Parser
-
-      result =
-        case apply(parser, :parse_commands, [frame]) do
-          {:ok, [{:command, cmd, parsed_args, ast, _keys}], ""} ->
-            dispatch_ast(ast, store)
-            |> tap(fn _ -> log_test_dispatch(cmd, parsed_args, start) end)
-
-          {:ok, _other, _rest} ->
-            {:error, "ERR protocol error"}
-
-          {:error, reason} ->
-            {:error, "ERR protocol error #{inspect(reason)}"}
-        end
-
-      result
-    end
-
-    defp log_test_dispatch(cmd, args, start) do
-      duration = System.monotonic_time(:microsecond) - start
-      Ferricstore.SlowLog.maybe_log([cmd | args], duration)
-    end
-
-    defp encode_test_command(name, args) do
-      parts = [to_command_binary(name) | Enum.map(args, &to_command_binary/1)]
-
-      IO.iodata_to_binary([
-        "*",
-        Integer.to_string(length(parts)),
-        "\r\n",
-        Enum.map(parts, fn part ->
-          ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
-        end)
-      ])
-    end
-
-    defp to_command_binary(value) when is_binary(value), do: value
-    defp to_command_binary(value), do: to_string(value)
+    def dispatch(name, args, store), do: dispatch_raw(name, args, store)
   end
+
+  defp log_raw_dispatch(cmd, args, start) do
+    duration = System.monotonic_time(:microsecond) - start
+    Ferricstore.SlowLog.maybe_log([cmd | args], duration)
+  end
+
+  defp encode_raw_command(name, args) do
+    parts = [to_command_binary(name) | Enum.map(args, &to_command_binary/1)]
+
+    IO.iodata_to_binary([
+      "*",
+      Integer.to_string(length(parts)),
+      "\r\n",
+      Enum.map(parts, fn part ->
+        ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
+      end)
+    ])
+  end
+
+  defp to_command_binary(value) when is_binary(value), do: value
+  defp to_command_binary(value), do: to_string(value)
 end
