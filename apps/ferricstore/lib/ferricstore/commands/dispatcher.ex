@@ -623,7 +623,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   """
   @spec parse_raw(binary(), [term()]) ::
           {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
-  def parse_raw("", _args), do: {:error, unknown_command("")}
+  def parse_raw("", _args), do: unknown_command("")
 
   def parse_raw(name, args) when is_binary(name) and is_list(args) do
     frame = encode_raw_command(name, args)
