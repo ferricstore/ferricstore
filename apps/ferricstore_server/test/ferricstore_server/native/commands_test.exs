@@ -450,6 +450,31 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
   end
 
+  test "native FLOW.CREATE accepts idempotent option" do
+    ctx = FerricStore.Instance.get(:default)
+    prefix = "native-flow-create-idempotent-#{System.unique_integer([:positive])}"
+    id = prefix <> ":flow"
+    flow_type = prefix <> ":type"
+    now = System.system_time(:millisecond)
+
+    body = %{
+      "id" => id,
+      "type" => flow_type,
+      "state" => "queued",
+      "partition_key" => prefix,
+      "payload" => "same-payload",
+      "now_ms" => now,
+      "run_at_ms" => now,
+      "idempotent" => true
+    }
+
+    assert {:ok, _record, _state} =
+             Commands.execute(@op_flow_create, body, state(instance_ctx: ctx))
+
+    assert {:ok, _record, _state} =
+             Commands.execute(@op_flow_create, body, state(instance_ctx: ctx))
+  end
+
   test "native Flow query commands accept count and time filter options" do
     ctx = FerricStore.Instance.get(:default)
     prefix = "native-flow-query-#{System.unique_integer([:positive])}"
