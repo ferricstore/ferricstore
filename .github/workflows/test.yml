@@ -10,6 +10,7 @@ on:
 env:
   MIX_ENV: test
   RUSTFLAGS: "-D warnings"
+  CARGO_HTTP_MULTIPLEXING: "false"
   FERRICSTORE_BUILD_NIF: "1"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
