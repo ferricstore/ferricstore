@@ -34,6 +34,8 @@ defmodule FerricstoreServer.Application do
 
   @impl true
   def start(_type, _args) do
+    {:ok, _} = Application.ensure_all_started(:ranch)
+
     port = Application.get_env(:ferricstore, :port, 6379)
     health_port = Application.get_env(:ferricstore, :health_port, 4000)
 

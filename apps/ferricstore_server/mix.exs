@@ -4,7 +4,7 @@ defmodule FerricstoreServer.MixProject do
   def project do
     [
       app: :ferricstore_server,
-      version: "0.5.1",
+      version: "0.5.2",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
@@ -22,7 +22,7 @@ defmodule FerricstoreServer.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :ssl, :public_key],
+      extra_applications: [:logger, :ssl, :public_key, :ranch],
       mod: {FerricstoreServer.Application, []}
     ]
   end

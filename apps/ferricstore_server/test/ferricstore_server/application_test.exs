@@ -88,6 +88,21 @@ defmodule FerricstoreServer.ApplicationTest do
   # ---------------------------------------------------------------------------
 
   describe "FerricstoreServer.Supervisor (server)" do
+    test "declares Ranch as a runtime application for releases" do
+      {:ok, apps} = :application.get_key(:ferricstore_server, :applications)
+      assert :ranch in apps
+    end
+
+    test "declares Ranch as permanent in the release" do
+      applications =
+        Ferricstore.Umbrella.MixProject.project()
+        |> Keyword.fetch!(:releases)
+        |> Keyword.fetch!(:ferricstore)
+        |> Keyword.fetch!(:applications)
+
+      assert applications[:ranch] == :permanent
+    end
+
     test "is alive after application start" do
       pid = Process.whereis(FerricstoreServer.Supervisor)
       assert is_pid(pid)
