@@ -16,6 +16,7 @@ defmodule FerricstoreServer.Native.IntegrationTest do
   @op_pipeline 0x000E
   @op_options 0x000B
   @op_subscribe_events 0x0011
+  @op_command_exec 0x0100
   @op_get 0x0101
   @op_set 0x0102
   @op_mget 0x0104
@@ -651,6 +652,110 @@ defmodule FerricstoreServer.Native.IntegrationTest do
     assert is_integer(event["payload"]["route_epoch"])
 
     :gen_tcp.close(sock)
+  end
+
+  test "COMMAND_EXEC supports native MULTI EXEC session semantics", %{port: port} do
+    sock = connect(port)
+    key = "native-tx:#{System.unique_integer([:positive])}"
+
+    send_request(sock, @op_command_exec, 0, 101, %{"command" => "MULTI"})
+    assert {0, "OK"} = recv_response(sock)
+
+    send_request(sock, @op_command_exec, 0, 102, %{
+      "command" => "SET",
+      "args" => [key, "value"]
+    })
+
+    assert {0, "QUEUED"} = recv_response(sock)
+
+    send_request(sock, @op_command_exec, 0, 103, %{"command" => "EXEC"})
+    assert {0, ["OK"]} = recv_response(sock)
+
+    send_request(sock, @op_get, 1, 104, %{"key" => key})
+    assert {0, "value"} = recv_response(sock)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "native MULTI rejects typed opcodes that would bypass transaction queue", %{port: port} do
+    sock = connect(port)
+    key = "native-tx-typed-reject:#{System.unique_integer([:positive])}"
+
+    send_request(sock, @op_command_exec, 0, 111, %{"command" => "MULTI"})
+    assert {0, "OK"} = recv_response(sock)
+
+    send_request(sock, @op_set, 1, 112, %{"key" => key, "value" => "bad"})
+    assert {6, error} = recv_response(sock)
+    assert error["message"] =~ "MULTI requires COMMAND_EXEC"
+
+    send_request(sock, @op_command_exec, 0, 113, %{"command" => "DISCARD"})
+    assert {0, "OK"} = recv_response(sock)
+
+    send_request(sock, @op_get, 1, 114, %{"key" => key})
+    assert {0, nil} = recv_response(sock)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "COMMAND_EXEC supports native PubSub subscriptions with event pushes", %{port: port} do
+    subscriber = connect(port)
+    publisher = connect(port)
+    channel = "native-pubsub:#{System.unique_integer([:positive])}"
+
+    send_request(subscriber, @op_command_exec, 0, 201, %{
+      "command" => "SUBSCRIBE",
+      "args" => [channel]
+    })
+
+    assert {0, [["subscribe", ^channel, 1]]} = recv_response(subscriber)
+
+    send_request(publisher, @op_command_exec, 1, 202, %{
+      "command" => "PUBLISH",
+      "args" => [channel, "hello"]
+    })
+
+    assert {0, 1} = recv_response(publisher)
+
+    assert %{opcode: 0x0010, lane_id: 0, request_id: 0, status: 0, value: event} =
+             recv_response_meta(subscriber)
+
+    assert event["event"] == "PUBSUB_MESSAGE"
+    assert event["payload"]["kind"] == "message"
+    assert event["payload"]["channel"] == channel
+    assert event["payload"]["message"] == "hello"
+
+    :gen_tcp.close(subscriber)
+    :gen_tcp.close(publisher)
+  end
+
+  test "COMMAND_EXEC supports native BLPOP blocking wake and timeout", %{port: port} do
+    blocked = connect(port)
+    producer = connect(port)
+    key = "native-blpop:#{System.unique_integer([:positive])}"
+    missing = key <> ":missing"
+
+    send_request(blocked, @op_command_exec, 1, 301, %{
+      "command" => "BLPOP",
+      "args" => [key, "1"]
+    })
+
+    send_request(producer, @op_command_exec, 1, 302, %{
+      "command" => "RPUSH",
+      "args" => [key, "job"]
+    })
+
+    assert {0, 1} = recv_response(producer)
+    assert {0, [^key, "job"]} = recv_response(blocked)
+
+    send_request(blocked, @op_command_exec, 1, 303, %{
+      "command" => "BLPOP",
+      "args" => [missing, "0.02"]
+    })
+
+    assert {0, nil} = recv_response(blocked)
+
+    :gen_tcp.close(blocked)
+    :gen_tcp.close(producer)
   end
 
   defp connect(port) do

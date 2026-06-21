@@ -14,10 +14,11 @@ defmodule FerricstoreServer.Native.Connection do
   alias Ferricstore.Stats
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Connection.Send
-  alias FerricstoreServer.Native.{Codec, Commands, Lane}
+  alias FerricstoreServer.Native.{Blocking, Codec, Commands, Lane, Session}
 
   @max_buffer_size 134_217_728
   @op_goaway 0x000A
+  @op_command_exec 0x0100
   @control_lane 0
   @flag_trace 0x01
   @flag_custom_payload 0x02
@@ -62,6 +63,15 @@ defmodule FerricstoreServer.Native.Connection do
     lane_inflight: %{},
     event_subscriptions: MapSet.new(),
     flow_wake_subscription: nil,
+    multi_state: :none,
+    multi_queue: [],
+    multi_queue_count: 0,
+    multi_error: false,
+    watched_keys: %{},
+    sandbox_namespace: nil,
+    pubsub_channels: nil,
+    pubsub_patterns: nil,
+    blocked_requests: %{},
     authenticated: false,
     require_auth: false,
     compact_flow_responses: false,
@@ -225,6 +235,56 @@ defmodule FerricstoreServer.Native.Connection do
         maybe_send_event(state, "FLOW_WAKE", Commands.flow_wake_event_payload(state))
         loop(state)
 
+      {:pubsub_message, channel, message} ->
+        native_send(
+          state,
+          Codec.encode_event(
+            Commands.event_opcode(),
+            %{
+              "event" => "PUBSUB_MESSAGE",
+              "payload" => Session.pubsub_payload(:message, channel, nil, message),
+              "at_ms" => System.system_time(:millisecond)
+            }
+          ),
+          :event
+        )
+
+        loop(state)
+
+      {:pubsub_pmessage, pattern, channel, message} ->
+        native_send(
+          state,
+          Codec.encode_event(
+            Commands.event_opcode(),
+            %{
+              "event" => "PUBSUB_MESSAGE",
+              "payload" => Session.pubsub_payload(:pmessage, channel, pattern, message),
+              "at_ms" => System.system_time(:millisecond)
+            }
+          ),
+          :event
+        )
+
+        loop(state)
+
+      {:native_blocking_response, meta, pid, status, value} ->
+        state = remove_blocked_request(state, pid)
+
+        native_send(
+          state,
+          encode_response_for_state(
+            state,
+            meta.opcode,
+            meta.lane_id,
+            meta.request_id,
+            status,
+            value
+          ),
+          :response
+        )
+
+        loop(state)
+
       {:acl_invalidate, username} ->
         refreshed_state =
           FerricstoreServer.Connection.Auth.maybe_refresh_acl_cache(state, username)
@@ -324,9 +384,26 @@ defmodule FerricstoreServer.Native.Connection do
     case prepare_frame(frame, state) do
       {:ok, frame, state} ->
         cond do
+          state.multi_state == :queuing and opcode(frame) != @op_command_exec ->
+            response =
+              encode_response_for_state(
+                state,
+                opcode(frame),
+                lane_id(frame),
+                request_id(frame),
+                :bad_request,
+                "ERR native MULTI requires COMMAND_EXEC frames until EXEC or DISCARD"
+              )
+
+            dispatch_frames(rest, state, [response | responses], decode_us, lane_batches)
+
           Commands.control_opcode?(opcode(frame)) ->
             flush_lane_batches(lane_batches)
             dispatch_control_frame(frame, rest, state, responses, decode_us)
+
+          native_session_frame?(frame, state) ->
+            flush_lane_batches(lane_batches)
+            dispatch_native_session_frame(frame, rest, state, responses, decode_us)
 
           lane_id(frame) == @control_lane ->
             response =
@@ -410,7 +487,98 @@ defmodule FerricstoreServer.Native.Connection do
     end
   end
 
+  defp dispatch_native_session_frame(frame, rest, state, responses, decode_us) do
+    case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
+      {:ok, payload} ->
+        Commands.mark_command_seen(state)
+
+        case dispatch_native_session_payload(frame, payload, state) do
+          {:reply, status, value, state} ->
+            state = refresh_command_state_and_lanes(state)
+
+            response =
+              encode_response_for_state(
+                state,
+                opcode(frame),
+                lane_id(frame),
+                request_id(frame),
+                status,
+                value
+              )
+
+            dispatch_frames(rest, state, [response | responses], decode_us)
+
+          {:blocked, state} ->
+            state = refresh_command_state_and_lanes(state)
+            dispatch_frames(rest, state, responses, decode_us)
+        end
+
+      {:error, reason} ->
+        response =
+          encode_response_for_state(
+            state,
+            opcode(frame),
+            lane_id(frame),
+            request_id(frame),
+            :bad_request,
+            reason
+          )
+
+        dispatch_frames(rest, state, [response | responses], decode_us)
+    end
+  end
+
+  defp dispatch_native_session_payload(frame, payload, state) do
+    case Session.parse_command(payload) do
+      {:ok, cmd, _args, _ast, _keys} ->
+        cond do
+          Blocking.blocking_command?(cmd) ->
+            meta = %{
+              opcode: opcode(frame),
+              lane_id: lane_id(frame),
+              request_id: request_id(frame)
+            }
+
+            case Blocking.start_request(payload, state, meta) do
+              {:ok, pid} ->
+                {:blocked, put_blocked_request(state, pid, meta)}
+
+              {:error, status, reason} ->
+                {:reply, status, reason, state}
+            end
+
+          Session.session_command?(cmd) or state.multi_state == :queuing ->
+            {status, value, state} = Session.execute(payload, state)
+            {:reply, status, value, state}
+
+          true ->
+            {:reply, :bad_request, "ERR native command is not a session command", state}
+        end
+
+      {:error, reason} ->
+        {:reply, :bad_request, reason, state}
+    end
+  end
+
   defp no_reply?(frame), do: Bitwise.band(flags(frame), @flag_no_reply) != 0
+
+  defp native_session_frame?(frame, state) do
+    opcode(frame) == @op_command_exec and
+      case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
+        {:ok, payload} ->
+          case Session.parse_command(payload) do
+            {:ok, cmd, _args, _ast, _keys} ->
+              Blocking.blocking_command?(cmd) or Session.session_command?(cmd) or
+                state.multi_state == :queuing
+
+            {:error, _reason} ->
+              false
+          end
+
+        {:error, _reason} ->
+          false
+      end
+  end
 
   defp dispatch_data_frame(frame, rest, state, responses, decode_us, lane_batches) do
     route_started_us = trace_started_us(frame)
@@ -656,11 +824,22 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp cleanup_connection(state) do
+    Session.cleanup_pubsub(state)
     Ferricstore.Flow.ClaimWaiters.cleanup(self())
+    Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
+    Enum.each(state.blocked_requests, fn {_pid, %{pid: pid}} -> Process.exit(pid, :shutdown) end)
     Enum.each(state.lanes, fn {_lane_id, pid} -> Lane.stop(pid) end)
     ConnRegistry.unregister(state.client_id, self())
     Stats.decr_connections()
     :ok
+  end
+
+  defp put_blocked_request(state, pid, meta) do
+    put_in(state.blocked_requests[pid], Map.put(meta, :pid, pid))
+  end
+
+  defp remove_blocked_request(state, pid) do
+    %{state | blocked_requests: Map.delete(state.blocked_requests, pid)}
   end
 
   defp send_native_error(socket, transport, reason) do
@@ -774,6 +953,14 @@ defmodule FerricstoreServer.Native.Connection do
       acl_cache: state.acl_cache,
       event_subscriptions: state.event_subscriptions,
       flow_wake_subscription: state.flow_wake_subscription,
+      multi_state: state.multi_state,
+      multi_queue: state.multi_queue,
+      multi_queue_count: state.multi_queue_count,
+      multi_error: state.multi_error,
+      watched_keys: state.watched_keys,
+      sandbox_namespace: state.sandbox_namespace,
+      pubsub_channels: state.pubsub_channels,
+      pubsub_patterns: state.pubsub_patterns,
       compression: state.compression,
       compact_flow_responses: state.compact_flow_responses,
       response_chunk_bytes: state.response_chunk_bytes,
