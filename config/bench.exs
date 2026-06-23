@@ -10,15 +10,16 @@ config :ferricstore, :ferricstore_wal_nif,
   skip_compilation?: false,
   load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
 
-config :ferricstore, :port, String.to_integer(System.get_env("FERRICSTORE_PORT", "0"))
+config :ferricstore,
+       :native_port,
+       String.to_integer(System.get_env("FERRICSTORE_NATIVE_PORT", "0"))
 
 config :ferricstore,
        :data_dir,
        System.get_env("FERRICSTORE_DATA_DIR", System.tmp_dir!() <> "/ferricstore_bench")
 
 config :ferricstore,
-  native_protocol_enabled:
-    System.get_env("FERRICSTORE_NATIVE_ENABLED", "false") in ["1", "true", "TRUE", "yes", "YES"],
+  native_protocol_enabled: true,
   native_port: String.to_integer(System.get_env("FERRICSTORE_NATIVE_PORT", "6388"))
 
 config :ferricstore,

@@ -26,7 +26,7 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRICSTORE_PORT` | `6379` | TCP listen port |
+| `FERRICSTORE_NATIVE_PORT` | `6388` | Ferric protocol TCP listen port |
 | `FERRICSTORE_HEALTH_PORT` | `6380` | Health endpoint port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Bitcask + WAL data directory |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards (0 = CPU count) |
@@ -66,7 +66,7 @@ The TCP acceptor uses the following socket options (hardcoded in `ferricstore_se
 ### Basic
 
 ```bash
-docker run -p 6379:6379 \
+docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
   ghcr.io/ferricstore/ferricstore:0.4.1
@@ -87,7 +87,7 @@ For write-heavy workloads, prefer a direct data mount on durable fast storage an
 make sure the container runtime allows io_uring syscalls.
 
 ```bash
-docker run -p 6379:6379 \
+docker run -p 6388:6388 \
   --security-opt seccomp=unconfined \
   -e FERRICSTORE_PROTECTED_MODE=true \
   -v /mnt/nvme/ferricstore:/data \
@@ -158,7 +158,7 @@ spec:
         - name: ferricstore
           image: ghcr.io/ferricstore/ferricstore:0.4.1
           ports:
-            - containerPort: 6379
+            - containerPort: 6388
           env:
             - name: FERRICSTORE_PROTECTED_MODE
               value: "false"

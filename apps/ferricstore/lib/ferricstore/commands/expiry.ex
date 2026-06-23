@@ -8,7 +8,7 @@ defmodule Ferricstore.Commands.Expiry do
 
   Each handler takes the uppercased command name, a list of string arguments,
   and an injected store map. Returns plain Elixir terms — the connection layer
-  handles RESP encoding.
+  handles wire encoding.
 
   ## Supported commands
 

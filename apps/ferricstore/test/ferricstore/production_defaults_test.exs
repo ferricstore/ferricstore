@@ -83,8 +83,7 @@ defmodule Ferricstore.ProductionDefaultsTest do
 
     nif_paths = [
       "apps/ferricstore/lib/ferricstore/bitcask/nif.ex",
-      "apps/ferricstore/lib/ferricstore/wal_nif.ex",
-      "apps/ferricstore/lib/ferricstore/resp/parser_nif.ex"
+      "apps/ferricstore/lib/ferricstore/wal_nif.ex"
     ]
 
     for path <- nif_paths do

@@ -39,7 +39,7 @@ defmodule Ferricstore.Commands.PubSub do
 
   ## Returns
 
-  Plain Elixir terms suitable for RESP encoding.
+  Plain Elixir terms suitable for wire encoding.
   """
   @spec handle(binary(), [binary()]) :: term()
   def handle(cmd, args)

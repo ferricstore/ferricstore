@@ -1,4 +1,4 @@
 import Config
 
-config :ferricstore, :port, 6379
+config :ferricstore, :native_port, 6388
 config :ferricstore, :data_dir, "data"

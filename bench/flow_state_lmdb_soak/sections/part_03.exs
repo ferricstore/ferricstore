@@ -96,7 +96,7 @@ defmodule FlowStateLMDBSoak.Sections.Part03 do
 
         Application.put_env(:libcluster, :topologies, [])
         Application.put_env(:ferricstore, :data_dir, data_dir)
-        Application.put_env(:ferricstore, :port, 0)
+        Application.put_env(:ferricstore, :native_port, 0)
         Application.put_env(:ferricstore, :health_port, 0)
         Application.put_env(:ferricstore, :shard_count, shards)
         Application.put_env(:ferricstore, :protected_mode, false)

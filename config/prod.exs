@@ -2,7 +2,7 @@ import Config
 
 config :logger, level: :info
 
-config :ferricstore, :port, 6379
+config :ferricstore, :native_port, 6388
 config :ferricstore, :data_dir, "/var/lib/ferricstore/data"
 
 # Node discovery via libcluster -- Kubernetes DNS strategy.

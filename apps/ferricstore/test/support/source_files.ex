@@ -184,12 +184,6 @@ defmodule Ferricstore.Test.SourceFiles do
     ])
   end
 
-  def resp_parser_source do
-    joined_source_with_wildcards(["../../native/resp_parser_nif/src/lib.rs"], [
-      "../../native/resp_parser_nif/src/sections/part_*.rs"
-    ])
-  end
-
   def waraft_backend_source do
     joined_source(@waraft_backend_sources)
   end

@@ -435,7 +435,7 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   The dashboard preview is intentionally sampled. The actual cleanup command is
   still the source of truth and runs through the same durable Flow command path
-  as a RESP `FLOW.RETENTION_CLEANUP`.
+  as a protocol `FLOW.RETENTION_CLEANUP`.
   """
   @spec collect_flow_retention_page(keyword()) :: map()
   def collect_flow_retention_page(opts \\ []) when is_list(opts) do

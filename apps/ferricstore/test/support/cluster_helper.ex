@@ -657,7 +657,7 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     env_settings = [
       {:data_dir, data_dir},
-      {:port, 0},
+      {:native_port, 0},
       {:health_port, 0},
       {:shard_count, shards},
       {:cluster_nodes, []},

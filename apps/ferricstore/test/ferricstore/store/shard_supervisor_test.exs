@@ -13,6 +13,7 @@ defmodule Ferricstore.Store.ShardSupervisorTest do
 
   setup do
     Ferricstore.Test.ShardHelpers.wait_shards_alive()
+    Ferricstore.Test.ShardHelpers.wait_default_pipeline_ready()
     :ok
   end
 

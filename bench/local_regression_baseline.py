@@ -3,13 +3,13 @@
 
 This runner exists to keep benchmark shape stable across cleanup/refactor work:
 
-* memtier SET/GET baseline uses RESP3 and the historical 200 clients x 4
+* memtier SET/GET baseline uses Ferric protocol and the historical 200 clients x 4
   threads x pipeline 50 shape.
 * DBOS-style Flow baseline delegates to the Python SDK benchmark script with
   the optimized queue settings we use for release checks.
 
-It intentionally does not benchmark the native TCP protocol. Native protocol
-needs a dedicated SDK/benchmark client so results are not mixed with RESP.
+It intentionally does not benchmark the Ferric protocol. Native protocol
+needs a dedicated SDK/benchmark client so results are not mixed with another protocol.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         description="Run local FerricStore memtier and DBOS-style baselines."
     )
     parser.add_argument("--suite", choices=("all", "memtier", "dbos"), default="all")
-    parser.add_argument("--url", default="redis://127.0.0.1:6379/0")
+    parser.add_argument("--url", default="ferric://127.0.0.1:6388")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--start-server", action="store_true")
@@ -395,7 +395,7 @@ def write_summary(
         [
             "## Notes",
             "",
-            "- memtier uses RESP3 and does not measure the native TCP protocol.",
+            "- Benchmarks use the Ferric protocol data plane.",
             "- DBOS-style Flow uses the Python SDK benchmark path.",
             "- Native protocol needs a dedicated SDK/client adapter before it can be compared fairly.",
             "",

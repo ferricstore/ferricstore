@@ -80,13 +80,13 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ConfigSetEmitsTelemet
           assert "slowlog-max-len" in keys
         end
 
-        test "CONFIG GET tls-* matches TLS parameters", %{store: store} do
-          result = Server.handle("CONFIG", ["GET", "tls-*"], store)
+        test "CONFIG GET native-tls-* matches TLS parameters", %{store: store} do
+          result = Server.handle("CONFIG", ["GET", "native-tls-*"], store)
           keys = every_other(result, 0)
 
-          assert "tls-port" in keys
-          assert "tls-cert-file" in keys
-          assert "tls-key-file" in keys
+          assert "native-tls-port" in keys
+          assert "native-tls-cert-file" in keys
+          assert "native-tls-key-file" in keys
         end
 
         test "CONFIG GET h? matches hz", %{store: store} do

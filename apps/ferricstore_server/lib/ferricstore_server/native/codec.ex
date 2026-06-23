@@ -7,7 +7,7 @@ defmodule FerricstoreServer.Native.Codec do
       magic(4) version(1) flags(1) lane_id(4) opcode(2) request_id(8) body_len(4) body(N)
 
   Request bodies and response payloads use a compact typed value codec. This
-  keeps client SDKs independent from RESP while still preserving binary-safe
+  keeps client SDKs binary-safe while preserving
   payloads and structured Flow metadata.
   """
 

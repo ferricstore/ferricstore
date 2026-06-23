@@ -1,6 +1,6 @@
 # Architecture
 
-This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the RESP server.
+This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the Ferric protocol server.
 
 Quick model:
 
@@ -8,7 +8,7 @@ Quick model:
 client command -> shard router -> WARaft segment log -> state/apply projection -> hot keydir/indexes
 ```
 
-FerricStore owns the storage path itself; workflow state is not written through an external Postgres, Cassandra, or Redis database. The committed WARaft segment log is the durable command boundary. Committed commands are projected into per-shard ETS keydirs and native Flow indexes for the hot serving path. LMDB/history are query projections that can lag briefly.
+FerricStore owns the storage path itself; workflow state is not written through an external Postgres, Cassandra, or FerricStore database. The committed WARaft segment log is the durable command boundary. Committed commands are projected into per-shard ETS keydirs and native Flow indexes for the hot serving path. LMDB/history are query projections that can lag briefly.
 
 For FerricFlow, command correctness uses the current Flow state in the hot keydir/native indexes. That state is recoverable from FerricStore-managed WARaft segment/apply-projection storage. LMDB/history projection freshness affects query surfaces, not whether a Flow command committed.
 
@@ -19,15 +19,15 @@ FerricStore is built around three core design principles: (1) all mutable state 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
 │                         Client Layer                                       │
-│  redis-cli / Redix / any Redis client          FerricStore Elixir API     │
-│  (RESP3 over TCP/TLS)                          (direct function calls)    │
+│  Ferric protocol SDKs / native clients          FerricStore Elixir API │
+│  (Ferric protocol over TCP/TLS)                          (direct function calls)    │
 └──────────────────┬──────────────────────────────────┬─────────────────────┘
                    │                                  │
                    ▼                                  │
 ┌──────────────────────────────────┐                  │
 │  FerricStore Server (standalone) │                  │
 │  Ranch TCP/TLS → Connection     │                  │
-│  → RESP3 Parser → ACL Check     │                  │
+│  → Ferric protocol parser → ACL Check     │                  │
 │  → Command Dispatcher           │                  │
 │  → CLIENT TRACKING              │                  │
 └──────────────────┬───────────────┘                  │
@@ -99,7 +99,7 @@ FerricStore is an Elixir umbrella application with two apps:
 | App | Purpose | Key Modules |
 |-----|---------|-------------|
 | `ferricstore` | Core engine: shards, ETS, Bitcask, Raft, Rust NIFs, LFU, MemoryGuard | `Ferricstore.Store.{Shard, Router, LFU, Promotion}`, `Ferricstore.Raft.{Batcher, StateMachine, Cluster}`, `Ferricstore.Bitcask.{NIF, Async}`, `Ferricstore.MemoryGuard` |
-| `ferricstore_server` | TCP/TLS server, RESP3 protocol, ACL, health HTTP | `FerricstoreServer.Connection`, `FerricstoreServer.Health` |
+| `ferricstore_server` | TCP/TLS server, Ferric protocol protocol, ACL, health HTTP | `FerricstoreServer.Connection`, `FerricstoreServer.Health` |
 
 In **embedded mode**, only the `ferricstore` app starts. In **standalone mode**, `ferricstore_server` also starts Ranch TCP/TLS listeners and an HTTP health endpoint.
 
@@ -137,7 +137,7 @@ Ferricstore.Supervisor (:one_for_one)
 
 FerricstoreServer.Supervisor (:one_for_one)  [standalone mode only]
 ├── :pg (FerricstoreServer.PG)            # ACL invalidation process groups
-├── Ranch TCP Listener                    # RESP3 connections
+├── Ranch TCP Listener                    # Ferric protocol connections
 ├── Ranch TLS Listener                    # Optional encrypted connections
 └── Health HTTP Endpoint                  # /health/ready + /metrics + dashboard
 ```
@@ -149,7 +149,7 @@ Before the supervision tree starts, `Application.start/2` performs critical init
 1. `DataDir.ensure_layout!(data_dir, shard_count)` -- creates the on-disk directory structure
 2. `LFU.init_config_cache()` -- caches `lfu_decay_time` and `lfu_log_factor` in `persistent_term` (~5ns reads)
 3. `persistent_term` initialization -- `hot_cache_max_value_size`, `keydir_full`, `reject_writes`, `shard_count`, `promotion_threshold`
-4. `Waiters.init()`, `ClientTracking.init_tables()`, `Stream.init_tables()` -- ETS tables for blocking commands, client tracking, and streams
+4. `Waiters.init()` and `Stream.init_tables()` -- ETS tables for blocking commands and streams
 5. `WARaftBackend.start(default_ctx)` -- starts WARaft partitions with the segment log under `data_dir/waraft`
 6. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> HLC -> WARaft namespace batchers -> BitcaskWriters -> Flow LMDB writers -> ShardSupervisor -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
 
@@ -394,7 +394,7 @@ A Rust-owned KV keydir should be treated as a larger architecture change, not a 
 
 ## LFU Eviction
 
-FerricStore implements Redis-compatible LFU (Least Frequently Used) eviction with time-based decay.
+FerricStore implements Ferric protocol LFU (Least Frequently Used) eviction with time-based decay.
 
 ### Packed Format
 
@@ -498,7 +498,7 @@ Bitcask files are append-only and accumulate dead entries (overwritten or delete
 
 ### Architecture
 
-This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the RESP server.
+This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the Ferric protocol server.
 
 Quick model:
 
@@ -636,9 +636,9 @@ Connections support pipelined commands with concurrent dispatch:
 - Responses are sent in-order: response N is sent as soon as responses 0..N are all complete. Fast commands before a slow command get delivered immediately.
 - Stateful commands (MULTI, AUTH, SUBSCRIBE, blocking ops) act as barriers: all prior concurrent tasks are awaited and flushed before the stateful command executes synchronously.
 
-### RESP Pipeline Write Batching
+### Ferric protocol Pipeline Write Batching
 
-Phase 1 batches only consecutive RESP pipeline runs of safe single-key writes that already have direct Raft state-machine commands. The connection keeps response order intact, preserves read boundaries, and falls back to the existing command path for anything outside the allowlist.
+Phase 1 batches only consecutive Ferric protocol pipeline runs of safe single-key writes that already have direct Raft state-machine commands. The connection keeps response order intact, preserves read boundaries, and falls back to the existing command path for anything outside the allowlist.
 
 Included in phase 1:
 
@@ -655,7 +655,7 @@ Explicitly excluded:
 - Compound writes without a direct Raft command conversion, including `HSET`, `SADD`, `ZADD`, list/stream mutations, `MSET`, and `DEL`.
 - Commands inside `MULTI` or commands requiring per-command ACL checks.
 
-Phase 2 can expand the allowlist when needed. Good candidates are same-shard `MSET`, same-shard single-entry compound writes (`HSET`, `SADD`, `ZADD`) after exact type/error semantics are audited, and `DEL`/`UNLINK` only if the batched path can preserve Redis integer-delete replies for plain and compound keys.
+Phase 2 can expand the allowlist when needed. Good candidates are same-shard `MSET`, same-shard single-entry compound writes (`HSET`, `SADD`, `ZADD`) after exact type/error semantics are audited, and `DEL`/`UNLINK` only if the batched path can preserve FerricStore integer-delete replies for plain and compound keys.
 
 ### Per-Connection State
 
@@ -675,15 +675,15 @@ Protocol-level limits prevent resource exhaustion from malicious or malformed in
 
 | Input | Limit | Enforced At |
 |-------|-------|-------------|
-| RESP array elements | 1,000,000 | RESP3 parser |
-| Inline command size | 1 MB | RESP3 parser |
+| Ferric protocol array elements | 1,000,000 | Ferric protocol parser |
+| Inline command size | 1 MB | Ferric protocol parser |
 | INCR/DECRBY values | i64 range (-2^63 to 2^63-1) | Command handler |
 | SETRANGE offset | 512 MB | Command handler |
 | SUBSCRIBE/PSUBSCRIBE per connection | 100,000 | Connection state |
 | SETBIT offset | 2^32 - 1 | Command handler |
 | Glob patterns (KEYS, SCAN) | 1,024 bytes | Command handler (CVE-2022-36021 mitigation) |
 
-These limits apply in both standalone and embedded mode. The RESP parser limits are checked before command dispatch, so oversized payloads are rejected without allocating memory for the full payload.
+These limits apply in both standalone and embedded mode. The Ferric protocol parser limits are checked before command dispatch, so oversized payloads are rejected without allocating memory for the full payload.
 
 ## Three-Tier Storage
 

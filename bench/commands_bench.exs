@@ -21,7 +21,7 @@ bench_data_dir = System.tmp_dir!() <> "/ferricstore_cmd_bench_#{:rand.uniform(9_
 File.mkdir_p!(bench_data_dir)
 
 Application.put_env(:ferricstore, :data_dir, bench_data_dir)
-Application.put_env(:ferricstore, :port, 0)
+Application.put_env(:ferricstore, :native_port, 0)
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 

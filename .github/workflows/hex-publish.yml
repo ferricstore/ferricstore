@@ -77,11 +77,10 @@ jobs:
             ASSETS=$(gh release view "v${VERSION}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' 2>/dev/null || true)
             BITCASK_COUNT=$(echo "$ASSETS" | grep -c "ferricstore_bitcask-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
             WAL_COUNT=$(echo "$ASSETS" | grep -c "ferricstore_wal_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
-            RESP_COUNT=$(echo "$ASSETS" | grep -c "resp_parser_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
             NATIVE_COUNT=$(echo "$ASSETS" | grep -c "native_protocol_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
-            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6, resp=$RESP_COUNT/6, native=$NATIVE_COUNT/4"
-            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ] && [ "$RESP_COUNT" -ge 6 ] && [ "$NATIVE_COUNT" -ge 4 ]; then
-              echo "All 22 NIF artifacts present."
+            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6, native=$NATIVE_COUNT/4"
+            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ] && [ "$NATIVE_COUNT" -ge 4 ]; then
+              echo "All 16 NIF artifacts present."
               break
             fi
             if [ "$i" = "90" ]; then
@@ -138,11 +137,6 @@ jobs:
             "checksum-ferricstore_wal_nif.exs" \
             "ferricstore_wal_nif-v${VERSION}-*.tar.gz" \
             "libferricstore_wal_nif-v${VERSION}-*.tar.gz"
-
-          generate_checksum_file \
-            "checksum-Elixir.Ferricstore.Resp.ParserNif.exs" \
-            "resp_parser_nif-v${VERSION}-*.tar.gz" \
-            "libresp_parser_nif-v${VERSION}-*.tar.gz"
 
           cd ../ferricstore_server
 

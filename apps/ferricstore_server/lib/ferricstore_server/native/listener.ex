@@ -2,8 +2,7 @@ defmodule FerricstoreServer.Native.Listener do
   @moduledoc """
   Ranch TCP listener for FerricStore's native binary protocol.
 
-  The listener is separate from the RESP-compatible listener so SDKs can choose
-  the most efficient data plane without changing Redis compatibility.
+  This is the standalone FerricStore SDK data plane.
   """
 
   @listener_ref __MODULE__

@@ -1,15 +1,15 @@
 # Embedded Mode
 
-Embedded mode runs FerricStore inside your Elixir application. There is no TCP listener and no RESP serialization; your code calls the public `FerricStore` module directly.
+Embedded mode runs FerricStore inside your Elixir application. There is no TCP listener and no wire serialization; your code calls the public `FerricStore` module directly.
 
-Use this guide after [Getting Started](getting-started.md). It covers setup, first commands, behavior differences from TCP/RESP mode, and the embedded API reference.
+Use this guide after [Getting Started](getting-started.md). It covers setup, first commands, behavior differences from Ferric protocol TCP mode, and the embedded API reference.
 
 ## When to Use Embedded Mode
 
 - Your application and cache run on the same BEAM node
 - You want microsecond read latency (~1-5us for hot keys) with zero-copy binaries
-- You want direct Elixir API access without TCP/RESP3 serialization overhead
-- You don't need external clients (redis-cli, Redix from another app) to connect
+- You want direct Elixir API access without Ferric protocol TCP serialization overhead
+- You don't need external clients (Ferric protocol client, Ferric protocol SDK from another app) to connect
 - You want the full FerricStore feature set (Raft durability, LFU eviction, probabilistic structures) as a library dependency
 
 ## Setup
@@ -38,9 +38,9 @@ config :ferricstore, :eviction_policy, :volatile_lru
 ```
 
 In embedded mode, these options are **not used** and can be omitted:
-- `:port` (no TCP listener)
+- `:native_port` (no TCP listener)
 - `:health_port` (no HTTP endpoint)
-- `:tls_port`, `:tls_cert_file`, `:tls_key_file` (no TLS)
+- `:native_tls_port`, `:native_tls_cert_file`, `:native_tls_key_file` (no TLS)
 - `:sendfile_threshold` (no TCP sends)
 
 ### 3. Start Using It
@@ -88,13 +88,13 @@ Use FerricFlow directly from embedded mode:
 )
 ```
 
-## Behavior Differences from RESP3 Mode
+## Behavior Differences from Ferric Protocol Mode
 
-The embedded API (`FerricStore` module) and the RESP3/TCP mode execute the same command handlers, but there are differences to be aware of:
+The embedded API (`FerricStore` module) and the Ferric protocol TCP mode execute the same command handlers, but there are differences to be aware of:
 
-| Aspect | RESP3/TCP mode | Embedded mode |
+| Aspect | Ferric protocol TCP mode | Embedded mode |
 |--------|---------------|---------------|
-| **Return values** | Raw RESP3 types (bulk strings, integers, arrays) | Elixir-idiomatic types (`{:ok, value}`, `:ok`, etc.) |
+| **Return values** | Raw protocol types (bulk strings, integers, arrays) | Elixir-idiomatic types (`{:ok, value}`, `:ok`, etc.) |
 | **Blocking commands** | `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` supported | Not available -- return immediately |
 | **Set algebra** | `SINTER`/`SUNION`/`SDIFF` scan the single shard owning the key | Same behavior -- set members are co-located per key |
 | **Transactions** | `MULTI`/`EXEC`/`WATCH` at connection level | `FerricStore.multi/1` with function-based API |
@@ -383,7 +383,7 @@ FerricStore.sadd("set2", ["b", "c", "d"])
 {:ok, seconds} = FerricStore.ttl("session")     # seconds remaining
 {:ok, ms} = FerricStore.pttl("session")          # milliseconds remaining
 {:ok, nil} = FerricStore.ttl("no_ttl_key")       # nil = no expiry
-# Returns {:ok, -2} style in RESP3, nil in embedded for missing keys
+# Returns {:ok, -2} style in Ferric protocol, nil in embedded for missing keys
 
 # EXPIRETIME / PEXPIRETIME -- absolute expiry
 {:ok, unix_seconds} = FerricStore.expiretime("key")
@@ -413,7 +413,7 @@ FerricStore.sadd("set2", ["b", "c", "d"])
 {:ok, trimmed} = FerricStore.xtrim("events", maxlen: 1000)
 ```
 
-**Note:** `XREAD BLOCK`, `XGROUP`, `XREADGROUP`, and `XACK` are only available in TCP/RESP3 mode. The embedded API does not support blocking reads or consumer groups.
+**Note:** `XREAD BLOCK`, `XGROUP`, `XREADGROUP`, and `XACK` are only available in Ferric protocol TCP mode. The embedded API does not support blocking reads or consumer groups.
 
 ### Bitmap
 

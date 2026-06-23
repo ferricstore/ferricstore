@@ -34,7 +34,7 @@ FerricFlow shape:
 ```python
 from ferricstore import QueueClient
 
-client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"user-1", idempotent=True)
@@ -70,7 +70,7 @@ FerricFlow shape:
 ```python
 from ferricstore import WorkflowClient, complete, transition
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 order = client.workflow(type="order", initial_state="created")
 
 

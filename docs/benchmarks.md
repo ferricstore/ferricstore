@@ -72,7 +72,7 @@ Environment:
 server: Azure Standard_L4as_v4, 4 vCPU
 client: Azure Standard_D2as_v4
 storage: local NVMe, ext4, noatime/nodiratime, scheduler=none
-protocol: RESP3 over TCP
+protocol: Ferric protocol over TCP
 value size: 256 bytes
 client load: memtier, 200 connections, pipeline 30, 4 threads, 30 seconds
 ```
@@ -104,6 +104,6 @@ max=9.296 ms
 
 ## Reproducing the shapes
 
-FerricFlow benchmarks are run from the Python SDK repository with the optimized queue/workflow benchmark scripts. KV benchmarks use `memtier_benchmark` with RESP3, 256-byte values, and the connection/pipeline settings above.
+FerricFlow benchmarks are run from the Python SDK repository with the optimized queue/workflow benchmark scripts. KV benchmarks use `memtier_benchmark` with Ferric protocol, 256-byte values, and the connection/pipeline settings above.
 
 For public reporting, prefer the 1M-flow live results and the 200-connection, pipeline-30 KV table. They are less bursty than short or preloaded-only runs.

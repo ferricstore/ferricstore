@@ -471,7 +471,7 @@ defmodule Ferricstore.Flow.Codec do
 
     # History entries intentionally omit immutable workflow identity fields.
     # decode_history_fields/2 must get record context when callers need the full
-    # RESP-facing history shape.
+    # protocol-facing history shape.
     [
       @history_bin_magic,
       encode_int(flags),
@@ -547,7 +547,7 @@ defmodule Ferricstore.Flow.Codec do
   end
 
   @doc false
-  # Decode history into the current RESP-facing field list. FSH2 callers should
+  # Decode history into the current protocol-facing field list. FSH2 callers should
   # pass the state record/context so omitted immutable fields can be restored.
   def decode_history_fields(value, context \\ %{})
 

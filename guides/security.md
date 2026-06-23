@@ -8,7 +8,7 @@ FerricStore provides multiple layers of security: ACL user accounts with fine-gr
 
 ## Access Control Lists (ACL)
 
-FerricStore implements Redis-compatible ACL with enhancements for production use.
+FerricStore implements Ferric protocol ACL with enhancements for production use.
 
 ### Default User
 
@@ -24,16 +24,16 @@ The `default` user cannot be deleted.
 
 ```bash
 # Create a read-only user with password
-redis-cli ACL SETUSER reader on >secretpassword +@read ~*
+ACL SETUSER reader on >secretpassword +@read ~*
 
 # Create an admin user with full access
-redis-cli ACL SETUSER admin on >adminpassword +@all ~*
+ACL SETUSER admin on >adminpassword +@all ~*
 
 # Create a user restricted to specific key patterns
-redis-cli ACL SETUSER appuser on >apppassword +@all ~app:*
+ACL SETUSER appuser on >apppassword +@all ~app:*
 
 # Create a user with specific commands only
-redis-cli ACL SETUSER metrics on >metricspass +INFO +DBSIZE +KEYS ~*
+ACL SETUSER metrics on >metricspass +INFO +DBSIZE +KEYS ~*
 ```
 
 ### ACL Rules
@@ -68,36 +68,36 @@ redis-cli ACL SETUSER metrics on >metricspass +INFO +DBSIZE +KEYS ~*
 
 ```bash
 # With default user (if password is set)
-redis-cli AUTH mypassword
+AUTH mypassword
 
 # With named user
-redis-cli AUTH username password
+AUTH username password
 ```
 
 ### Managing Users
 
 ```bash
 # List all users
-redis-cli ACL LIST
+ACL LIST
 
 # Get user details
-redis-cli ACL GETUSER reader
+ACL GETUSER reader
 
 # Check current user
-redis-cli ACL WHOAMI
+ACL WHOAMI
 
 # Delete a user
-redis-cli ACL DELUSER reader
+ACL DELUSER reader
 ```
 
 ### Persisting ACL
 
 ```bash
 # Save current ACL to data_dir/acl.conf
-redis-cli ACL SAVE
+ACL SAVE
 
 # Reload ACL from file
-redis-cli ACL LOAD
+ACL LOAD
 ```
 
 ACL state is auto-loaded from `data_dir/acl.conf` on startup if the file exists. The file is written atomically (tmp + fsync + rename) with 0600 permissions.
@@ -125,7 +125,7 @@ FerricStore has **two separate network layers**, each with its own TLS:
 
 | Layer | What it carries | How to encrypt |
 |-------|----------------|---------------|
-| **Client ↔ Server** | Redis commands (RESP3 over TCP) | FerricStore TLS config (`:tls_port`, `:tls_cert_file`, etc.) — configured below |
+| **Client ↔ Server** | FerricStore commands (Ferric protocol over TCP) | FerricStore TLS config (`:native_tls_port`, `:native_tls_cert_file`, etc.) — configured below |
 | **Node ↔ Node** | Raft consensus, cluster messages (Erlang distribution) | Erlang distribution TLS (`-proto_dist inet_tls`) — configured at VM level, see [Node-to-Node TLS](#node-to-node-tls-erlang-distribution) below |
 
 Configuring client TLS does **not** encrypt Raft traffic between nodes. In
@@ -139,18 +139,18 @@ Encrypt all client-server communication with TLS.
 
 ```elixir
 # config/config.exs
-config :ferricstore, :tls_port, 6380
-config :ferricstore, :tls_cert_file, "/etc/ssl/ferricstore/server-cert.pem"
-config :ferricstore, :tls_key_file, "/etc/ssl/ferricstore/server-key.pem"
+config :ferricstore, :native_tls_port, 6389
+config :ferricstore, :native_tls_cert_file, "/etc/ssl/ferricstore/server-cert.pem"
+config :ferricstore, :native_tls_key_file, "/etc/ssl/ferricstore/server-key.pem"
 ```
 
 ### Mutual TLS (Client Certificate Authentication)
 
 ```elixir
-config :ferricstore, :tls_ca_cert_file, "/etc/ssl/ferricstore/ca-cert.pem"
+config :ferricstore, :native_native_tls_ca_cert_file, "/etc/ssl/ferricstore/ca-cert.pem"
 ```
 
-When `tls_ca_cert_file` is set, the server requires clients to present a certificate signed by the specified CA.
+When `native_tls_ca_cert_file` is set, the server requires clients to present a certificate signed by the specified CA.
 
 ### Enforcing TLS Only
 
@@ -163,7 +163,7 @@ When `require_tls` is `true`, the plaintext TCP listener still starts (for healt
 ### Connecting with TLS
 
 ```bash
-redis-cli -p 6380 --tls \
+-p 6389 --tls \
   --cert /path/to/client-cert.pem \
   --key /path/to/client-key.pem \
   --cacert /path/to/ca-cert.pem
@@ -172,7 +172,7 @@ redis-cli -p 6380 --tls \
 ```elixir
 {:ok, conn} = Redix.start_link(
   host: "localhost",
-  port: 6380,
+  port: 6389,
   ssl: true,
   socket_opts: [
     certfile: "/path/to/client-cert.pem",
@@ -243,10 +243,10 @@ spec:
 
 ```elixir
 # config/runtime.exs
-config :ferricstore, :tls_port, 6380
-config :ferricstore, :tls_cert_file, System.get_env("TLS_CERT_FILE")
-config :ferricstore, :tls_key_file, System.get_env("TLS_KEY_FILE")
-config :ferricstore, :tls_ca_cert_file, System.get_env("TLS_CA_FILE")
+config :ferricstore, :native_tls_port, 6389
+config :ferricstore, :native_tls_cert_file, System.get_env("TLS_CERT_FILE")
+config :ferricstore, :native_tls_key_file, System.get_env("TLS_KEY_FILE")
+config :ferricstore, :native_native_tls_ca_cert_file, System.get_env("TLS_CA_FILE")
 config :ferricstore, :require_tls, true
 ```
 
@@ -552,7 +552,7 @@ This means ACL changes take effect on the next command from each connection, wit
 
 8. **Use mutual TLS** in zero-trust environments:
    ```elixir
-   config :ferricstore, :tls_ca_cert_file, "/etc/ssl/ca.pem"
+   config :ferricstore, :native_native_tls_ca_cert_file, "/etc/ssl/ca.pem"
    ```
 
 ## Limitations

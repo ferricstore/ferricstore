@@ -6,8 +6,8 @@ import Config
 config :logger, level: :warning
 
 # Use port 0 in test so the OS assigns an ephemeral port.
-# Tests that need the port call Application.get_env(:ferricstore, :port).
-config :ferricstore, :port, 0
+# Tests that need the protocol port call Application.get_env(:ferricstore, :native_port).
+config :ferricstore, :native_port, 0
 config :ferricstore, :health_port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
 

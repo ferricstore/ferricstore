@@ -87,9 +87,9 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert n > 0
     end
 
-    test "CONFIG GET tcp-port returns the configured port" do
-      result = Server.handle("CONFIG", ["GET", "tcp-port"], MockStore.make())
-      assert ["tcp-port", value] = result
+    test "CONFIG GET native-port returns the configured port" do
+      result = Server.handle("CONFIG", ["GET", "native-port"], MockStore.make())
+      assert ["native-port", value] = result
       assert {_n, ""} = Integer.parse(value)
     end
 
@@ -157,7 +157,7 @@ defmodule Ferricstore.Commands.ConfigTest do
       # All spec-required parameters should be present
       assert "maxmemory" in keys
       assert "maxclients" in keys
-      assert "tcp-port" in keys
+      assert "native-port" in keys
       assert "data-dir" in keys
       # raft-enabled removed — Raft always on
       assert "maxmemory-policy" in keys
@@ -331,8 +331,8 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert msg =~ "read-only"
     end
 
-    test "CONFIG SET tcp-port returns error" do
-      result = Server.handle("CONFIG", ["SET", "tcp-port", "9999"], MockStore.make())
+    test "CONFIG SET native-port returns error" do
+      result = Server.handle("CONFIG", ["SET", "native-port", "9999"], MockStore.make())
       assert {:error, msg} = result
       assert msg =~ "read-only"
     end

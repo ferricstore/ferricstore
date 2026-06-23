@@ -43,7 +43,7 @@ bench_time = System.get_env("BENCH_TIME", "5") |> String.to_integer()
 bench_data_dir = System.tmp_dir!() <> "/ferricstore_rwb_#{:rand.uniform(9_999_999)}"
 File.mkdir_p!(bench_data_dir)
 Application.put_env(:ferricstore, :data_dir, bench_data_dir)
-Application.put_env(:ferricstore, :port, 0)
+Application.put_env(:ferricstore, :native_port, 0)
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 
 shard_count = Application.compile_env(:ferricstore, :shard_count, 4)

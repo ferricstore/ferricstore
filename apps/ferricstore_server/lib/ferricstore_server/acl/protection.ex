@@ -12,10 +12,7 @@ defmodule FerricstoreServer.Acl.Protection do
   @spec has_configured_users?() :: boolean()
   def has_configured_users? do
     requirepass_configured?() or
-      Enum.any?(Tables.active_table() |> :ets.tab2list(), fn
-        {_name, %{enabled: true, password: password}} when is_binary(password) -> true
-        _ -> false
-      end)
+      configured_users_in_table?(Tables.active_table())
   end
 
   @spec localhost?({:inet.ip_address(), :inet.port_number()} | nil) :: boolean()
@@ -60,5 +57,22 @@ defmodule FerricstoreServer.Acl.Protection do
     _ -> false
   catch
     :exit, _ -> false
+  end
+
+  defp configured_users_in_table?(table) do
+    if table_exists?(table) do
+      Enum.any?(:ets.tab2list(table), fn
+        {_name, %{enabled: true, password: password}} when is_binary(password) -> true
+        _ -> false
+      end)
+    else
+      false
+    end
+  end
+
+  defp table_exists?(table) do
+    :ets.info(table) != :undefined
+  rescue
+    ArgumentError -> false
   end
 end

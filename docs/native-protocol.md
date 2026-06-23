@@ -1,7 +1,7 @@
 # FerricStore Native TCP Protocol
 
 FerricStore native protocol is a binary SDK data plane. It is separate from the
-RESP-compatible Redis listener and delegates every command to the same
+Ferric protocol listener and delegates every command to the same
 FerricStore engine path.
 
 The hot frame scanner/emitter is implemented as a pure Rust NIF:
@@ -261,7 +261,7 @@ ZADD: {"key": "z", "items": [[1.0, "a"], [2.0, "b"]]}
 ZRANGE: {"key": "z", "start": 0, "stop": -1, "withscores": true}
 ```
 
-Hash/list/set/sorted-set opcodes use the same store semantics as their RESP
+Hash/list/set/sorted-set opcodes use the same store semantics as their Ferric protocol
 commands. The initial native support uses typed map payloads; compact binary
 fast paths can be added later for commands that show up as real bottlenecks.
 
@@ -286,7 +286,7 @@ fast paths can be added later for commands that show up as real bottlenecks.
 0x0310 FERRICSTORE.BLOBGC
 ```
 
-Most admin bodies use a RESP-compatible `args` list:
+Most admin bodies use a Ferric protocol-compatible `args` list:
 
 ```text
 CLUSTER.JOIN:       {"args": ["node@host", "REPLACE"]}
@@ -432,14 +432,14 @@ ease-of-use, not as the highest-throughput coordinator path.
 
 ## Security model
 
-Native protocol uses the same protected-mode and ACL model as RESP:
+Native protocol uses the same protected-mode and ACL model as Ferric protocol:
 
 ```text
 protected mode -> rejects non-localhost clients unless a passworded user exists
 AUTH           -> supports ACL users and requirepass-compatible default auth
 ACL checks     -> command and key checks before dispatch
 require_tls    -> plaintext native connections are rejected when enabled
-maxclients     -> shared connection limit across RESP and native listeners
+maxclients     -> shared connection limit across Ferric protocol and native listeners
 frame caps     -> native_max_frame_bytes and per-connection buffer limit
 lane caps      -> native_max_lanes_per_connection and native_lane_max_queue
 ```
@@ -449,8 +449,8 @@ Recommended production setup:
 ```text
 FERRICSTORE_NATIVE_ENABLED=true
 FERRICSTORE_NATIVE_TLS_PORT=6389
-FERRICSTORE_TLS_CERT_FILE=/etc/ferricstore/tls.crt
-FERRICSTORE_TLS_KEY_FILE=/etc/ferricstore/tls.key
+FERRICSTORE_NATIVE_TLS_CERT_FILE=/etc/ferricstore/tls.crt
+FERRICSTORE_NATIVE_TLS_KEY_FILE=/etc/ferricstore/tls.key
 FERRICSTORE_REQUIRE_TLS=true
 ```
 

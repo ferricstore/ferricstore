@@ -16,43 +16,15 @@ defmodule Ferricstore.Transaction.Ast do
   # Keep this replay shim compiled in every environment; otherwise a production
   # node upgraded after the AST migration can fail while replaying old entries.
   def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
-    frame = encode_legacy_command(cmd, args)
-    parser = Ferricstore.Resp.Parser
+    normalized_args = Enum.map(args, &to_command_binary/1)
 
-    case Code.ensure_loaded(parser) do
-      {:module, ^parser} ->
-        parse_legacy_entry!(parser, frame)
-
-      {:error, reason} ->
-        raise ArgumentError,
-              "legacy transaction command replay requires #{inspect(parser)}: #{inspect(reason)}"
-    end
-  end
-
-  defp parse_legacy_entry!(parser, frame) do
-    case apply(parser, :parse_commands, [frame]) do
-      {:ok, [{:command, parsed_cmd, parsed_args, ast, _keys}], ""} ->
+    case Ferricstore.Commands.Dispatcher.parse_raw(cmd, normalized_args) do
+      {:ok, parsed_cmd, parsed_args, ast, _keys} ->
         {parsed_cmd, parsed_args, ast}
 
-      {:ok, _other, _rest} ->
-        raise ArgumentError, "invalid legacy transaction command frame"
-
       {:error, reason} ->
-        raise ArgumentError, "invalid legacy transaction command frame: #{inspect(reason)}"
+        raise ArgumentError, "invalid legacy transaction command #{inspect(cmd)}: #{reason}"
     end
-  end
-
-  defp encode_legacy_command(name, args) do
-    parts = [to_command_binary(name) | Enum.map(args, &to_command_binary/1)]
-
-    IO.iodata_to_binary([
-      "*",
-      Integer.to_string(length(parts)),
-      "\r\n",
-      Enum.map(parts, fn part ->
-        ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
-      end)
-    ])
   end
 
   defp to_command_binary(value) when is_binary(value), do: value

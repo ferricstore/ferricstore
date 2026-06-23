@@ -47,7 +47,7 @@ defmodule FerricstoreServer.Native.Connection.Responses do
   def acl_invalidation_affects_session?(state, username), do: state.username == username
 
   def join_acl_invalidation_group do
-    group = FerricstoreServer.Connection.acl_pg_group()
+    group = FerricstoreServer.Connection.Auth.acl_pg_group()
     :pg.join(group, group, self())
     :ok
   end

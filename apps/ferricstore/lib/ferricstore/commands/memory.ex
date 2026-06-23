@@ -31,7 +31,7 @@ defmodule Ferricstore.Commands.Memory do
 
   ## Returns
 
-  Plain Elixir term suitable for RESP encoding.
+  Plain Elixir term suitable for wire encoding.
   """
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(subcmd, args, store)

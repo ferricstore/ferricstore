@@ -1,16 +1,16 @@
 # Commands Reference
 
-This is the command reference for the Redis-compatible server and FerricFlow.
+This is the command reference for the Ferric protocol server and FerricFlow.
 
-Start here if you need exact RESP syntax, return values, embedded API equivalents, or compatibility notes. For a first walkthrough, use [Getting Started](getting-started.md).
+Start here if you need exact Ferric protocol syntax, return values, embedded API equivalents, or compatibility notes. For a first walkthrough, use [Getting Started](getting-started.md).
 
 FerricFlow commands use the `FLOW.*` prefix and model durable workflow state: create, claim due work, transition, retry, complete, fail, cancel, signal, value refs, and fanout.
 
-## Redis Compatibility Summary
+## FerricStore Compatibility Summary
 
 ### Fully Compatible Commands
 
-These commands match Redis 7.4 behavior exactly -- same arguments, same return values, same error messages:
+These commands match FerricStore 7.4 behavior exactly -- same arguments, same return values, same error messages:
 
 GET, SET (EX/PX/EXAT/PXAT/NX/XX/GET/KEEPTTL), DEL, EXISTS, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT,
 APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE,
@@ -35,8 +35,8 @@ CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELL
 
 ### FerricStore-Native Flow Commands
 
-Flow commands are FerricStore-native workflow commands, not Redis
-compatibility commands. They are exposed through RESP3 and the embedded API:
+Flow commands are FerricStore-native workflow commands, not FerricStore
+compatibility commands. They are exposed through Ferric protocol and the embedded API:
 
 `FLOW.CREATE`, `FLOW.CREATE_MANY`, `FLOW.VALUE.PUT`, `FLOW.SIGNAL`,
 `FLOW.SPAWN_CHILDREN`, `FLOW.GET`, `FLOW.CLAIM_DUE`, `FLOW.RECLAIM`,
@@ -73,16 +73,16 @@ documented in `guides/flow-elixir-sdk.md`.
 
 | Command | Difference |
 |---------|-----------|
-| `ZRANGE` | Redis 6.2+ unified syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) not yet supported -- use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` instead |
-| `SCAN` | Cursor is key-based (alphabetic position), not an opaque integer. Functionally equivalent but cursor values differ from Redis |
-| `HSCAN`/`SSCAN`/`ZSCAN` | Cursor is an integer offset into the scanned list. Redis uses a hash-table-based cursor; results are equivalent |
+| `ZRANGE` | FerricStore 6.2+ unified syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) not yet supported -- use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` instead |
+| `SCAN` | Cursor is key-based (alphabetic position), not an opaque integer. Functionally equivalent but cursor values differ from FerricStore |
+| `HSCAN`/`SSCAN`/`ZSCAN` | Cursor is an integer offset into the scanned list. FerricStore uses a hash-table-based cursor; results are equivalent |
 | `FLUSHDB`/`FLUSHALL` | `ASYNC`/`SYNC` accepted but both execute synchronously; true async reclaim happens during Bitcask merge |
 | `UNLINK` | Semantically identical to `DEL` -- async reclaim is deferred to Bitcask merge |
-| `OBJECT ENCODING` | Returns type-specific encoding (`"embstr"`, `"raw"`, `"hashtable"`, `"quicklist"`, `"skiplist"`, `"stream"`) instead of Redis's internal encodings like `ziplist`/`listpack`/`intset` |
-| `OBJECT FREQ` | Returns the LFU counter from keydir, not Redis's logarithmic frequency |
-| `OBJECT IDLETIME` | Returns idle seconds derived from LFU last-decrement-time, not Redis's LRU clock |
+| `OBJECT ENCODING` | Returns type-specific encoding (`"embstr"`, `"raw"`, `"hashtable"`, `"quicklist"`, `"skiplist"`, `"stream"`) instead of FerricStore's internal encodings like `ziplist`/`listpack`/`intset` |
+| `OBJECT FREQ` | Returns the LFU counter from keydir, not FerricStore's logarithmic frequency |
+| `OBJECT IDLETIME` | Returns idle seconds derived from LFU last-decrement-time, not FerricStore's LRU clock |
 | `SELECT` | Returns error -- FerricStore is single-database |
-| `INFO` | Returns FerricStore-specific sections (`raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`) in addition to Redis standard sections |
+| `INFO` | Returns FerricStore-specific sections (`raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`) in addition to FerricStore standard sections |
 | `WAIT` | Always returns `0` immediately (no replica acknowledgement) |
 | `BLPOP`/`BRPOP`/`BLMOVE`/`BLMPOP` | Supported in TCP mode only, not in embedded mode |
 | `XREAD BLOCK` | Supported in TCP mode via stream waiters; not available in embedded mode |
@@ -96,7 +96,7 @@ These are FerricStore-native commands:
 `FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`, `FERRICSTORE.DOCTOR`,
 `CLUSTER.HEALTH`, `CLUSTER.STATS`, `CLUSTER.KEYSLOT`, `CLUSTER.SLOTS`
 
-### Redis Commands Not Yet Supported
+### FerricStore Commands Not Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
 `LMPOP`, `ZMPOP`, `BZMPOP` (multi-key pop),
@@ -104,7 +104,7 @@ These are FerricStore-native commands:
 `ZRANGESTORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZLEXCOUNT`,
 `SORT`, `SORT_RO`,
 `OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
-`CLUSTER` (full Redis Cluster protocol),
+`CLUSTER` (full FerricStore Cluster protocol),
 `DUMP`, `RESTORE`, `MIGRATE`, `MOVE`,
 `CLIENT KILL`, `CLIENT NO-EVICT`, `CLIENT PAUSE`, `CLIENT UNPAUSE`,
 `DEBUG` (most subcommands)
@@ -121,11 +121,11 @@ Retrieves the value of a key. Returns a `WRONGTYPE` error if the key holds a non
 
 | | |
 |---|---|
-| **RESP3 syntax** | `GET key` |
+| **Protocol command** | `GET key` |
 | **Embedded API** | `FerricStore.get(key)` |
-| **RESP3 return** | Bulk string, or `_` (null) if key does not exist |
+| **Return** | Bulk string, or `_` (null) if key does not exist |
 | **Elixir return** | `{:ok, binary()}` or `{:ok, nil}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### SET
 
@@ -133,9 +133,9 @@ Sets a string value with optional expiry and conditional flags.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SET key value [EX seconds \| PX milliseconds \| EXAT unix-sec \| PXAT unix-ms] [NX\|XX] [GET] [KEEPTTL]` |
+| **Protocol command** | `SET key value [EX seconds \| PX milliseconds \| EXAT unix-sec \| PXAT unix-ms] [NX\|XX] [GET] [KEEPTTL]` |
 | **Embedded API** | `FerricStore.set(key, value, ttl: ms)` |
-| **RESP3 return** | `+OK` on success, `_` (null) when NX/XX condition fails. With `GET`: returns old value or null. |
+| **Return** | `+OK` on success, `_` (null) when NX/XX condition fails. With `GET`: returns old value or null. |
 | **Elixir return** | `:ok` on success, `{:ok, nil}` when condition fails |
 
 **Options:**
@@ -148,7 +148,7 @@ Sets a string value with optional expiry and conditional flags.
 - `GET` -- return the old value stored at key (or null if key didn't exist)
 - `KEEPTTL` -- retain the existing TTL on the key (cannot combine with EX/PX/EXAT/PXAT)
 
-**Redis compat:** Fully compatible -- all SET options supported.
+**FerricStore compat:** Fully compatible -- all SET options supported.
 
 **FerricStore behavior:** Expiry is stored as an absolute HLC timestamp (`expire_at_ms`). Writes go through Raft group-commit -- the ETS keydir is updated immediately (sub-microsecond read visibility) while Bitcask persistence is batched.
 
@@ -158,11 +158,11 @@ Deletes one or more keys. Handles both plain string keys and compound data struc
 
 | | |
 |---|---|
-| **RESP3 syntax** | `DEL key [key ...]` |
+| **Protocol command** | `DEL key [key ...]` |
 | **Embedded API** | `FerricStore.del(key)` |
-| **RESP3 return** | Integer -- number of keys deleted |
+| **Return** | Integer -- number of keys deleted |
 | **Elixir return** | `:ok` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### EXISTS
 
@@ -170,11 +170,11 @@ Returns the count of keys that exist. Checks both plain keys and compound data s
 
 | | |
 |---|---|
-| **RESP3 syntax** | `EXISTS key [key ...]` |
+| **Protocol command** | `EXISTS key [key ...]` |
 | **Embedded API** | `FerricStore.exists(key)` |
-| **RESP3 return** | Integer -- count of existing keys (a key is counted once for each time it appears in the argument list) |
+| **Return** | Integer -- count of existing keys (a key is counted once for each time it appears in the argument list) |
 | **Elixir return** | `true` or `false` (single key) |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### MGET
 
@@ -182,11 +182,11 @@ Returns values for multiple keys. Returns `nil` for keys that do not exist.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `MGET key [key ...]` |
+| **Protocol command** | `MGET key [key ...]` |
 | **Embedded API** | `FerricStore.mget(keys)` |
-| **RESP3 return** | Array of bulk strings / nulls |
+| **Return** | Array of bulk strings / nulls |
 | **Elixir return** | `{:ok, [binary() \| nil]}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### MSET
 
@@ -194,11 +194,11 @@ Sets multiple key-value pairs atomically. Never fails (always overwrites).
 
 | | |
 |---|---|
-| **RESP3 syntax** | `MSET key value [key value ...]` |
+| **Protocol command** | `MSET key value [key value ...]` |
 | **Embedded API** | `FerricStore.mset(map)` |
-| **RESP3 return** | `+OK` |
+| **Return** | `+OK` |
 | **Elixir return** | `:ok` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 **Validation:** Rejects empty keys and keys larger than 65,535 bytes.
 
@@ -208,11 +208,11 @@ Sets multiple keys only if NONE of the keys exist. Returns 0 if any key already 
 
 | | |
 |---|---|
-| **RESP3 syntax** | `MSETNX key value [key value ...]` |
+| **Protocol command** | `MSETNX key value [key value ...]` |
 | **Embedded API** | `FerricStore.msetnx(map)` |
-| **RESP3 return** | Integer -- `1` (all set) or `0` (none set) |
+| **Return** | Integer -- `1` (all set) or `0` (none set) |
 | **Elixir return** | `{:ok, true}` or `{:ok, false}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### INCR / DECR / INCRBY / DECRBY
 
@@ -220,11 +220,11 @@ Atomically increment or decrement integer values. If the key does not exist, it 
 
 | | |
 |---|---|
-| **RESP3 syntax** | `INCR key`, `DECR key`, `INCRBY key increment`, `DECRBY key decrement` |
+| **Protocol command** | `INCR key`, `DECR key`, `INCRBY key increment`, `DECRBY key decrement` |
 | **Embedded API** | `FerricStore.incr(key)`, `FerricStore.decr(key)`, `FerricStore.incr_by(key, n)`, `FerricStore.decr_by(key, n)` |
-| **RESP3 return** | Integer -- the new value |
+| **Return** | Integer -- the new value |
 | **Elixir return** | `{:ok, integer()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 **Error:** Returns `ERR value is not an integer or out of range` if the value is not a valid integer.
 
@@ -234,11 +234,11 @@ Atomically increment a value by a floating point amount. If the key does not exi
 
 | | |
 |---|---|
-| **RESP3 syntax** | `INCRBYFLOAT key increment` |
+| **Protocol command** | `INCRBYFLOAT key increment` |
 | **Embedded API** | `FerricStore.incr_by_float(key, delta)` |
-| **RESP3 return** | Bulk string -- the new value as a string |
+| **Return** | Bulk string -- the new value as a string |
 | **Elixir return** | `{:ok, binary()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### APPEND
 
@@ -246,11 +246,11 @@ Appends a value to an existing string. If the key does not exist, it is created 
 
 | | |
 |---|---|
-| **RESP3 syntax** | `APPEND key value` |
+| **Protocol command** | `APPEND key value` |
 | **Embedded API** | `FerricStore.append(key, value)` |
-| **RESP3 return** | Integer -- the new length in bytes |
+| **Return** | Integer -- the new length in bytes |
 | **Elixir return** | `{:ok, integer()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### STRLEN
 
@@ -258,23 +258,23 @@ Returns the byte length of the string stored at key. Returns `0` if the key does
 
 | | |
 |---|---|
-| **RESP3 syntax** | `STRLEN key` |
+| **Protocol command** | `STRLEN key` |
 | **Embedded API** | `FerricStore.strlen(key)` |
-| **RESP3 return** | Integer |
+| **Return** | Integer |
 | **Elixir return** | `{:ok, integer()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### GETSET
 
-Atomically sets a key and returns the old value. Deprecated in Redis 6.2+ (use `SET ... GET`), but still supported.
+Atomically sets a key and returns the old value. Deprecated in FerricStore 6.2+ (use `SET ... GET`), but still supported.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `GETSET key value` |
+| **Protocol command** | `GETSET key value` |
 | **Embedded API** | `FerricStore.getset(key, value)` |
-| **RESP3 return** | Bulk string (old value) or null |
+| **Return** | Bulk string (old value) or null |
 | **Elixir return** | `{:ok, binary() \| nil}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### GETDEL
 
@@ -282,11 +282,11 @@ Atomically gets and deletes a key.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `GETDEL key` |
+| **Protocol command** | `GETDEL key` |
 | **Embedded API** | `FerricStore.getdel(key)` |
-| **RESP3 return** | Bulk string or null |
+| **Return** | Bulk string or null |
 | **Elixir return** | `{:ok, binary() \| nil}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### GETEX
 
@@ -294,11 +294,11 @@ Gets a key and optionally updates its TTL.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `GETEX key [EX seconds \| PX ms \| EXAT ts \| PXAT ms_ts \| PERSIST]` |
+| **Protocol command** | `GETEX key [EX seconds \| PX ms \| EXAT ts \| PXAT ms_ts \| PERSIST]` |
 | **Embedded API** | `FerricStore.getex(key, ttl: ms)` |
-| **RESP3 return** | Bulk string or null |
+| **Return** | Bulk string or null |
 | **Elixir return** | `{:ok, binary() \| nil}` |
-| **Redis compat** | Fully compatible -- all five TTL options supported |
+| **FerricStore compat** | Fully compatible -- all five TTL options supported |
 
 ### SETNX
 
@@ -306,11 +306,11 @@ Sets a key only if it does not already exist.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SETNX key value` |
+| **Protocol command** | `SETNX key value` |
 | **Embedded API** | `FerricStore.setnx(key, value)` |
-| **RESP3 return** | Integer -- `1` (set) or `0` (not set) |
+| **Return** | Integer -- `1` (set) or `0` (not set) |
 | **Elixir return** | `{:ok, true}` or `{:ok, false}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### SETEX / PSETEX
 
@@ -318,11 +318,11 @@ Sets a key with an expiry.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SETEX key seconds value`, `PSETEX key milliseconds value` |
+| **Protocol command** | `SETEX key seconds value`, `PSETEX key milliseconds value` |
 | **Embedded API** | `FerricStore.setex(key, seconds, value)`, `FerricStore.psetex(key, ms, value)` |
-| **RESP3 return** | `+OK` |
+| **Return** | `+OK` |
 | **Elixir return** | `:ok` |
-| **Redis compat** | Fully compatible. TTL must be > 0. |
+| **FerricStore compat** | Fully compatible. TTL must be > 0. |
 
 ### GETRANGE
 
@@ -330,11 +330,11 @@ Returns a substring of the string value by byte range. Supports negative indices
 
 | | |
 |---|---|
-| **RESP3 syntax** | `GETRANGE key start end` |
+| **Protocol command** | `GETRANGE key start end` |
 | **Embedded API** | `FerricStore.getrange(key, start, stop)` |
-| **RESP3 return** | Bulk string (empty if key missing or range invalid) |
+| **Return** | Bulk string (empty if key missing or range invalid) |
 | **Elixir return** | `{:ok, binary()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### SETRANGE
 
@@ -342,11 +342,11 @@ Overwrites part of a string starting at the given byte offset. If the key does n
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SETRANGE key offset value` |
+| **Protocol command** | `SETRANGE key offset value` |
 | **Embedded API** | `FerricStore.setrange(key, offset, value)` |
-| **RESP3 return** | Integer -- the new string length |
+| **Return** | Integer -- the new string length |
 | **Elixir return** | `{:ok, integer()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ---
 
@@ -360,11 +360,11 @@ Sets one or more field-value pairs. Returns the number of NEW fields added (not 
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HSET key field value [field value ...]` |
+| **Protocol command** | `HSET key field value [field value ...]` |
 | **Embedded API** | `FerricStore.hset(key, map)` |
-| **RESP3 return** | Integer -- count of new fields added |
+| **Return** | Integer -- count of new fields added |
 | **Elixir return** | `:ok` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### HGET
 
@@ -372,11 +372,11 @@ Returns the value of a single field.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HGET key field` |
+| **Protocol command** | `HGET key field` |
 | **Embedded API** | `FerricStore.hget(key, field)` |
-| **RESP3 return** | Bulk string or null |
+| **Return** | Bulk string or null |
 | **Elixir return** | `{:ok, binary() \| nil}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### HDEL
 
@@ -384,11 +384,11 @@ Deletes one or more fields. Cleans up type metadata if the hash becomes empty.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HDEL key field [field ...]` |
+| **Protocol command** | `HDEL key field [field ...]` |
 | **Embedded API** | `FerricStore.hdel(key, fields)` |
-| **RESP3 return** | Integer -- count of fields deleted |
+| **Return** | Integer -- count of fields deleted |
 | **Elixir return** | `{:ok, integer()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### HMGET
 
@@ -396,11 +396,11 @@ Returns values for multiple fields. Missing fields return null.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HMGET key field [field ...]` |
+| **Protocol command** | `HMGET key field [field ...]` |
 | **Embedded API** | `FerricStore.hmget(key, fields)` |
-| **RESP3 return** | Array of bulk strings / nulls |
+| **Return** | Array of bulk strings / nulls |
 | **Elixir return** | `{:ok, [binary() \| nil]}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### HGETALL
 
@@ -408,11 +408,11 @@ Returns all fields and values as a flat list: `[field1, value1, field2, value2, 
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HGETALL key` |
+| **Protocol command** | `HGETALL key` |
 | **Embedded API** | `FerricStore.hgetall(key)` |
-| **RESP3 return** | Array (flat interleaved) or Map in RESP3 |
+| **Return** | Array (flat interleaved) or Map in Ferric protocol |
 | **Elixir return** | `{:ok, map()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### HEXISTS / HLEN / HKEYS / HVALS
 
@@ -423,7 +423,7 @@ Returns all fields and values as a flat list: `[field1, value1, field2, value2, 
 | `HKEYS` | `HKEYS key` | Array of field names |
 | `HVALS` | `HVALS key` | Array of values |
 
-All return empty results (0, []) for non-existent keys. Redis-compatible.
+All return empty results (0, []) for non-existent keys. Ferric protocol.
 
 ### HINCRBY / HINCRBYFLOAT
 
@@ -431,10 +431,10 @@ Atomically increment hash field values. If the field does not exist, it is initi
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HINCRBY key field increment`, `HINCRBYFLOAT key field increment` |
+| **Protocol command** | `HINCRBY key field increment`, `HINCRBYFLOAT key field increment` |
 | **Embedded API** | `FerricStore.hincrby(key, field, n)`, `FerricStore.hincrbyfloat(key, field, delta)` |
-| **RESP3 return** | Integer (HINCRBY) or bulk string (HINCRBYFLOAT) |
-| **Redis compat** | Fully compatible |
+| **Return** | Integer (HINCRBY) or bulk string (HINCRBYFLOAT) |
+| **FerricStore compat** | Fully compatible |
 
 ### HSETNX
 
@@ -442,9 +442,9 @@ Sets a field only if it does not exist.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HSETNX key field value` |
-| **RESP3 return** | `1` (set) or `0` (not set) |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `HSETNX key field value` |
+| **Return** | `1` (set) or `0` (not set) |
+| **FerricStore compat** | Fully compatible |
 
 ### HSTRLEN
 
@@ -452,9 +452,9 @@ Returns the string length of a hash field value. Returns `0` for missing fields.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HSTRLEN key field` |
-| **RESP3 return** | Integer |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `HSTRLEN key field` |
+| **Return** | Integer |
+| **FerricStore compat** | Fully compatible |
 
 ### HRANDFIELD
 
@@ -462,9 +462,9 @@ Returns random field(s). Negative count allows duplicates.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HRANDFIELD key [count [WITHVALUES]]` |
-| **RESP3 return** | Bulk string (single), array (multiple) |
-| **Redis compat** | Fully compatible. Negative count behavior (repeats allowed) matches Redis. |
+| **Protocol command** | `HRANDFIELD key [count [WITHVALUES]]` |
+| **Return** | Bulk string (single), array (multiple) |
+| **FerricStore compat** | Fully compatible. Negative count behavior (repeats allowed) matches FerricStore. |
 
 ### HSCAN
 
@@ -472,11 +472,11 @@ Cursor-based iteration over hash fields with optional pattern matching.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `HSCAN key cursor [MATCH pattern] [COUNT count]` |
-| **RESP3 return** | `[next_cursor, [field, value, ...]]` |
-| **Redis compat** | Cursor is an integer offset, not a Redis-style hash-table cursor. Results are equivalent. Default COUNT is 10. |
+| **Protocol command** | `HSCAN key cursor [MATCH pattern] [COUNT count]` |
+| **Return** | `[next_cursor, [field, value, ...]]` |
+| **FerricStore compat** | Cursor is an integer offset, not a FerricStore-style hash-table cursor. Results are equivalent. Default COUNT is 10. |
 
-### Hash Field TTL (Redis 7.4+)
+### Hash Field TTL (FerricStore 7.4+)
 
 FerricStore supports per-field expiry on hash fields:
 
@@ -492,7 +492,7 @@ FerricStore supports per-field expiry on hash fields:
 | `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values |
 | `HSETEX` | `HSETEX key seconds field value [field value ...]` | Count of new fields |
 
-**Redis compat:** These follow the Redis 7.4+ hash field expiry syntax.
+**FerricStore compat:** These follow the FerricStore 7.4+ hash field expiry syntax.
 
 ---
 
@@ -506,11 +506,11 @@ Push one or more elements to the head or tail. Returns the new list length.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `LPUSH key element [element ...]`, `RPUSH key element [element ...]` |
+| **Protocol command** | `LPUSH key element [element ...]`, `RPUSH key element [element ...]` |
 | **Embedded API** | `FerricStore.lpush(key, elements)`, `FerricStore.rpush(key, elements)` |
-| **RESP3 return** | Integer -- new length |
+| **Return** | Integer -- new length |
 | **Elixir return** | `{:ok, integer()}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### LPOP / RPOP
 
@@ -518,11 +518,11 @@ Pop one or more elements from head or tail.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `LPOP key [count]`, `RPOP key [count]` |
+| **Protocol command** | `LPOP key [count]`, `RPOP key [count]` |
 | **Embedded API** | `FerricStore.lpop(key)`, `FerricStore.rpop(key)` |
-| **RESP3 return** | Bulk string (single pop), Array (counted pop), null (empty/missing) |
+| **Return** | Bulk string (single pop), Array (counted pop), null (empty/missing) |
 | **Elixir return** | `{:ok, binary() \| nil}` |
-| **Redis compat** | Fully compatible. Count=0 returns empty list if key exists, nil if not. |
+| **FerricStore compat** | Fully compatible. Count=0 returns empty list if key exists, nil if not. |
 
 ### LRANGE
 
@@ -530,23 +530,23 @@ Returns elements in the specified range. Supports negative indices.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `LRANGE key start stop` |
+| **Protocol command** | `LRANGE key start stop` |
 | **Embedded API** | `FerricStore.lrange(key, start, stop)` |
-| **RESP3 return** | Array of bulk strings |
+| **Return** | Array of bulk strings |
 | **Elixir return** | `{:ok, [binary()]}` |
-| **Redis compat** | Fully compatible |
+| **FerricStore compat** | Fully compatible |
 
 ### LLEN / LINDEX / LSET / LREM / LTRIM / LPOS / LINSERT
 
 | Command | Syntax | Return | Notes |
 |---------|--------|--------|-------|
-| `LLEN` | `LLEN key` | Integer | Redis-compatible |
+| `LLEN` | `LLEN key` | Integer | Ferric protocol |
 | `LINDEX` | `LINDEX key index` | Bulk string / null | Supports negative indices |
-| `LSET` | `LSET key index element` | `+OK` or error | Redis-compatible |
+| `LSET` | `LSET key index element` | `+OK` or error | Ferric protocol |
 | `LREM` | `LREM key count element` | Integer (removed count) | count>0: head-to-tail, count<0: tail-to-head, count=0: all |
-| `LTRIM` | `LTRIM key start stop` | `+OK` | Redis-compatible |
+| `LTRIM` | `LTRIM key start stop` | `+OK` | Ferric protocol |
 | `LPOS` | `LPOS key element [RANK r] [COUNT c] [MAXLEN m]` | Integer / Array / null | RANK 0 is invalid |
-| `LINSERT` | `LINSERT key BEFORE\|AFTER pivot element` | Integer (new length) / `-1` (pivot not found) | Redis-compatible |
+| `LINSERT` | `LINSERT key BEFORE\|AFTER pivot element` | Integer (new length) / `-1` (pivot not found) | Ferric protocol |
 
 ### LMOVE / RPOPLPUSH
 
@@ -554,9 +554,9 @@ Atomically pops from one list and pushes to another.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `LMOVE source destination LEFT\|RIGHT LEFT\|RIGHT` |
+| **Protocol command** | `LMOVE source destination LEFT\|RIGHT LEFT\|RIGHT` |
 | **Embedded API** | `FerricStore.lmove(src, dst, from, to)` |
-| **Redis compat** | Fully compatible. `RPOPLPUSH` is an alias for `LMOVE source dest RIGHT LEFT`. |
+| **FerricStore compat** | Fully compatible. `RPOPLPUSH` is an alias for `LMOVE source dest RIGHT LEFT`. |
 
 ### LPUSHX / RPUSHX
 
@@ -564,12 +564,12 @@ Push only if the list already exists. Returns 0 if the key does not exist.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `LPUSHX key element [element ...]`, `RPUSHX key element [element ...]` |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `LPUSHX key element [element ...]`, `RPUSHX key element [element ...]` |
+| **FerricStore compat** | Fully compatible |
 
 ### BLPOP / BRPOP / BLMOVE / BLMPOP
 
-Blocking variants of pop/move. These are only available in TCP/RESP3 mode -- not in embedded mode. When the list is empty, the connection blocks until an element is pushed or the timeout expires.
+Blocking variants of pop/move. These are only available in Ferric protocol TCP mode -- not in embedded mode. When the list is empty, the connection blocks until an element is pushed or the timeout expires.
 
 ---
 
@@ -581,11 +581,11 @@ Each set member is stored as a compound key `S:redis_key\0member -> "1"`. This a
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SADD key member [member ...]`, `SREM key member [member ...]` |
+| **Protocol command** | `SADD key member [member ...]`, `SREM key member [member ...]` |
 | **Embedded API** | `FerricStore.sadd(key, members)`, `FerricStore.srem(key, members)` |
-| **RESP3 return** | Integer -- count of members added/removed |
+| **Return** | Integer -- count of members added/removed |
 | **Elixir return** | `{:ok, integer()}` |
-| **Redis compat** | Fully compatible. Type metadata cleaned up when set becomes empty. |
+| **FerricStore compat** | Fully compatible. Type metadata cleaned up when set becomes empty. |
 
 ### SMEMBERS / SISMEMBER / SCARD
 
@@ -595,14 +595,14 @@ Each set member is stored as a compound key `S:redis_key\0member -> "1"`. This a
 | `SISMEMBER` | `SISMEMBER key member` | `1` or `0` |
 | `SCARD` | `SCARD key` | Integer -- set size |
 
-All Redis-compatible. Non-existent keys return empty/0.
+All Ferric protocol. Non-existent keys return empty/0.
 
 ### SRANDMEMBER / SPOP
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SRANDMEMBER key [count]`, `SPOP key [count]` |
-| **Redis compat** | Fully compatible. Negative count for SRANDMEMBER allows duplicates (matches Redis). SPOP removes the selected members. |
+| **Protocol command** | `SRANDMEMBER key [count]`, `SPOP key [count]` |
+| **FerricStore compat** | Fully compatible. Negative count for SRANDMEMBER allows duplicates (matches FerricStore). SPOP removes the selected members. |
 
 ### SDIFF / SINTER / SUNION
 
@@ -610,10 +610,10 @@ Set algebra operations across multiple keys.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SDIFF key [key ...]`, `SINTER key [key ...]`, `SUNION key [key ...]` |
+| **Protocol command** | `SDIFF key [key ...]`, `SINTER key [key ...]`, `SUNION key [key ...]` |
 | **Embedded API** | `FerricStore.sdiff(keys)`, `FerricStore.sinter(keys)`, `FerricStore.sunion(keys)` |
-| **RESP3 return** | Array of members |
-| **Redis compat** | Fully compatible. All keys are loaded into `MapSet` for computation. |
+| **Return** | Array of members |
+| **FerricStore compat** | Fully compatible. All keys are loaded into `MapSet` for computation. |
 
 ### SDIFFSTORE / SINTERSTORE / SUNIONSTORE
 
@@ -621,9 +621,9 @@ Store operations that compute set algebra and write the result to a destination 
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SDIFFSTORE dest key [key ...]`, `SINTERSTORE dest key [key ...]`, `SUNIONSTORE dest key [key ...]` |
-| **RESP3 return** | Integer -- cardinality of the resulting set |
-| **Redis compat** | Fully compatible. Destination is cleared and re-created. |
+| **Protocol command** | `SDIFFSTORE dest key [key ...]`, `SINTERSTORE dest key [key ...]`, `SUNIONSTORE dest key [key ...]` |
+| **Return** | Integer -- cardinality of the resulting set |
+| **FerricStore compat** | Fully compatible. Destination is cleared and re-created. |
 
 ### SINTERCARD
 
@@ -631,9 +631,9 @@ Returns the cardinality of the intersection without creating a new set.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SINTERCARD numkeys key [key ...] [LIMIT limit]` |
-| **RESP3 return** | Integer -- intersection cardinality (capped by LIMIT if provided) |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `SINTERCARD numkeys key [key ...] [LIMIT limit]` |
+| **Return** | Integer -- intersection cardinality (capped by LIMIT if provided) |
+| **FerricStore compat** | Fully compatible |
 
 ### SMISMEMBER
 
@@ -641,9 +641,9 @@ Returns whether each member is a member of the set.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SMISMEMBER key member [member ...]` |
-| **RESP3 return** | Array of `1` / `0` |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `SMISMEMBER key member [member ...]` |
+| **Return** | Array of `1` / `0` |
+| **FerricStore compat** | Fully compatible |
 
 ### SMOVE
 
@@ -651,9 +651,9 @@ Atomically moves a member from source to destination set.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SMOVE source destination member` |
-| **RESP3 return** | `1` (moved) or `0` (member not in source) |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `SMOVE source destination member` |
+| **Return** | `1` (moved) or `0` (member not in source) |
+| **FerricStore compat** | Fully compatible |
 
 ### SSCAN
 
@@ -661,8 +661,8 @@ Cursor-based iteration with optional MATCH and COUNT.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SSCAN key cursor [MATCH pattern] [COUNT count]` |
-| **Redis compat** | Cursor is offset-based. Default COUNT is 10. |
+| **Protocol command** | `SSCAN key cursor [MATCH pattern] [COUNT count]` |
+| **FerricStore compat** | Cursor is offset-based. Default COUNT is 10. |
 
 ---
 
@@ -672,13 +672,13 @@ Each sorted set member is stored as `Z:redis_key\0member -> score_string`. Score
 
 ### ZADD
 
-Adds members with scores. Supports all Redis modifier flags.
+Adds members with scores. Supports all FerricStore modifier flags.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZADD key [NX\|XX] [GT\|LT] [CH] score member [score member ...]` |
+| **Protocol command** | `ZADD key [NX\|XX] [GT\|LT] [CH] score member [score member ...]` |
 | **Embedded API** | `FerricStore.zadd(key, [{score, member}, ...])` |
-| **RESP3 return** | Integer -- count of elements added (or added+changed with CH) |
+| **Return** | Integer -- count of elements added (or added+changed with CH) |
 | **Elixir return** | `{:ok, integer()}` |
 
 **Options:**
@@ -688,15 +688,15 @@ Adds members with scores. Supports all Redis modifier flags.
 - `LT` -- only update when new score < current score
 - `CH` -- return count of added + changed (instead of just added)
 
-**Redis compat:** Fully compatible.
+**FerricStore compat:** Fully compatible.
 
 ### ZSCORE / ZMSCORE
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZSCORE key member`, `ZMSCORE key member [member ...]` |
-| **RESP3 return** | Bulk string (score) or null |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `ZSCORE key member`, `ZMSCORE key member [member ...]` |
+| **Return** | Bulk string (score) or null |
+| **FerricStore compat** | Fully compatible |
 
 ### ZRANK / ZREVRANK
 
@@ -704,9 +704,9 @@ Returns zero-based rank of a member.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZRANK key member`, `ZREVRANK key member` |
-| **RESP3 return** | Integer or null (member not found) |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `ZRANK key member`, `ZREVRANK key member` |
+| **Return** | Integer or null (member not found) |
+| **FerricStore compat** | Fully compatible |
 
 ### ZRANGE / ZREVRANGE
 
@@ -714,10 +714,10 @@ Range query by index with optional WITHSCORES.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZRANGE key start stop [WITHSCORES]`, `ZREVRANGE key start stop [WITHSCORES]` |
+| **Protocol command** | `ZRANGE key start stop [WITHSCORES]`, `ZREVRANGE key start stop [WITHSCORES]` |
 | **Embedded API** | `FerricStore.zrange(key, start, stop, withscores: bool)` |
-| **RESP3 return** | Array of members, or interleaved `[member, score, ...]` with WITHSCORES |
-| **Redis compat** | The legacy index-based syntax is fully compatible. The Redis 6.2+ unified `ZRANGE` syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) is not yet supported. Use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` for score ranges. |
+| **Return** | Array of members, or interleaved `[member, score, ...]` with WITHSCORES |
+| **FerricStore compat** | The legacy index-based syntax is fully compatible. The FerricStore 6.2+ unified `ZRANGE` syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) is not yet supported. Use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` for score ranges. |
 
 ### ZRANGEBYSCORE / ZREVRANGEBYSCORE
 
@@ -725,9 +725,9 @@ Range by score with optional WITHSCORES and LIMIT.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]` |
+| **Protocol command** | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]` |
 | **Supported bounds** | Numeric, `-inf`, `+inf`, `(exclusive` prefix |
-| **Redis compat** | Fully compatible. Negative LIMIT count means "all remaining". |
+| **FerricStore compat** | Fully compatible. Negative LIMIT count means "all remaining". |
 
 ### ZCOUNT
 
@@ -735,8 +735,8 @@ Count members with scores in the given range.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZCOUNT key min max` |
-| **Redis compat** | Fully compatible. Supports `-inf`, `+inf`, and `(exclusive`. |
+| **Protocol command** | `ZCOUNT key min max` |
+| **FerricStore compat** | Fully compatible. Supports `-inf`, `+inf`, and `(exclusive`. |
 
 ### ZINCRBY
 
@@ -744,9 +744,9 @@ Increment the score of a member. Creates the member if it does not exist.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZINCRBY key increment member` |
-| **RESP3 return** | Bulk string -- the new score |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `ZINCRBY key increment member` |
+| **Return** | Bulk string -- the new score |
+| **FerricStore compat** | Fully compatible |
 
 ### ZPOPMIN / ZPOPMAX
 
@@ -754,13 +754,13 @@ Pop the lowest/highest scored members.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `ZPOPMIN key [count]`, `ZPOPMAX key [count]` |
-| **RESP3 return** | Array of `[member, score, ...]` |
-| **Redis compat** | Fully compatible. Cleans up type metadata when empty. |
+| **Protocol command** | `ZPOPMIN key [count]`, `ZPOPMAX key [count]` |
+| **Return** | Array of `[member, score, ...]` |
+| **FerricStore compat** | Fully compatible. Cleans up type metadata when empty. |
 
 ### ZRANDMEMBER / ZSCAN / ZCARD / ZREM
 
-| Command | Redis compat |
+| Command | FerricStore compat |
 |---------|-------------|
 | `ZRANDMEMBER key [count [WITHSCORES]]` | Fully compatible. Negative count allows duplicates. |
 | `ZSCAN key cursor [MATCH pattern] [COUNT count]` | Offset-based cursor |
@@ -779,14 +779,14 @@ Adds an entry to a stream with optional trimming and NOMKSTREAM.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] threshold] *\|ID field value [field value ...]` |
+| **Protocol command** | `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] threshold] *\|ID field value [field value ...]` |
 | **Embedded API** | `FerricStore.xadd(key, fields)` |
-| **RESP3 return** | Bulk string -- the generated entry ID |
+| **Return** | Bulk string -- the generated entry ID |
 | **Elixir return** | `{:ok, binary()}` |
 
 **ID generation:** `*` auto-generates using HLC. Explicit IDs must be strictly greater than the last entry. Partial IDs (just milliseconds) auto-assign the sequence.
 
-**Redis compat:** Fully compatible, including NOMKSTREAM and trim options.
+**FerricStore compat:** Fully compatible, including NOMKSTREAM and trim options.
 
 ### XLEN / XRANGE / XREVRANGE
 
@@ -794,7 +794,7 @@ Adds an entry to a stream with optional trimming and NOMKSTREAM.
 |---------|--------|--------|-------|
 | `XLEN` | `XLEN key` | Integer | From ETS metadata, O(1) |
 | `XRANGE` | `XRANGE key start end [COUNT count]` | Array of entries | `-` = min, `+` = max |
-| `XREVRANGE` | `XREVRANGE key end start [COUNT count]` | Array (reversed) | Redis-compatible |
+| `XREVRANGE` | `XREVRANGE key end start [COUNT count]` | Array (reversed) | Ferric protocol |
 
 ### XREAD
 
@@ -802,10 +802,10 @@ Reads entries from one or more streams. Supports BLOCK for waiting on new data.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]` |
+| **Protocol command** | `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]` |
 | **Special IDs** | `$` = only new entries from now on; `0` = all entries |
 | **BLOCK behavior** | In TCP mode, the connection registers as a stream waiter and is notified by XADD. In embedded mode, BLOCK is not supported. |
-| **Redis compat** | Fully compatible in TCP mode. BLOCK 0 = infinite wait. |
+| **FerricStore compat** | Fully compatible in TCP mode. BLOCK 0 = infinite wait. |
 
 ### XTRIM / XDEL
 
@@ -820,9 +820,9 @@ Returns stream metadata as a map.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `XINFO STREAM key` |
-| **RESP3 return** | Map with `length`, `first-entry`, `last-entry`, `last-generated-id`, `groups` |
-| **Redis compat** | Subset of Redis XINFO. FULL option not yet supported. |
+| **Protocol command** | `XINFO STREAM key` |
+| **Return** | Map with `length`, `first-entry`, `last-entry`, `last-generated-id`, `groups` |
+| **FerricStore compat** | Subset of FerricStore XINFO. FULL option not yet supported. |
 
 ### XGROUP CREATE / XREADGROUP / XACK
 
@@ -846,9 +846,9 @@ Returns the type of a key as a simple string.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `TYPE key` |
-| **RESP3 return** | Simple string: `string`, `hash`, `list`, `set`, `zset`, `stream`, or `none` |
-| **Redis compat** | Fully compatible |
+| **Protocol command** | `TYPE key` |
+| **Return** | Simple string: `string`, `hash`, `list`, `set`, `zset`, `stream`, or `none` |
+| **FerricStore compat** | Fully compatible |
 
 ### RENAME / RENAMENX / COPY
 
@@ -866,8 +866,8 @@ Cursor-based key iteration with optional MATCH pattern, COUNT hint, and TYPE fil
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` |
-| **RESP3 return** | `[next_cursor, [key, ...]]` |
+| **Protocol command** | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` |
+| **Return** | `[next_cursor, [key, ...]]` |
 
 **FerricStore behavior:** Cursor is the last key seen (alphabetic). `"0"` starts from the beginning. The prefix index is used for `prefix:*` patterns for O(matching) performance. Internal compound keys (H:, S:, Z:, T:, VM:, V:) are filtered out.
 
@@ -893,15 +893,15 @@ Cursor-based key iteration with optional MATCH pattern, COUNT hint, and TYPE fil
 | `EXPIRETIME` | `EXPIRETIME key` | Absolute Unix timestamp (seconds), `-1`, `-2` |
 | `PEXPIRETIME` | `PEXPIRETIME key` | Absolute Unix timestamp (ms), `-1`, `-2` |
 
-All Redis-compatible. Expiry uses HLC timestamps internally.
+All Ferric protocol. Expiry uses HLC timestamps internally.
 
 ### OBJECT
 
 | Subcommand | Return | Notes |
 |------------|--------|-------|
 | `OBJECT ENCODING key` | Type-specific encoding | Returns `"embstr"` (strings <= 44 bytes), `"raw"` (longer strings), `"hashtable"` (hashes), `"quicklist"` (lists), `"skiplist"` (sorted sets), `"stream"` (streams) |
-| `OBJECT HELP` | Array of help strings | Redis-compatible format |
-| `OBJECT FREQ key` | Integer (LFU counter) | Uses keydir LFU, not Redis logarithmic frequency |
+| `OBJECT HELP` | Array of help strings | Ferric protocol format |
+| `OBJECT FREQ key` | Integer (LFU counter) | Uses keydir LFU, not FerricStore logarithmic frequency |
 | `OBJECT IDLETIME key` | Integer (idle seconds) | Derived from LFU last-decrement-time. Returns elapsed seconds since last access. |
 | `OBJECT REFCOUNT key` | `1` | Always 1 |
 
@@ -909,9 +909,9 @@ All Redis-compatible. Expiry uses HLC timestamps internally.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `WAIT numreplicas timeout` |
-| **RESP3 return** | `0` (always) |
-| **Redis compat** | Stub -- no replica acknowledgement. Always returns immediately. |
+| **Protocol command** | `WAIT numreplicas timeout` |
+| **Return** | `0` (always) |
+| **FerricStore compat** | Stub -- no replica acknowledgement. Always returns immediately. |
 
 ---
 
@@ -919,7 +919,7 @@ All Redis-compatible. Expiry uses HLC timestamps internally.
 
 Bitmap operations work at the bit level on string values. Bits are numbered MSB-first: bit 0 is the MSB of byte 0 (value 128). Write operations (SETBIT, BITOP) perform a read-modify-write cycle.
 
-| Command | Syntax | Return | Redis compat |
+| Command | Syntax | Return | FerricStore compat |
 |---------|--------|--------|-------------|
 | `SETBIT` | `SETBIT key offset value` | Integer (old bit value) | Fully compatible |
 | `GETBIT` | `GETBIT key offset` | Integer (0 or 1) | Fully compatible |
@@ -933,7 +933,7 @@ Bitmap operations work at the bit level on string values. Bits are numbered MSB-
 
 HyperLogLog sketches are stored as 16,384-byte binary values (plain strings in Bitcask). No special type metadata.
 
-| Command | Syntax | Return | Redis compat |
+| Command | Syntax | Return | FerricStore compat |
 |---------|--------|--------|-------------|
 | `PFADD` | `PFADD key element [element ...]` | `1` (modified) or `0` | Fully compatible |
 | `PFCOUNT` | `PFCOUNT key [key ...]` | Integer (estimated cardinality) | Multi-key merges in memory without writing |
@@ -955,7 +955,7 @@ Backed by mmap NIF resources. Each filter is a memory-mapped file at `data_dir/p
 | `BF.CARD` | `BF.CARD key` | Integer | Items added count |
 | `BF.INFO` | `BF.INFO key` | Array: Capacity, Size, filters, items, expansion, error rate, hashes, bits | |
 
-**Redis compat:** Compatible with RedisBloom module syntax. Optimal sizing uses `m = -n*ln(p) / (ln(2))^2`. No scaling/expansion support (single filter).
+**FerricStore compat:** Compatible with FerricStoreBloom module syntax. Optimal sizing uses `m = -n*ln(p) / (ln(2))^2`. No scaling/expansion support (single filter).
 
 ---
 
@@ -974,7 +974,7 @@ Backed by mmap NIF resources at `data_dir/prob/shard_N/KEY.cuckoo`. Supports del
 | `CF.COUNT` | `CF.COUNT key element` | Integer (approximate count) | Fingerprint occurrences |
 | `CF.INFO` | `CF.INFO key` | Array: Size, buckets, filters, items, deletes, bucket_size, fingerprint_size, max_kicks, expansion | |
 
-**Redis compat:** Compatible with RedisBloom/Cuckoo module syntax.
+**FerricStore compat:** Compatible with FerricStoreBloom/Cuckoo module syntax.
 
 ---
 
@@ -991,7 +991,7 @@ Backed by mmap NIF resources at `data_dir/prob/shard_N/KEY.cms`.
 | `CMS.MERGE` | `CMS.MERGE dst numkeys key [key ...] [WEIGHTS w ...]` | `+OK` | All sources must have same width/depth. Creates dst if missing. |
 | `CMS.INFO` | `CMS.INFO key` | `[width, W, depth, D, count, C]` | |
 
-**Redis compat:** Compatible with RedisBloom CMS module syntax.
+**FerricStore compat:** Compatible with FerricStoreBloom CMS module syntax.
 
 ---
 
@@ -1008,7 +1008,7 @@ Backed by mmap NIF resources at `prob/shard_N/KEY.topk`. Uses Count-Min Sketch i
 | `TOPK.LIST` | `TOPK.LIST key [WITHCOUNT]` | Array of items (or interleaved items+counts) | |
 | `TOPK.INFO` | `TOPK.INFO key` | `[k, K, width, W, depth, D, decay, D]` | |
 
-**Redis compat:** Compatible with RedisBloom TopK module syntax.
+**FerricStore compat:** Compatible with FerricStoreBloom TopK module syntax.
 
 ---
 
@@ -1033,13 +1033,13 @@ T-digests provide accurate rank-based statistics (quantiles, CDF, trimmed means)
 | `TDIGEST.INFO` | `TDIGEST.INFO key` | Array: Compression, Capacity, Merged/Unmerged nodes, weights, total_compressions, Memory usage | |
 | `TDIGEST.MERGE` | `TDIGEST.MERGE dest numkeys key [key ...] [COMPRESSION c] [OVERRIDE]` | `+OK` | OVERRIDE replaces dest; without it, merges into existing |
 
-**Redis compat:** Compatible with RedisBloom TDigest module syntax.
+**FerricStore compat:** Compatible with FerricStoreBloom TDigest module syntax.
 
 ---
 
 ## Geo Commands
 
-Geo is implemented on top of Sorted Sets. Members are stored with 52-bit interleaved geohash scores (26 bits per axis, ~0.6mm precision), matching Redis's encoding. No new data structure is needed.
+Geo is implemented on top of Sorted Sets. Members are stored with 52-bit interleaved geohash scores (26 bits per axis, ~0.6mm precision), matching FerricStore's encoding. No new data structure is needed.
 
 | Command | Syntax | Return | Notes |
 |---------|--------|--------|-------|
@@ -1047,16 +1047,16 @@ Geo is implemented on top of Sorted Sets. Members are stored with 52-bit interle
 | `GEOPOS` | `GEOPOS key member [member ...]` | Array of `[lon, lat]` or null | |
 | `GEODIST` | `GEODIST key member1 member2 [M\|KM\|FT\|MI]` | Bulk string (distance) or null | Default unit: meters |
 | `GEOHASH` | `GEOHASH key member [member ...]` | Array of 11-char base32 strings | Standard geohash alphabet |
-| `GEOSEARCH` | `GEOSEARCH key FROMLONLAT lon lat\|FROMMEMBER member BYRADIUS radius unit\|BYBOX w h unit [ASC\|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]` | Array | Full Redis GEOSEARCH syntax |
+| `GEOSEARCH` | `GEOSEARCH key FROMLONLAT lon lat\|FROMMEMBER member BYRADIUS radius unit\|BYBOX w h unit [ASC\|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]` | Array | Full FerricStore GEOSEARCH syntax |
 | `GEOSEARCHSTORE` | `GEOSEARCHSTORE dest source [GEOSEARCH opts] [STOREDIST]` | Integer (stored count) | |
 
-**Redis compat:** Fully compatible including all GEOSEARCH options.
+**FerricStore compat:** Fully compatible including all GEOSEARCH options.
 
 ---
 
 ## FerricStore-Native Commands
 
-These commands extend beyond the Redis command set with operations not available in standard Redis.
+These commands extend beyond the FerricStore command set with operations not available in standard FerricStore.
 
 ### CAS (Compare-and-Swap)
 
@@ -1064,9 +1064,9 @@ Atomically sets a key only if its current value matches the expected value. Rout
 
 | | |
 |---|---|
-| **RESP3 syntax** | `CAS key expected new_value [EX seconds]` |
+| **Protocol command** | `CAS key expected new_value [EX seconds]` |
 | **Embedded API** | `FerricStore.cas(key, expected, new_value)` |
-| **RESP3 return** | `1` (swapped), `0` (value mismatch), null (key missing) |
+| **Return** | `1` (swapped), `0` (value mismatch), null (key missing) |
 | **Elixir return** | `{:ok, true}`, `{:ok, false}`, or `{:ok, nil}` |
 
 ### LOCK / UNLOCK / EXTEND
@@ -1085,7 +1085,7 @@ Sliding window rate limiter. Routed through `Router.ratelimit_add/4`.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `RATELIMIT.ADD key window_ms max_count [count]` |
+| **Protocol command** | `RATELIMIT.ADD key window_ms max_count [count]` |
 | **Embedded API** | `FerricStore.ratelimit_add(key, window_ms, max)` |
 | **Return** | Array: `[allowed (0\|1), current_count, remaining, retry_after_ms]` |
 | **Default count** | 1 |
@@ -1106,7 +1106,7 @@ Returns diagnostic metadata about a key.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `FERRICSTORE.KEY_INFO key` |
+| **Protocol command** | `FERRICSTORE.KEY_INFO key` |
 | **Return** | Array: `[type, T, value_size, N, ttl_ms, N, hot_cache_status, hot\|cold, last_write_shard, N]` |
 
 ### FERRICSTORE.DOCTOR
@@ -1118,9 +1118,9 @@ with `START` so the client connection is not held.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `FERRICSTORE.DOCTOR <subcommand> [args...]` |
+| **Protocol command** | `FERRICSTORE.DOCTOR <subcommand> [args...]` |
 | **Embedded API** | Internal command surface only |
-| **RESP3 return** | Map with `status`, `checks`, `job_id`, or `jobs` depending on subcommand |
+| **Return** | Map with `status`, `checks`, `job_id`, or `jobs` depending on subcommand |
 | **ACL** | `@admin`; repair jobs are also `@dangerous` |
 | **Dashboard** | `/dashboard/doctor` |
 
@@ -1148,12 +1148,12 @@ Subcommands:
 Examples:
 
 ```bash
-redis-cli FERRICSTORE.DOCTOR CHECK
-redis-cli FERRICSTORE.DOCTOR CHECK SCOPE FLOW_LMDB
-redis-cli FERRICSTORE.DOCTOR START CHECK SCOPE BITCASK
-redis-cli FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB
-redis-cli FERRICSTORE.DOCTOR STATUS doctor-1-123
-redis-cli FERRICSTORE.DOCTOR LIST
+FERRICSTORE.DOCTOR CHECK
+FERRICSTORE.DOCTOR CHECK SCOPE FLOW_LMDB
+FERRICSTORE.DOCTOR START CHECK SCOPE BITCASK
+FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE FLOW_LMDB
+FERRICSTORE.DOCTOR STATUS doctor-1-123
+FERRICSTORE.DOCTOR LIST
 ```
 
 Repair notes:
@@ -1183,7 +1183,7 @@ Returns server information. Supports sections: `server`, `clients`, `memory`, `k
 
 | | |
 |---|---|
-| **RESP3 syntax** | `INFO [section]` |
+| **Protocol command** | `INFO [section]` |
 | **FerricStore sections** | `raft` (per-shard role/term/commit), `bitcask` (per-shard file counts/sizes), `ferricstore` (raft committed, hot cache evictions), `keydir_analysis` (per-prefix key breakdown), `namespace_config` (group-commit settings) |
 
 The `server` section reports `redis_version: 7.4.0` for client compatibility along with `ferricstore_version: 0.4.1`.
@@ -1296,10 +1296,10 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 
 ---
 
-## Redis Compatibility Notes
+## FerricStore Compatibility Notes
 
 1. **Single database** -- `SELECT` returns an error. FerricStore is single-database.
-2. **RESP3 only** -- `HELLO 3` is required. RESP2 is not supported.
+2. **Ferric protocol only** -- `HELLO 3` is required. legacy text protocol is not supported.
 3. **No Lua scripting** -- `EVAL`/`EVALSHA` are not implemented. Use CAS, LOCK, and FETCH_OR_COMPUTE for atomic operations.
 4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` require a TCP connection.
 5. **Probabilistic structures are built-in** -- available without an external module. BF, CF, CMS, TopK, TDigest are all native.

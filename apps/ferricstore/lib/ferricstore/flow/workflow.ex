@@ -51,7 +51,7 @@ defmodule FerricStore.Flow.Workflow do
       -> hot Flow indexes
       -> async cold projections
 
-  No RESP client is used by this SDK.
+  No external protocol client is used by this SDK.
 
   ## Options
 

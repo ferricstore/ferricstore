@@ -29,7 +29,7 @@ defmodule Ferricstore.Store.CompoundKey do
     * `sub_key` is the type-specific sub-key (field name, position, member, etc.)
 
   The null byte separator is safe because Redis keys in normal use do not
-  contain null bytes (and the RESP protocol does not transmit them within
+  contain null bytes (and the wire protocol does not transmit them within
   key strings in standard client libraries).
 
   ## Type Metadata

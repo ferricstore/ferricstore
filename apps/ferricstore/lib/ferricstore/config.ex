@@ -2,9 +2,8 @@ defmodule Ferricstore.Config do
   @moduledoc """
   GenServer managing runtime configuration for FerricStore.
 
-  Provides a Redis-compatible `CONFIG GET`/`CONFIG SET` interface for reading
-  and writing server parameters at runtime. All values are stored as strings
-  to match Redis behaviour.
+  Provides a FerricStore `CONFIG GET`/`CONFIG SET` interface for reading and
+  writing server parameters at runtime. All values are stored as strings.
 
   ## Parameter categories
 
@@ -12,12 +11,12 @@ defmodule Ferricstore.Config do
 
     * `"maxmemory"` -- max memory budget in bytes from MemoryGuard
     * `"maxclients"` -- maximum simultaneous client connections
-    * `"tcp-port"` -- TCP port the server is listening on
+    * `"native-port"` -- Ferric protocol TCP port the server is listening on
     * `"data-dir"` -- Bitcask data directory path
-    * `"tls-port"` -- TLS port the server is listening on (`"0"` if not configured)
-    * `"tls-cert-file"` -- path to PEM certificate file
-    * `"tls-key-file"` -- path to PEM private key file
-    * `"tls-ca-cert-file"` -- path to CA certificate bundle
+    * `"native-tls-port"` -- Ferric protocol TLS port (`"0"` if not configured)
+    * `"native-tls-cert-file"` -- path to PEM certificate file
+    * `"native-tls-key-file"` -- path to PEM private key file
+    * `"native-tls-ca-cert-file"` -- path to CA certificate bundle
     * `"require-tls"` -- whether plaintext connections are rejected (`"true"` / `"false"`)
 
   **Read-write** (CONFIG GET and CONFIG SET):
@@ -29,8 +28,8 @@ defmodule Ferricstore.Config do
     * `"slowlog-max-len"` -- maximum slowlog entries
     * `"hz"` -- server tick frequency (stub, always reports 10)
 
-  Plus legacy parameters: `timeout`, `tcp-keepalive`, `databases`, `bind`,
-  `port`, `save`, `appendonly`, `loglevel`, `requirepass`.
+  Plus compatibility parameters: `timeout`, `tcp-keepalive`, `databases`,
+  `bind`, `save`, `appendonly`, `loglevel`, `requirepass`.
 
   ## Telemetry
 
@@ -62,12 +61,12 @@ defmodule Ferricstore.Config do
   @read_only_params MapSet.new([
                       "maxmemory",
                       "maxclients",
-                      "tcp-port",
+                      "native-port",
                       "data-dir",
-                      "tls-port",
-                      "tls-cert-file",
-                      "tls-key-file",
-                      "tls-ca-cert-file",
+                      "native-tls-port",
+                      "native-tls-cert-file",
+                      "native-tls-key-file",
+                      "native-tls-ca-cert-file",
                       "require-tls"
                     ])
 
@@ -100,7 +99,6 @@ defmodule Ferricstore.Config do
     "tcp-keepalive" => "300",
     "databases" => "1",
     "bind" => "127.0.0.1",
-    "port" => "6379",
     "save" => "",
     "appendonly" => "no",
     "loglevel" => "notice",
@@ -536,12 +534,12 @@ defmodule Ferricstore.Config do
     read_only = %{
       "maxmemory" => read_maxmemory(),
       "maxclients" => read_maxclients(),
-      "tcp-port" => read_tcp_port(),
+      "native-port" => read_native_port(),
       "data-dir" => read_data_dir(),
-      "tls-port" => read_tls_port(),
-      "tls-cert-file" => read_tls_cert_file(),
-      "tls-key-file" => read_tls_key_file(),
-      "tls-ca-cert-file" => read_tls_ca_cert_file(),
+      "native-tls-port" => read_native_tls_port(),
+      "native-tls-cert-file" => read_native_tls_cert_file(),
+      "native-tls-key-file" => read_native_tls_key_file(),
+      "native-tls-ca-cert-file" => read_native_tls_ca_cert_file(),
       "require-tls" => read_require_tls()
     }
 
@@ -567,12 +565,12 @@ defmodule Ferricstore.Config do
     state
     |> Map.put("maxmemory", read_maxmemory())
     |> Map.put("maxclients", read_maxclients())
-    |> Map.put("tcp-port", read_tcp_port())
+    |> Map.put("native-port", read_native_port())
     |> Map.put("data-dir", read_data_dir())
-    |> Map.put("tls-port", read_tls_port())
-    |> Map.put("tls-cert-file", read_tls_cert_file())
-    |> Map.put("tls-key-file", read_tls_key_file())
-    |> Map.put("tls-ca-cert-file", read_tls_ca_cert_file())
+    |> Map.put("native-tls-port", read_native_tls_port())
+    |> Map.put("native-tls-cert-file", read_native_tls_cert_file())
+    |> Map.put("native-tls-key-file", read_native_tls_key_file())
+    |> Map.put("native-tls-ca-cert-file", read_native_tls_ca_cert_file())
     |> Map.put("require-tls", read_require_tls())
   end
 
@@ -590,8 +588,8 @@ defmodule Ferricstore.Config do
     |> to_string()
   end
 
-  defp read_tcp_port do
-    Application.get_env(:ferricstore, :port, 6379)
+  defp read_native_port do
+    Application.get_env(:ferricstore, :native_port, 6388)
     |> to_string()
   end
 
@@ -631,21 +629,21 @@ defmodule Ferricstore.Config do
     |> to_string()
   end
 
-  defp read_tls_port do
-    Application.get_env(:ferricstore, :tls_port, 0)
+  defp read_native_tls_port do
+    (Application.get_env(:ferricstore, :native_tls_port) || 0)
     |> to_string()
   end
 
-  defp read_tls_cert_file do
-    Application.get_env(:ferricstore, :tls_cert_file, "")
+  defp read_native_tls_cert_file do
+    Application.get_env(:ferricstore, :native_tls_cert_file, "")
   end
 
-  defp read_tls_key_file do
-    Application.get_env(:ferricstore, :tls_key_file, "")
+  defp read_native_tls_key_file do
+    Application.get_env(:ferricstore, :native_tls_key_file, "")
   end
 
-  defp read_tls_ca_cert_file do
-    Application.get_env(:ferricstore, :tls_ca_cert_file, "")
+  defp read_native_tls_ca_cert_file do
+    Application.get_env(:ferricstore, :native_tls_ca_cert_file, "")
   end
 
   defp read_require_tls do

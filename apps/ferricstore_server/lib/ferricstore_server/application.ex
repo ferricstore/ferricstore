@@ -2,30 +2,16 @@ defmodule FerricstoreServer.Application do
   @moduledoc """
   OTP Application for the FerricStore standalone server.
 
-  Starts the network-facing children that expose the core engine over TCP:
+  Starts the network-facing children that expose the core engine:
 
-    * Ranch TCP listener (`FerricstoreServer.Listener`)
-    * Native TCP listener (`FerricstoreServer.Native.Listener`) -- optional
-    * Native TLS listener (`FerricstoreServer.Native.TlsListener`) -- optional
-    * Ranch TLS listener (`FerricstoreServer.TlsListener`) -- optional
+    * Ferric protocol TCP listener (`FerricstoreServer.Native.Listener`)
+    * Ferric protocol TLS listener (`FerricstoreServer.Native.TlsListener`) -- optional
     * HTTP health/metrics endpoint (`FerricstoreServer.Health.Endpoint`)
 
   This application depends on `:ferricstore` (the core engine). It injects
   server-specific callbacks (connected clients count, RSS tracking, server
   info) into the default Instance so the library can report them without
   knowing about the server.
-
-  ## Supervision tree (`:one_for_one`)
-
-  ```
-  FerricstoreServer.Supervisor
-  ├── :pg scope (FerricstoreServer.PG) — ACL invalidation process groups
-  ├── Ranch listener (FerricstoreServer.Listener)
-  ├── Native listener (FerricstoreServer.Native.Listener) [optional]
-  ├── Native TLS listener (FerricstoreServer.Native.TlsListener) [optional]
-  ├── Ranch TLS listener (FerricstoreServer.TlsListener) [optional]
-  └── Health HTTP endpoint (FerricstoreServer.Health.Endpoint)
-  ```
   """
 
   use Application
@@ -36,26 +22,18 @@ defmodule FerricstoreServer.Application do
   def start(_type, _args) do
     {:ok, _} = Application.ensure_all_started(:ranch)
 
-    port = Application.get_env(:ferricstore, :port, 6379)
+    native_port = Application.get_env(:ferricstore, :native_port, 6388)
     health_port = Application.get_env(:ferricstore, :health_port, 4000)
 
-    # Initialize ClientTracking ETS tables before any connection starts.
-    FerricstoreServer.ClientTracking.init_tables()
     FerricstoreServer.Connection.Registry.init_table()
 
     children =
       [
-        # ACL GenServer — manages user accounts, authentication, permissions.
-        # Must start before Ranch listener so connections can authenticate.
         FerricstoreServer.Acl,
-        # Start :pg scope for ACL invalidation broadcasts before the Ranch
-        # listener so it's ready when the first connection process starts.
-        pg_child_spec()
+        pg_child_spec(),
+        native_listener_spec(native_port)
       ] ++
-        [ranch_listener_spec(port)] ++
-        native_listener_children() ++
         native_tls_listener_children() ++
-        tls_listener_children() ++
         [FerricstoreServer.Health.Endpoint.child_spec(health_port)]
 
     opts = [
@@ -67,10 +45,7 @@ defmodule FerricstoreServer.Application do
 
     result = Supervisor.start_link(children, opts)
 
-    # Inject server-specific callbacks into the default Instance.
-    # The library uses these to report connected clients, RSS, etc.
-    # without needing to know about the server app.
-    inject_server_callbacks(port)
+    inject_server_callbacks(native_port)
 
     result
   end
@@ -79,40 +54,25 @@ defmodule FerricstoreServer.Application do
   def prep_stop(state) do
     Logger.info("FerricstoreServer: graceful shutdown starting")
 
-    # Step 1: Stop accepting new connections.
-    # Suspending the listener rejects new TCP connections while existing
-    # ones continue to be served.
-    try do
-      :ranch.suspend_listener(FerricstoreServer.Listener)
-      Logger.info("FerricstoreServer: listener suspended (no new connections)")
-    catch
-      _, _ -> :ok
-    end
-
     try do
       :ranch.suspend_listener(FerricstoreServer.Native.Listener)
-      Logger.info("FerricstoreServer: native listener suspended (no new connections)")
+      Logger.info("FerricstoreServer: protocol listener suspended (no new connections)")
     catch
       _, _ -> :ok
     end
 
     try do
       :ranch.suspend_listener(FerricstoreServer.Native.TlsListener)
-      Logger.info("FerricstoreServer: native TLS listener suspended (no new connections)")
+      Logger.info("FerricstoreServer: protocol TLS listener suspended (no new connections)")
     catch
       _, _ -> :ok
     end
 
-    # Step 2: Give active connections a grace period to finish in-flight
-    # commands. Connections that are idle will be closed by the supervisor.
-    # Connections mid-command get time to complete.
     grace_ms = Application.get_env(:ferricstore, :shutdown_grace_ms, 2_000)
-
     notify_native_goaway(grace_ms)
 
     active =
-      listener_connection_count(FerricstoreServer.Listener) +
-        listener_connection_count(FerricstoreServer.Native.Listener) +
+      listener_connection_count(FerricstoreServer.Native.Listener) +
         listener_connection_count(FerricstoreServer.Native.TlsListener)
 
     if active > 0 do
@@ -124,30 +84,19 @@ defmodule FerricstoreServer.Application do
     state
   end
 
-  # ---------------------------------------------------------------------------
-  # Server callback injection
-  # ---------------------------------------------------------------------------
-
-  defp inject_server_callbacks(port) do
+  defp inject_server_callbacks(native_port) do
     FerricStore.Instance.inject_callbacks(:default,
       connected_clients_fn: fn ->
-        listener_connection_count(FerricstoreServer.Listener) +
-          listener_connection_count(FerricstoreServer.Native.Listener) +
+        listener_connection_count(FerricstoreServer.Native.Listener) +
           listener_connection_count(FerricstoreServer.Native.TlsListener)
       end,
       process_rss_fn: &Ferricstore.MemoryGuard.process_rss_bytes/0,
       server_info_fn: fn ->
-        base = %{
-          tcp_port: port,
-          redis_mode: "standalone"
+        %{
+          protocol: "ferric",
+          native_port: native_port
         }
-
-        if native_enabled?() do
-          Map.put(base, :native_port, Application.get_env(:ferricstore, :native_port, 6388))
-          |> maybe_put_native_tls_port()
-        else
-          base
-        end
+        |> maybe_put_native_tls_port()
       end,
       raft_apply_hook: &FerricstoreServer.Acl.handle_raft_command/1
     )
@@ -197,112 +146,25 @@ defmodule FerricstoreServer.Application do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # :pg scope for ACL cache invalidation
-  # ---------------------------------------------------------------------------
-
-  # Returns a child spec for the :pg scope used by connection processes to
-  # receive ACL invalidation broadcasts. The scope name matches the constant
-  # in FerricstoreServer.Connection.
   defp pg_child_spec do
     %{
       id: FerricstoreServer.PG,
-      start: {:pg, :start_link, [FerricstoreServer.Connection.acl_pg_group()]}
+      start: {:pg, :start_link, [FerricstoreServer.Connection.Auth.acl_pg_group()]}
     }
-  end
-
-  # ---------------------------------------------------------------------------
-  # TLS listener children
-  # ---------------------------------------------------------------------------
-
-  # Returns a list with the TLS Ranch listener child spec if TLS is configured,
-  # or an empty list otherwise.
-  defp tls_listener_children do
-    tls_opts = [
-      port: Application.get_env(:ferricstore, :tls_port),
-      certfile: Application.get_env(:ferricstore, :tls_cert_file),
-      keyfile: Application.get_env(:ferricstore, :tls_key_file),
-      cacertfile: Application.get_env(:ferricstore, :tls_ca_cert_file)
-    ]
-
-    case FerricstoreServer.TlsListener.child_spec_if_configured(tls_opts) do
-      nil -> []
-      spec -> [spec]
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Native listener children
-  # ---------------------------------------------------------------------------
-
-  defp native_listener_children do
-    if native_enabled?() do
-      [native_listener_spec(Application.get_env(:ferricstore, :native_port, 6388))]
-    else
-      []
-    end
   end
 
   defp native_tls_listener_children do
-    if native_enabled?() do
-      tls_opts = [
-        port: Application.get_env(:ferricstore, :native_tls_port),
-        certfile:
-          Application.get_env(:ferricstore, :native_tls_cert_file) ||
-            Application.get_env(:ferricstore, :tls_cert_file),
-        keyfile:
-          Application.get_env(:ferricstore, :native_tls_key_file) ||
-            Application.get_env(:ferricstore, :tls_key_file),
-        cacertfile:
-          Application.get_env(:ferricstore, :native_tls_ca_cert_file) ||
-            Application.get_env(:ferricstore, :tls_ca_cert_file)
-      ]
+    tls_opts = [
+      port: Application.get_env(:ferricstore, :native_tls_port),
+      certfile: Application.get_env(:ferricstore, :native_tls_cert_file),
+      keyfile: Application.get_env(:ferricstore, :native_tls_key_file),
+      cacertfile: Application.get_env(:ferricstore, :native_tls_ca_cert_file)
+    ]
 
-      case FerricstoreServer.Native.TlsListener.child_spec_if_configured(tls_opts) do
-        nil -> []
-        spec -> [spec]
-      end
-    else
-      []
+    case FerricstoreServer.Native.TlsListener.child_spec_if_configured(tls_opts) do
+      nil -> []
+      spec -> [spec]
     end
-  end
-
-  defp native_enabled? do
-    Application.get_env(:ferricstore, :native_protocol_enabled, false)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Ranch child spec
-  # ---------------------------------------------------------------------------
-
-  # Builds a Ranch TCP listener child spec.
-  #
-  # Ranch 2.x exposes `:ranch.child_spec/5` which returns a plain Supervisor
-  # child spec suitable for embedding in any supervisor.  The listener will
-  # bind to `port` (0 = ephemeral, useful in tests).
-  defp ranch_listener_spec(port) do
-    nodelay = Application.get_env(:ferricstore, :tcp_nodelay, true)
-
-    transport_opts = %{
-      socket_opts: [
-        port: port,
-        nodelay: nodelay,
-        recbuf: Application.get_env(:ferricstore, :tcp_recbuf, 131_072),
-        sndbuf: Application.get_env(:ferricstore, :tcp_sndbuf, 131_072),
-        backlog: 1024,
-        keepalive: true
-      ]
-    }
-
-    protocol_opts = %{}
-
-    :ranch.child_spec(
-      FerricstoreServer.Listener,
-      :ranch_tcp,
-      transport_opts,
-      FerricstoreServer.Connection,
-      protocol_opts
-    )
   end
 
   defp native_listener_spec(port) do

@@ -110,7 +110,7 @@ defmodule FerricStore.API.Hashes do
   # Lists
   #
   # Note: Blocking list commands (BLPOP, BRPOP, BLMOVE, BLMPOP) are only
-  # available via TCP/RESP3. The embedded API provides non-blocking variants
+  # available via the network protocol. The embedded API provides non-blocking variants
   # (lpop, rpop, lmove). For blocking semantics, poll with lpop/rpop or use
   # Phoenix PubSub to subscribe to list-push events.
   # ---------------------------------------------------------------------------

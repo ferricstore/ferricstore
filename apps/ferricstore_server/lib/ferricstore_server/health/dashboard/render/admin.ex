@@ -266,12 +266,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     read_only = [
       {"maxmemory", "Configured process memory ceiling."},
       {"maxclients", "Configured client connection ceiling."},
-      {"tcp-port", "TCP listener port."},
+      {"native-port", "TCP listener port."},
       {"data-dir", "Persistent storage directory."},
-      {"tls-port", "TLS listener port."},
-      {"tls-cert-file", "TLS certificate path."},
-      {"tls-key-file", "TLS private-key path."},
-      {"tls-ca-cert-file", "TLS CA path."},
+      {"native-tls-port", "TLS listener port."},
+      {"native-tls-cert-file", "TLS certificate path."},
+      {"native-tls-key-file", "TLS private-key path."},
+      {"native-tls-ca-cert-file", "TLS CA path."},
       {"require-tls", "Whether cleartext client connections are rejected."}
     ]
 

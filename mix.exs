@@ -34,7 +34,6 @@ defmodule Ferricstore.Umbrella.MixProject do
 
   defp aliases do
     [
-      "bench.resp": "run bench/resp_bench.exs",
       "bench.commands": "run bench/commands_bench.exs",
       "bench.tcp": "run bench/tcp_bench.exs",
       "bench.flow": "run bench/flow_workflow_bench.exs"

@@ -318,7 +318,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
   defp configure_remote_node(node_name, data_dir, shards, cluster_nodes) do
     env_settings = [
       {:data_dir, data_dir},
-      {:port, 0},
+      {:native_port, 0},
       {:health_port, 0},
       {:shard_count, shards},
       {:cluster_nodes, cluster_nodes},

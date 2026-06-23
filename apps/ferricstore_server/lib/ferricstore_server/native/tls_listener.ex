@@ -3,7 +3,7 @@ defmodule FerricstoreServer.Native.TlsListener do
   Ranch TLS listener for FerricStore's native binary protocol.
 
   This keeps the native SDK data plane secure without forcing clients through
-  the RESP TLS listener.
+  a text-protocol TLS listener.
   """
 
   @listener_ref __MODULE__

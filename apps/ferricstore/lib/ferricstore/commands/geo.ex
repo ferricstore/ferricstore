@@ -52,7 +52,7 @@ defmodule Ferricstore.Commands.Geo do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Handles typed Geo command AST terms produced by the Rust RESP parser.
+  Handles typed Geo command AST terms produced by the native AST parser.
   """
   @spec handle_ast(term(), map()) :: term()
   def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}

@@ -51,23 +51,23 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
         end
       end
 
-      describe "read-only param: tcp-port" do
-        test "CONFIG GET tcp-port returns integer string matching Application env", %{
+      describe "read-only param: native-port" do
+        test "CONFIG GET native-port returns integer string matching Application env", %{
           store: store
         } do
-          result = Server.handle("CONFIG", ["GET", "tcp-port"], store)
-          assert ["tcp-port", value] = result
-          expected = Application.get_env(:ferricstore, :port, 6379) |> to_string()
+          result = Server.handle("CONFIG", ["GET", "native-port"], store)
+          assert ["native-port", value] = result
+          expected = Application.get_env(:ferricstore, :native_port, 6388) |> to_string()
           assert value == expected
         end
 
-        test "CONFIG GET tcp-port value is a parseable integer", %{store: store} do
-          ["tcp-port", value] = Server.handle("CONFIG", ["GET", "tcp-port"], store)
+        test "CONFIG GET native-port value is a parseable integer", %{store: store} do
+          ["native-port", value] = Server.handle("CONFIG", ["GET", "native-port"], store)
           assert {_n, ""} = Integer.parse(value)
         end
 
-        test "CONFIG SET tcp-port is rejected as read-only", %{store: store} do
-          assert {:error, msg} = Server.handle("CONFIG", ["SET", "tcp-port", "9999"], store)
+        test "CONFIG SET native-port is rejected as read-only", %{store: store} do
+          assert {:error, msg} = Server.handle("CONFIG", ["SET", "native-port", "9999"], store)
           assert msg =~ "read-only"
         end
       end
@@ -96,64 +96,74 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
         end
       end
 
-      describe "read-only param: tls-port" do
-        test "CONFIG GET tls-port returns integer string", %{store: store} do
-          result = Server.handle("CONFIG", ["GET", "tls-port"], store)
-          assert ["tls-port", value] = result
+      describe "read-only param: native-tls-port" do
+        test "CONFIG GET native-tls-port returns integer string", %{store: store} do
+          result = Server.handle("CONFIG", ["GET", "native-tls-port"], store)
+          assert ["native-tls-port", value] = result
           {n, ""} = Integer.parse(value)
           # Default is 0 (TLS not configured)
           assert n >= 0
         end
 
-        test "CONFIG GET tls-port matches Application env", %{store: store} do
-          ["tls-port", value] = Server.handle("CONFIG", ["GET", "tls-port"], store)
-          expected = Application.get_env(:ferricstore, :tls_port, 0) |> to_string()
+        test "CONFIG GET native-tls-port matches Application env", %{store: store} do
+          ["native-tls-port", value] = Server.handle("CONFIG", ["GET", "native-tls-port"], store)
+          expected = (Application.get_env(:ferricstore, :native_tls_port) || 0) |> to_string()
           assert value == expected
         end
 
-        test "CONFIG SET tls-port is rejected as read-only", %{store: store} do
-          assert {:error, msg} = Server.handle("CONFIG", ["SET", "tls-port", "6380"], store)
-          assert msg =~ "read-only"
-        end
-      end
-
-      describe "read-only param: tls-cert-file" do
-        test "CONFIG GET tls-cert-file returns string", %{store: store} do
-          result = Server.handle("CONFIG", ["GET", "tls-cert-file"], store)
-          assert ["tls-cert-file", value] = result
-          assert is_binary(value)
-        end
-
-        test "CONFIG GET tls-cert-file matches Application env", %{store: store} do
-          ["tls-cert-file", value] = Server.handle("CONFIG", ["GET", "tls-cert-file"], store)
-          expected = Application.get_env(:ferricstore, :tls_cert_file, "")
-          assert value == expected
-        end
-
-        test "CONFIG SET tls-cert-file is rejected as read-only", %{store: store} do
+        test "CONFIG SET native-tls-port is rejected as read-only", %{store: store} do
           assert {:error, msg} =
-                   Server.handle("CONFIG", ["SET", "tls-cert-file", "/etc/cert.pem"], store)
+                   Server.handle("CONFIG", ["SET", "native-tls-port", "6389"], store)
 
           assert msg =~ "read-only"
         end
       end
 
-      describe "read-only param: tls-key-file" do
-        test "CONFIG GET tls-key-file returns string", %{store: store} do
-          result = Server.handle("CONFIG", ["GET", "tls-key-file"], store)
-          assert ["tls-key-file", value] = result
+      describe "read-only param: native-tls-cert-file" do
+        test "CONFIG GET native-tls-cert-file returns string", %{store: store} do
+          result = Server.handle("CONFIG", ["GET", "native-tls-cert-file"], store)
+          assert ["native-tls-cert-file", value] = result
           assert is_binary(value)
         end
 
-        test "CONFIG GET tls-key-file matches Application env", %{store: store} do
-          ["tls-key-file", value] = Server.handle("CONFIG", ["GET", "tls-key-file"], store)
-          expected = Application.get_env(:ferricstore, :tls_key_file, "")
+        test "CONFIG GET native-tls-cert-file matches Application env", %{store: store} do
+          ["native-tls-cert-file", value] =
+            Server.handle("CONFIG", ["GET", "native-tls-cert-file"], store)
+
+          expected = Application.get_env(:ferricstore, :native_tls_cert_file, "")
           assert value == expected
         end
 
-        test "CONFIG SET tls-key-file is rejected as read-only", %{store: store} do
+        test "CONFIG SET native-tls-cert-file is rejected as read-only", %{store: store} do
           assert {:error, msg} =
-                   Server.handle("CONFIG", ["SET", "tls-key-file", "/etc/key.pem"], store)
+                   Server.handle(
+                     "CONFIG",
+                     ["SET", "native-tls-cert-file", "/etc/cert.pem"],
+                     store
+                   )
+
+          assert msg =~ "read-only"
+        end
+      end
+
+      describe "read-only param: native-tls-key-file" do
+        test "CONFIG GET native-tls-key-file returns string", %{store: store} do
+          result = Server.handle("CONFIG", ["GET", "native-tls-key-file"], store)
+          assert ["native-tls-key-file", value] = result
+          assert is_binary(value)
+        end
+
+        test "CONFIG GET native-tls-key-file matches Application env", %{store: store} do
+          ["native-tls-key-file", value] =
+            Server.handle("CONFIG", ["GET", "native-tls-key-file"], store)
+
+          expected = Application.get_env(:ferricstore, :native_tls_key_file, "")
+          assert value == expected
+        end
+
+        test "CONFIG SET native-tls-key-file is rejected as read-only", %{store: store} do
+          assert {:error, msg} =
+                   Server.handle("CONFIG", ["SET", "native-tls-key-file", "/etc/key.pem"], store)
 
           assert msg =~ "read-only"
         end
@@ -503,12 +513,12 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
 
           assert "maxmemory" in keys
           assert "maxclients" in keys
-          assert "tcp-port" in keys
+          assert "native-port" in keys
           assert "data-dir" in keys
           # raft-enabled was removed — Raft is always on
-          assert "tls-port" in keys
-          assert "tls-cert-file" in keys
-          assert "tls-key-file" in keys
+          assert "native-tls-port" in keys
+          assert "native-tls-cert-file" in keys
+          assert "native-tls-key-file" in keys
           assert "require-tls" in keys
         end
 
@@ -597,7 +607,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
           assert content =~ "maxmemory"
           assert content =~ "maxclients"
           assert content =~ "bind"
-          assert content =~ "tcp-port"
+          assert content =~ "native-port"
           assert content =~ "data-dir"
         end
 
@@ -738,7 +748,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
       describe "INFO server section reflects config" do
         test "INFO server section contains tcp_port matching configured port", %{store: store} do
           info = Server.handle("INFO", ["server"], store)
-          port = Application.get_env(:ferricstore, :port, 6379)
+          port = Application.get_env(:ferricstore, :native_port, 6388)
           assert info =~ "tcp_port:#{port}"
         end
 

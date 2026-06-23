@@ -390,7 +390,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
 
   defp collect_client_list_from_ranch do
     try do
-      pids = :ranch.procs(FerricstoreServer.Listener, :connections)
+      pids = :ranch.procs(FerricstoreServer.Native.Listener, :connections)
       now = System.monotonic_time(:millisecond)
 
       Enum.map(pids, fn pid ->

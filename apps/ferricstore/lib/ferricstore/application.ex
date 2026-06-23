@@ -142,7 +142,6 @@ defmodule Ferricstore.Application do
       # Initialize waiter registry ETS for blocking commands
       Ferricstore.Waiters.init()
       Ferricstore.Flow.ClaimWaiters.init()
-      # Client tracking ETS tables initialized by FerricstoreServer.ClientTracking
       # Initialize stream metadata ETS tables (owned by this long-lived process)
       Ferricstore.Commands.Stream.init_tables()
       # Start Erlang distribution if cluster is configured.

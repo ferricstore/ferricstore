@@ -298,6 +298,18 @@ defmodule FerricstoreServer.AclSecurityTest do
       refute Acl.has_configured_users?()
     end
 
+    test "has_configured_users? returns false when ACL ETS table is temporarily unavailable" do
+      on_exit(fn ->
+        FerricstoreServer.Acl.Tables.new_active_table()
+        FerricstoreServer.Acl.Tables.insert_default_user()
+      end)
+
+      table = FerricstoreServer.Acl.Tables.active_table()
+      :ets.delete(table)
+
+      refute Acl.has_configured_users?()
+    end
+
     test "has_configured_users? returns true when default user has a password" do
       assert :ok = Acl.set_user("default", ["on", ">s3cret"])
       assert Acl.has_configured_users?()

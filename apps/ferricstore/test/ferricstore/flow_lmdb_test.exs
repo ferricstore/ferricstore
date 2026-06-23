@@ -58,6 +58,23 @@ defmodule Ferricstore.Flow.LMDBTest do
   @moduletag :flow
   @moduletag :global_state
 
+  setup do
+    release_all_lmdb_envs!()
+
+    on_exit(fn ->
+      release_all_lmdb_envs!()
+    end)
+
+    :ok
+  end
+
+  defp release_all_lmdb_envs! do
+    case Ferricstore.Flow.LMDB.release_all() do
+      :ok -> :ok
+      {:ok, _released} -> :ok
+    end
+  end
+
   defmodule FlushProbeWriter do
     use GenServer
 

@@ -37,7 +37,7 @@ defmodule Ferricstore.PubSub do
     * `{:pubsub_message, channel, message}` — for exact channel subscriptions
     * `{:pubsub_pmessage, pattern, channel, message}` — for pattern subscriptions
 
-  The connection process is responsible for encoding these into RESP3 push frames.
+  The protocol connection process is responsible for encoding these into event frames.
   """
 
   use GenServer
@@ -299,7 +299,7 @@ defmodule Ferricstore.PubSub do
   Returns subscriber counts for the given channels.
 
   Returns a flat list of `[channel, count, channel, count, ...]` suitable
-  for RESP encoding.
+  for wire encoding.
 
   ## Parameters
 

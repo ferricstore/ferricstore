@@ -29,7 +29,7 @@ MIX_ENV=prod \
 FERRICSTORE_PROTECTED_MODE=false \
 FERRICSTORE_SHARD_COUNT=16 \
 FERRICSTORE_DATA_DIR=/tmp/ferricstore-clean-code-baseline/data-kv-c200p50 \
-FERRICSTORE_PORT=6379 \
+FERRICSTORE_NATIVE_PORT=6388 \
 mix run --no-halt
 ```
 
@@ -51,7 +51,7 @@ run has up to 40,000 in-flight requests.
 Command:
 
 ```bash
-memtier_benchmark -s 127.0.0.1 -p 6379 \
+memtier_benchmark -s 127.0.0.1 -p 6388 \
   --protocol=resp3 \
   --clients=200 --threads=4 \
   --pipeline=50 \
@@ -76,7 +76,7 @@ GET was run after the SET benchmark against the populated `bench:*` keyspace.
 Command:
 
 ```bash
-memtier_benchmark -s 127.0.0.1 -p 6379 \
+memtier_benchmark -s 127.0.0.1 -p 6388 \
   --protocol=resp3 \
   --clients=200 --threads=4 \
   --pipeline=50 \
@@ -179,4 +179,4 @@ Dry-run the exact commands without starting the server or running long benchmark
 python3 bench/local_regression_baseline.py --dry-run
 ```
 
-This runner keeps the RESP/memtier and DBOS-style Python SDK baselines stable. It does not benchmark the native TCP protocol until the SDK has a native transport adapter.
+This runner keeps the protocol benchmark and DBOS-style Python SDK baselines stable. It does not benchmark the Ferric protocol until the SDK has a native transport adapter.

@@ -33,6 +33,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     HyperLogLog,
     List,
     Memory,
+    NativeAstParser,
     Namespace,
     Native,
     PubSub,
@@ -46,6 +47,24 @@ defmodule Ferricstore.Commands.Dispatcher do
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TDigest
   alias Ferricstore.Commands.TopK
+
+  @string_raw_commands ~w(GET SET DEL EXISTS MGET MSET INCR DECR INCRBY DECRBY INCRBYFLOAT APPEND STRLEN GETSET GETDEL GETEX SETNX SETEX PSETEX GETRANGE SETRANGE MSETNX)
+  @expiry_raw_commands ~w(EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST)
+  @list_raw_commands ~w(LPUSH RPUSH LPOP RPOP LRANGE LLEN LINDEX LSET LREM LTRIM LPOS LINSERT LMOVE RPOPLPUSH LPUSHX RPUSHX)
+  @hash_raw_commands ~w(HSET HDEL HMGET HGET HGETALL HEXISTS HKEYS HVALS HLEN HSETNX HSTRLEN HSCAN HINCRBY HINCRBYFLOAT HRANDFIELD HEXPIRE HPEXPIRE HGETEX HSETEX HTTL HPTTL HPERSIST HEXPIRETIME HGETDEL)
+  @set_raw_commands ~w(SADD SREM SMISMEMBER SINTER SUNION SDIFF SDIFFSTORE SINTERSTORE SUNIONSTORE SMEMBERS SCARD SISMEMBER SRANDMEMBER SPOP SMOVE SSCAN SINTERCARD)
+  @zset_raw_commands ~w(ZADD ZREM ZSCORE ZRANK ZREVRANK ZCARD ZINCRBY ZCOUNT ZPOPMIN ZPOPMAX ZRANDMEMBER ZMSCORE ZRANGE ZREVRANGE ZSCAN ZRANGEBYSCORE ZREVRANGEBYSCORE)
+  @bitmap_raw_commands ~w(GETBIT SETBIT BITCOUNT BITPOS BITOP)
+  @generic_raw_commands ~w(TYPE UNLINK RENAME RENAMENX COPY RANDOMKEY SCAN EXPIRETIME PEXPIRETIME OBJECT WAIT)
+  @server_raw_commands ~w(PING ECHO DBSIZE KEYS FLUSHDB FLUSHALL SELECT INFO COMMAND LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR)
+  @stream_raw_commands ~w(XADD XLEN XRANGE XREVRANGE XREAD XTRIM XDEL XINFO XGROUP XREADGROUP XACK)
+  @geo_raw_commands ~w(GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE)
+  @hll_raw_commands ~w(PFADD PFCOUNT PFMERGE)
+  @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
+  @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
+  @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE FERRICSTORE.HOTNESS)
+  @raw_fallback_ast_tags ~w(xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
+  @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
   @ast_command_names %{
     get: "get",
@@ -226,14 +245,21 @@ defmodule Ferricstore.Commands.Dispatcher do
     tdigest_max: "tdigest.max",
     tdigest_info: "tdigest.info",
     tdigest_merge: "tdigest.merge",
+    cas: "cas",
+    lock: "lock",
+    unlock: "unlock",
+    extend: "extend",
+    ratelimit_add: "ratelimit.add",
+    ferricstore_key_info: "ferricstore.key_info",
+    fetch_or_compute: "fetch_or_compute",
+    fetch_or_compute_result: "fetch_or_compute_result",
+    fetch_or_compute_error: "fetch_or_compute_error",
     ferricstore_blobgc: "ferricstore.blobgc",
     ferricstore_doctor: "ferricstore.doctor"
   }
 
-  @single_value_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist expiretime pexpiretime llen lpop rpop hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel smembers scard srandmember spop zscore zrank zrevrank zcard zpopmin zpopmax zrandmember bitcount bitpos type xlen)a
-
   @doc """
-  Dispatches a command AST produced by the Rust RESP parser.
+  Dispatches a command AST produced by the native AST parser.
   """
   @spec dispatch_ast(term(), map()) :: term()
   def dispatch_ast(:ping, store), do: Server.handle("PING", [], store)
@@ -241,8 +267,12 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({:ping, args}, store) when is_list(args),
     do: Server.handle("PING", args, store)
 
-  def dispatch_ast({tag, args}, _store) when tag in @single_value_ast_tags and is_list(args),
-    do: wrong_arity_ast(tag)
+  def dispatch_ast({tag, args}, store) when tag in @raw_fallback_ast_tags and is_list(args),
+    do: dispatch_raw_handler(ast_command_name(tag), args, store)
+
+  def dispatch_ast({tag, args}, _store)
+      when tag in @wrong_arity_list_ast_tags and is_list(args),
+      do: wrong_arity_ast(tag)
 
   def dispatch_ast({:ping, arg}, store), do: Server.handle("PING", [arg], store)
 
@@ -360,13 +390,31 @@ defmodule Ferricstore.Commands.Dispatcher do
       when tag in ~w(zrem zcard zpopmin zpopmax zrandmember zmscore)a,
       do: SortedSet.handle_ast(ast, store)
 
+  def dispatch_ast({tag, _key, {:error, reason}}, _store)
+      when tag in ~w(zcount zrangebyscore zrevrangebyscore)a,
+      do: {:error, reason}
+
+  def dispatch_ast({tag, key, min, max}, store)
+      when tag in ~w(zcount zrangebyscore zrevrangebyscore)a and
+             (is_binary(min) or is_binary(max)),
+      do: SortedSet.handle(ast_command_name(tag), [key, min, max], store)
+
+  def dispatch_ast({tag, _, _, _} = ast, store)
+      when tag in ~w(zcount zrangebyscore zrevrangebyscore)a,
+      do: SortedSet.handle_ast(ast, store)
+
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(zscore zrank zrevrank zadd zcount zpopmin zpopmax zscan zrangebyscore zrevrangebyscore)a,
+      when tag in ~w(zscore zrank zrevrank zadd zpopmin zpopmax zscan)a,
       do: SortedSet.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(zadd zincrby zcount zrange zrevrange zrandmember zscan zrangebyscore zrevrangebyscore)a,
+      when tag in ~w(zadd zincrby zrange zrevrange zrandmember zscan)a,
       do: SortedSet.handle_ast(ast, store)
+
+  def dispatch_ast({tag, key, min, max, opts}, store)
+      when tag in ~w(zrangebyscore zrevrangebyscore)a and is_list(opts) and
+             (is_binary(min) or is_binary(max)),
+      do: SortedSet.handle(ast_command_name(tag), [key, min, max | opts], store)
 
   def dispatch_ast({tag, _, _, _, _} = ast, store)
       when tag in ~w(zrange zrevrange zrangebyscore zrevrangebyscore)a,
@@ -512,12 +560,14 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({:publish, args}, _store), do: PubSub.handle_ast({:publish, args})
   def dispatch_ast({:pubsub, args}, _store), do: PubSub.handle_ast({:pubsub, args})
 
+  def dispatch_ast({:raw_command, cmd, args}, store) when is_binary(cmd) and is_list(args),
+    do: dispatch_raw_handler(cmd, args, store)
+
   def dispatch_ast({:unknown, cmd, _args}, _store) when is_binary(cmd),
     do: unknown_command(cmd)
 
-  def dispatch_ast({tag, args}, _store) when is_atom(tag) and is_list(args) do
-    wrong_arity_ast(tag)
-  end
+  def dispatch_ast({tag, args}, _store) when is_atom(tag) and is_list(args),
+    do: wrong_arity_ast(tag)
 
   def dispatch_ast(_ast, _store), do: {:error, "ERR unsupported command AST"}
 
@@ -613,9 +663,55 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp ast_command_name(:cluster_role), do: "CLUSTER.ROLE"
   defp ast_command_name(:ferricstore_hotness), do: "FERRICSTORE.HOTNESS"
 
+  defp ast_command_name(tag) when is_atom(tag) do
+    case @ast_command_names do
+      %{^tag => name} -> String.upcase(name)
+      _ -> nil
+    end
+  end
+
+  defp dispatch_raw_handler(cmd, args, store) do
+    cond do
+      cmd in @string_raw_commands -> Strings.handle(cmd, args, store)
+      cmd in @expiry_raw_commands -> Expiry.handle(cmd, args, store)
+      cmd in @list_raw_commands -> List.handle(cmd, args, store)
+      cmd in @hash_raw_commands -> Hash.handle(cmd, args, store)
+      cmd in @set_raw_commands -> Set.handle(cmd, args, store)
+      cmd in @zset_raw_commands -> SortedSet.handle(cmd, args, store)
+      cmd in @bitmap_raw_commands -> Bitmap.handle(cmd, args, store)
+      cmd in @generic_raw_commands -> Generic.handle(cmd, args, store)
+      cmd in @server_raw_commands -> Server.handle(cmd, args, store)
+      cmd in @stream_raw_commands -> Stream.handle(cmd, args, store)
+      cmd in @geo_raw_commands -> Geo.handle(cmd, args, store)
+      cmd in @hll_raw_commands -> HyperLogLog.handle(cmd, args, store)
+      cmd in @native_raw_commands -> Native.handle(native_raw_command_name(cmd), args, store)
+      cmd in @cluster_raw_commands -> Cluster.handle(cmd, args, store)
+      cmd in @prob_raw_commands -> dispatch_prob_raw(cmd, args, store)
+      cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, args, store)
+      cmd == "FERRICSTORE.METRICS" -> Ferricstore.Metrics.handle(cmd, args)
+      cmd == "MEMORY" -> dispatch_memory_raw(args, store)
+      cmd == "PUBLISH" or cmd == "PUBSUB" -> PubSub.handle(cmd, args)
+      true -> unknown_command(cmd)
+    end
+  end
+
+  defp native_raw_command_name("FERRICSTORE.KEY_INFO"), do: "KEY_INFO"
+  defp native_raw_command_name(cmd), do: cmd
+
+  defp dispatch_prob_raw("BF." <> _ = cmd, args, store), do: Bloom.handle(cmd, args, store)
+  defp dispatch_prob_raw("CF." <> _ = cmd, args, store), do: Cuckoo.handle(cmd, args, store)
+  defp dispatch_prob_raw("CMS." <> _ = cmd, args, store), do: CMS.handle(cmd, args, store)
+  defp dispatch_prob_raw("TOPK." <> _ = cmd, args, store), do: TopK.handle(cmd, args, store)
+  defp dispatch_prob_raw("TDIGEST." <> _ = cmd, args, store), do: TDigest.handle(cmd, args, store)
+
+  defp dispatch_memory_raw([subcmd | rest], store), do: Memory.handle(subcmd, rest, store)
+
+  defp dispatch_memory_raw([], _store),
+    do: {:error, "ERR wrong number of arguments for 'memory' command"}
+
   @doc """
   Parses a raw command name and argument list into the same AST used by the
-  RESP server path.
+  native command path.
 
   Native protocol uses this as a compatibility fallback for commands that do
   not yet have a specialized native opcode. Hot commands should keep using
@@ -623,22 +719,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   """
   @spec parse_raw(binary(), [term()]) ::
           {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
-  def parse_raw("", _args), do: unknown_command("")
-
-  def parse_raw(name, args) when is_binary(name) and is_list(args) do
-    frame = encode_raw_command(name, args)
-
-    case Ferricstore.Resp.Parser.parse_commands(frame) do
-      {:ok, [{:command, cmd, parsed_args, ast, keys}], ""} ->
-        {:ok, cmd, parsed_args, ast, keys}
-
-      {:ok, _other, _rest} ->
-        {:error, "ERR protocol error"}
-
-      {:error, reason} ->
-        {:error, "ERR protocol error #{inspect(reason)}"}
-    end
-  end
+  def parse_raw(name, args), do: NativeAstParser.parse(name, args)
 
   @doc """
   Dispatches a raw command name and argument list through the canonical command
@@ -670,20 +751,4 @@ defmodule Ferricstore.Commands.Dispatcher do
     duration = System.monotonic_time(:microsecond) - start
     Ferricstore.SlowLog.maybe_log([cmd | args], duration)
   end
-
-  defp encode_raw_command(name, args) do
-    parts = [to_command_binary(name) | Enum.map(args, &to_command_binary/1)]
-
-    IO.iodata_to_binary([
-      "*",
-      Integer.to_string(length(parts)),
-      "\r\n",
-      Enum.map(parts, fn part ->
-        ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
-      end)
-    ])
-  end
-
-  defp to_command_binary(value) when is_binary(value), do: value
-  defp to_command_binary(value), do: to_string(value)
 end

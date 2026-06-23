@@ -664,9 +664,7 @@ defmodule FerricstoreServer.Native.Commands do
          {:ok, cmd, parsed_args, _ast, keys} <-
            Ferricstore.Commands.Dispatcher.parse_raw(command, args),
          :ok <- authorize_raw_command(cmd, keys, state) do
-      store = state.instance_ctx
-      result = Ferricstore.Commands.Dispatcher.dispatch_raw(command, parsed_args, store)
-      result |> raw_result_to_native() |> result_to_reply(state)
+      dispatch_command_exec(cmd, command, parsed_args, state)
     else
       {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
       {:error, status, reason} -> {status, reason, state}
@@ -1636,6 +1634,27 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp dispatch_command_exec("CLIENT", _command, [subcmd | rest], state) do
+    subcmd
+    |> String.upcase()
+    |> FerricstoreServer.Commands.Client.handle(rest, state, state.instance_ctx)
+    |> client_command_result_to_reply(state)
+  end
+
+  defp dispatch_command_exec("CLIENT", _command, [], state),
+    do: {:bad_request, "ERR wrong number of arguments for 'client' command", state}
+
+  defp dispatch_command_exec(_cmd, command, parsed_args, state) do
+    store = state.instance_ctx
+    result = Ferricstore.Commands.Dispatcher.dispatch_raw(command, parsed_args, store)
+    result |> raw_result_to_native() |> result_to_reply(state)
+  end
+
+  defp client_command_result_to_reply({:ok, new_state}, _state), do: {:ok, "OK", new_state}
+
+  defp client_command_result_to_reply({result, new_state}, _state),
+    do: result |> raw_result_to_native() |> result_to_reply(new_state)
+
   defp raw_command_args(%{"args" => args}) when is_list(args), do: {:ok, args}
   defp raw_command_args(%{"args" => nil}), do: {:ok, []}
   defp raw_command_args(payload) when not is_map_key(payload, "args"), do: {:ok, []}
@@ -2070,8 +2089,7 @@ defmodule FerricstoreServer.Native.Commands do
       route: %{
         slots: SlotMap.num_slots(),
         shard_count: state.instance_ctx.shard_count,
-        native_port: Application.get_env(:ferricstore, :native_port, 6388),
-        resp_port: Application.get_env(:ferricstore, :port, 6379)
+        native_port: Application.get_env(:ferricstore, :native_port, 6388)
       },
       auth_required: state.require_auth and not state.authenticated,
       backpressure: backpressure_payload()
@@ -2565,7 +2583,6 @@ defmodule FerricstoreServer.Native.Commands do
       route_epoch: route_epoch(),
       owner_node: Atom.to_string(node()),
       native_port: Application.get_env(:ferricstore, :native_port, 6388),
-      resp_port: Application.get_env(:ferricstore, :port, 6379),
       hint: "local"
     }
   end
@@ -2581,8 +2598,7 @@ defmodule FerricstoreServer.Native.Commands do
           shard: shard,
           lane_id: shard + 1,
           owner_node: Atom.to_string(node()),
-          native_port: Application.get_env(:ferricstore, :native_port, 6388),
-          resp_port: Application.get_env(:ferricstore, :port, 6379)
+          native_port: Application.get_env(:ferricstore, :native_port, 6388)
         }
       end)
 

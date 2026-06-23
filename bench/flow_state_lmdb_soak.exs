@@ -153,7 +153,7 @@ defmodule FlowStateLMDBSoak do
 
     try do
       {:ok, _} = Application.ensure_all_started(:ferricstore_server)
-      port = FerricstoreServer.Listener.port()
+      port = FerricstoreServer.Native.Listener.port()
 
       normal_port =
         start_python_workload(:normal, port,

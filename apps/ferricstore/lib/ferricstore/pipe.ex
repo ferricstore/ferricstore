@@ -4,7 +4,7 @@ defmodule FerricStore.Pipe do
 
   Used with `FerricStore.pipeline/1` to batch multiple operations into a single
   Raft entry per shard. Commands are accumulated in reverse order and on execute,
-  converted to RESP tuples and dispatched through the Coordinator. Single-shard
+  converted to command tuples and dispatched through the Coordinator. Single-shard
   pipelines commit in one Raft round-trip; cross-shard pipelines use the
   anchor-shard mechanism.
 
@@ -121,7 +121,7 @@ defmodule FerricStore.Pipe do
   per shard via the Coordinator.
 
   This is called internally by `FerricStore.pipeline/1`. Commands are converted
-  to RESP-style tuples and dispatched through `Ferricstore.Transaction.Coordinator`,
+  to command tuples and dispatched through `Ferricstore.Transaction.Coordinator`,
   which groups them by shard and submits each group as a single `{:batch}` or
   `{:tx_execute}` Raft entry. Single-shard pipelines commit in one Raft round-trip;
   cross-shard pipelines use the anchor-shard mechanism.
@@ -271,7 +271,7 @@ defmodule FerricStore.Pipe do
       Ferricstore.Store.Router.compound_get(ctx, key, list_meta_key) != nil
   end
 
-  # The Coordinator returns raw Dispatcher results (RESP-level values).
+  # The Coordinator returns raw Dispatcher results (dispatcher-level values).
   # Pipeline callers expect the same format as FerricStore public API calls.
   # This maps Dispatcher results back to the public API format.
   defp normalize_result({:get, _}, {:error, _} = err), do: err

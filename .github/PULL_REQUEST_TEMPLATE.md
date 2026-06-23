@@ -19,7 +19,7 @@ Describe the change and why it is needed.
 
 ## Performance Impact
 
-Mention any expected impact on Flow, RESP, Raft, Bitcask, NIFs, memory, disk, or startup/recovery.
+Mention any expected impact on Flow, Ferric protocol, Raft, Bitcask, NIFs, memory, disk, or startup/recovery.
 
 ## Public API / Docs
 

@@ -18,14 +18,8 @@ config :ferricstore, :ferricstore_wal_nif,
   skip_compilation?: false,
   load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
 
-# TCP server port (default: 6379, matches Redis)
-config :ferricstore, :port, 6379
-
-# Optional native binary SDK/data-plane listener. Disabled by default so the
-# Redis-compatible RESP listener remains the only public port unless explicitly
-# enabled with FERRICSTORE_NATIVE_ENABLED=true.
+# Ferric protocol TCP server port.
 config :ferricstore,
-  native_protocol_enabled: false,
   native_port: 6388,
   native_tls_port: nil,
   native_max_frame_bytes: 16 * 1024 * 1024,

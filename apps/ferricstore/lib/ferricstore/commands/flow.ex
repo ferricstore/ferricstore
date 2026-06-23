@@ -1,9 +1,9 @@
 defmodule Ferricstore.Commands.Flow do
   @moduledoc """
-  RESP command dispatch boundary for FerricFlow commands.
+  Command dispatch boundary for FerricFlow commands.
 
-  The Rust RESP parser builds Flow AST tuples and this module forwards them to
-  the public `FerricStore.flow_*` APIs, normalizing replies into Redis-friendly
+  The native AST parser builds Flow tuples and this module forwards them to
+  the public `FerricStore.flow_*` APIs, normalizing replies into protocol-friendly
   values. It intentionally stays thin so command parsing, API validation, and
   Raft apply logic remain separate.
 

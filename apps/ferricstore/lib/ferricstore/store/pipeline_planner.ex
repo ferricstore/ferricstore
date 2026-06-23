@@ -5,7 +5,7 @@ defmodule Ferricstore.Store.PipelinePlanner do
   Server/protocol code may know command shape, but routing decisions belong in
   the store layer. The planner keeps namespace expansion, shard ownership, and
   keydir lookup together so batch read/write paths can avoid recomputing them
-  per Router pass without moving store semantics into the RESP parser.
+  per Router pass without moving store semantics into the native AST parser.
   """
 
   alias Ferricstore.Store.SlotMap

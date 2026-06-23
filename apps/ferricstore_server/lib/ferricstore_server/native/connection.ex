@@ -4,7 +4,7 @@ defmodule FerricstoreServer.Native.Connection do
 
   The native listener is a binary, request-id based data plane for SDKs that
   need routing hints, pipelined command execution, and structured Flow results
-  without RESP parsing. It shares the same engine path as RESP; this module only
+  without text protocol parsing. It shares the same engine path as embedded commands; this module only
   handles network framing, ACL/protected-mode, client registry, and response
   coalescing.
   """

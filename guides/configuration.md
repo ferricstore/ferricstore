@@ -31,7 +31,7 @@ config :ferricstore, :mode, :embedded
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:port` | `integer` | `6379` | Standalone only | TCP port for the RESP3 listener. Use `0` for an OS-assigned ephemeral port (useful in tests). |
+| `:native_port` | `integer` | `6388` | Standalone only | TCP port for the Ferric protocol listener. Use `0` for an OS-assigned ephemeral port (useful in tests). |
 | `:health_port` | `integer` | `4000` | Standalone only | HTTP port for health checks and Prometheus metrics. Use `0` for ephemeral. |
 | `:socket_active_mode` | `:once \| true \| integer` | `true` | Standalone only | TCP socket active mode. `:once` reads one message at a time (back-pressure friendly). `true` pushes all data without flow control (highest throughput). An integer N reads N messages then switches to passive. |
 
@@ -46,7 +46,7 @@ The TCP listener also sets the following socket options (not configurable at run
 | `keepalive` | `true` | Enable TCP keepalive to detect dead connections |
 
 ```elixir
-config :ferricstore, :port, 6379
+config :ferricstore, :native_port, 6388
 config :ferricstore, :health_port, 4000
 ```
 
@@ -118,7 +118,7 @@ config :ferricstore, :supervisor_max_restarts, {1000, 60}
 > | `:max_memory_bytes` | `nil` (no limit) | Eviction is **disabled** until you set this. Without a limit, ETS grows unbounded. |
 > | `:eviction_policy` | `:volatile_lru` | When eviction triggers, only keys with a TTL are candidates. Least-frequently-accessed go first. |
 > | `:lfu_decay_time` | `1` minute | Counter decays by 1 every minute — keys that stop being accessed lose priority within minutes. |
-> | `:lfu_log_factor` | `10` | Moderate increment curve. Matches Redis default. |
+> | `:lfu_log_factor` | `10` | Moderate increment curve. Matches FerricStore default. |
 > | `:memory_guard_interval_ms` | `100` ms | Memory checked 10 times per second. |
 >
 > **If you set nothing**, eviction never happens and RAM grows until the OS kills the process.
@@ -153,7 +153,7 @@ goes from "hot" (~1-5 us) to "cold" (~50-200 us) — slower but still accessible
 permanently removed from both ETS and Bitcask (a tombstone is written to disk).
 The key is gone — `GET` returns nil, `EXISTS` returns 0. This happens two ways:
 lazy deletion on the next read, and active sweep every 100ms (configurable).
-This is the same behavior as Redis `EXPIRE`.
+This is the same behavior as FerricStore `EXPIRE`.
 
 When RAM usage reaches `max_memory_bytes`, MemoryGuard must choose which hot
 keys to make cold. This involves two things:
@@ -263,7 +263,7 @@ config :ferricstore, :lfu_decay_time, 1
 config :ferricstore, :lfu_log_factor, 10
 ```
 
-> These match Redis's `lfu-decay-time` and `lfu-log-factor` exactly — same
+> These match FerricStore's `lfu-decay-time` and `lfu-log-factor` exactly — same
 > algorithm, same defaults, same behavior.
 
 ### Memory Pressure Thresholds
@@ -359,13 +359,13 @@ Configure per-namespace at runtime:
 
 ```bash
 # Latency-sensitive keys: 1ms batch window (default)
-redis-cli FERRICSTORE.CONFIG SET latency window_ms 1
+FERRICSTORE.CONFIG SET latency window_ms 1
 
 # Analytics counters: 5ms batch window
-redis-cli FERRICSTORE.CONFIG SET analytics window_ms 5
+FERRICSTORE.CONFIG SET analytics window_ms 5
 
 # Reset to defaults
-redis-cli FERRICSTORE.CONFIG RESET analytics
+FERRICSTORE.CONFIG RESET analytics
 ```
 
 Or in Elixir config:
@@ -385,7 +385,7 @@ runaway transactions or pipelines.
 
 | Option | Type | Default | Hard Cap | Applies to | Description |
 |--------|------|---------|----------|------------|-------------|
-| `:max_value_size` | `integer` | `1_048_576` (1 MB) | `67_108_864` (64 MB) | Both | Maximum bulk string (value) size in bytes. Enforced at RESP3 parse time and in embedded `FerricStore.set/3`. The hard cap of 64 MB is non-configurable. |
+| `:max_value_size` | `integer` | `1_048_576` (1 MB) | `67_108_864` (64 MB) | Both | Maximum bulk string (value) size in bytes. Enforced at Ferric protocol parse time and in embedded `FerricStore.set/3`. The hard cap of 64 MB is non-configurable. |
 | Buffer limit | compile-time | `134_217_728` (128 MB) | — | Standalone only | Maximum bytes accumulated in a connection's receive buffer before the connection is closed. Not configurable at runtime (module attribute in `Connection`). |
 | MULTI queue limit | compile-time | `100_000` | — | Standalone only | Maximum commands queued inside a `MULTI` transaction. When exceeded, the transaction is auto-discarded and an error is returned. |
 | Pipeline batch limit | compile-time | `100_000` | — | Standalone only | Maximum commands in a single pipeline batch. When exceeded, the entire batch is rejected with an error. |
@@ -394,7 +394,7 @@ runaway transactions or pipelines.
 
 Applied at two levels:
 
-1. **RESP3 parser** — when a bulk string header `$N\r\n` declares a length exceeding the limit, the parser returns an error immediately without reading the body. The connection receives `-ERR value too large (N bytes, max M bytes)` and is closed.
+1. **Ferric protocol parser** — when a bulk string header `$N\r\n` declares a length exceeding the limit, the parser returns an error immediately without reading the body. The connection receives `-ERR value too large (N bytes, max M bytes)` and is closed.
 2. **Embedded API** — `FerricStore.set/3` checks `byte_size(value)` before writing and returns `{:error, "ERR value too large ..."}` if the value exceeds the limit.
 
 ```elixir
@@ -408,7 +408,7 @@ These are compile-time module attributes in `FerricstoreServer.Connection` and
 cannot be changed at runtime. The defaults are generous enough for any
 legitimate workload while preventing pathological resource exhaustion:
 
-- **Buffer overflow** — a client sending incomplete RESP frames faster than
+- **Buffer overflow** — a client sending incomplete Ferric protocol frames faster than
   they can be parsed will accumulate data in the receive buffer. At 128 MB the
   connection is closed with `-ERR connection buffer overflow`.
 - **MULTI queue overflow** — a client queueing more than 100K commands inside
@@ -437,17 +437,17 @@ config :ferricstore_server, :sendfile_threshold, 65_536
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:tls_port` | `integer` | `nil` | Standalone only | TLS port to bind. Not started unless configured. |
-| `:tls_cert_file` | `string` | `nil` | Standalone only | Path to PEM certificate file. |
-| `:tls_key_file` | `string` | `nil` | Standalone only | Path to PEM private key file. |
-| `:tls_ca_cert_file` | `string` | `nil` | Standalone only | Path to CA certificate bundle (optional, for mutual TLS). |
+| `:native_tls_port` | `integer` | `nil` | Standalone only | Ferric protocol TLS port to bind. Not started unless configured. |
+| `:native_tls_cert_file` | `string` | `nil` | Standalone only | Path to PEM certificate file. |
+| `:native_tls_key_file` | `string` | `nil` | Standalone only | Path to PEM private key file. |
+| `:native_native_tls_ca_cert_file` | `string` | `nil` | Standalone only | Path to CA certificate bundle (optional, for mutual TLS). |
 | `:require_tls` | `boolean` | `false` | Standalone only | When `true`, reject plaintext TCP connections. |
 
 ```elixir
-config :ferricstore, :tls_port, 6380
-config :ferricstore, :tls_cert_file, "/etc/ssl/ferricstore/cert.pem"
-config :ferricstore, :tls_key_file, "/etc/ssl/ferricstore/key.pem"
-config :ferricstore, :tls_ca_cert_file, "/etc/ssl/ferricstore/ca.pem"
+config :ferricstore, :native_tls_port, 6389
+config :ferricstore, :native_tls_cert_file, "/etc/ssl/ferricstore/cert.pem"
+config :ferricstore, :native_tls_key_file, "/etc/ssl/ferricstore/key.pem"
+config :ferricstore, :native_native_tls_ca_cert_file, "/etc/ssl/ferricstore/ca.pem"
 config :ferricstore, :require_tls, true
 ```
 
@@ -477,7 +477,7 @@ config :ferricstore, :merge,
 
 When you set a TTL on a key (`SET key value EX 60` or `FerricStore.set("key", "value", ttl: 60_000)`),
 the key doesn't disappear the instant it expires. FerricStore uses two complementary strategies to
-clean up expired keys — just like Redis:
+clean up expired keys — just like FerricStore:
 
 **1. Lazy expiry (on read):** When any command reads a key, it checks
 `expire_at_ms`. If the key is past its TTL, it's deleted on the spot and the
@@ -641,7 +641,7 @@ config :libcluster, topologies: :disabled
 
 ```elixir
 # config/dev.exs
-config :ferricstore, :port, 6379
+config :ferricstore, :native_port, 6388
 config :ferricstore, :data_dir, "data"
 config :ferricstore, :max_memory_bytes, 1_073_741_824  # 1 GB
 config :ferricstore, :eviction_policy, :volatile_lru
@@ -658,7 +658,7 @@ config :libcluster,
 
 ```elixir
 # config/test.exs
-config :ferricstore, :port, 0
+config :ferricstore, :native_port, 0
 config :ferricstore, :health_port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
 config :ferricstore, :shard_count, 4
@@ -680,14 +680,14 @@ config :libcluster, topologies: :disabled
 
 ```elixir
 # config/runtime.exs
-config :ferricstore, :port, String.to_integer(System.get_env("FERRICSTORE_PORT", "6379"))
+config :ferricstore, :native_port, String.to_integer(System.get_env("FERRICSTORE_NATIVE_PORT", "6388"))
 config :ferricstore, :data_dir, System.get_env("FERRICSTORE_DATA_DIR", "/var/lib/ferricstore")
 config :ferricstore, :max_memory_bytes, 8_589_934_592  # 8 GB
 config :ferricstore, :eviction_policy, :allkeys_lru
 
-config :ferricstore, :tls_port, 6380
-config :ferricstore, :tls_cert_file, System.get_env("TLS_CERT_FILE")
-config :ferricstore, :tls_key_file, System.get_env("TLS_KEY_FILE")
+config :ferricstore, :native_tls_port, 6389
+config :ferricstore, :native_tls_cert_file, System.get_env("TLS_CERT_FILE")
+config :ferricstore, :native_tls_key_file, System.get_env("TLS_KEY_FILE")
 config :ferricstore, :require_tls, true
 
 config :libcluster,
@@ -710,8 +710,8 @@ These environment variables are read from `config/runtime.exs` in production (`M
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRICSTORE_PORT` | `6379` | TCP port for RESP3 listener |
-| `FERRICSTORE_HEALTH_PORT` | `6380` | HTTP health/metrics port |
+| `FERRICSTORE_NATIVE_PORT` | `6388` | TCP port for the Ferric protocol listener |
+| `FERRICSTORE_HEALTH_PORT` | `6389` | HTTP health/metrics port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, WARaft segments, mmap) |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards. `0` = `System.schedulers_online()` |
 
@@ -764,10 +764,10 @@ These environment variables are read from `config/runtime.exs` in production (`M
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRICSTORE_TLS_PORT` | `6380` | TLS listener port (only if cert configured) |
-| `FERRICSTORE_TLS_CERT_FILE` | unset | Path to TLS certificate. Setting this enables TLS |
-| `FERRICSTORE_TLS_KEY_FILE` | unset | Path to TLS private key |
-| `FERRICSTORE_TLS_CA_CERT_FILE` | unset | Path to CA certificate for client verification |
+| `FERRICSTORE_NATIVE_TLS_PORT` | `6389` | TLS listener port (only if cert configured) |
+| `FERRICSTORE_NATIVE_TLS_CERT_FILE` | unset | Path to TLS certificate. Setting this enables TLS |
+| `FERRICSTORE_NATIVE_TLS_KEY_FILE` | unset | Path to TLS private key |
+| `FERRICSTORE_NATIVE_TLS_CA_CERT_FILE` | unset | Path to CA certificate for client verification |
 | `FERRICSTORE_REQUIRE_TLS` | `false` | Reject non-TLS connections when TLS is configured |
 
 ### Connection
@@ -810,12 +810,12 @@ Some parameters can be changed at runtime **without restarting FerricStore**.
 This works in both standalone and embedded mode — same parameters, same
 behavior, different API.
 
-### Standalone mode (Redis protocol)
+### Standalone mode (FerricStore protocol)
 
 ```bash
-redis-cli CONFIG SET maxmemory-policy allkeys-lru
-redis-cli CONFIG GET maxmemory
-redis-cli CONFIG GET *             # get all parameters
+CONFIG SET maxmemory-policy allkeys-lru
+CONFIG GET maxmemory
+CONFIG GET *             # get all parameters
 ```
 
 ### Embedded mode (Elixir API)
@@ -861,12 +861,12 @@ These reflect the startup configuration and cannot be changed at runtime.
 |-----------|-------------|------------|
 | `maxmemory` | Max memory budget in bytes | Both |
 | `maxclients` | Maximum simultaneous client connections | Standalone only |
-| `tcp-port` | TCP port | Standalone only |
+| `native-port` | TCP port | Standalone only |
 | `data-dir` | Bitcask data directory | Both |
-| `tls-port` | TLS port | Standalone only |
-| `tls-cert-file` | PEM certificate path | Standalone only |
-| `tls-key-file` | PEM key path | Standalone only |
-| `tls-ca-cert-file` | CA certificate bundle path | Standalone only |
+| `native-tls-port` | TLS port | Standalone only |
+| `native-tls-cert-file` | PEM certificate path | Standalone only |
+| `native-tls-key-file` | PEM key path | Standalone only |
+| `native-tls-ca-cert-file` | CA certificate bundle path | Standalone only |
 | `require-tls` | Whether plaintext is rejected | Standalone only |
 
 ### Namespace-Specific Configuration
@@ -878,13 +878,13 @@ namespace is derived from the key prefix (everything before the first `:`).
 
 ```bash
 # Latency-sensitive keys: 1ms batch window
-redis-cli FERRICSTORE.CONFIG SET latency window_ms 1
+FERRICSTORE.CONFIG SET latency window_ms 1
 
 # Analytics counters: 5ms batch window
-redis-cli FERRICSTORE.CONFIG SET analytics window_ms 5
+FERRICSTORE.CONFIG SET analytics window_ms 5
 
 # Reset to defaults
-redis-cli FERRICSTORE.CONFIG RESET analytics
+FERRICSTORE.CONFIG RESET analytics
 ```
 
 **Embedded mode:**

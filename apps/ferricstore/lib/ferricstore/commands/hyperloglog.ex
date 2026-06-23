@@ -8,7 +8,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   Each handler takes the uppercased command name, a list of string arguments,
   and an injected store map. Returns plain Elixir terms -- the connection layer
-  handles RESP encoding.
+  handles wire encoding.
 
   HyperLogLog sketches are stored as plain 16,384-byte binary values in the
   store with no expiry (expire_at_ms = 0). They are transparent to the store
@@ -35,7 +35,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
   @sketch_size HLL.num_registers()
 
   @doc """
-  Handles typed HyperLogLog command AST terms produced by the Rust RESP parser.
+  Handles typed HyperLogLog command AST terms produced by the native AST parser.
   """
   @spec handle_ast(term(), map()) :: term()
   def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}

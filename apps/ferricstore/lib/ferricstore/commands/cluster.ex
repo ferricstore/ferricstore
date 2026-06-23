@@ -43,7 +43,7 @@ defmodule Ferricstore.Commands.Cluster do
 
   ## Returns
 
-  A list of bulk strings formatted as key-value pairs for RESP3 encoding.
+  A list of bulk strings formatted as key-value pairs for wire encoding.
   """
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)

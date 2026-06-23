@@ -46,7 +46,7 @@ File.mkdir_p!(bench_data_dir)
 Logger.configure(level: :warning)
 
 Application.put_env(:ferricstore, :data_dir, bench_data_dir)
-Application.put_env(:ferricstore, :port, 0)
+Application.put_env(:ferricstore, :native_port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 

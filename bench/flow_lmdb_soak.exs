@@ -39,7 +39,7 @@ defmodule FlowLMDBSoak do
 
     try do
       {:ok, _} = Application.ensure_all_started(:ferricstore_server)
-      port = FerricstoreServer.Listener.port()
+      port = FerricstoreServer.Native.Listener.port()
 
       IO.puts(
         "flow_lmdb_soak backend=waraft port=#{port} data_dir=#{data_dir} " <>
@@ -198,7 +198,7 @@ defmodule FlowLMDBSoak do
     args = [
       "examples/dbos_style_benchmark.py",
       "--url",
-      "redis://127.0.0.1:#{port}/0",
+      "ferric://127.0.0.1:#{port}",
       "--mode",
       "queued",
       "--queued-shape",
@@ -337,7 +337,7 @@ defmodule FlowLMDBSoak do
 
     Application.put_env(:libcluster, :topologies, [])
     Application.put_env(:ferricstore, :data_dir, data_dir)
-    Application.put_env(:ferricstore, :port, 0)
+    Application.put_env(:ferricstore, :native_port, 0)
     Application.put_env(:ferricstore, :health_port, 0)
     Application.put_env(:ferricstore, :shard_count, shards)
     Application.put_env(:ferricstore, :protected_mode, false)

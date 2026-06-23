@@ -7,7 +7,7 @@ defmodule FerricStore.BatchWorker do
   `GenServer.call/2` over Erlang distribution. This eliminates
   per-call process spawn overhead and distribution codec setup.
 
-  No Ranch, no TCP, no RESP parsing -- just distribution to Router.
+  No Ranch, no TCP, no wire parsing -- just distribution to Router.
 
   ## Usage (from remote node)
 

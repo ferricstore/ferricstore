@@ -58,9 +58,13 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   # Core
   # ---------------------------------------------------------------------------
+  native_port_env =
+    System.get_env("FERRICSTORE_NATIVE_PORT") ||
+      "6388"
+
   config :ferricstore,
     protected_mode: boolean_env.("FERRICSTORE_PROTECTED_MODE", true),
-    port: String.to_integer(System.get_env("FERRICSTORE_PORT", "6379")),
+    native_port: String.to_integer(native_port_env),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
     shard_count:
@@ -297,20 +301,6 @@ if config_env() == :prod do
     acl_auto_save: boolean_env.("FERRICSTORE_ACL_AUTO_SAVE", false)
 
   # ---------------------------------------------------------------------------
-  # TLS (optional)
-  # ---------------------------------------------------------------------------
-  tls_cert = System.get_env("FERRICSTORE_TLS_CERT_FILE")
-
-  if tls_cert do
-    config :ferricstore,
-      tls_port: String.to_integer(System.get_env("FERRICSTORE_TLS_PORT", "6380")),
-      tls_cert_file: tls_cert,
-      tls_key_file: System.get_env("FERRICSTORE_TLS_KEY_FILE"),
-      tls_ca_cert_file: System.get_env("FERRICSTORE_TLS_CA_CERT_FILE"),
-      require_tls: boolean_env.("FERRICSTORE_REQUIRE_TLS", false)
-  end
-
-  # ---------------------------------------------------------------------------
   # Connection
   # ---------------------------------------------------------------------------
   socket_mode = System.get_env("FERRICSTORE_SOCKET_ACTIVE_MODE", "true")
@@ -322,8 +312,8 @@ if config_env() == :prod do
          "once" -> :once
          n -> String.to_integer(n)
        end),
-    native_protocol_enabled: boolean_env.("FERRICSTORE_NATIVE_ENABLED", false),
-    native_port: String.to_integer(System.get_env("FERRICSTORE_NATIVE_PORT", "6388")),
+    require_tls: boolean_env.("FERRICSTORE_REQUIRE_TLS", false),
+    native_protocol_enabled: true,
     native_tls_port:
       (case System.get_env("FERRICSTORE_NATIVE_TLS_PORT") do
          nil -> nil

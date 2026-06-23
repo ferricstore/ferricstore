@@ -847,7 +847,7 @@ defmodule FerricstoreServer.Acl do
   end
 
   def handle_call(:reset, _from, state) do
-    :ets.delete_all_objects(Tables.active_table())
+    :ets.delete_all_objects(ensure_active_table())
     Tables.insert_default_user()
     {:reply, :ok, state}
   end
@@ -913,6 +913,17 @@ defmodule FerricstoreServer.Acl do
     else
       state
     end
+  end
+
+  defp ensure_active_table do
+    table = Tables.active_table()
+
+    case :ets.info(table) do
+      :undefined -> Tables.new_active_table()
+      _info -> table
+    end
+  rescue
+    ArgumentError -> Tables.new_active_table()
   end
 
   @spec validate_del_users([binary()]) :: :ok | {:error, binary()}

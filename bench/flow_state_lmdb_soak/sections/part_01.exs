@@ -15,7 +15,7 @@ defmodule FlowStateLMDBSoak.Sections.Part01 do
           [
             "examples/async_state_machine_workflow_benchmark.py",
             "--url",
-            "redis://127.0.0.1:#{port}/0",
+            "ferric://127.0.0.1:#{port}",
             "--shape",
             env("SHAPE", "live"),
             "--flows",
