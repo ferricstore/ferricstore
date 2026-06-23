@@ -257,7 +257,7 @@ defmodule FerricstoreServer.Acl do
   end
 
   @doc """
-  Returns the user info for `ACL GETUSER` in Redis-compatible flat list format.
+  Returns the user info for `ACL GETUSER` in the flat command response format.
 
   Returns `nil` if the user does not exist.
 

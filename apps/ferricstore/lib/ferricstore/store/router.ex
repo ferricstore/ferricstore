@@ -20,9 +20,9 @@ defmodule Ferricstore.Store.Router do
 
   ## Performance boundary
 
-  Router helpers sit on GET/SET/Flow hot paths. Refactors here need memtier
-  SET/GET and DBOS Flow benchmark comparison. Avoid new allocations, dynamic
-  dispatch, or extra process calls in keyed request paths.
+  Router helpers sit on GET/SET/Flow hot paths. Refactors here need native
+  protocol SET/GET and DBOS Flow benchmark comparison. Avoid new allocations,
+  dynamic dispatch, or extra process calls in keyed request paths.
   """
 
   alias Ferricstore.CommandTime

@@ -1,9 +1,9 @@
 defmodule Ferricstore.Commands.RedisCompatTest do
   @moduledoc """
-  Redis compatibility tests based on known edge cases and bugs found in
-  Redis-compatible servers (KeyDB, Dragonfly, Garnet, Valkey).
+  Legacy command compatibility tests based on known edge cases from
+  key-value server implementations.
 
-  These tests verify that FerricStore matches Redis behaviour for:
+  These tests verify FerricStore behavior for:
 
   1. WRONGTYPE enforcement gaps (SET overwrites type, INCR on wrong type, etc.)
   2. Transaction atomicity edge cases (MULTI/EXEC error propagation)

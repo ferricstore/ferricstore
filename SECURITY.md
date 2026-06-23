@@ -23,7 +23,7 @@ Security-sensitive areas include:
 
 - ACL and authentication
 - TLS configuration
-- RESP parser and command validation
+- Native protocol frame decoding and command validation
 - file path handling and snapshot/backup paths
 - Flow value refs and payload retention
 - Raft/Bitcask recovery paths

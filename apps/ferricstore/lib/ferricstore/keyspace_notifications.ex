@@ -1,6 +1,6 @@
 defmodule Ferricstore.KeyspaceNotifications do
   @moduledoc """
-  Emits Redis-compatible keyspace and keyevent notifications via PubSub.
+  Emits keyspace and keyevent notifications via PubSub.
 
   When the `notify-keyspace-events` configuration value is set (non-empty),
   key mutation operations fire pub/sub messages on two channel families:

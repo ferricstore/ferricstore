@@ -746,10 +746,10 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
       end
 
       describe "INFO server section reflects config" do
-        test "INFO server section contains tcp_port matching configured port", %{store: store} do
+        test "INFO server section contains native_port matching configured port", %{store: store} do
           info = Server.handle("INFO", ["server"], store)
           port = Application.get_env(:ferricstore, :native_port, 6388)
-          assert info =~ "tcp_port:#{port}"
+          assert info =~ "native_port:#{port}"
         end
 
         test "INFO server section contains hz", %{store: store} do
@@ -757,9 +757,9 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
           assert info =~ "hz:"
         end
 
-        test "INFO server section contains redis_version", %{store: store} do
+        test "INFO server section contains protocol", %{store: store} do
           info = Server.handle("INFO", ["server"], store)
-          assert info =~ "redis_version:"
+          assert info =~ "protocol:"
         end
 
         test "INFO server section contains ferricstore_version", %{store: store} do
@@ -798,7 +798,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
         test "INFO all includes server section", %{store: store} do
           info = Server.handle("INFO", ["all"], store)
           assert info =~ "# Server"
-          assert info =~ "tcp_port:"
+          assert info =~ "native_port:"
         end
 
         test "INFO with no args includes all sections", %{store: store} do

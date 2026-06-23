@@ -6,7 +6,7 @@
 <main class="main-content">
 <%= render_subpage_header("Doctor") %>
 <div class="content">
-<%= render_page_intro("Doctor", "Run operator diagnostics and safe repair jobs through the same FERRICSTORE.DOCTOR command available over Redis.") %>
+<%= render_page_intro("Doctor", "Run operator diagnostics and safe repair jobs through the same FERRICSTORE.DOCTOR command available over the native protocol.") %>
 <%= render_doctor_flash(Map.get(data, :flash, %{})) %>
 <%= render_doctor_summary(Map.get(data, :check, %{})) %>
 <%= render_doctor_checks(Map.get(data, :check, %{})) %>

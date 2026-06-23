@@ -86,7 +86,7 @@ For each split:
 2. Keep behavior assertions unchanged.
 3. Add focused tests only where extraction exposes missing coverage.
 4. Run targeted tests after each area.
-5. Run DBOS + memtier baseline only after hot-path modules change.
+5. Run DBOS + native-KV baseline only after hot-path modules change.
 
 Commit rule:
 
@@ -168,7 +168,7 @@ Add focused tests only if extraction exposes missing behavior.
 Benchmark requirement:
 
 ```text
-No DBOS/memtier benchmark required for dashboard-only extraction.
+No DBOS/native-KV benchmark required for dashboard-only extraction.
 ```
 
 ## Area 2: Public Ferricstore facade
@@ -223,7 +223,7 @@ Add a small facade compatibility test for representative delegated functions.
 Benchmark requirement:
 
 ```text
-No DBOS/memtier benchmark required if facade delegates directly and no hot logic changes.
+No DBOS/native-KV benchmark required if facade delegates directly and no hot logic changes.
 ```
 
 ## Area 3: Flow command modules
@@ -297,7 +297,7 @@ Benchmark requirement:
 
 ```text
 Run DBOS baseline after Flow hot-path extraction.
-Run memtier only if Router/StateMachine/KV path changed.
+Run native KV benchmark only if Router/StateMachine/KV path changed.
 ```
 
 ## Area 4: Router split
@@ -358,7 +358,7 @@ Benchmark requirement:
 
 ```text
 Run DBOS baseline.
-Run memtier SET and GET baseline.
+Run native KV SET and GET baseline.
 Commit only if performance stays within baseline noise.
 ```
 
@@ -420,7 +420,7 @@ Benchmark requirement:
 
 ```text
 Run DBOS baseline if Flow value refs or terminal payload handling changed.
-Run memtier only if generic KV write/read path changed.
+Run native KV benchmark only if generic KV write/read path changed.
 ```
 
 ## Area 6: WARaftStorage split
@@ -481,7 +481,7 @@ Benchmark requirement:
 
 ```text
 Run DBOS baseline.
-Run memtier SET and GET baseline.
+Run native KV SET and GET baseline.
 Commit only if performance stays at baseline.
 ```
 
@@ -553,7 +553,7 @@ Benchmark requirement:
 
 ```text
 Run DBOS baseline.
-Run memtier SET and GET baseline.
+Run native KV SET and GET baseline.
 Commit only if performance stays at baseline.
 ```
 
@@ -573,13 +573,13 @@ cd /Users/yoavgea/repos/ferricstore-python
 python examples/dbos_style_benchmark.py --mode queued --transport many --flows 1000000 --server-shards 16
 ```
 
-Required memtier shape:
+Required native KV benchmark shape:
 
 ```text
 --clients=200 --threads=4 --pipeline=50
 ```
 
-In memtier this means:
+For the native benchmark this means:
 
 ```text
 200 connections per thread
@@ -636,7 +636,7 @@ No production module exceeds 1000 lines.
 Oversized tests are split by domain.
 Public APIs remain compatible.
 Targeted tests pass for every area.
-DBOS/memtier baselines are preserved after hot-path splits.
+DBOS/native-KV baselines are preserved after hot-path splits.
 Each area is committed separately.
 The module graph is understandable from names alone.
 ```

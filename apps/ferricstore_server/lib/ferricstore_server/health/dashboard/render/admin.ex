@@ -253,7 +253,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
   def runtime_config_parameter_reference do
     read_write = [
       {"maxmemory-policy", "Eviction/rejection policy used when memory pressure is high."},
-      {"notify-keyspace-events", "Redis-compatible keyspace notification setting."},
+      {"notify-keyspace-events", "Keyspace notification setting."},
       {"slowlog-log-slower-than", "Slowlog threshold in microseconds."},
       {"slowlog-max-len", "Maximum slowlog entries kept in memory."},
       {"hz", "Background maintenance frequency."},
@@ -276,15 +276,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
     ]
 
     legacy = [
-      {"timeout", "Redis-compatible setting accepted for client compatibility."},
-      {"tcp-keepalive", "Redis-compatible setting accepted for client compatibility."},
-      {"databases", "Redis-compatible setting accepted for client compatibility."},
-      {"bind", "Redis-compatible setting accepted for client compatibility."},
-      {"port", "Redis-compatible setting accepted for client compatibility."},
-      {"save", "Redis-compatible setting accepted for client compatibility."},
-      {"appendonly", "Redis-compatible setting accepted for client compatibility."},
-      {"loglevel", "Redis-compatible setting accepted for client compatibility."},
-      {"requirepass", "Redis-compatible setting accepted for client compatibility."}
+      {"timeout", "Legacy setting accepted as a no-op or mapped config value."},
+      {"tcp-keepalive", "Legacy setting accepted as a no-op or mapped config value."},
+      {"databases", "Legacy setting accepted as a no-op or mapped config value."},
+      {"bind", "Legacy setting accepted as a no-op or mapped config value."},
+      {"port", "Legacy setting accepted as a no-op or mapped config value."},
+      {"save", "Legacy setting accepted as a no-op or mapped config value."},
+      {"appendonly", "Legacy setting accepted as a no-op or mapped config value."},
+      {"loglevel", "Legacy setting accepted as a no-op or mapped config value."},
+      {"requirepass", "Legacy setting accepted as a no-op or mapped config value."}
     ]
 
     local = [
@@ -293,7 +293,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
     Enum.map(read_write, &config_parameter_entry(&1, "runtime", "read-write")) ++
       Enum.map(read_only, &config_parameter_entry(&1, "runtime", "read-only")) ++
-      Enum.map(legacy, &config_parameter_entry(&1, "redis-compatible", "read-write")) ++
+      Enum.map(legacy, &config_parameter_entry(&1, "legacy", "read-write")) ++
       Enum.map(local, &config_parameter_entry(&1, "current node", "node-local"))
   end
 

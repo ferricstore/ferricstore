@@ -65,7 +65,8 @@ defmodule Ferricstore.Raft.StateMachine do
   ## Performance boundary
 
   `apply/3` is the core durable write hot path. Do not replace section macros
-  or split apply helpers without before/after DBOS Flow and memtier benchmarks.
+  or split apply helpers without before/after DBOS Flow and native-protocol KV
+  benchmarks.
   No behaviours/protocol dispatch, no extra maps/lists in per-command loops,
   and no extra GenServer/Task calls in apply.
   """

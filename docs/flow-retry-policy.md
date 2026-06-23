@@ -69,7 +69,7 @@ def charge(job):
 
 Unhandled handler exceptions follow `exception_policy`. Explicit `retry(...)` is for application-known retry decisions.
 
-## Ferric protocol commands
+## Native TCP commands
 
 Install or update policy for a Flow type:
 

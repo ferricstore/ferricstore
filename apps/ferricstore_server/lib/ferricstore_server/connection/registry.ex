@@ -1,6 +1,6 @@
 defmodule FerricstoreServer.Connection.Registry do
   @moduledoc """
-  Tracks live connection processes by Redis client ID.
+  Tracks live connection processes by native client ID.
 
   The table is intentionally tiny and write-light: one insert on connection
   open, small summary updates when connection metadata changes, one delete on

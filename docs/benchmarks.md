@@ -64,46 +64,26 @@ Async live runs:
 
 Interpretation: 32 shards was the best balanced setting in these Azure runs. 64 shards slightly improved queue-only sync throughput, but 32 shards was better for the workflow mix.
 
-## KV SET/GET: latest Azure local-NVMe runs
+## KV SET/GET: native protocol baseline pending
 
-Environment:
+The older KV benchmark shape is no longer valid because the standalone server
+now exposes the Ferric native binary protocol. Publish KV SET/GET
+numbers only after rerunning them through a native SDK or native protocol
+benchmark client.
 
-```text
-server: Azure Standard_L4as_v4, 4 vCPU
-client: Azure Standard_D2as_v4
-storage: local NVMe, ext4, noatime/nodiratime, scheduler=none
-protocol: Ferric protocol over TCP
-value size: 256 bytes
-client load: memtier, 200 connections, pipeline 30, 4 threads, 30 seconds
-```
+The replacement benchmark should report at least:
 
-| Operation | Durability/read mode | Throughput | p50 latency | p99 latency | p99.9 latency |
-| --- | --- | ---: | ---: | ---: | ---: |
-| SET | Quorum durable write | 175,650 ops/s | 129 ms | 338 ms | 391 ms |
-| SET | Async write | 267,935 ops/s | 59 ms | 414 ms | 532 ms |
-| GET | Quorum read | 592,684 ops/s | 37 ms | 125 ms | 194 ms |
-| GET | Async read | 387,057 ops/s | 36 ms | 200 ms | 11,403 ms |
-
-The async-read p99.9 had a large outlier in this run. Treat p50/p99 as the useful signal for that row until the run is repeated.
-
-A higher-pipeline quorum SET run on the same 4-vCPU NVMe setup reached:
-
-| Operation | Client load | Throughput | p50 latency | p99 latency | p99.9 latency |
-| --- | --- | ---: | ---: | ---: | ---: |
-| SET quorum | 200 connections, pipeline 50 | 200,969 ops/s | 197.63 ms | 339.97 ms | 423.94 ms |
-
-Single-command unloaded durable SET latency on the same NVMe server:
-
-```text
-n=30
-min=7.724 ms
-avg=8.129 ms
-p50=8.054 ms
-max=9.296 ms
-```
+| Field | Required shape |
+| --- | --- |
+| Transport | Ferric native TCP/TLS protocol |
+| Workload | SET and GET with fixed value size |
+| Client concurrency | Connections, lanes, in-flight requests per lane |
+| Durability mode | Quorum durable writes vs any async mode being tested |
+| Hardware | Server/client VM size, storage type, filesystem |
+| Metrics | Throughput, p50, p95, p99, p99.9 |
 
 ## Reproducing the shapes
 
-FerricFlow benchmarks are run from the Python SDK repository with the optimized queue/workflow benchmark scripts. KV benchmarks use `memtier_benchmark` with Ferric protocol, 256-byte values, and the connection/pipeline settings above.
+FerricFlow benchmarks are run from the Python SDK repository with the optimized queue/workflow benchmark scripts. KV benchmarks should use a native-protocol SDK/client shape for current FerricStore releases.
 
-For public reporting, prefer the 1M-flow live results and the 200-connection, pipeline-30 KV table. They are less bursty than short or preloaded-only runs.
+For public reporting, prefer the 1M-flow live results. Add KV tables only after native-protocol SET/GET runs are available.

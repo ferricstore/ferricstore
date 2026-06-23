@@ -8,7 +8,7 @@ FerricStore provides multiple layers of security: ACL user accounts with fine-gr
 
 ## Access Control Lists (ACL)
 
-FerricStore implements Ferric protocol ACL with enhancements for production use.
+FerricStore implements native-protocol ACL with enhancements for production use.
 
 ### Default User
 
@@ -125,7 +125,7 @@ FerricStore has **two separate network layers**, each with its own TLS:
 
 | Layer | What it carries | How to encrypt |
 |-------|----------------|---------------|
-| **Client ↔ Server** | FerricStore commands (Ferric protocol over TCP) | FerricStore TLS config (`:native_tls_port`, `:native_tls_cert_file`, etc.) — configured below |
+| **Client <-> Server** | FerricStore commands (native protocol over TCP) | FerricStore TLS config (`:native_tls_port`, `:native_tls_cert_file`, etc.) -- configured below |
 | **Node ↔ Node** | Raft consensus, cluster messages (Erlang distribution) | Erlang distribution TLS (`-proto_dist inet_tls`) — configured at VM level, see [Node-to-Node TLS](#node-to-node-tls-erlang-distribution) below |
 
 Configuring client TLS does **not** encrypt Raft traffic between nodes. In
@@ -147,7 +147,7 @@ config :ferricstore, :native_tls_key_file, "/etc/ssl/ferricstore/server-key.pem"
 ### Mutual TLS (Client Certificate Authentication)
 
 ```elixir
-config :ferricstore, :native_native_tls_ca_cert_file, "/etc/ssl/ferricstore/ca-cert.pem"
+config :ferricstore, :native_tls_ca_cert_file, "/etc/ssl/ferricstore/ca-cert.pem"
 ```
 
 When `native_tls_ca_cert_file` is set, the server requires clients to present a certificate signed by the specified CA.
@@ -162,25 +162,10 @@ When `require_tls` is `true`, the plaintext TCP listener still starts (for healt
 
 ### Connecting with TLS
 
-```bash
--p 6389 --tls \
-  --cert /path/to/client-cert.pem \
-  --key /path/to/client-key.pem \
-  --cacert /path/to/ca-cert.pem
-```
-
-```elixir
-{:ok, conn} = Redix.start_link(
-  host: "localhost",
-  port: 6389,
-  ssl: true,
-  socket_opts: [
-    certfile: "/path/to/client-cert.pem",
-    keyfile: "/path/to/client-key.pem",
-    cacertfile: "/path/to/ca-cert.pem"
-  ]
-)
-```
+Native SDK clients should connect to `:native_tls_port`, validate the server
+certificate with the configured CA, and present a client certificate when mTLS
+is enabled. Exact client options are SDK-specific, but the server-side contract
+is always the native protocol over TLS on the configured TLS port.
 
 ### TLS in Kubernetes
 
@@ -246,7 +231,7 @@ spec:
 config :ferricstore, :native_tls_port, 6389
 config :ferricstore, :native_tls_cert_file, System.get_env("TLS_CERT_FILE")
 config :ferricstore, :native_tls_key_file, System.get_env("TLS_KEY_FILE")
-config :ferricstore, :native_native_tls_ca_cert_file, System.get_env("TLS_CA_FILE")
+config :ferricstore, :native_tls_ca_cert_file, System.get_env("TLS_CA_FILE")
 config :ferricstore, :require_tls, true
 ```
 
@@ -552,7 +537,7 @@ This means ACL changes take effect on the next command from each connection, wit
 
 8. **Use mutual TLS** in zero-trust environments:
    ```elixir
-   config :ferricstore, :native_native_tls_ca_cert_file, "/etc/ssl/ca.pem"
+   config :ferricstore, :native_tls_ca_cert_file, "/etc/ssl/ca.pem"
    ```
 
 ## Limitations

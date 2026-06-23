@@ -14,13 +14,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       },
       %{
         name: "Structured Values",
-        purpose: "Redis-compatible compound primitives stored as internal keys.",
+        purpose: "Compound primitives stored as internal keys.",
         commands:
           ~w(HGET HSET HMGET HGETALL LPUSH RPUSH LPOP RPOP SADD SMEMBERS ZADD ZRANGE XADD XREAD)
       },
       %{
         name: "Large / Cold Values",
-        purpose: "Debug large values, sendfile candidates, and cold reads.",
+        purpose: "Debug large values, cold reads, and native response chunks.",
         commands: ~w(GET MGET STRLEN FERRICSTORE.KEY_INFO FERRICSTORE.HOTNESS)
       },
       %{

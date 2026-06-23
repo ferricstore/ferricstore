@@ -60,9 +60,9 @@ defmodule Ferricstore.Commands.ServerInfoTest do
 
       assert is_binary(result)
       assert result =~ "# Server"
-      assert result =~ "redis_version:7.4.0"
       assert result =~ ~r/ferricstore_version:\d+\.\d+\.\d+/
-      assert result =~ "tcp_port:"
+      assert result =~ "protocol:"
+      assert result =~ "native_port:"
       assert result =~ "uptime_in_seconds:"
       assert result =~ "process_id:"
       assert result =~ "run_id:"
@@ -413,9 +413,9 @@ defmodule Ferricstore.Commands.ServerInfoTest do
   # ---------------------------------------------------------------------------
 
   describe "INFO server (extended fields)" do
-    test "has redis_mode" do
+    test "has protocol" do
       result = Server.handle("INFO", ["server"], MockStore.make())
-      assert result =~ "redis_mode:"
+      assert result =~ "protocol:"
     end
 
     test "has os field" do

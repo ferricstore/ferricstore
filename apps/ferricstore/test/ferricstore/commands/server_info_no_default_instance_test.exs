@@ -34,8 +34,8 @@ defmodule Ferricstore.Commands.ServerInfoNoDefaultInstanceTest do
     result = Server.handle("INFO", ["server"], MockStore.make())
 
     assert result =~ "# Server"
-    assert result =~ "redis_mode:embedded"
-    assert result =~ "tcp_port:0"
+    assert result =~ "protocol:embedded"
+    assert result =~ "native_port:0"
   end
 
   test "INFO clients is available before a default instance is registered" do

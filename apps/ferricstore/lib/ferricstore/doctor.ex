@@ -3,7 +3,7 @@ defmodule Ferricstore.Doctor do
   Admin diagnostics and bounded repair jobs.
 
   Doctor is deliberately command-driven: production users can run it through the
-  Redis protocol and the dashboard can call the same surface. The inline CHECK
+  native protocol and the dashboard can call the same surface. The inline CHECK
   path only reads bounded metadata. Potentially expensive scans or repairs run
   as background jobs so they do not block a client connection or a dashboard
   request.

@@ -21,7 +21,8 @@ defmodule Ferricstore.Store.Shard do
      Data-file durability is owned by `Ferricstore.Store.BitcaskCheckpointer`,
      which runs on its own, longer tick and issues `v2_fsync` against
      the same active file.
-  4. File rotation occurs when the active file exceeds 256 MB.
+  4. File rotation occurs when the active file exceeds `@max_active_file_size`
+     (8 GiB by default).
 
   ## Read path: ETS bypass
 
@@ -47,7 +48,7 @@ defmodule Ferricstore.Store.Shard do
 
   Shard write/read helpers are hot. Keep per-command paths allocation-light and
   avoid extra GenServer/Task hops. Any refactor in this module or its shard
-  helper modules needs memtier and Flow benchmark comparison.
+  helper modules needs native-protocol KV and Flow benchmark comparison.
   """
 
   use GenServer
@@ -91,9 +92,9 @@ defmodule Ferricstore.Store.Shard do
     :flow_run_steps_many
   ]
 
-  # Default maximum active file size before rotation (256 MB).
+  # Default maximum active file size before rotation (8 GiB).
   # Configurable via :max_active_file_size application env.
-  @default_max_active_file_size 256 * 1024 * 1024
+  @default_max_active_file_size 8 * 1024 * 1024 * 1024
 
   # Default fragmentation thresholds for per-file dead bytes tracking.
   @default_fragmentation_threshold 0.5
@@ -138,7 +139,7 @@ defmodule Ferricstore.Store.Shard do
     raft?: true,
     # Maximum active file size before rotation. Cached from Application env
     # at init time. Updated via handle_cast(:update_max_active_file_size, n).
-    max_active_file_size: 256 * 1024 * 1024,
+    max_active_file_size: 8 * 1024 * 1024 * 1024,
     writes_paused: false,
     compound_member_index: nil,
     zset_score_index: nil,

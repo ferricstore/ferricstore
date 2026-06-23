@@ -2,14 +2,14 @@
 
 Embedded mode runs FerricStore inside your Elixir application. There is no TCP listener and no wire serialization; your code calls the public `FerricStore` module directly.
 
-Use this guide after [Getting Started](getting-started.md). It covers setup, first commands, behavior differences from Ferric protocol TCP mode, and the embedded API reference.
+Use this guide after [Getting Started](getting-started.md). It covers setup, first commands, behavior differences from native TCP mode, and the embedded API reference.
 
 ## When to Use Embedded Mode
 
 - Your application and cache run on the same BEAM node
 - You want microsecond read latency (~1-5us for hot keys) with zero-copy binaries
-- You want direct Elixir API access without Ferric protocol TCP serialization overhead
-- You don't need external clients (Ferric protocol client, Ferric protocol SDK from another app) to connect
+- You want direct Elixir API access without native TCP serialization overhead
+- You don't need external SDK clients from another app to connect
 - You want the full FerricStore feature set (Raft durability, LFU eviction, probabilistic structures) as a library dependency
 
 ## Setup
@@ -41,7 +41,7 @@ In embedded mode, these options are **not used** and can be omitted:
 - `:native_port` (no TCP listener)
 - `:health_port` (no HTTP endpoint)
 - `:native_tls_port`, `:native_tls_cert_file`, `:native_tls_key_file` (no TLS)
-- `:sendfile_threshold` (no TCP sends)
+- `:native_response_chunk_bytes` and response coalescing settings (no TCP sends)
 
 ### 3. Start Using It
 
@@ -88,18 +88,18 @@ Use FerricFlow directly from embedded mode:
 )
 ```
 
-## Behavior Differences from Ferric Protocol Mode
+## Behavior Differences from Native TCP Mode
 
-The embedded API (`FerricStore` module) and the Ferric protocol TCP mode execute the same command handlers, but there are differences to be aware of:
+The embedded API (`FerricStore` module) and the native TCP mode execute the same command handlers, but there are differences to be aware of:
 
-| Aspect | Ferric protocol TCP mode | Embedded mode |
+| Aspect | Native TCP mode | Embedded mode |
 |--------|---------------|---------------|
-| **Return values** | Raw protocol types (bulk strings, integers, arrays) | Elixir-idiomatic types (`{:ok, value}`, `:ok`, etc.) |
+| **Return values** | Native typed values (`nil`, binary, integer, list, map) | Elixir-idiomatic types (`{:ok, value}`, `:ok`, etc.) |
 | **Blocking commands** | `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` supported | Not available -- return immediately |
 | **Set algebra** | `SINTER`/`SUNION`/`SDIFF` scan the single shard owning the key | Same behavior -- set members are co-located per key |
 | **Transactions** | `MULTI`/`EXEC`/`WATCH` at connection level | `FerricStore.multi/1` with function-based API |
 | **ACL** | Per-connection ACL enforcement | No ACL checks |
-| **Client tracking** | `CLIENT TRACKING` with invalidation messages | Not applicable |
+| **Client state** | Client registry, lanes, sessions, Pub/Sub, blocking waits | Not applicable |
 
 ## API Reference
 
@@ -173,7 +173,7 @@ false = FerricStore.exists("nonexistent")
 {:ok, "World"} = FerricStore.getrange("greeting", 6, 10)
 
 # SETRANGE -- overwrite at offset
-{:ok, 11} = FerricStore.setrange("greeting", 6, "Redis")
+{:ok, 11} = FerricStore.setrange("greeting", 6, "World")
 
 # KEYS -- find keys by glob pattern
 {:ok, keys} = FerricStore.keys("user:*")
@@ -286,10 +286,10 @@ false = FerricStore.hexists("user:42", "email")
 
 ```elixir
 # SADD -- add members
-{:ok, 3} = FerricStore.sadd("tags", ["elixir", "rust", "redis"])
+{:ok, 3} = FerricStore.sadd("tags", ["elixir", "rust", "storage"])
 
 # SMEMBERS -- get all members (unordered)
-{:ok, members} = FerricStore.smembers("tags")  # ["elixir", "rust", "redis"] in any order
+{:ok, members} = FerricStore.smembers("tags")  # ["elixir", "rust", "storage"] in any order
 
 # SISMEMBER -- check membership
 true = FerricStore.sismember("tags", "elixir")
@@ -302,7 +302,7 @@ false = FerricStore.sismember("tags", "python")
 {:ok, 3} = FerricStore.scard("tags")
 
 # SREM -- remove members
-{:ok, 1} = FerricStore.srem("tags", ["redis"])
+{:ok, 1} = FerricStore.srem("tags", ["storage"])
 
 # SRANDMEMBER -- random member without removal
 {:ok, member} = FerricStore.srandmember("tags")
@@ -383,7 +383,7 @@ FerricStore.sadd("set2", ["b", "c", "d"])
 {:ok, seconds} = FerricStore.ttl("session")     # seconds remaining
 {:ok, ms} = FerricStore.pttl("session")          # milliseconds remaining
 {:ok, nil} = FerricStore.ttl("no_ttl_key")       # nil = no expiry
-# Returns {:ok, -2} style in Ferric protocol, nil in embedded for missing keys
+# Returns native integer TTL codes over TCP, nil in embedded for missing keys
 
 # EXPIRETIME / PEXPIRETIME -- absolute expiry
 {:ok, unix_seconds} = FerricStore.expiretime("key")
@@ -413,7 +413,7 @@ FerricStore.sadd("set2", ["b", "c", "d"])
 {:ok, trimmed} = FerricStore.xtrim("events", maxlen: 1000)
 ```
 
-**Note:** `XREAD BLOCK`, `XGROUP`, `XREADGROUP`, and `XACK` are only available in Ferric protocol TCP mode. The embedded API does not support blocking reads or consumer groups.
+**Note:** `XREAD BLOCK`, `XGROUP`, `XREADGROUP`, and `XACK` are only available in native TCP mode. The embedded API does not support blocking reads or consumer groups.
 
 ### Bitmap
 
@@ -762,7 +762,7 @@ largest key="big:blob" (2097152 bytes)
 If you routinely store values larger than 64 KB, consider:
 - Raising `hot_cache_max_value_size` (if you have the RAM)
 - Chunking values into smaller pieces
-- Using the standalone mode with sendfile zero-copy
+- Using standalone native mode with response chunking and connection backpressure
 
 ## Testing
 

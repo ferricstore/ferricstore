@@ -42,7 +42,7 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
     <body>
       <main>
         <h1>FerricStore Dashboard</h1>
-        <p>Sign in with a Redis ACL user. Page access follows that user's command and key permissions.</p>
+        <p>Sign in with a FerricStore ACL user. Page access follows that user's command and key permissions.</p>
         #{error_html}
         <form method="post" action="/dashboard/login">
           <input type="hidden" name="next" value="#{html_escape(safe_next)}">

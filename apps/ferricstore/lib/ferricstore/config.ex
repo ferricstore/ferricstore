@@ -11,9 +11,9 @@ defmodule Ferricstore.Config do
 
     * `"maxmemory"` -- max memory budget in bytes from MemoryGuard
     * `"maxclients"` -- maximum simultaneous client connections
-    * `"native-port"` -- Ferric protocol TCP port the server is listening on
+    * `"native-port"` -- Ferric native protocol TCP port the server is listening on
     * `"data-dir"` -- Bitcask data directory path
-    * `"native-tls-port"` -- Ferric protocol TLS port (`"0"` if not configured)
+    * `"native-tls-port"` -- Ferric native protocol TLS port (`"0"` if not configured)
     * `"native-tls-cert-file"` -- path to PEM certificate file
     * `"native-tls-key-file"` -- path to PEM private key file
     * `"native-tls-ca-cert-file"` -- path to CA certificate bundle

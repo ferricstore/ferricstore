@@ -18,7 +18,7 @@ config :ferricstore, :ferricstore_wal_nif,
   skip_compilation?: false,
   load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
 
-# Ferric protocol TCP server port.
+# Ferric native protocol TCP server port.
 config :ferricstore,
   native_port: 6388,
   native_tls_port: nil,
@@ -79,15 +79,14 @@ config :ferricstore,
   operational_disk_reject_ratio: 0.90,
   operational_disk_panic_ratio: 0.95
 
-# LFU decay: minutes per decay step (0 = no decay). Matches Redis lfu-decay-time.
+# LFU decay: minutes per decay step (0 = no decay).
 config :ferricstore, :lfu_decay_time, 1
-# LFU log factor: controls probabilistic increment curve. Matches Redis lfu-log-factor.
+# LFU log factor: controls probabilistic increment curve.
 config :ferricstore, :lfu_log_factor, 10
 
-# Sendfile zero-copy threshold for GET responses in standalone TCP mode.
-# Values >= this size are served via :file.sendfile/5 (kernel zero-copy)
-# instead of reading into BEAM memory. Only applies to cold (on-disk) keys
-# over plain TCP (:ranch_tcp); TLS and hot keys always use the normal path.
+# Legacy direct file-send threshold retained for older/internal transports.
+# Native TCP/TLS responses use native frame encoding, response coalescing,
+# and optional response chunking.
 config :ferricstore_server, :sendfile_threshold, 65_536
 
 # Large values at or above this size are stored in per-shard append blob

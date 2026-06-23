@@ -21,7 +21,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     :ok
   end
 
-  test "OPTIONS advertises Ferric protocol capabilities and command coverage" do
+  test "OPTIONS advertises native protocol capabilities and command coverage" do
     {status, payload, _state} = Commands.execute(@op_options, %{}, state())
 
     assert status == :ok

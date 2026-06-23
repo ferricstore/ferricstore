@@ -1,6 +1,6 @@
 #cloud-config
 
-# Benchmark client node — installs memtier_benchmark + Elixir for erpc benchmarks
+# Benchmark client node -- installs Elixir/Rust for native SDK and erpc benchmarks
 
 package_update: true
 package_upgrade: true
@@ -11,10 +11,6 @@ packages:
   - curl
   - unzip
   - libssl-dev
-  - automake
-  - autoconf
-  - libncurses-dev
-  - libevent-dev
   - pkg-config
   - zlib1g-dev
 
@@ -51,18 +47,6 @@ write_files:
         source "$HOME/.cargo/env"
       fi
 
-      # Install memtier_benchmark
-      if ! command -v memtier_benchmark &> /dev/null; then
-        cd /tmp
-        git clone https://github.com/RedisLabs/memtier_benchmark.git
-        cd memtier_benchmark
-        autoreconf -ivf
-        ./configure
-        make -j$(nproc)
-        sudo make install
-        cd ~
-      fi
-
       # Clone FerricStore (for bench scripts + erpc client)
       if [ ! -d "$HOME/ferricstore" ]; then
         git clone https://github.com/yoavgeva/ferricstore.git "$HOME/ferricstore"
@@ -78,8 +62,7 @@ write_files:
 
       echo "=== Client setup complete ==="
       echo ""
-      echo "Run TCP benchmark:"
-      echo "  bash bench/tcp_throughput.sh <server_private_ip> 6379"
+      echo "Run native protocol benchmarks from the Python SDK repository or native client runner."
       echo ""
       echo "Run erpc benchmark:"
       echo "  elixir --sname bench --cookie ferricstore_bench -S mix run bench/erpc_throughput.exs --remote ferricstore@ferricstore-0"

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve FerricStore. This repo is focused on FerricStore core, FerricFlow, and the Redis-compatible server.
+Thanks for helping improve FerricStore. This repo is focused on FerricStore core, FerricFlow, and the native TCP server.
 
 ## Development Setup
 
@@ -66,7 +66,7 @@ Stable benchmark entry points live in `bench/`. Public benchmark results are sum
 - Keep public APIs stable unless the PR explicitly changes them.
 - Add tests for correctness changes.
 - Update docs for user-visible behavior.
-- Mention performance impact for hot-path Flow, RESP, Raft, Bitcask, or NIF changes.
+- Mention performance impact for hot-path Flow, native protocol, Raft, Bitcask, or NIF changes.
 - Do not include local tooling files, cloud state, secrets, or generated build artifacts.
 
 ## Public Docs Tone

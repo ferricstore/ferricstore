@@ -221,7 +221,7 @@ IO.puts("""
 
 === What this means for ferricstore ===
 
-Ferricstore serves Redis-protocol clients over TCP. Each SET command is one
+Ferricstore serves native-protocol clients over TCP. Each SET command is one
 Router.put call on the server side. The numbers above translate directly to
 how many SET commands per second ferricstore can handle durably (fsynced).
 

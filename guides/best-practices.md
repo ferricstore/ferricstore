@@ -16,7 +16,7 @@ FerricStore shards data across multiple independent Raft groups. Each shard has 
 
 ### How hash tags work
 
-FerricStore supports Redis hash tags: if a key contains `{tag}`, only the content between the first `{` and the next `}` is used for shard routing. Everything outside the braces is ignored for routing purposes.
+FerricStore supports key hash tags: if a key contains `{tag}`, only the content between the first `{` and the next `}` is used for shard routing. Everything outside the braces is ignored for routing purposes.
 
 ```
 {user:42}:session   → hashes on "user:42"
@@ -57,7 +57,7 @@ Every quorum write goes through Raft consensus and fsync. The group-commit batch
 ```
 
 **Transactions (MULTI/EXEC with WATCH):**
-```redis
+```text
 WATCH {account:A}:balance {account:A}:history
 MULTI
 SET {account:A}:balance 950
@@ -83,7 +83,7 @@ cache:product:3
 
 When keys span multiple shards, FerricStore uses a mini-percolator protocol: lock keys in shard order, write intent, execute, unlock. This is correct but slower than single-shard operations because it requires multiple Raft round-trips.
 
-Some Redis-compatible multi-key commands require all keys to live on one shard. If keys span shards for one of those commands, FerricStore returns a `CROSSSLOT` error with guidance:
+Some multi-key commands require all keys to live on one shard. If keys span shards for one of those commands, FerricStore returns a `CROSSSLOT` error with guidance:
 
 ```
 CROSSSLOT Keys in request don't hash to the same slot.
@@ -101,7 +101,7 @@ Use hash tags {tag} to colocate keys.
 
 All standalone-server writes use the Raft durability path. Namespace prefixes can still tune the group-commit window:
 
-```redis
+```text
 # Latency-sensitive state: short commit window
 FERRICSTORE.CONFIG SET "auth:" window_ms 1
 FERRICSTORE.CONFIG SET "order:" window_ms 1
@@ -145,27 +145,12 @@ Each round-trip is a Raft commit. Fewer round-trips = fewer fsyncs = higher thro
 
 ## Pipeline Commands
 
-Pipelining is a client behavior, not a Redis command. The client sends multiple commands before waiting for replies, reducing round trips and helping FerricStore batch writes.
+Pipelining is a client behavior. The client sends multiple native requests before waiting for replies, reducing round trips and helping FerricStore batch writes.
 
-Elixir example with Redix:
+Native protocol clients have two useful shapes:
 
-```elixir
-Redix.pipeline(conn, [
-  ["SET", "a", "1"],
-  ["SET", "b", "2"],
-  ["GET", "a"]
-])
-```
-
-Python redis-py example:
-
-```python
-pipe = redis.pipeline(transaction=False)
-pipe.set("a", "1")
-pipe.set("b", "2")
-pipe.get("a")
-pipe.execute()
-```
+- Send multiple frames with distinct `request_id` values on the same lane when order matters.
+- Send independent shard-local work on different lanes, usually `lane_id = shard_id + 1`.
 
 FerricFlow SDKs use batching/pipelining internally where safe. Use explicit batch APIs when you need batch semantics; use client pipelining when you want independent commands with fewer network round trips.
 

@@ -6,7 +6,7 @@ FerricStore has two common ways to run:
 
 | Mode | Use when |
 | --- | --- |
-| Docker/server | You want a Ferric protocol TCP server for Python, Go, Node, Java, Elixir, or clients. |
+| Docker/server | You want a Ferric native TCP server for Python, Go, Node, Java, Elixir, or SDK clients. |
 | Embedded Elixir | You want FerricStore inside an Elixir application with direct `FerricStore.*` calls. |
 
 FerricFlow is available in both modes. It keeps workflow or job state and history in one durable place for queues, state-machine workflows, retries, leases, signals, value refs, observability, and fanout.
@@ -21,13 +21,13 @@ FerricFlow is available in both modes. It keeps workflow or job state and histor
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.4.1
+  ghcr.io/ferricstore/ferricstore:0.5.2
 ```
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
 
 The official container image is `ghcr.io/ferricstore/ferricstore`. The current
-release tag is `0.4.1` and is published for `linux/amd64` and `linux/arm64`.
+release tag is `0.5.2` and is published for `linux/amd64` and `linux/arm64`.
 
 Smoke test with the Python SDK:
 
@@ -118,7 +118,7 @@ Add the dependency:
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.4.1"}
+    {:ferricstore, "~> 0.5.2"}
   ]
 end
 ```
@@ -162,7 +162,7 @@ _build/prod/rel/ferricstore/bin/ferricstore start
 ## 6. Next Steps
 
 - [Workflow usage examples](../docs/flow-vs-temporal-usage.md) -- queues, state machines, signals, retries, fanout, and value refs.
-- [Commands Reference](commands.md) -- Ferric protocol command syntax.
+- [Commands Reference](commands.md) -- command syntax and native protocol mapping.
 - [Embedded Mode](embedded-mode.md) -- direct Elixir API.
 - [Configuration](configuration.md) -- production defaults and runtime configuration.
 - [Deployment](deployment.md) -- Docker, releases, Kubernetes, and clustering.

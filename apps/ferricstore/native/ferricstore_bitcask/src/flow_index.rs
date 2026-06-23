@@ -2785,4 +2785,4 @@ mod tests {
 //
 // Do not split this file into normal Rust modules only for readability. If it
 // must be reorganized, preserve the fused compilation shape first and prove it
-// with the DBOS + memtier benchmark gate.
+// with the DBOS + native-protocol KV benchmark gate.

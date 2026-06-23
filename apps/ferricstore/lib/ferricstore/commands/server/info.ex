@@ -45,15 +45,14 @@ defmodule Ferricstore.Commands.Server.Info do
   end
 
   def info_string(_unknown, _store) do
-    # Redis returns an empty string for unknown sections
     ""
   end
 
   defp build_section("server", _store) do
     ctx = default_instance_ctx()
     info = if ctx && ctx.server_info_fn, do: ctx.server_info_fn.(), else: %{}
-    port = Map.get(info, :tcp_port, 0)
-    redis_mode = Map.get(info, :redis_mode, "embedded")
+    native_port = Map.get(info, :native_port, 0)
+    protocol = Map.get(info, :protocol, "embedded")
 
     uptime_seconds = Stats.uptime_seconds()
     uptime_days = div(uptime_seconds, 86_400)
@@ -63,12 +62,11 @@ defmodule Ferricstore.Commands.Server.Info do
     os_string = "#{os_family}:#{os_name} #{major}.#{minor}.#{patch}"
 
     fields = [
-      {"redis_version", "7.4.0"},
-      {"ferricstore_version", "0.4.1"},
-      {"redis_mode", redis_mode},
+      {"ferricstore_version", ferricstore_version()},
+      {"protocol", protocol},
       {"os", os_string},
       {"arch_bits", "64"},
-      {"tcp_port", Integer.to_string(port)},
+      {"native_port", Integer.to_string(native_port)},
       {"uptime_in_seconds", Integer.to_string(uptime_seconds)},
       {"uptime_in_days", Integer.to_string(uptime_days)},
       {"hz", "10"},
@@ -717,6 +715,13 @@ defmodule Ferricstore.Commands.Server.Info do
   # ---------------------------------------------------------------------------
   # INFO formatting helpers
   # ---------------------------------------------------------------------------
+
+  defp ferricstore_version do
+    case Application.spec(:ferricstore, :vsn) do
+      nil -> "dev"
+      vsn -> List.to_string(vsn)
+    end
+  end
 
   defp format_section(header, fields) do
     lines = Enum.map(fields, fn {k, v} -> [k, ":", v] end)

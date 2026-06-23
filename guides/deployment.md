@@ -26,7 +26,7 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRICSTORE_NATIVE_PORT` | `6388` | Ferric protocol TCP listen port |
+| `FERRICSTORE_NATIVE_PORT` | `6388` | Ferric native protocol TCP listen port |
 | `FERRICSTORE_HEALTH_PORT` | `6380` | Health endpoint port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Bitcask + WAL data directory |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards (0 = CPU count) |

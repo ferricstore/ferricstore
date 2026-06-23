@@ -4,8 +4,8 @@ defmodule FerricstoreServer.Application do
 
   Starts the network-facing children that expose the core engine:
 
-    * Ferric protocol TCP listener (`FerricstoreServer.Native.Listener`)
-    * Ferric protocol TLS listener (`FerricstoreServer.Native.TlsListener`) -- optional
+    * Ferric native protocol TCP listener (`FerricstoreServer.Native.Listener`)
+    * Ferric native protocol TLS listener (`FerricstoreServer.Native.TlsListener`) -- optional
     * HTTP health/metrics endpoint (`FerricstoreServer.Health.Endpoint`)
 
   This application depends on `:ferricstore` (the core engine). It injects

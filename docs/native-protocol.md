@@ -1,8 +1,8 @@
 # FerricStore Native TCP Protocol
 
-FerricStore native protocol is a binary SDK data plane. It is separate from the
-Ferric protocol listener and delegates every command to the same
-FerricStore engine path.
+FerricStore native protocol is the standalone binary SDK data plane. It
+delegates command semantics to the same FerricStore engine path used by the
+embedded Elixir API.
 
 The hot frame scanner/emitter is implemented as a pure Rust NIF:
 
@@ -130,7 +130,7 @@ Response body starts with a `u16` status code followed by one typed value.
 0x000B OPTIONS
 0x000C STARTUP
 0x000D WINDOW_UPDATE
-0x000E BATCH
+0x000E PIPELINE
 0x000F ROUTE_BATCH
 0x0010 EVENT           server-initiated, request_id=0
 0x0011 SUBSCRIBE_EVENTS
@@ -261,9 +261,9 @@ ZADD: {"key": "z", "items": [[1.0, "a"], [2.0, "b"]]}
 ZRANGE: {"key": "z", "start": 0, "stop": -1, "withscores": true}
 ```
 
-Hash/list/set/sorted-set opcodes use the same store semantics as their Ferric protocol
-commands. The initial native support uses typed map payloads; compact binary
-fast paths can be added later for commands that show up as real bottlenecks.
+Hash/list/set/sorted-set opcodes use the same store semantics as the embedded
+command handlers. Native requests use typed map payloads; compact binary fast
+paths can be added for commands that show up as real bottlenecks.
 
 ## Admin/observability opcodes
 
@@ -286,7 +286,8 @@ fast paths can be added later for commands that show up as real bottlenecks.
 0x0310 FERRICSTORE.BLOBGC
 ```
 
-Most admin bodies use a Ferric protocol-compatible `args` list:
+Most admin bodies use an `args` list so the native protocol can delegate to the
+existing command handlers:
 
 ```text
 CLUSTER.JOIN:       {"args": ["node@host", "REPLACE"]}
@@ -416,7 +417,7 @@ Data commands sent on lane `0` are rejected.
 
 ## Multi-shard commands and batch policy
 
-`BATCH` accepts a list of native command bodies and an explicit atomicity policy:
+`PIPELINE` accepts a list of native command bodies and an explicit atomicity policy:
 
 ```text
 none       independent command results
@@ -427,19 +428,20 @@ same_shard server validates all keys route to one shard
 Unsupported/global atomicity must be rejected rather than faked.
 
 For peak performance, clients should still split multi-shard independent work
-into shard-local lanes. Server-side `BATCH` exists for protocol completeness and
-ease-of-use, not as the highest-throughput coordinator path.
+into shard-local lanes. Server-side `PIPELINE` exists for protocol completeness
+and ease-of-use, not as the highest-throughput coordinator path.
 
 ## Security model
 
-Native protocol uses the same protected-mode and ACL model as Ferric protocol:
+Native protocol uses the same protected-mode and ACL model as the embedded
+command path:
 
 ```text
 protected mode -> rejects non-localhost clients unless a passworded user exists
 AUTH           -> supports ACL users and requirepass-compatible default auth
 ACL checks     -> command and key checks before dispatch
 require_tls    -> plaintext native connections are rejected when enabled
-maxclients     -> shared connection limit across Ferric protocol and native listeners
+maxclients     -> connection limit across native TCP/TLS listeners
 frame caps     -> native_max_frame_bytes and per-connection buffer limit
 lane caps      -> native_max_lanes_per_connection and native_lane_max_queue
 ```

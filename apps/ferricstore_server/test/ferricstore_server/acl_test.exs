@@ -482,7 +482,7 @@ defmodule FerricstoreServer.AclTest do
   # ---------------------------------------------------------------------------
 
   describe "get_user_info/1" do
-    test "returns Redis-compatible flat list for existing user" do
+    test "returns flat list for existing user" do
       info = Acl.get_user_info("default")
       assert is_list(info)
 

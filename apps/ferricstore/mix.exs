@@ -61,7 +61,7 @@ defmodule Ferricstore.MixProject do
   defp package do
     [
       description:
-        "FerricFlow durable workflows and queues with Redis-compatible storage, Raft durability, and Bitcask persistence.",
+        "FerricFlow durable workflows and queues with native-protocol storage, Raft durability, and Bitcask persistence.",
       files: [
         "lib",
         "native/ferricstore_bitcask/.cargo",

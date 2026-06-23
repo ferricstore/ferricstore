@@ -26,7 +26,7 @@ defmodule FerricstoreServer.Acl.Protection do
   def check_protected_mode(peer) do
     if protected_mode?() and not has_configured_users?() and not localhost?(peer) do
       {:error,
-       "DENIED Redis is running in protected mode because protected mode is enabled and no password is configured for the default user. Connections are only accepted from localhost."}
+       "DENIED FerricStore is running in protected mode because protected mode is enabled and no password is configured for the default user. Connections are only accepted from localhost."}
     else
       :ok
     end

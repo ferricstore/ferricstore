@@ -1,6 +1,6 @@
 defmodule Ferricstore.Commands.TDigest do
   @moduledoc """
-  Handles Redis-compatible TDIGEST.* commands.
+  Handles TDIGEST.* commands.
 
   A t-digest is a probabilistic data structure for accurate on-line accumulation
   of rank-based statistics such as quantiles, trimmed means, and cumulative

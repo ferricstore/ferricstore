@@ -1,7 +1,7 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule FerricstoreServer.Commands.Client do
   @moduledoc """
-  Handles Ferric protocol CLIENT metadata commands.
+  Handles native protocol CLIENT metadata commands.
 
   Legacy client-tracking invalidation was removed with the text protocol
   listener. Native SDKs should use protocol event subscriptions instead of
@@ -83,12 +83,12 @@ defmodule FerricstoreServer.Commands.Client do
 
   def handle("TRACKING", _args, conn_state, _store) do
     {{:error,
-      "ERR CLIENT TRACKING is not supported by the Ferric protocol; use event subscriptions"},
+      "ERR CLIENT TRACKING is not supported by the native protocol; use event subscriptions"},
      conn_state}
   end
 
   def handle("CACHING", _args, conn_state, _store) do
-    {{:error, "ERR CLIENT CACHING is not supported by the Ferric protocol"}, conn_state}
+    {{:error, "ERR CLIENT CACHING is not supported by the native protocol"}, conn_state}
   end
 
   def handle("TRACKINGINFO", [], conn_state, _store) do

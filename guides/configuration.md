@@ -31,7 +31,7 @@ config :ferricstore, :mode, :embedded
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:native_port` | `integer` | `6388` | Standalone only | TCP port for the Ferric protocol listener. Use `0` for an OS-assigned ephemeral port (useful in tests). |
+| `:native_port` | `integer` | `6388` | Standalone only | TCP port for the Ferric native protocol listener. Use `0` for an OS-assigned ephemeral port (useful in tests). |
 | `:health_port` | `integer` | `4000` | Standalone only | HTTP port for health checks and Prometheus metrics. Use `0` for ephemeral. |
 | `:socket_active_mode` | `:once \| true \| integer` | `true` | Standalone only | TCP socket active mode. `:once` reads one message at a time (back-pressure friendly). `true` pushes all data without flow control (highest throughput). An integer N reads N messages then switches to passive. |
 
@@ -385,16 +385,22 @@ runaway transactions or pipelines.
 
 | Option | Type | Default | Hard Cap | Applies to | Description |
 |--------|------|---------|----------|------------|-------------|
-| `:max_value_size` | `integer` | `1_048_576` (1 MB) | `67_108_864` (64 MB) | Both | Maximum bulk string (value) size in bytes. Enforced at Ferric protocol parse time and in embedded `FerricStore.set/3`. The hard cap of 64 MB is non-configurable. |
-| Buffer limit | compile-time | `134_217_728` (128 MB) | — | Standalone only | Maximum bytes accumulated in a connection's receive buffer before the connection is closed. Not configurable at runtime (module attribute in `Connection`). |
+| `:max_value_size` | `integer` | `1_048_576` (1 MB) | `67_108_864` (64 MB) | Both | Maximum value size in bytes. Enforced during native body validation and in embedded `FerricStore.set/3`. The hard cap of 64 MB is non-configurable. |
+| `:native_max_frame_bytes` | `integer` | `16_777_216` (16 MB) | — | Standalone only | Maximum native frame body size before command dispatch. |
+| `:native_max_lanes_per_connection` | `integer` | `1024` | — | Standalone only | Maximum active native protocol lanes per connection. |
+| `:native_lane_max_queue` | `integer` | `1024` | — | Standalone only | Maximum queued/inflight requests per native lane before `busy` responses. |
+| `:native_max_inflight_per_connection` | `integer` | `4096` | — | Standalone only | Maximum total in-flight native requests per connection. |
+| `:native_max_inflight_per_lane` | `integer` | `1024` | — | Standalone only | Maximum in-flight native requests per lane. |
+| `:native_max_pending_chunks` | `integer` | `1024` | — | Standalone only | Maximum incomplete chunked request streams per connection. |
+| `:native_max_pending_chunk_bytes` | `integer` | `67_108_864` (64 MB) | — | Standalone only | Maximum memory held by incomplete native request chunks per connection. |
+| Connection buffer limit | compile-time | `134_217_728` (128 MB) | — | Standalone only | Maximum bytes accumulated in a connection's receive buffer before the connection is closed. Not configurable at runtime (module attribute in `Native.Connection`). |
 | MULTI queue limit | compile-time | `100_000` | — | Standalone only | Maximum commands queued inside a `MULTI` transaction. When exceeded, the transaction is auto-discarded and an error is returned. |
-| Pipeline batch limit | compile-time | `100_000` | — | Standalone only | Maximum commands in a single pipeline batch. When exceeded, the entire batch is rejected with an error. |
 
 ### Max value size
 
 Applied at two levels:
 
-1. **Ferric protocol parser** — when a bulk string header `$N\r\n` declares a length exceeding the limit, the parser returns an error immediately without reading the body. The connection receives `-ERR value too large (N bytes, max M bytes)` and is closed.
+1. **Native protocol body validation** — native command payloads are decoded with bounded frame and typed-value limits before command dispatch. Oversized values return an error without executing the command.
 2. **Embedded API** — `FerricStore.set/3` checks `byte_size(value)` before writing and returns `{:error, "ERR value too large ..."}` if the value exceeds the limit.
 
 ```elixir
@@ -402,31 +408,46 @@ Applied at two levels:
 config :ferricstore, :max_value_size, 10_485_760
 ```
 
-### Buffer, MULTI queue, and pipeline limits
+### Native frame, lane, and transaction limits
 
-These are compile-time module attributes in `FerricstoreServer.Connection` and
-cannot be changed at runtime. The defaults are generous enough for any
-legitimate workload while preventing pathological resource exhaustion:
+The native listener rejects or backpressures clients before one connection can
+consume unbounded memory. Runtime-configurable native limits bound frame bodies,
+active lanes, per-lane queues, in-flight requests, and incomplete chunked
+requests. The receive-buffer and `MULTI` queue caps are compile-time safeguards.
 
-- **Buffer overflow** — a client sending incomplete Ferric protocol frames faster than
+- **Frame too large** — a native frame body larger than `native_max_frame_bytes`
+  is rejected before command dispatch.
+- **Buffer overflow** — a client sending incomplete native frames faster than
   they can be parsed will accumulate data in the receive buffer. At 128 MB the
-  connection is closed with `-ERR connection buffer overflow`.
+  connection is closed with `ERR connection buffer overflow`.
+- **Lane or inflight overflow** — a client exceeding lane or in-flight limits
+  receives a `busy` response instead of growing server memory without bound.
 - **MULTI queue overflow** — a client queueing more than 100K commands inside
-  `MULTI` triggers an automatic `DISCARD` with `-ERR MULTI queue overflow`.
-- **Pipeline overflow** — a pipeline batch with more than 100K commands is
-  rejected with `-ERR pipeline batch too large`.
+  `MULTI` triggers an automatic `DISCARD` with `ERR MULTI queue overflow`.
 
-## Sendfile Zero-Copy
+## Native Response Framing
 
-*Standalone only — embedded mode returns values directly via ETS or `v2_pread_at`, with no socket involved.*
+Standalone native responses are encoded as native frames. The server can
+coalesce adjacent responses to reduce socket writes, and can split large
+responses into bounded chunks so one client cannot force unbounded response
+memory.
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:sendfile_threshold` | `integer` | `65_536` | Standalone only | Minimum value size (bytes) for sendfile zero-copy. Values larger than this are served via `:file.sendfile/5` instead of copying into BEAM memory. Only applies to cold (on-disk) keys over plain TCP. |
+| `:native_response_chunk_bytes` | `integer` | `0` | Standalone only | Maximum native response payload bytes per chunk. `0` disables response chunking. |
+| `:native_response_coalesce_max` | `integer` | `64` | Standalone only | Maximum ready responses to coalesce into one socket flush. |
+| `:native_response_coalesce_bytes` | `integer` | `8_388_608` (8 MB) | Standalone only | Approximate byte limit for coalesced response iodata before flushing. |
 
 ```elixir
-config :ferricstore_server, :sendfile_threshold, 65_536
+config :ferricstore,
+  native_response_chunk_bytes: 0,
+  native_response_coalesce_max: 64,
+  native_response_coalesce_bytes: 8 * 1024 * 1024
 ```
+
+The legacy `:sendfile_threshold` server option is retained for older/internal
+direct file-send helpers. The native TCP/TLS data plane uses response
+framing, coalescing, and chunking instead.
 
 ## TLS
 
@@ -437,17 +458,17 @@ config :ferricstore_server, :sendfile_threshold, 65_536
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:native_tls_port` | `integer` | `nil` | Standalone only | Ferric protocol TLS port to bind. Not started unless configured. |
+| `:native_tls_port` | `integer` | `nil` | Standalone only | Ferric native protocol TLS port to bind. Not started unless configured. |
 | `:native_tls_cert_file` | `string` | `nil` | Standalone only | Path to PEM certificate file. |
 | `:native_tls_key_file` | `string` | `nil` | Standalone only | Path to PEM private key file. |
-| `:native_native_tls_ca_cert_file` | `string` | `nil` | Standalone only | Path to CA certificate bundle (optional, for mutual TLS). |
+| `:native_tls_ca_cert_file` | `string` | `nil` | Standalone only | Path to CA certificate bundle (optional, for mutual TLS). |
 | `:require_tls` | `boolean` | `false` | Standalone only | When `true`, reject plaintext TCP connections. |
 
 ```elixir
 config :ferricstore, :native_tls_port, 6389
 config :ferricstore, :native_tls_cert_file, "/etc/ssl/ferricstore/cert.pem"
 config :ferricstore, :native_tls_key_file, "/etc/ssl/ferricstore/key.pem"
-config :ferricstore, :native_native_tls_ca_cert_file, "/etc/ssl/ferricstore/ca.pem"
+config :ferricstore, :native_tls_ca_cert_file, "/etc/ssl/ferricstore/ca.pem"
 config :ferricstore, :require_tls, true
 ```
 
@@ -597,7 +618,7 @@ config :ferricstore, :sync_flush_timeout_ms, 5_000
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:embedded_large_value_warning_bytes` | `integer` | `524_288` | Embedded only | At startup, scan ETS for values exceeding this threshold and log a warning. Helps catch accidental large-value storage in embedded mode. In standalone mode, large values are served via sendfile zero-copy instead. |
+| `:embedded_large_value_warning_bytes` | `integer` | `524_288` | Embedded only | At startup, scan ETS for values exceeding this threshold and log a warning. Helps catch accidental large-value storage in embedded mode. In standalone native mode, large responses are bounded by native response framing and optional chunking. |
 
 ```elixir
 config :ferricstore, :embedded_large_value_warning_bytes, 512 * 1024
@@ -710,7 +731,7 @@ These environment variables are read from `config/runtime.exs` in production (`M
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRICSTORE_NATIVE_PORT` | `6388` | TCP port for the Ferric protocol listener |
+| `FERRICSTORE_NATIVE_PORT` | `6388` | TCP port for the Ferric native protocol listener |
 | `FERRICSTORE_HEALTH_PORT` | `6389` | HTTP health/metrics port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, WARaft segments, mmap) |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards. `0` = `System.schedulers_online()` |
@@ -810,7 +831,7 @@ Some parameters can be changed at runtime **without restarting FerricStore**.
 This works in both standalone and embedded mode — same parameters, same
 behavior, different API.
 
-### Standalone mode (FerricStore protocol)
+### Standalone mode (native protocol)
 
 ```bash
 CONFIG SET maxmemory-policy allkeys-lru

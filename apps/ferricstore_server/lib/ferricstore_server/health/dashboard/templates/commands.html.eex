@@ -6,7 +6,7 @@
 <main class="main-content">
 <%= render_subpage_header("Commands") %>
 <div class="content">
-<%= render_page_intro("Commands", "Understand command traffic, slow command shape, and which Redis-compatible command families map to the generic KV engine.") %>
+<%= render_page_intro("Commands", "Understand command traffic, slow command shape, and which command families map to the generic KV engine.") %>
 <%= render_kv_subnav("commands") %>
 <%= render_live_component("commands_summary", render_commands_summary(data)) %>
 <%= render_live_component("commands_slowlog", render_command_slowlog_table(data)) %>

@@ -30,7 +30,7 @@ defmodule FerricstoreServer.MixProject do
   defp package do
     [
       description:
-        "FerricStore Ferric protocol server for durable KV and FerricFlow.",
+        "FerricStore native protocol server for durable KV and FerricFlow.",
       files: [
         "lib",
         "native/native_protocol_nif/.cargo",

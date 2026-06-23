@@ -37,7 +37,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.OperationalPages do
           assert is_integer(data.connections.tracking)
         end
 
-        test "renders clients page with Ferric protocol connection language" do
+        test "renders clients page with native protocol connection language" do
           html =
             Dashboard.collect_clients_page()
             |> Dashboard.render_clients_page()

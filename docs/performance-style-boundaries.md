@@ -6,11 +6,11 @@ paths.
 
 ## Hot paths: benchmark required
 
-Run DBOS-style Flow and memtier SET/GET pipeline benchmarks before/after changes
+Run DBOS-style Flow and native-protocol SET/GET pipeline benchmarks before/after changes
 in these areas:
 
-- `FerricstoreServer.Connection`
-- `FerricstoreServer.Connection.Pipeline`
+- `FerricstoreServer.Native.Connection`
+- `FerricstoreServer.Native.Lane`
 - `Ferricstore.Store.Router`
 - `Ferricstore.Store.Shard`
 - `Ferricstore.Store.Shard.*`
@@ -65,4 +65,3 @@ Lower-risk candidates:
 - Dashboard/test section modules.
 - Test-only section macros.
 - Cold helper modules currently named `part_XX`.
-

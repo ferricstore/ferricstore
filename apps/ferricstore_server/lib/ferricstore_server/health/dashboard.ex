@@ -223,7 +223,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Collects doctor diagnostics through the same Redis command handler exposed to
+  Collects doctor diagnostics through the same command handler exposed to
   administrators. The dashboard must not bypass command/ACL semantics for
   repair-oriented tools.
   """

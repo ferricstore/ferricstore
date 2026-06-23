@@ -1,6 +1,6 @@
 # Architecture
 
-This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the Ferric protocol server.
+This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the native TCP server.
 
 Quick model:
 
@@ -12,85 +12,48 @@ FerricStore owns the storage path itself; workflow state is not written through 
 
 For FerricFlow, command correctness uses the current Flow state in the hot keydir/native indexes. That state is recoverable from FerricStore-managed WARaft segment/apply-projection storage. LMDB/history projection freshness affects query surfaces, not whether a Flow command committed.
 
-FerricStore is built around three core design principles: (1) all mutable state lives in Elixir where it is observable and debuggable, (2) Rust NIFs are pure stateless functions for I/O and CPU-intensive work, and (3) data is stored in the tier best suited to its access pattern.
+FerricStore is built around three boundaries: (1) the BEAM owns routing, sessions, ACL, Raft orchestration, ETS keydir state, and operational decisions, (2) Rust NIFs handle bounded binary protocol work, file I/O, and CPU-heavy primitives, with selected native resources for specialized indexes, and (3) data is stored in the tier best suited to its access pattern.
 
 ## Overview
 
+```text
+Clients
+  Native SDKs / native clients
+    -> native binary TCP/TLS
+    -> Ranch listener
+    -> FerricstoreServer.Native.Connection
+       - Native.Codec + native-protocol Rust NIF frame scan
+       - protected mode, maxclients, ACL
+       - control lane, data lanes, backpressure, chunking
+       - Native.Commands / NativeAstParser
+
+  Embedded Elixir callers
+    -> FerricStore API
+
+Core engine
+  Command handlers / Router
+    -> shard_for(key): phash2(key) band 0x3FF -> slot_map[slot] -> shard idx
+    -> hot reads: ETS keydir direct lookup
+    -> writes: shard GenServer -> WARaft batcher -> committed segment/apply projection
+
+Storage
+  Tier 0: WARaft segment/apply projection storage
+    durable command boundary and restart/replay source
+
+  Tier 1: ETS keydir
+    {key, value | nil, expire_at_ms, lfu, file_id, offset, value_size}
+
+  Tier 2: Bitcask/blob files
+    append-only cold values, large values, dedicated collections, merge/compaction
+
+  Tier 3: stateless pread/pwrite files
+    Bloom, Cuckoo, CMS, TopK, TDigest query structures backed by OS page cache
+
+Operations
+  Raft consensus, MemoryGuard, LFU eviction, merge scheduling, Pub/Sub, Flow events
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         Client Layer                                       │
-│  Ferric protocol SDKs / native clients          FerricStore Elixir API │
-│  (Ferric protocol over TCP/TLS)                          (direct function calls)    │
-└──────────────────┬──────────────────────────────────┬─────────────────────┘
-                   │                                  │
-                   ▼                                  │
-┌──────────────────────────────────┐                  │
-│  FerricStore Server (standalone) │                  │
-│  Ranch TCP/TLS → Connection     │                  │
-│  → Ferric protocol parser → ACL Check     │                  │
-│  → Command Dispatcher           │                  │
-│  → CLIENT TRACKING              │                  │
-└──────────────────┬───────────────┘                  │
-                   │                                  │
-                   ▼                                  ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         FerricStore Core                                   │
-│                                                                            │
-│  ┌────────────────────────────────────────────────┐                       │
-│  │                    Router                       │                       │
-│  │  key → phash2(key) band 0x3FF → slot            │                       │
-│  │  slot → slot_map[slot] → idx                   │                       │
-│  │  idx → :"Ferricstore.Store.Shard.N"            │                       │
-│  └────────────────┬────────────────┬──────────────┘                       │
-│                   │                │                                        │
-│    ┌──────────────┴──┐  ┌─────────┴───────────┐                           │
-│    │   Read Path      │  │    Write Path        │                          │
-│    │   ETS direct     │  │    GenServer call    │                          │
-│    │   (no GenServer) │  │    → ETS immediate   │                          │
-│    │                  │  │    → WARaft Batcher  │                          │
-│    └──────┬───────────┘  │    → ra consensus    │                          │
-│           │              │    → segment/apply   │                          │
-│           │              │      projection       │                          │
-│           │              └────────────┬─────────┘                          │
-│           │                           │                                    │
-│  ┌────────┴───────────────────────────┴──────────────────────────┐        │
-│  │                    Storage Tiers                                │        │
-│  │                                                                 │        │
-│  │  ┌─────────────────────────────────────────────────────────┐   │        │
-│  │  │  Tier 0: WARaft segment/apply projection storage         │   │        │
-│  │  │  Durable command log plus projected value locations      │   │        │
-│  │  │  Source for restart/replay of committed writes           │   │        │
-│  │  └────────────────────────────┬────────────────────────────┘   │        │
-│  │                               │ hot serving state               │        │
-│  │  ┌─────────────────────────────────────────────────────────┐   │        │
-│  │  │  Tier 1: ETS keydir (hot data)                          │   │        │
-│  │  │  {key, value|nil, expire, lfu, file_id, offset, vsize}  │   │        │
-│  │  │  One table per shard: keydir_0, keydir_1, ...            │   │        │
-│  │  │  read_concurrency: true, write_concurrency: true         │   │        │
-│  │  └────────────────────────────┬────────────────────────────┘   │        │
-│  │                               │ cold read (value=nil)           │        │
-│  │  ┌────────────────────────────▼────────────────────────────┐   │        │
-│  │  │  Tier 2: Bitcask/blob files (cold and large values)      │   │        │
-│  │  │  Append-only files, dedicated collections, blob refs     │   │        │
-│  │  │  Rust NIF: v2_pread_at(path, offset)                     │   │        │
-│  │  │  Background merge/compaction                             │   │        │
-│  │  └─────────────────────────────────────────────────────────┘   │        │
-│  │                                                                 │        │
-│  │  ┌─────────────────────────────────────────────────────────┐   │        │
-│  │  │  Tier 3: pread/pwrite files (probabilistic)               │   │        │
-│  │  │  Bloom (.bloom), Cuckoo (.cuckoo), CMS (.cms)            │   │        │
-│  │  │  TopK (.topk), TDigest (.tdig)                           │   │        │
-│  │  │  OS page cache manages RAM, stateless NIF reads           │   │        │
-│  │  └─────────────────────────────────────────────────────────┘   │        │
-│  └─────────────────────────────────────────────────────────────────┘        │
-│                                                                            │
-│  ┌────────────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │
-│  │  Raft Consensus     │  │  MemoryGuard  │  │  Merge/Compaction        │   │
-│  │  ra library         │  │  LFU eviction │  │  Background scheduler   │   │
-│  │  per-shard group    │  │  per shard    │  │  Semaphore-gated        │   │
-│  └────────────────────┘  └──────────────┘  └──────────────────────────┘   │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+
+Standalone and embedded mode converge at the command handler and router boundary. The native TCP protocol owns transport, framing, multiplexing, ACL enforcement, and response shaping; command correctness and storage semantics stay in the core engine.
 
 ## Umbrella Structure
 
@@ -99,7 +62,7 @@ FerricStore is an Elixir umbrella application with two apps:
 | App | Purpose | Key Modules |
 |-----|---------|-------------|
 | `ferricstore` | Core engine: shards, ETS, Bitcask, Raft, Rust NIFs, LFU, MemoryGuard | `Ferricstore.Store.{Shard, Router, LFU, Promotion}`, `Ferricstore.Raft.{Batcher, StateMachine, Cluster}`, `Ferricstore.Bitcask.{NIF, Async}`, `Ferricstore.MemoryGuard` |
-| `ferricstore_server` | TCP/TLS server, Ferric protocol protocol, ACL, health HTTP | `FerricstoreServer.Connection`, `FerricstoreServer.Health` |
+| `ferricstore_server` | Native TCP/TLS server, ACL, client registry, health HTTP | `FerricstoreServer.Native.Connection`, `FerricstoreServer.Native.Codec`, `FerricstoreServer.Health` |
 
 In **embedded mode**, only the `ferricstore` app starts. In **standalone mode**, `ferricstore_server` also starts Ranch TCP/TLS listeners and an HTTP health endpoint.
 
@@ -137,8 +100,9 @@ Ferricstore.Supervisor (:one_for_one)
 
 FerricstoreServer.Supervisor (:one_for_one)  [standalone mode only]
 ├── :pg (FerricstoreServer.PG)            # ACL invalidation process groups
-├── Ranch TCP Listener                    # Ferric protocol connections
-├── Ranch TLS Listener                    # Optional encrypted connections
+├── FerricstoreServer.Acl                 # Server-side ACL state and invalidation hooks
+├── Ranch TCP Listener                    # Native protocol connections
+├── Ranch TLS Listener                    # Optional encrypted native connections
 └── Health HTTP Endpoint                  # /health/ready + /metrics + dashboard
 ```
 
@@ -153,7 +117,7 @@ Before the supervision tree starts, `Application.start/2` performs critical init
 5. `WARaftBackend.start(default_ctx)` -- starts WARaft partitions with the segment log under `data_dir/waraft`
 6. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> HLC -> WARaft namespace batchers -> BitcaskWriters -> Flow LMDB writers -> ShardSupervisor -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
 
-Stats starts first so counters are available before any connection. The ShardSupervisor must start before the Ranch listener (in the server app) so the key-value store is ready before any client arrives. MemoryGuard starts last because it reads from shard ETS tables.
+Stats starts first so counters are available before any connection. The ShardSupervisor must start before the Ranch listener (in the server app) so the key-value store is ready before any client arrives. In standalone mode, the server app starts ACL invalidation groups before accepting native TCP/TLS clients. MemoryGuard starts last because it reads from shard ETS tables.
 
 ## Shard Routing
 
@@ -218,6 +182,10 @@ The ETS keydir is the single source of truth for all key-value data in RAM. Each
 **ETS Table Options**: Each keydir table is created with `[:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}]`. `:public` allows the Router to read directly from any process without going through the Shard GenServer. `:read_concurrency` enables lock-free concurrent readers on multi-core systems.
 
 ## Write Path
+
+The write path below starts after a standalone native frame has been decoded,
+authorized, and dispatched, or after an embedded caller has invoked the Elixir
+API directly.
 
 ```
 Client                Router              Shard GenServer         WARaft Batcher
@@ -320,9 +288,18 @@ Client                Router              ETS keydir          Shard GenServer
 
 3. Every read is recorded as hot or cold in `Ferricstore.Stats` for the `FERRICSTORE.HOTNESS` command and `INFO stats`.
 
-### Sendfile Zero-Copy (Standalone Mode)
+### Native Response Framing
 
-For cold keys over plain TCP (not TLS), `Router.get_file_ref/1` returns `{file_path, value_offset, value_size}` when the value exceeds the sendfile threshold (default: 64KB). The connection handler uses `:file.sendfile/5` to transfer data directly from disk to the TCP socket without copying through BEAM memory. The value offset is computed as `record_offset + 26 (header) + key_length`.
+Standalone responses always return through the native frame encoder. Hot values
+come from ETS. Cold values are read from the Bitcask/blob location stored in
+the ETS keydir, then encoded as native response frames. The native connection
+can coalesce adjacent responses and can split large responses into chunks using
+`native_response_coalesce_max`, `native_response_coalesce_bytes`, and
+`native_response_chunk_bytes`.
+
+Large cold values still return through native frames, so request-id
+correlation, lane ordering, TLS parity, compact response payloads, and bounded
+chunk memory all use the same response machinery.
 
 ## WARaft Consensus
 
@@ -377,7 +354,7 @@ The next native experiment should keep the current Elixir-owned ETS keydir model
 4. Return enough compact location data for the state machine to publish final ETS rows with no visible partial writes, or publish through a carefully audited native helper that preserves the same ETS tuple contract.
 5. Keep Flow policy/value mirror hooks, blob externalization, large-value hot-cache thresholds, and rollback semantics equivalent to the current path.
 
-A Rust-owned KV keydir should be treated as a larger architecture change, not a first optimization step. It must prove that it beats ETS for concurrent hot reads, avoids one mutex bottleneck per shard, preserves lazy expiry and LFU bookkeeping semantics, and does not weaken crash recovery. Benchmarks should compare the current path, the native batch path, and any Rust-keydir prototype under the public memtier shape from `docs/benchmarks.md` before replacing the ETS-backed design.
+A Rust-owned KV keydir should be treated as a larger architecture change, not a first optimization step. It must prove that it beats ETS for concurrent hot reads, avoids one mutex bottleneck per shard, preserves lazy expiry and LFU bookkeeping semantics, and does not weaken crash recovery. Benchmarks should compare the current path, the native batch path, and any Rust-keydir prototype under a native-protocol SDK benchmark shape before replacing the ETS-backed design.
 
 ### State Machine
 
@@ -394,7 +371,7 @@ A Rust-owned KV keydir should be treated as a larger architecture change, not a 
 
 ## LFU Eviction
 
-FerricStore implements Ferric protocol LFU (Least Frequently Used) eviction with time-based decay.
+FerricStore implements LFU (Least Frequently Used) eviction with time-based decay.
 
 ### Packed Format
 
@@ -465,10 +442,10 @@ When a compound-key collection (hash, set, sorted set) exceeds the `promotion_th
 ### Compound Key Encoding
 
 Small collections store each field as a compound key in the shared shard:
-- Hash fields: `H:redis_key\0field`
-- Set members: `S:redis_key\0member`
-- Sorted set members: `Z:redis_key\0member`
-- List elements: `L:redis_key\0<position>`
+- Hash fields: `H:user_key\0field`
+- Set members: `S:user_key\0member`
+- Sorted set members: `Z:user_key\0member`
+- List elements: `L:user_key\0<position>`
 
 ### Promotion Process
 
@@ -476,7 +453,7 @@ Small collections store each field as a compound key in the shared shard:
 2. Opens (or creates) a dedicated Bitcask directory at `data_dir/dedicated/shard_N/{type}:{sha256_of_key}/`.
 3. Writes all entries to the dedicated Bitcask via `NIF.v2_append_batch`.
 4. Writes tombstones to the shared Bitcask for the migrated keys.
-5. Writes a marker entry `PM:redis_key` to the shared Bitcask (value = type string).
+5. Writes a marker entry `PM:user_key` to the shared Bitcask (value = type string).
 6. Entries **stay** in ETS so compound operations continue to work immediately.
 
 ### Recovery
@@ -486,7 +463,7 @@ On shard startup, `Promotion.recover_promoted/4` scans ETS for `PM:` marker keys
 ### List Compound Keys
 
 Lists use compound keys like other collection types:
-- List elements: `L:redis_key\0<position>`
+- List elements: `L:user_key\0<position>`
 
 Each element is a separate Bitcask entry, making LPUSH/RPUSH O(1) per element instead of O(N). Position values encode the element's location in the list.
 
@@ -496,17 +473,9 @@ Lists are not promoted to dedicated Bitcask instances because the position-based
 
 Bitcask files are append-only and accumulate dead entries (overwritten or deleted keys). The merge subsystem compacts data files in the background.
 
-### Architecture
+### Merge Supervision
 
-This guide explains how FerricStore works internally. Read it after [Getting Started](getting-started.md) if you want to understand routing, durability, storage, recovery, memory behavior, and the Ferric protocol server.
-
-Quick model:
-
-```text
-client command -> shard router -> WARaft segment log -> state/apply projection -> hot keydir/indexes
-```
-
-FerricFlow current state is served from hot keydir/native indexes and is recoverable from FerricStore-managed WARaft segment/apply-projection storage. LMDB/history projections are query surfaces that can lag briefly.
+This section explains the merge subsystem that keeps append-only storage compact over time.
 
 ```
 Ferricstore.Merge.Supervisor (:one_for_one)
@@ -544,11 +513,16 @@ On shard startup, `Shard.init/1` rebuilds the in-memory keydir:
 5. **Recover promoted collections**: Scans ETS for `PM:` marker keys, re-opens dedicated Bitcask directories, scans their logs to recover entries.
 6. **Migrate prob files**: Scans prob directory for existing `.bloom`/`.cms`/`.cuckoo`/`.topk` files, writes metadata markers to ETS for any files without corresponding keydir entries.
 7. **Start quorum runtime**: application startup owns WARaft partition startup. A shard GenServer restart reuses the same keydir and active-file state while WARaft keeps the committed segment log durable.
-9. **Schedule flush timer and expiry sweep**.
+8. **Schedule flush timer and expiry sweep**.
 
 ## Rust NIF Design
 
-Rust NIFs are **pure, stateless functions** -- no HashMap, no Mutex, no internal state for the v2 API. Elixir owns all mutable state (ETS keydir, GenServer). For mmap-backed structures, Rust NIFs use NIF resources (reference-counted by the BEAM GC).
+The main storage path keeps routing, keydir ownership, scheduling, consensus,
+and operational decisions in Elixir. Rust NIFs are used where they give a clear
+boundary advantage: native frame scanning/encoding, file I/O, CRC/layout work,
+and CPU-heavy data-structure primitives. The v2 file I/O API is stateless; for
+specialized indexes or mmap-backed structures, Rust can expose NIF resources
+that are reference-counted by the BEAM GC.
 
 ### v2 Pure Stateless File I/O
 
@@ -594,7 +568,7 @@ Header size: 26 bytes. CRC32 covers everything after the checksum field. Tombsto
 
 ### Stateless pread/pwrite Structures
 
-Probabilistic structures use stateless file-based NIFs. Each NIF opens the file, reads/writes specific bytes via pread/pwrite, and closes on return. No mmap, no ResourceArc, no Mutex. Memory stays in kernel page cache (managed by OS).
+Most probabilistic structures use stateless file-based NIFs. Each stateless NIF opens the file, reads/writes specific bytes via pread/pwrite, and closes on return. Memory stays in kernel page cache. TDigest still uses an in-memory native resource and is tracked separately from the stateless file-backed structures.
 
 | Structure | File Extension | NIFs |
 |-----------|---------------|------|
@@ -602,7 +576,7 @@ Probabilistic structures use stateless file-based NIFs. Each NIF opens the file,
 | Cuckoo Filter | `.cuckoo` | `cuckoo_file_create`, `cuckoo_file_add`, `cuckoo_file_addnx`, `cuckoo_file_del`, `cuckoo_file_exists`, `cuckoo_file_count`, `cuckoo_file_info` |
 | Count-Min Sketch | `.cms` | `cms_file_create`, `cms_file_incrby`, `cms_file_query`, `cms_file_info`, `cms_file_merge` |
 | TopK | `.topk` | `topk_file_create_v2`, `topk_file_add_v2`, `topk_file_incrby_v2`, `topk_file_query_v2`, `topk_file_list_v2`, `topk_file_count_v2`, `topk_file_info_v2` |
-| TDigest | `.tdig` | (in-memory ResourceArc — pending migration to stateless) |
+| TDigest | `.tdig` | In-memory native resource, pending migration to stateless file-backed storage |
 
 Write commands route through Raft for replication. Read commands use stateless pread NIFs directly on the local file. Files live at `shard_data_path/prob/BASE64_KEY.ext`.
 
@@ -621,69 +595,105 @@ NIFs run on the Normal BEAM scheduler with cooperative yielding via `enif_schedu
 
 ## Connection Handling (Standalone Mode)
 
-Each TCP connection is a Ranch protocol handler (`FerricstoreServer.Connection`) that:
+Each standalone client connection is a Ranch protocol handler
+(`FerricstoreServer.Native.Connection`). The only standalone data plane is the
+Ferric native binary protocol.
 
-1. Performs the Ranch handshake (`ranch.handshake/1`)
-2. Enforces `require_tls` -- rejects plaintext connections if configured
-3. Checks protected mode -- rejects non-localhost when no ACL passwords are set
-4. Enters an event-driven receive loop (configurable via `:socket_active_mode`, default `active: true`)
+Connection startup:
 
-### Sliding Window Pipeline
+1. Performs the Ranch handshake (`ranch.handshake/1`).
+2. Enforces `require_tls` when configured.
+3. Checks protected mode and `maxclients`.
+4. Creates a connection state with client id, ACL cache, socket settings,
+   frame limits, lane limits, chunk limits, and idle timeout.
+5. Registers the client in `FerricstoreServer.Connection.Registry`.
+6. Enters an event-driven receive loop.
 
-Connections support pipelined commands with concurrent dispatch:
+Native frame shape:
 
-- All "pure" commands (those that don't mutate connection state) in a pipeline batch are dispatched concurrently as `Task`s.
-- Responses are sent in-order: response N is sent as soon as responses 0..N are all complete. Fast commands before a slow command get delivered immediately.
-- Stateful commands (MULTI, AUTH, SUBSCRIBE, blocking ops) act as barriers: all prior concurrent tasks are awaited and flushed before the stateful command executes synchronously.
+```text
+magic(4) version(1) flags(1) lane_id(4) opcode(2) request_id(8) body_len(4) body(N)
+```
 
-### Ferric protocol Pipeline Write Batching
+The Rust native-protocol NIF scans frames and emits frame headers/bodies. It
+does not own sessions, ACL state, storage state, or command semantics. Elixir
+owns socket/TLS handling, authorization, lane scheduling, command dispatch, and
+response coalescing.
 
-Phase 1 batches only consecutive Ferric protocol pipeline runs of safe single-key writes that already have direct Raft state-machine commands. The connection keeps response order intact, preserves read boundaries, and falls back to the existing command path for anything outside the allowlist.
+### Lanes And Multiplexing
 
-Included in phase 1:
+Native clients can pipeline requests with stable `request_id` correlation.
+Ordering is preserved within one lane; different lanes can execute
+concurrently.
 
-- Plain `SET`
-- `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`
-- `APPEND`, `SETRANGE`, `SETBIT`
-- `HINCRBY`, `HINCRBYFLOAT`, `ZINCRBY`
-- `PFADD`
+```text
+lane 0   control requests and server events
+lane N   ordered data stream, usually mapped to shard_id + 1
+```
 
-Explicitly excluded:
+The server bounds per-connection inflight requests, per-lane inflight requests,
+lane queue size, pending chunks, and pending chunk bytes. A closed window or
+full queue returns `busy` instead of letting one client consume unbounded
+memory.
 
-- `GETSET`, `GETDEL`, `GETEX`, and any other write command whose reply depends on returning prior state.
-- Multi-key commands and cross-shard commands.
-- Compound writes without a direct Raft command conversion, including `HSET`, `SADD`, `ZADD`, list/stream mutations, `MSET`, and `DEL`.
-- Commands inside `MULTI` or commands requiring per-command ACL checks.
+### Command Forms
 
-Phase 2 can expand the allowlist when needed. Good candidates are same-shard `MSET`, same-shard single-entry compound writes (`HSET`, `SADD`, `ZADD`) after exact type/error semantics are audited, and `DEL`/`UNLINK` only if the batched path can preserve FerricStore integer-delete replies for plain and compound keys.
+Dedicated native opcodes exist for hot KV, Flow, cluster, and admin commands.
+The protocol also has `COMMAND_EXEC` for generic command execution:
+
+```text
+{"command": "SET", "args": ["key", "value"]}
+{"command": "FLOW.CLAIM_DUE", "args": ["email", "STATE", "queued", "WORKER", "w1"]}
+```
+
+`Ferricstore.Commands.NativeAstParser` converts generic native command bodies
+into the same internal AST shape used by embedded command handlers. The native
+protocol separates command name and arguments; it does not parse inline text
+frames.
 
 ### Per-Connection State
 
-Each connection maintains:
-- **Multi/transaction state**: `:none` or `:queuing` mode, queued commands, watched keys with shard write versions.
-- **ACL context**: Cached user permissions (commands, key patterns, enabled flag).
-- **Pub/Sub subscriptions**: Channel and pattern subscription sets.
-- **Client tracking config**: For cache invalidation broadcasts.
+Each native connection maintains:
 
-### Transaction Support (MULTI/EXEC/DISCARD/WATCH)
+- **Multi/transaction state**: `:none` or `:queuing`, queued commands, and watched keys.
+- **ACL context**: cached command, key, and channel permissions.
+- **Pub/Sub subscriptions**: channel and pattern subscription sets.
+- **Flow wake/event subscriptions**: optional server events on lane 0.
+- **Backpressure state**: inflight counters, lane queues, chunk buffers, and close-after-reply flags.
 
-When `MULTI` is issued, the connection enters `:queuing` mode. Subsequent commands (except EXEC, DISCARD, MULTI, WATCH, UNWATCH) are queued with `+QUEUED` responses. `EXEC` executes all queued commands sequentially. If `WATCH` was used and any watched key's shard write-version changed, `EXEC` returns nil (transaction aborted). `DISCARD` clears the queue.
+### Transaction And Blocking Support
+
+`MULTI`/`EXEC`/`DISCARD`/`WATCH` are session commands carried by
+`COMMAND_EXEC`. During a transaction, the server requires `COMMAND_EXEC` frames
+until `EXEC` or `DISCARD` so queued commands have a single session-level shape.
+
+Blocking list/stream commands are handled by the native blocking path and keep
+the request correlated to its original lane and request id. Embedded mode does
+not expose blocking waits because there is no persistent client socket to hold.
 
 ### Input Validation
 
-Protocol-level limits prevent resource exhaustion from malicious or malformed input:
+Protocol-level and command-level limits prevent resource exhaustion from
+malicious or malformed input:
 
 | Input | Limit | Enforced At |
 |-------|-------|-------------|
-| Ferric protocol array elements | 1,000,000 | Ferric protocol parser |
-| Inline command size | 1 MB | Ferric protocol parser |
+| Native frame body | `native_max_frame_bytes` | Native frame decoder |
+| Connection receive buffer | 128 MB | `Native.Connection` |
+| Pending request chunks | `native_max_pending_chunks` | `Native.Connection` |
+| Pending chunk bytes | `native_max_pending_chunk_bytes` | `Native.Connection` |
+| Lanes per connection | `native_max_lanes_per_connection` | `Native.Connection` |
+| Lane queue length | `native_lane_max_queue` | Native lane scheduler |
+| Value size | `max_value_size` | Native body validation and embedded API |
 | INCR/DECRBY values | i64 range (-2^63 to 2^63-1) | Command handler |
 | SETRANGE offset | 512 MB | Command handler |
-| SUBSCRIBE/PSUBSCRIBE per connection | 100,000 | Connection state |
+| SUBSCRIBE/PSUBSCRIBE per connection | 100,000 | Native session state |
 | SETBIT offset | 2^32 - 1 | Command handler |
-| Glob patterns (KEYS, SCAN) | 1,024 bytes | Command handler (CVE-2022-36021 mitigation) |
+| Glob patterns (KEYS, SCAN) | 1,024 bytes | Command handler |
 
-These limits apply in both standalone and embedded mode. The Ferric protocol parser limits are checked before command dispatch, so oversized payloads are rejected without allocating memory for the full payload.
+These command limits apply in both standalone and embedded mode. Native frame
+limits are checked before command dispatch, so oversized payloads are rejected
+without executing a command.
 
 ## Three-Tier Storage
 
@@ -705,7 +715,7 @@ Bitcask is an append-only log-structured storage engine. When values are evicted
 - Point reads via pread at known offset -- no scanning
 - Background merge/compaction removes dead entries
 - Hint files for fast startup recovery
-- File rotation at 256 MB
+- File rotation at `@max_active_file_size` (8 GiB by default)
 
 ### Tier 3: Stateless pread/pwrite (Probabilistic)
 
@@ -719,7 +729,7 @@ Probabilistic data structures use stateless file-based NIFs with pread/pwrite. E
 | TopK | `.topk` | CMS + min-heap |
 | TDigest | `.tdig` | Sorted centroid array |
 
-Write commands replicate through Raft. Read commands bypass Raft and use stateless pread NIFs on local files. Zero process memory — the OS page cache handles caching.
+Write commands replicate through Raft. Read commands bypass Raft and use stateless pread NIFs on local files. The OS page cache handles caching instead of process heap storage.
 
 ## Telemetry Events
 

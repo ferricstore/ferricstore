@@ -600,7 +600,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Private helpers
   # -------------------------------------------------------------------
 
-  # LFU touch with time-based decay (Redis-compatible).
+  # LFU touch with time-based decay.
   defp lfu_touch(keydir, key, packed_lfu) do
     LFU.touch(keydir, key, packed_lfu)
   end

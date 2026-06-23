@@ -817,7 +817,7 @@ high-rate denials aggregate
 Performance tests:
 
 ```text
-governance disabled: DBOS/memtier unchanged
+governance disabled: DBOS/native-KV baselines unchanged
 warm local credits: claim_due close to baseline
 refill path: bounded p99
 denial storm: no write/log storm

@@ -14,7 +14,7 @@ Use the production guides for normal deployments:
 | Resource | Purpose |
 | --- | --- |
 | FerricStore server VM(s) | Run the FerricStore server under benchmark load. |
-| Client VM | Run benchmark clients such as memtier and SDK workload scripts. |
+| Client VM | Run native benchmark clients and SDK workload scripts. |
 | VNet/subnet/NSG | Private benchmark network plus SSH access. |
 | Local NVMe mount | Benchmark data directory mounted at `/data`. |
 
@@ -116,19 +116,9 @@ terraform output
 
 SSH to the client VM and run benchmark scripts from `~/ferricstore` or the Python SDK repository, depending on the workload being reproduced.
 
-KV SET/GET benchmark shape:
-
-```bash
-memtier_benchmark \
-  --server <server_private_ip> \
-  --port 6379 \
-  --protocol resp3 \
-  --threads 4 \
-  --clients 200 \
-  --pipeline 30 \
-  --test-time 30 \
-  --data-size 256
-```
+KV SET/GET benchmark shape should use a native-protocol SDK/client. Record the
+connection count, lanes per connection, in-flight requests per lane, value size,
+key range, throughput, and p50/p95/p99/p99.9 latency.
 
 FerricFlow benchmark shapes are documented in [Benchmarks](../../docs/benchmarks.md). Use the Python SDK benchmark scripts for queue/workflow runs.
 

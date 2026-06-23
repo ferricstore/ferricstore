@@ -27,7 +27,7 @@ defmodule FerricstoreServer.Native.ProtocolAuditTest do
     end
   end
 
-  test "application config enables the Ferric protocol listener by default" do
+  test "application config enables the native protocol listener by default" do
     assert is_integer(Application.get_env(:ferricstore, :native_port))
   end
 

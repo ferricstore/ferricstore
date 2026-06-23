@@ -1,6 +1,6 @@
 defmodule Ferricstore.Commands.Bloom do
   @moduledoc """
-  Handles Redis-compatible Bloom filter commands.
+  Handles Bloom filter commands.
 
   Write commands (BF.RESERVE, BF.ADD, BF.MADD) route through Raft via
   `store.prob_write` so that mutations are replicated to follower nodes.

@@ -5,7 +5,7 @@
 [![CI](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml/badge.svg)](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-**FerricStore is a durable server with Ferric protocol storage and FerricFlow workflow state built in.**
+**FerricStore is a durable server with a Ferric native TCP protocol and FerricFlow workflow state built in.**
 
 FerricStore gives applications a durable key-value/data-structure store and a workflow layer for worker queues, explicit state machines, retries, leases, history, observability, indexed attributes, value refs, signals, and fanout.
 
@@ -75,9 +75,9 @@ docker pull ghcr.io/ferricstore/ferricstore:0.5.2
 Current release images are published as multi-arch images for `linux/amd64`
 and `linux/arm64`.
 
-## First Flow Over the Ferric protocol
+## First Flow Over The Ferric Native Protocol
 
-FerricFlow commands are exposed over Ferric protocol, so clients can use pipelines, ACLs, TLS, and existing connection pools. Durability is the default contract: a workflow command returns success only after the state change is accepted through the quorum path and written to disk.
+FerricFlow commands are exposed over FerricStore's native binary TCP protocol, so SDK clients can use multiplexed lanes, request ids, ACLs, TLS, and bounded backpressure. Durability is the default contract: a workflow command returns success only after the state change is accepted through the quorum path and written to disk.
 
 Durable queue item:
 
@@ -97,7 +97,7 @@ FLOW.CLAIM_DUE order STATE charged WORKER worker-1 LIMIT 1
 FLOW.COMPLETE order-1 <lease-token> FENCING <fencing-token> RESULT "ok"
 ```
 
-Because this is the Ferric protocol, Flow commands and normal FerricStore commands can be pipelined on the same connection.
+Flow commands and normal FerricStore commands can be pipelined on the same native connection.
 
 ## Python SDK
 
@@ -160,7 +160,7 @@ Python SDK links:
 
 ## Core FerricFlow Primitives
 
-- **Queue-to-workflow upgrade** — Python, Elixir, Java, Go, Node, or any Ferric protocol-capable service can claim specific Flow states, transition work forward, and share one durable record for retries, leases, history, and terminal status.
+- **Queue-to-workflow upgrade** — Python, Elixir, Java, Go, Node, or any FerricStore SDK-capable service can claim specific Flow states, transition work forward, and share one durable record for retries, leases, history, and terminal status.
 
 ### Signals
 
@@ -239,7 +239,7 @@ def dispatch(job):
 
 ## Durable Store Underneath
 
-FerricStore also exposes a Ferric protocol durable key-value/data-structure store:
+FerricStore also exposes a durable key-value/data-structure store through the native protocol and embedded API:
 
 ```text
 SET user:42:name alice
@@ -283,7 +283,7 @@ Start here:
 
 FerricFlow:
 
-- [Flow command reference](guides/commands.md) — `FLOW.*` command syntax and FerricStore command compatibility.
+- [Flow command reference](guides/commands.md) — `FLOW.*` command syntax and FerricStore command behavior.
 - [Flow retry policy](docs/flow-retry-policy.md) — type/state retry policies and retry exhaustion behavior.
 - [Flow production readiness](docs/flow-production-readiness.md) — operational model, lagged projections, retention, reclaim, and production tuning.
 - [Elixir Flow SDK](guides/flow-elixir-sdk.md) — high-level embedded workflow/state-machine API over core Flow commands.
@@ -291,7 +291,7 @@ FerricFlow:
 Operations and reference:
 
 - [Architecture](guides/architecture.md) — write path, read path, storage, Raft consensus.
-- [Commands Reference](guides/commands.md) — FerricStore command syntax, FerricStore compatibility, and FerricFlow commands.
+- [Commands Reference](guides/commands.md) — FerricStore command syntax, native protocol mapping, and FerricFlow commands.
 - [Configuration](guides/configuration.md) — server config and production defaults.
 - [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering.
 - [Security](guides/security.md) — ACL, TLS, protected mode.

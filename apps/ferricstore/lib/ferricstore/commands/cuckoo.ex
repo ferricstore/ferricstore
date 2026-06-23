@@ -1,6 +1,6 @@
 defmodule Ferricstore.Commands.Cuckoo do
   @moduledoc """
-  Handles Redis-compatible Cuckoo filter commands.
+  Handles Cuckoo filter commands.
 
   Write commands (CF.RESERVE, CF.ADD, CF.ADDNX, CF.DEL) route through
   Raft via `store.prob_write`. Read commands (CF.EXISTS, CF.MEXISTS,
