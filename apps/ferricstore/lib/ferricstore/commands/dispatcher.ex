@@ -32,6 +32,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     Hash,
     HyperLogLog,
     List,
+    Management,
     Memory,
     NativeAstParser,
     Namespace,
@@ -62,6 +63,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @hll_raw_commands ~w(PFADD PFCOUNT PFMERGE)
   @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
   @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
+  @management_raw_commands ~w(ACL FERRICSTORE.CAPABILITIES FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
   @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE FERRICSTORE.HOTNESS)
   @raw_fallback_ast_tags ~w(xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
@@ -254,6 +256,10 @@ defmodule Ferricstore.Commands.Dispatcher do
     fetch_or_compute: "fetch_or_compute",
     fetch_or_compute_result: "fetch_or_compute_result",
     fetch_or_compute_error: "fetch_or_compute_error",
+    ferricstore_capabilities: "ferricstore.capabilities",
+    ferricstore_namespace: "ferricstore.namespace",
+    ferricstore_quota: "ferricstore.quota",
+    ferricstore_telemetry: "ferricstore.telemetry",
     ferricstore_blobgc: "ferricstore.blobgc",
     ferricstore_doctor: "ferricstore.doctor"
   }
@@ -545,6 +551,23 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({:ferricstore_metrics, args}, _store),
     do: Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args)
 
+  def dispatch_ast({:acl, {:error, _} = err}, _store), do: err
+
+  def dispatch_ast({:acl, subcmd, args}, store) when is_binary(subcmd) and is_list(args),
+    do: Management.handle("ACL", [subcmd | args], store)
+
+  def dispatch_ast({:ferricstore_capabilities, args}, store),
+    do: Management.handle("FERRICSTORE.CAPABILITIES", args, store)
+
+  def dispatch_ast({:ferricstore_namespace, args}, store),
+    do: Management.handle("FERRICSTORE.NAMESPACE", args, store)
+
+  def dispatch_ast({:ferricstore_quota, args}, store),
+    do: Management.handle("FERRICSTORE.QUOTA", args, store)
+
+  def dispatch_ast({:ferricstore_telemetry, args}, store),
+    do: Management.handle("FERRICSTORE.TELEMETRY", args, store)
+
   def dispatch_ast({:ferricstore_blobgc, args}, store),
     do: Server.handle("FERRICSTORE.BLOBGC", args, store)
 
@@ -685,6 +708,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       cmd in @geo_raw_commands -> Geo.handle(cmd, args, store)
       cmd in @hll_raw_commands -> HyperLogLog.handle(cmd, args, store)
       cmd in @native_raw_commands -> Native.handle(native_raw_command_name(cmd), args, store)
+      cmd in @management_raw_commands -> Management.handle(cmd, args, store)
       cmd in @cluster_raw_commands -> Cluster.handle(cmd, args, store)
       cmd in @prob_raw_commands -> dispatch_prob_raw(cmd, args, store)
       cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, args, store)

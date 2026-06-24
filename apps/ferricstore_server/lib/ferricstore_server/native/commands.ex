@@ -661,9 +661,9 @@ defmodule FerricstoreServer.Native.Commands do
   defp do_execute(@op_command_exec, payload, state) do
     with {:ok, command} <- require_binary(payload, "command"),
          {:ok, args} <- raw_command_args(payload),
-         {:ok, cmd, parsed_args, _ast, keys} <-
+         {:ok, cmd, parsed_args, ast, keys} <-
            Ferricstore.Commands.Dispatcher.parse_raw(command, args),
-         :ok <- authorize_raw_command(cmd, keys, state) do
+         :ok <- authorize_raw_command(cmd, parsed_args, ast, keys, state) do
       dispatch_command_exec(cmd, command, parsed_args, state)
     else
       {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
@@ -1814,20 +1814,22 @@ defmodule FerricstoreServer.Native.Commands do
     ConnAuth.check_keys_cached(cache, key_acl_command(opcode), keys(opcode, payload))
   end
 
-  defp authorize_raw_command(command, keys, state) do
+  defp authorize_raw_command(command, args, ast, keys, state) do
     cond do
       state.require_auth and not state.authenticated ->
         {:error, :auth, "NOAUTH Authentication required."}
 
       true ->
-        with :ok <- ConnAuth.check_command_cached(state.acl_cache, command),
-             :ok <- ConnAuth.check_keys_cached(state.acl_cache, command, keys) do
+        acl_command = ConnAuth.acl_command_name(command, args, ast)
+
+        with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_command),
+             :ok <- ConnAuth.check_keys_cached(state.acl_cache, acl_command, keys) do
           :ok
         else
           {:error, reason} ->
             FerricstoreServer.Acl.Protection.log_command_denied(
               state.username,
-              command,
+              acl_command,
               format_peer(state.peer),
               state.client_id
             )

@@ -16,7 +16,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
     MULTI EXEC DISCARD WATCH UNWATCH
     DBSIZE KEYS FLUSHDB FLUSHALL SELECT INFO COMMAND LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE
     CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.CONFIG
-    FERRICSTORE.METRICS FERRICSTORE.KEY_INFO
+    FERRICSTORE.METRICS FERRICSTORE.KEY_INFO FERRICSTORE.CAPABILITIES
+    FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY
     FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.STEP_CONTINUE
     FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
     FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.GET FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE_DUE
@@ -83,6 +84,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK
     TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE
   )
+  @management_scoped_commands ~w(FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
 
   @command_tags Map.new(
                   Enum.map(Catalog.names(), &String.upcase/1) ++ @extra_command_names,
@@ -934,10 +936,76 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast(_cmd, tag, args), do: {tag, args}
 
+  defp command_keys(cmd, args) when cmd in @management_scoped_commands do
+    management_command_keys(cmd, args)
+  end
+
   defp command_keys(cmd, args) do
     case Catalog.get_keys_upper(cmd, args) do
       {:ok, keys} -> keys
       {:error, _} -> extra_command_keys(cmd, args)
+    end
+  end
+
+  defp management_command_keys("FERRICSTORE.NAMESPACE", ["ENSURE", prefix | _]),
+    do: [scope_boundary_key(prefix)]
+
+  defp management_command_keys("FERRICSTORE.NAMESPACE", ["GET", prefix]),
+    do: [scope_boundary_key(prefix)]
+
+  defp management_command_keys("FERRICSTORE.NAMESPACE", ["DELETE", prefix]),
+    do: [scope_boundary_key(prefix)]
+
+  defp management_command_keys("FERRICSTORE.NAMESPACE", ["LIST"]), do: ["*"]
+
+  defp management_command_keys("FERRICSTORE.QUOTA", [subcmd, scope | _])
+       when subcmd in ["SET", "GET", "USAGE"],
+       do: [scope_boundary_key(scope)]
+
+  defp management_command_keys("FERRICSTORE.TELEMETRY", ["CLUSTER_INFO"]), do: ["*"]
+
+  defp management_command_keys("FERRICSTORE.TELEMETRY", ["NAMESPACE_USAGE", prefix]),
+    do: [scope_boundary_key(prefix)]
+
+  defp management_command_keys("FERRICSTORE.TELEMETRY", ["FLOW_QUERY" | attrs]),
+    do: scoped_attr_keys(attrs)
+
+  defp management_command_keys("FERRICSTORE.TELEMETRY", ["FLOW_HISTORY", _id | attrs]),
+    do: scoped_attr_keys(attrs)
+
+  defp management_command_keys(_cmd, _args), do: []
+
+  defp scoped_attr_keys(attrs) do
+    keys =
+      attrs
+      |> Enum.chunk_every(2)
+      |> Enum.flat_map(fn
+        [key, value] when is_binary(key) and is_binary(value) ->
+          case String.downcase(key) do
+            key when key in ["prefix", "namespace", "scope", "partition", "partition_key"] ->
+              [scope_boundary_key(value)]
+
+            _ ->
+              []
+          end
+
+        _ ->
+          []
+      end)
+
+    case keys do
+      [] -> ["*"]
+      keys -> keys
+    end
+  end
+
+  defp scope_boundary_key("*"), do: "*"
+
+  defp scope_boundary_key(scope) when is_binary(scope) do
+    cond do
+      String.ends_with?(scope, "*") -> scope
+      String.ends_with?(scope, ":") -> scope <> "*"
+      true -> scope <> ":*"
     end
   end
 

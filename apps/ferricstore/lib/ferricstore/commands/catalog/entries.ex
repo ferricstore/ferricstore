@@ -225,6 +225,15 @@ defmodule Ferricstore.Commands.Catalog.Entries do
       step: 0,
       summary: "Returns information about all or specific commands."
     },
+    %{
+      name: "acl",
+      arity: -2,
+      flags: ["admin"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Manages ACL users when management support is available."
+    },
 
     # -- CLIENT subcommands ------------------------------------------------
     %{
@@ -302,6 +311,42 @@ defmodule Ferricstore.Commands.Catalog.Entries do
       last_key: 1,
       step: 1,
       summary: "Returns diagnostic metadata about a key (type, size, TTL, cache status, shard)."
+    },
+    %{
+      name: "ferricstore.capabilities",
+      arity: 1,
+      flags: ["readonly", "fast", "stale"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Returns stable SDK management capabilities for this server."
+    },
+    %{
+      name: "ferricstore.namespace",
+      arity: -2,
+      flags: ["admin"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Manages namespace metadata when management support is available."
+    },
+    %{
+      name: "ferricstore.quota",
+      arity: -3,
+      flags: ["admin"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Manages namespace resource-limit specs when management support is available."
+    },
+    %{
+      name: "ferricstore.telemetry",
+      arity: -2,
+      flags: ["readonly", "fast", "stale"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Reads safe control-plane telemetry metadata."
     },
 
     # -- Flow --------------------------------------------------------------
