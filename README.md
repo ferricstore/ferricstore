@@ -257,6 +257,12 @@ Writes go through Raft consensus and disk-backed storage before success is repor
 | Isolated | Single-threaded state machine per shard. |
 | Durable | WAL, disk-backed storage, and Raft quorum before ack. |
 
+The KV store is not just `SET`/`GET`: it also includes hashes, lists, sets,
+sorted sets, durable streams, live Pub/Sub notifications, bitmaps, HyperLogLog,
+GEO, probabilistic structures, CAS, locks, rate limits, and cache-aside helpers.
+See [Key-Value Store](guides/kv-store.md) for the model, write/read path, TTL
+behavior, hot/cold storage, streams vs Pub/Sub, and key design.
+
 ## Embedded Elixir
 
 FerricStore can also run inside an Elixir application.
@@ -278,6 +284,7 @@ FerricFlow is also available through embedded `FerricStore.flow_*` functions and
 Start here:
 
 - [Getting Started](guides/getting-started.md) — installation, configuration, first commands.
+- [Key-Value Store](guides/kv-store.md) — how the durable KV/data-structure store works.
 - [Workflow usage examples](docs/flow-vs-temporal-usage.md) — queues, workflows, retries, fanout, signals, and value refs.
 - [Benchmarks](docs/benchmarks.md) — latest Azure FerricFlow and KV SET/GET results.
 

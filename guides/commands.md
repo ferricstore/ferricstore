@@ -2,7 +2,7 @@
 
 This is the command reference for the native TCP server, embedded API, and FerricFlow.
 
-Start here if you need command syntax, logical return values, embedded API equivalents, or native protocol mapping notes. For a first walkthrough, use [Getting Started](getting-started.md).
+Start here if you need command syntax, logical return values, embedded API equivalents, or native protocol mapping notes. For a first walkthrough, use [Getting Started](getting-started.md). For the KV store model and storage path, use [Key-Value Store](kv-store.md).
 
 Native TCP clients normally use dedicated opcodes with typed map payloads. For
 commands outside the compact opcode set, native clients use `COMMAND_EXEC` with

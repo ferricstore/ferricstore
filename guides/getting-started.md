@@ -161,6 +161,7 @@ _build/prod/rel/ferricstore/bin/ferricstore start
 
 ## 6. Next Steps
 
+- [Key-Value Store](kv-store.md) -- how the durable KV/data-structure store works.
 - [Workflow usage examples](../docs/flow-vs-temporal-usage.md) -- queues, state machines, signals, retries, fanout, and value refs.
 - [Commands Reference](commands.md) -- command syntax and native protocol mapping.
 - [Embedded Mode](embedded-mode.md) -- direct Elixir API.
