@@ -286,7 +286,7 @@ Start here:
 - [Getting Started](guides/getting-started.md) — installation, configuration, first commands.
 - [Key-Value Store](guides/kv-store.md) — how the durable KV/data-structure store works.
 - [Workflow usage examples](docs/flow-vs-temporal-usage.md) — queues, workflows, retries, fanout, signals, and value refs.
-- [Benchmarks](docs/benchmarks.md) — latest Azure FerricFlow and KV SET/GET results.
+- [Benchmarks](docs/benchmarks.md) — latest Azure FerricFlow results and native KV benchmark requirements.
 
 FerricFlow:
 

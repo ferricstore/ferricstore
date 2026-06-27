@@ -520,7 +520,7 @@ defmodule FerricstoreServer.Native.Commands do
     end
   rescue
     error ->
-      {:error, Exception.message(error), state}
+      rescued_execute_error(opcode, payload, state, error)
   end
 
   def execute(opcode, payload, state) do
@@ -535,8 +535,31 @@ defmodule FerricstoreServer.Native.Commands do
     end
   rescue
     error ->
-      {:error, Exception.message(error), state}
+      rescued_execute_error(opcode, payload, state, error)
   end
+
+  defp rescued_execute_error(opcode, payload, state, error) do
+    if metrics_command_payload?(opcode, payload) do
+      {:ok, "", state}
+    else
+      {:error, Exception.message(error), state}
+    end
+  end
+
+  defp metrics_command_payload?(@op_ferricstore_metrics, _payload), do: true
+
+  defp metrics_command_payload?(@op_command_exec, payload) when is_map(payload) do
+    payload
+    |> Map.get("command", Map.get(payload, :command))
+    |> metrics_command_name?()
+  end
+
+  defp metrics_command_payload?(_opcode, _payload), do: false
+
+  defp metrics_command_name?(command) when is_binary(command),
+    do: String.upcase(command) == "FERRICSTORE.METRICS"
+
+  defp metrics_command_name?(_command), do: false
 
   @spec summary(map()) :: map()
   def summary(state) do
@@ -660,11 +683,19 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_command_exec, payload, state) do
     with {:ok, command} <- require_binary(payload, "command"),
-         {:ok, args} <- raw_command_args(payload),
-         {:ok, cmd, parsed_args, ast, keys} <-
-           Ferricstore.Commands.Dispatcher.parse_raw(command, args),
-         :ok <- authorize_raw_command(cmd, parsed_args, ast, keys, state) do
-      dispatch_command_exec(cmd, command, parsed_args, state)
+         {:ok, args} <- raw_command_args(payload) do
+      if String.upcase(command) == "FERRICSTORE.METRICS" do
+        ferricstore_metrics_result(args, state)
+      else
+        with {:ok, cmd, parsed_args, ast, keys} <-
+               Ferricstore.Commands.Dispatcher.parse_raw(command, args),
+             :ok <- authorize_raw_command(cmd, parsed_args, ast, keys, state) do
+          dispatch_command_exec(cmd, command, parsed_args, state)
+        else
+          {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
+          {:error, status, reason} -> {status, reason, state}
+        end
+      end
     else
       {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
       {:error, status, reason} -> {status, reason, state}
@@ -1030,7 +1061,16 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_ferricstore_metrics, payload, state) do
     with {:ok, args} <- native_args(payload) do
-      result_to_reply(Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args), state)
+      result =
+        try do
+          Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args)
+        rescue
+          _ -> ""
+        catch
+          :exit, _ -> ""
+        end
+
+      result_to_reply(result, state)
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1644,9 +1684,26 @@ defmodule FerricstoreServer.Native.Commands do
   defp dispatch_command_exec("CLIENT", _command, [], state),
     do: {:bad_request, "ERR wrong number of arguments for 'client' command", state}
 
+  defp dispatch_command_exec("FERRICSTORE.METRICS", _command, parsed_args, state) do
+    ferricstore_metrics_result(parsed_args, state)
+  end
+
   defp dispatch_command_exec(_cmd, command, parsed_args, state) do
     store = state.instance_ctx
     result = Ferricstore.Commands.Dispatcher.dispatch_raw(command, parsed_args, store)
+    result |> raw_result_to_native() |> result_to_reply(state)
+  end
+
+  defp ferricstore_metrics_result(parsed_args, state) do
+    result =
+      try do
+        Ferricstore.Metrics.handle("FERRICSTORE.METRICS", parsed_args)
+      rescue
+        _ -> ""
+      catch
+        :exit, _ -> ""
+      end
+
     result |> raw_result_to_native() |> result_to_reply(state)
   end
 

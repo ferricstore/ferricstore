@@ -549,7 +549,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     do: Namespace.handle("FERRICSTORE.CONFIG", args, store)
 
   def dispatch_ast({:ferricstore_metrics, args}, _store),
-    do: Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args)
+    do: safe_ferricstore_metrics(args)
 
   def dispatch_ast({:acl, {:error, _} = err}, _store), do: err
 
@@ -593,6 +593,14 @@ defmodule Ferricstore.Commands.Dispatcher do
     do: wrong_arity_ast(tag)
 
   def dispatch_ast(_ast, _store), do: {:error, "ERR unsupported command AST"}
+
+  defp safe_ferricstore_metrics(args) do
+    Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args)
+  rescue
+    _ -> ""
+  catch
+    :exit, _ -> ""
+  end
 
   defp wrong_arity_ast(tag) do
     case @ast_command_names do
@@ -703,6 +711,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       cmd in @zset_raw_commands -> SortedSet.handle(cmd, args, store)
       cmd in @bitmap_raw_commands -> Bitmap.handle(cmd, args, store)
       cmd in @generic_raw_commands -> Generic.handle(cmd, args, store)
+      cmd == "FERRICSTORE.METRICS" -> safe_ferricstore_metrics(args)
       cmd in @server_raw_commands -> Server.handle(cmd, args, store)
       cmd in @stream_raw_commands -> Stream.handle(cmd, args, store)
       cmd in @geo_raw_commands -> Geo.handle(cmd, args, store)
@@ -712,7 +721,6 @@ defmodule Ferricstore.Commands.Dispatcher do
       cmd in @cluster_raw_commands -> Cluster.handle(cmd, args, store)
       cmd in @prob_raw_commands -> dispatch_prob_raw(cmd, args, store)
       cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, args, store)
-      cmd == "FERRICSTORE.METRICS" -> Ferricstore.Metrics.handle(cmd, args)
       cmd == "MEMORY" -> dispatch_memory_raw(args, store)
       cmd == "PUBLISH" or cmd == "PUBSUB" -> PubSub.handle(cmd, args)
       true -> unknown_command(cmd)

@@ -90,17 +90,24 @@ defmodule Ferricstore.Metrics do
       metrics()
       |> Enum.map_join("\n", &format_metric/1)
 
-    ns = namespace_metrics_text()
-    checkpoint = checkpoint_metrics_text()
-    prefix = prefix_metrics_text()
-    quorum = Ferricstore.QuorumMetrics.prometheus_text()
-
-    blob = blob_metrics_text()
+    ns = safe_metric_block(&namespace_metrics_text/0)
+    checkpoint = safe_metric_block(&checkpoint_metrics_text/0)
+    prefix = safe_metric_block(&prefix_metrics_text/0)
+    quorum = safe_metric_block(&Ferricstore.QuorumMetrics.prometheus_text/0)
+    blob = safe_metric_block(&blob_metrics_text/0)
 
     [base, ns, checkpoint, prefix, quorum, blob]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n")
     |> Kernel.<>("\n")
+  end
+
+  defp safe_metric_block(fun) when is_function(fun, 0) do
+    fun.()
+  rescue
+    _ -> ""
+  catch
+    :exit, _ -> ""
   end
 
   # ---------------------------------------------------------------------------
@@ -441,10 +448,18 @@ defmodule Ferricstore.Metrics do
     samples =
       0..(shard_count() - 1)
       |> Enum.map_join("\n", fn shard ->
-        "#{name}{shard_index=\"#{shard}\"} #{value_fun.(shard)}"
+        "#{name}{shard_index=\"#{shard}\"} #{safe_metric_value(value_fun, shard)}"
       end)
 
     "# HELP #{name} #{help}\n# TYPE #{name} gauge\n#{samples}"
+  end
+
+  defp safe_metric_value(value_fun, shard) do
+    value_fun.(shard)
+  rescue
+    _ -> 0
+  catch
+    :exit, _ -> 0
   end
 
   defp blob_hardened_stat(%{data_dir: data_dir}, shard, field)
@@ -458,17 +473,18 @@ defmodule Ferricstore.Metrics do
 
   defp blob_hardened_stat(_ctx, _shard, _field), do: 0
 
-  defp atomic_metric(nil, _field, _shard), do: 0
+  defp atomic_metric(ctx, field, shard) do
+    if is_map(ctx) and is_atom(field) and is_integer(shard) and shard >= 0 do
+      case Map.get(ctx, field) do
+        ref when is_reference(ref) ->
+          index = shard + 1
+          if index <= :atomics.info(ref).size, do: :atomics.get(ref, index), else: 0
 
-  defp atomic_metric(ctx, field, shard)
-       when is_atom(field) and is_integer(shard) and shard >= 0 do
-    case Map.get(ctx, field) do
-      ref when is_reference(ref) ->
-        index = shard + 1
-        if index <= :atomics.info(ref).size, do: :atomics.get(ref, index), else: 0
-
-      _ ->
-        0
+        _ ->
+          0
+      end
+    else
+      0
     end
   rescue
     _ -> 0

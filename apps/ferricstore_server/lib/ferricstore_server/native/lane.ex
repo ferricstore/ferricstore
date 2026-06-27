@@ -15,9 +15,11 @@ defmodule FerricstoreServer.Native.Lane do
   @flag_trace 0x01
   @flag_custom_payload 0x02
   @flag_no_reply 0x10
+  @op_pipeline 0x000E
   @op_get 0x0101
   @op_set 0x0102
   @op_mget 0x0104
+  @compact_data_write_pipeline_modes [22, 23, 24, 25, 26, 31, 32]
 
   @spec start_link(pid(), non_neg_integer(), map()) :: {:ok, pid()}
   def start_link(owner, lane_id, command_state)
@@ -61,23 +63,39 @@ defmodule FerricstoreServer.Native.Lane do
   def loop(owner, lane_id, command_state) do
     receive do
       {:native_lane_frame, frame} ->
-        response = execute_frame(frame, command_state)
+        cond do
+          compact_set_pipeline_frame?(frame) ->
+            {frames, next_frame} = collect_ready_compact_set_pipeline_frames([frame])
+            execute_and_send_frames(owner, lane_id, frames, command_state)
 
-        case response do
-          :noreply -> send(owner, {:native_lane_done, lane_id})
-          iodata -> send(owner, {:native_lane_response, lane_id, iodata})
+            if next_frame != nil do
+              execute_and_send_frame(owner, lane_id, next_frame, command_state)
+            end
+
+          plain_set_frame?(frame) ->
+            {frames, next_frame} = collect_ready_plain_set_frames([frame])
+            execute_and_send_frames(owner, lane_id, frames, command_state)
+
+            if next_frame != nil do
+              execute_and_send_frame(owner, lane_id, next_frame, command_state)
+            end
+
+          compact_data_write_pipeline_frame?(frame) ->
+            {frames, next_frame} = collect_ready_compact_data_write_pipeline_frames([frame])
+            execute_and_send_frames(owner, lane_id, frames, command_state)
+
+            if next_frame != nil do
+              execute_and_send_frame(owner, lane_id, next_frame, command_state)
+            end
+
+          true ->
+            execute_and_send_frame(owner, lane_id, frame, command_state)
         end
 
         loop(owner, lane_id, command_state)
 
       {:native_lane_frames, frames} ->
-        {responses, done_count} = execute_frames(frames, command_state)
-
-        case responses do
-          [] -> send(owner, {:native_lane_done_many, lane_id, done_count})
-          _ -> send(owner, {:native_lane_responses, lane_id, responses, done_count})
-        end
-
+        execute_and_send_frames(owner, lane_id, frames, command_state)
         loop(owner, lane_id, command_state)
 
       {:native_lane_command_state, command_state} ->
@@ -88,34 +106,346 @@ defmodule FerricstoreServer.Native.Lane do
     end
   end
 
+  defp execute_and_send_frame(owner, lane_id, frame, command_state) do
+    case execute_frame(frame, command_state) do
+      :noreply -> send(owner, {:native_lane_done, lane_id})
+      iodata -> send(owner, {:native_lane_response, lane_id, iodata})
+    end
+  end
+
+  defp execute_and_send_frames(owner, lane_id, frames, command_state) do
+    {responses, done_count} = execute_frames(frames, command_state)
+
+    case responses do
+      [] -> send(owner, {:native_lane_done_many, lane_id, done_count})
+      _ -> send(owner, {:native_lane_responses, lane_id, responses, done_count})
+    end
+  end
+
+  defp compact_set_pipeline_frame?(
+         {_lane_id, @op_pipeline, _request_id, @flag_custom_payload,
+          <<0x94, 0x81, _rest::binary>>}
+       ),
+       do: true
+
+  defp compact_set_pipeline_frame?(_frame), do: false
+
+  defp compact_data_write_pipeline_frame?(frame),
+    do: compact_data_write_pipeline_mode(frame) != nil
+
+  defp compact_data_write_pipeline_mode(
+         {_lane_id, @op_pipeline, _request_id, @flag_custom_payload,
+          <<0x94, mode_byte, _rest::binary>>}
+       ) do
+    mode = Bitwise.band(mode_byte, 0x7F)
+
+    if mode_byte == mode and mode in @compact_data_write_pipeline_modes do
+      mode
+    end
+  end
+
+  defp compact_data_write_pipeline_mode(_frame), do: nil
+
+  defp plain_set_frame?({_lane_id, @op_set, _request_id, 0, _body}), do: true
+  defp plain_set_frame?(_frame), do: false
+
+  defp collect_ready_compact_set_pipeline_frames(frames) do
+    receive do
+      {:native_lane_frame, frame} ->
+        if compact_set_pipeline_frame?(frame) do
+          collect_ready_compact_set_pipeline_frames([frame | frames])
+        else
+          {Enum.reverse(frames), frame}
+        end
+    after
+      0 -> {Enum.reverse(frames), nil}
+    end
+  end
+
+  defp collect_ready_plain_set_frames(frames) do
+    receive do
+      {:native_lane_frame, frame} ->
+        if plain_set_frame?(frame) do
+          collect_ready_plain_set_frames([frame | frames])
+        else
+          {Enum.reverse(frames), frame}
+        end
+    after
+      0 -> {Enum.reverse(frames), nil}
+    end
+  end
+
+  defp collect_ready_compact_data_write_pipeline_frames(frames) do
+    receive do
+      {:native_lane_frame, frame} ->
+        if compact_data_write_pipeline_frame?(frame) do
+          collect_ready_compact_data_write_pipeline_frames([frame | frames])
+        else
+          {Enum.reverse(frames), frame}
+        end
+    after
+      0 -> {Enum.reverse(frames), nil}
+    end
+  end
+
   defp execute_frames(frames, command_state) do
-    case try_compact_mget_batch(frames, command_state) do
+    case try_compact_set_pipeline_batch(frames, command_state) do
       {:ok, responses} ->
         {responses, length(frames)}
 
       :fallback ->
-        case try_plain_get_batch(frames, command_state) do
+        case try_compact_data_write_pipeline_batch(frames, command_state) do
           {:ok, responses} ->
             {responses, length(frames)}
 
           :fallback ->
-            case try_plain_set_batch(frames, command_state) do
+            case try_compact_mget_batch(frames, command_state) do
               {:ok, responses} ->
                 {responses, length(frames)}
 
               :fallback ->
-                {responses, done_count} =
-                  Enum.reduce(frames, {[], 0}, fn frame, {responses, done_count} ->
-                    case execute_frame(frame, command_state) do
-                      :noreply -> {responses, done_count + 1}
-                      iodata -> {[iodata | responses], done_count + 1}
-                    end
-                  end)
+                case try_plain_get_batch(frames, command_state) do
+                  {:ok, responses} ->
+                    {responses, length(frames)}
 
-                {Enum.reverse(responses), done_count}
+                  :fallback ->
+                    case try_plain_set_batch(frames, command_state) do
+                      {:ok, responses} ->
+                        {responses, length(frames)}
+
+                      :fallback ->
+                        {responses, done_count} =
+                          Enum.reduce(frames, {[], 0}, fn frame, {responses, done_count} ->
+                            case execute_frame(frame, command_state) do
+                              :noreply -> {responses, done_count + 1}
+                              iodata -> {[iodata | responses], done_count + 1}
+                            end
+                          end)
+
+                        {Enum.reverse(responses), done_count}
+                    end
+                end
             end
         end
     end
+  end
+
+  defp try_compact_set_pipeline_batch(frames, command_state) do
+    with true <- plain_set_batch_allowed?(command_state),
+         true <- pressure_ok?(command_state),
+         {:ok, requests, counts, kv_pairs} <-
+           extract_compact_set_pipeline_frames(frames, [], [], []) do
+      Stats.incr_commands_by(command_state.stats_counter, length(kv_pairs))
+
+      responses =
+        command_state.instance_ctx
+        |> Router.batch_quorum_put(kv_pairs)
+        |> encode_compact_set_pipeline_batch_responses(requests, counts, command_state)
+
+      {:ok, responses}
+    else
+      _ -> :fallback
+    end
+  rescue
+    _ -> :fallback
+  end
+
+  defp extract_compact_set_pipeline_frames([], requests, counts, kv_pairs) do
+    {:ok, Enum.reverse(requests), Enum.reverse(counts),
+     kv_pairs |> Enum.reverse() |> List.flatten()}
+  end
+
+  defp extract_compact_set_pipeline_frames(
+         [
+           {lane_id, @op_pipeline, request_id, @flag_custom_payload,
+            <<0x94, 0x81, _rest::binary>> = body}
+           | rest
+         ],
+         requests,
+         counts,
+         kv_pairs
+       ) do
+    case Codec.decode_body(@op_pipeline, @flag_custom_payload, body) do
+      {:ok, %{"compact_pipeline" => {1, pairs}, "compact_values" => true}} when is_list(pairs) ->
+        extract_compact_set_pipeline_frames(
+          rest,
+          [{lane_id, request_id} | requests],
+          [length(pairs) | counts],
+          [pairs | kv_pairs]
+        )
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp extract_compact_set_pipeline_frames(_frames, _requests, _counts, _kv_pairs), do: :fallback
+
+  defp encode_compact_set_pipeline_batch_responses(results, requests, counts, command_state) do
+    {responses, []} =
+      requests
+      |> Enum.zip(counts)
+      |> Enum.map_reduce(results, fn {{lane_id, request_id}, count}, remaining ->
+        {frame_results, rest} = Enum.split(remaining, count)
+
+        response =
+          Codec.encode_command_response_frames(
+            @op_pipeline,
+            lane_id,
+            request_id,
+            :ok,
+            compact_set_pipeline_result_body(frame_results),
+            compression: Map.get(command_state, :compression, :none),
+            compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+          )
+
+        {response, rest}
+      end)
+
+    responses
+  end
+
+  defp try_compact_data_write_pipeline_batch(frames, command_state) do
+    with true <- plain_set_batch_allowed?(command_state),
+         true <- pressure_ok?(command_state),
+         {:ok, requests, counts, ops} <-
+           extract_compact_data_write_pipeline_frames(frames, [], [], []) do
+      Stats.incr_commands_by(command_state.stats_counter, length(ops))
+
+      responses =
+        command_state.instance_ctx
+        |> Router.pipeline_write_batch(ops)
+        |> encode_compact_data_write_pipeline_batch_responses(requests, counts, command_state)
+
+      {:ok, responses}
+    else
+      _ -> :fallback
+    end
+  rescue
+    _ -> :fallback
+  end
+
+  defp extract_compact_data_write_pipeline_frames([], requests, counts, ops) do
+    {:ok, Enum.reverse(requests), Enum.reverse(counts), ops |> Enum.reverse() |> List.flatten()}
+  end
+
+  defp extract_compact_data_write_pipeline_frames(
+         [{lane_id, @op_pipeline, request_id, @flag_custom_payload, body} | rest],
+         requests,
+         counts,
+         ops
+       ) do
+    case Codec.decode_body(@op_pipeline, @flag_custom_payload, body) do
+      {:ok, %{"compact_pipeline" => {mode, items}}}
+      when mode in @compact_data_write_pipeline_modes and is_list(items) ->
+        frame_ops = compact_data_write_pipeline_ops(mode, items)
+
+        extract_compact_data_write_pipeline_frames(
+          rest,
+          [{lane_id, request_id} | requests],
+          [length(frame_ops) | counts],
+          [frame_ops | ops]
+        )
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp extract_compact_data_write_pipeline_frames(_frames, _requests, _counts, _ops),
+    do: :fallback
+
+  defp compact_data_write_pipeline_ops(22, items) do
+    Enum.map(items, fn {key, field, value} -> {key, {:hset_single, key, field, value}} end)
+  end
+
+  defp compact_data_write_pipeline_ops(23, items) do
+    Enum.map(items, fn {key, value} -> {key, {:lpush_single, key, value}} end)
+  end
+
+  defp compact_data_write_pipeline_ops(24, items) do
+    Enum.map(items, fn {key, value} -> {key, {:rpush_single, key, value}} end)
+  end
+
+  defp compact_data_write_pipeline_ops(25, items) do
+    Enum.map(items, fn {key, member} -> {key, {:sadd_single, key, member}} end)
+  end
+
+  defp compact_data_write_pipeline_ops(26, items) do
+    Enum.map(items, fn {key, score, member} -> {key, {:zadd_single, key, score, member}} end)
+  end
+
+  defp compact_data_write_pipeline_ops(31, items) do
+    Enum.map(items, fn {key, member} -> {key, {:srem_single, key, member}} end)
+  end
+
+  defp compact_data_write_pipeline_ops(32, items) do
+    Enum.map(items, fn {key, member} -> {key, {:zrem_single, key, member}} end)
+  end
+
+  defp encode_compact_data_write_pipeline_batch_responses(
+         results,
+         requests,
+         counts,
+         command_state
+       ) do
+    {responses, []} =
+      requests
+      |> Enum.zip(counts)
+      |> Enum.map_reduce(results, fn {{lane_id, request_id}, count}, remaining ->
+        {frame_results, rest} = Enum.split(remaining, count)
+
+        response =
+          Codec.encode_command_response_frames(
+            @op_pipeline,
+            lane_id,
+            request_id,
+            :ok,
+            compact_pipeline_result_body(frame_results),
+            compression: Map.get(command_state, :compression, :none),
+            compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+          )
+
+        {response, rest}
+      end)
+
+    responses
+  end
+
+  defp compact_pipeline_result_body(results) do
+    pairs = Enum.map(results, &compact_set_result_pair/1)
+
+    case Codec.encode_compact_pipeline_response(pairs) do
+      payload when is_binary(payload) -> payload
+      nil -> pairs
+    end
+  end
+
+  defp compact_set_pipeline_result_body(results) do
+    case compact_ok_result_count(results, 0) do
+      {:ok, count} ->
+        Codec.encode_compact_ok_count(count)
+
+      :error ->
+        results
+        |> Enum.map(&compact_set_result_pair/1)
+        |> Codec.encode_compact_pipeline_response()
+    end
+  end
+
+  defp compact_ok_result_count([], count), do: {:ok, count}
+  defp compact_ok_result_count([:ok | rest], count), do: compact_ok_result_count(rest, count + 1)
+
+  defp compact_ok_result_count([{:ok, :ok} | rest], count),
+    do: compact_ok_result_count(rest, count + 1)
+
+  defp compact_ok_result_count([_other | _rest], _count), do: :error
+
+  defp compact_set_result_pair(result) do
+    {status, value} = plain_set_response(result)
+    [Atom.to_string(status), value]
   end
 
   defp try_compact_mget_batch(frames, command_state) do
