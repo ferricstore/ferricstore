@@ -66,17 +66,17 @@ defmodule Ferricstore.Commands.Management do
 
   def handle("FERRICSTORE.NAMESPACE", [], _store), do: wrong_arity("ferricstore.namespace")
 
-  def handle("FERRICSTORE.QUOTA", ["SET", namespace | rest], _store) do
+  def handle("FERRICSTORE.QUOTA", ["SET", namespace | rest], store) do
     with {:ok, limit_spec} <- pair_map(rest) do
-      result(FerricStore.ResourceLimits.set_limit(namespace, limit_spec))
+      result(FerricStore.ResourceLimits.set_limit(namespace, limit_spec, store_opts(store)))
     end
   end
 
-  def handle("FERRICSTORE.QUOTA", ["GET", namespace], _store),
-    do: result(FerricStore.ResourceLimits.get_limit(namespace))
+  def handle("FERRICSTORE.QUOTA", ["GET", namespace], store),
+    do: result(FerricStore.ResourceLimits.get_limit(namespace, store_opts(store)))
 
-  def handle("FERRICSTORE.QUOTA", ["USAGE", namespace], _store),
-    do: result(FerricStore.ResourceLimits.usage(namespace))
+  def handle("FERRICSTORE.QUOTA", ["USAGE", namespace], store),
+    do: result(FerricStore.ResourceLimits.usage(namespace, store_opts(store)))
 
   def handle("FERRICSTORE.QUOTA", [subcmd | _args], _store),
     do: {:error, "ERR unknown FERRICSTORE.QUOTA subcommand '#{String.downcase(subcmd)}'"}

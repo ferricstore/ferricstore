@@ -26,6 +26,8 @@ defmodule Ferricstore.Commands.Extension do
 
   @callback commands() :: [command_entry()]
   @callback handle(binary(), [binary()], map()) :: term()
+  @callback keys(binary(), [binary()]) :: {:ok, [binary()]} | :error
+  @optional_callbacks keys: 2
 
   alias Ferricstore.Commands.Catalog.Entries
 
@@ -117,6 +119,30 @@ defmodule Ferricstore.Commands.Extension do
   @doc "Extracts key arguments for a configured command."
   @spec keys(binary(), [binary()]) :: {:ok, [binary()]} | :error
   def keys(command, args) when is_binary(command) and is_list(args) do
+    upper = String.upcase(command)
+
+    case handler_module(upper) do
+      {:ok, module} ->
+        extension_keys(module, upper, args)
+
+      :error ->
+        metadata_keys(command, args)
+    end
+  end
+
+  defp extension_keys(module, command, args) do
+    if function_exported?(module, :keys, 2) do
+      case module.keys(command, args) do
+        {:ok, keys} when is_list(keys) -> {:ok, keys}
+        :error -> metadata_keys(command, args)
+        _other -> :error
+      end
+    else
+      metadata_keys(command, args)
+    end
+  end
+
+  defp metadata_keys(command, args) do
     case lookup(command) do
       {:ok, %{first_key: 0}} ->
         {:ok, []}

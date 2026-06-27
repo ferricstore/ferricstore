@@ -42,6 +42,10 @@ defmodule Ferricstore.Commands.ExtensionTest do
       :ok = store.put.(key, value, 0)
       {:ok, "OK"}
     end
+
+    @impl true
+    def keys("EXT.PUT", [_key, value]), do: {:ok, ["dynamic:" <> value]}
+    def keys(_command, _args), do: :error
   end
 
   defmodule ShadowingExtension do
@@ -94,7 +98,8 @@ defmodule Ferricstore.Commands.ExtensionTest do
   test "extension metadata supplies keys for parsed raw commands" do
     Application.put_env(:ferricstore, :command_extensions, [TestExtension])
 
-    assert {:ok, "EXT.PUT", ["k", "v"], {:extension_command, "EXT.PUT", ["k", "v"]}, ["k"]} =
+    assert {:ok, "EXT.PUT", ["k", "v"], {:extension_command, "EXT.PUT", ["k", "v"]},
+            ["dynamic:v"]} =
              Dispatcher.parse_raw("ext.put", ["k", "v"])
   end
 

@@ -36,13 +36,16 @@ defmodule FerricStore.ManagementContractTest do
     @behaviour FerricStore.ResourceLimits
 
     @impl true
-    def set_limit(scope, limit_spec, _opts), do: {:ok, %{scope: scope, limit: limit_spec}}
+    def set_limit(scope, limit_spec, opts),
+      do: {:ok, %{scope: scope, limit: limit_spec, store?: Keyword.has_key?(opts, :store)}}
 
     @impl true
-    def get_limit(scope, _opts), do: {:ok, %{scope: scope, limit: %{"keys" => 10}}}
+    def get_limit(scope, opts),
+      do: {:ok, %{scope: scope, limit: %{"keys" => 10}, store?: Keyword.has_key?(opts, :store)}}
 
     @impl true
-    def usage(scope, _opts), do: {:ok, %{scope: scope, usage: %{"keys" => 0}}}
+    def usage(scope, opts),
+      do: {:ok, %{scope: scope, usage: %{"keys" => 0}, store?: Keyword.has_key?(opts, :store)}}
 
     @impl true
     def check(_scope, _resource, _amount, _opts), do: :ok
@@ -133,17 +136,17 @@ defmodule FerricStore.ManagementContractTest do
   test "FERRICSTORE.QUOTA delegates to configured resource limit implementation" do
     Application.put_env(:ferricstore, FerricStore.ResourceLimits, FakeResourceLimits)
 
-    assert %{"scope" => "tenant", "limit" => %{"keys" => 10}} =
+    assert %{"scope" => "tenant", "limit" => %{"keys" => 10}, "store?" => true} =
              Dispatcher.dispatch(
                "FERRICSTORE.QUOTA",
                ["SET", "tenant", "KEYS", "10"],
                MockStore.make()
              )
 
-    assert %{"scope" => "tenant", "limit" => %{"keys" => 10}} =
+    assert %{"scope" => "tenant", "limit" => %{"keys" => 10}, "store?" => true} =
              Dispatcher.dispatch("FERRICSTORE.QUOTA", ["GET", "tenant"], MockStore.make())
 
-    assert %{"scope" => "tenant", "usage" => %{"keys" => 0}} =
+    assert %{"scope" => "tenant", "usage" => %{"keys" => 0}, "store?" => true} =
              Dispatcher.dispatch("FERRICSTORE.QUOTA", ["USAGE", "tenant"], MockStore.make())
   end
 
