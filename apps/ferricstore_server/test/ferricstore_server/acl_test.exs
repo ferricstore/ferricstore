@@ -15,9 +15,68 @@ defmodule FerricstoreServer.AclTest do
   @moduletag :global_state
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.CommandCategories
+
+  defmodule ShadowingWriteExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "GET",
+          arity: 2,
+          flags: ["write"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :write,
+          summary: "Invalid shadow command"
+        }
+      ]
+    end
+
+    @impl true
+    def handle("GET", _args, _store), do: {:ok, "shadowed"}
+  end
+
+  defmodule ShadowingReadExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "PING",
+          arity: -1,
+          flags: ["readonly"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :read,
+          summary: "Invalid shadow command"
+        }
+      ]
+    end
+
+    @impl true
+    def handle("PING", _args, _store), do: {:ok, "shadowed"}
+  end
 
   setup do
+    previous_extensions = Application.get_env(:ferricstore, :command_extensions)
+    Application.delete_env(:ferricstore, :command_extensions)
     Acl.reset!()
+
+    on_exit(fn ->
+      Acl.reset!()
+
+      case previous_extensions do
+        nil -> Application.delete_env(:ferricstore, :command_extensions)
+        value -> Application.put_env(:ferricstore, :command_extensions, value)
+      end
+    end)
+
     :ok
   end
 
@@ -265,6 +324,22 @@ defmodule FerricstoreServer.AclTest do
       assert user.commands == MapSet.new()
     end
 
+    test "extension metadata cannot move built-in commands between ACL categories" do
+      Application.put_env(:ferricstore, :command_extensions, [ShadowingWriteExtension])
+
+      assert :ok = Acl.set_user("writer", ["on", "nopass", "-@all", "+@write", "~*"])
+
+      assert :ok = Acl.check_command("writer", "SET")
+      assert {:error, msg} = Acl.check_command("writer", "GET")
+      assert msg =~ "get"
+    end
+
+    test "extension metadata cannot change built-in command key access type" do
+      Application.put_env(:ferricstore, :command_extensions, [ShadowingReadExtension])
+
+      assert :rw = CommandCategories.command_access_type("PING")
+    end
+
     test "+command is case-insensitive (stored uppercased)" do
       assert :ok = Acl.set_user("alice", ["on", "-@all", "+get"])
       user = Acl.get_user("alice")
@@ -486,7 +561,7 @@ defmodule FerricstoreServer.AclTest do
       info = Acl.get_user_info("default")
       assert is_list(info)
 
-      # The format is: ["flags", [flags], "passwords", [passwords], "commands", cmd_str, "keys", keys_str, "channels", "&*"]
+      # The format includes flags, passwords, commands, keys, and channels.
       assert "flags" in info
       assert "passwords" in info
       assert "commands" in info

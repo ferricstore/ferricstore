@@ -8,7 +8,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   command catalog.
   """
 
-  alias Ferricstore.Commands.Catalog
+  alias Ferricstore.Commands.{Catalog, Extension}
 
   @max_flow_ref_size 4096
   @extra_command_names ~w(
@@ -101,7 +101,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
   Returns the command names accepted by the native AST parser.
   """
   @spec supported_command_names() :: MapSet.t(String.t())
-  def supported_command_names, do: @supported_command_names
+  def supported_command_names do
+    MapSet.union(@supported_command_names, Extension.command_names_upper())
+  end
 
   @single_key_tags ~w(
     get incr decr strlen getdel ttl pttl persist llen hgetall hkeys hvals hlen
@@ -942,8 +944,22 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp command_keys(cmd, args) do
     case Catalog.get_keys_upper(cmd, args) do
-      {:ok, keys} -> keys
-      {:error, _} -> extra_command_keys(cmd, args)
+      {:ok, keys} ->
+        keys
+
+      {:error, _} ->
+        static_or_extension_keys(cmd, args)
+    end
+  end
+
+  defp static_or_extension_keys(cmd, args) do
+    if MapSet.member?(@supported_command_names, cmd) do
+      extra_command_keys(cmd, args)
+    else
+      case Extension.keys(cmd, args) do
+        {:ok, keys} -> keys
+        :error -> extra_command_keys(cmd, args)
+      end
     end
   end
 

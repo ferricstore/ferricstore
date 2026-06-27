@@ -1,6 +1,8 @@
 defmodule FerricstoreServer.Acl.CommandCategories do
   @moduledoc false
 
+  alias Ferricstore.Commands.Extension
+
   @string_read ~w(GET MGET GETRANGE STRLEN)
   @string_write ~w(
     SET SETNX SETEX PSETEX MSET MSETNX PIPELINE APPEND SETRANGE
@@ -227,17 +229,23 @@ defmodule FerricstoreServer.Acl.CommandCategories do
 
   @spec category_commands(binary()) :: {:ok, MapSet.t(binary())} | :error
   def category_commands(category) when is_binary(category) do
-    Map.fetch(@category_map, String.upcase(category))
+    case String.upcase(category) do
+      "READ" -> {:ok, MapSet.union(@read_commands, extension_commands_by_access(:read))}
+      "WRITE" -> {:ok, MapSet.union(@write_commands, extension_commands_by_access(:write))}
+      "ALL" -> {:ok, MapSet.union(Map.fetch!(@category_map, "ALL"), extension_commands())}
+      category -> Map.fetch(@category_map, category)
+    end
   end
 
   @spec read_commands() :: MapSet.t(binary())
-  def read_commands, do: @read_commands
+  def read_commands, do: MapSet.union(@read_commands, extension_commands_by_access(:read))
 
   @spec write_commands() :: MapSet.t(binary())
-  def write_commands, do: @write_commands
+  def write_commands, do: MapSet.union(@write_commands, extension_commands_by_access(:write))
 
   @spec acl_supported_commands() :: MapSet.t(binary())
-  def acl_supported_commands, do: Map.fetch!(@category_map, "ALL")
+  def acl_supported_commands,
+    do: MapSet.union(Map.fetch!(@category_map, "ALL"), extension_commands())
 
   @spec command_access_type(binary()) :: :read | :write | :rw
   def command_access_type(cmd) when is_binary(cmd) do
@@ -247,7 +255,19 @@ defmodule FerricstoreServer.Acl.CommandCategories do
       MapSet.member?(@read_write_key_commands, cmd) -> :rw
       MapSet.member?(@read_key_commands, cmd) -> :read
       MapSet.member?(@write_key_commands, cmd) -> :write
+      access = Extension.non_shadowing_command_access_type(cmd) -> access
       true -> :rw
     end
+  end
+
+  defp extension_commands do
+    Extension.non_shadowing_command_names_upper()
+  end
+
+  defp extension_commands_by_access(access) do
+    Extension.non_shadowing_commands()
+    |> Enum.filter(&(Map.get(&1, :access, :rw) == access))
+    |> Enum.map(&String.upcase(&1.name))
+    |> MapSet.new()
   end
 end

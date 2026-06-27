@@ -26,6 +26,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     Cluster,
     Cuckoo,
     Expiry,
+    Extension,
     Flow,
     Generic,
     Geo,
@@ -34,9 +35,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     List,
     Management,
     Memory,
-    NativeAstParser,
     Namespace,
     Native,
+    NativeAstParser,
     PubSub,
     Server,
     Set,
@@ -583,6 +584,10 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({:publish, args}, _store), do: PubSub.handle_ast({:publish, args})
   def dispatch_ast({:pubsub, args}, _store), do: PubSub.handle_ast({:pubsub, args})
 
+  def dispatch_ast({:extension_command, cmd, args}, store)
+      when is_binary(cmd) and is_list(args),
+      do: dispatch_extension_raw(cmd, args, store)
+
   def dispatch_ast({:raw_command, cmd, args}, store) when is_binary(cmd) and is_list(args),
     do: dispatch_raw_handler(cmd, args, store)
 
@@ -723,7 +728,14 @@ defmodule Ferricstore.Commands.Dispatcher do
       cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, args, store)
       cmd == "MEMORY" -> dispatch_memory_raw(args, store)
       cmd == "PUBLISH" or cmd == "PUBSUB" -> PubSub.handle(cmd, args)
-      true -> unknown_command(cmd)
+      true -> dispatch_extension_raw(cmd, args, store)
+    end
+  end
+
+  defp dispatch_extension_raw(cmd, args, store) do
+    case Extension.handle(cmd, args, store) do
+      :not_found -> unknown_command(cmd)
+      result -> result
     end
   end
 
@@ -751,7 +763,18 @@ defmodule Ferricstore.Commands.Dispatcher do
   """
   @spec parse_raw(binary(), [term()]) ::
           {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
-  def parse_raw(name, args), do: NativeAstParser.parse(name, args)
+  def parse_raw(name, args) do
+    case NativeAstParser.parse(name, args) do
+      {:ok, cmd, parsed_args, {:unknown, _cmd, _args}, _keys} ->
+        case Extension.keys(cmd, parsed_args) do
+          {:ok, keys} -> {:ok, cmd, parsed_args, Extension.ast(cmd, parsed_args), keys}
+          :error -> {:ok, cmd, parsed_args, {:unknown, cmd, parsed_args}, []}
+        end
+
+      other ->
+        other
+    end
+  end
 
   @doc """
   Dispatches a raw command name and argument list through the canonical command

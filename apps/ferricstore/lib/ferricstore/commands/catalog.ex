@@ -36,18 +36,19 @@ defmodule Ferricstore.Commands.Catalog do
         }
 
   alias Ferricstore.Commands.Catalog.Entries
+  alias Ferricstore.Commands.Extension
 
   @doc "Returns the full list of command entries."
   @spec all() :: [command_entry()]
-  def all, do: Entries.all()
+  def all, do: Entries.all() ++ extension_commands()
 
   @doc "Returns the number of supported commands."
   @spec count() :: non_neg_integer()
-  def count, do: Entries.count()
+  def count, do: Entries.count() + length(extension_commands())
 
   @doc "Returns all command names as lowercase strings."
   @spec names() :: [binary()]
-  def names, do: Entries.names()
+  def names, do: Entries.names() ++ Enum.map(extension_commands(), & &1.name)
 
   @doc """
   Looks up a command entry by name (case-insensitive).
@@ -55,7 +56,12 @@ defmodule Ferricstore.Commands.Catalog do
   Returns `{:ok, entry}` or `:error`.
   """
   @spec lookup(binary()) :: {:ok, command_entry()} | :error
-  def lookup(name) when is_binary(name), do: Entries.lookup(name)
+  def lookup(name) when is_binary(name) do
+    case Entries.lookup(name) do
+      {:ok, _} = ok -> ok
+      :error -> Extension.lookup(name)
+    end
+  end
 
   @doc """
   Looks up a command entry by an already-uppercase name.
@@ -66,7 +72,12 @@ defmodule Ferricstore.Commands.Catalog do
   Returns `{:ok, entry}` or `:error`.
   """
   @spec lookup_upper(binary()) :: {:ok, command_entry()} | :error
-  def lookup_upper(name) when is_binary(name), do: Entries.lookup_upper(name)
+  def lookup_upper(name) when is_binary(name) do
+    case Entries.lookup_upper(name) do
+      {:ok, _} = ok -> ok
+      :error -> Extension.lookup_upper(name)
+    end
+  end
 
   @doc """
   Returns the Redis-style info tuple for a command entry.
@@ -346,6 +357,10 @@ defmodule Ferricstore.Commands.Catalog do
     do: ascii_eq_ignore_case?(arg, expected)
 
   defp arg_eq?(_arg, _expected), do: false
+
+  defp extension_commands do
+    Extension.non_shadowing_commands()
+  end
 
   defp ascii_eq_ignore_case?(left, right) when byte_size(left) != byte_size(right), do: false
   defp ascii_eq_ignore_case?(<<>>, <<>>), do: true

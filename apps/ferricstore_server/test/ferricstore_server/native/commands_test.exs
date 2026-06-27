@@ -11,13 +11,55 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_options 0x000B
   @op_command_exec 0x0100
 
+  defmodule TestExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "EXT.READ",
+          arity: 2,
+          flags: ["readonly"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :read,
+          summary: "Test extension read"
+        },
+        %{
+          name: "EXT.WRITE",
+          arity: 2,
+          flags: ["write"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :write,
+          summary: "Test extension write"
+        }
+      ]
+    end
+
+    @impl true
+    def handle("EXT.READ", [key], _store), do: {:ok, ["read", key]}
+    def handle("EXT.WRITE", [key], _store), do: {:ok, ["write", key]}
+  end
+
   setup do
+    previous_extensions = Application.get_env(:ferricstore, :command_extensions)
+    Application.delete_env(:ferricstore, :command_extensions)
+
     ConnRegistry.init_table()
     FerricstoreServer.Acl.reset!()
     {:ok, _} = Application.ensure_all_started(:ferricstore)
 
     on_exit(fn ->
       FerricstoreServer.Acl.reset!()
+
+      case previous_extensions do
+        nil -> Application.delete_env(:ferricstore, :command_extensions)
+        value -> Application.put_env(:ferricstore, :command_extensions, value)
+      end
     end)
 
     :ok
@@ -60,6 +102,63 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == "PONG"
+  end
+
+  test "COMMAND_EXEC delegates configured extension commands" do
+    Application.put_env(:ferricstore, :command_extensions, [TestExtension])
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "ext.read", "args" => ["tenant:1"]},
+        state()
+      )
+
+    assert status == :ok
+    assert payload == ["read", "tenant:1"]
+  end
+
+  test "COMMAND_EXEC authorizes extension command and key metadata" do
+    Application.put_env(:ferricstore, :command_extensions, [TestExtension])
+
+    assert :ok =
+             Acl.set_user("ext-reader", [
+               "on",
+               "nopass",
+               "-@all",
+               "+ext.read",
+               "~tenant:*"
+             ])
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "EXT.READ", "args" => ["tenant:1"]},
+        state_as("ext-reader")
+      )
+
+    assert status == :ok
+    assert payload == ["read", "tenant:1"]
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "EXT.READ", "args" => ["other:1"]},
+        state_as("ext-reader")
+      )
+
+    assert status == :noperm
+    assert payload =~ "keys mentioned"
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "EXT.WRITE", "args" => ["tenant:1"]},
+        state_as("ext-reader")
+      )
+
+    assert status == :noperm
+    assert payload =~ "ext.write"
   end
 
   test "COMMAND_EXEC authorizes ACL subcommands before dispatch" do
@@ -126,7 +225,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
       authenticated: true,
       require_auth: false,
       acl_cache: :full_access,
-      peer: {{127, 0, 0, 1}, 12345},
+      peer: {{127, 0, 0, 1}, 12_345},
       created_at: System.monotonic_time(:millisecond),
       instance_ctx: FerricStore.Instance.get(:default),
       compression: :none,
