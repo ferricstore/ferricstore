@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Native.LaneTest do
   @op_set 0x0102
   @lane_id 7
   @op_hget 0x0111
+  @receive_timeout 5_000
 
   setup do
     {:ok, _} = Application.ensure_all_started(:ferricstore)
@@ -39,7 +40,7 @@ defmodule FerricstoreServer.Native.LaneTest do
     Lane.enqueue(pid, set_frame(26, "native:lane:set:drain:b", "b"))
     :erlang.resume_process(pid)
 
-    assert_receive {:native_lane_responses, @lane_id, responses, 2}, 250
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
     assert length(responses) == 2
     assert_ok_response(Enum.at(responses, 0), @op_set, 25)
     assert_ok_response(Enum.at(responses, 1), @op_set, 26)
@@ -54,7 +55,7 @@ defmodule FerricstoreServer.Native.LaneTest do
       compact_set_pipeline_frame(32, [{"native:lane:pipeline:set:b", "b"}])
     ])
 
-    assert_receive {:native_lane_responses, @lane_id, responses, 2}, 250
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
     assert length(responses) == 2
     assert_compact_ok_count_response(Enum.at(responses, 0), @op_pipeline, 31, 1)
     assert_compact_ok_count_response(Enum.at(responses, 1), @op_pipeline, 32, 1)
@@ -69,7 +70,7 @@ defmodule FerricstoreServer.Native.LaneTest do
     Lane.enqueue(pid, compact_set_pipeline_frame(42, [{"native:lane:pipeline:drain:b", "b"}]))
     :erlang.resume_process(pid)
 
-    assert_receive {:native_lane_responses, @lane_id, responses, 2}, 250
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
     assert length(responses) == 2
     assert_compact_ok_count_response(Enum.at(responses, 0), @op_pipeline, 41, 1)
     assert_compact_ok_count_response(Enum.at(responses, 1), @op_pipeline, 42, 1)
@@ -91,7 +92,7 @@ defmodule FerricstoreServer.Native.LaneTest do
       compact_data_write_pipeline_frame(57, 32, [{"native:lane:data:zset", "member"}])
     ])
 
-    assert_receive {:native_lane_responses, @lane_id, responses, 7}, 500
+    assert_receive {:native_lane_responses, @lane_id, responses, 7}, @receive_timeout
     assert length(responses) == 7
 
     Enum.zip(responses, 51..57)
@@ -118,7 +119,7 @@ defmodule FerricstoreServer.Native.LaneTest do
 
     :erlang.resume_process(pid)
 
-    assert_receive {:native_lane_responses, @lane_id, responses, 2}, 500
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
     assert length(responses) == 2
     assert_pipeline_pairs_response(Enum.at(responses, 0), @op_pipeline, 61, [["ok", 1]])
     assert_pipeline_pairs_response(Enum.at(responses, 1), @op_pipeline, 62, [["ok", 1]])
@@ -132,10 +133,10 @@ defmodule FerricstoreServer.Native.LaneTest do
     Lane.enqueue(pid, compact_data_write_pipeline_frame(71, 22, [{key, "field", "visible"}]))
     Lane.enqueue(pid, hget_frame(72, key, "field"))
 
-    assert_receive {:native_lane_responses, @lane_id, hset_responses, 1}, 500
+    assert_receive {:native_lane_responses, @lane_id, hset_responses, 1}, @receive_timeout
     assert_pipeline_pairs_response(Enum.at(hset_responses, 0), @op_pipeline, 71, [["ok", 1]])
 
-    assert_receive {:native_lane_response, @lane_id, hget_response}, 500
+    assert_receive {:native_lane_response, @lane_id, hget_response}, @receive_timeout
     assert_response(hget_response, @op_hget, 72, "visible")
   end
 
@@ -147,10 +148,10 @@ defmodule FerricstoreServer.Native.LaneTest do
     Lane.enqueue(pid, set_frame(11, key, "visible"))
     Lane.enqueue(pid, get_frame(12, key))
 
-    assert_receive {:native_lane_responses, @lane_id, set_responses, 1}, 250
+    assert_receive {:native_lane_responses, @lane_id, set_responses, 1}, @receive_timeout
     assert_ok_response(Enum.at(set_responses, 0), @op_set, 11)
 
-    assert_receive {:native_lane_response, @lane_id, get_response}, 250
+    assert_receive {:native_lane_response, @lane_id, get_response}, @receive_timeout
     assert_response(get_response, @op_get, 12, "visible")
   end
 

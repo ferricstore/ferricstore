@@ -17,6 +17,7 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
   @moduletag :global_state
 
   alias FerricstoreServer.Acl
+  alias Ferricstore.Test.ShardHelpers
 
   # ---------------------------------------------------------------------------
   # R2-C1: Deleted user ACL cache must fail closed
@@ -82,6 +83,8 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
 
   describe "R2-C5: embedded API bypasses ACL" do
     setup do
+      ShardHelpers.wait_default_quorum_writable(60_000)
+      ShardHelpers.flush_all_keys()
       Acl.reset!()
       # Create a restricted user that can only GET
       :ok = Acl.set_user("restricted", ["on", ">secret", "+GET", "-SET", "~limited:*"])
