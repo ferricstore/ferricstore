@@ -98,7 +98,7 @@ defmodule FerricstoreServer.Application do
         }
         |> maybe_put_native_tls_port()
       end,
-      raft_apply_hook: &FerricstoreServer.Acl.handle_raft_command/1
+      raft_apply_hook: FerricstoreServer.RaftApplyHook.compose_current(:default)
     )
   end
 
