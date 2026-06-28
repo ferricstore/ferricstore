@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
   @op_hello 0x0001
   @op_options 0x000B
+  @op_pipeline 0x000E
   @op_command_exec 0x0100
 
   defmodule TestExtension do
@@ -36,6 +37,16 @@ defmodule FerricstoreServer.Native.CommandsTest do
           step: 1,
           access: :write,
           summary: "Test extension write"
+        },
+        %{
+          name: "EXT.CONTEXT",
+          arity: 1,
+          flags: ["readonly"],
+          first_key: 0,
+          last_key: 0,
+          step: 0,
+          access: :read,
+          summary: "Test extension request context"
         }
       ]
     end
@@ -43,11 +54,19 @@ defmodule FerricstoreServer.Native.CommandsTest do
     @impl true
     def handle("EXT.READ", [key], _store), do: {:ok, ["read", key]}
     def handle("EXT.WRITE", [key], _store), do: {:ok, ["write", key]}
+
+    def handle("EXT.CONTEXT", [], store),
+      do: {:ok, Ferricstore.Commands.Extension.request_context(store)}
   end
 
   setup do
     previous_extensions = Application.get_env(:ferricstore, :command_extensions)
+
+    previous_trusted_request_context_users =
+      Application.get_env(:ferricstore, :native_trusted_request_context_users)
+
     Application.delete_env(:ferricstore, :command_extensions)
+    Application.delete_env(:ferricstore, :native_trusted_request_context_users)
 
     ConnRegistry.init_table()
     FerricstoreServer.Acl.reset!()
@@ -59,6 +78,11 @@ defmodule FerricstoreServer.Native.CommandsTest do
       case previous_extensions do
         nil -> Application.delete_env(:ferricstore, :command_extensions)
         value -> Application.put_env(:ferricstore, :command_extensions, value)
+      end
+
+      case previous_trusted_request_context_users do
+        nil -> Application.delete_env(:ferricstore, :native_trusted_request_context_users)
+        value -> Application.put_env(:ferricstore, :native_trusted_request_context_users, value)
       end
     end)
 
@@ -116,6 +140,92 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == ["read", "tenant:1"]
+  end
+
+  test "COMMAND_EXEC ignores request context unless the native user is trusted" do
+    Application.put_env(:ferricstore, :command_extensions, [TestExtension])
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{
+          "command" => "EXT.CONTEXT",
+          "args" => [],
+          "request_context" => %{"subject" => "client-1"}
+        },
+        state()
+      )
+
+    assert status == :ok
+    assert payload == %{}
+  end
+
+  test "COMMAND_EXEC attaches trusted request context to extension store" do
+    Application.put_env(:ferricstore, :command_extensions, [TestExtension])
+    Application.put_env(:ferricstore, :native_trusted_request_context_users, ["default"])
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{
+          "command" => "EXT.CONTEXT",
+          "args" => [],
+          "request_context" => %{
+            "subject" => "client-1",
+            "tenant" => "t1",
+            "scopes" => ["tenant:t1:write", nil]
+          }
+        },
+        state()
+      )
+
+    assert status == :ok
+
+    assert payload == %{
+             "subject" => "client-1",
+             "tenant" => "t1",
+             "scopes" => ["tenant:t1:write"]
+           }
+  end
+
+  test "PIPELINE attaches top-level trusted request context to extension commands" do
+    Application.put_env(:ferricstore, :command_extensions, [TestExtension])
+    Application.put_env(:ferricstore, :native_trusted_request_context_users, ["default"])
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_pipeline,
+        %{
+          "request_context" => %{
+            "subject" => "client-1",
+            "tenant" => "t1",
+            "scopes" => "tenant:t1:write invocation:create:*"
+          },
+          "commands" => [
+            %{
+              "opcode" => @op_command_exec,
+              "lane_id" => 1,
+              "request_id" => 7,
+              "body" => %{"command" => "EXT.CONTEXT", "args" => []}
+            }
+          ]
+        },
+        state()
+      )
+
+    assert status == :ok
+
+    assert [
+             %{
+               "request_id" => 7,
+               "status" => "ok",
+               "value" => %{
+                 "subject" => "client-1",
+                 "tenant" => "t1",
+                 "scopes" => ["tenant:t1:write", "invocation:create:*"]
+               }
+             }
+           ] = payload
   end
 
   test "COMMAND_EXEC authorizes extension command and key metadata" do

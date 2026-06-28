@@ -177,6 +177,22 @@ defmodule Ferricstore.Commands.Extension do
 
   def handle(_command, _args, _store), do: :not_found
 
+  @doc """
+  Returns trusted request context attached by the server protocol layer.
+
+  Extension providers can use this to read authenticated subject, tenant, and
+  scope data without parsing command arguments as authority.
+  """
+  @spec request_context(map()) :: map()
+  def request_context(%{} = store) do
+    case Map.get(store, :request_context) || Map.get(store, "request_context") do
+      %{} = context -> context
+      _other -> %{}
+    end
+  end
+
+  def request_context(_store), do: %{}
+
   defp module_commands(module) do
     if Code.ensure_loaded?(module) and function_exported?(module, :commands, 0) do
       module.commands()

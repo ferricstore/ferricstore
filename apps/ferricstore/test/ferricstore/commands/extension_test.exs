@@ -111,6 +111,16 @@ defmodule Ferricstore.Commands.ExtensionTest do
     assert "v" == store.get.("k")
   end
 
+  test "extension request context helper returns attached trusted context" do
+    assert %{} == Ferricstore.Commands.Extension.request_context(MockStore.make())
+
+    assert %{"subject" => "client-1"} ==
+             Ferricstore.Commands.Extension.request_context(%{
+               store: MockStore.make(),
+               request_context: %{"subject" => "client-1"}
+             })
+  end
+
   test "configured extensions cannot shadow built-in command routing or key metadata" do
     Application.put_env(:ferricstore, :command_extensions, [ShadowingExtension])
     store = MockStore.make(%{"k" => {"v", 0}})

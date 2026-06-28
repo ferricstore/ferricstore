@@ -683,14 +683,15 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_command_exec, payload, state) do
     with {:ok, command} <- require_binary(payload, "command"),
-         {:ok, args} <- raw_command_args(payload) do
+         {:ok, args} <- raw_command_args(payload),
+         {:ok, request_context} <- request_context(payload, state) do
       if String.upcase(command) == "FERRICSTORE.METRICS" do
         ferricstore_metrics_result(args, state)
       else
         with {:ok, cmd, parsed_args, ast, keys} <-
                Ferricstore.Commands.Dispatcher.parse_raw(command, args),
              :ok <- authorize_raw_command(cmd, parsed_args, ast, keys, state) do
-          dispatch_command_exec(cmd, command, parsed_args, state)
+          dispatch_command_exec(cmd, command, parsed_args, state, request_context)
         else
           {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
           {:error, status, reason} -> {status, reason, state}
@@ -1674,22 +1675,28 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
-  defp dispatch_command_exec("CLIENT", _command, [subcmd | rest], state) do
+  defp dispatch_command_exec("CLIENT", _command, [subcmd | rest], state, _request_context) do
     subcmd
     |> String.upcase()
     |> FerricstoreServer.Commands.Client.handle(rest, state, state.instance_ctx)
     |> client_command_result_to_reply(state)
   end
 
-  defp dispatch_command_exec("CLIENT", _command, [], state),
+  defp dispatch_command_exec("CLIENT", _command, [], state, _request_context),
     do: {:bad_request, "ERR wrong number of arguments for 'client' command", state}
 
-  defp dispatch_command_exec("FERRICSTORE.METRICS", _command, parsed_args, state) do
+  defp dispatch_command_exec(
+         "FERRICSTORE.METRICS",
+         _command,
+         parsed_args,
+         state,
+         _request_context
+       ) do
     ferricstore_metrics_result(parsed_args, state)
   end
 
-  defp dispatch_command_exec(_cmd, command, parsed_args, state) do
-    store = state.instance_ctx
+  defp dispatch_command_exec(_cmd, command, parsed_args, state, request_context) do
+    store = attach_request_context(state.instance_ctx, request_context)
     result = Ferricstore.Commands.Dispatcher.dispatch_raw(command, parsed_args, store)
     result |> raw_result_to_native() |> result_to_reply(state)
   end
@@ -1716,6 +1723,108 @@ defmodule FerricstoreServer.Native.Commands do
   defp raw_command_args(%{"args" => nil}), do: {:ok, []}
   defp raw_command_args(payload) when not is_map_key(payload, "args"), do: {:ok, []}
   defp raw_command_args(_payload), do: {:error, "ERR native COMMAND_EXEC args must be a list"}
+
+  defp request_context(payload, state) when is_map(payload) do
+    case Map.get(payload, "request_context") do
+      nil -> {:ok, %{}}
+      %{} = context -> trusted_request_context(context, state)
+      _other -> invalid_request_context(state)
+    end
+  end
+
+  defp request_context(_payload, _state), do: {:ok, %{}}
+
+  defp trusted_request_context(context, state) do
+    if trusted_request_context_connection?(state) do
+      {:ok, normalize_request_context(context)}
+    else
+      {:ok, %{}}
+    end
+  end
+
+  defp invalid_request_context(state) do
+    if trusted_request_context_connection?(state) do
+      {:error, "ERR native request_context must be an object"}
+    else
+      {:ok, %{}}
+    end
+  end
+
+  defp trusted_request_context_connection?(state) do
+    users = trusted_request_context_users()
+    username = Map.get(state, :username)
+
+    "*" in users or (is_binary(username) and username in users)
+  end
+
+  defp trusted_request_context_users do
+    case Application.get_env(:ferricstore, :native_trusted_request_context_users, []) do
+      users when is_list(users) ->
+        users
+        |> Enum.flat_map(&trusted_request_context_user/1)
+        |> Enum.uniq()
+
+      users when is_binary(users) ->
+        String.split(users, [",", " "], trim: true)
+
+      :all ->
+        ["*"]
+
+      _other ->
+        []
+    end
+  end
+
+  defp trusted_request_context_user(user) when is_binary(user), do: [user]
+  defp trusted_request_context_user(user) when is_atom(user), do: [Atom.to_string(user)]
+  defp trusted_request_context_user(_user), do: []
+
+  defp normalize_request_context(%{} = context) do
+    %{}
+    |> put_context_value("subject", context_value(context, "subject", :subject))
+    |> put_context_value("tenant", context_value(context, "tenant", :tenant))
+    |> put_context_scopes(context_value(context, "scopes", :scopes))
+  end
+
+  defp put_context_value(payload, _key, value) when value in [nil, ""], do: payload
+
+  defp put_context_value(payload, key, value) when is_binary(value),
+    do: Map.put(payload, key, value)
+
+  defp put_context_value(payload, _key, _value), do: payload
+
+  defp put_context_scopes(payload, scopes) do
+    scopes =
+      scopes
+      |> normalize_context_scopes()
+      |> Enum.uniq()
+
+    case scopes do
+      [] -> payload
+      scopes -> Map.put(payload, "scopes", scopes)
+    end
+  end
+
+  defp normalize_context_scopes(scopes) when is_binary(scopes) do
+    String.split(scopes, [",", " "], trim: true)
+  end
+
+  defp normalize_context_scopes(scopes) when is_list(scopes),
+    do: Enum.filter(scopes, &is_binary/1)
+
+  defp normalize_context_scopes(_scopes), do: []
+
+  defp context_value(%{} = context, string_key, atom_key) do
+    Map.get(context, string_key) || Map.get(context, atom_key)
+  end
+
+  defp attach_request_context(store, request_context) when request_context == %{}, do: store
+
+  defp attach_request_context(%{} = store, request_context) when is_map(request_context) do
+    Map.put(store, :request_context, request_context)
+  end
+
+  defp attach_request_context(store, _request_context), do: store
 
   defp raw_result_to_native({:simple, value}), do: value
   defp raw_result_to_native({:bulk, value}), do: value
@@ -3114,10 +3223,11 @@ defmodule FerricstoreServer.Native.Commands do
   defp normalize_event(_event), do: nil
 
   defp execute_typed_pipeline(payload, state) do
-    with {:ok, commands} <- pipeline_commands(payload),
+    with {:ok, request_context} <- request_context(payload, state),
+         {:ok, commands} <- pipeline_commands(payload),
          {:ok, atomicity} <- pipeline_atomicity(payload),
          :ok <- validate_pipeline_atomicity(commands, atomicity, state) do
-      execute_pipeline_commands(commands, pipeline_return_format(payload), state)
+      execute_pipeline_commands(commands, pipeline_return_format(payload), state, request_context)
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -3136,7 +3246,7 @@ defmodule FerricstoreServer.Native.Commands do
 
         :fallback ->
           with {:ok, commands} <- compact_pipeline_commands(mode, items) do
-            execute_pipeline_commands(commands, return_format, state)
+            execute_pipeline_commands(commands, return_format, state, %{})
           else
             {:error, reason} -> {:bad_request, reason, state}
           end
@@ -3149,7 +3259,7 @@ defmodule FerricstoreServer.Native.Commands do
   defp compact_pipeline_return_format(%{"compact_values" => true}), do: :values
   defp compact_pipeline_return_format(payload), do: pipeline_return_format(payload)
 
-  defp execute_pipeline_commands(commands, return_format, state) do
+  defp execute_pipeline_commands(commands, return_format, state, request_context) do
     case execute_pipeline_fast_path(commands, state) do
       {:ok, results} ->
         {:ok, format_pipeline_results(results, return_format), state}
@@ -3157,7 +3267,7 @@ defmodule FerricstoreServer.Native.Commands do
       :fallback ->
         {results, state} =
           Enum.map_reduce(commands, state, fn command, acc_state ->
-            execute_pipeline_command(command, acc_state)
+            execute_pipeline_command(command, acc_state, request_context)
           end)
 
         {:ok, format_pipeline_results(results, return_format), state}
@@ -6144,13 +6254,21 @@ defmodule FerricstoreServer.Native.Commands do
     }
   end
 
-  defp execute_pipeline_command(command, state) do
-    {status, value, state} = execute(command.opcode, command.body, state)
+  defp execute_pipeline_command(command, state, request_context) do
+    body = command_body_with_request_context(command.opcode, command.body, request_context)
+    {status, value, state} = execute(command.opcode, body, state)
 
     result = pipeline_result(command.opcode, command.request_id, command.lane_id, status, value)
 
     {result, state}
   end
+
+  defp command_body_with_request_context(@op_command_exec, body, request_context)
+       when is_map(body) and map_size(request_context) > 0 do
+    Map.put(body, "request_context", request_context)
+  end
+
+  defp command_body_with_request_context(_opcode, body, _request_context), do: body
 
   defp flow_opts(payload, drop_keys) do
     case Map.get(payload, :__wire_flow_opts__) do

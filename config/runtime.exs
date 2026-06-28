@@ -62,6 +62,10 @@ if config_env() == :prod do
     System.get_env("FERRICSTORE_NATIVE_PORT") ||
       "6388"
 
+  native_trusted_request_context_users =
+    System.get_env("FERRICSTORE_NATIVE_TRUSTED_REQUEST_CONTEXT_USERS", "")
+    |> String.split([",", " "], trim: true)
+
   config :ferricstore,
     protected_mode: boolean_env.("FERRICSTORE_PROTECTED_MODE", true),
     native_port: String.to_integer(native_port_env),
@@ -343,6 +347,7 @@ if config_env() == :prod do
         System.get_env("FERRICSTORE_NATIVE_MAX_COLLECTION_RESPONSE_ITEMS", "10000")
       ),
     native_trace_enabled: boolean_env.("FERRICSTORE_NATIVE_TRACE_ENABLED", false),
+    native_trusted_request_context_users: native_trusted_request_context_users,
     native_idle_timeout_ms:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_IDLE_TIMEOUT_MS", "90000")),
     tcp_nodelay: boolean_env.("FERRICSTORE_TCP_NODELAY", true),
