@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.5.6 - 2026-06-29
+
+- Added trusted native request context for extension command execution.
+- Gated native `request_context` acceptance behind trusted native users so arbitrary clients cannot spoof control-plane authority.
+- Propagated trusted request context from typed pipelines into nested `COMMAND_EXEC` extension commands.
+- Added `FERRICSTORE_NATIVE_TRUSTED_REQUEST_CONTEXT_USERS` for production configuration.
+
 ## 0.5.4 - 2026-06-27
 
 - Added the command extension interface for optional command providers.
