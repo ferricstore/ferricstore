@@ -12,7 +12,7 @@ defmodule FerricStore.Management.Namespace do
   @callback ensure_namespace(prefix(), keyword()) :: result()
   @callback get_namespace(prefix()) :: result()
   @callback list_namespaces() :: result()
-  @callback delete_namespace(prefix()) :: result()
+  @callback delete_namespace(prefix(), keyword()) :: result()
 
   @spec ensure_namespace(prefix(), keyword()) :: result()
   def ensure_namespace(prefix, opts \\ []),
@@ -24,8 +24,9 @@ defmodule FerricStore.Management.Namespace do
   @spec list_namespaces() :: result()
   def list_namespaces, do: implementation([]).list_namespaces()
 
-  @spec delete_namespace(prefix()) :: result()
-  def delete_namespace(prefix), do: implementation([]).delete_namespace(prefix)
+  @spec delete_namespace(prefix(), keyword()) :: result()
+  def delete_namespace(prefix, opts \\ []),
+    do: implementation(opts).delete_namespace(prefix, opts)
 
   @doc false
   @spec implementation(keyword()) :: module()
@@ -50,5 +51,5 @@ defmodule FerricStore.Management.Namespace.Unsupported do
   def list_namespaces, do: {:error, :unsupported}
 
   @impl true
-  def delete_namespace(_prefix), do: {:error, :unsupported}
+  def delete_namespace(_prefix, _opts), do: {:error, :unsupported}
 end

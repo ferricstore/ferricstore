@@ -58,14 +58,34 @@ defmodule FerricStore.ManagementContractTest do
     def release(_reservation, _opts), do: :ok
   end
 
+  defmodule FakeNamespace do
+    @behaviour FerricStore.Management.Namespace
+
+    @impl true
+    def ensure_namespace(prefix, opts),
+      do: {:ok, %{prefix: prefix, store?: Keyword.has_key?(opts, :store)}}
+
+    @impl true
+    def get_namespace(prefix), do: {:ok, %{prefix: prefix}}
+
+    @impl true
+    def list_namespaces, do: {:ok, [%{prefix: "tenant"}]}
+
+    @impl true
+    def delete_namespace(prefix, opts),
+      do: {:ok, %{deleted: prefix, store?: Keyword.has_key?(opts, :store)}}
+  end
+
   setup do
     Application.delete_env(:ferricstore, FerricStore.ManagementCapabilities)
     Application.delete_env(:ferricstore, FerricStore.Management.ACL)
+    Application.delete_env(:ferricstore, FerricStore.Management.Namespace)
     Application.delete_env(:ferricstore, FerricStore.ResourceLimits)
 
     on_exit(fn ->
       Application.delete_env(:ferricstore, FerricStore.ManagementCapabilities)
       Application.delete_env(:ferricstore, FerricStore.Management.ACL)
+      Application.delete_env(:ferricstore, FerricStore.Management.Namespace)
       Application.delete_env(:ferricstore, FerricStore.ResourceLimits)
     end)
   end
@@ -148,6 +168,16 @@ defmodule FerricStore.ManagementContractTest do
 
     assert %{"scope" => "tenant", "usage" => %{"keys" => 0}, "store?" => true} =
              Dispatcher.dispatch("FERRICSTORE.QUOTA", ["USAGE", "tenant"], MockStore.make())
+  end
+
+  test "FERRICSTORE.NAMESPACE delegates mutations with caller store opts" do
+    Application.put_env(:ferricstore, FerricStore.Management.Namespace, FakeNamespace)
+
+    assert %{"prefix" => "tenant", "store?" => true} =
+             Dispatcher.dispatch("FERRICSTORE.NAMESPACE", ["ENSURE", "tenant"], MockStore.make())
+
+    assert %{"deleted" => "tenant", "store?" => true} =
+             Dispatcher.dispatch("FERRICSTORE.NAMESPACE", ["DELETE", "tenant"], MockStore.make())
   end
 
   test "ACL command delegates to configured implementation" do

@@ -4,7 +4,7 @@ defmodule FerricstoreServer.MixProject do
   def project do
     [
       app: :ferricstore_server,
-      version: "0.5.6",
+      version: "0.5.7",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
@@ -29,8 +29,7 @@ defmodule FerricstoreServer.MixProject do
 
   defp package do
     [
-      description:
-        "FerricStore native protocol server for durable KV and FerricFlow.",
+      description: "FerricStore native protocol server for durable KV and FerricFlow.",
       files: [
         "lib",
         "native/native_protocol_nif/.cargo",

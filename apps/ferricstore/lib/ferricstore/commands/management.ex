@@ -58,8 +58,8 @@ defmodule Ferricstore.Commands.Management do
   def handle("FERRICSTORE.NAMESPACE", ["LIST"], _store),
     do: result(FerricStore.Management.Namespace.list_namespaces())
 
-  def handle("FERRICSTORE.NAMESPACE", ["DELETE", prefix], _store),
-    do: result(FerricStore.Management.Namespace.delete_namespace(prefix))
+  def handle("FERRICSTORE.NAMESPACE", ["DELETE", prefix], store),
+    do: result(FerricStore.Management.Namespace.delete_namespace(prefix, store_opts(store)))
 
   def handle("FERRICSTORE.NAMESPACE", [subcmd | _args], _store),
     do: {:error, "ERR unknown FERRICSTORE.NAMESPACE subcommand '#{String.downcase(subcmd)}'"}
