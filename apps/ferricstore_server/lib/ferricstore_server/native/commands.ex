@@ -515,8 +515,17 @@ defmodule FerricstoreServer.Native.Commands do
     payload = normalize_payload(payload)
 
     case check_deadline(payload) do
-      :ok -> do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
-      {:error, status, reason} -> {status, reason, state}
+      :ok ->
+        case check_native_resource_limits(opcode, payload, state) do
+          :ok ->
+            do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
+
+          {:error, reason} ->
+            {:error, FerricStore.ResourceLimits.error_message(reason), state}
+        end
+
+      {:error, status, reason} ->
+        {status, reason, state}
     end
   rescue
     error ->
@@ -528,9 +537,11 @@ defmodule FerricstoreServer.Native.Commands do
 
     with {:ok, command} <- fetch_command(opcode),
          :ok <- check_deadline(payload),
-         :ok <- authorize(command, opcode, payload, state) do
+         :ok <- authorize(command, opcode, payload, state),
+         :ok <- check_native_resource_limits(opcode, payload, state) do
       do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
     else
+      {:error, reason} -> {:error, FerricStore.ResourceLimits.error_message(reason), state}
       {:error, status, reason} -> {status, reason, state}
     end
   rescue
@@ -561,6 +572,88 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp record_native_activity(result, _opcode, _payload), do: result
+
+  defp check_native_resource_limits(opcode, payload, %{instance_ctx: store}) do
+    if data_plane_activity_opcode?(opcode) do
+      command = Map.get(@commands, opcode)
+
+      if is_binary(command) do
+        FerricStore.ResourceLimits.check_command(
+          command,
+          native_resource_limit_args(opcode, payload),
+          resource_limit_keys(opcode, payload),
+          store: store,
+          flow_create_count: native_flow_create_count(opcode, payload)
+        )
+      else
+        :ok
+      end
+    else
+      :ok
+    end
+  rescue
+    _error -> {:error, :resource_limit_check_failed}
+  catch
+    _kind, _reason -> {:error, :resource_limit_check_failed}
+  end
+
+  defp check_native_resource_limits(_opcode, _payload, _state), do: :ok
+
+  defp native_resource_limit_args(@op_set, payload) do
+    [Map.get(payload, "key"), Map.get(payload, "value")]
+  end
+
+  defp native_resource_limit_args(@op_mset, payload) do
+    payload
+    |> Map.get("pairs", [])
+    |> Enum.flat_map(fn
+      %{"key" => key, "value" => value} -> [key, value]
+      %{key: key, value: value} -> [key, value]
+      {key, value} -> [key, value]
+      _other -> []
+    end)
+  end
+
+  defp native_resource_limit_args(_opcode, payload) when is_map(payload) do
+    payload
+    |> Map.drop(["request_context"])
+    |> Enum.flat_map(fn {_key, value} -> List.wrap(value) end)
+  end
+
+  defp native_resource_limit_args(_opcode, _payload), do: []
+
+  defp resource_limit_keys(opcode, payload)
+       when opcode in [@op_flow_create, @op_flow_start_and_claim] do
+    binary_list([Map.get(payload, "partition_key") || Map.get(payload, "id")])
+  end
+
+  defp resource_limit_keys(@op_flow_create_many, payload) do
+    item_keys =
+      payload
+      |> Map.get("items", [])
+      |> Enum.map(fn
+        %{"partition_key" => partition_key} -> partition_key
+        %{partition_key: partition_key} -> partition_key
+        _item -> nil
+      end)
+
+    [Map.get(payload, "partition_key") | item_keys]
+    |> binary_list()
+  end
+
+  defp resource_limit_keys(opcode, payload), do: keys(opcode, payload)
+
+  defp native_flow_create_count(@op_flow_create, _payload), do: 1
+  defp native_flow_create_count(@op_flow_start_and_claim, _payload), do: 1
+
+  defp native_flow_create_count(@op_flow_create_many, payload) do
+    case Map.get(payload, "items") do
+      items when is_list(items) -> length(items)
+      _other -> 1
+    end
+  end
+
+  defp native_flow_create_count(_opcode, _payload), do: 0
 
   defp data_plane_activity_opcode?(opcode)
        when opcode in [@op_command_exec, @op_pipeline],

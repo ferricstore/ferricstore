@@ -11,6 +11,8 @@ defmodule FerricStore.ResourceLimits do
   @type scope :: binary() | map()
   @type resource :: atom() | binary()
   @type amount :: non_neg_integer()
+  @type command :: binary()
+  @type command_args :: [term()]
   @type limit_spec :: map()
   @type reservation :: term()
   @type result :: :ok | {:ok, term()} | {:error, term()}
@@ -23,6 +25,8 @@ defmodule FerricStore.ResourceLimits do
               {:ok, reservation()} | {:error, term()}
   @callback release(reservation(), keyword()) :: :ok | {:error, term()}
   @callback record_activity([binary()], keyword()) :: :ok
+  @callback check_command(command(), command_args(), [binary()], keyword()) ::
+              :ok | {:error, term()}
 
   @spec set_limit(scope(), limit_spec(), keyword()) :: result()
   def set_limit(scope, limit_spec, opts \\ []),
@@ -49,6 +53,28 @@ defmodule FerricStore.ResourceLimits do
   @spec record_activity([binary()], keyword()) :: :ok
   def record_activity(keys, opts \\ []) when is_list(keys),
     do: implementation(opts).record_activity(keys, opts)
+
+  @spec check_command(command(), command_args(), [binary()], keyword()) ::
+          :ok | {:error, term()}
+  def check_command(command, args, keys, opts \\ [])
+      when is_binary(command) and is_list(args) and is_list(keys),
+      do: implementation(opts).check_command(command, args, keys, opts)
+
+  @spec error_message(term()) :: binary()
+  def error_message("ERR " <> _ = reason), do: reason
+
+  def error_message({:limit_exceeded, scope, resource, max, requested})
+      when is_binary(scope) do
+    "ERR quota #{resource} limit exceeded for #{scope} (limit #{max}, requested #{requested})"
+  end
+
+  def error_message({:limit_exceeded, resource, max, requested}) do
+    "ERR quota #{resource} limit exceeded (limit #{max}, requested #{requested})"
+  end
+
+  def error_message(:resource_limit_check_failed), do: "ERR quota check failed"
+  def error_message(reason) when is_atom(reason), do: "ERR quota #{reason}"
+  def error_message(reason), do: "ERR quota #{inspect(reason)}"
 
   @doc false
   @spec implementation(keyword()) :: module()
@@ -94,4 +120,7 @@ defmodule FerricStore.ResourceLimits.Default do
 
   @impl true
   def record_activity(_keys, _opts), do: :ok
+
+  @impl true
+  def check_command(_command, _args, _keys, _opts), do: :ok
 end

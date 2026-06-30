@@ -786,8 +786,17 @@ defmodule Ferricstore.Commands.Dispatcher do
 
     case parse_raw(name, args) do
       {:ok, cmd, parsed_args, ast, keys} ->
-        result = dispatch_ast(ast, store)
-        record_raw_activity(result, cmd, keys, store)
+        result =
+          case check_raw_resource_limits(cmd, parsed_args, keys, store) do
+            :ok ->
+              result = dispatch_ast(ast, store)
+              record_raw_activity(result, cmd, keys, store)
+              result
+
+            {:error, reason} ->
+              {:error, FerricStore.ResourceLimits.error_message(reason)}
+          end
+
         log_raw_dispatch(cmd, parsed_args, start)
         result
 
@@ -822,6 +831,20 @@ defmodule Ferricstore.Commands.Dispatcher do
     _error -> :ok
   catch
     _kind, _reason -> :ok
+  end
+
+  defp check_raw_resource_limits(_cmd, _args, [], _store), do: :ok
+
+  defp check_raw_resource_limits(cmd, args, keys, store) do
+    if data_plane_activity_command?(cmd) do
+      FerricStore.ResourceLimits.check_command(cmd, args, keys, store: store)
+    else
+      :ok
+    end
+  rescue
+    _error -> {:error, :resource_limit_check_failed}
+  catch
+    _kind, _reason -> {:error, :resource_limit_check_failed}
   end
 
   defp data_plane_activity_command?(cmd) when cmd in @management_raw_commands, do: false
