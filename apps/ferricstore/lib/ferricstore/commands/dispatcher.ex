@@ -785,9 +785,11 @@ defmodule Ferricstore.Commands.Dispatcher do
     start = System.monotonic_time(:microsecond)
 
     case parse_raw(name, args) do
-      {:ok, cmd, parsed_args, ast, _keys} ->
-        dispatch_ast(ast, store)
-        |> tap(fn _ -> log_raw_dispatch(cmd, parsed_args, start) end)
+      {:ok, cmd, parsed_args, ast, keys} ->
+        result = dispatch_ast(ast, store)
+        record_raw_activity(result, cmd, keys, store)
+        log_raw_dispatch(cmd, parsed_args, start)
+        result
 
       {:error, reason} ->
         {:error, reason}
@@ -806,4 +808,27 @@ defmodule Ferricstore.Commands.Dispatcher do
     duration = System.monotonic_time(:microsecond) - start
     Ferricstore.SlowLog.maybe_log([cmd | args], duration)
   end
+
+  defp record_raw_activity({:error, _reason}, _cmd, _keys, _store), do: :ok
+  defp record_raw_activity(_result, _cmd, [], _store), do: :ok
+
+  defp record_raw_activity(_result, cmd, keys, store) do
+    if data_plane_activity_command?(cmd) do
+      FerricStore.ResourceLimits.record_activity(keys, store: store)
+    else
+      :ok
+    end
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp data_plane_activity_command?(cmd) when cmd in @management_raw_commands, do: false
+  defp data_plane_activity_command?(cmd) when cmd in @server_raw_commands, do: false
+  defp data_plane_activity_command?(cmd) when cmd in @cluster_raw_commands, do: false
+  defp data_plane_activity_command?("MEMORY"), do: false
+  defp data_plane_activity_command?("FERRICSTORE.CONFIG"), do: false
+  defp data_plane_activity_command?("FERRICSTORE.METRICS"), do: false
+  defp data_plane_activity_command?(_cmd), do: true
 end

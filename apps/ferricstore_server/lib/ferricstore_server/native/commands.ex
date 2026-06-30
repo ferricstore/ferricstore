@@ -515,7 +515,7 @@ defmodule FerricstoreServer.Native.Commands do
     payload = normalize_payload(payload)
 
     case check_deadline(payload) do
-      :ok -> do_execute(opcode, payload, state)
+      :ok -> do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
       {:error, status, reason} -> {status, reason, state}
     end
   rescue
@@ -529,7 +529,7 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, command} <- fetch_command(opcode),
          :ok <- check_deadline(payload),
          :ok <- authorize(command, opcode, payload, state) do
-      do_execute(opcode, payload, state)
+      do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
     else
       {:error, status, reason} -> {status, reason, state}
     end
@@ -545,6 +545,29 @@ defmodule FerricstoreServer.Native.Commands do
       {:error, Exception.message(error), state}
     end
   end
+
+  defp record_native_activity({:ok, _payload, %{instance_ctx: store}} = result, opcode, payload) do
+    keys = keys(opcode, payload)
+
+    if data_plane_activity_opcode?(opcode) and keys != [] do
+      FerricStore.ResourceLimits.record_activity(keys, store: store)
+    end
+
+    result
+  rescue
+    _error -> result
+  catch
+    _kind, _reason -> result
+  end
+
+  defp record_native_activity(result, _opcode, _payload), do: result
+
+  defp data_plane_activity_opcode?(opcode)
+       when opcode in [@op_command_exec, @op_pipeline],
+       do: false
+
+  defp data_plane_activity_opcode?(opcode),
+    do: Map.has_key?(@kv_commands, opcode) or Map.has_key?(@flow_commands, opcode)
 
   defp metrics_command_payload?(@op_ferricstore_metrics, _payload), do: true
 

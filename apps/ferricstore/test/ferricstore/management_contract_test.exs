@@ -56,6 +56,16 @@ defmodule FerricStore.ManagementContractTest do
 
     @impl true
     def release(_reservation, _opts), do: :ok
+
+    @impl true
+    def record_activity(keys, opts) do
+      send(
+        :persistent_term.get({__MODULE__, :test_pid}),
+        {:activity, keys, Keyword.has_key?(opts, :store)}
+      )
+
+      :ok
+    end
   end
 
   defmodule FakeNamespace do
@@ -151,6 +161,19 @@ defmodule FerricStore.ManagementContractTest do
     assert :ok = FerricStore.ResourceLimits.check("tenant:namespace", :keys, 1)
     assert {:ok, nil} = FerricStore.ResourceLimits.reserve("tenant:namespace", :ops_per_sec, 1)
     assert :ok = FerricStore.ResourceLimits.release(nil)
+    assert :ok = FerricStore.ResourceLimits.record_activity(["tenant:namespace:key"])
+  end
+
+  test "resource limit activity hook delegates to configured implementation" do
+    Application.put_env(:ferricstore, FerricStore.ResourceLimits, FakeResourceLimits)
+    :persistent_term.put({FakeResourceLimits, :test_pid}, self())
+
+    assert :ok =
+             FerricStore.ResourceLimits.record_activity(["tenant:namespace:key"],
+               store: MockStore.make()
+             )
+
+    assert_receive {:activity, ["tenant:namespace:key"], true}
   end
 
   test "FERRICSTORE.QUOTA delegates to configured resource limit implementation" do

@@ -3,8 +3,9 @@ defmodule FerricStore.ResourceLimits do
   Stable resource-limit contract for FerricStore control planes and write paths.
 
   The public management commands use `set_limit/3`, `get_limit/2`, and
-  `usage/2`. Internal enforcement points can use `check/4`, `reserve/4`, and
-  `release/2` without coupling storage code to any specific limit backend.
+  `usage/2`. Internal enforcement points can use `check/4`, `reserve/4`,
+  `release/2`, and `record_activity/2` without coupling storage code to any
+  specific limit backend.
   """
 
   @type scope :: binary() | map()
@@ -21,6 +22,7 @@ defmodule FerricStore.ResourceLimits do
   @callback reserve(scope(), resource(), amount(), keyword()) ::
               {:ok, reservation()} | {:error, term()}
   @callback release(reservation(), keyword()) :: :ok | {:error, term()}
+  @callback record_activity([binary()], keyword()) :: :ok
 
   @spec set_limit(scope(), limit_spec(), keyword()) :: result()
   def set_limit(scope, limit_spec, opts \\ []),
@@ -43,6 +45,10 @@ defmodule FerricStore.ResourceLimits do
 
   @spec release(reservation(), keyword()) :: :ok | {:error, term()}
   def release(reservation, opts \\ []), do: implementation(opts).release(reservation, opts)
+
+  @spec record_activity([binary()], keyword()) :: :ok
+  def record_activity(keys, opts \\ []) when is_list(keys),
+    do: implementation(opts).record_activity(keys, opts)
 
   @doc false
   @spec implementation(keyword()) :: module()
@@ -85,4 +91,7 @@ defmodule FerricStore.ResourceLimits.Default do
 
   @impl true
   def release(_reservation, _opts), do: :ok
+
+  @impl true
+  def record_activity(_keys, _opts), do: :ok
 end
