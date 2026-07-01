@@ -299,6 +299,7 @@ Operations and reference:
 
 - [Architecture](guides/architecture.md) — write path, read path, storage, Raft consensus.
 - [Commands Reference](guides/commands.md) — FerricStore command syntax, native protocol mapping, and FerricFlow commands.
+- [Redis Migration Guide](guides/redis-migration.md) — compatibility matrix generation, workload assessment, and import strategy.
 - [Configuration](guides/configuration.md) — server config and production defaults.
 - [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering.
 - [Security](guides/security.md) — ACL, TLS, protected mode.

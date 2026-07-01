@@ -38,6 +38,7 @@ defmodule Ferricstore.MixProject do
         "../../guides/embedded-mode.md",
         "../../guides/flow-elixir-sdk.md",
         "../../guides/commands.md",
+        "../../guides/redis-migration.md",
         "../../guides/configuration.md",
         "../../guides/architecture.md",
         "../../guides/deployment.md",
