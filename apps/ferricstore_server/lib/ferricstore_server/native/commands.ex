@@ -801,17 +801,13 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, command} <- require_binary(payload, "command"),
          {:ok, args} <- raw_command_args(payload),
          {:ok, request_context} <- request_context(payload, state) do
-      if String.upcase(command) == "FERRICSTORE.METRICS" do
-        ferricstore_metrics_result(args, state)
+      with {:ok, cmd, parsed_args, ast, keys} <-
+             Ferricstore.Commands.Dispatcher.parse_raw(command, args),
+           :ok <- authorize_raw_command(cmd, parsed_args, ast, keys, state) do
+        dispatch_command_exec(cmd, command, parsed_args, state, request_context)
       else
-        with {:ok, cmd, parsed_args, ast, keys} <-
-               Ferricstore.Commands.Dispatcher.parse_raw(command, args),
-             :ok <- authorize_raw_command(cmd, parsed_args, ast, keys, state) do
-          dispatch_command_exec(cmd, command, parsed_args, state, request_context)
-        else
-          {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
-          {:error, status, reason} -> {status, reason, state}
-        end
+        {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
+        {:error, status, reason} -> {status, reason, state}
       end
     else
       {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}

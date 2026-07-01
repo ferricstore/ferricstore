@@ -6,11 +6,13 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Commands
+  alias FerricstoreServer.Native.Session
 
   @op_hello 0x0001
   @op_options 0x000B
   @op_pipeline 0x000E
   @op_command_exec 0x0100
+  @op_set 0x0102
 
   defmodule TestExtension do
     @behaviour Ferricstore.Commands.Extension
@@ -363,6 +365,139 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload == "ERR unsupported management command"
   end
 
+  test "COMMAND_EXEC enforces admin and dangerous categories for scoped credentials" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    denied_commands = [
+      {"ACL", ["SETUSER", "target", "on"], "acl.setuser"},
+      {"CONFIG", ["GET", "*"], "config"},
+      {"FLUSHDB", [], "flushdb"},
+      {"FERRICSTORE.METRICS", [], "ferricstore.metrics"},
+      {"FERRICSTORE.NAMESPACE", ["LIST"], "ferricstore.namespace"},
+      {"FERRICSTORE.QUOTA", ["GET", "tenant:a"], "ferricstore.quota"},
+      {"FLOW.RETENTION_CLEANUP", [], "flow.retention_cleanup"}
+    ]
+
+    for {command, args, expected} <- denied_commands do
+      {status, payload, _state} =
+        Commands.execute(
+          @op_command_exec,
+          %{"command" => command, "args" => args},
+          state
+        )
+
+      assert status == :noperm
+      assert payload =~ expected
+    end
+  end
+
+  test "COMMAND_EXEC enforces key scope for scoped credentials" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:ok, "OK", _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "SET", "args" => ["tenant:a:key", "value"]},
+               state
+             )
+
+    assert {:noperm, payload, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "SET", "args" => ["tenant:b:key", "value"]},
+               state
+             )
+
+    assert payload =~ "keys mentioned"
+  end
+
+  test "PIPELINE preserves COMMAND_EXEC and typed command ACL checks" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_pipeline,
+        %{
+          "commands" => [
+            %{
+              "opcode" => @op_command_exec,
+              "request_id" => 1,
+              "body" => %{"command" => "PING", "args" => []}
+            },
+            %{
+              "opcode" => @op_command_exec,
+              "request_id" => 2,
+              "body" => %{"command" => "FERRICSTORE.METRICS", "args" => []}
+            },
+            %{
+              "opcode" => @op_set,
+              "request_id" => 3,
+              "body" => %{"key" => "tenant:b:key", "value" => "value"}
+            }
+          ]
+        },
+        state
+      )
+
+    assert status == :ok
+    assert Enum.map(payload, & &1["status"]) == ["ok", "noperm", "noperm"]
+    assert Enum.at(payload, 1)["value"] =~ "ferricstore.metrics"
+    assert Enum.at(payload, 2)["value"] =~ "keys mentioned"
+  end
+
+  test "compact PIPELINE fallback preserves key ACL checks" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_pipeline,
+        %{
+          "return" => "pairs",
+          "compact_pipeline" => {1, [{"tenant:a:key", "ok"}, {"tenant:b:key", "denied"}]}
+        },
+        state
+      )
+
+    assert status == :ok
+    assert [["ok", "OK"], ["noperm", message]] = payload
+    assert message =~ "keys mentioned"
+  end
+
+  test "native transactions deny scoped credential boundary escapes before queueing" do
+    put_platform_scoped_user("platform_scoped")
+    state = session_state_as("platform_scoped")
+
+    assert {:ok, "OK", state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, state)
+
+    assert {:noperm, admin_payload, admin_state} =
+             Session.execute(%{"command" => "FLUSHDB", "args" => []}, state)
+
+    assert admin_payload =~ "flushdb"
+    assert admin_state.multi_queue == []
+
+    assert {:noperm, key_payload, key_state} =
+             Session.execute(
+               %{"command" => "SET", "args" => ["tenant:b:key", "value"]},
+               state
+             )
+
+    assert key_payload =~ "keys mentioned"
+    assert key_state.multi_queue == []
+
+    assert {:ok, "QUEUED", queued_state} =
+             Session.execute(
+               %{"command" => "SET", "args" => ["tenant:a:key", "value"]},
+               state
+             )
+
+    assert queued_state.multi_queue_count == 1
+  end
+
   test "replicated ACL disable denies rotated-out native service credential sessions only" do
     join_acl_invalidation_group()
 
@@ -485,6 +620,20 @@ defmodule FerricstoreServer.Native.CommandsTest do
     })
   end
 
+  defp session_state_as(username) do
+    username
+    |> state_as()
+    |> Map.merge(%{
+      multi_state: :none,
+      multi_queue: [],
+      multi_queue_count: 0,
+      multi_error: false,
+      watched_keys: %{},
+      pubsub_channels: nil,
+      pubsub_patterns: nil
+    })
+  end
+
   defp join_acl_invalidation_group do
     group = ConnAuth.acl_pg_group()
     :ok = :pg.join(group, group, self())
@@ -501,6 +650,25 @@ defmodule FerricstoreServer.Native.CommandsTest do
   defp apply_raft_acl(command) do
     Task.async(fn -> Acl.handle_raft_command(command) end)
     |> Task.await()
+  end
+
+  defp put_platform_scoped_user(username) do
+    assert :ok =
+             Acl.set_user(username, [
+               "on",
+               "nopass",
+               "-@all",
+               "+PING",
+               "+@read",
+               "+@write",
+               "+MULTI",
+               "+EXEC",
+               "+DISCARD",
+               "-@dangerous",
+               "-@admin",
+               "~tenant:a:*",
+               "&tenant:a:*"
+             ])
   end
 
   defp assert_native_get_ok(key, state) do
