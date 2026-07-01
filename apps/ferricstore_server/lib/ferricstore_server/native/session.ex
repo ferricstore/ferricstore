@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Native.Session do
   alias Ferricstore.PubSub, as: PS
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Coordinator, as: TxCoordinator
+  alias FerricstoreServer.Acl.Protection
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
 
   @max_subscriptions 100_000
@@ -59,7 +60,9 @@ defmodule FerricstoreServer.Native.Session do
              :ok <- ConnAuth.check_keys_cached(state.acl_cache, acl_cmd, keys) do
           :ok
         else
-          {:error, reason} -> {:error, :noperm, reason}
+          {:error, reason} ->
+            log_acl_denial(state, acl_cmd)
+            {:error, :noperm, reason}
         end
     end
   end
@@ -322,6 +325,19 @@ defmodule FerricstoreServer.Native.Session do
        do: ConnAuth.check_channels_cached(state.acl_cache, args)
 
   defp authorize_channels(_cmd, _args, _state), do: :ok
+
+  defp log_acl_denial(state, command) do
+    Protection.log_command_denied(
+      Map.get(state, :username),
+      command,
+      format_peer(Map.get(state, :peer)),
+      Map.get(state, :client_id)
+    )
+  end
+
+  defp format_peer(nil), do: "unknown"
+  defp format_peer({ip, port}), do: "#{:inet.ntoa(ip)}:#{port}"
+  defp format_peer(peer), do: inspect(peer)
 
   defp ensure_pubsub_sets(%{pubsub_channels: nil} = state),
     do: %{state | pubsub_channels: MapSet.new(), pubsub_patterns: MapSet.new()}

@@ -18,6 +18,8 @@ defmodule FerricstoreServer.AclSecurityTest do
   @moduletag :global_state
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Connection.Auth, as: ConnAuth
+  alias FerricstoreServer.Native.Session
   alias Ferricstore.AuditLog
 
   setup do
@@ -506,6 +508,39 @@ defmodule FerricstoreServer.AclSecurityTest do
       entries = AuditLog.get()
       denied_entries = Enum.filter(entries, fn {_, _, type, _} -> type == :command_denied end)
       assert length(denied_entries) == 3
+    end
+
+    test "native session channel ACL denials are logged to audit log" do
+      assert :ok =
+               Acl.set_user("subscriber", [
+                 "on",
+                 "nopass",
+                 "-@all",
+                 "+psubscribe",
+                 "&tenant:a:*"
+               ])
+
+      state = %{
+        username: "subscriber",
+        authenticated: true,
+        require_auth: false,
+        acl_cache: ConnAuth.build_acl_cache("subscriber"),
+        peer: {{127, 0, 0, 1}, 5_678},
+        client_id: 123
+      }
+
+      assert {:noperm, payload, _state} =
+               Session.execute(%{"command" => "PSUBSCRIBE", "args" => ["tenant:*"]}, state)
+
+      assert payload =~ "channels mentioned"
+
+      Process.sleep(10)
+
+      [{_, _, :command_denied, details}] = AuditLog.get()
+      assert details.username == "subscriber"
+      assert details.command == "PSUBSCRIBE"
+      assert details.client_ip == "127.0.0.1:5678"
+      assert details.client_id == 123
     end
 
     test "denial log is a no-op when audit logging is disabled" do
