@@ -1407,6 +1407,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp parse_flow_options(["ATTRIBUTE_DELETE", key | rest], specs, acc),
     do: parse_flow_options(rest, specs, append_list_opt(:attributes_delete, key, acc))
 
+  defp parse_flow_options(["STATE_META", key, value | rest], specs, acc),
+    do: parse_flow_options(rest, specs, merge_map_opt(:state_meta, key, value, acc))
+
   defp parse_flow_options([name, value | rest], specs, acc) do
     case parse_flow_option(name, value, specs) do
       {:ok, nil} -> parse_flow_options(rest, specs, acc)
@@ -1521,9 +1524,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp parse_flow_signal_opts(_args, _acc), do: {:error, "ERR syntax error"}
 
   defp parse_flow_policy_set_options(args),
-    do: parse_flow_policy_set_options(args, [], [], [], [])
+    do: parse_flow_policy_set_options(args, [], [], [], [], [])
 
-  defp parse_flow_policy_set_options([], retry_opts, backoff_opts, retention_opts, states) do
+  defp parse_flow_policy_set_options(
+         [],
+         policy_opts,
+         retry_opts,
+         backoff_opts,
+         retention_opts,
+         states
+       ) do
     retry_opts =
       if backoff_opts == [] do
         retry_opts
@@ -1531,7 +1541,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
         [{:backoff, Enum.reverse(backoff_opts)} | retry_opts]
       end
 
-    []
+    Enum.reverse(policy_opts)
     |> maybe_put_policy(:retry, retry_opts)
     |> maybe_put_policy(:retention, retention_opts)
     |> maybe_put_policy(:states, states)
@@ -1540,6 +1550,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_flow_policy_set_options(
          ["STATE", state | rest],
+         policy_opts,
          retry_opts,
          backoff_opts,
          retention_opts,
@@ -1549,9 +1560,14 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
     case parse_flow_policy_state_options(state_args) do
       {:ok, state_policy} ->
-        parse_flow_policy_set_options(tail, retry_opts, backoff_opts, retention_opts, [
-          {state, state_policy} | states
-        ])
+        parse_flow_policy_set_options(
+          tail,
+          policy_opts,
+          retry_opts,
+          backoff_opts,
+          retention_opts,
+          [{state, state_policy} | states]
+        )
 
       {:error, reason} ->
         {:error, reason}
@@ -1560,6 +1576,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_flow_policy_set_options(
          [name, value | rest],
+         policy_opts,
          retry_opts,
          backoff_opts,
          retention_opts,
@@ -1569,6 +1586,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {:retry, opt} ->
         parse_flow_policy_set_options(
           rest,
+          policy_opts,
           [opt | retry_opts],
           backoff_opts,
           retention_opts,
@@ -1578,6 +1596,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {:backoff, opt} ->
         parse_flow_policy_set_options(
           rest,
+          policy_opts,
           retry_opts,
           [opt | backoff_opts],
           retention_opts,
@@ -1587,9 +1606,20 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {:retention, opt} ->
         parse_flow_policy_set_options(
           rest,
+          policy_opts,
           retry_opts,
           backoff_opts,
           [opt | retention_opts],
+          states
+        )
+
+      {:policy, opt} ->
+        parse_flow_policy_set_options(
+          rest,
+          [opt | policy_opts],
+          retry_opts,
+          backoff_opts,
+          retention_opts,
           states
         )
 
@@ -1598,13 +1628,27 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
-  defp parse_flow_policy_set_options(_args, _retry_opts, _backoff_opts, _retention_opts, _states),
-    do: {:error, "ERR syntax error"}
+  defp parse_flow_policy_set_options(
+         _args,
+         _policy_opts,
+         _retry_opts,
+         _backoff_opts,
+         _retention_opts,
+         _states
+       ),
+       do: {:error, "ERR syntax error"}
 
   defp parse_flow_policy_state_options(args) do
     case parse_flow_policy_set_options(args) do
-      opts when is_list(opts) -> {:ok, opts}
-      {:error, reason} -> {:error, reason}
+      opts when is_list(opts) ->
+        if Keyword.has_key?(opts, :indexed_state_meta) do
+          {:error, "ERR flow indexed_state_meta is type-level only"}
+        else
+          {:ok, opts}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1624,6 +1668,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
       "HISTORY_HOT_MAX_EVENTS" ->
         {:error, "ERR flow retention history_hot_max_events is internal"}
+
+      "INDEXED_STATE_META" ->
+        {:policy, {:indexed_state_meta, value}}
 
       "MAX_RETRIES" ->
         policy_non_negative(:retry, :max_retries, value)

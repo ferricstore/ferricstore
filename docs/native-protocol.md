@@ -370,6 +370,14 @@ Flow `attributes` are small indexed metadata values for list/stats/dashboard
 filters. They are not payload bytes and are projected asynchronously for query
 use.
 
+Flow `state_meta` values are small per-state metadata maps. Mutating commands
+accept `STATE_META <key> <value>` options, and `FLOW.POLICY.SET <type>
+INDEXED_STATE_META <key>` enables one indexed state metadata key for broad
+search on that Flow type. Metadata for one state does not replace metadata
+stored for another state. Changing or removing `INDEXED_STATE_META` rewrites
+existing Flow records for that type so LMDB query rows are backfilled or deleted
+for the affected key.
+
 ## Client management and reroute behavior
 
 Native clients should:

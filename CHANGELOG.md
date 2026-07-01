@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.6.0 - 2026-07-01
+
+- Added bounded per-state Flow metadata with durable record/history encoding.
+- Added one policy-controlled indexed state metadata key per Flow type for indexed search.
+- Added automatic backfill and stale index cleanup when a Flow type changes its indexed state metadata key.
+- Added native command support for `STATE_META` mutation options and `INDEXED_STATE_META` Flow policy configuration.
+- Added LMDB projection, rebuild, and retention cleanup coverage for indexed state metadata rows.
+- Exposed Flow policy and retention cleanup functions through embedded `use FerricStore` instances.
+
 ## 0.5.6 - 2026-06-29
 
 - Added trusted native request context for extension command execution.

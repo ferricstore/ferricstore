@@ -39,6 +39,17 @@ defmodule Ferricstore.Flow.ManyItemOptsTest do
     assert ManyItemOpts.cancel(%{"id" => "flow-1", "fencing_token" => 3, "partition_key" => "p"}) ==
              {:ok, "flow-1", [fencing_token: 3, partition_key: "p"]}
 
+    assert {:ok, "flow-1", opts} =
+             ManyItemOpts.cancel(%{
+               id: "flow-1",
+               fencing_token: 3,
+               state_meta: %{"version" => 4},
+               attributes_merge: %{"phase" => "cancelled"}
+             })
+
+    assert opts[:state_meta] == %{"version" => 4}
+    assert opts[:attributes_merge] == %{"phase" => "cancelled"}
+
     assert ManyItemOpts.transition(
              {:id, "flow-1", :partition_key, "p", :fencing_token, 3, :lease_token, nil}
            ) ==

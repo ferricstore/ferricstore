@@ -695,7 +695,7 @@ defmodule Ferricstore.Flow.Codec do
          {:ok, rewound_to_event_id, rest} <-
            decode_flagged_bin(flags, @record_flag_rewound_to_event_id, rest, nil),
          {:ok, child_groups, ""} <- decode_record_sidecar(flags, rest) do
-      {child_groups, value_refs, attributes, indexed_attributes} =
+      {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta} =
         Support.split_record_sidecar(child_groups)
 
       record =
@@ -732,6 +732,8 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_value_refs(value_refs)
         |> maybe_put_decoded_attributes(attributes)
         |> maybe_put_decoded_indexed_attributes(indexed_attributes)
+        |> maybe_put_decoded_state_meta(state_meta)
+        |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
 
       if is_nil(rewound_to_event_id) do
         record
@@ -815,7 +817,7 @@ defmodule Ferricstore.Flow.Codec do
        ])
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
-      {child_groups, value_refs, attributes, indexed_attributes} =
+      {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta} =
         Support.split_record_sidecar(child_groups)
 
       record =
@@ -852,6 +854,8 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_value_refs(value_refs)
         |> maybe_put_decoded_attributes(attributes)
         |> maybe_put_decoded_indexed_attributes(indexed_attributes)
+        |> maybe_put_decoded_state_meta(state_meta)
+        |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
 
       if is_nil(rewound_to_event_id) do
         record
@@ -888,7 +892,7 @@ defmodule Ferricstore.Flow.Codec do
        ])
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
-      {_child_groups, value_refs, attributes, indexed_attributes} =
+      {_child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta} =
         Support.split_record_sidecar(child_groups)
 
       %{
@@ -914,6 +918,8 @@ defmodule Ferricstore.Flow.Codec do
       |> maybe_put_decoded_value_refs(value_refs)
       |> maybe_put_decoded_attributes(attributes)
       |> maybe_put_decoded_indexed_attributes(indexed_attributes)
+      |> maybe_put_decoded_state_meta(state_meta)
+      |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
     else
       _ -> raise ArgumentError, "invalid flow record"
     end
@@ -935,6 +941,17 @@ defmodule Ferricstore.Flow.Codec do
     do: Map.put(record, :indexed_attributes, names)
 
   defp maybe_put_decoded_indexed_attributes(record, _names), do: record
+
+  defp maybe_put_decoded_state_meta(record, state_meta)
+       when is_map(state_meta) and map_size(state_meta) > 0,
+       do: Map.put(record, :state_meta, state_meta)
+
+  defp maybe_put_decoded_state_meta(record, _state_meta), do: record
+
+  defp maybe_put_decoded_indexed_state_meta(record, key) when is_binary(key) and key != "",
+    do: Map.put(record, :indexed_state_meta, key)
+
+  defp maybe_put_decoded_indexed_state_meta(record, _key), do: record
 
   defp decode_history_fields_bin(rest, context) do
     with {:ok, flags, rest} <- decode_int(rest),

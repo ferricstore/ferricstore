@@ -279,6 +279,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
              lease_deadline_ms: 0
            })
            |> flow_put_history_attributes(fields)
+           |> flow_put_history_state_meta(fields)
            |> flow_stamp_terminal_retention(now_ms)}
         end
       end
@@ -330,6 +331,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
               {:ok, decoded} ->
                 case Ferricstore.Flow.Attributes.normalize(decoded) do
                   {:ok, attrs} -> Ferricstore.Flow.Attributes.put_record(record, attrs)
+                  {:error, _reason} -> record
+                end
+
+              {:error, _reason} ->
+                record
+            end
+
+          _missing_or_empty ->
+            record
+        end
+      end
+
+      defp flow_put_history_state_meta(record, fields) do
+        case Map.get(fields, "state_meta") do
+          value when is_binary(value) and value != "" ->
+            case Jason.decode(value) do
+              {:ok, decoded} ->
+                case Ferricstore.Flow.StateMeta.normalize(decoded) do
+                  {:ok, state_meta} -> Ferricstore.Flow.StateMeta.put_record(record, state_meta)
                   {:error, _reason} -> record
                 end
 

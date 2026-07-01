@@ -117,6 +117,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_policy_put, key, value, expire_at_ms}, state) do
+        apply_flow_pending_with_time(meta, state, :flow_policy_put, %{items: 1}, fn ->
+          do_flow_policy_put(state, key, value, expire_at_ms)
+        end)
+      end
+
       def apply(meta, {:put_blob_ref, key, encoded_ref, expire_at_ms}, state) do
         apply_pending_with_time(meta, state, fn ->
           do_checked_put_blob_ref_ref_only(state, key, encoded_ref, expire_at_ms)

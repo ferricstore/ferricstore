@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.RecordQuery
   alias Ferricstore.Flow.RecordRead
+  alias Ferricstore.Flow.StateMeta
   alias Ferricstore.Flow.TerminalQuery
 
   @default_state "queued"
@@ -61,7 +62,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
-         :ok <- validate_search_attributes(attributes),
+         {:ok, state_meta} <- StateMeta.query_from_opts(opts),
+         :ok <- validate_search_filters(attributes, state_meta),
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          :ok <-
@@ -73,24 +75,16 @@ defmodule Ferricstore.Flow.ReadAPI do
              attributes,
              consistent_projection?
            ),
-         {:ok, {name, value}} <-
-           select_attribute_filter(
+         :ok <- validate_indexed_search_state_meta(ctx, type, state_meta),
+         {:ok, records} <-
+           search_records(
              ctx,
              type,
              state,
              partition_key,
              attributes,
-             consistent_projection?
-           ),
-         {:ok, records} <-
-           list_records_for_search_attribute(
-             ctx,
-             type,
-             state,
-             partition_key,
-             name,
-             value,
-             attribute_fetch_query(query, attributes),
+             state_meta,
+             query,
              consistent_projection?
            ) do
       {:ok,
@@ -99,6 +93,7 @@ defmodule Ferricstore.Flow.ReadAPI do
        |> filter_optional_state(state)
        |> Enum.filter(&IndexQuery.record_matches?(&1, query, @terminal_states))
        |> Enum.filter(&Attributes.matches?(&1, attributes))
+       |> Enum.filter(&StateMeta.matches?(&1, state_meta))
        |> RecordQuery.sort_by_update()
        |> RecordQuery.maybe_reverse(query.rev?)
        |> Enum.take(count)}
@@ -477,6 +472,19 @@ defmodule Ferricstore.Flow.ReadAPI do
     end
   end
 
+  defp state_meta_fetch_query(query, attributes, state_meta) do
+    fetch_more? = map_size(attributes) > 0 or length(StateMeta.candidate_filters(state_meta)) > 1
+
+    if fetch_more? do
+      %{
+        query
+        | count: LMDBIndexRead.query_scan_count(query.count, @default_lmdb_query_scan_limit)
+      }
+    else
+      query
+    end
+  end
+
   defp list_records_for_search_attribute(
          ctx,
          type,
@@ -546,10 +554,12 @@ defmodule Ferricstore.Flow.ReadAPI do
   defp filter_optional_state(records, state),
     do: Enum.filter(records, &(Map.get(&1, :state) == state))
 
-  defp validate_search_attributes(attributes) when map_size(attributes) > 0, do: :ok
+  defp validate_search_filters(attributes, state_meta)
+       when map_size(attributes) > 0 or map_size(state_meta) > 0,
+       do: :ok
 
-  defp validate_search_attributes(_attributes),
-    do: {:error, "ERR flow search requires attributes"}
+  defp validate_search_filters(_attributes, _state_meta),
+    do: {:error, "ERR flow search requires attributes or state_meta"}
 
   defp validate_indexed_search_attributes(ctx, nil, state, partition_key, attributes, consistent?) do
     attributes
@@ -585,6 +595,94 @@ defmodule Ferricstore.Flow.ReadAPI do
         [name | _rest] ->
           {:error, "ERR flow attribute #{name} is not indexed for broad search"}
       end
+    end
+  end
+
+  defp validate_indexed_search_state_meta(_ctx, _type, state_meta) when map_size(state_meta) == 0,
+    do: :ok
+
+  defp validate_indexed_search_state_meta(_ctx, nil, _state_meta),
+    do: {:error, "ERR flow state_meta search requires type"}
+
+  defp validate_indexed_search_state_meta(ctx, type, state_meta) when is_binary(type) do
+    with {:ok, indexed_key} <- policy_indexed_state_meta(ctx, type) do
+      missing =
+        state_meta
+        |> StateMeta.candidate_filters()
+        |> Enum.map(fn {_state, name, _value} -> name end)
+        |> Enum.reject(&(&1 == indexed_key))
+
+      case {indexed_key, missing} do
+        {nil, [{_state, name, _value} | _rest]} ->
+          {:error, "ERR flow state_meta #{name} is not indexed for broad search"}
+
+        {nil, [name | _rest]} ->
+          {:error, "ERR flow state_meta #{name} is not indexed for broad search"}
+
+        {_key, []} ->
+          :ok
+
+        {_key, [name | _rest]} ->
+          {:error, "ERR flow state_meta #{name} is not indexed for broad search"}
+      end
+    end
+  end
+
+  defp search_records(
+         ctx,
+         type,
+         _state,
+         partition_key,
+         attributes,
+         state_meta,
+         query,
+         consistent_projection?
+       )
+       when map_size(state_meta) > 0 do
+    with {:ok, {meta_state, name, value}} <-
+           select_state_meta_filter(ctx, type, partition_key, state_meta, consistent_projection?) do
+      list_records_for_search_state_meta(
+        ctx,
+        type,
+        meta_state,
+        partition_key,
+        name,
+        value,
+        state_meta_fetch_query(query, attributes, state_meta),
+        consistent_projection?
+      )
+    end
+  end
+
+  defp search_records(
+         ctx,
+         type,
+         state,
+         partition_key,
+         attributes,
+         _state_meta,
+         query,
+         consistent_projection?
+       ) do
+    with {:ok, {name, value}} <-
+           select_attribute_filter(
+             ctx,
+             type,
+             state,
+             partition_key,
+             attributes,
+             consistent_projection?
+           ) do
+      list_records_for_search_attribute(
+        ctx,
+        type,
+        state,
+        partition_key,
+        name,
+        value,
+        attribute_fetch_query(query, attributes),
+        consistent_projection?
+      )
     end
   end
 
@@ -713,6 +811,126 @@ defmodule Ferricstore.Flow.ReadAPI do
       RAMIndexRead.score_entries(ctx, index_key, query, @default_lmdb_query_scan_limit)
 
     length(entries)
+  end
+
+  defp select_state_meta_filter(ctx, type, partition_key, state_meta, consistent?) do
+    case StateMeta.candidate_filters(state_meta) do
+      [] ->
+        {:error, "ERR flow state_meta must not be empty"}
+
+      [candidate] ->
+        {:ok, candidate}
+
+      candidates ->
+        candidates
+        |> Enum.map(fn {meta_state, name, value} = candidate ->
+          {state_meta_candidate_count(
+             ctx,
+             type,
+             meta_state,
+             partition_key,
+             name,
+             value,
+             consistent?
+           ), candidate}
+        end)
+        |> Enum.min_by(fn {{status, count}, {meta_state, name, value}} ->
+          score = if status == :ok, do: count, else: @default_lmdb_query_scan_limit
+          {score, meta_state, name, StateMeta.index_value(value)}
+        end)
+        |> elem(1)
+        |> then(&{:ok, &1})
+    end
+  end
+
+  defp state_meta_candidate_count(ctx, type, meta_state, :auto, name, value, consistent?) do
+    Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, 0}, fn partition_key, {:ok, acc} ->
+      case state_meta_candidate_count(
+             ctx,
+             type,
+             meta_state,
+             partition_key,
+             name,
+             value,
+             consistent?
+           ) do
+        {:ok, count} -> {:cont, {:ok, acc + count}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp state_meta_candidate_count(ctx, type, meta_state, partition_key, name, value, consistent?) do
+    value = StateMeta.index_value(value)
+    index_key = Keys.state_meta_index_key(type, meta_state, name, value, partition_key)
+
+    if byte_size(index_key) <= Ferricstore.Store.Router.max_key_size() do
+      with {:ok, lmdb_count} <-
+             LMDBIndexRead.query_count(ctx, index_key, partition_key, consistent?) do
+        {:ok, max(lmdb_count, ram_attribute_candidate_count(ctx, index_key))}
+      end
+    else
+      {:error, "ERR key too large (max #{Ferricstore.Store.Router.max_key_size()} bytes)"}
+    end
+  end
+
+  defp list_records_for_search_state_meta(
+         ctx,
+         type,
+         meta_state,
+         :auto,
+         name,
+         value,
+         query,
+         consistent_projection?
+       ) do
+    Ferricstore.Flow.Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
+      case list_records_for_search_state_meta(
+             ctx,
+             type,
+             meta_state,
+             partition_key,
+             name,
+             value,
+             query,
+             consistent_projection?
+           ) do
+        {:ok, records} -> {:cont, {:ok, RecordQuery.prepend_chunk(records, acc)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, chunks} -> {:ok, RecordQuery.flatten_chunks(chunks)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp list_records_for_search_state_meta(
+         ctx,
+         type,
+         meta_state,
+         partition_key,
+         name,
+         value,
+         query,
+         consistent_projection?
+       ) do
+    value = StateMeta.index_value(value)
+    index_key = Keys.state_meta_index_key(type, meta_state, name, value, partition_key)
+
+    with :ok <- validate_key_size(index_key) do
+      RecordRead.records_for_index(
+        ctx,
+        index_key,
+        partition_key,
+        query,
+        true,
+        consistent_projection?,
+        @default_lmdb_query_scan_limit
+      )
+    end
   end
 
   defp attribute_name_entries(_ctx, _type, _state, _partition_key, [], _consistent?),
@@ -1023,6 +1241,14 @@ defmodule Ferricstore.Flow.ReadAPI do
     case Ferricstore.Flow.Policy.get(ctx, type, []) do
       {:ok, %{indexed_attributes: names}} when is_list(names) -> {:ok, names}
       {:ok, _policy} -> {:ok, []}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp policy_indexed_state_meta(ctx, type) do
+    case Ferricstore.Flow.Policy.get(ctx, type, []) do
+      {:ok, %{indexed_state_meta: key}} when is_binary(key) -> {:ok, key}
+      {:ok, _policy} -> {:ok, nil}
       {:error, _reason} = error -> error
     end
   end

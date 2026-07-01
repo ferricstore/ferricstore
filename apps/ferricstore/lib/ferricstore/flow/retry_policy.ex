@@ -55,6 +55,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
          {:ok, retry} <- optional_retry_override(attrs),
          {:ok, retention} <- optional_retention_override(attrs),
          {:ok, indexed_attributes} <- optional_indexed_attributes(attrs),
+         {:ok, indexed_state_meta} <- optional_indexed_state_meta(attrs),
          {:ok, governance} <- optional_governance(attrs),
          {:ok, states} <- normalize_state_policies(fetch_policy(attrs, :states, "states", %{})) do
       policy =
@@ -65,6 +66,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
           retention: retention,
           states: states,
           indexed_attributes: indexed_attributes,
+          indexed_state_meta: indexed_state_meta,
           governance: governance
         }
         |> drop_nil_policy_fields()
@@ -129,6 +131,15 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   def indexed_attributes(_policy), do: []
+
+  def indexed_state_meta(%{indexed_state_meta: key}) do
+    case Ferricstore.Flow.StateMeta.normalize_indexed_key(key) do
+      {:ok, key} -> key
+      {:error, _reason} -> nil
+    end
+  end
+
+  def indexed_state_meta(_policy), do: nil
 
   defp optional_policy_version(attrs) do
     case fetch_policy(attrs, :version, "version", nil) do
@@ -376,6 +387,16 @@ defmodule Ferricstore.Flow.RetryPolicy do
       attrs
       |> fetch_policy(:indexed_attributes, "indexed_attributes", [])
       |> Ferricstore.Flow.Attributes.normalize_indexed_names()
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp optional_indexed_state_meta(attrs) do
+    if has_policy_key?(attrs, :indexed_state_meta, "indexed_state_meta") do
+      attrs
+      |> fetch_policy(:indexed_state_meta, "indexed_state_meta", nil)
+      |> Ferricstore.Flow.StateMeta.normalize_indexed_key()
     else
       {:ok, nil}
     end
@@ -629,6 +650,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
     |> drop_nil_field(:retry)
     |> drop_nil_field(:retention)
     |> drop_nil_field(:indexed_attributes)
+    |> drop_nil_field(:indexed_state_meta)
     |> drop_nil_field(:governance)
   end
 

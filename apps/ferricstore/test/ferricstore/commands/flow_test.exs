@@ -5,6 +5,7 @@ Code.require_file(
 
 Code.require_file("flow_test/sections/dispatches_flow_create_many_through_rust_ast.exs", __DIR__)
 Code.require_file("flow_test/sections/dispatches_flow_rewind_through_rust_ast.exs", __DIR__)
+Code.require_file("flow_test/sections/dispatches_flow_state_meta_through_rust_ast.exs", __DIR__)
 
 defmodule Ferricstore.Commands.FlowTest do
   use ExUnit.Case, async: false
@@ -29,4 +30,5 @@ defmodule Ferricstore.Commands.FlowTest do
   use Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRefsThroughRustAst
   use Ferricstore.Commands.FlowTest.Sections.DispatchesFlowCreateManyThroughRustAst
   use Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRustAst
+  use Ferricstore.Commands.FlowTest.Sections.DispatchesFlowStateMetaThroughRustAst
 end

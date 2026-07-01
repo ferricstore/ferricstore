@@ -181,7 +181,7 @@ defmodule Ferricstore.Store.Router.Part06 do
               :ok ->
                 0..(ctx.shard_count - 1)
                 |> Enum.reduce_while(:ok, fn idx, :ok ->
-                  case raft_write(ctx, idx, key, {:put, key, value, expire_at_ms}) do
+                  case raft_write(ctx, idx, key, {:flow_policy_put, key, value, expire_at_ms}) do
                     :ok -> {:cont, :ok}
                     {:error, _reason} = error -> {:halt, error}
                     other -> {:halt, other}

@@ -111,7 +111,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
            Map.get(record, :updated_at_ms, 0), state_key, expire_at_ms,
            Map.get(record, :parent_flow_id), Map.get(record, :root_flow_id),
            Map.get(record, :correlation_id), Ferricstore.Flow.Attributes.record(record),
-           Ferricstore.Flow.Attributes.indexed_names(record)},
+           Ferricstore.Flow.Attributes.indexed_names(record),
+           Ferricstore.Flow.StateMeta.record(record),
+           Ferricstore.Flow.StateMeta.indexed_key(record)},
           acc
         )
       end
@@ -371,7 +373,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         path,
         {:terminal_project, id, type, terminal_state, partition_key, updated_at_ms, state_key,
          expire_at_ms, parent_flow_id, root_flow_id, correlation_id, attributes,
-         indexed_attributes},
+         indexed_attributes, state_meta, indexed_state_meta},
         acc
       )
       when is_binary(id) and is_binary(type) and is_binary(terminal_state) and
@@ -401,7 +403,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
            partition_key: partition_key,
            updated_at_ms: updated_at_ms,
            attributes: attributes,
-           indexed_attributes: indexed_attributes
+           indexed_attributes: indexed_attributes,
+           state_meta: state_meta,
+           indexed_state_meta: indexed_state_meta
          }) ++
            terminal_project_metadata_ops(
              id,
@@ -415,7 +419,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
              type,
              terminal_state,
              attributes,
-             indexed_attributes
+             indexed_attributes,
+             state_meta,
+             indexed_state_meta
            )
        )}
     end
@@ -738,7 +744,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         type,
         terminal_state,
         attributes \\ %{},
-        indexed_attributes \\ []
+        indexed_attributes \\ [],
+        state_meta \\ %{},
+        indexed_state_meta \\ nil
       ) do
     []
     |> terminal_project_metadata_op(
@@ -777,7 +785,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       score,
       expire_at_ms,
       state_key,
-      indexed_attributes
+      indexed_attributes,
+      state_meta,
+      indexed_state_meta
     )
   end
 
@@ -791,7 +801,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         score,
         expire_at_ms,
         state_key,
-        indexed_attributes
+        indexed_attributes,
+        state_meta,
+        indexed_state_meta
       ) do
     record = %{
       id: id,
@@ -800,7 +812,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       partition_key: partition_key,
       updated_at_ms: score,
       attributes: attributes,
-      indexed_attributes: indexed_attributes
+      indexed_attributes: indexed_attributes,
+      state_meta: state_meta,
+      indexed_state_meta: indexed_state_meta
     }
 
     flow_attribute_query_ops(record, expire_at_ms, state_key) ++ ops
@@ -809,8 +823,11 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def flow_attribute_query_ops(record, expire_at_ms, state_key) do
     id = Map.get(record, :id)
 
-    record
-    |> Ferricstore.Flow.Attributes.index_entries()
+    entries =
+      Ferricstore.Flow.Attributes.index_entries(record) ++
+        Ferricstore.Flow.StateMeta.index_entries(record)
+
+    entries
     |> Enum.map(fn {index_key, _id, score} ->
       query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
       value = Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms, state_key)
@@ -850,8 +867,11 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def flow_attribute_query_keys(record) do
     id = Map.get(record, :id)
 
-    record
-    |> Ferricstore.Flow.Attributes.index_entries()
+    entries =
+      Ferricstore.Flow.Attributes.index_entries(record) ++
+        Ferricstore.Flow.StateMeta.index_entries(record)
+
+    entries
     |> Enum.map(fn {index_key, _id, score} ->
       Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
     end)

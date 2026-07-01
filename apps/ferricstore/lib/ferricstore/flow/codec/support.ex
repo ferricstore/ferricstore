@@ -9,8 +9,11 @@ defmodule Ferricstore.Flow.Codec.Support do
   @record_value_refs_key "__value_refs__"
   @record_attributes_key "__attributes__"
   @record_indexed_attributes_key "__indexed_attributes__"
+  @record_state_meta_key "__state_meta__"
+  @record_indexed_state_meta_key "__indexed_state_meta__"
   @history_value_refs_key "value_refs"
   @history_attributes_key "attributes"
+  @history_state_meta_key "state_meta"
   @record_flag_attempts 1 <<< 0
   @record_flag_fencing_token 1 <<< 1
   @record_flag_next_run_at_ms 1 <<< 2
@@ -161,10 +164,12 @@ defmodule Ferricstore.Flow.Codec.Support do
   def record_history_meta(record, meta) when is_map(record) and is_map(meta) do
     refs = flow_record_value_refs(record)
     attributes = Ferricstore.Flow.Attributes.record(record)
+    state_meta = Ferricstore.Flow.StateMeta.record(record)
 
     meta
     |> maybe_put_history_value_refs(refs)
     |> maybe_put_history_attributes(attributes)
+    |> maybe_put_history_state_meta(state_meta)
   end
 
   def record_history_meta(_record, meta), do: meta
@@ -178,6 +183,12 @@ defmodule Ferricstore.Flow.Codec.Support do
     do: Map.put_new(meta, @history_attributes_key, Jason.encode!(attrs))
 
   defp maybe_put_history_attributes(meta, _attrs), do: meta
+
+  defp maybe_put_history_state_meta(meta, state_meta)
+       when is_map(state_meta) and map_size(state_meta) > 0,
+       do: Map.put_new(meta, @history_state_meta_key, Jason.encode!(state_meta))
+
+  defp maybe_put_history_state_meta(meta, _state_meta), do: meta
 
   def history_meta_pair(key, nil), do: [{key, ""}]
   def history_meta_pair(key, value) when is_binary(value), do: [{key, value}]
@@ -240,14 +251,19 @@ defmodule Ferricstore.Flow.Codec.Support do
     refs = flow_record_value_refs(record)
     attributes = Ferricstore.Flow.Attributes.record(record)
     indexed_attributes = Ferricstore.Flow.Attributes.indexed_names(record)
+    state_meta = Ferricstore.Flow.StateMeta.record(record)
+    indexed_state_meta = Ferricstore.Flow.StateMeta.indexed_key(record)
 
-    if map_size(refs) == 0 and map_size(attributes) == 0 and indexed_attributes == [] do
+    if map_size(refs) == 0 and map_size(attributes) == 0 and indexed_attributes == [] and
+         map_size(state_meta) == 0 and is_nil(indexed_state_meta) do
       encode_child_groups(child_groups)
     else
       child_groups
       |> maybe_put_record_refs(refs)
       |> maybe_put_record_attributes(attributes)
       |> maybe_put_record_indexed_attributes(indexed_attributes)
+      |> maybe_put_record_state_meta(state_meta)
+      |> maybe_put_record_indexed_state_meta(indexed_state_meta)
       |> encode_child_groups()
     end
   end
@@ -264,13 +280,19 @@ defmodule Ferricstore.Flow.Codec.Support do
     {encoded_refs, child_groups} = Map.pop(groups, @record_value_refs_key, %{})
     {encoded_attributes, child_groups} = Map.pop(child_groups, @record_attributes_key, %{})
     {indexed_attributes, child_groups} = Map.pop(child_groups, @record_indexed_attributes_key, [])
+    {encoded_state_meta, child_groups} = Map.pop(child_groups, @record_state_meta_key, %{})
+
+    {indexed_state_meta, child_groups} =
+      Map.pop(child_groups, @record_indexed_state_meta_key, nil)
 
     {child_groups, decode_value_refs(encoded_refs),
      Ferricstore.Flow.Attributes.decode_sidecar(encoded_attributes),
-     decode_record_indexed_attributes(indexed_attributes)}
+     decode_record_indexed_attributes(indexed_attributes),
+     Ferricstore.Flow.StateMeta.decode_sidecar(encoded_state_meta),
+     decode_record_indexed_state_meta(indexed_state_meta)}
   end
 
-  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, []}
+  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, [], %{}, nil}
 
   def maybe_put_record_refs(groups, refs) when is_map(refs) and map_size(refs) > 0,
     do: Map.put(groups, @record_value_refs_key, encode_value_refs(refs))
@@ -287,10 +309,33 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def maybe_put_record_indexed_attributes(groups, _names), do: groups
 
+  def maybe_put_record_state_meta(groups, state_meta)
+      when is_map(state_meta) and map_size(state_meta) > 0,
+      do:
+        Map.put(
+          groups,
+          @record_state_meta_key,
+          Ferricstore.Flow.StateMeta.encode_sidecar(state_meta)
+        )
+
+  def maybe_put_record_state_meta(groups, _state_meta), do: groups
+
+  def maybe_put_record_indexed_state_meta(groups, key) when is_binary(key) and key != "",
+    do: Map.put(groups, @record_indexed_state_meta_key, key)
+
+  def maybe_put_record_indexed_state_meta(groups, _key), do: groups
+
   def decode_record_indexed_attributes(names) do
     case Ferricstore.Flow.Attributes.normalize_indexed_names(names) do
       {:ok, names} -> names
       {:error, _reason} -> []
+    end
+  end
+
+  def decode_record_indexed_state_meta(key) do
+    case Ferricstore.Flow.StateMeta.normalize_indexed_key(key) do
+      {:ok, key} -> key
+      {:error, _reason} -> nil
     end
   end
 

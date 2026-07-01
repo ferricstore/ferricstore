@@ -514,6 +514,7 @@ defmodule FerricStore.Impl do
     do: Ferricstore.Flow.fail(ctx, id, lease_token, opts)
 
   def flow_cancel(ctx, id, opts \\ []), do: Ferricstore.Flow.cancel(ctx, id, opts)
+  def flow_retention_cleanup(ctx, opts \\ []), do: Ferricstore.Flow.retention_cleanup(ctx, opts)
   def flow_rewind(ctx, id, opts), do: Ferricstore.Flow.rewind(ctx, id, opts)
   def flow_list(ctx, type, opts \\ []), do: Ferricstore.Flow.list(ctx, type, opts)
   def flow_search(ctx, opts \\ []), do: Ferricstore.Flow.search(ctx, opts)

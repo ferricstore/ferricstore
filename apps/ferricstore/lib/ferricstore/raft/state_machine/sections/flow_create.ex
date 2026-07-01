@@ -22,6 +22,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.RetryPolicy
+      alias Ferricstore.Flow.StateMeta
       alias Ferricstore.HLC
 
       alias Ferricstore.Store.{
@@ -191,10 +192,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             retention
           )
 
-        flow_put_record_indexed_attributes(
-          record,
-          flow_indexed_attributes_for_record(state, record)
-        )
+        flow_refresh_indexed_attributes(state, record)
       end
 
       defp flow_create_record_cached_retention(state, attrs, retention_cache) do
@@ -204,19 +202,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           {:ok, retention} ->
             record = flow_create_record_with_resolved_retention(attrs, retention)
 
-            {flow_put_record_indexed_attributes(
-               record,
-               flow_indexed_attributes_for_record(state, record)
-             ), retention_cache}
+            {flow_refresh_indexed_attributes(state, record), retention_cache}
 
           :error ->
             retention = flow_retention_for_create(state, attrs)
             record = flow_create_record_with_resolved_retention(attrs, retention)
 
-            {flow_put_record_indexed_attributes(
-               record,
-               flow_indexed_attributes_for_record(state, record)
-             ), Map.put(retention_cache, key, retention)}
+            {flow_refresh_indexed_attributes(state, record),
+             Map.put(retention_cache, key, retention)}
         end
       end
 
@@ -284,6 +277,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           child_groups: %{}
         }
         |> flow_put_record_attributes(Map.get(attrs, :attributes))
+        |> StateMeta.apply_update(attrs)
         |> flow_stamp_terminal_retention(now_ms)
       end
 
@@ -652,11 +646,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             Map.get(attrs, :attributes_merge, %{}),
             Map.get(attrs, :attributes_delete, [])
           )
+          |> StateMeta.apply_update(attrs)
 
         flow_put_record_indexed_attributes(
           record,
           Ferricstore.Flow.Attributes.indexed_names(record)
         )
+        |> flow_put_record_indexed_state_meta(StateMeta.indexed_key(record))
       end
 
       defp flow_put_record_attributes(record, attrs) when is_map(attrs) and map_size(attrs) > 0,
@@ -667,12 +663,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_put_record_indexed_attributes(record, names),
         do: Ferricstore.Flow.Attributes.put_indexed_names(record, names)
 
+      defp flow_put_record_indexed_state_meta(record, key),
+        do: StateMeta.put_indexed_key(record, key)
+
       defp flow_refresh_indexed_attributes(state, record),
         do:
-          flow_put_record_indexed_attributes(
-            record,
-            flow_indexed_attributes_for_record(state, record)
-          )
+          record
+          |> flow_put_record_indexed_attributes(flow_indexed_attributes_for_record(state, record))
+          |> flow_put_record_indexed_state_meta(flow_indexed_state_meta_for_record(state, record))
 
       defp flow_indexed_attributes_for_record(state, record) do
         case Map.get(record, :attributes) do
@@ -684,6 +682,104 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           _other ->
             []
         end
+      end
+
+      defp flow_indexed_state_meta_for_record(state, record) do
+        case Map.get(record, :state_meta) do
+          meta when is_map(meta) and map_size(meta) > 0 ->
+            state
+            |> flow_read_policy(Map.get(record, :type))
+            |> RetryPolicy.indexed_state_meta()
+
+          _other ->
+            nil
+        end
+      end
+
+      defp do_flow_policy_put(state, key, value, expire_at_ms) do
+        with {:ok, type} <- FlowKeys.policy_type(key),
+             {:ok, new_policy} <- RetryPolicy.decode_flow_policy(value) do
+          old_policy = flow_read_policy(state, type)
+          old_indexed_key = RetryPolicy.indexed_state_meta(old_policy)
+          new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
+
+          with :ok <- do_put(state, key, value, expire_at_ms) do
+            if old_indexed_key == new_indexed_key do
+              :ok
+            else
+              flow_reindex_state_meta_policy_records(state, type, new_indexed_key)
+            end
+          end
+        else
+          _other -> do_put(state, key, value, expire_at_ms)
+        end
+      end
+
+      defp flow_reindex_state_meta_policy_records(state, type, indexed_key) do
+        state
+        |> flow_state_keys_for_policy_reindex()
+        |> Enum.reduce_while(:ok, fn state_key, :ok ->
+          case flow_read_record_by_key(state, state_key) do
+            %{type: ^type} = record ->
+              case flow_reindex_state_meta_policy_record(state, state_key, record, indexed_key) do
+                :ok -> {:cont, :ok}
+                {:error, _reason} = error -> {:halt, error}
+              end
+
+            _other ->
+              {:cont, :ok}
+          end
+        end)
+      end
+
+      defp flow_state_keys_for_policy_reindex(%{ets: ets}) do
+        :ets.foldl(
+          fn
+            {key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}, acc
+            when is_binary(key) ->
+              if FlowKeys.state_key?(key), do: [key | acc], else: acc
+
+            _entry, acc ->
+              acc
+          end,
+          [],
+          ets
+        )
+      rescue
+        _ -> []
+      end
+
+      defp flow_reindex_state_meta_policy_record(state, state_key, record, indexed_key) do
+        target_key = flow_state_meta_policy_target_indexed_key(record, indexed_key)
+
+        if StateMeta.indexed_key(record) == target_key do
+          :ok
+        else
+          next = StateMeta.put_indexed_key(record, target_key)
+
+          with :ok <- flow_put_state_record(state, state_key, next) do
+            flow_queue_state_meta_policy_projection(state, state_key, next)
+          end
+        end
+      end
+
+      defp flow_state_meta_policy_target_indexed_key(record, indexed_key) do
+        case StateMeta.record(record) do
+          meta when is_map(meta) and map_size(meta) > 0 -> indexed_key
+          _other -> nil
+        end
+      end
+
+      defp flow_queue_state_meta_policy_projection(state, state_key, record) do
+        with_lmdb_mirror_shard(state, fn ->
+          queue_pending_lmdb_flow_state_projection(
+            state_key,
+            flow_encode(record),
+            flow_state_record_expire_at(record)
+          )
+        end)
+
+        :ok
       end
 
       defp flow_normalize_value_refs(refs) when is_map(refs) do

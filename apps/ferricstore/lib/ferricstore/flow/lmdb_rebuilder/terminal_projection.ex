@@ -74,8 +74,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
       end)
 
     attribute_ops =
-      record
-      |> Ferricstore.Flow.Attributes.index_entries()
+      (Ferricstore.Flow.Attributes.index_entries(record) ++
+         Ferricstore.Flow.StateMeta.index_entries(record))
       |> Enum.map(fn {key, _id, _score} ->
         query_key = LMDB.query_index_key(key, record.id, score)
         state_key = Flow.Keys.state_key(record.id, partition_key)

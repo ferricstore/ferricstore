@@ -71,6 +71,7 @@ defmodule Ferricstore.Flow.Policy do
       retry: RetryPolicy.resolve(policy, nil, nil),
       retention: response_retention(policy, nil),
       indexed_attributes: RetryPolicy.indexed_attributes(policy),
+      indexed_state_meta: RetryPolicy.indexed_state_meta(policy),
       governance: RetryPolicy.governance(policy),
       states:
         Map.new(states, fn {state, _state_policy} ->
@@ -92,6 +93,7 @@ defmodule Ferricstore.Flow.Policy do
       retry: RetryPolicy.resolve(policy, state, nil),
       retention: response_retention(policy, state),
       indexed_attributes: RetryPolicy.indexed_attributes(policy),
+      indexed_state_meta: RetryPolicy.indexed_state_meta(policy),
       governance: state_governance(policy, state) || RetryPolicy.governance(policy)
     }
   end

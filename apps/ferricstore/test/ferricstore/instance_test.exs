@@ -245,6 +245,101 @@ defmodule Ferricstore.InstanceTest do
       assert {:ok, [%{id: ^spawn_child, parent_flow_id: ^spawn_parent}]} =
                EmbeddedFlow.flow_by_parent(spawn_parent, partition_key: partition)
     end
+
+    test "custom instances expose indexed Flow state_meta search and retention cleanup" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_flow_state_meta_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedFlow.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} = EmbeddedFlow.start_link(data_dir: root, shard_count: 1)
+
+      id = "embedded-flow-state-meta-1"
+      type = "embedded-flow-state-meta"
+      partition = "tenant-state-meta"
+      now = System.system_time(:millisecond)
+
+      assert {:ok, %{indexed_state_meta: "version"}} =
+               EmbeddedFlow.flow_policy_set(type, indexed_state_meta: "version")
+
+      assert :ok =
+               EmbeddedFlow.flow_create(id,
+                 type: type,
+                 state: "accept",
+                 partition_key: partition,
+                 state_meta: %{"version" => 1},
+                 retention_ttl_ms: 100,
+                 run_at_ms: now,
+                 now_ms: now
+               )
+
+      assert {:ok, [claimed]} =
+               EmbeddedFlow.flow_claim_due(type,
+                 states: ["accept"],
+                 partition_key: partition,
+                 worker: "worker-state-meta",
+                 limit: 1,
+                 now_ms: now + 1
+               )
+
+      assert :ok =
+               EmbeddedFlow.flow_complete(id, claimed.lease_token,
+                 fencing_token: claimed.fencing_token,
+                 partition_key: partition,
+                 state_meta: %{"version" => 3},
+                 now_ms: now + 2
+               )
+
+      assert eventually(fn ->
+               case EmbeddedFlow.flow_search(
+                      type: type,
+                      partition_key: partition,
+                      state_meta: %{"accept" => %{"version" => 1}},
+                      consistent_projection: true,
+                      count: 10
+                    ) do
+                 {:ok, [%{id: ^id}]} -> true
+                 _ -> false
+               end
+             end)
+
+      assert eventually(fn ->
+               case EmbeddedFlow.flow_search(
+                      type: type,
+                      partition_key: partition,
+                      state_meta: %{"completed" => %{"version" => 3}},
+                      consistent_projection: true,
+                      count: 10
+                    ) do
+                 {:ok, [%{id: ^id}]} -> true
+                 _ -> false
+               end
+             end)
+
+      assert {:ok, cleaned} = EmbeddedFlow.flow_retention_cleanup(limit: 10, now_ms: now + 200)
+      assert cleaned.flows >= 1
+
+      assert eventually(fn ->
+               case EmbeddedFlow.flow_search(
+                      type: type,
+                      partition_key: partition,
+                      state_meta: %{"completed" => %{"version" => 3}},
+                      consistent_projection: true,
+                      count: 10
+                    ) do
+                 {:ok, []} -> true
+                 _ -> false
+               end
+             end)
+    end
   end
 
   describe "custom instance cleanup" do

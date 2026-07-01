@@ -149,12 +149,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp queue_lmdb_metadata_index_deletes(state, record) do
         with_lmdb_mirror_shard(state, fn ->
-          record
-          |> flow_metadata_index_entries()
-          |> Enum.each(fn {index_key, id, score} ->
-            index_key
-            |> Ferricstore.Flow.LMDB.query_index_key(id, score)
-            |> queue_pending_lmdb_mirror_query_delete()
+          metadata_query_keys =
+            record
+            |> flow_metadata_index_entries()
+            |> Enum.map(fn {index_key, id, score} ->
+              Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
+            end)
+
+          state_meta_query_keys =
+            record
+            |> Ferricstore.Flow.StateMeta.index_entries()
+            |> Enum.map(fn {index_key, id, score} ->
+              Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
+            end)
+
+          (metadata_query_keys ++ state_meta_query_keys)
+          |> Enum.each(fn query_key ->
+            queue_pending_lmdb_mirror_query_delete(query_key)
           end)
         end)
 

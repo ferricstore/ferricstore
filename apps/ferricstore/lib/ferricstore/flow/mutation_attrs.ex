@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.MutationAttrs do
   @moduledoc false
 
-  alias Ferricstore.Flow.{Attributes, Internal, RetryPolicy}
+  alias Ferricstore.Flow.{Attributes, Internal, RetryPolicy, StateMeta}
   alias Ferricstore.Store.Router
 
   import Ferricstore.Flow.Options,
@@ -107,7 +107,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_history_event_caps(history_hot_max_events, history_max_events),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
-         {:ok, attributes} <- Attributes.from_opts(opts) do
+         {:ok, attributes} <- Attributes.from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       partition_key = partition_key || Ferricstore.Flow.Keys.auto_partition_key(id)
 
       attrs =
@@ -129,6 +130,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attr(:attributes, attributes)
+        |> maybe_put_state_meta_update_opts(state, state_meta)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
 
@@ -161,7 +163,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_history_event_caps(history_hot_max_events, history_max_events),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
-         {:ok, attributes} <- Attributes.from_opts(opts) do
+         {:ok, attributes} <- Attributes.from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       partition_key = partition_key || Ferricstore.Flow.Keys.auto_partition_key(id)
 
       attrs =
@@ -185,6 +188,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attr(:attributes, attributes)
+        |> maybe_put_state_meta_update_opts(initial_state, state_meta)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -314,7 +318,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, priority} <- optional_priority_or_nil(opts),
-         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts) do
+         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
         %{
           id: id,
@@ -329,6 +334,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attribute_update_opts(attributes_merge, attributes_delete)
+        |> maybe_put_state_meta_update_opts(to_state, state_meta)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
 
@@ -350,7 +356,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
          {:ok, worker} <- optional_binary_or_nil(opts, :worker, nil),
-         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts) do
+         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
         %{
           id: id,
@@ -366,6 +373,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attribute_update_opts(attributes_merge, attributes_delete)
+        |> maybe_put_state_meta_update_opts(to_state, state_meta)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -384,7 +392,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
          {:ok, retry_policy} <- optional_retry_policy(opts),
-         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts) do
+         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
         %{
           id: id,
@@ -395,6 +404,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_flow_value(opts, :error)
         |> maybe_put_attribute_update_opts(attributes_merge, attributes_delete)
+        |> maybe_put_state_meta_update_opts(nil, state_meta)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
         |> maybe_put_attr(:retry_policy, retry_policy)
@@ -416,7 +426,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, nil),
          {:ok, priority} <- optional_priority_or_nil(opts),
-         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts) do
+         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
         %{
           id: id,
@@ -431,6 +442,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attribute_update_opts(attributes_merge, attributes_delete)
+        |> maybe_put_state_meta_update_opts(state, state_meta)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -448,7 +460,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
-         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts) do
+         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
         %{
           id: id,
@@ -461,6 +474,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value(opts, :result)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attribute_update_opts(attributes_merge, attributes_delete)
+        |> maybe_put_state_meta_update_opts("completed", state_meta)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -528,7 +542,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
-         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts) do
+         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
         %{
           id: id,
@@ -541,6 +556,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_flow_value(opts, :error)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attribute_update_opts(attributes_merge, attributes_delete)
+        |> maybe_put_state_meta_update_opts("failed", state_meta)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -559,7 +575,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
          :ok <- validate_cancel_reason_source(opts),
-         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts) do
+         {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
+         {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
         %{
           id: id,
@@ -571,6 +588,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_cancel_reason(opts)
         |> maybe_put_named_value_opts(opts)
         |> maybe_put_attribute_update_opts(attributes_merge, attributes_delete)
+        |> maybe_put_state_meta_update_opts("cancelled", state_meta)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -1090,5 +1108,13 @@ defmodule Ferricstore.Flow.MutationAttrs do
     attrs
     |> maybe_put_attr(:attributes_merge, merge)
     |> maybe_put_attr(:attributes_delete, delete)
+  end
+
+  def maybe_put_state_meta_update_opts(attrs, _state, meta) when meta in [nil, %{}], do: attrs
+
+  def maybe_put_state_meta_update_opts(attrs, state, meta) do
+    attrs
+    |> maybe_put_attr(:state_meta_state, state)
+    |> maybe_put_attr(:state_meta_update, meta)
   end
 end

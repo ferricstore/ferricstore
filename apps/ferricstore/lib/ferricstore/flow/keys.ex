@@ -81,6 +81,9 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> @global_tag <> ":policy:" <> type
   end
 
+  def policy_type("f:" <> @global_tag <> ":policy:" <> type) when type != "", do: {:ok, type}
+  def policy_type(_key), do: :error
+
   def governance_effect_key(id, effect_key, partition_key \\ nil) do
     "f:" <> tag(partition_key) <> ":gov:e:" <> id <> ":" <> effect_key
   end
@@ -218,6 +221,10 @@ defmodule Ferricstore.Flow.Keys do
 
   def attribute_partition_index_prefix(name, partition_key \\ nil) do
     "f:" <> tag(partition_key) <> ":i:ap:" <> name <> "="
+  end
+
+  def state_meta_index_key(type, state, name, value, partition_key \\ nil) do
+    "f:" <> tag(partition_key) <> ":i:sm:" <> type <> ":" <> state <> ":" <> name <> "=" <> value
   end
 
   def stream_entry_key(id, event_id, partition_key \\ nil) do

@@ -70,6 +70,21 @@ state-specific data. Attribute query projection is asynchronous, so use
 `CONSISTENT_PROJECTION true` when an admin/debug read must wait for projection
 catch-up.
 
+State metadata is per logical Flow state. It is retained with the record/history
+for that state and does not overwrite metadata stored for earlier states:
+
+```text
+FLOW.POLICY.SET order INDEXED_STATE_META version
+FLOW.CREATE order-1 TYPE order STATE accept STATE_META version 1
+FLOW.COMPLETE order-1 <lease-token> FENCING <fencing-token> STATE_META version 3
+```
+
+Only one state metadata key can be indexed per Flow type. Non-indexed state
+metadata is still returned by `FLOW.GET`, but broad `state_meta` search requires
+the type policy to index the searched key. Changing the indexed state metadata
+key backfills existing Flow records of that type and removes stale query rows
+for the previous key.
+
 Production semantics, retry policy, history caps, LMDB cold projection, and
 operator metrics are documented in `docs/flow-production-readiness.md` and
 `docs/flow-retry-policy.md`. The Elixir workflow SDK for the embedded API is

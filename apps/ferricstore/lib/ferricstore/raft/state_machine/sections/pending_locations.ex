@@ -964,13 +964,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       end
 
       defp flow_record_has_indexed_attributes?(record) when is_map(record) do
+        flow_record_has_attributes?(record) or flow_record_has_indexed_state_meta?(record)
+      end
+
+      defp flow_record_has_indexed_attributes?(_record), do: false
+
+      defp flow_record_has_attributes?(record) do
         case Map.get(record, :attributes) do
           attrs when is_map(attrs) -> map_size(attrs) > 0
           _other -> false
         end
       end
 
-      defp flow_record_has_indexed_attributes?(_record), do: false
+      defp flow_record_has_indexed_state_meta?(record) do
+        case {Map.get(record, :state_meta), Map.get(record, :indexed_state_meta)} do
+          {meta, key} when is_map(meta) and is_binary(key) -> map_size(meta) > 0
+          _other -> false
+        end
+      end
     end
   end
 end

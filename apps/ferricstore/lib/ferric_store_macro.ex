@@ -449,6 +449,14 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_get(__instance__(), id, opts)
       end
 
+      def flow_policy_set(type, opts) do
+        FerricStore.Impl.flow_policy_set(__instance__(), type, opts)
+      end
+
+      def flow_policy_get(type, opts \\ []) do
+        FerricStore.Impl.flow_policy_get(__instance__(), type, opts)
+      end
+
       def flow_claim_due(type, opts) do
         FerricStore.Impl.flow_claim_due(__instance__(), type, opts)
       end
@@ -522,6 +530,10 @@ defmodule FerricStore.Macro do
 
       def flow_cancel(id, opts \\ []) do
         FerricStore.Impl.flow_cancel(__instance__(), id, opts)
+      end
+
+      def flow_retention_cleanup(opts \\ []) do
+        FerricStore.Impl.flow_retention_cleanup(__instance__(), opts)
       end
 
       def flow_rewind(id, opts) do

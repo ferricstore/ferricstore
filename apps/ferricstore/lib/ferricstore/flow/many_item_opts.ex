@@ -242,6 +242,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
     |> maybe_put(:values, item, :values, "values")
     |> maybe_put(:value_refs, item, :value_refs, "value_refs")
     |> maybe_put(:attributes, item, :attributes, "attributes")
+    |> maybe_put(:state_meta, item, :state_meta, "state_meta")
     |> maybe_put(:partition_key, item, :partition_key, "partition_key")
     |> maybe_put(:parent_flow_id, item, :parent_flow_id, "parent_flow_id")
     |> maybe_put(:root_flow_id, item, :root_flow_id, "root_flow_id")
@@ -303,6 +304,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
     |> maybe_put(:attributes, item, :attributes, "attributes")
     |> maybe_put(:attributes_merge, item, :attributes_merge, "attributes_merge")
     |> maybe_put(:attributes_delete, item, :attributes_delete, "attributes_delete")
+    |> maybe_put(:state_meta, item, :state_meta, "state_meta")
   end
 
   defp complete_result_ref(item), do: maybe_put([], :result_ref, item, :result_ref, "result_ref")
@@ -323,6 +325,10 @@ defmodule Ferricstore.Flow.ManyItemOpts do
     |> maybe_put(:value_refs, item, :value_refs, "value_refs")
     |> maybe_put(:drop_values, item, :drop_values, "drop_values")
     |> maybe_put(:override_values, item, :override_values, "override_values")
+    |> maybe_put(:attributes, item, :attributes, "attributes")
+    |> maybe_put(:attributes_merge, item, :attributes_merge, "attributes_merge")
+    |> maybe_put(:attributes_delete, item, :attributes_delete, "attributes_delete")
+    |> maybe_put(:state_meta, item, :state_meta, "state_meta")
   end
 
   defp maybe_put(opts, opt_key, item, atom_key, string_key) do
