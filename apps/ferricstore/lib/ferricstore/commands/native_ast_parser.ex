@@ -1048,6 +1048,11 @@ defmodule Ferricstore.Commands.NativeAstParser do
     if String.upcase(subcmd) == "NUMSUB", do: channels, else: []
   end
 
+  defp extra_command_keys("FLOW.ATTRIBUTES", args), do: flow_partition_keys_or_global(args, 1)
+
+  defp extra_command_keys("FLOW.ATTRIBUTE_VALUES", args),
+    do: flow_partition_keys_or_global(args, 2)
+
   defp extra_command_keys("WATCH", keys), do: keys
   defp extra_command_keys("BLPOP", args), do: drop_last(args)
   defp extra_command_keys("BRPOP", args), do: drop_last(args)
@@ -1061,6 +1066,36 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp extra_command_keys(cmd, [key | _args]) when cmd in @extra_first_key_commands, do: [key]
   defp extra_command_keys(_cmd, _args), do: []
+
+  defp flow_partition_keys_or_global(args, option_start) do
+    case flow_partition_key_values(args, option_start) do
+      [] -> ["*"]
+      keys -> keys
+    end
+  end
+
+  defp flow_partition_key_values(args, option_start) when option_start >= length(args), do: []
+
+  defp flow_partition_key_values(args, option_start) do
+    option_start..(length(args) - 2)
+    |> Enum.flat_map(fn idx ->
+      case {Enum.at(args, idx), Enum.at(args, idx + 1)} do
+        {name, value} when is_binary(value) ->
+          if String.upcase(to_string(name)) == "PARTITION" do
+            [flow_acl_partition_key(value)]
+          else
+            []
+          end
+
+        _other ->
+          []
+      end
+    end)
+    |> Enum.uniq()
+  end
+
+  defp flow_acl_partition_key("GLOBAL"), do: "*"
+  defp flow_acl_partition_key(value), do: value
 
   defp parse_set_opts(opts), do: parse_set_opts(opts, [])
 

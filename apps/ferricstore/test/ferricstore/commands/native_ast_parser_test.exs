@@ -89,7 +89,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
   end
 
   test "parses Flow create claim terminal and query ASTs" do
-    assert {:ok, "FLOW.CREATE", _args, {:flow_create, "flow-1", create_opts}, _keys} =
+    assert {:ok, "FLOW.CREATE", _args, {:flow_create, "flow-1", create_opts}, ["tenant-a"]} =
              NativeAstParser.parse("flow.create", [
                "flow-1",
                "TYPE",
@@ -114,7 +114,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert create_opts[:payload] == "payload"
     assert create_opts[:attributes] == %{"tenant" => "acme"}
 
-    assert {:ok, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, "checkout", claim_opts}, _keys} =
+    assert {:ok, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, "checkout", claim_opts}, ["checkout"]} =
              NativeAstParser.parse("flow.claim_due", [
                "checkout",
                "WORKER",
@@ -136,7 +136,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert claim_opts[:attributes] == %{"tenant" => "acme"}
 
     assert {:ok, "FLOW.COMPLETE", _args,
-            {:flow_complete, "flow-1", "lease-1", [fencing_token: 1, result: "ok"]}, _keys} =
+            {:flow_complete, "flow-1", "lease-1", [fencing_token: 1, result: "ok"]}, ["flow-1"]} =
              NativeAstParser.parse("flow.complete", [
                "flow-1",
                "lease-1",
@@ -147,8 +147,54 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              ])
 
     assert {:ok, "FLOW.ATTRIBUTE_VALUES", _args,
-            {:flow_attribute_values, "checkout", "tenant", [count: 10]}, _keys} =
-             NativeAstParser.parse("flow.attribute_values", ["checkout", "tenant", "COUNT", "10"])
+            {:flow_attribute_values, "checkout", "tenant",
+             [count: 10, partition_key: "tenant-a"]}, ["tenant-a"]} =
+             NativeAstParser.parse("flow.attribute_values", [
+               "checkout",
+               "tenant",
+               "COUNT",
+               "10",
+               "PARTITION",
+               "tenant-a"
+             ])
+  end
+
+  test "extracts namespace ACL keys from direct Flow metadata commands" do
+    assert {:ok, "FLOW.GET", _args, {:flow_get, "flow-1", [partition_key: "tenant:a"]},
+            ["tenant:a"]} =
+             NativeAstParser.parse("flow.get", ["flow-1", "PARTITION", "tenant:a"])
+
+    assert {:ok, "FLOW.GET", _args, {:flow_get, "flow-1", []}, ["flow-1"]} =
+             NativeAstParser.parse("flow.get", ["flow-1"])
+
+    assert {:ok, "FLOW.HISTORY", _args, {:flow_history, "flow-1", [partition_key: "tenant:a"]},
+            ["tenant:a"]} =
+             NativeAstParser.parse("flow.history", ["flow-1", "PARTITION", "tenant:a"])
+
+    assert {:ok, "FLOW.LIST", _args, {:flow_list, "checkout", [partition_key: "tenant:a"]},
+            ["tenant:a"]} =
+             NativeAstParser.parse("flow.list", ["checkout", "PARTITION", "tenant:a"])
+
+    assert {:ok, "FLOW.ATTRIBUTES", _args,
+            {:flow_attributes, "checkout", [partition_key: "tenant:a"]}, ["tenant:a"]} =
+             NativeAstParser.parse("flow.attributes", ["checkout", "PARTITION", "tenant:a"])
+
+    assert {:ok, "FLOW.ATTRIBUTE_VALUES", _args,
+            {:flow_attribute_values, "checkout", "tenant", [partition_key: "tenant:a"]},
+            ["tenant:a"]} =
+             NativeAstParser.parse("flow.attribute_values", [
+               "checkout",
+               "tenant",
+               "PARTITION",
+               "tenant:a"
+             ])
+
+    assert {:ok, "FLOW.ATTRIBUTES", _args, {:flow_attributes, "checkout", []}, ["*"]} =
+             NativeAstParser.parse("flow.attributes", ["checkout"])
+
+    assert {:ok, "FLOW.ATTRIBUTE_VALUES", _args,
+            {:flow_attribute_values, "checkout", "tenant", []}, ["*"]} =
+             NativeAstParser.parse("flow.attribute_values", ["checkout", "tenant"])
   end
 
   test "parses Flow many and newer workflow/governance command names" do
