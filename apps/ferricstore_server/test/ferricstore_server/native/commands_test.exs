@@ -65,8 +65,16 @@ defmodule FerricstoreServer.Native.CommandsTest do
     previous_trusted_request_context_users =
       Application.get_env(:ferricstore, :native_trusted_request_context_users)
 
+    previous_acl_management = Application.get_env(:ferricstore, FerricStore.Management.ACL)
+
     Application.delete_env(:ferricstore, :command_extensions)
     Application.delete_env(:ferricstore, :native_trusted_request_context_users)
+
+    Application.put_env(
+      :ferricstore,
+      FerricStore.Management.ACL,
+      FerricstoreServer.Management.ACL
+    )
 
     ConnRegistry.init_table()
     FerricstoreServer.Acl.reset!()
@@ -83,6 +91,11 @@ defmodule FerricstoreServer.Native.CommandsTest do
       case previous_trusted_request_context_users do
         nil -> Application.delete_env(:ferricstore, :native_trusted_request_context_users)
         value -> Application.put_env(:ferricstore, :native_trusted_request_context_users, value)
+      end
+
+      case previous_acl_management do
+        nil -> Application.delete_env(:ferricstore, FerricStore.Management.ACL)
+        value -> Application.put_env(:ferricstore, FerricStore.Management.ACL, value)
       end
     end)
 
@@ -285,6 +298,41 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload =~ "acl.setuser"
   end
 
+  test "COMMAND_EXEC dispatches ACL subcommands through server management adapter" do
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{
+          "command" => "ACL",
+          "args" => ["SETUSER", "native-target", "on", "nopass", "+PING", "~*"]
+        },
+        state()
+      )
+
+    assert status == :ok
+    assert payload == "OK"
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "ACL", "args" => ["GETUSER", "native-target"]},
+        state()
+      )
+
+    assert status == :ok
+    assert "flags" in payload
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "ACL", "args" => ["DELUSER", "native-target"]},
+        state()
+      )
+
+    assert status == :ok
+    assert payload == 1
+  end
+
   test "COMMAND_EXEC enforces scoped keys for management commands" do
     assert :ok =
              Acl.set_user("tenant-a-manager", [
@@ -313,6 +361,89 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :error
     assert payload == "ERR unsupported management command"
+  end
+
+  test "replicated ACL disable denies rotated-out native service credential sessions only" do
+    join_acl_invalidation_group()
+
+    assert :ok =
+             Acl.set_user("platform_worker_old", [
+               "on",
+               "nopass",
+               "-@all",
+               "+get",
+               "~tenant:a:*"
+             ])
+
+    assert :ok =
+             Acl.set_user("platform_worker_new", [
+               "on",
+               "nopass",
+               "-@all",
+               "+get",
+               "~tenant:a:*"
+             ])
+
+    old_state = state_as("platform_worker_old")
+    new_state = state_as("platform_worker_new")
+
+    assert_native_get_ok("tenant:a:key", old_state)
+    assert_native_get_ok("tenant:a:key", new_state)
+
+    assert :ok = apply_raft_acl({:acl_setuser, "platform_worker_old", ["off"]})
+    assert_receive {:acl_invalidate, "platform_worker_old"}
+
+    old_state = ConnAuth.maybe_refresh_acl_cache(old_state, "platform_worker_old")
+    new_state = ConnAuth.maybe_refresh_acl_cache(new_state, "platform_worker_old")
+
+    assert_native_get_denied("tenant:a:key", old_state)
+    assert_native_get_ok("tenant:a:key", new_state)
+  end
+
+  test "replicated ACL delete denies active native service credential sessions" do
+    join_acl_invalidation_group()
+
+    assert :ok =
+             Acl.set_user("platform_revoke_abcd", [
+               "on",
+               "nopass",
+               "-@all",
+               "+get",
+               "~tenant:revoke:*"
+             ])
+
+    state = state_as("platform_revoke_abcd")
+    assert_native_get_ok("tenant:revoke:key", state)
+
+    assert :ok = apply_raft_acl({:acl_deluser, "platform_revoke_abcd"})
+    assert_receive {:acl_invalidate, "platform_revoke_abcd"}
+
+    state = ConnAuth.maybe_refresh_acl_cache(state, "platform_revoke_abcd")
+    assert_native_get_denied("tenant:revoke:key", state)
+  end
+
+  test "replicated ACL delete of missing credential does not invalidate other sessions" do
+    join_acl_invalidation_group()
+
+    assert :ok =
+             Acl.set_user("platform_other_abcd", [
+               "on",
+               "nopass",
+               "-@all",
+               "+get",
+               "~tenant:other:*"
+             ])
+
+    state = state_as("platform_other_abcd")
+    assert_native_get_ok("tenant:other:key", state)
+
+    assert {:error, "ERR User 'platform_missing_abcd' does not exist"} =
+             apply_raft_acl({:acl_deluser, "platform_missing_abcd"})
+
+    refute_receive {:acl_invalidate, _username}, 100
+
+    state = ConnAuth.maybe_refresh_acl_cache(state, "platform_missing_abcd")
+    assert_native_get_ok("tenant:other:key", state)
   end
 
   test "CLIENT TRACKING is explicitly rejected after text protocol removal" do
@@ -352,6 +483,36 @@ defmodule FerricstoreServer.Native.CommandsTest do
       acl_cache: ConnAuth.build_acl_cache(username),
       require_auth: ConnAuth.user_requires_auth?(username)
     })
+  end
+
+  defp join_acl_invalidation_group do
+    group = ConnAuth.acl_pg_group()
+    :ok = :pg.join(group, group, self())
+
+    on_exit(fn ->
+      try do
+        :pg.leave(group, group, self())
+      catch
+        :error, _reason -> :ok
+      end
+    end)
+  end
+
+  defp apply_raft_acl(command) do
+    Task.async(fn -> Acl.handle_raft_command(command) end)
+    |> Task.await()
+  end
+
+  defp assert_native_get_ok(key, state) do
+    assert {:ok, _payload, _state} =
+             Commands.execute(@op_command_exec, %{"command" => "GET", "args" => [key]}, state)
+  end
+
+  defp assert_native_get_denied(key, state) do
+    assert {:noperm, message, _state} =
+             Commands.execute(@op_command_exec, %{"command" => "GET", "args" => [key]}, state)
+
+    assert message =~ "NOPERM"
   end
 
   defp schema_names(payload), do: Map.keys(payload.schemas)

@@ -25,6 +25,7 @@ defmodule FerricstoreServer.Application do
     native_port = Application.get_env(:ferricstore, :native_port, 6388)
     health_port = Application.get_env(:ferricstore, :health_port, 4000)
 
+    configure_management_adapters()
     FerricstoreServer.Connection.Registry.init_table()
 
     children =
@@ -100,6 +101,16 @@ defmodule FerricstoreServer.Application do
       end,
       raft_apply_hook: FerricstoreServer.RaftApplyHook.compose_current(:default)
     )
+  end
+
+  defp configure_management_adapters do
+    unless Application.get_env(:ferricstore, FerricStore.Management.ACL) do
+      Application.put_env(
+        :ferricstore,
+        FerricStore.Management.ACL,
+        FerricstoreServer.Management.ACL
+      )
+    end
   end
 
   defp listener_connection_count(listener) do
