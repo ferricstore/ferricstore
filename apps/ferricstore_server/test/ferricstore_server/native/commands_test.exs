@@ -9,6 +9,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Native.Session
 
   @op_hello 0x0001
+  @op_route 0x0006
+  @op_shards 0x0007
   @op_options 0x000B
   @op_pipeline 0x000E
   @op_command_exec 0x0100
@@ -130,9 +132,64 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload.protocol == "ferricstore-native"
-    assert payload.route.native_port == Application.get_env(:ferricstore, :native_port, 6388)
+    assert is_binary(payload.route.host)
+    assert is_integer(payload.route.native_port)
+    assert payload.route.endpoint.host == payload.route.host
+    assert payload.route.endpoint.native_port == payload.route.native_port
     refute Map.has_key?(payload.route, String.to_atom("resp" <> "_port"))
     assert new_state.client_name == "sdk-a"
+  end
+
+  test "HELLO redacts native endpoints before authentication is complete" do
+    {status, payload, _state} =
+      Commands.execute(
+        @op_hello,
+        %{"client_name" => "sdk-a"},
+        state(%{require_auth: true, authenticated: false, acl_cache: nil})
+      )
+
+    assert status == :ok
+    assert payload.auth_required == true
+    assert payload.route.slots == 1024
+    assert payload.route.shard_count >= 1
+    refute Map.has_key?(payload.route, :host)
+    refute Map.has_key?(payload.route, :native_host)
+    refute Map.has_key?(payload.route, :native_port)
+    refute Map.has_key?(payload.route, :endpoint)
+  end
+
+  test "ROUTE returns leader-aware native endpoint metadata" do
+    {status, payload, _state} =
+      Commands.execute(@op_route, %{"key" => "{sdk-route}:a"}, state())
+
+    assert status == :ok
+    assert payload.slot in 0..1023
+    assert payload.lane_id == payload.shard + 1
+    assert is_binary(payload.owner_node)
+    assert is_binary(payload.leader_node)
+    assert payload.owner_node == payload.leader_node
+    assert is_binary(payload.native_host)
+    assert is_integer(payload.native_port)
+    assert payload.endpoint.node == payload.leader_node
+    assert payload.endpoint.host == payload.native_host
+    assert payload.endpoint.native_port == payload.native_port
+    assert payload.hint in ["leader", "remote_leader", "local"]
+  end
+
+  test "SHARDS returns leader-aware endpoint metadata per slot range" do
+    {status, payload, _state} = Commands.execute(@op_shards, %{}, state())
+
+    assert status == :ok
+    assert payload.slots == 1024
+    assert is_list(payload.ranges)
+    assert [range | _] = payload.ranges
+    assert range.first_slot <= range.last_slot
+    assert range.lane_id == range.shard + 1
+    assert range.owner_node == range.leader_node
+    assert range.endpoint.node == range.leader_node
+    assert range.endpoint.host == range.native_host
+    assert range.endpoint.native_port == range.native_port
+    assert range.hint in ["leader", "remote_leader", "local"]
   end
 
   test "COMMAND_EXEC delegates through native AST parser" do

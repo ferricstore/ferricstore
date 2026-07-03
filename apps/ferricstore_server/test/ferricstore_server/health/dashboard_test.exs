@@ -131,6 +131,188 @@ defmodule FerricstoreServer.Health.DashboardTest do
              "FLOW.CIRCUIT.OPEN"
   end
 
+  test "Flow governance query parser supports indexed state metadata filters" do
+    opts =
+      Dashboard.flow_governance_opts_from_query(
+        "meta_type=ai-review&meta_state=review&meta_key=ai.model&meta_value=gpt-5&meta_value_type=string&meta_partition_key=tenant-a&limit=25"
+      )
+
+    assert Keyword.fetch!(opts, :meta_type) == "ai-review"
+    assert Keyword.fetch!(opts, :meta_state) == "review"
+    assert Keyword.fetch!(opts, :meta_key) == "ai.model"
+    assert Keyword.fetch!(opts, :meta_value) == "gpt-5"
+    assert Keyword.fetch!(opts, :meta_value_type) == "string"
+    assert Keyword.fetch!(opts, :meta_partition_key) == "tenant-a"
+    assert Keyword.fetch!(opts, :limit) == 25
+  end
+
+  test "Flow governance metadata panel stays idle until query is complete" do
+    parent = self()
+    previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+
+    Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn opts ->
+      send(parent, {:flow_search_called, opts})
+      {:ok, []}
+    end)
+
+    on_exit(fn -> restore_env(:flow_dashboard_flow_search_fun, previous_search) end)
+
+    data = Dashboard.collect_flow_governance_page(meta_type: "ai-review")
+    html = Dashboard.render_flow_governance_page(data)
+
+    assert data.state_meta_result.status == :idle
+    assert String.contains?(html, "State Metadata")
+    assert String.contains?(html, "Enter workflow type, metadata state, key, and value")
+    refute_received {:flow_search_called, _opts}
+  end
+
+  test "Flow governance metadata panel queries indexed state_meta with bounded options" do
+    parent = self()
+    previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+
+    Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn opts ->
+      send(parent, {:flow_search_called, opts})
+
+      {:ok,
+       [
+         %{
+           id: "flow-1",
+           type: "ai-review",
+           state: "approved",
+           partition_key: "tenant-a",
+           updated_at_ms: 1_000,
+           indexed_state_meta: "ai.model",
+           state_meta: %{
+             "review" => %{
+               "ai.model" => "gpt-5",
+               "risk_tier" => "high"
+             }
+           }
+         }
+       ]}
+    end)
+
+    on_exit(fn -> restore_env(:flow_dashboard_flow_search_fun, previous_search) end)
+
+    data =
+      Dashboard.collect_flow_governance_page(
+        meta_type: "ai-review",
+        meta_state: "review",
+        meta_key: "ai.model",
+        meta_value: "gpt-5",
+        meta_value_type: "string",
+        meta_partition_key: "tenant-a",
+        limit: 5
+      )
+
+    assert_receive {:flow_search_called, opts}
+    assert Keyword.fetch!(opts, :type) == "ai-review"
+    assert Keyword.fetch!(opts, :partition_key) == "tenant-a"
+    assert Keyword.fetch!(opts, :count) == 5
+    assert Keyword.fetch!(opts, :consistent_projection) == true
+    assert Keyword.fetch!(opts, :state_meta) == %{"review" => %{"ai.model" => "gpt-5"}}
+
+    html = Dashboard.render_flow_governance_page(data)
+
+    assert data.state_meta_result.status == :ok
+    assert String.contains?(html, "FLOW.SEARCH")
+    assert String.contains?(html, "flow-1")
+    assert String.contains?(html, "ai.model=gpt-5")
+    assert String.contains?(html, "risk_tier=high")
+  end
+
+  test "Flow governance metadata panel finds real indexed state_meta records" do
+    type = "dashboard-ai-governance-#{System.unique_integer([:positive])}"
+    id = "dashboard-ai-flow-#{System.unique_integer([:positive])}"
+
+    assert {:ok, %{indexed_state_meta: "ai.model"}} =
+             FerricStore.flow_policy_set(type, indexed_state_meta: "ai.model")
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "review",
+               partition_key: "tenant-a",
+               state_meta: %{
+                 "ai.model" => "gpt-5",
+                 "risk_tier" => "high",
+                 "prompt_version" => "refund-v3"
+               },
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    ShardHelpers.eventually(
+      fn ->
+        data =
+          Dashboard.collect_flow_governance_page(
+            meta_type: type,
+            meta_state: "review",
+            meta_key: "ai.model",
+            meta_value: "gpt-5",
+            meta_value_type: "string",
+            meta_partition_key: "tenant-a",
+            limit: 10
+          )
+
+        data.state_meta_result.status == :ok and
+          Enum.any?(data.state_meta_result.rows, &(Map.get(&1, :id) == id))
+      end,
+      "dashboard governance state_meta search should find the indexed flow",
+      50,
+      100
+    )
+
+    data =
+      Dashboard.collect_flow_governance_page(
+        meta_type: type,
+        meta_state: "review",
+        meta_key: "ai.model",
+        meta_value: "gpt-5",
+        meta_value_type: "string",
+        meta_partition_key: "tenant-a",
+        limit: 10
+      )
+
+    html = Dashboard.render_flow_governance_page(data)
+
+    assert String.contains?(html, id)
+    assert String.contains?(html, "ai.model=gpt-5")
+    assert String.contains?(html, "prompt_version=refund-v3")
+  end
+
+  test "Flow governance metadata panel reports timeout instead of blocking dashboard" do
+    previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+    previous_timeout = Application.get_env(:ferricstore, :flow_dashboard_list_fetch_timeout_ms)
+
+    Application.put_env(:ferricstore, :flow_dashboard_list_fetch_timeout_ms, 10)
+
+    Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn _opts ->
+      Process.sleep(1_000)
+      {:ok, []}
+    end)
+
+    on_exit(fn ->
+      restore_env(:flow_dashboard_flow_search_fun, previous_search)
+      restore_env(:flow_dashboard_list_fetch_timeout_ms, previous_timeout)
+    end)
+
+    data =
+      Dashboard.collect_flow_governance_page(
+        meta_type: "ai-review",
+        meta_state: "review",
+        meta_key: "risk_tier",
+        meta_value: "high",
+        meta_value_type: "string",
+        limit: 5
+      )
+
+    assert data.state_meta_result.status == :timeout
+
+    html = Dashboard.render_flow_governance_page(data)
+    assert String.contains?(html, "query timed out")
+  end
+
   def handle_dashboard_flow_lookup_event(event, measurements, metadata, parent) do
     send(parent, {:dashboard_flow_lookup, event, measurements, metadata})
   end

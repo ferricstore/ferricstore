@@ -139,9 +139,12 @@ Response body starts with a `u16` status code followed by one typed value.
 
 `OPTIONS` returns supported versions/features without changing session state.
 `STARTUP`/`HELLO` returns protocol version, client id, auth requirement,
-backpressure, limits, and route metadata. `ROUTE` returns slot/shard/listener
-hints for a key. `ROUTE_BATCH` returns route hints for many keys. `SHARDS`
-returns current slot ranges and `route_epoch`.
+backpressure, limits, and route metadata. `ROUTE` returns slot/shard/leader
+native endpoint hints for a key. `ROUTE_BATCH` returns route hints for many
+keys. `SHARDS` returns current slot ranges, `route_epoch`, and the native
+endpoint for the current leader of each shard when known. If leader lookup is
+temporarily unavailable, the server returns a local fallback route and still
+keeps server-side write redirection active.
 
 `GOAWAY` is sent by the server with `request_id=0` during graceful shutdown or
 drain. Clients should stop writing new requests on that connection, finish
@@ -385,13 +388,13 @@ Native clients should:
 1. Connect and send `HELLO`.
 2. If `auth_required` is true, send `AUTH`.
 3. Fetch `SHARDS`.
-4. Route key/flow-id commands by slot/shard.
+4. Route key/flow-id commands by slot -> shard -> leader endpoint.
 5. Refresh route metadata when connection errors, topology changes, or
    `BACKPRESSURE` indicates sustained pressure.
 
-The v1 server returns local route hints. Future cluster builds can use the same
-`ROUTE`/`SHARDS` shape to send remote owner hints or reroute statuses without
-changing the command bodies.
+The server keeps the old safety behavior: a request accepted on a follower can
+still be redirected internally to the relevant shard leader. Leader-aware SDKs
+should treat that as a fallback path, not the primary data path.
 
 ## Multiplexing model
 
@@ -462,6 +465,8 @@ FERRICSTORE_NATIVE_TLS_PORT=6389
 FERRICSTORE_NATIVE_TLS_CERT_FILE=/etc/ferricstore/tls.crt
 FERRICSTORE_NATIVE_TLS_KEY_FILE=/etc/ferricstore/tls.key
 FERRICSTORE_REQUIRE_TLS=true
+FERRICSTORE_NATIVE_ADVERTISE_HOST=ferricstore-0.ferricstore-headless.default.svc.cluster.local
+FERRICSTORE_NATIVE_ADVERTISE_TLS_PORT=6389
 ```
 
 For mTLS, set a CA file:
@@ -481,12 +486,13 @@ Client SDK best practice:
 
 ```text
 1. Keep one small control connection for HELLO/SHARDS/BACKPRESSURE.
-2. Keep a small pool of data TCP connections, usually 1-4.
-3. Route key/flow-id commands by slot -> shard -> lane.
-4. Keep lane-local pipelines bounded, for example 32-256 in flight.
-5. Use more TCP connections only when one socket/TLS process saturates.
-6. Do not pipeline dependent Flow operations that need the previous response.
-7. Treat request_id=0 frames as server management events, not command replies.
+2. Keep a small data TCP connection pool per advertised node, usually 1-4.
+3. Route key/flow-id commands by slot -> shard -> leader endpoint -> lane.
+4. Split independent multi-key commands by shard/leader and merge results client-side.
+5. Keep lane-local pipelines bounded, for example 32-256 in flight.
+6. Use more TCP connections only when one socket/TLS process saturates.
+7. Do not pipeline dependent Flow operations that need the previous response.
+8. Treat request_id=0 frames as server management events, not command replies.
 ```
 
 Operator tuning:
@@ -533,7 +539,35 @@ FLOW.COMPLETE/FAIL/RETRY should keep lease_token and fencing_token from claim_du
 FLOW.CLAIM_DUE should be bounded by worker capacity, not a fixed huge batch.
 ```
 
-## SDK surface expected later
+## Elixir SDK
+
+The umbrella contains `apps/ferricstore_sdk`, a topology-aware Elixir native
+client. It bootstraps from seed nodes, performs `HELLO`/`AUTH`, fetches
+`SHARDS`, builds the slot table, opens one connection per advertised endpoint,
+routes keyed commands to shard leaders, and refreshes topology once on stale
+endpoints/reroute responses.
+
+```elixir
+{:ok, client} = FerricStore.SDK.start_link(seeds: [{"127.0.0.1", 6388}])
+
+:ok = FerricStore.SDK.set(client, "{tenant:1}:k", "value")
+{:ok, "value"} = FerricStore.SDK.get(client, "{tenant:1}:k")
+
+:ok = FerricStore.SDK.mset(client, %{"{a}:1" => "one", "{b}:2" => "two"})
+{:ok, ["one", "two"]} = FerricStore.SDK.mget(client, ["{a}:1", "{b}:2"])
+
+FerricStore.SDK.Flow.create(client, %{id: "flow-1", type: "email", state: "queued"})
+FerricStore.SDK.Admin.cluster_keyslot(client, %{key: "{a}:1", args: ["{a}:1"]})
+```
+
+Advanced callers can use raw opcodes without hard-coded integers:
+
+```elixir
+FerricStore.SDK.request_by_key(client, :get, "k", %{key: "k"})
+FerricStore.SDK.command_exec(client, "PING", [])
+```
+
+## Other SDK surfaces expected later
 
 The Python/TypeScript SDKs should expose native protocol without making users
 manage frames directly:

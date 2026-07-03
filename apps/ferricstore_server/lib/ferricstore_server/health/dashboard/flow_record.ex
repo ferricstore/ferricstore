@@ -90,6 +90,19 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
     |> normalize_flow_attributes()
   end
 
+  def flow_record_state_meta(record) do
+    record
+    |> flow_field(:state_meta, %{})
+    |> normalize_flow_state_meta()
+  end
+
+  def flow_record_indexed_state_meta(record) do
+    case flow_field(record, :indexed_state_meta, nil) do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
   def normalize_flow_attributes(attrs) when is_map(attrs) do
     Map.new(attrs, fn {key, value} -> {to_string(key), value} end)
   end
@@ -102,6 +115,26 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
   end
 
   def normalize_flow_attributes(_attrs), do: %{}
+
+  def normalize_flow_state_meta(state_meta) when is_map(state_meta) do
+    state_meta
+    |> Enum.reduce(%{}, fn
+      {state, meta}, acc when is_map(meta) ->
+        Map.put(acc, to_string(state), normalize_flow_attributes(meta))
+
+      {_state, _meta}, acc ->
+        acc
+    end)
+  end
+
+  def normalize_flow_state_meta(state_meta) when is_binary(state_meta) do
+    case Jason.decode(state_meta) do
+      {:ok, decoded} -> normalize_flow_state_meta(decoded)
+      _ -> %{}
+    end
+  end
+
+  def normalize_flow_state_meta(_state_meta), do: %{}
 
   def normalize_flow_named_value_refs(refs) when is_map(refs) do
     Enum.flat_map(refs, fn {name, ref} ->

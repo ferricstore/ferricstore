@@ -23,6 +23,7 @@ defmodule FerricstoreServer.Native.Commands do
   alias Ferricstore.Store.SlotMap
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
+  alias FerricstoreServer.Native.RouteMetadata
 
   @list_position_step 1_000_000_000
   @default_max_collection_response_items 10_000
@@ -2358,6 +2359,9 @@ defmodule FerricstoreServer.Native.Commands do
     do: Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024)
 
   defp hello_payload(state) do
+    endpoint = RouteMetadata.endpoint()
+    route = hello_route_payload(state, endpoint)
+
     %{
       protocol: "ferricstore-native",
       version: 1,
@@ -2366,14 +2370,25 @@ defmodule FerricstoreServer.Native.Commands do
       route_epoch: route_epoch(),
       capabilities: capabilities_payload(state),
       server: server_payload(),
-      route: %{
-        slots: SlotMap.num_slots(),
-        shard_count: state.instance_ctx.shard_count,
-        native_port: Application.get_env(:ferricstore, :native_port, 6388)
-      },
+      route: route,
       auth_required: state.require_auth and not state.authenticated,
       backpressure: backpressure_payload()
     }
+  end
+
+  defp hello_route_payload(%{require_auth: true, authenticated: false} = state, _endpoint) do
+    %{
+      slots: SlotMap.num_slots(),
+      shard_count: state.instance_ctx.shard_count
+    }
+  end
+
+  defp hello_route_payload(state, endpoint) do
+    Map.merge(endpoint, %{
+      slots: SlotMap.num_slots(),
+      shard_count: state.instance_ctx.shard_count,
+      endpoint: endpoint
+    })
   end
 
   defp capabilities_payload(state) do
@@ -2854,17 +2869,15 @@ defmodule FerricstoreServer.Native.Commands do
   defp route_payload(ctx, key) do
     slot = Router.slot_for(ctx, key)
     shard = Router.shard_for(ctx, key)
+    target = RouteMetadata.target_for_shard(shard)
 
-    %{
+    Map.merge(target, %{
       key: key,
       slot: slot,
       shard: shard,
       lane_id: shard + 1,
-      route_epoch: route_epoch(),
-      owner_node: Atom.to_string(node()),
-      native_port: Application.get_env(:ferricstore, :native_port, 6388),
-      hint: "local"
-    }
+      route_epoch: route_epoch()
+    })
   end
 
   defp shards_payload(ctx) do
@@ -2872,14 +2885,14 @@ defmodule FerricstoreServer.Native.Commands do
       ctx.slot_map
       |> SlotMap.slot_ranges()
       |> Enum.map(fn {first, last, shard} ->
-        %{
+        target = RouteMetadata.target_for_shard(shard)
+
+        Map.merge(target, %{
           first_slot: first,
           last_slot: last,
           shard: shard,
-          lane_id: shard + 1,
-          owner_node: Atom.to_string(node()),
-          native_port: Application.get_env(:ferricstore, :native_port, 6388)
-        }
+          lane_id: shard + 1
+        })
       end)
 
     %{

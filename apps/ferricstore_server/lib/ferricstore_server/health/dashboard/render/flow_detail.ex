@@ -118,6 +118,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
       {"Root", flow_field(record, :root_flow_id, "-")},
       {"Correlation", flow_field(record, :correlation_id, "-")},
       {"Attributes", {:safe, render_flow_attribute_badges(record)}},
+      {"State Meta", {:safe, render_flow_state_meta_badges(record)}},
       {"Value Refs", {:safe, render_flow_value_ref_badges(record)}}
     ]
 
@@ -168,6 +169,35 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
   defp flow_attribute_display_value(value) when is_integer(value), do: Integer.to_string(value)
   defp flow_attribute_display_value(value) when is_boolean(value), do: to_string(value)
   defp flow_attribute_display_value(value), do: inspect(value)
+
+  def render_flow_state_meta_badges(record) do
+    entries =
+      record
+      |> flow_record_state_meta()
+      |> Enum.flat_map(fn {state, meta} ->
+        Enum.map(meta, fn {name, value} -> {state, name, value} end)
+      end)
+      |> Enum.sort_by(fn {state, name, _value} -> {state, name} end)
+
+    case entries do
+      [] ->
+        ~s(<span class="badge badge-idle">none</span>)
+
+      _ ->
+        entries
+        |> Enum.take(32)
+        |> Enum.map_join(" ", fn {state, name, value} ->
+          label = "#{state}.#{name}=#{flow_attribute_display_value(value)}"
+          ~s(<span class="badge badge-idle">#{escape(label)}</span>)
+        end)
+        |> append_state_meta_overflow(length(entries))
+    end
+  end
+
+  defp append_state_meta_overflow(html, count) when count > 32,
+    do: html <> ~s( <span class="badge badge-idle">+#{count - 32} more</span>)
+
+  defp append_state_meta_overflow(html, _count), do: html
 
   def render_flow_rewind_action(%{record: %{} = record} = data) do
     targets = flow_rewind_targets(Map.get(data, :history, []))

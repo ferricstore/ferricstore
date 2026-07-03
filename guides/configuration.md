@@ -732,6 +732,8 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRICSTORE_NATIVE_PORT` | `6388` | TCP port for the Ferric native protocol listener |
+| `FERRICSTORE_NATIVE_ADVERTISE_HOST` | derived from node name / localhost | Hostname or IP advertised to native SDKs in `HELLO`, `ROUTE`, and `SHARDS` |
+| `FERRICSTORE_NATIVE_ADVERTISE_PORT` | live native listener port | Port advertised to native SDKs for plaintext native connections |
 | `FERRICSTORE_HEALTH_PORT` | `6389` | HTTP health/metrics port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, WARaft segments, mmap) |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards. `0` = `System.schedulers_online()` |
@@ -786,6 +788,7 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRICSTORE_NATIVE_TLS_PORT` | `6389` | TLS listener port (only if cert configured) |
+| `FERRICSTORE_NATIVE_ADVERTISE_TLS_PORT` | live TLS listener port | TLS port advertised to native SDKs |
 | `FERRICSTORE_NATIVE_TLS_CERT_FILE` | unset | Path to TLS certificate. Setting this enables TLS |
 | `FERRICSTORE_NATIVE_TLS_KEY_FILE` | unset | Path to TLS private key |
 | `FERRICSTORE_NATIVE_TLS_CA_CERT_FILE` | unset | Path to CA certificate for client verification |

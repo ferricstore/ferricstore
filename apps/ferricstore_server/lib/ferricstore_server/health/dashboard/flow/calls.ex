@@ -42,6 +42,13 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Calls do
     end
   end
 
+  def flow_dashboard_flow_search(opts) do
+    case Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun) do
+      fun when is_function(fun, 1) -> fun.(opts)
+      _ -> FerricStore.flow_search(opts)
+    end
+  end
+
   def flow_dashboard_flow_stats(type, opts) do
     case Application.get_env(:ferricstore, :flow_dashboard_flow_stats_fun) do
       fun when is_function(fun, 2) -> fun.(type, opts)
