@@ -2,6 +2,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
   @moduledoc false
 
   import FerricstoreServer.Health.Dashboard.Format
+  import FerricstoreServer.Health.Dashboard.FlowRecord
+
+  import FerricstoreServer.Health.Dashboard.Render.FlowHistory,
+    only: [flow_state_class: 1, render_flow_id_link: 2]
+
   import FerricstoreServer.Health.Dashboard.Render.FlowOverview, only: [render_flow_stat_card: 3]
 
   def render_flow_governance_summary(data) do
@@ -37,6 +42,55 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="500" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum records per governance section">
       <button class="flow-search-button" type="submit">Refresh</button>
     </form>
+    """
+  end
+
+  def render_flow_governance_state_meta_filters(data) do
+    filters = Map.get(data, :filters, %{})
+
+    """
+    <div class="section-title">State Metadata</div>
+    <form class="flow-search" action="/dashboard/flow/governance" method="get" aria-label="State metadata filters">
+      <input class="flow-search-input mono" type="search" name="meta_type" value="#{escape_attr(Map.get(filters, :meta_type, "") || "")}" placeholder="workflow type" title="Workflow type with an indexed state metadata policy">
+      <input class="flow-search-input mono" type="search" name="meta_state" value="#{escape_attr(Map.get(filters, :meta_state, "") || "")}" placeholder="metadata state" title="State whose metadata should be matched">
+      <input class="flow-search-input mono" type="search" name="meta_key" value="#{escape_attr(Map.get(filters, :meta_key, "") || "")}" placeholder="ai.model / risk_tier" title="Indexed state metadata key">
+      <input class="flow-search-input mono" type="search" name="meta_value" value="#{escape_attr(Map.get(filters, :meta_value, "") || "")}" placeholder="gpt-5 / high" title="State metadata value">
+      <select class="flow-search-input mono" name="meta_value_type" title="State metadata value type">
+        #{state_meta_value_type_options(Map.get(filters, :meta_value_type))}
+      </select>
+      <input class="flow-search-input mono" type="search" name="meta_partition_key" value="#{escape_attr(Map.get(filters, :meta_partition_key, "") || "")}" placeholder="partition optional" title="Optional partition key">
+      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="500" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum records returned">
+      <button class="flow-search-button" type="submit">Search</button>
+    </form>
+    """
+  end
+
+  def render_flow_governance_state_meta(data) when is_map(data) do
+    result =
+      Map.get(data, :state_meta_result, %{
+        status: :idle,
+        command: "FLOW.SEARCH",
+        rows: [],
+        message: "Enter workflow type, metadata state, key, and value"
+      })
+
+    filters = Map.get(data, :filters, %{})
+    rows = Map.get(result, :rows, [])
+
+    rendered_rows =
+      if rows == [] do
+        ~s(<tr><td colspan="7" class="c-muted">No state metadata records loaded.</td></tr>)
+      else
+        Enum.map_join(rows, "\n", &state_meta_row(&1, filters))
+      end
+
+    """
+    <div class="section-title">State Metadata Results <span class="badge badge-idle">#{escape(Map.get(result, :command, "FLOW.SEARCH"))}</span></div>
+    #{state_meta_status(result)}
+    <table>
+      <thead><tr><th>ID</th><th>Type</th><th>Current State</th><th>Metadata State</th><th>Indexed Key</th><th>Metadata</th><th>Updated</th></tr></thead>
+      <tbody>#{rendered_rows}</tbody>
+    </table>
     """
   end
 
@@ -175,6 +229,99 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       ~s(<option value="#{escape(value)}"#{selected_attr}>#{escape(label)}</option>)
     end)
   end
+
+  defp state_meta_value_type_options(selected) do
+    [
+      {"string", "string"},
+      {"integer", "integer"},
+      {"float", "float"},
+      {"boolean", "boolean"}
+    ]
+    |> Enum.map_join(fn {value, label} ->
+      selected_attr = if value == to_string(selected || "string"), do: " selected", else: ""
+      ~s(<option value="#{escape(value)}"#{selected_attr}>#{escape(label)}</option>)
+    end)
+  end
+
+  defp state_meta_status(%{status: :ok, message: message}),
+    do: ~s(<div class="flow-alert flow-alert-ok">#{escape(message)}</div>)
+
+  defp state_meta_status(%{status: :idle, message: message}),
+    do: ~s(<div class="flow-section-note">#{escape(message)}</div>)
+
+  defp state_meta_status(%{message: message}),
+    do: ~s(<div class="flow-alert flow-alert-error">#{escape(message)}</div>)
+
+  defp state_meta_status(_result), do: ""
+
+  defp state_meta_row(record, filters) when is_map(record) do
+    state = flow_record_state(record)
+    meta_state = Map.get(filters, :meta_state)
+    meta_key = Map.get(filters, :meta_key)
+
+    """
+    <tr>
+      <td class="mono">#{render_flow_id_link(flow_record_id(record), flow_record_partition_key(record))}</td>
+      <td class="mono">#{escape(flow_record_type(record))}</td>
+      <td class="#{flow_state_class(state)}">#{escape(state)}</td>
+      <td class="mono">#{escape(meta_state || "-")}</td>
+      <td class="mono">#{escape(flow_record_indexed_state_meta(record) || "-")}</td>
+      <td>#{state_meta_badges(record, meta_state, meta_key)}</td>
+      <td>#{format_timestamp_ms_or_dash(flow_record_updated_at_ms(record))}</td>
+    </tr>
+    """
+  end
+
+  defp state_meta_row(record, _filters) do
+    """
+    <tr>
+      <td class="mono">#{escape(inspect(record, limit: 5))}</td>
+      <td colspan="6" class="c-muted">non-record result</td>
+    </tr>
+    """
+  end
+
+  defp state_meta_badges(record, selected_state, selected_key) do
+    entries =
+      record
+      |> flow_record_state_meta()
+      |> Enum.flat_map(fn {state, meta} ->
+        Enum.map(meta, fn {key, value} -> {state, key, value} end)
+      end)
+      |> Enum.sort_by(fn {state, key, _value} -> {state, key} end)
+
+    case entries do
+      [] ->
+        ~s(<span class="c-muted">none</span>)
+
+      _ ->
+        entries
+        |> Enum.take(32)
+        |> Enum.map_join(" ", fn {state, key, value} ->
+          class =
+            if state == selected_state and key == selected_key do
+              "badge badge-ok"
+            else
+              "badge badge-idle"
+            end
+
+          label = "#{state}.#{key}=#{state_meta_value(value)}"
+          ~s(<span class="#{class}">#{escape(label)}</span>)
+        end)
+        |> maybe_append_state_meta_overflow(length(entries))
+    end
+  end
+
+  defp maybe_append_state_meta_overflow(html, count) when count > 32,
+    do: html <> ~s( <span class="badge badge-idle">+#{count - 32} more</span>)
+
+  defp maybe_append_state_meta_overflow(html, _count), do: html
+
+  defp state_meta_value(value) when is_binary(value), do: value
+  defp state_meta_value(value) when is_integer(value), do: Integer.to_string(value)
+  defp state_meta_value(value) when is_float(value), do: Float.to_string(value)
+  defp state_meta_value(value) when is_boolean(value), do: to_string(value)
+  defp state_meta_value(value), do: inspect(value, limit: 10)
 
   defp circuit_bar(label, value, total, class) do
     percent = value * 100 / total

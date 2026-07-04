@@ -1,8 +1,16 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   @moduledoc false
 
+  import FerricstoreServer.Health.Dashboard.Flow.Calls,
+    only: [
+      bounded_dashboard_call: 3,
+      flow_dashboard_flow_search: 1,
+      flow_dashboard_list_fetch_timeout_ms: 0
+    ]
+
   @default_limit 100
   @max_limit 500
+  @state_meta_idle "Enter workflow type, metadata state, key, and value"
 
   def opts_from_query(query) when is_binary(query) do
     params = URI.decode_query(query)
@@ -13,6 +21,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
       status: normalize_status(Map.get(params, "status")),
       flow_id: normalize_text(Map.get(params, "flow_id")),
       circuit_status: normalize_circuit_status(Map.get(params, "circuit_status")),
+      meta_type: normalize_text(Map.get(params, "meta_type")),
+      meta_state: normalize_text(Map.get(params, "meta_state")),
+      meta_key: normalize_text(Map.get(params, "meta_key")),
+      meta_value: normalize_text(Map.get(params, "meta_value")),
+      meta_value_type: normalize_meta_value_type(Map.get(params, "meta_value_type")),
+      meta_partition_key: normalize_text(Map.get(params, "meta_partition_key")),
       flash: flash_from_params(params)
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
@@ -28,13 +42,23 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
       scope: Keyword.get(opts, :scope),
       status: Keyword.get(opts, :status),
       flow_id: Keyword.get(opts, :flow_id),
-      circuit_status: Keyword.get(opts, :circuit_status)
+      circuit_status: Keyword.get(opts, :circuit_status),
+      meta_type: Keyword.get(opts, :meta_type),
+      meta_state: Keyword.get(opts, :meta_state),
+      meta_key: Keyword.get(opts, :meta_key),
+      meta_value: Keyword.get(opts, :meta_value),
+      meta_value_type: normalize_meta_value_type(Keyword.get(opts, :meta_value_type)),
+      meta_partition_key: Keyword.get(opts, :meta_partition_key)
     }
 
-    case FerricStore.flow_governance_overview(Keyword.merge(opts, limit: limit)) do
+    state_meta_result = collect_state_meta_result(filters)
+    overview_opts = overview_opts(opts, limit)
+
+    case FerricStore.flow_governance_overview(overview_opts) do
       {:ok, overview} ->
         overview
         |> Map.put(:filters, filters)
+        |> Map.put(:state_meta_result, state_meta_result)
         |> Map.put(:flash, Keyword.get(opts, :flash))
 
       {:error, reason} ->
@@ -53,6 +77,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
             half_open_circuits: 0
           },
           filters: filters,
+          state_meta_result: state_meta_result,
           flash: Keyword.get(opts, :flash),
           error: reason
         }
@@ -129,6 +154,111 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
 
   defp normalize_circuit_status(value) when value in ["open", "half_open", "closed"], do: value
   defp normalize_circuit_status(_value), do: nil
+
+  defp normalize_meta_value_type(value) when value in ["string", "integer", "float", "boolean"],
+    do: value
+
+  defp normalize_meta_value_type(_value), do: "string"
+
+  defp overview_opts(opts, limit) do
+    opts
+    |> Keyword.take([:scope, :status, :flow_id, :circuit_status, :partition_key])
+    |> Keyword.put(:limit, limit)
+  end
+
+  defp collect_state_meta_result(filters) do
+    case state_meta_search_opts(filters) do
+      {:idle, message} ->
+        %{status: :idle, command: "FLOW.SEARCH", rows: [], message: message}
+
+      {:error, reason} ->
+        %{status: :error, command: "FLOW.SEARCH", rows: [], message: reason}
+
+      {:ok, opts} ->
+        case bounded_dashboard_call(
+               fn -> flow_dashboard_flow_search(opts) end,
+               flow_dashboard_list_fetch_timeout_ms(),
+               :governance_state_meta
+             ) do
+          {:ok, {:ok, rows}} when is_list(rows) ->
+            %{status: :ok, command: "FLOW.SEARCH", rows: rows, message: "#{length(rows)} row(s)"}
+
+          {:ok, {:error, reason}} ->
+            %{status: :error, command: "FLOW.SEARCH", rows: [], message: inspect(reason)}
+
+          {:error, :timeout} ->
+            %{status: :timeout, command: "FLOW.SEARCH", rows: [], message: "query timed out"}
+
+          {:error, reason} ->
+            %{status: :error, command: "FLOW.SEARCH", rows: [], message: inspect(reason)}
+
+          _other ->
+            %{
+              status: :error,
+              command: "FLOW.SEARCH",
+              rows: [],
+              message: "unexpected query result"
+            }
+        end
+    end
+  end
+
+  defp state_meta_search_opts(filters) when is_map(filters) do
+    with {:ok, type} <- required_filter(filters, :meta_type),
+         {:ok, state} <- required_filter(filters, :meta_state),
+         {:ok, key} <- required_filter(filters, :meta_key),
+         {:ok, raw_value} <- required_filter(filters, :meta_value),
+         {:ok, value} <- parse_meta_value(raw_value, Map.get(filters, :meta_value_type, "string")) do
+      opts =
+        [
+          type: type,
+          state_meta: %{state => %{key => value}},
+          count: Map.get(filters, :limit, @default_limit),
+          consistent_projection: true
+        ]
+        |> maybe_put_opt(:partition_key, Map.get(filters, :meta_partition_key))
+
+      {:ok, opts}
+    else
+      {:missing, _key} -> {:idle, @state_meta_idle}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp required_filter(filters, key) do
+    case Map.get(filters, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:missing, key}
+    end
+  end
+
+  defp parse_meta_value(value, "string"), do: {:ok, value}
+
+  defp parse_meta_value(value, "integer") do
+    case Integer.parse(value) do
+      {parsed, ""} -> {:ok, parsed}
+      _ -> {:error, "ERR state_meta value must be an integer"}
+    end
+  end
+
+  defp parse_meta_value(value, "float") do
+    case Float.parse(value) do
+      {parsed, ""} -> {:ok, parsed}
+      _ -> {:error, "ERR state_meta value must be a float"}
+    end
+  end
+
+  defp parse_meta_value("true", "boolean"), do: {:ok, true}
+  defp parse_meta_value("false", "boolean"), do: {:ok, false}
+
+  defp parse_meta_value(_value, "boolean"),
+    do: {:error, "ERR state_meta value must be true or false"}
+
+  defp parse_meta_value(value, _type), do: {:ok, value}
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, _key, ""), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp positive_integer(params, key, default) do
     case params |> Map.get(key, "") |> to_string() |> String.trim() |> Integer.parse() do

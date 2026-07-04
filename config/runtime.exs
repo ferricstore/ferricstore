@@ -69,6 +69,12 @@ if config_env() == :prod do
   config :ferricstore,
     protected_mode: boolean_env.("FERRICSTORE_PROTECTED_MODE", true),
     native_port: String.to_integer(native_port_env),
+    native_advertise_host: System.get_env("FERRICSTORE_NATIVE_ADVERTISE_HOST"),
+    native_advertise_port:
+      (case System.get_env("FERRICSTORE_NATIVE_ADVERTISE_PORT") do
+         nil -> nil
+         value -> String.to_integer(value)
+       end),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
     shard_count:
@@ -320,6 +326,11 @@ if config_env() == :prod do
     native_protocol_enabled: true,
     native_tls_port:
       (case System.get_env("FERRICSTORE_NATIVE_TLS_PORT") do
+         nil -> nil
+         value -> String.to_integer(value)
+       end),
+    native_advertise_tls_port:
+      (case System.get_env("FERRICSTORE_NATIVE_ADVERTISE_TLS_PORT") do
          nil -> nil
          value -> String.to_integer(value)
        end),

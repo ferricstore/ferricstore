@@ -365,9 +365,9 @@ defmodule FerricstoreServer.Health.Endpoint do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
       params = FlowPaths.decode_form_body(body)
-      command = FerricstoreServer.Health.Dashboard.flow_governance_form_command(params)
+      requirement = RouteRequirements.flow_governance_form_requirement(params)
 
-      case Auth.authorize_command_request(peer, headers, {command, []}, :html) do
+      case Auth.authorize_command_request(peer, headers, requirement, :html) do
         :ok ->
           location =
             case FerricstoreServer.Health.Dashboard.apply_flow_governance_form(params) do

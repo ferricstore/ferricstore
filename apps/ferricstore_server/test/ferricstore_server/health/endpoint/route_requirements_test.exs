@@ -97,5 +97,20 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
 
     assert RouteRequirements.flow_rewind_form_requirement("flow-1", %{}) ==
              {"FLOW.REWIND", key: {"flow-1", :write}}
+
+    assert RouteRequirements.flow_governance_form_requirement(%{
+             "action" => "open_circuit",
+             "scope" => "tenant-a:payments"
+           }) == {"FLOW.CIRCUIT.OPEN", key: {"tenant-a:payments", :write}}
+
+    assert RouteRequirements.flow_governance_form_requirement(%{
+             "action" => "close_circuit",
+             "scope" => "tenant-a:payments"
+           }) == {"FLOW.CIRCUIT.CLOSE", key: {"tenant-a:payments", :write}}
+
+    assert RouteRequirements.flow_governance_form_requirement(%{
+             "action" => "open_circuit",
+             "scope" => " "
+           }) == {"FLOW.CIRCUIT.OPEN", []}
   end
 end

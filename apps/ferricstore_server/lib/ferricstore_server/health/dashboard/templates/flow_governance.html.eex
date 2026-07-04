@@ -10,6 +10,8 @@
         <%= render_flow_subnav("governance") %>
         <%= render_flow_governance_summary(data) %>
         <%= render_flow_governance_filters(data) %>
+        <%= render_flow_governance_state_meta_filters(data) %>
+        <%= render_flow_governance_state_meta(data) %>
         <%= render_flow_governance_circuit_actions() %>
         <%= render_flow_governance_circuit_graph(Map.get(data, :circuits, [])) %>
         <%= render_flow_governance_circuits(Map.get(data, :circuits, [])) %>

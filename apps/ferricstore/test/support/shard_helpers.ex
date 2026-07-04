@@ -409,12 +409,32 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
   @spec wait_default_quorum_writable(non_neg_integer()) :: :ok
   def wait_default_quorum_writable(timeout_ms \\ 60_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    timeout_ms = max(timeout_ms, 0)
     ctx = FerricStore.Instance.get(:default)
 
-    Enum.each(0..(shard_count() - 1), fn shard_index ->
+    prepare_default_quorum_write_path(ctx, timeout_ms)
+
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    Enum.each(0..(ctx.shard_count - 1), fn shard_index ->
       key = writable_probe_key(ctx, shard_index)
       wait_probe_write(ctx, shard_index, key, deadline)
+    end)
+  end
+
+  defp prepare_default_quorum_write_path(ctx, timeout_ms) do
+    reset_memory_guard_pressure()
+    reset_runtime_pressure_state()
+    clear_default_disk_pressure(ctx)
+    ensure_default_waraft_started()
+    wait_default_waraft_ready(min(max(timeout_ms, 1), 10_000))
+  end
+
+  defp clear_default_disk_pressure(ctx) do
+    Enum.each(0..(ctx.shard_count - 1), fn shard_index ->
+      Ferricstore.Store.DiskPressure.clear(ctx, shard_index)
+      Ferricstore.Store.DiskPressure.clear(shard_index)
+      Ferricstore.Store.DiskPressure.clear_operational(shard_index)
     end)
   end
 

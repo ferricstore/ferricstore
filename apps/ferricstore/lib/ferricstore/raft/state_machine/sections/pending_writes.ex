@@ -516,19 +516,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           max_active_file_size =
             Map.get(ctx, :max_active_file_size, Map.get(state, :max_active_file_size))
 
-          %{
-            state
-            | shard_index: shard_index,
-              shard_data_path: shard_data_path,
-              shard_data_path_expanded: Path.expand(shard_data_path),
-              active_file_id: file_id,
-              active_file_path: file_path,
-              active_file_size: active_file_size,
-              file_stats: %{file_id => {active_file_size, 0}},
-              max_active_file_size: max_active_file_size,
-              ets: keydir
-          }
-          |> maybe_rotate_state_machine_active_file()
+          rotated =
+            %{
+              state
+              | shard_index: shard_index,
+                shard_data_path: shard_data_path,
+                shard_data_path_expanded: Path.expand(shard_data_path),
+                active_file_id: file_id,
+                active_file_path: file_path,
+                active_file_size: active_file_size,
+                file_stats: %{file_id => {active_file_size, 0}},
+                max_active_file_size: max_active_file_size,
+                ets: keydir
+            }
+            |> maybe_rotate_state_machine_active_file()
+
+          if rotated.active_file_id != file_id or rotated.active_file_path != file_path do
+            notify_cross_shard_active_file_sync(ctx, shard_index)
+          end
         end
 
         :ok
@@ -544,6 +549,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
              _written_bytes
            ),
            do: :ok
+
+      defp notify_cross_shard_active_file_sync(%{name: _name} = ctx, shard_index) do
+        ctx
+        |> Router.shard_name(shard_index)
+        |> GenServer.cast(:sync_active_file_from_registry)
+      rescue
+        _ -> :ok
+      catch
+        :exit, _ -> :ok
+      end
+
+      defp notify_cross_shard_active_file_sync(_ctx, _shard_index), do: :ok
 
       defp mark_cross_shard_checkpoint_dirty(state, shard_index) do
         case checkpoint_ctx_for_state(state) do

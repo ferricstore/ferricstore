@@ -400,6 +400,73 @@ jobs:
           retention-days: 14
 
   # ===========================================================================
+  # SDK tests (per OS)
+  # ===========================================================================
+  test-sdk-ubuntu:
+    name: "SDK tests (ubuntu)"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-Linux
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
+      - name: Run ferricstore_sdk tests
+        timeout-minutes: 15
+        run: mix test apps/ferricstore_sdk/test --timeout 30000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: test-results-sdk-ubuntu
+          path: test-results/
+          retention-days: 14
+
+  test-sdk-macos:
+    name: "SDK tests (macos)"
+    needs: build-macos
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-macOS
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
+      - name: Run ferricstore_sdk tests
+        timeout-minutes: 15
+        run: mix test apps/ferricstore_sdk/test --timeout 30000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: test-results-sdk-macos
+          path: test-results/
+          retention-days: 14
+
+  # ===========================================================================
   # Durability tests (ubuntu only — shard-kill, jepsen, large alloc)
   # ===========================================================================
   test-durability:
@@ -429,10 +496,11 @@ jobs:
           epmd -daemon
           set +e
 
-          # Run core durability tests only. Server lifecycle tests run in the
-          # dedicated server jobs; mixing destructive app suites in one umbrella
-          # invocation can leave supervised state polluted for later suites.
+          # Run destructive durability suites explicitly. Server lifecycle tests
+          # stay in the dedicated server jobs to avoid supervised-state leakage
+          # into later umbrella test suites.
           mix test apps/ferricstore/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
+          mix test apps/ferricstore_sdk/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_sdk_shard_kill.log
           elixir --sname ci_jepsen --cookie ferricstore_test -S mix test apps/ferricstore/test --only jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
           mix test apps/ferricstore/test --only large_alloc --timeout 120000 2>&1 | tee /tmp/durability_large_alloc.log
 
@@ -468,6 +536,42 @@ jobs:
         continue-on-error: true
         with:
           name: test-results-durability
+          path: test-results/
+          retention-days: 14
+
+  # ===========================================================================
+  # Performance guards (ubuntu only — bounded PR-safe regression checks)
+  # ===========================================================================
+  test-perf-guard:
+    name: "Performance guards"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-Linux
+          path: .
+
+      - name: Ensure dependencies
+        run: mix deps.get
+
+      - name: Run bounded performance guards
+        run: mix test apps/ferricstore/test --only perf_guard --timeout 120000
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: test-results-perf-guard
           path: test-results/
           retention-days: 14
 

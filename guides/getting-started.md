@@ -21,13 +21,13 @@ FerricFlow is available in both modes. It keeps workflow or job state and histor
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.5.3
+  ghcr.io/ferricstore/ferricstore:0.7.0
 ```
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
 
 The official container image is `ghcr.io/ferricstore/ferricstore`. The current
-release tag is `0.5.3` and is published for `linux/amd64` and `linux/arm64`.
+release tag is `0.7.0` and is published for `linux/amd64` and `linux/arm64`.
 
 Smoke test with the Python SDK:
 
@@ -118,7 +118,7 @@ Add the dependency:
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.5.3"}
+    {:ferricstore, "~> 0.7.0"}
   ]
 end
 ```

@@ -9,10 +9,16 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Native.Session
 
   @op_hello 0x0001
+  @op_route 0x0006
+  @op_shards 0x0007
   @op_options 0x000B
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_set 0x0102
+  @op_flow_circuit_open 0x024A
+  @op_flow_circuit_get 0x024C
+  @op_flow_budget_reserve 0x024D
+  @op_flow_limit_lease 0x024F
 
   defmodule TestExtension do
     @behaviour Ferricstore.Commands.Extension
@@ -130,9 +136,64 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload.protocol == "ferricstore-native"
-    assert payload.route.native_port == Application.get_env(:ferricstore, :native_port, 6388)
+    assert is_binary(payload.route.host)
+    assert is_integer(payload.route.native_port)
+    assert payload.route.endpoint.host == payload.route.host
+    assert payload.route.endpoint.native_port == payload.route.native_port
     refute Map.has_key?(payload.route, String.to_atom("resp" <> "_port"))
     assert new_state.client_name == "sdk-a"
+  end
+
+  test "HELLO redacts native endpoints before authentication is complete" do
+    {status, payload, _state} =
+      Commands.execute(
+        @op_hello,
+        %{"client_name" => "sdk-a"},
+        state(%{require_auth: true, authenticated: false, acl_cache: nil})
+      )
+
+    assert status == :ok
+    assert payload.auth_required == true
+    assert payload.route.slots == 1024
+    assert payload.route.shard_count >= 1
+    refute Map.has_key?(payload.route, :host)
+    refute Map.has_key?(payload.route, :native_host)
+    refute Map.has_key?(payload.route, :native_port)
+    refute Map.has_key?(payload.route, :endpoint)
+  end
+
+  test "ROUTE returns leader-aware native endpoint metadata" do
+    {status, payload, _state} =
+      Commands.execute(@op_route, %{"key" => "{sdk-route}:a"}, state())
+
+    assert status == :ok
+    assert payload.slot in 0..1023
+    assert payload.lane_id == payload.shard + 1
+    assert is_binary(payload.owner_node)
+    assert is_binary(payload.leader_node)
+    assert payload.owner_node == payload.leader_node
+    assert is_binary(payload.native_host)
+    assert is_integer(payload.native_port)
+    assert payload.endpoint.node == payload.leader_node
+    assert payload.endpoint.host == payload.native_host
+    assert payload.endpoint.native_port == payload.native_port
+    assert payload.hint in ["leader", "remote_leader", "local"]
+  end
+
+  test "SHARDS returns leader-aware endpoint metadata per slot range" do
+    {status, payload, _state} = Commands.execute(@op_shards, %{}, state())
+
+    assert status == :ok
+    assert payload.slots == 1024
+    assert is_list(payload.ranges)
+    assert [range | _] = payload.ranges
+    assert range.first_slot <= range.last_slot
+    assert range.lane_id == range.shard + 1
+    assert range.owner_node == range.leader_node
+    assert range.endpoint.node == range.leader_node
+    assert range.endpoint.host == range.native_host
+    assert range.endpoint.native_port == range.native_port
+    assert range.hint in ["leader", "remote_leader", "local"]
   end
 
   test "COMMAND_EXEC delegates through native AST parser" do
@@ -579,6 +640,42 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     state = ConnAuth.maybe_refresh_acl_cache(state, "platform_missing_abcd")
     assert_native_get_ok("tenant:other:key", state)
+  end
+
+  test "native scope-based governance commands enforce key ACLs" do
+    assert :ok =
+             Acl.set_user("scope_guard", [
+               "on",
+               "nopass",
+               "-@all",
+               "+FLOW.CIRCUIT.OPEN",
+               "+FLOW.CIRCUIT.GET",
+               "+FLOW.BUDGET.RESERVE",
+               "+FLOW.LIMIT.LEASE",
+               "~tenant:a:*"
+             ])
+
+    state = state_as("scope_guard")
+
+    for {opcode, payload} <- [
+          {@op_flow_circuit_open,
+           %{"scope" => "tenant:b:effect", "failure_threshold" => 1, "open_ms" => 1_000}},
+          {@op_flow_circuit_get, %{"scope" => "tenant:b:effect"}},
+          {@op_flow_budget_reserve, %{"scope" => "tenant:b:budget", "amount" => 10}},
+          {@op_flow_limit_lease, %{"scope" => "tenant:b:limit", "limit" => 10}}
+        ] do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+      assert message =~ "NOPERM"
+    end
+
+    {status, _payload, _state} =
+      Commands.execute(
+        @op_flow_circuit_open,
+        %{"scope" => "tenant:a:effect", "failure_threshold" => 1, "open_ms" => 1_000},
+        state
+      )
+
+    refute status == :noperm
   end
 
   test "CLIENT TRACKING is explicitly rejected after text protocol removal" do
