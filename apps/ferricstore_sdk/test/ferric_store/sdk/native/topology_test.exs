@@ -48,4 +48,24 @@ defmodule FerricStore.SDK.Native.TopologyTest do
     assert route1.shard == 1
     assert route1.endpoint.host == "b.local"
   end
+
+  test "leader_unknown ranges return a specific topology error" do
+    payload = %{
+      "route_epoch" => 124,
+      "shard_count" => 1,
+      "ranges" => [
+        %{
+          "first_slot" => 0,
+          "last_slot" => 1023,
+          "shard" => 0,
+          "lane_id" => 1,
+          "owner_node" => nil,
+          "leader_node" => nil,
+          "hint" => "leader_unknown"
+        }
+      ]
+    }
+
+    assert {:error, {:leader_unknown, 0}} = Topology.build(payload)
+  end
 end

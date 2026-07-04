@@ -37,10 +37,27 @@ defmodule FerricStore.SDK.Native.Connection do
     request_id = state.next_request_id
     frame = Codec.encode_frame(opcode, lane_id, request_id, payload)
 
-    with :ok <- apply(state.transport, :send, [state.socket, frame]),
-         {:ok, value, next_state} <- await_response(state, opcode, request_id, timeout) do
-      {:reply, {:ok, value}, %{next_state | next_request_id: request_id + 1}}
-    else
+    case apply(state.transport, :send, [state.socket, frame]) do
+      :ok ->
+        await_request_response(state, opcode, request_id, timeout)
+
+      {:error, reason} ->
+        next_state = %{state | next_request_id: request_id + 1}
+        error = {:send_failed, reason}
+
+        if connection_failure?(reason) do
+          {:stop, :normal, {:error, error}, next_state}
+        else
+          {:reply, {:error, error}, next_state}
+        end
+    end
+  end
+
+  defp await_request_response(state, opcode, request_id, timeout) do
+    case await_response(state, opcode, request_id, timeout) do
+      {:ok, value, next_state} ->
+        {:reply, {:ok, value}, %{next_state | next_request_id: request_id + 1}}
+
       {:error, reason, next_state} ->
         next_state = %{next_state | next_request_id: request_id + 1}
 
@@ -156,13 +173,11 @@ defmodule FerricStore.SDK.Native.Connection do
         {:need_more, buffer}
 
       {:ok, frames, rest} ->
-        case Enum.find(frames, fn {_lane, frame_opcode, frame_request_id, _flags, _body, _raw} ->
-               frame_opcode == opcode and frame_request_id == request_id
-             end) do
-          nil ->
+        case matching_logical_response(frames, opcode, request_id) do
+          :need_more ->
             {:need_more, preserve_unmatched_frames(frames, nil, rest)}
 
-          {_lane, ^opcode, ^request_id, flags, body, _raw} = matched ->
+          {:ok, matched, flags, body} ->
             rest = preserve_unmatched_frames(frames, matched, rest)
 
             case Codec.decode_response(opcode, flags, body) do
@@ -174,6 +189,51 @@ defmodule FerricStore.SDK.Native.Connection do
 
       {:error, reason} ->
         {:error, reason, ""}
+    end
+  end
+
+  defp matching_logical_response(frames, opcode, request_id) do
+    matching =
+      Enum.filter(frames, fn {_lane, frame_opcode, frame_request_id, _flags, _body, _raw} ->
+        frame_opcode == opcode and frame_request_id == request_id
+      end)
+
+    case matching do
+      [] ->
+        :need_more
+
+      [{_lane, ^opcode, ^request_id, flags, body, _raw} = frame | rest] ->
+        if Codec.more_chunks?(flags) do
+          reassemble_chunks([frame | rest])
+        else
+          {:ok, [frame], flags, body}
+        end
+    end
+  end
+
+  defp reassemble_chunks(frames) do
+    Enum.reduce_while(frames, {[], 0}, fn
+      {_lane, _opcode, _request_id, flags, _body, _raw} = frame, {matched, acc_flags} ->
+        next_matched = [frame | matched]
+        next_flags = Bitwise.bor(acc_flags, flags)
+
+        if Codec.more_chunks?(flags) do
+          {:cont, {next_matched, next_flags}}
+        else
+          matched = Enum.reverse(next_matched)
+
+          body =
+            matched
+            |> Enum.map(fn {_lane, _opcode, _request_id, _flags, chunk, _raw} -> chunk end)
+            |> IO.iodata_to_binary()
+
+          flags = Bitwise.band(next_flags, Bitwise.bnot(0x20))
+          {:halt, {:ok, matched, flags, body}}
+        end
+    end)
+    |> case do
+      {:ok, _matched, _flags, _body} = ok -> ok
+      {_pending, _flags} -> :need_more
     end
   end
 
@@ -196,6 +256,7 @@ defmodule FerricStore.SDK.Native.Connection do
   end
 
   defp matched_frame?(_frame, nil), do: false
+  defp matched_frame?(frame, matched) when is_list(matched), do: frame in matched
   defp matched_frame?(frame, matched), do: frame == matched
 
   defp keep_raw_frames_within_limit(raw_frames, limit) do

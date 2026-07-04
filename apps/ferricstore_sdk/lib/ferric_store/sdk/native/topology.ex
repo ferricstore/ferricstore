@@ -67,6 +67,13 @@ defmodule FerricStore.SDK.Native.Topology do
   @spec endpoint_key(endpoint()) :: {binary(), non_neg_integer()}
   def endpoint_key(%{host: host, native_port: port}), do: {host, port}
 
+  defp put_range(_topology, %{"hint" => "leader_unknown"} = range) do
+    case fetch_int(range, "shard") do
+      {:ok, shard} -> {:error, {:leader_unknown, shard}}
+      {:error, _reason} -> {:error, {:leader_unknown, range}}
+    end
+  end
+
   defp put_range(topology, range) do
     with {:ok, first} <- fetch_int(range, "first_slot"),
          {:ok, last} <- fetch_int(range, "last_slot"),

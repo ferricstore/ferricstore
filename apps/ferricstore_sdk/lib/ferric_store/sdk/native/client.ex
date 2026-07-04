@@ -273,11 +273,16 @@ defmodule FerricStore.SDK.Native.Client do
            ) do
       {:ok, value, state}
     else
-      {:error, reason} when reason in [:closed, :timeout, :econnrefused] ->
-        retry_control_after_refresh(state, opcode, payload, opts, reason)
-
       {:error, reason} ->
-        {:error, reason, state}
+        maybe_retry_control_after_refresh(state, opcode, payload, opts, reason)
+    end
+  end
+
+  defp maybe_retry_control_after_refresh(state, opcode, payload, opts, reason) do
+    if retryable_route_error?(reason) do
+      retry_control_after_refresh(state, opcode, payload, opts, reason)
+    else
+      {:error, reason, state}
     end
   end
 
@@ -334,22 +339,33 @@ defmodule FerricStore.SDK.Native.Client do
 
   defp async_connection_request(client, conn, opcode, key, payload, lane_id, timeout, opts) do
     case safe_connection_request(conn, opcode, payload, lane_id, timeout) do
-      {:error, reason} when reason in [:closed, :timeout, :econnrefused] ->
-        retry_command_call(client, opcode, key, payload, opts, reason)
-
-      {:error, {:reroute, _payload} = reason} ->
-        retry_command_call(client, opcode, key, payload, opts, reason)
+      {:error, reason} ->
+        if retryable_route_error?(reason) do
+          retry_command_call(client, opcode, key, payload, opts, reason)
+        else
+          {:error, reason}
+        end
 
       result ->
         result
     end
   end
 
-  defp safe_connection_request(conn, opcode, payload, lane_id, timeout) do
-    Connection.request(conn, opcode, payload, lane_id, timeout)
-  catch
-    :exit, reason -> {:error, {:connection_call_exit, reason}}
+  defp retry_command_result_after_refresh(
+         {:error, reason, state},
+         opcode,
+         key,
+         payload,
+         opts
+       ) do
+    if retryable_route_error?(reason) do
+      retry_after_refresh(state, opcode, key, payload, opts, reason)
+    else
+      {:error, reason, state}
+    end
   end
+
+  defp retry_command_result_after_refresh(result, _opcode, _key, _payload, _opts), do: result
 
   defp retry_command_call(client, opcode, key, payload, opts, original_reason) do
     GenServer.call(
@@ -359,6 +375,12 @@ defmodule FerricStore.SDK.Native.Client do
     )
   catch
     :exit, reason -> {:error, {:retry_call_exit, reason}}
+  end
+
+  defp safe_connection_request(conn, opcode, payload, lane_id, timeout) do
+    Connection.request(conn, opcode, payload, lane_id, timeout)
+  catch
+    :exit, reason -> {:error, {:connection_call_exit, reason}}
   end
 
   defp routed_request(state, opcode, key, payload, opts) do
@@ -374,14 +396,9 @@ defmodule FerricStore.SDK.Native.Client do
            ) do
       {:ok, value, state}
     else
-      {:error, reason} when reason in [:closed, :timeout, :econnrefused] ->
-        retry_after_refresh(state, opcode, key, payload, opts, reason)
-
-      {:error, {:reroute, _payload} = reason} ->
-        retry_after_refresh(state, opcode, key, payload, opts, reason)
-
       {:error, reason} ->
         {:error, reason, state}
+        |> retry_command_result_after_refresh(opcode, key, payload, opts)
     end
   end
 
@@ -403,19 +420,70 @@ defmodule FerricStore.SDK.Native.Client do
     end
   end
 
+  defp retryable_route_error?({:connect_failed, _reason}), do: true
+  defp retryable_route_error?({:send_failed, _reason}), do: true
+  defp retryable_route_error?({:reroute, _payload}), do: true
+  defp retryable_route_error?(_reason), do: false
+
   defp routed_requests_by_items(state, _opcode, [], _key_fun, _payload_builder, _opts),
     do: {:ok, [], state}
 
   defp routed_requests_by_items(state, opcode, items, key_fun, payload_builder, opts) do
     with {:ok, groups} <- route_item_groups(state, items, key_fun),
          {:ok, groups_with_connections, state} <- ensure_group_connections(state, groups) do
-      execute_group_requests(state, opcode, groups_with_connections, payload_builder, opts)
+      state
+      |> execute_group_requests(opcode, groups_with_connections, payload_builder, opts)
+      |> retry_items_result_after_refresh(state, opcode, items, key_fun, payload_builder, opts)
     else
-      {:error, reason} when reason in [:closed, :timeout, :econnrefused] ->
-        retry_items_after_refresh(state, opcode, items, key_fun, payload_builder, opts, reason)
-
       {:error, reason} ->
-        {:error, reason, state}
+        retry_items_error_after_refresh(
+          state,
+          opcode,
+          items,
+          key_fun,
+          payload_builder,
+          opts,
+          reason
+        )
+    end
+  end
+
+  defp retry_items_result_after_refresh(
+         {:error, reason, state},
+         _original_state,
+         opcode,
+         items,
+         key_fun,
+         payload_builder,
+         opts
+       ) do
+    retry_items_error_after_refresh(state, opcode, items, key_fun, payload_builder, opts, reason)
+  end
+
+  defp retry_items_result_after_refresh(
+         result,
+         _state,
+         _opcode,
+         _items,
+         _key_fun,
+         _builder,
+         _opts
+       ),
+       do: result
+
+  defp retry_items_error_after_refresh(
+         state,
+         opcode,
+         items,
+         key_fun,
+         payload_builder,
+         opts,
+         reason
+       ) do
+    if retryable_route_error?(reason) do
+      retry_items_after_refresh(state, opcode, items, key_fun, payload_builder, opts, reason)
+    else
+      {:error, reason, state}
     end
   end
 
@@ -499,27 +567,67 @@ defmodule FerricStore.SDK.Native.Client do
   end
 
   defp execute_group_requests(state, opcode, groups, payload_builder, opts) do
-    Enum.reduce_while(groups, {:ok, [], state}, fn group, {:ok, acc, acc_state} ->
-      payload = payload_builder.(group.items)
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-      case Connection.request(
-             group.conn,
-             opcode,
-             payload || %{},
-             group.route.lane_id,
-             Keyword.get(opts, :timeout, @default_timeout)
-           ) do
-        {:ok, value} ->
-          result = Map.take(group, [:route, :items, :indexes]) |> Map.put(:value, value)
-          {:cont, {:ok, [result | acc], acc_state}}
+    results =
+      groups
+      |> Task.async_stream(
+        fn group ->
+          execute_group_request(opcode, group, payload_builder, timeout)
+        end,
+        max_concurrency: max(length(groups), 1),
+        ordered: true,
+        timeout: timeout + 1_000
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, reason} -> {:error, {:group_request_exit, reason}}
+      end)
 
-        {:error, reason} ->
-          {:halt, {:error, reason, acc_state}}
-      end
-    end)
-    |> case do
-      {:ok, values, state} -> {:ok, Enum.reverse(values), state}
-      {:error, reason, state} -> {:error, reason, state}
+    case split_group_results(results) do
+      {:ok, values} ->
+        {:ok, values, state}
+
+      {:error, reason, 0} ->
+        {:error, reason, state}
+
+      {:error, reason, completed_count} ->
+        {:error, {:partial_group_failure, reason, completed_count}, state}
+    end
+  end
+
+  defp execute_group_request(opcode, group, payload_builder, timeout) do
+    payload = payload_builder.(group.items)
+
+    case Connection.request(
+           group.conn,
+           opcode,
+           payload || %{},
+           group.route.lane_id,
+           timeout
+         ) do
+      {:ok, value} ->
+        result = Map.take(group, [:route, :items, :indexes]) |> Map.put(:value, value)
+        {:ok, result}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  catch
+    :exit, reason -> {:error, {:connection_call_exit, reason}}
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp split_group_results(results) do
+    values =
+      Enum.flat_map(results, fn
+        {:ok, value} -> [value]
+        {:error, _reason} -> []
+      end)
+
+    case Enum.find(results, &match?({:error, _reason}, &1)) do
+      nil -> {:ok, values}
+      {:error, reason} -> {:error, reason, length(values)}
     end
   end
 
@@ -544,7 +652,7 @@ defmodule FerricStore.SDK.Native.Client do
 
   defp connect_and_bootstrap(state, endpoint) do
     with :ok <- validate_endpoint(state, endpoint),
-         {:ok, conn} <- Connection.start(endpoint),
+         {:ok, conn} <- start_transport_connection(endpoint),
          {:ok, _hello} <- hello(conn, state),
          :ok <- maybe_auth(conn, state),
          {:ok, shards} <- Connection.request(conn, @op_shards, %{}, 0),
@@ -619,10 +727,17 @@ defmodule FerricStore.SDK.Native.Client do
     endpoint = endpoint_defaults(endpoint, state)
 
     with :ok <- validate_endpoint(state, endpoint),
-         {:ok, conn} <- Connection.start(endpoint),
+         {:ok, conn} <- start_transport_connection(endpoint),
          {:ok, _hello} <- hello(conn, state),
          :ok <- maybe_auth(conn, state) do
       {:ok, conn, %{state | connections: Map.put(state.connections, key, conn)}}
+    end
+  end
+
+  defp start_transport_connection(endpoint) do
+    case Connection.start(endpoint) do
+      {:ok, conn} -> {:ok, conn}
+      {:error, reason} -> {:error, {:connect_failed, reason}}
     end
   end
 

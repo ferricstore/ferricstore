@@ -16,9 +16,12 @@
 #   `mix test test/ferricstore/jepsen/ --include jepsen`.
 # :bench — long-running throughput benchmarks (30s+ per test). Excluded by default.
 #   Run with `mix test test/ferricstore/cluster/throughput_bench_test.exs --include bench`.
+# :perf_guard — short bounded latency/throughput regression guards. Excluded
+#   from default local runs and exercised by the dedicated CI perf-guard job.
 ExUnit.start(
   exclude: [
     :bench,
+    :perf_guard,
     :linux_io_uring,
     :large_alloc,
     :cluster,

@@ -42,8 +42,9 @@ defmodule FerricStore.SDK.KV do
 
   def mget(client, keys, opts) when is_list(keys) do
     with {:ok, groups} <-
-           Client.request_by_keys(client, Opcodes.mget(), keys, &%{"keys" => &1}, opts) do
-      {:ok, merge_ordered_values(groups, length(keys))}
+           Client.request_by_keys(client, Opcodes.mget(), keys, &%{"keys" => &1}, opts),
+         {:ok, values} <- merge_ordered_values(groups, length(keys)) do
+      {:ok, values}
     end
   end
 
@@ -367,15 +368,36 @@ defmodule FerricStore.SDK.KV do
   end
 
   defp merge_ordered_values(groups, count) do
-    tuple = List.to_tuple(List.duplicate(nil, count))
+    Enum.reduce_while(groups, {:ok, List.to_tuple(List.duplicate(nil, count))}, fn
+      %{indexes: indexes, value: values} = group, {:ok, acc} when is_list(values) ->
+        if length(indexes) == length(values) do
+          next =
+            indexes
+            |> Enum.zip(values)
+            |> Enum.reduce(acc, fn {index, value}, inner -> put_elem(inner, index, value) end)
 
-    groups
-    |> Enum.reduce(tuple, fn %{indexes: indexes, value: values}, acc ->
-      indexes
-      |> Enum.zip(values)
-      |> Enum.reduce(acc, fn {index, value}, inner -> put_elem(inner, index, value) end)
+          {:cont, {:ok, next}}
+        else
+          {:halt, {:error, mget_group_size_error(group, values)}}
+        end
+
+      group, {:ok, _acc} ->
+        {:halt, {:error, {:invalid_mget_group_response, Map.take(group, [:indexes, :value])}}}
     end)
-    |> Tuple.to_list()
+    |> case do
+      {:ok, tuple} -> {:ok, Tuple.to_list(tuple)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp mget_group_size_error(%{indexes: indexes} = group, values) do
+    %{
+      expected: length(indexes),
+      actual: length(values),
+      indexes: indexes,
+      items: Map.get(group, :items, [])
+    }
+    |> then(&{:mismatched_mget_response, &1})
   end
 
   defp sum_integer_values(groups) do

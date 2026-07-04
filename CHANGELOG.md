@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.7.0 - 2026-07-04
+
+- Added HA-aware native route metadata for `HELLO`, `ROUTE`, `ROUTE_BATCH`, and `SHARDS`, including advertised native endpoints and leader hints.
+- Added the embedded Elixir native SDK with topology-aware routing, keyed KV helpers, Flow helpers, and admin/governance helpers.
+- Hardened SDK rerouting so automatic replay is limited to connection-open/send failures and explicit native `REROUTE`; post-send close/timeout results are surfaced to callers as unknown outcomes.
+- Added SDK durability coverage for routed leader loss, no-quorum failures, and topology refresh recovery.
+- Exposed state metadata in the governance dashboard and Flow detail views using bounded indexed `state_meta` queries.
+- Hardened native route/governance ACL checks and expanded CI coverage for SDK and durability routing paths.
+
 ## 0.6.0 - 2026-07-01
 
 - Added bounded per-state Flow metadata with durable record/history encoding.

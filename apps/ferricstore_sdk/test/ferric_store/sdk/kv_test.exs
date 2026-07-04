@@ -36,6 +36,37 @@ defmodule FerricStore.SDK.KVTest do
     assert Enum.flat_map(groups, & &1.indexes) |> Enum.sort() == [0, 1, 2]
   end
 
+  test "multi-key reads preserve duplicate key positions", %{client: client} do
+    key = "{#{unique("sdk-mget-dup")}}:key"
+
+    assert :ok = KV.set(client, key, "dup-value")
+
+    assert {:ok, ["dup-value", "dup-value", "dup-value"]} =
+             KV.mget(client, [key, key, key])
+  end
+
+  test "multi-key reads reject shard responses with the wrong value count", %{client: client} do
+    key = "{#{unique("sdk-mget-mismatch")}}:key"
+    assert {:ok, route} = Client.route(client, key)
+
+    {:ok, conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        reply: ["only-one-value"]
+      )
+
+    :sys.replace_state(client, fn state ->
+      %{state | connections: Map.put(state.connections, route.endpoint_key, conn)}
+    end)
+
+    assert {:error, {:mismatched_mget_response, meta}} = KV.mget(client, [key, key])
+    assert meta.expected == 2
+    assert meta.actual == 1
+    assert meta.indexes == [0, 1]
+    assert meta.items == [key, key]
+    assert_receive {:fake_mget, [^key, ^key]}, 100
+  end
+
   test "rejects multi-shard writes by default before partial mutation", %{client: client} do
     [a, b] = distinct_route_keys(client, unique("sdk-partial"), 2)
 
@@ -48,6 +79,13 @@ defmodule FerricStore.SDK.KVTest do
     assert :ok = KV.set(client, b, "b")
 
     assert {:error, {:multi_shard_write_requires_explicit_policy, :del}} = KV.del(client, [a, b])
+    assert {:ok, ["a", "b"]} = KV.mget(client, [a, b])
+  end
+
+  test "supports explicit per-shard multi-shard writes", %{client: client} do
+    [a, b] = distinct_route_keys(client, unique("sdk-per-shard"), 2)
+
+    assert :ok = KV.mset(client, [{a, "a"}, {b, "b"}], atomicity: :per_shard)
     assert {:ok, ["a", "b"]} = KV.mget(client, [a, b])
   end
 
@@ -115,5 +153,20 @@ defmodule FerricStore.SDK.KVTest do
       end
     end)
     |> Map.values()
+  end
+
+  defmodule FakeConnection do
+    use GenServer
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+
+    @impl true
+    def init(opts), do: {:ok, opts}
+
+    @impl true
+    def handle_call({:request, _opcode, payload, _lane_id, _timeout}, _from, state) do
+      send(state.parent, {:fake_mget, payload["keys"]})
+      {:reply, {:ok, state.reply}, state}
+    end
   end
 end

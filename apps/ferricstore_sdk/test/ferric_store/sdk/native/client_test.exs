@@ -284,6 +284,302 @@ defmodule FerricStore.SDK.Native.ClientTest do
     assert {:ok, "slow"} = Task.await(slow_task, 1_000)
   end
 
+  test "refreshes topology and retries single-key requests after native reroute" do
+    port = FerricstoreServer.Native.Listener.port()
+    {:ok, client} = Client.start_link(seeds: [{"127.0.0.1", port}])
+
+    key = "{sdk-single-reroute}:#{System.unique_integer([:positive])}"
+    assert :ok = Client.set(client, key, "single-reroute-value")
+    assert {:ok, route} = Client.route(client, key)
+
+    {:ok, reroute_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :single_reroute,
+        delay_ms: 0,
+        reply: {:error, {:reroute, %{"reason" => "leader_changed"}}}
+      )
+
+    :sys.replace_state(client, fn state ->
+      %{state | connections: Map.put(state.connections, route.endpoint_key, reroute_conn)}
+    end)
+
+    assert {:ok, "single-reroute-value"} = Client.get(client, key)
+    assert_receive {:fake_request, :single_reroute, ^key}, 100
+  end
+
+  test "grouped requests on different endpoints do not serialize through slow shards" do
+    port = FerricstoreServer.Native.Listener.port()
+    {:ok, client} = Client.start_link(seeds: [{"127.0.0.1", port}])
+
+    slow_key = "{sdk-group-slow}:#{System.unique_integer([:positive])}"
+    fast_key = different_slot_key(slow_key)
+
+    slow_endpoint = %{
+      node: "group-slow@fixture",
+      host: "127.0.0.1",
+      native_port: unused_port(),
+      tls: false
+    }
+
+    fast_endpoint = %{
+      node: "group-fast@fixture",
+      host: "127.0.0.1",
+      native_port: unused_port(),
+      tls: false
+    }
+
+    slow_endpoint_key = Topology.endpoint_key(slow_endpoint)
+    fast_endpoint_key = Topology.endpoint_key(fast_endpoint)
+    slow_slot = Topology.slot_for_key(slow_key)
+    fast_slot = Topology.slot_for_key(fast_key)
+
+    {:ok, slow_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :group_slow,
+        delay_ms: 250,
+        reply: ["slow"]
+      )
+
+    {:ok, fast_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :group_fast,
+        delay_ms: 0,
+        reply: ["fast"]
+      )
+
+    :sys.replace_state(client, fn state ->
+      slow_route = %{
+        shard: 1,
+        lane_id: 2,
+        endpoint_key: slow_endpoint_key,
+        endpoint: slow_endpoint,
+        leader_node: slow_endpoint.node
+      }
+
+      fast_route = %{
+        shard: 2,
+        lane_id: 3,
+        endpoint_key: fast_endpoint_key,
+        endpoint: fast_endpoint,
+        leader_node: fast_endpoint.node
+      }
+
+      topology = %{
+        state.topology
+        | slots:
+            state.topology.slots
+            |> put_elem(slow_slot, slow_route)
+            |> put_elem(fast_slot, fast_route),
+          endpoints:
+            state.topology.endpoints
+            |> Map.put(slow_endpoint_key, slow_endpoint)
+            |> Map.put(fast_endpoint_key, fast_endpoint)
+      }
+
+      %{
+        state
+        | topology: topology,
+          connections:
+            state.connections
+            |> Map.put(slow_endpoint_key, slow_conn)
+            |> Map.put(fast_endpoint_key, fast_conn)
+      }
+    end)
+
+    request_task =
+      Task.async(fn ->
+        Client.request_by_keys(client, :mget, [slow_key, fast_key], fn keys ->
+          %{"keys" => keys}
+        end)
+      end)
+
+    assert_receive {:fake_request, :group_slow, [^slow_key]}, 100
+    assert_receive {:fake_request, :group_fast, [^fast_key]}, 100
+
+    assert {:ok, [slow_group, fast_group]} = Task.await(request_task, 1_000)
+    assert slow_group.value == ["slow"]
+    assert fast_group.value == ["fast"]
+  end
+
+  test "grouped requests do not replay completed shard groups after partial failure" do
+    port = FerricstoreServer.Native.Listener.port()
+    {:ok, client} = Client.start_link(seeds: [{"127.0.0.1", port}])
+
+    ok_key = "{sdk-group-ok}:#{System.unique_integer([:positive])}"
+    failing_key = different_slot_key(ok_key)
+
+    ok_endpoint = %{
+      node: "group-ok@fixture",
+      host: "127.0.0.1",
+      native_port: unused_port(),
+      tls: false
+    }
+
+    failing_endpoint = %{
+      node: "group-failing@fixture",
+      host: "127.0.0.1",
+      native_port: unused_port(),
+      tls: false
+    }
+
+    ok_endpoint_key = Topology.endpoint_key(ok_endpoint)
+    failing_endpoint_key = Topology.endpoint_key(failing_endpoint)
+    ok_slot = Topology.slot_for_key(ok_key)
+    failing_slot = Topology.slot_for_key(failing_key)
+
+    {:ok, ok_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :group_ok,
+        delay_ms: 0,
+        reply: ["ok"]
+      )
+
+    {:ok, failing_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :group_failing,
+        delay_ms: 0,
+        reply: {:error, {:reroute, %{"reason" => "leader_changed"}}}
+      )
+
+    :sys.replace_state(client, fn state ->
+      ok_route = %{
+        shard: 1,
+        lane_id: 2,
+        endpoint_key: ok_endpoint_key,
+        endpoint: ok_endpoint,
+        leader_node: ok_endpoint.node
+      }
+
+      failing_route = %{
+        shard: 2,
+        lane_id: 3,
+        endpoint_key: failing_endpoint_key,
+        endpoint: failing_endpoint,
+        leader_node: failing_endpoint.node
+      }
+
+      topology = %{
+        state.topology
+        | slots:
+            state.topology.slots
+            |> put_elem(ok_slot, ok_route)
+            |> put_elem(failing_slot, failing_route),
+          endpoints:
+            state.topology.endpoints
+            |> Map.put(ok_endpoint_key, ok_endpoint)
+            |> Map.put(failing_endpoint_key, failing_endpoint)
+      }
+
+      %{
+        state
+        | topology: topology,
+          connections:
+            state.connections
+            |> Map.put(ok_endpoint_key, ok_conn)
+            |> Map.put(failing_endpoint_key, failing_conn)
+      }
+    end)
+
+    assert {:error, {:partial_group_failure, {:reroute, %{"reason" => "leader_changed"}}, 1}} =
+             Client.request_by_keys(client, :mget, [ok_key, failing_key], fn keys ->
+               %{"keys" => keys}
+             end)
+
+    assert_receive {:fake_request, :group_ok, [^ok_key]}, 100
+    assert_receive {:fake_request, :group_failing, [^failing_key]}, 100
+    refute_receive {:fake_request, :group_ok, [^ok_key]}, 100
+  end
+
+  test "refreshes topology and retries grouped requests after native reroute" do
+    port = FerricstoreServer.Native.Listener.port()
+    {:ok, client} = Client.start_link(seeds: [{"127.0.0.1", port}])
+
+    key = "{sdk-group-reroute}:#{System.unique_integer([:positive])}"
+    assert :ok = Client.set(client, key, "group-reroute-value")
+    assert {:ok, route} = Client.route(client, key)
+
+    {:ok, reroute_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :reroute,
+        delay_ms: 0,
+        reply: {:error, {:reroute, %{"reason" => "leader_changed"}}}
+      )
+
+    :sys.replace_state(client, fn state ->
+      %{state | connections: Map.put(state.connections, route.endpoint_key, reroute_conn)}
+    end)
+
+    assert {:ok, [group]} =
+             Client.request_by_keys(client, :mget, [key], fn keys -> %{"keys" => keys} end)
+
+    assert group.indexes == [0]
+    assert group.items == [key]
+    assert group.value == ["group-reroute-value"]
+    assert_receive {:fake_request, :reroute, [^key]}, 100
+  end
+
+  test "refreshes topology and retries grouped requests when send fails before write" do
+    port = FerricstoreServer.Native.Listener.port()
+    {:ok, client} = Client.start_link(seeds: [{"127.0.0.1", port}])
+
+    key = "{sdk-group-send-failed}:#{System.unique_integer([:positive])}"
+    assert :ok = Client.set(client, key, "group-send-failed-value")
+    assert {:ok, route} = Client.route(client, key)
+
+    {:ok, send_failed_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :send_failed,
+        delay_ms: 0,
+        reply: {:error, {:send_failed, :closed}}
+      )
+
+    :sys.replace_state(client, fn state ->
+      %{state | connections: Map.put(state.connections, route.endpoint_key, send_failed_conn)}
+    end)
+
+    assert {:ok, [group]} =
+             Client.request_by_keys(client, :mget, [key], fn keys -> %{"keys" => keys} end)
+
+    assert group.indexes == [0]
+    assert group.items == [key]
+    assert group.value == ["group-send-failed-value"]
+    assert_receive {:fake_request, :send_failed, [^key]}, 100
+  end
+
+  test "does not replay routed requests when the cached connection closes after send" do
+    port = FerricstoreServer.Native.Listener.port()
+    {:ok, client} = Client.start_link(seeds: [{"127.0.0.1", port}])
+
+    key = "{sdk-no-replay-closed}:#{System.unique_integer([:positive])}"
+    assert :ok = Client.set(client, key, "durable-value")
+    assert {:ok, route} = Client.route(client, key)
+
+    {:ok, closed_after_send_conn} =
+      __MODULE__.FakeConnection.start_link(
+        parent: self(),
+        name: :closed_after_send,
+        delay_ms: 0,
+        reply: {:error, :closed}
+      )
+
+    :sys.replace_state(client, fn state ->
+      %{
+        state
+        | connections: Map.put(state.connections, route.endpoint_key, closed_after_send_conn)
+      }
+    end)
+
+    assert {:error, :closed} = Client.get(client, key)
+    assert_receive {:fake_request, :closed_after_send, ^key}, 100
+  end
+
   test "public TLS trust options are carried into seed endpoint validation" do
     parent = self()
     trap_exit? = Process.flag(:trap_exit, true)
@@ -355,9 +651,13 @@ defmodule FerricStore.SDK.Native.ClientTest do
 
     @impl true
     def handle_call({:request, _opcode, payload, _lane_id, _timeout}, _from, state) do
-      send(state.parent, {:fake_request, state.name, payload["key"]})
+      send(state.parent, {:fake_request, state.name, payload["key"] || payload["keys"]})
       Process.sleep(state.delay_ms)
-      {:reply, {:ok, state.reply}, state}
+
+      case state.reply do
+        {:error, _reason} = error -> {:reply, error, state}
+        value -> {:reply, {:ok, value}, state}
+      end
     end
   end
 end

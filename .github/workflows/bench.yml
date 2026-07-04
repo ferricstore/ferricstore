@@ -81,7 +81,11 @@ jobs:
           BENCH_TIME: ${{ github.event.inputs.time || '10' }}
         run: |
           echo "::group::TCP Benchmark Output"
-          mix run bench/tcp_bench.exs 2>&1 | tee bench/output/tcp_results.txt
+          if [ -f bench/tcp_bench.exs ]; then
+            mix run bench/tcp_bench.exs 2>&1 | tee bench/output/tcp_results.txt
+          else
+            echo "::notice::bench/tcp_bench.exs is not present in this OSS tree; native TCP benchmarks live outside this workflow." | tee bench/output/tcp_results.txt
+          fi
           echo "::endgroup::"
 
       - name: Run commands benchmark

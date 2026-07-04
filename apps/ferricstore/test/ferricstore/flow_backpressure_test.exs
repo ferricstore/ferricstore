@@ -202,4 +202,43 @@ defmodule Ferricstore.FlowBackpressureTest do
     assert_receive {:flow_telemetry, [:ferricstore, :flow, :create, :rejected], %{count: 3},
                     %{reason: _reason}}
   end
+
+  test "concurrent flow creates under pressure return BUSY or succeed and recover cleanly" do
+    ctx = FerricStore.Instance.get(:default)
+    MemoryGuard.set_reject_writes(true)
+
+    tasks =
+      for i <- 1..32 do
+        Task.async(fn ->
+          Router.flow_create(ctx, %{
+            id: "flow-pressure-concurrent-#{System.unique_integer([:positive])}-#{i}",
+            type: "pressure",
+            state: "queued"
+          })
+        end)
+      end
+
+    Process.sleep(10)
+    MemoryGuard.set_reject_writes(false)
+
+    results = Task.await_many(tasks, 10_000)
+
+    assert Enum.all?(results, fn
+             :ok ->
+               true
+
+             {:error, message} when is_binary(message) ->
+               message =~ "BUSY" and message =~ "retry_after_ms="
+
+             _other ->
+               false
+           end)
+
+    assert :ok =
+             Router.flow_create(ctx, %{
+               id: "flow-pressure-recovered-#{System.unique_integer([:positive])}",
+               type: "pressure",
+               state: "queued"
+             })
+  end
 end
