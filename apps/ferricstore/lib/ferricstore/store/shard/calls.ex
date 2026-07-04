@@ -71,6 +71,7 @@ defmodule Ferricstore.Store.Shard.Calls do
       # need to reach the shard's current Bitcask file without copying the
       # entire Shard state via :sys.get_state.
       def handle_call(:get_active_file, _from, state) do
+        state = sync_active_file_from_registry(state)
         {:reply, {state.active_file_id, state.active_file_path}, state}
       end
 

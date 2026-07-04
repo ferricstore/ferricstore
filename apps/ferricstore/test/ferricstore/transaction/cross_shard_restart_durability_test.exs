@@ -73,6 +73,13 @@ defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
         50,
         100
       )
+
+      ShardHelpers.eventually(
+        fn -> shard_active_file_id(shard) >= 1 end,
+        "shard #{shard} process should sync rotated active Bitcask file",
+        50,
+        100
+      )
     end)
 
     restart_current_dir!(isolated)
@@ -117,6 +124,17 @@ defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
       {:error, _reason} ->
         0
     end
+  end
+
+  defp shard_active_file_id(shard) do
+    FerricStore.Instance.get(:default)
+    |> Router.shard_name(shard)
+    |> :sys.get_state(5_000)
+    |> Map.fetch!(:active_file_id)
+  rescue
+    _ -> -1
+  catch
+    :exit, _ -> -1
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

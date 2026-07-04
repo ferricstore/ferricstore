@@ -106,6 +106,11 @@ defmodule Ferricstore.Store.Shard.Info do
         end
       end
 
+      @impl true
+      def handle_cast(:sync_active_file_from_registry, state) do
+        {:noreply, sync_active_file_from_registry(state)}
+      end
+
       def handle_info(:drain_pending, state) do
         # Drain any pending writes from BEAM memory to the active file
         # (page cache only — NO fsync). BitcaskCheckpointer is responsible
