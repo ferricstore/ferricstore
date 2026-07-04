@@ -7,6 +7,7 @@ defmodule FerricStore.SDK.Native.Connection do
 
   @default_timeout 5_000
   @max_frame_bytes 16 * 1024 * 1024
+  @max_unmatched_buffer_bytes 64 * 1024
 
   defstruct [:socket, :transport, :endpoint, next_request_id: 1, buffer: ""]
 
@@ -159,7 +160,7 @@ defmodule FerricStore.SDK.Native.Connection do
                frame_opcode == opcode and frame_request_id == request_id
              end) do
           nil ->
-            {:need_more, buffer}
+            {:need_more, preserve_unmatched_frames(frames, nil, rest)}
 
           {_lane, ^opcode, ^request_id, flags, body, _raw} = matched ->
             rest = preserve_unmatched_frames(frames, matched, rest)
@@ -183,10 +184,33 @@ defmodule FerricStore.SDK.Native.Connection do
   end
 
   defp preserve_unmatched_frames(frames, matched, rest) do
-    frames
-    |> Enum.reject(&(&1 == matched))
-    |> Enum.map(fn {_lane, _opcode, _request_id, _flags, _body, raw} -> raw end)
-    |> then(&IO.iodata_to_binary([&1, rest]))
+    limit = max(@max_unmatched_buffer_bytes - byte_size(rest), 0)
+
+    raw_frames =
+      frames
+      |> Enum.reject(&matched_frame?(&1, matched))
+      |> Enum.map(fn {_lane, _opcode, _request_id, _flags, _body, raw} -> raw end)
+      |> keep_raw_frames_within_limit(limit)
+
+    IO.iodata_to_binary([raw_frames, rest])
+  end
+
+  defp matched_frame?(_frame, nil), do: false
+  defp matched_frame?(frame, matched), do: frame == matched
+
+  defp keep_raw_frames_within_limit(raw_frames, limit) do
+    raw_frames
+    |> Enum.reverse()
+    |> Enum.reduce_while({[], 0}, fn raw, {acc, size} ->
+      next_size = size + byte_size(raw)
+
+      if next_size <= limit do
+        {:cont, {[raw | acc], next_size}}
+      else
+        {:halt, {acc, size}}
+      end
+    end)
+    |> elem(0)
   end
 
   defp tls_verify?(endpoint) do

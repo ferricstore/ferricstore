@@ -84,7 +84,7 @@ defmodule FerricStore.SDK.Native.Codec do
         {:ok, Enum.reverse(acc), buffer}
 
       true ->
-        <<body::binary-size(body_len), next::binary>> = rest
+        <<body::binary-size(^body_len), next::binary>> = rest
         raw_len = @header_size + body_len
         raw = binary_part(buffer, 0, raw_len)
         frame = {lane_id, opcode, request_id, flags, body, raw}
@@ -154,7 +154,7 @@ defmodule FerricStore.SDK.Native.Codec do
 
   defp decode_compact_mget(count, <<1, len::unsigned-32, rest::binary>>, acc)
        when count > 0 and byte_size(rest) >= len do
-    <<value::binary-size(len), next::binary>> = rest
+    <<value::binary-size(^len), next::binary>> = rest
     decode_compact_mget(count - 1, next, [value | acc])
   end
 
@@ -222,7 +222,7 @@ defmodule FerricStore.SDK.Native.Codec do
   def decode_value(_), do: {:error, :unknown_or_truncated_value}
 
   defp decode_binary(len, rest) when byte_size(rest) >= len do
-    <<value::binary-size(len), next::binary>> = rest
+    <<value::binary-size(^len), next::binary>> = rest
     {:ok, value, next}
   end
 

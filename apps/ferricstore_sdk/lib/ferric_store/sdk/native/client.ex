@@ -32,6 +32,14 @@ defmodule FerricStore.SDK.Native.Client do
                           0x0012
                         ])
   @default_timeout 5_000
+  @endpoint_option_keys [
+    :server_name,
+    :verify,
+    :tls_verify,
+    :cacertfile,
+    :cacerts,
+    :connect_timeout
+  ]
 
   defstruct [
     :username,
@@ -40,6 +48,10 @@ defmodule FerricStore.SDK.Native.Client do
     :server_name,
     :client_name,
     :endpoint_validator,
+    :endpoint_policy,
+    :trusted_hosts,
+    :endpoint_options,
+    :warm_connections,
     :topology,
     seeds: [],
     connections: %{}
@@ -49,6 +61,9 @@ defmodule FerricStore.SDK.Native.Client do
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+  @spec close(pid()) :: :ok
+  def close(client), do: GenServer.stop(client, :normal)
 
   @spec from_url(binary(), keyword()) :: GenServer.on_start()
   def from_url(url, opts \\ []) do
@@ -155,18 +170,26 @@ defmodule FerricStore.SDK.Native.Client do
 
   @impl true
   def init(opts) do
+    endpoint_options = endpoint_options(opts)
+
+    seeds =
+      normalize_seeds(
+        Keyword.fetch!(opts, :seeds),
+        Keyword.get(opts, :tls, false),
+        endpoint_options
+      )
+
     state = %__MODULE__{
-      seeds:
-        normalize_seeds(
-          Keyword.fetch!(opts, :seeds),
-          Keyword.get(opts, :tls, false),
-          Keyword.get(opts, :server_name)
-        ),
+      seeds: seeds,
       username: Keyword.get(opts, :username),
       password: Keyword.get(opts, :password),
       tls: Keyword.get(opts, :tls, false),
       server_name: Keyword.get(opts, :server_name),
       endpoint_validator: Keyword.get(opts, :endpoint_validator),
+      endpoint_policy: Keyword.get(opts, :endpoint_policy, :seed_hosts),
+      trusted_hosts: trusted_hosts(seeds, opts),
+      endpoint_options: endpoint_options,
+      warm_connections: Keyword.get(opts, :warm_connections, false),
       client_name: Keyword.get(opts, :client_name, "ferricstore-elixir-sdk")
     }
 
@@ -199,8 +222,24 @@ defmodule FerricStore.SDK.Native.Client do
     end
   end
 
-  def handle_call({:command, opcode, key, payload, opts}, _from, state) do
-    case routed_request(state, opcode, key, payload, opts) do
+  def handle_call({:command, opcode, key, payload, opts}, from, state) do
+    case maybe_async_routed_request(state, from, opcode, key, payload, opts) do
+      :ok ->
+        {:noreply, state}
+
+      :fallback ->
+        case routed_request(state, opcode, key, payload, opts) do
+          {:ok, value, next_state} ->
+            {:reply, {:ok, value}, next_state}
+
+          {:error, reason, next_state} ->
+            {:reply, {:error, reason}, next_state}
+        end
+    end
+  end
+
+  def handle_call({:retry_command, opcode, key, payload, opts, original_reason}, _from, state) do
+    case retry_after_refresh(state, opcode, key, payload, opts, original_reason) do
       {:ok, value, next_state} ->
         {:reply, {:ok, value}, next_state}
 
@@ -261,6 +300,65 @@ defmodule FerricStore.SDK.Native.Client do
     else
       {:error, reason} -> {:error, {:retry_failed, original_reason, reason}, state}
     end
+  end
+
+  defp maybe_async_routed_request(state, from, opcode, key, payload, opts) do
+    with {:ok, route} <- Topology.route_key(state.topology, key),
+         {:ok, conn} <- Map.fetch(state.connections, route.endpoint_key),
+         true <- Process.alive?(conn) do
+      client = self()
+      timeout = Keyword.get(opts, :timeout, @default_timeout)
+
+      case Task.start(fn ->
+             result =
+               async_connection_request(
+                 client,
+                 conn,
+                 opcode,
+                 key,
+                 payload,
+                 route.lane_id,
+                 timeout,
+                 opts
+               )
+
+             GenServer.reply(from, result)
+           end) do
+        {:ok, _pid} -> :ok
+        {:error, _reason} -> :fallback
+      end
+    else
+      _other -> :fallback
+    end
+  end
+
+  defp async_connection_request(client, conn, opcode, key, payload, lane_id, timeout, opts) do
+    case safe_connection_request(conn, opcode, payload, lane_id, timeout) do
+      {:error, reason} when reason in [:closed, :timeout, :econnrefused] ->
+        retry_command_call(client, opcode, key, payload, opts, reason)
+
+      {:error, {:reroute, _payload} = reason} ->
+        retry_command_call(client, opcode, key, payload, opts, reason)
+
+      result ->
+        result
+    end
+  end
+
+  defp safe_connection_request(conn, opcode, payload, lane_id, timeout) do
+    Connection.request(conn, opcode, payload, lane_id, timeout)
+  catch
+    :exit, reason -> {:error, {:connection_call_exit, reason}}
+  end
+
+  defp retry_command_call(client, opcode, key, payload, opts, original_reason) do
+    GenServer.call(
+      client,
+      {:retry_command, opcode, key, payload, opts, original_reason},
+      call_timeout(opts)
+    )
+  catch
+    :exit, reason -> {:error, {:retry_call_exit, reason}}
   end
 
   defp routed_request(state, opcode, key, payload, opts) do
@@ -434,7 +532,7 @@ defmodule FerricStore.SDK.Native.Client do
 
           state =
             %{state | topology: topology, connections: Map.put(state.connections, key, conn)}
-            |> warm_topology_connections()
+            |> maybe_warm_topology_connections()
 
           {:halt, {:ok, state}}
 
@@ -528,6 +626,11 @@ defmodule FerricStore.SDK.Native.Client do
     end
   end
 
+  defp maybe_warm_topology_connections(%{warm_connections: true} = state),
+    do: warm_topology_connections(state)
+
+  defp maybe_warm_topology_connections(state), do: state
+
   defp warm_topology_connections(state) do
     Enum.reduce(state.topology.endpoints, state, fn {_key, endpoint}, acc ->
       case ensure_connection(acc, endpoint) do
@@ -540,12 +643,46 @@ defmodule FerricStore.SDK.Native.Client do
   defp endpoint_defaults(endpoint, state) do
     endpoint
     |> Map.put_new(:tls, state.tls)
+    |> apply_endpoint_options(state.endpoint_options || %{})
     |> put_if_present(:server_name, state.server_name)
   end
 
-  defp validate_endpoint(%{endpoint_validator: nil}, _endpoint), do: :ok
+  defp validate_endpoint(state, endpoint) do
+    with :ok <- validate_endpoint_policy(state, endpoint) do
+      validate_endpoint_validator(state, endpoint)
+    end
+  end
 
-  defp validate_endpoint(%{endpoint_validator: validator}, endpoint)
+  defp validate_endpoint_policy(%{endpoint_policy: :any}, _endpoint), do: :ok
+  defp validate_endpoint_policy(%{endpoint_policy: :none}, _endpoint), do: :ok
+
+  defp validate_endpoint_policy(
+         %{endpoint_policy: :seed_hosts, trusted_hosts: trusted_hosts},
+         endpoint
+       ) do
+    if trusted_endpoint_host?(trusted_hosts, endpoint) do
+      :ok
+    else
+      {:error, :unsafe_endpoint}
+    end
+  end
+
+  defp validate_endpoint_policy(%{endpoint_policy: {:allow_hosts, hosts}}, endpoint) do
+    trusted_hosts = hosts |> List.wrap() |> normalized_host_set()
+
+    if trusted_endpoint_host?(trusted_hosts, endpoint) do
+      :ok
+    else
+      {:error, :unsafe_endpoint}
+    end
+  end
+
+  defp validate_endpoint_policy(%{endpoint_policy: other}, _endpoint),
+    do: {:error, {:invalid_endpoint_policy, other}}
+
+  defp validate_endpoint_validator(%{endpoint_validator: nil}, _endpoint), do: :ok
+
+  defp validate_endpoint_validator(%{endpoint_validator: validator}, endpoint)
        when is_function(validator, 1) do
     case validator.(endpoint) do
       :ok -> :ok
@@ -557,19 +694,19 @@ defmodule FerricStore.SDK.Native.Client do
     end
   end
 
-  defp validate_endpoint(_state, _endpoint), do: {:error, :invalid_endpoint_validator}
+  defp validate_endpoint_validator(_state, _endpoint), do: {:error, :invalid_endpoint_validator}
 
-  defp normalize_seeds(seeds, tls, server_name) do
+  defp normalize_seeds(seeds, tls, endpoint_options) do
     Enum.map(seeds, fn
       {host, port} ->
         %{node: host, host: host, native_port: port, tls: tls}
-        |> put_if_present(:server_name, server_name)
+        |> apply_endpoint_options(endpoint_options)
 
       %{host: host, native_port: _port} = seed ->
         seed
         |> Map.put_new(:node, host)
         |> Map.put_new(:tls, tls)
-        |> put_if_present(:server_name, server_name)
+        |> apply_endpoint_options(endpoint_options)
 
       %{"host" => host, "native_port" => port} = seed ->
         %{
@@ -578,12 +715,57 @@ defmodule FerricStore.SDK.Native.Client do
           native_port: port,
           native_tls_port: seed["native_tls_port"],
           tls: tls,
-          server_name: seed["server_name"] || server_name
+          server_name: seed["server_name"]
         }
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new()
+        |> apply_endpoint_options(endpoint_options)
     end)
   end
+
+  defp endpoint_options(opts) do
+    opts
+    |> Keyword.take(@endpoint_option_keys)
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp apply_endpoint_options(endpoint, endpoint_options) do
+    Enum.reduce(endpoint_options, endpoint, fn {key, value}, acc ->
+      Map.put_new(acc, key, value)
+    end)
+  end
+
+  defp trusted_hosts(seeds, opts) do
+    seed_hosts = Enum.map(seeds, &Map.get(&1, :host))
+    configured_hosts = Keyword.get(opts, :trusted_hosts, [])
+    normalized_host_set(seed_hosts ++ List.wrap(configured_hosts))
+  end
+
+  defp trusted_endpoint_host?(trusted_hosts, endpoint) do
+    host = endpoint |> Map.get(:host) |> normalize_host()
+    is_binary(host) and MapSet.member?(trusted_hosts, host)
+  end
+
+  defp normalized_host_set(hosts) do
+    hosts
+    |> Enum.map(&normalize_host/1)
+    |> Enum.reject(&is_nil/1)
+    |> MapSet.new()
+  end
+
+  defp normalize_host(host) when is_binary(host) do
+    host
+    |> String.trim()
+    |> String.downcase()
+    |> case do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_host(host) when is_atom(host), do: host |> Atom.to_string() |> normalize_host()
+  defp normalize_host(_host), do: nil
 
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put_new(map, key, value)
@@ -591,20 +773,21 @@ defmodule FerricStore.SDK.Native.Client do
   defp parse_url(url) do
     uri = URI.parse(url)
 
-    tls =
-      case uri.scheme do
-        "ferrics" -> true
-        "ferric+tls" -> true
-        "ferric" -> false
-        _ -> false
-      end
-
-    if uri.host && uri.port do
+    with {:ok, tls} <- url_tls(uri.scheme),
+         true <- is_binary(uri.host),
+         true <- is_integer(uri.port) do
       {:ok, {uri.host, uri.port}, tls}
     else
-      {:error, :invalid_url}
+      false -> {:error, :invalid_url}
+      {:error, _reason} = error -> error
     end
   end
+
+  defp url_tls("ferrics"), do: {:ok, true}
+  defp url_tls("ferric+tls"), do: {:ok, true}
+  defp url_tls("ferric"), do: {:ok, false}
+  defp url_tls(scheme) when is_binary(scheme), do: {:error, {:invalid_url_scheme, scheme}}
+  defp url_tls(_scheme), do: {:error, :invalid_url}
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

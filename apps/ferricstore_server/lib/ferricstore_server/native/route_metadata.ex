@@ -18,8 +18,7 @@ defmodule FerricstoreServer.Native.RouteMetadata do
         target_payload(endpoint, hint)
 
       _unknown ->
-        endpoint = local_endpoint(node())
-        target_payload(endpoint, "local")
+        unknown_target_payload()
     end
   end
 
@@ -59,6 +58,14 @@ defmodule FerricstoreServer.Native.RouteMetadata do
       hint: hint
     }
     |> maybe_put(:native_tls_port, Map.get(endpoint, :native_tls_port))
+  end
+
+  defp unknown_target_payload do
+    %{
+      owner_node: nil,
+      leader_node: nil,
+      hint: "leader_unknown"
+    }
   end
 
   defp local_endpoint(node_name) do

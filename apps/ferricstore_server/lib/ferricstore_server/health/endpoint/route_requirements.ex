@@ -157,6 +157,30 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     end
   end
 
+  @spec flow_governance_form_requirement(map()) :: requirement()
+  def flow_governance_form_requirement(%{"action" => "close_circuit"} = params) do
+    flow_governance_scope_requirement("FLOW.CIRCUIT.CLOSE", params)
+  end
+
+  def flow_governance_form_requirement(%{"action" => "open_circuit"} = params) do
+    flow_governance_scope_requirement("FLOW.CIRCUIT.OPEN", params)
+  end
+
+  def flow_governance_form_requirement(_params), do: {"FLOW.GOVERNANCE.OVERVIEW", []}
+
+  defp flow_governance_scope_requirement(command, params) do
+    scope =
+      params
+      |> Map.get("scope", "")
+      |> String.trim()
+
+    if scope == "" do
+      {command, []}
+    else
+      {command, key: {scope, :write}}
+    end
+  end
+
   defp flow_lookup_requirement(query) do
     id =
       query

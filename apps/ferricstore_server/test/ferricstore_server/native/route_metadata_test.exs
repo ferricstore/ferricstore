@@ -28,6 +28,15 @@ defmodule FerricstoreServer.Native.RouteMetadataTest do
     assert endpoint.host == "remote.example"
   end
 
+  test "unknown leader metadata is explicit and does not advertise local endpoint as leader" do
+    target = RouteMetadata.target_for_shard(999_999)
+
+    assert target.hint == "leader_unknown"
+    assert target.leader_node == nil
+    refute Map.has_key?(target, :native_host)
+    refute Map.has_key?(target, :endpoint)
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

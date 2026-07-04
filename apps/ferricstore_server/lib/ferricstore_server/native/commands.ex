@@ -2176,6 +2176,16 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_history,
               @op_flow_signal,
               @op_flow_rewind,
+              @op_flow_effect_reserve,
+              @op_flow_effect_confirm,
+              @op_flow_effect_fail,
+              @op_flow_effect_compensate,
+              @op_flow_effect_get,
+              @op_flow_governance_ledger,
+              @op_flow_approval_request,
+              @op_flow_approval_approve,
+              @op_flow_approval_reject,
+              @op_flow_approval_get,
               @op_flow_spawn_children,
               @op_flow_schedule_create,
               @op_flow_schedule_get,
@@ -2201,6 +2211,22 @@ defmodule FerricstoreServer.Native.Commands do
   defp keys(@op_flow_value_put, payload),
     do: binary_list([Map.get(payload, "owner_flow_id") || Map.get(payload, "id")])
 
+  defp keys(opcode, payload)
+       when opcode in [
+              @op_flow_circuit_open,
+              @op_flow_circuit_close,
+              @op_flow_circuit_get,
+              @op_flow_budget_reserve,
+              @op_flow_budget_commit,
+              @op_flow_budget_release,
+              @op_flow_budget_get,
+              @op_flow_limit_lease,
+              @op_flow_limit_spend,
+              @op_flow_limit_release,
+              @op_flow_limit_get
+            ],
+       do: binary_list([Map.get(payload, "scope")])
+
   defp keys(_opcode, _payload), do: []
 
   defp key_acl_command(opcode)
@@ -2224,6 +2250,12 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_attribute_values,
               @op_flow_value_mget,
               @op_flow_policy_get,
+              @op_flow_effect_get,
+              @op_flow_governance_ledger,
+              @op_flow_approval_get,
+              @op_flow_circuit_get,
+              @op_flow_budget_get,
+              @op_flow_limit_get,
               @op_flow_schedule_get,
               @op_flow_schedule_list,
               @op_cluster_keyslot,

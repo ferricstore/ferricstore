@@ -15,6 +15,10 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_set 0x0102
+  @op_flow_circuit_open 0x024A
+  @op_flow_circuit_get 0x024C
+  @op_flow_budget_reserve 0x024D
+  @op_flow_limit_lease 0x024F
 
   defmodule TestExtension do
     @behaviour Ferricstore.Commands.Extension
@@ -636,6 +640,42 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     state = ConnAuth.maybe_refresh_acl_cache(state, "platform_missing_abcd")
     assert_native_get_ok("tenant:other:key", state)
+  end
+
+  test "native scope-based governance commands enforce key ACLs" do
+    assert :ok =
+             Acl.set_user("scope_guard", [
+               "on",
+               "nopass",
+               "-@all",
+               "+FLOW.CIRCUIT.OPEN",
+               "+FLOW.CIRCUIT.GET",
+               "+FLOW.BUDGET.RESERVE",
+               "+FLOW.LIMIT.LEASE",
+               "~tenant:a:*"
+             ])
+
+    state = state_as("scope_guard")
+
+    for {opcode, payload} <- [
+          {@op_flow_circuit_open,
+           %{"scope" => "tenant:b:effect", "failure_threshold" => 1, "open_ms" => 1_000}},
+          {@op_flow_circuit_get, %{"scope" => "tenant:b:effect"}},
+          {@op_flow_budget_reserve, %{"scope" => "tenant:b:budget", "amount" => 10}},
+          {@op_flow_limit_lease, %{"scope" => "tenant:b:limit", "limit" => 10}}
+        ] do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+      assert message =~ "NOPERM"
+    end
+
+    {status, _payload, _state} =
+      Commands.execute(
+        @op_flow_circuit_open,
+        %{"scope" => "tenant:a:effect", "failure_threshold" => 1, "open_ms" => 1_000},
+        state
+      )
+
+    refute status == :noperm
   end
 
   test "CLIENT TRACKING is explicitly rejected after text protocol removal" do

@@ -4,8 +4,11 @@ Topology-aware Elixir client for the FerricStore native TCP protocol.
 
 The SDK bootstraps from one or more seed nodes, performs `HELLO`/`AUTH`, fetches
 `SHARDS`, builds a slot table with the server-compatible CRC32/hash-tag
-algorithm, and keeps one connection per advertised native endpoint. Keyed
-commands are routed to the endpoint for the relevant shard leader.
+algorithm, and opens connections lazily per advertised native endpoint. Keyed
+commands are routed to the endpoint for the relevant shard leader. Learned
+endpoints must be on seed hosts by default; multi-host clusters should pass
+`trusted_hosts: [...]`, `endpoint_policy: {:allow_hosts, [...]}`, or
+`endpoint_policy: :any` with an `endpoint_validator`.
 
 ```elixir
 {:ok, client} =
@@ -19,13 +22,14 @@ commands are routed to the endpoint for the relevant shard leader.
 {:ok, "value"} = FerricStore.SDK.get(client, "{tenant:1}:k")
 ```
 
-Multi-key commands are split by route group when keys span shards:
+Multi-key reads are split by route group when keys span shards. Multi-key
+writes require keys on the same shard unless `atomicity: :per_shard` is passed:
 
 ```elixir
 :ok = FerricStore.SDK.mset(client, %{
   "{a}:1" => "one",
   "{b}:2" => "two"
-})
+}, atomicity: :per_shard)
 
 {:ok, ["one", "two"]} = FerricStore.SDK.mget(client, ["{a}:1", "{b}:2"])
 ```

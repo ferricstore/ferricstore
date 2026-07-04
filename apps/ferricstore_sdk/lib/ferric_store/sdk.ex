@@ -6,10 +6,17 @@ defmodule FerricStore.SDK do
   alias FerricStore.SDK.KV
   alias FerricStore.SDK.Native.Client
 
-  defdelegate start_link(opts), to: Client
+  def start_link(opts) do
+    case Keyword.pop(opts, :url) do
+      {nil, opts} -> Client.start_link(opts)
+      {url, opts} -> Client.from_url(url, opts)
+    end
+  end
+
   defdelegate from_url(url, opts \\ []), to: Client
   defdelegate ping(client, message \\ "PONG", opts \\ []), to: Client
   defdelegate command_exec(client, command, args \\ [], opts \\ []), to: Client
+  defdelegate close(client), to: Client
   defdelegate request(client, opcode, payload \\ %{}, opts \\ []), to: Client
   defdelegate request_by_key(client, opcode, key, payload, opts \\ []), to: Client
   defdelegate request_by_keys(client, opcode, keys, payload_builder, opts \\ []), to: Client
@@ -20,6 +27,13 @@ defmodule FerricStore.SDK do
   defdelegate refresh_topology(client), to: Client
   defdelegate route(client, key), to: Client
   defdelegate topology(client), to: Client
+
+  def command(client, command, args \\ [], opts \\ []) do
+    case command_exec(client, command, args, opts) do
+      {:ok, value} -> value
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defdelegate get(client, key, opts \\ []), to: KV
   defdelegate set(client, key, value, opts \\ []), to: KV
