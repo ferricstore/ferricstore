@@ -97,6 +97,83 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
         assert :undefined == :ets.whereis(ets)
       end
 
+      test "standalone ENOSPC append rolls back keydir state and clears pressure after recovery",
+           %{
+             state: state,
+             ets: ets
+           } do
+        root = Path.join(System.tmp_dir!(), "sm_enospc_#{System.unique_integer([:positive])}")
+        shard_index = 0
+        shard_path = Ferricstore.DataDir.shard_data_path(root, shard_index)
+        active_file_path = Path.join(shard_path, "00000.log")
+        instance_name = :"sm_enospc_#{System.unique_integer([:positive])}"
+        old_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+        File.mkdir_p!(shard_path)
+        File.touch!(active_file_path)
+        Ferricstore.Store.ActiveFile.init(1)
+
+        instance_ctx = %{
+          FerricStore.Instance.build(instance_name, shard_count: 1, data_dir: root)
+          | keydir_refs: {ets},
+            hot_cache_max_value_size: 64
+        }
+
+        Ferricstore.Store.ActiveFile.publish(
+          instance_ctx,
+          shard_index,
+          0,
+          active_file_path,
+          shard_path
+        )
+
+        failing_key = "enospc_key"
+        recovered_key = "after_enospc_key"
+
+        Application.put_env(:ferricstore, :standalone_durability_hook, fn
+          _path, [{:put, ^failing_key, "value", 0}] -> {:error, :enospc}
+          _path, _batch -> :passthrough
+        end)
+
+        on_exit(fn -> restore_env(:standalone_durability_hook, old_hook) end)
+
+        staged_state = %{
+          state
+          | shard_index: shard_index,
+            shard_data_path: shard_path,
+            active_file_id: 0,
+            active_file_path: active_file_path,
+            instance_ctx: instance_ctx
+        }
+
+        try do
+          {_new_state, result} =
+            StateMachine.apply_standalone_command({:put, failing_key, "value", 0}, staged_state)
+
+          assert {:error, {:bitcask_append_failed, :enospc}} = result
+          assert [] == :ets.lookup(ets, failing_key)
+          assert Ferricstore.Store.DiskPressure.under_pressure?(instance_ctx, shard_index)
+
+          Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, _batch ->
+            :passthrough
+          end)
+
+          {_new_state, :ok} =
+            StateMachine.apply_standalone_command(
+              {:put, recovered_key, "recovered", 0},
+              staged_state
+            )
+
+          assert [{^recovered_key, "recovered", 0, _lfu, 0, _offset, 9}] =
+                   :ets.lookup(ets, recovered_key)
+
+          refute Ferricstore.Store.DiskPressure.under_pressure?(instance_ctx, shard_index)
+        after
+          Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+          File.rm_rf!(root)
+        end
+      end
+
       test "Flow read during apply tolerates keydir table disappearing during shutdown", %{
         state: state,
         ets: ets

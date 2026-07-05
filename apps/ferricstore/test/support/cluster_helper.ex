@@ -395,6 +395,86 @@ defmodule Ferricstore.Test.ClusterHelper do
   end
 
   @doc """
+  Restarts a killed cluster node with the same node name and data directory.
+
+  This models beta same-version crash/restart recovery. It intentionally does
+  not try to exercise rolling upgrade behavior.
+
+  ## Parameters
+
+    - `nodes` -- desired full cluster list, including the killed node map
+    - `target` -- killed node map returned from `kill_node/2`
+    - `opts` -- keyword options:
+      - `:shards` -- number of shards per node (default: 4)
+      - `:timeout` -- leader election timeout in ms (default: 30_000)
+
+  ## Returns
+
+  The restarted node map with a fresh peer pid.
+  """
+  @spec restart_node([map()], map(), keyword()) :: map()
+  def restart_node(nodes, target, opts \\ []) when is_list(nodes) and is_map(target) do
+    unless peer_available?() do
+      raise "ClusterHelper requires OTP 25+ for :peer module"
+    end
+
+    ensure_distribution!()
+
+    shards = Keyword.get(opts, :shards, 4)
+    timeout = Keyword.get(opts, :timeout, 30_000)
+    node_names = Enum.map(nodes, & &1.name)
+    name = node_short_name(target.name)
+
+    code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
+    cookie = Atom.to_charlist(Node.get_cookie())
+
+    {:ok, peer_pid, node_name} =
+      :peer.start(%{
+        name: name,
+        args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie],
+        wait_boot: 120_000
+      })
+
+    restarted = %{target | name: node_name, peer: peer_pid}
+
+    live_nodes =
+      nodes
+      |> Enum.reject(&(&1.name == target.name))
+      |> Enum.concat([restarted])
+
+    Ferricstore.Test.ClusterHelper.Partition.normalize_cluster_cookies(live_nodes)
+
+    for n1 <- node_names, n2 <- node_names, n1 != n2 do
+      :rpc.call(n1, Node, :connect, [n2])
+    end
+
+    :ok = ensure_nodes_reachable(node_names, timeout: timeout)
+
+    configure_remote_node(node_name, target.data_dir, shards)
+
+    :ok =
+      :rpc.call(node_name, Application, :put_env, [
+        :ferricstore,
+        :cluster_nodes,
+        node_names
+      ])
+
+    :ok =
+      :rpc.call(node_name, Application, :put_env, [
+        :ferricstore,
+        :cluster_auto_join,
+        true
+      ])
+
+    start_ferricstore_on_node(node_name)
+
+    :ok = ensure_peer_mesh_reachable(node_names, timeout: timeout)
+    :ok = wait_for_cluster_ready(live_nodes, shards, timeout)
+
+    restarted
+  end
+
+  @doc """
   Kills the leader node for a given shard.
 
   Finds which node is the leader for the specified shard and stops it.
@@ -784,6 +864,14 @@ defmodule Ferricstore.Test.ClusterHelper do
         Process.sleep(100)
         do_ensure_peer_mesh_reachable(node_names, deadline)
     end
+  end
+
+  defp node_short_name(node_name) do
+    node_name
+    |> Atom.to_string()
+    |> String.split("@", parts: 2)
+    |> hd()
+    |> String.to_atom()
   end
 
   defp members_on_node(node_name, shard, timeout \\ :default)

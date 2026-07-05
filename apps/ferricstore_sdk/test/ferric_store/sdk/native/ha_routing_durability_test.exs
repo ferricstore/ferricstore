@@ -92,6 +92,91 @@ defmodule FerricStore.SDK.Native.HARoutingDurabilityTest do
     end
   end
 
+  test "SDK concurrent writes around leader loss surface uncertainty and keep acknowledged writes durable" do
+    nodes = ClusterHelper.start_cluster(3, shards: @shards)
+
+    try do
+      seeds = start_native_servers(nodes)
+      {:ok, client} = start_client(seeds)
+
+      try do
+        tag = "{sdk-ha-concurrent-#{System.unique_integer([:positive])}}"
+        keys = Enum.map(1..12, &"#{tag}:#{&1}")
+        base_values = Map.new(keys, &{&1, "before-concurrent-failover"})
+
+        Enum.each(keys, fn key ->
+          assert :ok = Client.set(client, key, Map.fetch!(base_values, key), timeout: 10_000)
+        end)
+
+        assert {:ok, route} = Client.route(client, hd(keys))
+        eventually_values_on_nodes(nodes, base_values)
+
+        leader = node_by_name!(nodes, route.leader_node)
+        parent = self()
+
+        tasks =
+          Enum.map(keys, fn key ->
+            Task.async(fn ->
+              value = "during-failover-#{key}"
+              send(parent, {:ready, self()})
+
+              receive do
+                :go -> :ok
+              after
+                5_000 -> flunk("concurrent write task was not released")
+              end
+
+              {key, value, Client.set(client, key, value, timeout: 15_000)}
+            end)
+          end)
+
+        task_pids =
+          Enum.map(tasks, fn _task ->
+            receive do
+              {:ready, pid} -> pid
+            after
+              5_000 -> flunk("concurrent write task did not start")
+            end
+          end)
+
+        Enum.each(task_pids, &send(&1, :go))
+        Process.sleep(10)
+
+        {_killed, remaining} = ClusterHelper.kill_node(nodes, leader)
+        assert :ok = ClusterHelper.wait_for_leaders(remaining, @shards, timeout: 60_000)
+
+        results = Task.await_many(tasks, 30_000)
+
+        acknowledged =
+          results
+          |> Enum.filter(fn {_key, _value, result} -> result == :ok end)
+          |> Map.new(fn {key, value, :ok} -> {key, value} end)
+
+        errors =
+          Enum.filter(results, fn
+            {_key, _value, {:error, _reason}} -> true
+            _other -> false
+          end)
+
+        assert map_size(acknowledged) + length(errors) == length(keys)
+        assert :ok = Client.refresh_topology(client)
+
+        Enum.each(acknowledged, fn {key, value} ->
+          eventually_value_on_nodes(remaining, key, value)
+        end)
+
+        post_key = "#{tag}:post-refresh"
+        assert :ok = Client.set(client, post_key, "after-refresh", timeout: 15_000)
+        assert {:ok, "after-refresh"} = Client.get(client, post_key, timeout: 10_000)
+        eventually_value_on_nodes(remaining, post_key, "after-refresh")
+      after
+        close_client(client)
+      end
+    after
+      ClusterHelper.stop_cluster(nodes)
+    end
+  end
+
   defp start_client(seeds) do
     Client.start_link(
       seeds: seeds,
@@ -127,6 +212,16 @@ defmodule FerricStore.SDK.Native.HARoutingDurabilityTest do
     eventually(fn ->
       Enum.each(nodes, fn node ->
         assert remote_get(node.name, key) == expected
+      end)
+    end)
+  end
+
+  defp eventually_values_on_nodes(nodes, expected_values) do
+    eventually(fn ->
+      Enum.each(nodes, fn node ->
+        Enum.each(expected_values, fn {key, value} ->
+          assert remote_get(node.name, key) == value
+        end)
       end)
     end)
   end
