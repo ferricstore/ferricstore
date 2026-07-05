@@ -2239,7 +2239,20 @@ defmodule FerricstoreServer.Native.Commands do
             ],
        do: binary_list([Map.get(payload, "scope")])
 
+  defp keys(@op_flow_search, payload), do: flow_search_acl_keys(payload)
+
   defp keys(_opcode, _payload), do: []
+
+  defp flow_search_acl_keys(payload) do
+    case payload_flow_option(payload, "partition_key") do
+      value when is_binary(value) and value not in ["", "GLOBAL"] -> [value]
+      _other -> ["*"]
+    end
+  end
+
+  defp payload_flow_option(payload, key) when is_map(payload) do
+    Map.get(payload, key) || payload |> Map.get("opts", %{}) |> option_map() |> Map.get(key)
+  end
 
   defp key_acl_command(opcode)
        when opcode in [

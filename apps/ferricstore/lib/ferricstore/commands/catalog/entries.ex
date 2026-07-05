@@ -567,6 +567,15 @@ defmodule Ferricstore.Commands.Catalog.Entries do
       summary: "Lists workflow records by type and optional state."
     },
     %{
+      name: "flow.search",
+      arity: -1,
+      flags: ["readonly"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Searches workflow records by indexed attributes and state metadata."
+    },
+    %{
       name: "flow.failures",
       arity: -2,
       flags: ["readonly"],

@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_set 0x0102
+  @op_flow_search 0x0230
   @op_flow_circuit_open 0x024A
   @op_flow_circuit_get 0x024C
   @op_flow_budget_reserve 0x024D
@@ -473,6 +474,44 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert payload =~ "keys mentioned"
+  end
+
+  test "FLOW.SEARCH enforces scoped key boundaries" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{
+                 "command" => "FLOW.SEARCH",
+                 "args" => [
+                   "TYPE",
+                   "checkout",
+                   "ATTRIBUTE",
+                   "tenant",
+                   "acme",
+                   "PARTITION",
+                   "tenant:b"
+                 ]
+               },
+               state
+             )
+
+    assert message =~ "keys mentioned"
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_flow_search,
+               %{
+                 "type" => "checkout",
+                 "attributes" => %{"tenant" => "acme"},
+                 "partition_key" => "tenant:b"
+               },
+               state
+             )
+
+    assert message =~ "keys mentioned"
   end
 
   test "PIPELINE preserves COMMAND_EXEC and typed command ACL checks" do

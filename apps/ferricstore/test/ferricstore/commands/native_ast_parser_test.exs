@@ -175,6 +175,37 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
             ["tenant:a"]} =
              NativeAstParser.parse("flow.list", ["checkout", "PARTITION", "tenant:a"])
 
+    assert {:ok, "FLOW.SEARCH", _args, {:flow_search, search_opts}, ["tenant:a"]} =
+             NativeAstParser.parse("flow.search", [
+               "TYPE",
+               "checkout",
+               "ATTRIBUTE",
+               "tenant",
+               "acme",
+               "COUNT",
+               "10",
+               "PARTITION",
+               "tenant:a"
+             ])
+
+    assert search_opts[:type] == "checkout"
+    assert search_opts[:attributes] == %{"tenant" => "acme"}
+    assert search_opts[:count] == 10
+    assert search_opts[:partition_key] == "tenant:a"
+
+    assert {:ok, "FLOW.SEARCH", _args, {:flow_search, search_opts}, ["*"]} =
+             NativeAstParser.parse("flow.search", [
+               "TYPE",
+               "checkout",
+               "STATE_META",
+               "running",
+               "step",
+               "charge"
+             ])
+
+    assert search_opts[:type] == "checkout"
+    assert search_opts[:state_meta] == %{"running" => %{"step" => "charge"}}
+
     assert {:ok, "FLOW.ATTRIBUTES", _args,
             {:flow_attributes, "checkout", [partition_key: "tenant:a"]}, ["tenant:a"]} =
              NativeAstParser.parse("flow.attributes", ["checkout", "PARTITION", "tenant:a"])

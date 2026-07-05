@@ -18,7 +18,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.CONFIG
     FERRICSTORE.METRICS FERRICSTORE.KEY_INFO FERRICSTORE.CAPABILITIES
     FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY
-    FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.STEP_CONTINUE
+    FLOW.SEARCH FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.STEP_CONTINUE
     FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
     FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.GET FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE_DUE
     FLOW.SCHEDULE.LIST FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME
@@ -294,6 +294,17 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {"COUNT", :count, {:positive, :count}},
       {"PARTITION", :partition_key, :partition},
       {"INCLUDE_COLD", :include_cold, :boolean},
+      {"CONSISTENT_PROJECTION", :consistent_projection, :boolean}
+    ],
+    search: [
+      {"TYPE", :type, :binary},
+      {"STATE", :state, :binary},
+      {"COUNT", :count, {:positive, :count}},
+      {"PARTITION", :partition_key, :partition},
+      {"FROM_MS", :from_ms, :non_negative},
+      {"TO_MS", :to_ms, :non_negative},
+      {"REV", :rev, :boolean},
+      {"TERMINAL_ONLY", :terminal_only, :boolean},
       {"CONSISTENT_PROJECTION", :consistent_projection, :boolean}
     ],
     index_query: [
@@ -686,6 +697,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast("FLOW.LIST", :flow_list, [type | opts]),
     do: {:flow_list, type, parse_flow_options(opts, spec(:list))}
+
+  defp make_ast("FLOW.SEARCH", :flow_search, opts),
+    do: {:flow_search, parse_flow_search_options(opts)}
 
   defp make_ast("FLOW.ATTRIBUTES", :flow_attributes, [type | opts]),
     do: {:flow_attributes, type, parse_flow_options(opts, spec(:index_query))}
@@ -1523,6 +1537,26 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_flow_signal_opts(_args, _acc), do: {:error, "ERR syntax error"}
 
+  defp parse_flow_search_options(args), do: parse_flow_search_options(args, [])
+
+  defp parse_flow_search_options([], acc), do: Enum.reverse(acc)
+
+  defp parse_flow_search_options(["ATTRIBUTE", key, value | rest], acc),
+    do: parse_flow_search_options(rest, merge_map_opt(:attributes, key, value, acc))
+
+  defp parse_flow_search_options(["STATE_META", state, key, value | rest], acc),
+    do: parse_flow_search_options(rest, merge_nested_map_opt(:state_meta, state, key, value, acc))
+
+  defp parse_flow_search_options([name, value | rest], acc) do
+    case parse_flow_option(name, value, spec(:search)) do
+      {:ok, nil} -> parse_flow_search_options(rest, acc)
+      {:ok, opt} -> parse_flow_search_options(rest, [opt | acc])
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_flow_search_options(_args, _acc), do: {:error, "ERR syntax error"}
+
   defp parse_flow_policy_set_options(args),
     do: parse_flow_policy_set_options(args, [], [], [], [], [])
 
@@ -1951,6 +1985,14 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp merge_map_opt(key, attr_key, attr_value, acc) do
     Keyword.update(acc, key, %{attr_key => attr_value}, &Map.put(&1, attr_key, attr_value))
+  end
+
+  defp merge_nested_map_opt(key, outer_key, inner_key, inner_value, acc) do
+    Keyword.update(acc, key, %{outer_key => %{inner_key => inner_value}}, fn existing ->
+      Map.update(existing, outer_key, %{inner_key => inner_value}, fn nested ->
+        Map.put(nested, inner_key, inner_value)
+      end)
+    end)
   end
 
   defp append_list_opt(key, value, acc), do: Keyword.update(acc, key, [value], &(&1 ++ [value]))

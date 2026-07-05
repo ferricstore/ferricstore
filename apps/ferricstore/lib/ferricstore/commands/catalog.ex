@@ -183,13 +183,23 @@ defmodule Ferricstore.Commands.Catalog do
               "FLOW.CLAIM_DUE",
               "FLOW.RECLAIM",
               "FLOW.LIST",
-              "FLOW.STATS",
               "FLOW.TERMINALS",
               "FLOW.FAILURES",
               "FLOW.INFO",
               "FLOW.STUCK"
             ],
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
+
+  defp flow_dynamic_keys(name, args)
+       when name in [
+              "FLOW.SEARCH",
+              "FLOW.STATS",
+              "FLOW.ATTRIBUTES"
+            ],
+       do: {:ok, flow_partition_keys_or_global(args, 0)}
+
+  defp flow_dynamic_keys("FLOW.ATTRIBUTE_VALUES", args),
+    do: {:ok, flow_partition_keys_or_global(args, 0)}
 
   defp flow_dynamic_keys(name, args)
        when name in ["FLOW.POLICY.SET", "FLOW.POLICY.GET"],
@@ -209,6 +219,16 @@ defmodule Ferricstore.Commands.Catalog do
   defp flow_partition_key_indices(args, option_start) do
     flow_partition_key_indices_until(args, option_start, length(args))
   end
+
+  defp flow_partition_keys_or_global(args, option_start) do
+    case args_at(args, flow_partition_key_indices(args, option_start)) do
+      [] -> ["*"]
+      keys -> Enum.map(keys, &flow_acl_partition_key/1)
+    end
+  end
+
+  defp flow_acl_partition_key("GLOBAL"), do: "*"
+  defp flow_acl_partition_key(value), do: value
 
   defp flow_partition_key_indices_until(args, option_start, option_end) do
     option_end = min(option_end, length(args))

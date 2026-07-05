@@ -508,7 +508,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_attributes flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
+      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_search flow_attributes flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
