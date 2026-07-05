@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.7.1 - 2026-07-05
+
+- Added native `FLOW.SEARCH` support for indexed per-state metadata queries.
+- Exposed Flow `state_meta`, `indexed_state_meta`, and `FLOW.SEARCH` through the embedded Elixir SDK.
+- Added SDK and server coverage for state metadata indexing/search and HA topology refresh after node restart/rejoin.
+
 ## 0.7.0 - 2026-07-04
 
 - Added HA-aware native route metadata for `HELLO`, `ROUTE`, `ROUTE_BATCH`, and `SHARDS`, including advertised native endpoints and leader hints.
