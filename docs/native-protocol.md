@@ -541,11 +541,12 @@ FLOW.CLAIM_DUE should be bounded by worker capacity, not a fixed huge batch.
 
 ## Elixir SDK
 
-The umbrella contains `apps/ferricstore_sdk`, a topology-aware Elixir native
-client. It bootstraps from seed nodes, performs `HELLO`/`AUTH`, fetches
-`SHARDS`, builds the slot table, opens one connection per advertised endpoint,
-routes keyed commands to shard leaders, and refreshes topology once on stale
-endpoints/reroute responses.
+The topology-aware Elixir native client lives in the standalone
+[`ferricstore-elixir`](https://github.com/ferricstore/ferricstore-elixir)
+repository and is published as the Hex package `ferricstore_sdk`. It bootstraps
+from seed nodes, performs `HELLO`/`AUTH`, fetches `SHARDS`, builds the slot
+table, opens one connection per advertised endpoint, routes keyed commands to
+shard leaders, and refreshes topology once on stale endpoints/reroute responses.
 
 ```elixir
 {:ok, client} = FerricStore.SDK.start_link(seeds: [{"127.0.0.1", 6388}])

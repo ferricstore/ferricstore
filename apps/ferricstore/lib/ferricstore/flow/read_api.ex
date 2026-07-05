@@ -4,10 +4,11 @@ defmodule Ferricstore.Flow.ReadAPI do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Attributes
   alias Ferricstore.Flow.HistoryQuery
+  alias Ferricstore.Flow.InfoAPI
+  alias Ferricstore.Flow.InfoCountRead
   alias Ferricstore.Flow.IndexQuery
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDBIndexRead
-  alias Ferricstore.Flow.RAMIndexRead
   alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.RecordQuery
   alias Ferricstore.Flow.RecordRead
@@ -371,15 +372,22 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, state} <- flow_state(opts),
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
-         {:ok, count} <- flow_stats_count(opts),
-         {:ok, records} <-
-           list_records(ctx, type, state, partition_key, count, attributes, true, true) do
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, true),
+         {:ok, count} <-
+           stats_count_records(
+             ctx,
+             type,
+             state,
+             partition_key,
+             attributes,
+             consistent_projection?
+           ) do
       {:ok,
        %{
          type: type,
          state: state,
          attributes: attributes,
-         count: length(records)
+         count: count
        }}
     end
   end
@@ -388,6 +396,202 @@ defmodule Ferricstore.Flow.ReadAPI do
     do: {:error, "ERR flow type must be a non-empty string"}
 
   def stats(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  defp stats_count_records(_ctx, _type, "any", _partition_key, attributes, _consistent?)
+       when map_size(attributes) == 0,
+       do: {:error, "ERR flow state any requires attributes"}
+
+  defp stats_count_records(ctx, type, state, partition_key, attributes, consistent?)
+       when map_size(attributes) == 0 do
+    stats_state_count(ctx, type, state, partition_key, consistent?)
+  end
+
+  defp stats_count_records(ctx, type, state, partition_key, attributes, consistent?) do
+    search_state = if state == "any", do: nil, else: state
+
+    with {:ok, {name, value}} <-
+           select_attribute_filter(
+             ctx,
+             type,
+             search_state,
+             partition_key,
+             attributes,
+             consistent?
+           ) do
+      stats_count_attribute_exact(
+        ctx,
+        type,
+        search_state,
+        partition_key,
+        name,
+        value,
+        attributes,
+        consistent?
+      )
+    end
+  end
+
+  defp stats_state_count(ctx, type, state, partition_key, consistent?)
+       when state in @terminal_states do
+    with {:ok, info} <-
+           InfoAPI.info(ctx, type,
+             partition_key: partition_key,
+             include_cold: true,
+             consistent_projection: consistent?
+           ) do
+      {:ok, Map.get(info, String.to_atom(state), 0)}
+    end
+  end
+
+  defp stats_state_count(ctx, type, state, :auto, _consistent?) do
+    state_keys =
+      Keys.auto_partition_keys()
+      |> Enum.map(&{state, Keys.state_index_key(type, state, &1)})
+
+    with :ok <- validate_index_keys(state_keys),
+         {:ok, counts} <-
+           InfoCountRead.zset_count_many(ctx, Enum.map(state_keys, fn {_state, key} -> key end)) do
+      {:ok, Enum.sum(counts)}
+    end
+  end
+
+  defp stats_state_count(ctx, type, state, partition_key, _consistent?) do
+    key = Keys.state_index_key(type, state, partition_key)
+
+    with :ok <- validate_key_size(key),
+         {:ok, [count]} <- InfoCountRead.zset_count_many(ctx, [key]) do
+      {:ok, count}
+    end
+  end
+
+  defp stats_count_attribute_exact(
+         ctx,
+         type,
+         state,
+         :auto,
+         name,
+         value,
+         attributes,
+         consistent?
+       ) do
+    scan_limit = stats_attribute_scan_limit()
+
+    Keys.auto_partition_keys()
+    |> Enum.reduce_while({:ok, 0, scan_limit}, fn partition_key, {:ok, total, remaining} ->
+      case stats_count_attribute_exact_partition(
+             ctx,
+             type,
+             state,
+             partition_key,
+             name,
+             value,
+             attributes,
+             consistent?,
+             remaining,
+             scan_limit
+           ) do
+        {:ok, count, scanned} -> {:cont, {:ok, total + count, remaining - scanned}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, count, _remaining} -> {:ok, count}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp stats_count_attribute_exact(
+         ctx,
+         type,
+         state,
+         partition_key,
+         name,
+         value,
+         attributes,
+         consistent?
+       ) do
+    scan_limit = stats_attribute_scan_limit()
+
+    with {:ok, count, _scanned} <-
+           stats_count_attribute_exact_partition(
+             ctx,
+             type,
+             state,
+             partition_key,
+             name,
+             value,
+             attributes,
+             consistent?,
+             scan_limit,
+             scan_limit
+           ) do
+      {:ok, count}
+    end
+  end
+
+  defp stats_count_attribute_exact_partition(
+         ctx,
+         type,
+         state,
+         partition_key,
+         name,
+         value,
+         attributes,
+         consistent?,
+         remaining,
+         scan_limit
+       ) do
+    with {:ok, candidate_count} <-
+           attribute_candidate_count(ctx, type, state, partition_key, name, value, consistent?) do
+      cond do
+        candidate_count == 0 ->
+          {:ok, 0, 0}
+
+        candidate_count > remaining ->
+          {:error, "ERR flow stats exact attribute count exceeds scan limit #{scan_limit}"}
+
+        true ->
+          with {:ok, records} <-
+                 list_records_for_search_attribute(
+                   ctx,
+                   type,
+                   state,
+                   partition_key,
+                   name,
+                   value,
+                   default_index_query(candidate_count),
+                   consistent?
+                 ) do
+            {:ok,
+             records
+             |> Enum.filter(&(Map.get(&1, :type) == type))
+             |> filter_optional_state(state)
+             |> Enum.filter(&Attributes.matches?(&1, attributes))
+             |> length(), candidate_count}
+          end
+      end
+    end
+  end
+
+  defp validate_index_keys(state_keys) do
+    Enum.reduce_while(state_keys, :ok, fn {_state, key}, :ok ->
+      case validate_key_size(key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp stats_attribute_scan_limit do
+    case Application.get_env(
+           :ferricstore,
+           :flow_stats_attribute_scan_limit,
+           @default_lmdb_query_scan_limit
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @default_lmdb_query_scan_limit
+    end
+  end
 
   defp list_records(
          ctx,
@@ -710,29 +914,6 @@ defmodule Ferricstore.Flow.ReadAPI do
     end
   end
 
-  defp list_records(
-         ctx,
-         type,
-         state,
-         partition_key,
-         count,
-         attributes,
-         include_cold?,
-         consistent_projection?
-       ) do
-    list_records(
-      ctx,
-      type,
-      state,
-      partition_key,
-      count,
-      attributes,
-      include_cold?,
-      consistent_projection?,
-      default_index_query(count)
-    )
-  end
-
   defp default_index_query(count) do
     %{
       count: count,
@@ -805,12 +986,10 @@ defmodule Ferricstore.Flow.ReadAPI do
   end
 
   defp ram_attribute_candidate_count(ctx, index_key) do
-    query = default_index_query(@default_lmdb_query_scan_limit)
-
-    {:ok, entries} =
-      RAMIndexRead.score_entries(ctx, index_key, query, @default_lmdb_query_scan_limit)
-
-    length(entries)
+    case InfoCountRead.zset_count_many(ctx, [index_key]) do
+      {:ok, [count]} -> count
+      _ -> 0
+    end
   end
 
   defp select_state_meta_filter(ctx, type, partition_key, state_meta, consistent?) do
@@ -1318,8 +1497,6 @@ defmodule Ferricstore.Flow.ReadAPI do
         {:error, "ERR flow count must be a positive integer"}
     end
   end
-
-  defp flow_stats_count(opts), do: flow_count(Keyword.put_new(opts, :count, flow_max_count()))
 
   defp flow_max_count do
     case Application.get_env(:ferricstore, :flow_max_count, @default_max_count) do
