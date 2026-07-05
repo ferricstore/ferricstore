@@ -96,6 +96,7 @@ defmodule FerricStore.SDK.Native.Opcodes do
     flow_stats: {"FLOW.STATS", 0x022D},
     flow_attributes: {"FLOW.ATTRIBUTES", 0x022E},
     flow_attribute_values: {"FLOW.ATTRIBUTE_VALUES", 0x022F},
+    flow_search: {"FLOW.SEARCH", 0x0230},
     flow_effect_reserve: {"FLOW.EFFECT.RESERVE", 0x0240},
     flow_effect_confirm: {"FLOW.EFFECT.CONFIRM", 0x0241},
     flow_effect_fail: {"FLOW.EFFECT.FAIL", 0x0242},

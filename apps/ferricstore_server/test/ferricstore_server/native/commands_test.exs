@@ -124,6 +124,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "FLOW.RUN_STEPS_MANY" in schema_names(payload)
     assert "FLOW.SCHEDULE.CREATE" in schema_names(payload)
     assert "FLOW.ATTRIBUTES" in schema_names(payload)
+    assert "FLOW.SEARCH" in opcode_names(payload)
     assert "FLOW.BUDGET.RESERVE" in opcode_names(payload)
     assert "GET" in opcode_names(payload)
     assert "SET" in opcode_names(payload)

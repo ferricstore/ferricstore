@@ -4,6 +4,7 @@ defmodule FerricStore.SDK.Native.HARoutingDurabilityTest do
   @moduletag :shard_kill
   @moduletag timeout: 180_000
 
+  alias FerricStore.SDK.Admin
   alias FerricStore.SDK.Native.Client
   alias Ferricstore.Test.ClusterHelper
 
@@ -174,6 +175,82 @@ defmodule FerricStore.SDK.Native.HARoutingDurabilityTest do
       end
     after
       ClusterHelper.stop_cluster(nodes)
+    end
+  end
+
+  test "SDK refreshes topology after a killed leader restarts and routes to the rejoined endpoint" do
+    nodes = ClusterHelper.start_cluster(3, shards: @shards)
+    {:ok, node_holder} = Agent.start_link(fn -> nodes end)
+
+    try do
+      seeds = start_native_servers(nodes)
+      {:ok, client} = start_client(seeds)
+
+      try do
+        key = "{sdk-ha-rejoin}:#{System.unique_integer([:positive])}"
+
+        assert :ok = Client.set(client, key, "before-restart", timeout: 10_000)
+        assert {:ok, before_route} = Client.route(client, key)
+        eventually_value_on_nodes(nodes, key, "before-restart")
+
+        killed = node_by_name!(nodes, before_route.leader_node)
+        {^killed, remaining} = ClusterHelper.kill_node(nodes, killed)
+        Agent.update(node_holder, fn _ -> remaining end)
+        assert :ok = ClusterHelper.wait_for_leaders(remaining, @shards, timeout: 60_000)
+
+        assert :ok = Client.refresh_topology(client)
+        assert :ok = Client.set(client, key, "after-leader-loss", timeout: 15_000)
+        eventually_value_on_nodes(remaining, key, "after-leader-loss")
+
+        restarted =
+          ClusterHelper.restart_node([killed | remaining], killed,
+            shards: @shards,
+            timeout: 60_000
+          )
+
+        active_nodes = [restarted | remaining]
+        Agent.update(node_holder, fn _ -> active_nodes end)
+        _restarted_seed = start_native_servers([restarted])
+
+        assert :ok = ClusterHelper.wait_for_leaders(active_nodes, @shards, timeout: 60_000)
+
+        assert {:ok, "OK"} =
+                 Admin.cluster_failover(
+                   client,
+                   %{
+                     "args" => [
+                       Integer.to_string(before_route.shard),
+                       Atom.to_string(restarted.name)
+                     ]
+                   },
+                   timeout: 30_000
+                 )
+
+        eventually(fn ->
+          leader =
+            try do
+              ClusterHelper.find_leader(active_nodes, before_route.shard)
+            rescue
+              RuntimeError -> nil
+            end
+
+          assert leader == restarted.name
+        end)
+
+        assert :ok = Client.refresh_topology(client)
+        assert {:ok, restarted_route} = Client.route(client, key)
+        assert restarted_route.leader_node == Atom.to_string(restarted.name)
+
+        assert :ok = Client.set(client, key, "after-rejoin", timeout: 15_000)
+        assert {:ok, "after-rejoin"} = Client.get(client, key, timeout: 10_000)
+        eventually_value_on_nodes(active_nodes, key, "after-rejoin")
+      after
+        close_client(client)
+      end
+    after
+      active_nodes = Agent.get(node_holder, & &1)
+      ClusterHelper.stop_cluster(active_nodes)
+      Agent.stop(node_holder)
     end
   end
 

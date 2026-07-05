@@ -144,6 +144,7 @@ defmodule FerricstoreServer.Native.Commands do
   @op_flow_stats 0x022D
   @op_flow_attributes 0x022E
   @op_flow_attribute_values 0x022F
+  @op_flow_search 0x0230
   @op_flow_effect_reserve 0x0240
   @op_flow_effect_confirm 0x0241
   @op_flow_effect_fail 0x0242
@@ -292,6 +293,7 @@ defmodule FerricstoreServer.Native.Commands do
     @op_flow_stats => "FLOW.STATS",
     @op_flow_attributes => "FLOW.ATTRIBUTES",
     @op_flow_attribute_values => "FLOW.ATTRIBUTE_VALUES",
+    @op_flow_search => "FLOW.SEARCH",
     @op_flow_effect_reserve => "FLOW.EFFECT.RESERVE",
     @op_flow_effect_confirm => "FLOW.EFFECT.CONFIRM",
     @op_flow_effect_fail => "FLOW.EFFECT.FAIL",
@@ -384,6 +386,7 @@ defmodule FerricstoreServer.Native.Commands do
     "idempotency_key" => :idempotency_key,
     "if_state" => :if_state,
     "include_cold" => :include_cold,
+    "indexed_state_meta" => :indexed_state_meta,
     "independent" => :independent,
     "initial_state" => :initial_state,
     "items" => :items,
@@ -455,6 +458,7 @@ defmodule FerricstoreServer.Native.Commands do
     "signal" => :signal,
     "shard_id" => :shard_id,
     "state" => :state,
+    "state_meta" => :state_meta,
     "status" => :status,
     "states" => :states,
     "start_at_ms" => :start_at_ms,
@@ -1322,6 +1326,14 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_flow_attribute_values, payload, state),
     do: flow_attribute_values_call(payload, state)
+
+  defp do_execute(@op_flow_search, payload, state) do
+    with {:ok, opts} <- flow_opts(payload, []) do
+      result_to_reply(FerricStore.Impl.flow_search(state.instance_ctx, opts), state)
+    else
+      {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
 
   defp do_execute(@op_flow_effect_reserve, payload, state) do
     with {:ok, id} <- require_binary(payload, "id"),
@@ -2248,6 +2260,7 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_stats,
               @op_flow_attributes,
               @op_flow_attribute_values,
+              @op_flow_search,
               @op_flow_value_mget,
               @op_flow_policy_get,
               @op_flow_effect_get,

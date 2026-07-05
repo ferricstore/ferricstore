@@ -47,4 +47,65 @@ defmodule FerricStore.SDK.FlowAdminTest do
     assert flow["type"] == "sdk"
     assert flow["state"] == "queued"
   end
+
+  test "supports Flow state_meta and indexed_state_meta through native wrappers", %{
+    client: client
+  } do
+    suffix = System.unique_integer([:positive])
+    type = "sdk-state-meta-#{suffix}"
+    partition = "sdk-state-meta-partition"
+    id = "sdk-state-meta-flow-#{suffix}"
+
+    assert {:ok, policy} =
+             Flow.policy_set(client, %{
+               "type" => type,
+               "indexed_state_meta" => "version"
+             })
+
+    assert policy["indexed_state_meta"] == "version"
+
+    assert {:ok, "OK"} =
+             Flow.create(client, %{
+               "id" => id,
+               "type" => type,
+               "state" => "accept",
+               "partition_key" => partition,
+               "state_meta" => %{"version" => 1, "owner" => "risk"},
+               "run_at_ms" => 1_000,
+               "now_ms" => 1_000
+             })
+
+    assert {:ok, flow} = Flow.get(client, %{"id" => id, "partition_key" => partition})
+
+    assert flow["state_meta"] == %{
+             "accept" => %{"version" => 1, "owner" => "risk"}
+           }
+
+    assert_eventually(fn ->
+      assert {:ok, records} =
+               Flow.search(client, %{
+                 "type" => type,
+                 "partition_key" => partition,
+                 "state_meta" => %{"accept" => %{"version" => 1}},
+                 "consistent_projection" => true,
+                 "count" => 10
+               })
+
+      assert Enum.map(records, & &1["id"]) == [id]
+    end)
+  end
+
+  defp assert_eventually(fun, attempts \\ 40, interval_ms \\ 100)
+
+  defp assert_eventually(fun, attempts, interval_ms) when attempts > 0 do
+    fun.()
+  rescue
+    error in [ExUnit.AssertionError] ->
+      if attempts == 1 do
+        reraise(error, __STACKTRACE__)
+      else
+        Process.sleep(interval_ms)
+        assert_eventually(fun, attempts - 1, interval_ms)
+      end
+  end
 end

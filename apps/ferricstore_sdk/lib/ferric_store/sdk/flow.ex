@@ -57,6 +57,7 @@ defmodule FerricStore.SDK.Flow do
     stats: :flow_stats,
     attributes: :flow_attributes,
     attribute_values: :flow_attribute_values,
+    search: :flow_search,
     effect_reserve: :flow_effect_reserve,
     effect_confirm: :flow_effect_confirm,
     effect_fail: :flow_effect_fail,
