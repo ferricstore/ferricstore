@@ -228,6 +228,50 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              NativeAstParser.parse("flow.attribute_values", ["checkout", "tenant"])
   end
 
+  test "parses Flow policy indexed attributes through native AST" do
+    assert {:ok, "FLOW.POLICY.SET", _args, {:flow_policy_set, "checkout", opts}, ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "INDEXED_ATTRIBUTES",
+               "tenant,region",
+               "INDEXED_STATE_META",
+               "version"
+             ])
+
+    assert opts[:indexed_attributes] == ["tenant", "region"]
+    assert opts[:indexed_state_meta] == "version"
+
+    assert {:ok, "FLOW.POLICY.SET", _args,
+            {:flow_policy_set, "checkout", [indexed_attributes: ["tenant"]]}, ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "INDEXED_ATTRIBUTES",
+               "tenant"
+             ])
+
+    assert {:ok, "FLOW.POLICY.SET", _args,
+            {:flow_policy_set, "checkout", [indexed_attributes: ["tenant", "region"]]},
+            ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "INDEXED_ATTRIBUTES",
+               ~s(["tenant","region"])
+             ])
+  end
+
+  test "rejects state-level Flow policy indexed attributes through native AST" do
+    assert {:ok, "FLOW.POLICY.SET", _args,
+            {:flow_policy_set, "checkout",
+             {:error, "ERR flow indexed_attributes is type-level only"}}, ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "STATE",
+               "queued",
+               "INDEXED_ATTRIBUTES",
+               "tenant"
+             ])
+  end
+
   test "parses Flow many and newer workflow/governance command names" do
     assert {:ok, "FLOW.CREATE_MANY", _args,
             {:flow_create_many, "tenant-a",

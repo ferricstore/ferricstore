@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_set 0x0102
+  @op_flow_policy_set 0x021E
   @op_flow_search 0x0230
   @op_flow_circuit_open 0x024A
   @op_flow_circuit_get 0x024C
@@ -204,6 +205,97 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == "PONG"
+  end
+
+  test "FLOW.POLICY.SET accepts indexed attributes through native opcode" do
+    type = "native-policy-indexes-#{System.unique_integer([:positive, :monotonic])}"
+
+    {status, payload, _state} =
+      Commands.execute(
+        @op_flow_policy_set,
+        %{
+          "type" => type,
+          "indexed_attributes" => ["tenant", "region"],
+          "indexed_state_meta" => "version",
+          "retry" => %{"max_retries" => 5}
+        },
+        state()
+      )
+
+    assert status == :ok
+    assert payload.indexed_attributes == ["tenant", "region"]
+    assert payload.indexed_state_meta == "version"
+    assert payload.retry.max_retries == 5
+  end
+
+  test "FLOW.SEARCH returns indexed records through COMMAND_EXEC and native opcode" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    type = "native-search-#{suffix}"
+    id = "native:search:#{suffix}"
+    partition = "native:search:#{suffix}:partition"
+    marker = "marker-#{suffix}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _policy} =
+             FerricStore.flow_policy_set(type,
+               indexed_attributes: ["search_marker"],
+               indexed_state_meta: "version"
+             )
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "searchable",
+               partition_key: partition,
+               attributes: %{"search_marker" => marker},
+               state_meta: %{"version" => "1"},
+               idempotent: true,
+               run_at_ms: now,
+               now_ms: now
+             )
+
+    command_exec_payload = %{
+      "command" => "FLOW.SEARCH",
+      "args" => [
+        "TYPE",
+        type,
+        "STATE",
+        "searchable",
+        "ATTRIBUTE",
+        "search_marker",
+        marker,
+        "STATE_META",
+        "searchable",
+        "version",
+        "1",
+        "PARTITION",
+        partition,
+        "COUNT",
+        "10",
+        "CONSISTENT_PROJECTION",
+        "true"
+      ]
+    }
+
+    assert {:ok, command_records, _state} =
+             Commands.execute(@op_command_exec, command_exec_payload, state())
+
+    assert id in flow_record_ids(command_records)
+
+    native_payload = %{
+      "type" => type,
+      "state" => "searchable",
+      "partition_key" => partition,
+      "attributes" => %{"search_marker" => marker},
+      "state_meta" => %{"searchable" => %{"version" => "1"}},
+      "count" => 10,
+      "consistent_projection" => true
+    }
+
+    assert {:ok, native_records, _state} =
+             Commands.execute(@op_flow_search, native_payload, state())
+
+    assert id in flow_record_ids(native_records)
   end
 
   test "COMMAND_EXEC delegates configured extension commands" do
@@ -818,6 +910,12 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Commands.execute(@op_command_exec, %{"command" => "GET", "args" => [key]}, state)
 
     assert message =~ "NOPERM"
+  end
+
+  defp flow_record_ids(records) when is_list(records) do
+    Enum.map(records, fn record ->
+      Map.get(record, :id) || Map.get(record, "id")
+    end)
   end
 
   defp schema_names(payload), do: Map.keys(payload.schemas)

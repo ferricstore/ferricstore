@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.7.3 - 2026-07-07
+
+- Added native `FLOW.POLICY.SET` support for indexed Flow attributes.
+- Added native and `COMMAND_EXEC` coverage for `FLOW.SEARCH` attribute and state metadata queries.
+- Rejected state-scoped indexed Flow policy options that are type-level only.
+- Updated native protocol and command guides for newer Flow opcodes and `FLOW.SEARCH`.
+
 ## 0.7.2 - 2026-07-06
 
 - Removed the embedded Elixir SDK app from this repository; the Elixir SDK now lives in the standalone SDK repository.

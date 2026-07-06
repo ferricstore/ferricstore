@@ -123,6 +123,13 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowStateMetaThroughR
                    [type, "STATE", "accept", "INDEXED_STATE_META", "version"],
                    MockStore.make()
                  )
+
+        assert {:error, "ERR flow indexed_attributes is type-level only"} =
+                 Dispatcher.dispatch(
+                   "FLOW.POLICY.SET",
+                   [type, "STATE", "accept", "INDEXED_ATTRIBUTES", "tenant"],
+                   MockStore.make()
+                 )
       end
     end
   end

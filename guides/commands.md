@@ -52,7 +52,7 @@ data-structure commands. They are exposed through native TCP mode and the embedd
 `FLOW.REWIND`, `FLOW.LIST`, `FLOW.STATS`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`,
 `FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`, `FLOW.HISTORY`,
 `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.POLICY.SET`, `FLOW.POLICY.GET`,
-and `FLOW.RETENTION_CLEANUP`.
+`FLOW.SEARCH`, and `FLOW.RETENTION_CLEANUP`.
 
 Flow attributes are small indexed metadata fields for query and dashboard
 filters. They are separate from payload and named value refs:
@@ -62,6 +62,7 @@ FLOW.CREATE order-1 TYPE order STATE queued ATTRIBUTE tenant acme ATTRIBUTE regi
 FLOW.TRANSITION order-1 queued charged LEASE_TOKEN <token> FENCING 1 ATTRIBUTE_MERGE phase charge
 FLOW.LIST order STATE queued ATTRIBUTE tenant acme COUNT 100
 FLOW.STATS order STATE queued ATTRIBUTE tenant acme
+FLOW.SEARCH TYPE order STATE queued ATTRIBUTE tenant acme CONSISTENT_PROJECTION true
 ```
 
 Use attributes for values you want to filter or count by, such as tenant,
@@ -77,6 +78,7 @@ for that state and does not overwrite metadata stored for earlier states:
 FLOW.POLICY.SET order INDEXED_STATE_META version
 FLOW.CREATE order-1 TYPE order STATE accept STATE_META version 1
 FLOW.COMPLETE order-1 <lease-token> FENCING <fencing-token> STATE_META version 3
+FLOW.SEARCH TYPE order STATE accept STATE_META accept version 1
 ```
 
 Only one state metadata key can be indexed per Flow type. Non-indexed state

@@ -1675,10 +1675,15 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp parse_flow_policy_state_options(args) do
     case parse_flow_policy_set_options(args) do
       opts when is_list(opts) ->
-        if Keyword.has_key?(opts, :indexed_state_meta) do
-          {:error, "ERR flow indexed_state_meta is type-level only"}
-        else
-          {:ok, opts}
+        cond do
+          Keyword.has_key?(opts, :indexed_state_meta) ->
+            {:error, "ERR flow indexed_state_meta is type-level only"}
+
+          Keyword.has_key?(opts, :indexed_attributes) ->
+            {:error, "ERR flow indexed_attributes is type-level only"}
+
+          true ->
+            {:ok, opts}
         end
 
       {:error, reason} ->
@@ -1706,6 +1711,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
       "INDEXED_STATE_META" ->
         {:policy, {:indexed_state_meta, value}}
 
+      "INDEXED_ATTRIBUTES" ->
+        {:policy, {:indexed_attributes, flow_policy_indexed_attributes(value)}}
+
       "MAX_RETRIES" ->
         policy_non_negative(:retry, :max_retries, value)
 
@@ -1728,6 +1736,31 @@ defmodule Ferricstore.Commands.NativeAstParser do
         {:error, "ERR syntax error"}
     end
   end
+
+  defp flow_policy_indexed_attributes(value) when is_list(value), do: value
+
+  defp flow_policy_indexed_attributes(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    cond do
+      String.starts_with?(trimmed, "[") ->
+        case Jason.decode(trimmed) do
+          {:ok, values} when is_list(values) -> values
+          _ -> [value]
+        end
+
+      String.contains?(value, ",") ->
+        value
+        |> String.split(",")
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+
+      true ->
+        [value]
+    end
+  end
+
+  defp flow_policy_indexed_attributes(value), do: [value]
 
   defp policy_positive(scope, key, value) do
     case parse_int(value) do
