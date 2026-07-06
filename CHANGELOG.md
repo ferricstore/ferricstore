@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.7.2 - 2026-07-06
+
+- Removed the embedded Elixir SDK app from this repository; the Elixir SDK now lives in the standalone SDK repository.
+- Added `FLOW.SEARCH` support to the native `COMMAND_EXEC` parser and dispatcher.
+- Hardened namespace-scope enforcement for `FLOW.SEARCH` over raw and typed native commands.
+
 ## 0.7.1 - 2026-07-05
 
 - Added native `FLOW.SEARCH` support for indexed per-state metadata queries.
