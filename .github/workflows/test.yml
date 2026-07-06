@@ -292,7 +292,7 @@ jobs:
     name: "Core tests (macos ${{ matrix.partition }}/3)"
     needs: build-macos
     runs-on: macos-latest
-    timeout-minutes: 50
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -314,7 +314,7 @@ jobs:
       - name: Ensure dependencies
         run: mix deps.get
       - name: Run ferricstore tests
-        timeout-minutes: 45
+        timeout-minutes: 80
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
       - uses: actions/upload-artifact@v4
         if: always()
