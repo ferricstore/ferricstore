@@ -283,13 +283,14 @@ defmodule Ferricstore.FlowTest.Sections.ClaimDueMultiStateClaimsEarliestDueJobIn
         partition_key = uid("tenant")
         id = uid("pipeline-claim-no-now-id")
         now = System.system_time(:millisecond)
+        due_at = now - 1_000
 
         assert {:ok, %{id: ^id}} =
                  flow_create_and_get(id,
                    type: type,
                    partition_key: partition_key,
                    now_ms: now,
-                   run_at_ms: now
+                   run_at_ms: due_at
                  )
 
         assert [{:ok, [%{id: ^id, lease_owner: "worker-a"}]}] =

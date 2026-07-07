@@ -681,7 +681,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         {ets_value, lfu, write} =
           cond do
             blob_ref? ->
-              lfu = LFU.initial()
+              lfu =
+                if terminal?,
+                  do: flow_record_lfu(record, encoded_record),
+                  else: LFU.initial()
+
               {nil, lfu, {:put_cold, key, disk_val, expire_at_ms, lfu}}
 
             projection_enabled? and terminal? ->
@@ -744,6 +748,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         {ets_value, lfu, write} =
           cond do
             blob_ref? ->
+              lfu =
+                if terminal?,
+                  do: flow_record_lfu(record, encoded_record),
+                  else: lfu
+
               {nil, lfu, {:put_cold, key, disk_val, expire_at_ms, lfu}}
 
             projection_enabled? and terminal? ->

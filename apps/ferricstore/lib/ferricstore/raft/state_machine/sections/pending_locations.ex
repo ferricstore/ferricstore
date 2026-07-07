@@ -942,6 +942,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             flow_record_has_indexed_attributes?(record) and is_binary(value) and
                 is_integer(expire_at_ms) ->
               queue_pending_lmdb_flow_state_projection(state_key, value, expire_at_ms)
+              maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
 
             Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) ->
               case Ferricstore.Flow.LMDB.mode() do
@@ -968,6 +969,41 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       end
 
       defp flow_record_has_indexed_attributes?(_record), do: false
+
+      defp maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
+           when is_binary(state_key) and is_map(record) do
+        with true <- Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)),
+             id when is_binary(id) <- Map.get(record, :id),
+             type when is_binary(type) <- Map.get(record, :type),
+             terminal_state when is_binary(terminal_state) <- Map.get(record, :state),
+             version when is_integer(version) <- Map.get(record, :version),
+             data_dir when is_binary(data_dir) <- Map.get(state, :data_dir),
+             shard_index when is_integer(shard_index) and shard_index >= 0 <-
+               Map.get(state, :shard_index) do
+          {zset_index, zset_lookup} =
+            ZSetIndex.table_names(Map.get(state, :instance_name), shard_index)
+
+          {flow_index, flow_lookup} =
+            NativeFlowIndex.table_names(Map.get(state, :instance_name), shard_index)
+
+          action =
+            {:prune_terminal_flow_v3, data_dir, shard_index, state.ets, zset_index, zset_lookup,
+             flow_index, flow_lookup, state_key, type, terminal_state,
+             Map.get(record, :partition_key), Map.get(record, :parent_flow_id),
+             Map.get(record, :root_flow_id), Map.get(record, :correlation_id), id, version}
+
+          queue_pending_lmdb_mirror_after_flush(
+            {:defer_after_flush, Ferricstore.Flow.LMDBWriter.terminal_hot_ttl_ms(), action}
+          )
+        else
+          _ -> :ok
+        end
+
+        :ok
+      end
+
+      defp maybe_queue_lmdb_terminal_state_prune_after_flush(_state, _state_key, _record),
+        do: :ok
 
       defp flow_record_has_attributes?(record) do
         case Map.get(record, :attributes) do

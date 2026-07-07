@@ -71,9 +71,11 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         zset_score_index,
         zset_score_lookup,
         flow_index \\ nil,
-        flow_lookup \\ nil
+        flow_lookup \\ nil,
+        opts \\ []
       ) do
     lmdb_path = LMDB.path(shard_path)
+    prune_terminal_keydir? = Keyword.get(opts, :prune_terminal_keydir?, false)
     Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
 
     try do
@@ -94,6 +96,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
               zset_score_lookup,
               flow_index,
               flow_lookup,
+              prune_terminal_keydir?,
               acc
             )
           end
@@ -316,6 +319,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          zset_score_lookup,
          flow_index,
          flow_lookup,
+         prune_terminal_keydir?,
          acc
        ) do
     decoded = ColdState.read_and_decode(entries, shard_path, shard_index, instance_ctx)
@@ -404,9 +408,18 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           ActiveIndexes.rebuild_flow_indexes(flow_index, flow_lookup, record)
         end)
 
-        Enum.each(Enum.reverse(terminal_prunes), fn {key, record} ->
-          safe_prune_terminal_keydir_entry(keydir, shard_index, key, record, instance_ctx)
-        end)
+        if prune_terminal_keydir? do
+          Enum.each(Enum.reverse(terminal_prunes), fn {key, record} ->
+            safe_prune_terminal_keydir_entry(
+              keydir,
+              shard_path,
+              shard_index,
+              key,
+              record,
+              instance_ctx
+            )
+          end)
+        end
 
         %{
           acc
@@ -892,13 +905,19 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     select_state_entry_chunks(keydir, :ets.select(continuation), acc)
   end
 
-  defp safe_prune_terminal_keydir_entry(keydir, shard_index, key, record, instance_ctx) do
+  defp safe_prune_terminal_keydir_entry(
+         keydir,
+         shard_path,
+         shard_index,
+         key,
+         record,
+         instance_ctx
+       ) do
     version = Map.get(record, :version)
 
-    with [{^key, value, expire_at_ms, _lfu, _fid, _off, _vsize}] <- :ets.lookup(keydir, key),
-         true <- is_binary(value),
-         [{^key, _materialized, _expire_at_ms, current}] <-
-           ColdState.decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx),
+    with [row] <- :ets.lookup(keydir, key),
+         {:ok, current} <-
+           prune_terminal_keydir_record(row, shard_path, shard_index, key, instance_ctx),
          ^version <- Map.get(current, :version),
          true <- LMDB.terminal_state?(Map.get(current, :state)) do
       track_binary_remove(keydir, shard_index, key, instance_ctx)
@@ -909,6 +928,39 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   rescue
     ArgumentError -> :ok
   end
+
+  defp prune_terminal_keydir_record(
+         {key, value, expire_at_ms, _lfu, _fid, _off, _vsize},
+         _shard_path,
+         shard_index,
+         key,
+         instance_ctx
+       )
+       when is_binary(value) do
+    case ColdState.decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx) do
+      [{^key, _materialized, _expire_at_ms, record}] -> {:ok, record}
+      _ -> :error
+    end
+  end
+
+  defp prune_terminal_keydir_record(
+         {key, nil, expire_at_ms, _lfu, fid, off, vsize},
+         shard_path,
+         shard_index,
+         key,
+         instance_ctx
+       ) do
+    shard_path
+    |> ColdState.cold_locations_for_state(key, expire_at_ms, fid, off, vsize)
+    |> ColdState.read_cold_locations(shard_index, instance_ctx)
+    |> case do
+      [{^key, _materialized, _expire_at_ms, record}] -> {:ok, record}
+      _ -> :error
+    end
+  end
+
+  defp prune_terminal_keydir_record(_row, _shard_path, _shard_index, _key, _instance_ctx),
+    do: :error
 
   defp keydir_match_spec do
     [

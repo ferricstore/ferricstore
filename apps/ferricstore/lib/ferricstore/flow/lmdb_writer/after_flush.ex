@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   alias Ferricstore.Flow.Hibernation
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Flow.Locator
+  alias Ferricstore.Store.{BlobRef, BlobStore, ColdRead}
 
   def apply_after_flush(
         {:prune_terminal_flow, ets, zset_index, zset_lookup, state_key, state_index_key, id,
@@ -104,7 +105,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
         {:prune_terminal_flow_from_source_v1, data_dir, shard_index, ets, zset_index, zset_lookup,
          flow_index, flow_lookup, state_key, version}
       ) do
-    with {:ok, record} <- hot_flow_record_from_ets(ets, state_key),
+    with {:ok, record} <- flow_record_from_keydir(data_dir, shard_index, ets, state_key),
          ^version <- Map.get(record, :version),
          terminal_state when is_binary(terminal_state) <- Map.get(record, :state),
          true <- Ferricstore.Flow.LMDB.terminal_state?(terminal_state),
@@ -305,11 +306,29 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
         delete_apply_projection_cache_for_row(data_dir, shard_index, row)
         :ets.delete(ets, state_key)
 
+      [{^state_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize} = row] ->
+        if terminal_state_row_version?(data_dir, shard_index, state_key, version, row) do
+          delete_apply_projection_cache_for_row(data_dir, shard_index, row)
+          :ets.delete(ets, state_key)
+        else
+          :ok
+        end
+
       _ ->
         :ok
     end
   rescue
     ArgumentError -> :ok
+  end
+
+  defp terminal_state_row_version?(data_dir, shard_index, state_key, version, row) do
+    with {:ok, record} <- flow_record_from_keydir_row(data_dir, shard_index, state_key, row),
+         ^version <- Map.get(record, :version),
+         terminal_state when is_binary(terminal_state) <- Map.get(record, :state) do
+      Ferricstore.Flow.LMDB.terminal_state?(terminal_state)
+    else
+      _ -> false
+    end
   end
 
   def delete_apply_projection_cache_for_row(
@@ -330,4 +349,70 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   end
 
   def delete_apply_projection_cache_for_row(_data_dir, _shard_index, _row), do: :ok
+
+  def flow_record_from_keydir(data_dir, shard_index, ets, state_key) do
+    case :ets.lookup(ets, state_key) do
+      [row] -> flow_record_from_keydir_row(data_dir, shard_index, state_key, row)
+      _ -> :not_found
+    end
+  rescue
+    ArgumentError -> :not_found
+  end
+
+  def flow_record_from_keydir_row(
+        data_dir,
+        shard_index,
+        state_key,
+        {state_key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}
+      )
+      when is_binary(value) do
+    decode_keydir_flow_value(data_dir, shard_index, value)
+  end
+
+  def flow_record_from_keydir_row(
+        data_dir,
+        shard_index,
+        state_key,
+        {state_key, nil, _expire_at_ms, _lfu, file_id, offset, value_size}
+      ) do
+    with {:ok, value} <-
+           read_keydir_flow_value(data_dir, shard_index, state_key, file_id, offset, value_size) do
+      decode_keydir_flow_value(data_dir, shard_index, value)
+    end
+  end
+
+  def flow_record_from_keydir_row(_data_dir, _shard_index, _state_key, _row), do: :not_found
+
+  defp decode_keydir_flow_value(data_dir, shard_index, value) when is_binary(value) do
+    with {:ok, materialized} <- maybe_materialize_blob_ref(data_dir, shard_index, value) do
+      decode_raw_flow_record(materialized)
+    end
+  end
+
+  defp maybe_materialize_blob_ref(data_dir, shard_index, value) when is_binary(value) do
+    case BlobRef.decode(value) do
+      {:ok, %BlobRef{} = ref} -> BlobStore.get(data_dir, shard_index, ref)
+      :error -> {:ok, value}
+    end
+  end
+
+  defp read_keydir_flow_value(data_dir, shard_index, state_key, file_id, offset, value_size)
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(state_key) and is_integer(file_id) and file_id >= 0 and
+              is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 do
+    data_dir
+    |> Ferricstore.DataDir.shard_data_path(shard_index)
+    |> Ferricstore.Store.Shard.ETS.file_path(file_id)
+    |> ColdRead.pread_keyed(offset, state_key, 10_000)
+  end
+
+  defp read_keydir_flow_value(
+         _data_dir,
+         _shard_index,
+         _state_key,
+         _file_id,
+         _offset,
+         _value_size
+       ),
+       do: :not_found
 end

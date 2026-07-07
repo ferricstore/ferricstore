@@ -143,13 +143,20 @@ defmodule Ferricstore.Store.LFU do
   def elapsed_minutes(now, ldt) when now >= ldt, do: now - ldt
   def elapsed_minutes(now, ldt), do: 0xFFFF - ldt + now + 1
 
+  @type packed_or_tagged ::
+          non_neg_integer() | {:flow_state_version, integer(), non_neg_integer()}
+
   @doc """
   Returns the effective (decayed) counter for a packed LFU value.
 
   Applies time-based decay without updating the stored value. Used for eviction
   comparison and OBJECT FREQ.
   """
-  @spec effective_counter(non_neg_integer()) :: non_neg_integer()
+  @spec effective_counter(packed_or_tagged()) :: non_neg_integer()
+  def effective_counter({:flow_state_version, _version, packed}) when is_integer(packed) do
+    effective_counter(packed)
+  end
+
   def effective_counter(packed) do
     {ldt, counter} = unpack(packed)
     decay_time = :persistent_term.get(:ferricstore_lfu_decay_time, 1)
@@ -163,7 +170,11 @@ defmodule Ferricstore.Store.LFU do
   end
 
   @doc "Returns the effective (decayed) counter using instance ctx."
-  @spec effective_counter(FerricStore.Instance.t(), non_neg_integer()) :: non_neg_integer()
+  @spec effective_counter(FerricStore.Instance.t(), packed_or_tagged()) :: non_neg_integer()
+  def effective_counter(ctx, {:flow_state_version, _version, packed}) when is_integer(packed) do
+    effective_counter(ctx, packed)
+  end
+
   def effective_counter(ctx, packed) do
     {ldt, counter} = unpack(packed)
     decay_time = ctx.lfu_decay_time
@@ -181,50 +192,49 @@ defmodule Ferricstore.Store.LFU do
 
   Returns the new packed LFU value. Updates the ETS entry at position 4.
   """
-  @spec touch(atom(), binary(), non_neg_integer()) :: :ok
-  def touch(keydir, key, packed) do
-    {ldt, counter} = unpack(packed)
-    now_min = now_minutes()
-
-    # Step 1: Decay — read from persistent_term (~5ns) instead of
-    # Application.get_env (~200-250ns). Saves ~400ns per hot GET.
+  @spec touch(atom(), binary(), packed_or_tagged()) :: :ok
+  def touch(keydir, key, {:flow_state_version, version, packed}) when is_integer(packed) do
     decay_time = :persistent_term.get(:ferricstore_lfu_decay_time, 1)
-    elapsed = elapsed_minutes(now_min, ldt)
-
-    decayed_counter =
-      if decay_time > 0 do
-        max(0, counter - div(elapsed, decay_time))
-      else
-        counter
-      end
-
-    # Step 2: Probabilistic increment
     log_factor = :persistent_term.get(:ferricstore_lfu_log_factor, 10)
 
-    new_counter =
-      if :rand.uniform() < 1.0 / (decayed_counter * log_factor + 1) do
-        min(decayed_counter + 1, 255)
-      else
-        decayed_counter
-      end
+    touch_packed(keydir, key, packed, decay_time, log_factor, fn new_packed ->
+      {:flow_state_version, version, new_packed}
+    end)
+  end
 
-    # Step 3: Update ETS with new packed LFU — skip write when unchanged
-    new_packed = pack(now_min, new_counter)
+  def touch(keydir, key, packed) do
+    decay_time = :persistent_term.get(:ferricstore_lfu_decay_time, 1)
+    log_factor = :persistent_term.get(:ferricstore_lfu_log_factor, 10)
 
+    touch_packed(keydir, key, packed, decay_time, log_factor, & &1)
+  end
+
+  @doc "Performs an LFU touch using instance ctx for config values."
+  @spec touch(FerricStore.Instance.t(), atom(), binary(), packed_or_tagged()) :: :ok
+  def touch(ctx, keydir, key, {:flow_state_version, version, packed}) when is_integer(packed) do
+    touch_packed(keydir, key, packed, ctx.lfu_decay_time, ctx.lfu_log_factor, fn new_packed ->
+      {:flow_state_version, version, new_packed}
+    end)
+  end
+
+  def touch(ctx, keydir, key, packed) do
+    touch_packed(keydir, key, packed, ctx.lfu_decay_time, ctx.lfu_log_factor, & &1)
+  end
+
+  defp touch_packed(keydir, key, packed, decay_time, log_factor, wrap_fun) do
+    new_packed = next_packed(packed, decay_time, log_factor)
+
+    # Skip write when unchanged; wrapper metadata is already present in ETS.
     if new_packed != packed do
-      :ets.update_element(keydir, key, {4, new_packed})
+      :ets.update_element(keydir, key, {4, wrap_fun.(new_packed)})
     end
 
     :ok
   end
 
-  @doc "Performs an LFU touch using instance ctx for config values."
-  @spec touch(FerricStore.Instance.t(), atom(), binary(), non_neg_integer()) :: :ok
-  def touch(ctx, keydir, key, packed) do
+  defp next_packed(packed, decay_time, log_factor) do
     {ldt, counter} = unpack(packed)
     now_min = now_minutes()
-
-    decay_time = ctx.lfu_decay_time
     elapsed = elapsed_minutes(now_min, ldt)
 
     decayed_counter =
@@ -234,8 +244,6 @@ defmodule Ferricstore.Store.LFU do
         counter
       end
 
-    log_factor = ctx.lfu_log_factor
-
     new_counter =
       if :rand.uniform() < 1.0 / (decayed_counter * log_factor + 1) do
         min(decayed_counter + 1, 255)
@@ -243,12 +251,6 @@ defmodule Ferricstore.Store.LFU do
         decayed_counter
       end
 
-    new_packed = pack(now_min, new_counter)
-
-    if new_packed != packed do
-      :ets.update_element(keydir, key, {4, new_packed})
-    end
-
-    :ok
+    pack(now_min, new_counter)
   end
 end

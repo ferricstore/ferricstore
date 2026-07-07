@@ -124,7 +124,8 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
           zset_index,
           zset_lookup,
           flow_index,
-          flow_lookup
+          flow_lookup,
+          prune_terminal_keydir?: true
         )
     end
   rescue

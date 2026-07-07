@@ -132,6 +132,13 @@ defmodule Ferricstore.Store.LFUDecayTest do
       assert LFU.effective_counter(packed) == 100
     end
 
+    test "reads counter through flow state version wrapper" do
+      packed = LFU.pack(LFU.now_minutes(), 100)
+
+      assert LFU.effective_counter({:flow_state_version, 7, packed}) == 100
+      assert LFU.effective_counter(%{lfu_decay_time: 1}, {:flow_state_version, 7, packed}) == 100
+    end
+
     test "decays counter based on elapsed minutes" do
       # ldt 10 minutes ago, counter=50, decay_time=1 -> effective = 50 - 10 = 40
       old_ldt = LFU.now_minutes() - 10 &&& 0xFFFF
@@ -166,6 +173,43 @@ defmodule Ferricstore.Store.LFUDecayTest do
         Application.put_env(:ferricstore, :lfu_decay_time, original)
         LFU.init_config_cache()
       end
+    end
+  end
+
+  describe "LFU.touch flow state version wrapper" do
+    test "preserves wrapper when touching with persistent config" do
+      LFU.init_config_cache()
+
+      table = :ets.new(:lfu_flow_state_version_touch, [:set])
+      packed = LFU.pack(LFU.now_minutes() - 2 &&& 0xFFFF, 0)
+      tagged = {:flow_state_version, 3, packed}
+
+      :ets.insert(table, {"flow-state", nil, 0, tagged, :pending, 0, 1})
+
+      assert :ok = LFU.touch(table, "flow-state", tagged)
+
+      assert [{"flow-state", nil, 0, {:flow_state_version, 3, new_packed}, :pending, 0, 1}] =
+               :ets.lookup(table, "flow-state")
+
+      assert is_integer(new_packed)
+      assert new_packed != packed
+    end
+
+    test "preserves wrapper when touching with instance config" do
+      table = :ets.new(:lfu_flow_state_version_touch_ctx, [:set])
+      packed = LFU.pack(LFU.now_minutes() - 2 &&& 0xFFFF, 0)
+      tagged = {:flow_state_version, 5, packed}
+      ctx = %{lfu_decay_time: 1, lfu_log_factor: 10}
+
+      :ets.insert(table, {"flow-state", nil, 0, tagged, :pending, 0, 1})
+
+      assert :ok = LFU.touch(ctx, table, "flow-state", tagged)
+
+      assert [{"flow-state", nil, 0, {:flow_state_version, 5, new_packed}, :pending, 0, 1}] =
+               :ets.lookup(table, "flow-state")
+
+      assert is_integer(new_packed)
+      assert new_packed != packed
     end
   end
 
