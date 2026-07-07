@@ -77,6 +77,7 @@ defmodule Ferricstore.Flow.Policy do
         Map.new(states, fn {state, _state_policy} ->
           {state,
            %{
+             mode: RetryPolicy.state_mode(policy, state),
              retry: RetryPolicy.resolve(policy, state, nil),
              retention: response_retention(policy, state),
              governance: state_governance(policy, state)
@@ -90,6 +91,7 @@ defmodule Ferricstore.Flow.Policy do
       type: type,
       state: state,
       version: Map.get(policy || %{}, :version),
+      mode: RetryPolicy.state_mode(policy, state),
       retry: RetryPolicy.resolve(policy, state, nil),
       retention: response_retention(policy, state),
       indexed_attributes: RetryPolicy.indexed_attributes(policy),

@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Store.Router
 
@@ -229,7 +230,8 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp maybe_return_start_and_claim({:ok, record}, _ctx, :record), do: {:ok, record}
+  defp maybe_return_start_and_claim({:ok, record}, _ctx, :record),
+    do: {:ok, RecordProjection.public(record)}
 
   defp maybe_return_start_and_claim({:ok, record}, ctx, :jobs_compact) do
     [job] = Ferricstore.Flow.ClaimDueAPI.return_records(ctx, [record], nil, :jobs_compact, [])
@@ -470,6 +472,7 @@ defmodule Ferricstore.Flow do
           |> safe_decode_record()
           |> then(&Ferricstore.Flow.ValueHydration.payload_result(ctx, &1, payload_return))
           |> Ferricstore.Flow.ValueHydration.named_value_result(ctx, named_values)
+          |> Ferricstore.Flow.RecordProjection.public_result()
 
         {:error, _reason} = error ->
           error
@@ -789,7 +792,8 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp maybe_return_step_continue({:ok, record}, _ctx, :record), do: {:ok, record}
+  defp maybe_return_step_continue({:ok, record}, _ctx, :record),
+    do: {:ok, RecordProjection.public(record)}
 
   defp maybe_return_step_continue({:ok, record}, ctx, :jobs_compact) do
     [job] = Ferricstore.Flow.ClaimDueAPI.return_records(ctx, [record], nil, :jobs_compact, [])
@@ -931,6 +935,7 @@ defmodule Ferricstore.Flow do
 
   defp pipeline_start_and_claim_return_result(ctx, opts, result) do
     case start_and_claim_return_mode(opts) do
+      {:ok, :record} -> maybe_return_start_and_claim(result, ctx, :record)
       {:ok, :jobs_compact} -> maybe_return_start_and_claim(result, ctx, :jobs_compact)
       _ -> result
     end
@@ -938,6 +943,7 @@ defmodule Ferricstore.Flow do
 
   defp pipeline_step_continue_return_result(ctx, opts, result) do
     case step_continue_return_mode(opts) do
+      {:ok, :record} -> maybe_return_step_continue(result, ctx, :record)
       {:ok, :jobs_compact} -> maybe_return_step_continue(result, ctx, :jobs_compact)
       _ -> result
     end

@@ -45,6 +45,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
+      @flow_state_enter_seq_offset_span 4_294_967_296
+
       defp flow_create_existing_state(state, %{idempotent: true}, state_key) do
         flow_read_record_by_key(state, state_key)
       end
@@ -182,6 +184,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
         record =
           flow_create_record_with_retention(
+            state,
             attrs,
             id,
             type,
@@ -200,13 +203,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
         case Map.fetch(retention_cache, key) do
           {:ok, retention} ->
-            record = flow_create_record_with_resolved_retention(attrs, retention)
+            record = flow_create_record_with_resolved_retention(state, attrs, retention)
 
             {flow_refresh_indexed_attributes(state, record), retention_cache}
 
           :error ->
             retention = flow_retention_for_create(state, attrs)
-            record = flow_create_record_with_resolved_retention(attrs, retention)
+            record = flow_create_record_with_resolved_retention(state, attrs, retention)
 
             {flow_refresh_indexed_attributes(state, record),
              Map.put(retention_cache, key, retention)}
@@ -214,6 +217,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       end
 
       defp flow_create_record_with_resolved_retention(
+             state,
              %{id: id, type: type, state: flow_state} = attrs,
              retention
            ) do
@@ -222,6 +226,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         priority = Map.get(attrs, :priority, 0)
 
         flow_create_record_with_retention(
+          state,
           attrs,
           id,
           type,
@@ -234,6 +239,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       end
 
       defp flow_create_record_with_retention(
+             state,
              attrs,
              id,
              type,
@@ -256,6 +262,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
           priority: priority,
+          state_enter_seq: flow_next_state_enter_seq(state),
           ttl_ms: nil,
           retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
           terminal_retention_until_ms: nil,
@@ -279,6 +286,70 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         |> flow_put_record_attributes(Map.get(attrs, :attributes))
         |> StateMeta.apply_update(attrs)
         |> flow_stamp_terminal_retention(now_ms)
+      end
+
+      defp flow_next_state_enter_seq(state) do
+        base =
+          (current_ra_index() || Map.get(state, :applied_count, 0)) *
+            @flow_state_enter_seq_offset_span
+
+        offset =
+          case Process.get(:sm_flow_state_enter_seq) do
+            {^base, offset}
+            when is_integer(offset) and offset >= 0 and
+                   offset < @flow_state_enter_seq_offset_span ->
+              offset
+
+            _other ->
+              0
+          end
+
+        Process.put(:sm_flow_state_enter_seq, {base, offset + 1})
+        base + offset
+      end
+
+      defp flow_record_logical_state(%{state: "running"} = record) do
+        Map.get(record, :run_state) || "queued"
+      end
+
+      defp flow_record_logical_state(%{state: flow_state}), do: flow_state
+      defp flow_record_logical_state(_record), do: nil
+
+      defp flow_stamp_state_enter_seq_on_change(state, record, next) do
+        if flow_record_logical_state(record) != flow_record_logical_state(next) and
+             Map.get(next, :state) != "running" and
+             not Ferricstore.Flow.LMDB.terminal_state?(Map.get(next, :state)) do
+          Map.put(next, :state_enter_seq, flow_next_state_enter_seq(state))
+        else
+          next
+        end
+      end
+
+      defp flow_require_fifo_entry(state, attrs, record, require_explicit_partition?) do
+        flow_state = flow_record_logical_state(record)
+        policy = flow_read_policy(state, Map.get(record, :type))
+
+        if RetryPolicy.state_fifo?(policy, flow_state) do
+          cond do
+            Map.get(record, :state) == "running" ->
+              {:error, "ERR flow direct running entry is not supported for fifo state"}
+
+            require_explicit_partition? and not flow_fifo_explicit_partition?(attrs) ->
+              {:error, "ERR flow partition_key is required for fifo state"}
+
+            Map.get(record, :priority, 0) != 0 ->
+              {:error, "ERR flow priority is not supported for fifo state"}
+
+            true ->
+              :ok
+          end
+        else
+          :ok
+        end
+      end
+
+      defp flow_fifo_explicit_partition?(attrs) do
+        Map.get(attrs, :partition_key_explicit, is_binary(Map.get(attrs, :partition_key)))
       end
 
       defp flow_create_retention_cache_key(attrs) do
@@ -1106,10 +1177,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                   {record, retention_cache} =
                     flow_create_record_cached_retention(state, attrs, retention_cache)
 
-                  case flow_validate_record_keys(record) do
-                    :ok ->
-                      {:cont, {:ok, [record | acc], [{record, attrs} | new_acc], retention_cache}}
-
+                  with :ok <- flow_require_fifo_entry(state, attrs, record, true),
+                       :ok <- flow_validate_record_keys(record) do
+                    {:cont, {:ok, [record | acc], [{record, attrs} | new_acc], retention_cache}}
+                  else
                     {:error, _reason} = error ->
                       {:halt, error}
                   end

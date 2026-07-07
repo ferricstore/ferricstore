@@ -139,7 +139,7 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
   def decode_get(nil), do: {:ok, nil}
 
   def decode_get(value) when is_binary(value) do
-    {:ok, Codec.decode_record(value)}
+    {:ok, value |> Codec.decode_record() |> RecordProjection.public()}
   rescue
     _ -> {:ok, nil}
   end

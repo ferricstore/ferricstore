@@ -194,7 +194,10 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
 
   def return_records(ctx, records, payload_return, :records, named_values) do
     hydrated = Ferricstore.Flow.ValueHydration.payload_records(ctx, records, payload_return)
-    Ferricstore.Flow.ValueHydration.named_value_records(ctx, hydrated, named_values)
+
+    ctx
+    |> Ferricstore.Flow.ValueHydration.named_value_records(hydrated, named_values)
+    |> Enum.map(&Ferricstore.Flow.RecordProjection.public/1)
   end
 
   def normal_attrs(_attrs, nil, _limit), do: nil

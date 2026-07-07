@@ -154,4 +154,14 @@ defmodule Ferricstore.Flow.PipelineReadTest do
              {0, {:ok, %{id: "flow-1"}}}
            ]
   end
+
+  test "hydrate_get_results projects internal record fields" do
+    decoded = [
+      {0, {:ok, %{id: "flow-1", state_enter_seq: 123}}, %{enabled?: false, max_bytes: 10}}
+    ]
+
+    assert PipelineRead.hydrate_get_results(decoded, :ctx) == [
+             {0, {:ok, %{id: "flow-1"}}}
+           ]
+  end
 end

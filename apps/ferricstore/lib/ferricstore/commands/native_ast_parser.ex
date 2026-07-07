@@ -1714,6 +1714,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
       "INDEXED_ATTRIBUTES" ->
         {:policy, {:indexed_attributes, flow_policy_indexed_attributes(value)}}
 
+      "MODE" ->
+        parse_flow_state_mode(value)
+
       "MAX_RETRIES" ->
         policy_non_negative(:retry, :max_retries, value)
 
@@ -1761,6 +1764,17 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   defp flow_policy_indexed_attributes(value), do: [value]
+
+  defp parse_flow_state_mode(value) when is_binary(value) do
+    case String.upcase(value) do
+      "PARALLEL" -> {:policy, {:mode, :parallel}}
+      "FIFO" -> {:policy, {:mode, :fifo}}
+      _other -> {:error, "ERR flow state mode must be parallel or fifo"}
+    end
+  end
+
+  defp parse_flow_state_mode(_value),
+    do: {:error, "ERR flow state mode must be parallel or fifo"}
 
   defp policy_positive(scope, key, value) do
     case parse_int(value) do

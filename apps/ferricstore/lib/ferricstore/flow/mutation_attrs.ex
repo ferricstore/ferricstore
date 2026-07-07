@@ -109,6 +109,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
+      partition_key_explicit? = not is_nil(partition_key)
       partition_key = partition_key || Ferricstore.Flow.Keys.auto_partition_key(id)
 
       attrs =
@@ -126,6 +127,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_attr(:history_hot_max_events, history_hot_max_events)
         |> maybe_put_attr(:history_max_events, history_max_events)
         |> maybe_put_default_attr(:priority, priority, @default_priority)
+        |> maybe_put_default_attr(:partition_key_explicit, partition_key_explicit?, true)
         |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
@@ -165,6 +167,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
+      partition_key_explicit? = not is_nil(partition_key)
       partition_key = partition_key || Ferricstore.Flow.Keys.auto_partition_key(id)
 
       attrs =
@@ -184,6 +187,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_attr(:history_hot_max_events, history_hot_max_events)
         |> maybe_put_attr(:history_max_events, history_max_events)
         |> maybe_put_default_attr(:priority, priority, @default_priority)
+        |> maybe_put_default_attr(:partition_key_explicit, partition_key_explicit?, true)
         |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
@@ -246,6 +250,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_children(children),
          {:ok, partition_key} <- required_partition_key(Keyword.get(opts, :partition_key)),
          {:ok, group_id} <- required_binary(opts, :group_id),
+         :ok <- validate_child_group_id(group_id),
          {:ok, wait} <- optional_child_policy(opts, :wait, :all, [:all, :any, :none]),
          {:ok, on_child_failed} <-
            optional_child_policy(opts, :on_child_failed, :fail_parent, [
@@ -320,6 +325,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
+      partition_key_explicit? = not is_nil(partition_key)
+
       attrs =
         %{
           id: id,
@@ -330,6 +337,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         }
         |> maybe_put_attr(:lease_token, lease_token)
         |> maybe_put_attr(:priority, priority)
+        |> maybe_put_default_attr(:partition_key_explicit, partition_key_explicit?, true)
         |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
@@ -428,6 +436,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
+      partition_key_explicit? = not is_nil(partition_key)
+
       attrs =
         %{
           id: id,
@@ -438,6 +448,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
           run_at_ms: run_at_ms
         }
         |> maybe_put_attr(:priority, priority)
+        |> maybe_put_default_attr(:partition_key_explicit, partition_key_explicit?, true)
         |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_named_value_opts(opts)
@@ -653,6 +664,9 @@ defmodule Ferricstore.Flow.MutationAttrs do
       :error -> {:error, "ERR flow #{key} is required"}
     end
   end
+
+  defp validate_child_group_id("__" <> _suffix), do: {:error, "ERR flow group_id is reserved"}
+  defp validate_child_group_id(_group_id), do: :ok
 
   def optional_binary(opts, key, default) do
     case Keyword.get(opts, key, default) do

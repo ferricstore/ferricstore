@@ -51,7 +51,8 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   def normalize_flow_policy(type, attrs) when is_binary(type) and is_map(attrs) do
-    with {:ok, version} <- optional_policy_version(attrs),
+    with :ok <- reject_top_level_state_mode(attrs),
+         {:ok, version} <- optional_policy_version(attrs),
          {:ok, retry} <- optional_retry_override(attrs),
          {:ok, retention} <- optional_retention_override(attrs),
          {:ok, indexed_attributes} <- optional_indexed_attributes(attrs),
@@ -114,6 +115,28 @@ defmodule Ferricstore.Flow.RetryPolicy do
     |> merge_retry(state_retry(flow_policy, state))
     |> merge_retry(command_override)
   end
+
+  def state_mode(%{states: states}, state) when is_map(states) and is_binary(state) do
+    case Map.get(states, state) do
+      %{mode: mode} when mode in [:parallel, :fifo] -> mode
+      _other -> :parallel
+    end
+  end
+
+  def state_mode(_flow_policy, _state), do: :parallel
+
+  def state_fifo?(flow_policy, state), do: state_mode(flow_policy, state) == :fifo
+
+  def fifo_states(%{states: states}) when is_map(states) do
+    states
+    |> Enum.flat_map(fn
+      {state, %{mode: :fifo}} -> [state]
+      _other -> []
+    end)
+    |> MapSet.new()
+  end
+
+  def fifo_states(_flow_policy), do: MapSet.new()
 
   def resolve_retention(flow_policy, state, command_override) do
     default_retention()
@@ -412,10 +435,19 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
+  defp reject_top_level_state_mode(attrs) do
+    if has_policy_key?(attrs, :mode, "mode") do
+      {:error, "ERR flow state mode is state-level only"}
+    else
+      :ok
+    end
+  end
+
   defp normalize_state_policies(states) when is_map(states) do
     Enum.reduce_while(states, {:ok, %{}}, fn {state, policy}, {:ok, acc} ->
       with {:ok, state} <- normalize_state_name(state),
            policy = policy_map(policy),
+           {:ok, mode} <- optional_state_mode(policy),
            {:ok, retry} <- optional_retry_override(policy),
            {:ok, retention} <- optional_retention_override(policy),
            {:ok, governance} <- optional_governance(policy) do
@@ -424,7 +456,12 @@ defmodule Ferricstore.Flow.RetryPolicy do
           Map.put(
             acc,
             state,
-            drop_nil_policy_fields(%{retry: retry, retention: retention, governance: governance})
+            drop_nil_policy_fields(%{
+              mode: mode,
+              retry: retry,
+              retention: retention,
+              governance: governance
+            })
           )}}
       else
         {:error, _reason} = error -> {:halt, error}
@@ -461,6 +498,29 @@ defmodule Ferricstore.Flow.RetryPolicy do
        do: true
 
   defp state_policy_pair?(_entry), do: false
+
+  defp optional_state_mode(policy) do
+    if has_policy_key?(policy, :mode, "mode") do
+      policy
+      |> fetch_policy(:mode, "mode", nil)
+      |> normalize_state_mode()
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp normalize_state_mode(mode) when mode in [:parallel, :fifo], do: {:ok, mode}
+
+  defp normalize_state_mode(mode) when is_binary(mode) do
+    case String.downcase(mode) do
+      "parallel" -> {:ok, :parallel}
+      "fifo" -> {:ok, :fifo}
+      _other -> {:error, "ERR flow state mode must be parallel or fifo"}
+    end
+  end
+
+  defp normalize_state_mode(_mode),
+    do: {:error, "ERR flow state mode must be parallel or fifo"}
 
   defp policy_map(policy) when is_map(policy), do: policy
 

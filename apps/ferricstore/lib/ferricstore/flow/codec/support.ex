@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   @record_indexed_attributes_key "__indexed_attributes__"
   @record_state_meta_key "__state_meta__"
   @record_indexed_state_meta_key "__indexed_state_meta__"
+  @record_state_enter_seq_key "__state_enter_seq__"
   @history_value_refs_key "value_refs"
   @history_attributes_key "attributes"
   @history_state_meta_key "state_meta"
@@ -253,9 +254,11 @@ defmodule Ferricstore.Flow.Codec.Support do
     indexed_attributes = Ferricstore.Flow.Attributes.indexed_names(record)
     state_meta = Ferricstore.Flow.StateMeta.record(record)
     indexed_state_meta = Ferricstore.Flow.StateMeta.indexed_key(record)
+    state_enter_seq = Map.get(record, :state_enter_seq)
 
     if map_size(refs) == 0 and map_size(attributes) == 0 and indexed_attributes == [] and
-         map_size(state_meta) == 0 and is_nil(indexed_state_meta) do
+         map_size(state_meta) == 0 and is_nil(indexed_state_meta) and
+         not is_integer(state_enter_seq) do
       encode_child_groups(child_groups)
     else
       child_groups
@@ -264,6 +267,7 @@ defmodule Ferricstore.Flow.Codec.Support do
       |> maybe_put_record_indexed_attributes(indexed_attributes)
       |> maybe_put_record_state_meta(state_meta)
       |> maybe_put_record_indexed_state_meta(indexed_state_meta)
+      |> maybe_put_record_state_enter_seq(state_enter_seq)
       |> encode_child_groups()
     end
   end
@@ -285,14 +289,18 @@ defmodule Ferricstore.Flow.Codec.Support do
     {indexed_state_meta, child_groups} =
       Map.pop(child_groups, @record_indexed_state_meta_key, nil)
 
+    {state_enter_seq, child_groups} =
+      Map.pop(child_groups, @record_state_enter_seq_key, nil)
+
     {child_groups, decode_value_refs(encoded_refs),
      Ferricstore.Flow.Attributes.decode_sidecar(encoded_attributes),
      decode_record_indexed_attributes(indexed_attributes),
      Ferricstore.Flow.StateMeta.decode_sidecar(encoded_state_meta),
-     decode_record_indexed_state_meta(indexed_state_meta)}
+     decode_record_indexed_state_meta(indexed_state_meta),
+     decode_record_state_enter_seq(state_enter_seq)}
   end
 
-  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, [], %{}, nil}
+  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, [], %{}, nil, nil}
 
   def maybe_put_record_refs(groups, refs) when is_map(refs) and map_size(refs) > 0,
     do: Map.put(groups, @record_value_refs_key, encode_value_refs(refs))
@@ -325,6 +333,11 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def maybe_put_record_indexed_state_meta(groups, _key), do: groups
 
+  def maybe_put_record_state_enter_seq(groups, seq) when is_integer(seq) and seq >= 0,
+    do: Map.put(groups, @record_state_enter_seq_key, seq)
+
+  def maybe_put_record_state_enter_seq(groups, _seq), do: groups
+
   def decode_record_indexed_attributes(names) do
     case Ferricstore.Flow.Attributes.normalize_indexed_names(names) do
       {:ok, names} -> names
@@ -338,6 +351,9 @@ defmodule Ferricstore.Flow.Codec.Support do
       {:error, _reason} -> nil
     end
   end
+
+  def decode_record_state_enter_seq(seq) when is_integer(seq) and seq >= 0, do: seq
+  def decode_record_state_enter_seq(_seq), do: nil
 
   def flow_record_value_refs(record) when is_map(record) do
     record

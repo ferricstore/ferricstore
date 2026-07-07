@@ -757,9 +757,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         with :ok <- flow_validate_create_attrs(attrs) do
           key_info = flow_create_fast_key_info(attrs, state_key)
           record = flow_create_record(state, attrs)
-          plan = flow_create_fast_plan(record, attrs, key_info)
 
-          with false <- Map.get(attrs, :idempotent, false),
+          with :ok <- flow_require_fifo_entry(state, attrs, record, true),
+               false <- Map.get(attrs, :idempotent, false),
+               plan = flow_create_fast_plan(record, attrs, key_info),
                :ok <- flow_many_same_state_machine_shard_by_keys?(state, [key_info]),
                :ok <- flow_validate_create_fast_plan_keys(plan) do
             flow_create_many_fast_apply(state, [plan])
@@ -797,9 +798,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             |> flow_create_record(attrs)
             |> flow_start_and_claim_record(attrs)
 
-          plan = flow_create_fast_plan(record, attrs, key_info)
-
-          with :ok <- flow_many_same_state_machine_shard_by_keys?(state, [key_info]),
+          with :ok <- flow_require_fifo_entry(state, attrs, record, true),
+               plan = flow_create_fast_plan(record, attrs, key_info),
+               :ok <- flow_many_same_state_machine_shard_by_keys?(state, [key_info]),
                :ok <- flow_validate_create_fast_plan_keys(plan),
                :ok <- flow_create_many_fast_apply(state, [plan]) do
             {:ok, record}
@@ -1039,10 +1040,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
           |> Enum.zip(key_infos)
           |> Enum.reduce_while({:ok, []}, fn {%{id: _id} = attrs, key_info}, {:ok, acc} ->
             record = flow_create_record(state, attrs)
-            plan = flow_create_fast_plan(record, attrs, key_info)
 
-            case flow_validate_create_fast_plan_keys(plan) do
-              :ok -> {:cont, {:ok, [plan | acc]}}
+            with :ok <- flow_require_fifo_entry(state, attrs, record, true),
+                 plan = flow_create_fast_plan(record, attrs, key_info),
+                 :ok <- flow_validate_create_fast_plan_keys(plan) do
+              {:cont, {:ok, [plan | acc]}}
+            else
               {:error, _reason} = error -> {:halt, error}
             end
           end)
@@ -1070,10 +1073,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
               |> flow_create_record(attrs)
               |> flow_start_and_claim_record(attrs)
 
-            plan = flow_create_fast_plan(record, attrs, key_info)
-
-            case flow_validate_create_fast_plan_keys(plan) do
-              :ok -> {:cont, {:ok, [plan | plans], [record | records]}}
+            with :ok <- flow_require_fifo_entry(state, attrs, record, true),
+                 plan = flow_create_fast_plan(record, attrs, key_info),
+                 :ok <- flow_validate_create_fast_plan_keys(plan) do
+              {:cont, {:ok, [plan | plans], [record | records]}}
+            else
               {:error, _reason} = error -> {:halt, error}
             end
           end)

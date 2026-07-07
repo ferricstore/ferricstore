@@ -101,6 +101,7 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRust
                       ],
                       states: %{
                         "charge_card" => [
+                          mode: :fifo,
                           retry: [max_retries: 1, exhausted_to: "payment_failed"],
                           retention: [
                             ttl_ms: 30_000,
@@ -130,6 +131,7 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRust
         assert %{
                  "type" => ^type,
                  "state" => "charge_card",
+                 "mode" => :fifo,
                  "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
                  "retention" => %{
                    "ttl_ms" => 30_000,
@@ -180,6 +182,8 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRust
                      "failed",
                      "STATE",
                      "charge_card",
+                     "MODE",
+                     "FIFO",
                      "MAX_RETRIES",
                      "1",
                      "EXHAUSTED_TO",
@@ -208,6 +212,7 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRust
         assert %{
                  "type" => ^type,
                  "state" => "charge_card",
+                 "mode" => :fifo,
                  "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
                  "retention" => %{
                    "ttl_ms" => 30_000,
@@ -224,6 +229,13 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRust
                  Dispatcher.dispatch(
                    "FLOW.POLICY.SET",
                    [type, "STATE", "queued", "MAX_RETRIES"],
+                   MockStore.make()
+                 )
+
+        assert {:error, "ERR flow state mode must be parallel or fifo"} =
+                 Dispatcher.dispatch(
+                   "FLOW.POLICY.SET",
+                   [type, "STATE", "queued", "MODE", "PRIORITY"],
                    MockStore.make()
                  )
 

@@ -1,6 +1,7 @@
 defmodule Ferricstore.Flow.PipelineRead do
   @moduledoc false
 
+  alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.ValueHydration
   alias Ferricstore.Store.Router
 
@@ -212,7 +213,9 @@ defmodule Ferricstore.Flow.PipelineRead do
       end)
       |> Enum.flat_map(fn
         {{false, _max_bytes}, entries} ->
-          Enum.map(entries, fn {idx, record, _payload_return} -> {idx, {:ok, record}} end)
+          Enum.map(entries, fn {idx, record, _payload_return} ->
+            {idx, {:ok, RecordProjection.public(record)}}
+          end)
 
         {{true, max_bytes}, entries} ->
           hydrated_records =
@@ -225,7 +228,7 @@ defmodule Ferricstore.Flow.PipelineRead do
           entries
           |> Enum.map(fn {idx, _record, _payload_return} -> idx end)
           |> Enum.zip(hydrated_records)
-          |> Enum.map(fn {idx, record} -> {idx, {:ok, record}} end)
+          |> Enum.map(fn {idx, record} -> {idx, {:ok, RecordProjection.public(record)}} end)
       end)
 
     pass_through ++ hydrated

@@ -1457,7 +1457,7 @@ defmodule Ferricstore.Flow.ReadAPI do
     if Keyword.get(opts, :return) == :meta do
       Enum.map(records, &RecordProjection.meta/1)
     else
-      records
+      Enum.map(records, &RecordProjection.public/1)
     end
   end
 

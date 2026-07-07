@@ -25,6 +25,13 @@ defmodule Ferricstore.Flow.RecordProjection do
     :state_meta
   ]
 
+  def public(record) when is_map(record), do: Map.delete(record, :state_enter_seq)
+  def public(record), do: record
+
+  def public_result({:ok, record}) when is_map(record), do: {:ok, public(record)}
+  def public_result({:ok, records}) when is_list(records), do: {:ok, Enum.map(records, &public/1)}
+  def public_result(result), do: result
+
   def meta(record) when is_map(record), do: :maps.with(@meta_keys, record)
   def meta(record), do: record
 
