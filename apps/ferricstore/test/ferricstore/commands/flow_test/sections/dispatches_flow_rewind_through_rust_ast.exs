@@ -247,6 +247,82 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRust
                  )
       end
 
+      test "dispatches FIFO policy and claims through Rust AST command path" do
+        suffix = System.unique_integer([:positive])
+        type = uid("flow-policy-fifo-command")
+        partition = "tenant:fifo-command:#{suffix}"
+        first_id = "z-fifo-command-first:#{suffix}"
+        second_id = "a-fifo-command-second:#{suffix}"
+
+        assert %{"type" => ^type, "states" => %{"queued" => %{"mode" => :fifo}}} =
+                 Dispatcher.dispatch(
+                   "FLOW.POLICY.SET",
+                   [type, "STATE", "queued", "MODE", "FIFO"],
+                   MockStore.make()
+                 )
+
+        for {id, now_ms} <- [{first_id, "1000"}, {second_id, "1000"}] do
+          assert "OK" =
+                   Dispatcher.dispatch(
+                     "FLOW.CREATE",
+                     [
+                       id,
+                       "TYPE",
+                       type,
+                       "STATE",
+                       "queued",
+                       "PARTITION",
+                       partition,
+                       "PAYLOAD",
+                       id,
+                       "NOW",
+                       now_ms,
+                       "RUN_AT",
+                       "2000"
+                     ],
+                     MockStore.make()
+                   )
+        end
+
+        assert [%{"id" => ^first_id}] =
+                 Dispatcher.dispatch(
+                   "FLOW.CLAIM_DUE",
+                   [
+                     type,
+                     "STATE",
+                     "queued",
+                     "PARTITION",
+                     partition,
+                     "WORKER",
+                     "resp-fifo-worker",
+                     "LIMIT",
+                     "10",
+                     "NOW",
+                     "2000"
+                   ],
+                   MockStore.make()
+                 )
+
+        assert [] =
+                 Dispatcher.dispatch(
+                   "FLOW.CLAIM_DUE",
+                   [
+                     type,
+                     "STATE",
+                     "queued",
+                     "PARTITION",
+                     partition,
+                     "WORKER",
+                     "resp-fifo-worker",
+                     "LIMIT",
+                     "10",
+                     "NOW",
+                     "2001"
+                   ],
+                   MockStore.make()
+                 )
+      end
+
       test "Flow commands are visible in COMMAND catalog" do
         names = Dispatcher.dispatch("COMMAND", ["LIST"], MockStore.make())
         assert "flow.create" in names

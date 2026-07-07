@@ -15,6 +15,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_set 0x0102
+  @op_flow_create 0x0201
+  @op_flow_claim_due 0x0203
   @op_flow_policy_set 0x021E
   @op_flow_search 0x0230
   @op_flow_circuit_open 0x024A
@@ -226,6 +228,81 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.indexed_attributes == ["tenant", "region"]
     assert payload.indexed_state_meta == "version"
     assert payload.retry.max_retries == 5
+  end
+
+  test "native Flow opcodes enforce FIFO lane claims" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    type = "native-fifo-#{suffix}"
+    partition = "native:fifo:#{suffix}:partition"
+    first_id = "z-native-fifo-first:#{suffix}"
+    second_id = "a-native-fifo-second:#{suffix}"
+
+    {status, policy, _state} =
+      Commands.execute(
+        @op_flow_policy_set,
+        %{
+          "type" => type,
+          "states" => %{"queued" => %{"mode" => "fifo"}}
+        },
+        state()
+      )
+
+    assert status == :ok
+    assert policy.states["queued"].mode == :fifo
+
+    for {id, now_ms} <- [{first_id, 1_000}, {second_id, 1_000}] do
+      {status, payload, _state} =
+        Commands.execute(
+          @op_flow_create,
+          %{
+            "id" => id,
+            "type" => type,
+            "state" => "queued",
+            "partition_key" => partition,
+            "payload" => id,
+            "now_ms" => now_ms,
+            "run_at_ms" => 2_000
+          },
+          state()
+        )
+
+      assert status == :ok
+      assert payload == "OK"
+    end
+
+    {status, claimed, _state} =
+      Commands.execute(
+        @op_flow_claim_due,
+        %{
+          "type" => type,
+          "state" => "queued",
+          "partition_key" => partition,
+          "worker" => "native-fifo-worker",
+          "limit" => 10,
+          "now_ms" => 2_000
+        },
+        state()
+      )
+
+    assert status == :ok
+    assert [%{id: ^first_id}] = claimed
+
+    {status, claimed, _state} =
+      Commands.execute(
+        @op_flow_claim_due,
+        %{
+          "type" => type,
+          "state" => "queued",
+          "partition_key" => partition,
+          "worker" => "native-fifo-worker",
+          "limit" => 10,
+          "now_ms" => 2_001
+        },
+        state()
+      )
+
+    assert status == :ok
+    assert claimed == []
   end
 
   test "FLOW.SEARCH returns indexed records through COMMAND_EXEC and native opcode" do

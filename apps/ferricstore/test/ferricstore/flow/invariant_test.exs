@@ -2,6 +2,39 @@ defmodule Ferricstore.Flow.InvariantTest do
   use Ferricstore.Test.FlowCase
 
   describe "claim_due invariants" do
+    test "states are parallel by default until policy opts a state into fifo" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-default-parallel-type")
+      partition_key = "tenant:default-parallel:#{suffix}"
+      first_id = "z-default-parallel-first:#{suffix}"
+      second_id = "a-default-parallel-second:#{suffix}"
+
+      for {id, now_ms} <- [{first_id, 1_000}, {second_id, 1_001}] do
+        assert :ok =
+                 FerricStore.flow_create(id,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition_key,
+                   priority: 1,
+                   payload: id,
+                   now_ms: now_ms,
+                   run_at_ms: 2_000
+                 )
+      end
+
+      assert {:ok, claimed} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 priority: 1,
+                 limit: 10,
+                 worker: "parallel-worker",
+                 now_ms: 2_000
+               )
+
+      assert MapSet.new(Enum.map(claimed, & &1.id)) == MapSet.new([first_id, second_id])
+    end
+
     test "fifo state claims one flow per partition lane in state-entry order" do
       suffix = System.unique_integer([:positive])
       type = unique_flow_id("flow-invariant-fifo-type")
@@ -208,6 +241,298 @@ defmodule Ferricstore.Flow.InvariantTest do
                )
 
       assert charge.id == charge_id
+    end
+
+    test "fifo any-partition claims at most one flow per partition lane" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-any-type")
+      partition_a = "tenant:fifo-any-a:#{suffix}"
+      partition_b = "tenant:fifo-any-b:#{suffix}"
+      first_a = "z-fifo-any-a-first:#{suffix}"
+      second_a = "a-fifo-any-a-second:#{suffix}"
+      first_b = "z-fifo-any-b-first:#{suffix}"
+      second_b = "a-fifo-any-b-second:#{suffix}"
+
+      put_fifo_policy!(type)
+
+      for {id, partition_key, now_ms} <- [
+            {first_a, partition_a, 1_000},
+            {second_a, partition_a, 1_001},
+            {first_b, partition_b, 1_002},
+            {second_b, partition_b, 1_003}
+          ] do
+        create_fifo_flow!(id, type, partition_key, now_ms: now_ms, run_at_ms: 2_000)
+      end
+
+      assert {:ok, claimed} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: :any,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert MapSet.new(Enum.map(claimed, & &1.id)) == MapSet.new([first_a, first_b])
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: :any,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_001
+               )
+
+      partition_by_id = %{first_a => partition_a, first_b => partition_b}
+
+      for record <- claimed do
+        assert :ok =
+                 FerricStore.flow_complete(record.id, record.lease_token,
+                   result: "done",
+                   fencing_token: record.fencing_token,
+                   partition_key: Map.fetch!(partition_by_id, record.id),
+                   now_ms: 2_100
+                 )
+      end
+
+      assert {:ok, claimed_after_complete} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: :any,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_101
+               )
+
+      assert MapSet.new(Enum.map(claimed_after_complete, & &1.id)) ==
+               MapSet.new([second_a, second_b])
+    end
+
+    test "fifo partition list claims at most one flow per listed partition lane" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-partition-list-type")
+      partition_a = "tenant:fifo-list-a:#{suffix}"
+      partition_b = "tenant:fifo-list-b:#{suffix}"
+      partition_c = "tenant:fifo-list-c:#{suffix}"
+      first_a = "z-fifo-list-a-first:#{suffix}"
+      second_a = "a-fifo-list-a-second:#{suffix}"
+      first_b = "z-fifo-list-b-first:#{suffix}"
+      second_b = "a-fifo-list-b-second:#{suffix}"
+      ignored_c = "z-fifo-list-c-ignored:#{suffix}"
+
+      put_fifo_policy!(type)
+
+      for {id, partition_key, now_ms} <- [
+            {first_a, partition_a, 1_000},
+            {second_a, partition_a, 1_001},
+            {first_b, partition_b, 1_002},
+            {second_b, partition_b, 1_003},
+            {ignored_c, partition_c, 1_004}
+          ] do
+        create_fifo_flow!(id, type, partition_key, now_ms: now_ms, run_at_ms: 2_000)
+      end
+
+      assert {:ok, claimed} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_keys: [partition_a, partition_b],
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert MapSet.new(Enum.map(claimed, & &1.id)) == MapSet.new([first_a, first_b])
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_keys: [partition_a, partition_b],
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_001
+               )
+
+      assert {:ok, [ignored]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_keys: [partition_c],
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_001
+               )
+
+      assert ignored.id == ignored_c
+    end
+
+    test "fifo pipeline claim batch does not overclaim a single partition lane" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-pipeline-type")
+      partition_key = "tenant:fifo-pipeline:#{suffix}"
+      first_id = "z-fifo-pipeline-first:#{suffix}"
+      second_id = "a-fifo-pipeline-second:#{suffix}"
+      ctx = FerricStore.Instance.get(:default)
+
+      put_fifo_policy!(type)
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 2_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_001, run_at_ms: 2_000)
+
+      assert [
+               {:ok, [%{id: ^first_id}]},
+               {:ok, []}
+             ] =
+               Ferricstore.Flow.pipeline_claim_due_batch(ctx, [
+                 {:claim_due, type,
+                  [
+                    state: "queued",
+                    worker: "fifo-worker-a",
+                    partition_key: partition_key,
+                    limit: 1,
+                    now_ms: 2_000
+                  ]},
+                 {:claim_due, type,
+                  [
+                    state: "queued",
+                    worker: "fifo-worker-b",
+                    partition_key: partition_key,
+                    limit: 1,
+                    now_ms: 2_000
+                  ]}
+               ])
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_001
+               )
+    end
+
+    test "fifo reclaim picks the expired lane head instead of the queued follower" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-reclaim-type")
+      partition_key = "tenant:fifo-reclaim:#{suffix}"
+      first_id = "z-fifo-reclaim-first:#{suffix}"
+      second_id = "a-fifo-reclaim-second:#{suffix}"
+
+      put_fifo_policy!(type)
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 2_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_001, run_at_ms: 2_000)
+
+      assert {:ok, [%{id: ^first_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 lease_ms: 50,
+                 worker: "old-worker",
+                 now_ms: 2_000
+               )
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_010
+               )
+
+      assert {:ok, [reclaimed]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 lease_ms: 50,
+                 worker: "new-worker",
+                 now_ms: 2_100
+               )
+
+      assert reclaimed.id == first_id
+      assert reclaimed.lease_owner == "new-worker"
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_101
+               )
+    end
+
+    test "fifo lane unblocks when the running flow transitions out of the fifo state" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-transition-unblock-type")
+      partition_key = "tenant:fifo-transition-unblock:#{suffix}"
+      first_id = "z-fifo-transition-first:#{suffix}"
+      second_id = "a-fifo-transition-second:#{suffix}"
+
+      put_fifo_policy!(type, ["queued"])
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 2_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_001, run_at_ms: 2_000)
+
+      assert {:ok, [first]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert :ok =
+               FerricStore.flow_transition(first.id, "running", "waiting",
+                 lease_token: first.lease_token,
+                 fencing_token: first.fencing_token,
+                 partition_key: partition_key,
+                 run_at_ms: 5_000,
+                 now_ms: 2_100
+               )
+
+      assert {:ok, [second]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_101
+               )
+
+      assert second.id == second_id
+    end
+
+    test "fifo state-entry order survives restart when ids and timestamps would sort differently" do
+      isolated = ShardHelpers.setup_isolated_data_dir()
+
+      on_exit(fn ->
+        ShardHelpers.teardown_isolated_data_dir(isolated)
+      end)
+
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-restart-type")
+      partition_key = "tenant:fifo-restart:#{suffix}"
+      first_id = "z-fifo-restart-first:#{suffix}"
+      second_id = "a-fifo-restart-second:#{suffix}"
+
+      put_fifo_policy!(type)
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 2_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_000, run_at_ms: 2_000)
+
+      :ok = ShardHelpers.restart_current_data_dir(isolated)
+
+      assert {:ok, [first]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert first.id == first_id
     end
 
     test "fifo state rejects priority and implicit partition entry" do
@@ -595,5 +920,27 @@ defmodule Ferricstore.Flow.InvariantTest do
       assert {:ok, ref} = FerricStore.flow_value_put("shared-doc", now_ms: 1_000)
       assert {:ok, ["shared-doc"]} = FerricStore.flow_value_mget([ref.ref])
     end
+  end
+
+  defp put_fifo_policy!(type, states \\ ["queued"]) do
+    state_policies = Map.new(states, &{&1, [mode: :fifo]})
+
+    assert {:ok, _policy} = FerricStore.flow_policy_set(type, states: state_policies)
+    :ok
+  end
+
+  defp create_fifo_flow!(id, type, partition_key, opts) do
+    assert :ok =
+             FerricStore.flow_create(
+               id,
+               [
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 payload: id
+               ] ++ opts
+             )
+
+    :ok
   end
 end

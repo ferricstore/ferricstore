@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.7.4 - 2026-07-07
+
+- Fixed lagged LMDB terminal Flow cleanup so stale cold keydir rows are pruned only after durable projection while startup rebuild remains non-destructive.
+- Preserved LFU Flow state version wrappers during hotness updates for cold Flow rows.
+- Added FIFO Flow coverage for partition-wide claims, explicit partition lists, batched claims, expired lease reclaim, state transitions, restart replay ordering, RESP command dispatch, and native opcode execution.
+
 ## 0.7.3 - 2026-07-07
 
 - Added native `FLOW.POLICY.SET` support for indexed Flow attributes.
