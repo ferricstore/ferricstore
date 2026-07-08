@@ -133,6 +133,7 @@ const RECORD_FLAG_LEASE_DEADLINE_MS: u64 = 1 << 20;
 const RECORD_FLAG_RUN_STATE: u64 = 1 << 21;
 const RECORD_FLAG_REWOUND_TO_EVENT_ID: u64 = 1 << 22;
 const RECORD_FLAG_SIDECAR: u64 = 1 << 23;
+const RECORD_FLAG_MAX_ACTIVE_MS: u64 = 1 << 24;
 
 const HISTORY_FLAG_PRIORITY: u64 = 1 << 0;
 const HISTORY_FLAG_ATTEMPTS: u64 = 1 << 1;
@@ -164,6 +165,7 @@ struct FlowRecordParts<'a> {
     history_max_events: Option<u64>,
     retention_ttl_ms: Option<u64>,
     terminal_retention_until_ms: Option<u64>,
+    max_active_ms: Option<u64>,
     partition_key: Option<&'a [u8]>,
     payload_ref: Option<&'a [u8]>,
     parent_flow_id: Option<&'a [u8]>,
@@ -963,6 +965,7 @@ pub fn flow_record_encode<'a>(
     history_max_events: Option<u64>,
     retention_ttl_ms: Option<u64>,
     terminal_retention_until_ms: Option<u64>,
+    max_active_ms: Option<u64>,
     partition_key: Option<Binary<'a>>,
     payload_ref: Option<Binary<'a>>,
     parent_flow_id: Option<Binary<'a>>,
@@ -994,6 +997,7 @@ pub fn flow_record_encode<'a>(
         history_max_events,
         retention_ttl_ms,
         terminal_retention_until_ms,
+        max_active_ms,
         optional_bin_slice(partition_key.as_ref()),
         optional_bin_slice(payload_ref.as_ref()),
         optional_bin_slice(parent_flow_id.as_ref()),
@@ -1030,6 +1034,7 @@ fn encode_flow_record_compact(
     history_max_events: Option<u64>,
     retention_ttl_ms: Option<u64>,
     terminal_retention_until_ms: Option<u64>,
+    max_active_ms: Option<u64>,
     partition_key: Option<&[u8]>,
     payload_ref: Option<&[u8]>,
     parent_flow_id: Option<&[u8]>,
@@ -1058,6 +1063,7 @@ fn encode_flow_record_compact(
         history_max_events,
         retention_ttl_ms,
         terminal_retention_until_ms,
+        max_active_ms,
         partition_key,
         payload_ref,
         parent_flow_id,
@@ -1133,6 +1139,7 @@ fn encode_flow_record_compact(
         RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS,
         terminal_retention_until_ms,
     );
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_MAX_ACTIVE_MS, max_active_ms);
     encode_flagged_bin(&mut out, flags, RECORD_FLAG_PARTITION_KEY, partition_key);
     encode_flagged_bin(&mut out, flags, RECORD_FLAG_PAYLOAD_REF, payload_ref);
     encode_flagged_bin(&mut out, flags, RECORD_FLAG_PARENT_FLOW_ID, parent_flow_id);
@@ -1191,6 +1198,7 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
         option_u64_term(env, record.history_max_events),
         option_u64_term(env, record.retention_ttl_ms),
         option_u64_term(env, record.terminal_retention_until_ms),
+        option_u64_term(env, record.max_active_ms),
         option_binary_term(env, record.partition_key)?,
         option_binary_term(env, record.payload_ref)?,
         option_binary_term(env, record.parent_flow_id)?,
@@ -1235,6 +1243,7 @@ pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult
         option_u64_term(env, record.fencing_token),
         option_u64_term(env, record.attempts),
         option_binary_term(env, record.run_state)?,
+        option_u64_term(env, record.max_active_ms),
         binary_term(env, record.child_groups_encoded)?,
     ];
 
@@ -2079,6 +2088,8 @@ fn decode_flow_record(value: &[u8]) -> Option<FlowRecordParts<'_>> {
     let (terminal_retention_until_ms, rest) =
         decode_flagged_int(input, flags, RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS, None)?;
     input = rest;
+    let (max_active_ms, rest) = decode_flagged_int(input, flags, RECORD_FLAG_MAX_ACTIVE_MS, None)?;
+    input = rest;
     let (partition_key, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_PARTITION_KEY)?;
     input = rest;
     let (payload_ref, rest) = decode_flagged_bin(input, flags, RECORD_FLAG_PAYLOAD_REF)?;
@@ -2130,6 +2141,7 @@ fn decode_flow_record(value: &[u8]) -> Option<FlowRecordParts<'_>> {
         history_max_events,
         retention_ttl_ms,
         terminal_retention_until_ms,
+        max_active_ms,
         partition_key,
         payload_ref,
         parent_flow_id,
@@ -2303,6 +2315,7 @@ fn encode_claimed_record(
         record.history_max_events,
         record.retention_ttl_ms,
         None,
+        record.max_active_ms,
         record.partition_key,
         record.payload_ref,
         record.parent_flow_id,
@@ -2398,6 +2411,7 @@ fn encode_record_flags(
     history_max_events: Option<u64>,
     retention_ttl_ms: Option<u64>,
     terminal_retention_until_ms: Option<u64>,
+    max_active_ms: Option<u64>,
     partition_key: Option<&[u8]>,
     payload_ref: Option<&[u8]>,
     parent_flow_id: Option<&[u8]>,
@@ -2435,6 +2449,7 @@ fn encode_record_flags(
         RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS,
         terminal_retention_until_ms,
     );
+    flag_int_present(&mut flags, RECORD_FLAG_MAX_ACTIVE_MS, max_active_ms);
     flag_bin(&mut flags, RECORD_FLAG_PARTITION_KEY, partition_key);
     flag_bin(&mut flags, RECORD_FLAG_PAYLOAD_REF, payload_ref);
     flag_bin(&mut flags, RECORD_FLAG_PARENT_FLOW_ID, parent_flow_id);

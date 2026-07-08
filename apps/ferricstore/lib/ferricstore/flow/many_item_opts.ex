@@ -249,6 +249,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
     |> maybe_put(:correlation_id, item, :correlation_id, "correlation_id")
     |> maybe_put(:idempotent, item, :idempotent, "idempotent")
     |> maybe_put(:retention_ttl_ms, item, :retention_ttl_ms, "retention_ttl_ms")
+    |> maybe_put(:max_active_ms, item, :max_active_ms, "max_active_ms")
     |> maybe_put(:history_hot_max_events, item, :history_hot_max_events, "history_hot_max_events")
     |> maybe_put(:history_max_events, item, :history_max_events, "history_max_events")
   end

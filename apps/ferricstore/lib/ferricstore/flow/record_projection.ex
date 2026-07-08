@@ -20,6 +20,7 @@ defmodule Ferricstore.Flow.RecordProjection do
     :fencing_token,
     :attempts,
     :run_state,
+    :max_active_ms,
     :value_refs,
     :attributes,
     :state_meta

@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
   @max_retries 1_000
   @max_delay_ms 2_592_000_000
   @max_retention_ttl_ms 31_536_000_000
+  @max_active_ms 31_536_000_000
   @max_history_hot_max_events 10_000
   @max_history_max_events 1_000_000
 
@@ -53,6 +54,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
   def normalize_flow_policy(type, attrs) when is_binary(type) and is_map(attrs) do
     with :ok <- reject_top_level_state_mode(attrs),
          {:ok, version} <- optional_policy_version(attrs),
+         {:ok, max_active_ms} <- optional_max_active_ms(attrs),
          {:ok, retry} <- optional_retry_override(attrs),
          {:ok, retention} <- optional_retention_override(attrs),
          {:ok, indexed_attributes} <- optional_indexed_attributes(attrs),
@@ -63,6 +65,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
         %{
           type: type,
           version: version,
+          max_active_ms: max_active_ms,
           retry: retry,
           retention: retention,
           states: states,
@@ -138,6 +141,21 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   def fifo_states(_flow_policy), do: MapSet.new()
 
+  def resolve_max_active_ms(flow_policy, command_override \\ nil)
+
+  def resolve_max_active_ms(_flow_policy, command_override) when is_integer(command_override),
+    do: command_override
+
+  def resolve_max_active_ms(_flow_policy, command_override)
+      when command_override in [:infinity, "infinity", "INFINITY"],
+      do: nil
+
+  def resolve_max_active_ms(%{max_active_ms: max_active_ms}, _command_override)
+      when is_integer(max_active_ms),
+      do: max_active_ms
+
+  def resolve_max_active_ms(_flow_policy, _command_override), do: nil
+
   def resolve_retention(flow_policy, state, command_override) do
     default_retention()
     |> merge_retention(policy_retention(flow_policy))
@@ -177,6 +195,16 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
       _other ->
         {:error, "ERR flow policy version must be a non-empty string or non-negative integer"}
+    end
+  end
+
+  defp optional_max_active_ms(attrs) do
+    if has_policy_key?(attrs, :max_active_ms, "max_active_ms") do
+      attrs
+      |> fetch_policy(:max_active_ms, "max_active_ms", nil)
+      |> validate_max_active_ms()
+    else
+      {:ok, nil}
     end
   end
 
@@ -447,6 +475,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
     Enum.reduce_while(states, {:ok, %{}}, fn {state, policy}, {:ok, acc} ->
       with {:ok, state} <- normalize_state_name(state),
            policy = policy_map(policy),
+           :ok <- reject_state_level_max_active_ms(policy),
            {:ok, mode} <- optional_state_mode(policy),
            {:ok, retry} <- optional_retry_override(policy),
            {:ok, retention} <- optional_retention_override(policy),
@@ -521,6 +550,14 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   defp normalize_state_mode(_mode),
     do: {:error, "ERR flow state mode must be parallel or fifo"}
+
+  defp reject_state_level_max_active_ms(policy) do
+    if has_policy_key?(policy, :max_active_ms, "max_active_ms") do
+      {:error, "ERR flow max_active_ms is type-level only"}
+    else
+      :ok
+    end
+  end
 
   defp policy_map(policy) when is_map(policy), do: policy
 
@@ -599,6 +636,16 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   defp validate_retention_ttl_ms(_value),
     do: {:error, "ERR flow retention ttl_ms must be between 1 and #{@max_retention_ttl_ms}"}
+
+  defp validate_max_active_ms(value)
+       when is_integer(value) and value > 0 and value <= @max_active_ms,
+       do: {:ok, value}
+
+  defp validate_max_active_ms(value) when value in [nil, :infinity, "infinity", "INFINITY"],
+    do: {:ok, nil}
+
+  defp validate_max_active_ms(_value),
+    do: {:error, "ERR flow max_active_ms must be between 1 and #{@max_active_ms} or infinity"}
 
   defp optional_history_hot_max_events(policy) do
     if has_policy_key?(policy, :history_hot_max_events, "history_hot_max_events") do

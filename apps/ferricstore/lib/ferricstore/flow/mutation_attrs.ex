@@ -16,6 +16,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
   @default_lease_ms 30_000
   @max_history_hot_max_events 10_000
   @max_history_max_events 1_000_000
+  @max_active_ms 31_536_000_000
   @default_max_batch_items 1_000
 
   def validate_opts(opts, allowed \\ []) do
@@ -102,6 +103,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, retention_ttl_ms} <- optional_retention_ttl_ms(opts),
+         {:ok, max_active_ms} <- optional_max_active_ms(opts),
          {:ok, history_hot_max_events} <- optional_history_hot_max_events(opts),
          {:ok, history_max_events} <- optional_history_max_events(opts),
          :ok <- validate_history_event_caps(history_hot_max_events, history_max_events),
@@ -124,6 +126,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_attr(:correlation_id, correlation_id)
         |> maybe_put_default_attr(:idempotent, idempotent, false)
         |> maybe_put_attr(:retention_ttl_ms, retention_ttl_ms)
+        |> maybe_put_attr(:max_active_ms, max_active_ms)
         |> maybe_put_attr(:history_hot_max_events, history_hot_max_events)
         |> maybe_put_attr(:history_max_events, history_max_events)
         |> maybe_put_default_attr(:priority, priority, @default_priority)
@@ -160,6 +163,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_ref_size(:correlation_id, correlation_id),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, retention_ttl_ms} <- optional_retention_ttl_ms(opts),
+         {:ok, max_active_ms} <- optional_max_active_ms(opts),
          {:ok, history_hot_max_events} <- optional_history_hot_max_events(opts),
          {:ok, history_max_events} <- optional_history_max_events(opts),
          :ok <- validate_history_event_caps(history_hot_max_events, history_max_events),
@@ -184,6 +188,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_attr(:root_flow_id, if(root_flow_id == id, do: nil, else: root_flow_id))
         |> maybe_put_attr(:correlation_id, correlation_id)
         |> maybe_put_attr(:retention_ttl_ms, retention_ttl_ms)
+        |> maybe_put_attr(:max_active_ms, max_active_ms)
         |> maybe_put_attr(:history_hot_max_events, history_hot_max_events)
         |> maybe_put_attr(:history_max_events, history_max_events)
         |> maybe_put_default_attr(:priority, priority, @default_priority)
@@ -977,6 +982,23 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
       true ->
         {:ok, nil}
+    end
+  end
+
+  def optional_max_active_ms(opts) do
+    if Keyword.has_key?(opts, :max_active_ms) do
+      case Keyword.get(opts, :max_active_ms) do
+        value when is_integer(value) and value > 0 and value <= @max_active_ms ->
+          {:ok, value}
+
+        value when value in [nil, :infinity, "infinity", "INFINITY"] ->
+          {:ok, :infinity}
+
+        _ ->
+          {:error, "ERR flow max_active_ms must be between 1 and #{@max_active_ms} or infinity"}
+      end
+    else
+      {:ok, nil}
     end
   end
 

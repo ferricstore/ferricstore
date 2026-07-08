@@ -713,7 +713,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         %{
           flows: Map.get(left, :flows, 0) + Map.get(right, :flows, 0),
           history: Map.get(left, :history, 0) + Map.get(right, :history, 0),
-          values: Map.get(left, :values, 0) + Map.get(right, :values, 0)
+          values: Map.get(left, :values, 0) + Map.get(right, :values, 0),
+          active_timeouts:
+            Map.get(left, :active_timeouts, 0) + Map.get(right, :active_timeouts, 0)
         }
       end
 

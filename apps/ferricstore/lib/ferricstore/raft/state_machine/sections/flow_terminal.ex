@@ -914,39 +914,52 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         now_ms = flow_attrs_now_ms(attrs)
         limit = Map.get(attrs, :limit, 100)
 
-        if flow_retention_history_projection_pending?(state) do
-          flow_retention_zero_counts()
-        else
-          ets_entries = flow_retention_expired_state_entries(state, now_ms, limit)
+        active_entries = flow_active_timeout_expired_state_entries(state, now_ms, limit)
 
-          ets_result =
-            Enum.reduce_while(ets_entries, flow_retention_zero_counts(), fn entry, {:ok, acc} ->
-              case flow_retention_cleanup_entry(state, entry) do
-                {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
-                {:error, _reason} = error -> {:halt, error}
-              end
-            end)
+        active_result =
+          Enum.reduce_while(active_entries, flow_retention_zero_counts(), fn entry, {:ok, acc} ->
+            case flow_active_timeout_entry(state, entry, now_ms) do
+              {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end)
 
-          with {:ok, acc} <- ets_result do
-            seen =
-              ets_entries
-              |> Enum.map(fn {state_key, _value, _expire_at_ms, _fid, _offset, _value_size} ->
-                state_key
+        with {:ok, active_acc} <- active_result do
+          if flow_retention_history_projection_pending?(state) do
+            {:ok, active_acc}
+          else
+            remaining_limit = max(limit - Map.get(active_acc, :active_timeouts, 0), 0)
+            ets_entries = flow_retention_expired_state_entries(state, now_ms, remaining_limit)
+
+            ets_result =
+              Enum.reduce_while(ets_entries, {:ok, active_acc}, fn entry, {:ok, acc} ->
+                case flow_retention_cleanup_entry(state, entry) do
+                  {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+                  {:error, _reason} = error -> {:halt, error}
+                end
               end)
-              |> MapSet.new()
 
-            state
-            |> flow_retention_expired_lmdb_state_keys(
-              now_ms,
-              max(limit - MapSet.size(seen), 0),
-              seen
-            )
-            |> Enum.reduce_while({:ok, acc}, fn state_key, {:ok, acc} ->
-              case flow_retention_cleanup_lmdb_state_key(state, state_key, now_ms) do
-                {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
-                {:error, _reason} = error -> {:halt, error}
-              end
-            end)
+            with {:ok, acc} <- ets_result do
+              seen =
+                ets_entries
+                |> Enum.map(fn {state_key, _value, _expire_at_ms, _fid, _offset, _value_size} ->
+                  state_key
+                end)
+                |> MapSet.new()
+
+              state
+              |> flow_retention_expired_lmdb_state_keys(
+                now_ms,
+                max(remaining_limit - MapSet.size(seen), 0),
+                seen
+              )
+              |> Enum.reduce_while({:ok, acc}, fn state_key, {:ok, acc} ->
+                case flow_retention_cleanup_lmdb_state_key(state, state_key, now_ms) do
+                  {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+                  {:error, _reason} = error -> {:halt, error}
+                end
+              end)
+            end
           end
         end
       end

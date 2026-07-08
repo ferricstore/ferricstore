@@ -10,6 +10,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
 
         assert {:ok, policy} =
                  FerricStore.flow_policy_set(type,
+                   max_active_ms: 120_000,
                    retention: [ttl_ms: 60_000, history_max_events: 512],
                    retry: [
                      max_retries: 5,
@@ -31,6 +32,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
                  )
 
         assert policy.retry.max_retries == 5
+        assert policy.max_active_ms == 120_000
         assert policy.retention.ttl_ms == 60_000
         refute Map.has_key?(policy.retention, :history_hot_max_events)
         assert policy.retention.history_max_events == 512
@@ -42,6 +44,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
         assert policy.states["charge_card"].retention.history_max_events == 256
 
         assert {:ok, state_policy} = FerricStore.flow_policy_get(type, state: "charge_card")
+        assert state_policy.max_active_ms == 120_000
         assert state_policy.retry.max_retries == 2
         assert state_policy.retry.backoff.base_ms == 10_000
         assert state_policy.retry.exhausted_to == "payment_failed"
@@ -56,6 +59,17 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
         assert {:error, "ERR flow retention history_hot_max_events is internal"} =
                  FerricStore.flow_policy_set(type,
                    retention: [ttl_ms: 5_000, history_hot_max_events: 3]
+                 )
+      end
+
+      test "flow policy rejects state-level max_active_ms because it is type-level only" do
+        type = uid("flow-policy-state-active-timeout")
+
+        assert {:error, "ERR flow max_active_ms is type-level only"} =
+                 FerricStore.flow_policy_set(type,
+                   states: %{
+                     "queued" => [max_active_ms: 1_000]
+                   }
                  )
       end
 

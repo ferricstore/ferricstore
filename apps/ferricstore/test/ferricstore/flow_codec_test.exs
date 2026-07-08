@@ -251,6 +251,7 @@ defmodule Ferricstore.FlowCodecTest do
       history_hot_max_events: 100,
       history_max_events: 1_000,
       retention_ttl_ms: 86_400_000,
+      max_active_ms: 300_000,
       terminal_retention_until_ms: nil,
       partition_key: nil,
       payload_ref: "flow/value/a/payload/1",

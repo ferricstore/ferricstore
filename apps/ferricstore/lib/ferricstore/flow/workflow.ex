@@ -475,6 +475,7 @@ defmodule FerricStore.Flow.Workflow do
         :correlation_id,
         :idempotent,
         :retention_ttl_ms,
+        :max_active_ms,
         :history_hot_max_events,
         :history_max_events
       ])
@@ -725,6 +726,7 @@ defmodule FerricStore.Flow.Workflow do
             :correlation_id,
             :idempotent,
             :retention_ttl_ms,
+            :max_active_ms,
             :history_hot_max_events,
             :history_max_events
           ])
@@ -909,6 +911,7 @@ defmodule FerricStore.Flow.Workflow do
       :correlation_id,
       :idempotent,
       :retention_ttl_ms,
+      :max_active_ms,
       :history_hot_max_events,
       :history_max_events
     ])

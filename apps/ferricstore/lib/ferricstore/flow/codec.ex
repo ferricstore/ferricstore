@@ -42,6 +42,7 @@ defmodule Ferricstore.Flow.Codec do
   @record_flag_run_state 1 <<< 21
   @record_flag_rewound_to_event_id 1 <<< 22
   @record_flag_sidecar 1 <<< 23
+  @record_flag_max_active_ms 1 <<< 24
 
   # FSH2 stores per-event history only. Immutable workflow metadata such as id,
   # type, parent/root, and correlation id is restored from the current/snapshot
@@ -82,6 +83,7 @@ defmodule Ferricstore.Flow.Codec do
       Map.get(record, :history_max_events),
       Map.get(record, :retention_ttl_ms),
       Map.get(record, :terminal_retention_until_ms),
+      Map.get(record, :max_active_ms),
       Map.get(record, :partition_key),
       Map.get(record, :payload_ref),
       Map.get(record, :parent_flow_id),
@@ -152,6 +154,11 @@ defmodule Ferricstore.Flow.Codec do
         flags,
         @record_flag_terminal_retention_until_ms,
         Map.get(record, :terminal_retention_until_ms)
+      ),
+      Support.encode_flagged_int(
+        flags,
+        @record_flag_max_active_ms,
+        Map.get(record, :max_active_ms)
       ),
       Support.encode_flagged_bin(
         flags,
@@ -672,6 +679,8 @@ defmodule Ferricstore.Flow.Codec do
            decode_flagged_int(flags, @record_flag_retention_ttl_ms, rest, nil),
          {:ok, terminal_retention_until_ms, rest} <-
            decode_flagged_int(flags, @record_flag_terminal_retention_until_ms, rest, nil),
+         {:ok, max_active_ms, rest} <-
+           decode_flagged_int(flags, @record_flag_max_active_ms, rest, nil),
          {:ok, partition_key, rest} <-
            decode_flagged_bin(flags, @record_flag_partition_key, rest, nil),
          {:ok, payload_ref, rest} <-
@@ -735,6 +744,7 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_state_meta(state_meta)
         |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
         |> maybe_put_decoded_state_enter_seq(state_enter_seq)
+        |> maybe_put_decoded_max_active_ms(max_active_ms)
 
       if is_nil(rewound_to_event_id) do
         record
@@ -801,6 +811,7 @@ defmodule Ferricstore.Flow.Codec do
          history_max_events,
          retention_ttl_ms,
          terminal_retention_until_ms,
+         max_active_ms,
          partition_key,
          payload_ref,
          parent_flow_id,
@@ -858,6 +869,7 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_state_meta(state_meta)
         |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
         |> maybe_put_decoded_state_enter_seq(state_enter_seq)
+        |> maybe_put_decoded_max_active_ms(max_active_ms)
 
       if is_nil(rewound_to_event_id) do
         record
@@ -890,6 +902,7 @@ defmodule Ferricstore.Flow.Codec do
          fencing_token,
          attempts,
          run_state,
+         max_active_ms,
          child_groups_encoded
        ])
        when is_binary(child_groups_encoded) do
@@ -922,6 +935,7 @@ defmodule Ferricstore.Flow.Codec do
       |> maybe_put_decoded_indexed_attributes(indexed_attributes)
       |> maybe_put_decoded_state_meta(state_meta)
       |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
+      |> maybe_put_decoded_max_active_ms(max_active_ms)
     else
       _ -> raise ArgumentError, "invalid flow record"
     end
@@ -959,6 +973,12 @@ defmodule Ferricstore.Flow.Codec do
     do: Map.put(record, :state_enter_seq, seq)
 
   defp maybe_put_decoded_state_enter_seq(record, _seq), do: record
+
+  defp maybe_put_decoded_max_active_ms(record, max_active_ms)
+       when is_integer(max_active_ms) and max_active_ms > 0,
+       do: Map.put(record, :max_active_ms, max_active_ms)
+
+  defp maybe_put_decoded_max_active_ms(record, _max_active_ms), do: record
 
   defp decode_history_fields_bin(rest, context) do
     with {:ok, flags, rest} <- decode_int(rest),

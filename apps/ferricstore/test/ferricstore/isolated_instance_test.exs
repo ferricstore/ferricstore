@@ -75,20 +75,22 @@ defmodule Ferricstore.IsolatedInstanceTest do
     test "concurrent isolated instances do not interfere" do
       # Keep the module non-async so CI resource pressure from unrelated test
       # modules does not starve the isolated instance supervisors. The test
-      # still proves concurrent isolated instances by running multiple checked
-      # out instances at the same time.
+      # still proves concurrent isolated instances by running multiple
+      # single-shard instances at the same time.
       tasks =
         for i <- 1..5 do
           Task.async(fn ->
-            ctx = IsolatedInstance.checkout()
+            ctx = IsolatedInstance.checkout(shard_count: 1)
 
-            FerricStore.Impl.set(ctx, "key", "value_#{i}")
-            Process.sleep(10)
-            {:ok, val} = FerricStore.Impl.get(ctx, "key")
-            assert val == "value_#{i}"
-
-            IsolatedInstance.checkin(ctx)
-            :ok
+            try do
+              FerricStore.Impl.set(ctx, "key", "value_#{i}")
+              Process.sleep(10)
+              {:ok, val} = FerricStore.Impl.get(ctx, "key")
+              assert val == "value_#{i}"
+              :ok
+            after
+              IsolatedInstance.checkin(ctx)
+            end
           end)
         end
 

@@ -180,10 +180,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         now_ms = flow_attrs_now_ms(attrs)
         run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
         priority = Map.get(attrs, :priority, 0)
-        retention = flow_retention_for_create(state, attrs)
+        lifecycle = flow_lifecycle_for_create(state, attrs)
 
         record =
-          flow_create_record_with_retention(
+          flow_create_record_with_lifecycle(
             state,
             attrs,
             id,
@@ -192,7 +192,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             now_ms,
             run_at_ms,
             priority,
-            retention
+            lifecycle
           )
 
         flow_refresh_indexed_attributes(state, record)
@@ -202,30 +202,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         key = flow_create_retention_cache_key(attrs)
 
         case Map.fetch(retention_cache, key) do
-          {:ok, retention} ->
-            record = flow_create_record_with_resolved_retention(state, attrs, retention)
+          {:ok, lifecycle} ->
+            record = flow_create_record_with_resolved_lifecycle(state, attrs, lifecycle)
 
             {flow_refresh_indexed_attributes(state, record), retention_cache}
 
           :error ->
-            retention = flow_retention_for_create(state, attrs)
-            record = flow_create_record_with_resolved_retention(state, attrs, retention)
+            lifecycle = flow_lifecycle_for_create(state, attrs)
+            record = flow_create_record_with_resolved_lifecycle(state, attrs, lifecycle)
 
             {flow_refresh_indexed_attributes(state, record),
-             Map.put(retention_cache, key, retention)}
+             Map.put(retention_cache, key, lifecycle)}
         end
       end
 
-      defp flow_create_record_with_resolved_retention(
+      defp flow_create_record_with_resolved_lifecycle(
              state,
              %{id: id, type: type, state: flow_state} = attrs,
-             retention
+             lifecycle
            ) do
         now_ms = flow_attrs_now_ms(attrs)
         run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
         priority = Map.get(attrs, :priority, 0)
 
-        flow_create_record_with_retention(
+        flow_create_record_with_lifecycle(
           state,
           attrs,
           id,
@@ -234,11 +234,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           now_ms,
           run_at_ms,
           priority,
-          retention
+          lifecycle
         )
       end
 
-      defp flow_create_record_with_retention(
+      defp flow_create_record_with_lifecycle(
              state,
              attrs,
              id,
@@ -247,9 +247,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
              now_ms,
              run_at_ms,
              priority,
-             retention
+             lifecycle
            ) do
         partition_key = Map.get(attrs, :partition_key)
+        retention = Map.fetch!(lifecycle, :retention)
 
         %{
           id: id,
@@ -265,6 +266,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           state_enter_seq: flow_next_state_enter_seq(state),
           ttl_ms: nil,
           retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
+          max_active_ms: Map.get(lifecycle, :max_active_ms),
           terminal_retention_until_ms: nil,
           history_hot_max_events: Map.fetch!(retention, :history_hot_max_events),
           history_max_events: Map.fetch!(retention, :history_max_events),
@@ -357,6 +359,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           Map.get(attrs, :type),
           Map.get(attrs, :state),
           Map.get(attrs, :retention_ttl_ms),
+          Map.get(attrs, :max_active_ms),
           Map.get(attrs, :history_hot_max_events),
           Map.get(attrs, :history_max_events)
         }
@@ -557,7 +560,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         end
       end
 
-      defp flow_retention_for_create(state, attrs) do
+      defp flow_lifecycle_for_create(state, attrs) do
         flow_policy = flow_read_policy(state, Map.get(attrs, :type))
 
         override =
@@ -572,7 +575,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             Map.get(attrs, :history_max_events)
           )
 
-        RetryPolicy.resolve_retention(flow_policy, Map.get(attrs, :state), override)
+        %{
+          retention: RetryPolicy.resolve_retention(flow_policy, Map.get(attrs, :state), override),
+          max_active_ms:
+            RetryPolicy.resolve_max_active_ms(flow_policy, Map.get(attrs, :max_active_ms))
+        }
       end
 
       defp maybe_put_retention_override(map, _key, nil), do: map
@@ -993,7 +1000,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_create_idempotent_match?(state, existing, attrs) do
         id = Map.fetch!(attrs, :id)
         partition_key = Map.get(attrs, :partition_key)
-        retention = flow_retention_for_create(state, attrs)
+        lifecycle = flow_lifecycle_for_create(state, attrs)
+        retention = Map.fetch!(lifecycle, :retention)
 
         comparable_attrs = %{
           id: id,
@@ -1007,6 +1015,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           priority: Map.get(attrs, :priority, 0),
           ttl_ms: nil,
           retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
+          max_active_ms: Map.get(lifecycle, :max_active_ms),
           history_hot_max_events: Map.fetch!(retention, :history_hot_max_events),
           history_max_events: Map.fetch!(retention, :history_max_events)
         }

@@ -45,6 +45,8 @@ Code.require_file(
   __DIR__
 )
 
+Code.require_file("flow_test/sections/flow_max_active_ms_times_out_flows.exs", __DIR__)
+
 Code.require_file(
   "flow_test/sections/flow_fail_many_atomically_fails_one_partition_batch.exs",
   __DIR__
@@ -497,6 +499,7 @@ defmodule Ferricstore.FlowTest do
   use Ferricstore.FlowTest.Sections.FlowClaimDueDrainsHigherPrioritiesBeforeLowerPrioritiesDefault
   use Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetentionDefaults
   use Ferricstore.FlowTest.Sections.FlowClaimDueAutomaticallyReclaimsExpiredLeasesRatio
+  use Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows
   use Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionBatch
   use Ferricstore.FlowTest.Sections.FlowHistorySupportsRangeReverseEventWorkerFilters
   use Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfiguredMaximum

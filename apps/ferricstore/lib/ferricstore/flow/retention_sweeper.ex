@@ -209,6 +209,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
             flows: Map.get(counts, :flows, 0),
             history: Map.get(counts, :history, 0),
             values: Map.get(counts, :values, 0),
+            active_timeouts: Map.get(counts, :active_timeouts, 0),
             pressure?: pressure?,
             duration_us: duration_us,
             limit: limit,
@@ -276,7 +277,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
   defp normalize_result(other), do: {:error, %{}, other}
 
   defp cleanup_limit_hit?(counts, limit) do
-    Enum.any?([:flows, :history, :values], fn key ->
+    Enum.any?([:flows, :history, :values, :active_timeouts], fn key ->
       Map.get(counts, key, 0) >= limit
     end)
   end
@@ -299,6 +300,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         flows: Map.get(counts, :flows, 0),
         history: Map.get(counts, :history, 0),
         values: Map.get(counts, :values, 0),
+        active_timeouts: Map.get(counts, :active_timeouts, 0),
         limit: limit
       },
       %{
@@ -335,6 +337,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         flows: Map.get(counts, :flows, 0),
         history: Map.get(counts, :history, 0),
         values: Map.get(counts, :values, 0),
+        active_timeouts: Map.get(counts, :active_timeouts, 0),
         limit: state.limit
       },
       %{consecutive_limit_hits: state.consecutive_limit_hits + 1}

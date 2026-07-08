@@ -86,7 +86,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         end
       end
 
-      defp flow_retention_zero_counts, do: {:ok, %{flows: 0, history: 0, values: 0}}
+      defp flow_retention_zero_counts,
+        do: {:ok, %{flows: 0, history: 0, values: 0, active_timeouts: 0}}
 
       defp flow_retention_current_state_record(state, state_key) do
         case :ets.lookup(state.ets, state_key) do
@@ -150,6 +151,108 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
             end
         end)
         |> Enum.take(limit)
+      end
+
+      defp flow_active_timeout_expired_state_entries(_state, _now_ms, limit)
+           when not is_integer(limit) or limit <= 0,
+           do: []
+
+      defp flow_active_timeout_expired_state_entries(state, now_ms, limit) do
+        prefix = "f:{"
+        prefix_len = byte_size(prefix)
+
+        match_spec = [
+          {{:"$1", :"$2", :"$3", :_, :"$5", :"$6", :"$7"},
+           [
+             {:andalso, {:is_binary, :"$1"},
+              {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+           ], [{{:"$1", :"$2", :"$3", :"$5", :"$6", :"$7"}}]}
+        ]
+
+        state.ets
+        |> safe_ets_select(match_spec)
+        |> Enum.filter(fn {key, value, _expire_at_ms, fid, offset, value_size} ->
+          FlowKeys.state_key?(key) and
+            case flow_retention_decode_state_record(state, key, value, fid, offset, value_size) do
+              {:ok, record} -> flow_active_timeout_expired_record?(record, now_ms)
+              :miss -> false
+            end
+        end)
+        |> Enum.take(limit)
+      end
+
+      defp flow_active_timeout_expired_record?(record, now_ms) do
+        not Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) and
+          case {Map.get(record, :created_at_ms), Map.get(record, :max_active_ms)} do
+            {created_at_ms, max_active_ms}
+            when is_integer(created_at_ms) and is_integer(max_active_ms) and max_active_ms > 0 ->
+              created_at_ms + max_active_ms <= now_ms
+
+            _other ->
+              false
+          end
+      end
+
+      defp flow_active_timeout_entry(
+             state,
+             {state_key, value, _expire_at_ms, fid, offset, value_size},
+             now_ms
+           ) do
+        case flow_retention_decode_state_record(state, state_key, value, fid, offset, value_size) do
+          {:ok, record} ->
+            if flow_active_timeout_expired_record?(record, now_ms) do
+              flow_active_timeout_record(state, state_key, record, now_ms)
+            else
+              flow_retention_zero_counts()
+            end
+
+          :miss ->
+            flow_retention_zero_counts()
+        end
+      end
+
+      defp flow_active_timeout_record(state, _state_key, record, now_ms) do
+        version = Map.fetch!(record, :version) + 1
+        id = Map.fetch!(record, :id)
+        partition_key = Map.get(record, :partition_key)
+        max_active_ms = Map.fetch!(record, :max_active_ms)
+        attrs = %{error: %{reason: "max_active_ms", max_active_ms: max_active_ms}}
+
+        next =
+          record
+          |> Map.merge(%{
+            state: "failed",
+            version: version,
+            updated_at_ms: now_ms,
+            ttl_ms: nil,
+            error_ref: flow_value_ref(attrs, :error, id, version, partition_key),
+            lease_owner: nil,
+            lease_token: nil,
+            lease_deadline_ms: 0,
+            next_run_at_ms: nil
+          })
+          |> flow_stamp_terminal_retention(now_ms)
+
+        meta = %{
+          reason: "max_active_ms",
+          max_active_ms: max_active_ms
+        }
+
+        with :ok <- flow_put_record_values(state, next, attrs),
+             :ok <- flow_transition_move_indexes(state, [{record, next}]),
+             :ok <-
+               flow_put_state_record(
+                 state,
+                 FlowKeys.state_key(next.id, Map.get(next, :partition_key)),
+                 next
+               ),
+             :ok <- flow_history_put_planned(state, record, next, "failed", now_ms, meta),
+             :ok <- flow_after_history_put(state, next),
+             :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms),
+             :ok <- flow_maybe_apply_child_terminal(state, next, "failed", now_ms) do
+          {:ok, %{flows: 0, history: 0, values: 0, active_timeouts: 1}}
+        end
       end
 
       defp flow_retention_cleanup_entry(

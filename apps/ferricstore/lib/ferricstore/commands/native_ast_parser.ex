@@ -131,6 +131,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {"PARTITION", :partition_key, :partition},
       {"RETENTION_TTL", :retention_ttl_ms, {:positive, :retention_ttl_ms}},
       {"RETENTION_TTL_MS", :retention_ttl_ms, {:positive, :retention_ttl_ms}},
+      {"MAX_ACTIVE_MS", :max_active_ms, :positive_or_infinity},
       {"HISTORY_HOT_MAX_EVENTS", :history_hot_max_events,
        {:non_negative_named, :history_hot_max_events}},
       {"HISTORY_MAX_EVENTS", :history_max_events, {:positive, :history_max_events}},
@@ -169,6 +170,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {"NOW", :now_ms, :non_negative},
       {"RETENTION_TTL", :retention_ttl_ms, {:positive, :retention_ttl_ms}},
       {"RETENTION_TTL_MS", :retention_ttl_ms, {:positive, :retention_ttl_ms}},
+      {"MAX_ACTIVE_MS", :max_active_ms, :positive_or_infinity},
       {"HISTORY_HOT_MAX_EVENTS", :history_hot_max_events,
        {:non_negative_named, :history_hot_max_events}},
       {"HISTORY_MAX_EVENTS", :history_max_events, {:positive, :history_max_events}}
@@ -1682,6 +1684,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
           Keyword.has_key?(opts, :indexed_attributes) ->
             {:error, "ERR flow indexed_attributes is type-level only"}
 
+          Keyword.has_key?(opts, :max_active_ms) ->
+            {:error, "ERR flow max_active_ms is type-level only"}
+
           true ->
             {:ok, opts}
         end
@@ -1707,6 +1712,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
       "HISTORY_HOT_MAX_EVENTS" ->
         {:error, "ERR flow retention history_hot_max_events is internal"}
+
+      "MAX_ACTIVE_MS" ->
+        policy_positive_or_infinity(:policy, :max_active_ms, value)
 
       "INDEXED_STATE_META" ->
         {:policy, {:indexed_state_meta, value}}
@@ -1783,6 +1791,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
+  defp policy_positive_or_infinity(scope, key, value) do
+    case String.upcase(value) do
+      "INFINITY" ->
+        {scope, {key, :infinity}}
+
+      _other ->
+        policy_positive(scope, key, value)
+    end
+  end
+
   defp policy_non_negative(scope, key, value) do
     case parse_int(value) do
       int when is_integer(int) and int >= 0 -> {scope, {key, int}}
@@ -1823,6 +1841,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp flow_value(key, :non_negative, value), do: non_negative_value(key, value)
   defp flow_value(key, {:non_negative_named, _label}, value), do: non_negative_value(key, value)
   defp flow_value(key, {:positive, _label}, value), do: positive_value(key, value)
+  defp flow_value(key, :positive_or_infinity, value), do: positive_or_infinity_value(key, value)
 
   defp flow_value(key, {:ref, label}, value) do
     if byte_size(value) <= @max_flow_ref_size do
@@ -1843,6 +1862,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
     case parse_int(value) do
       int when is_integer(int) and int > 0 -> {:ok, {key, int}}
       _ -> {:error, "ERR flow #{key} must be a positive integer"}
+    end
+  end
+
+  defp positive_or_infinity_value(key, value) do
+    case String.upcase(value) do
+      "INFINITY" ->
+        {:ok, {key, :infinity}}
+
+      _other ->
+        positive_value(key, value)
     end
   end
 

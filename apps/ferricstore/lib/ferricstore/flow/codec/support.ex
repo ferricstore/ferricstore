@@ -39,6 +39,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   @record_flag_run_state 1 <<< 21
   @record_flag_rewound_to_event_id 1 <<< 22
   @record_flag_sidecar 1 <<< 23
+  @record_flag_max_active_ms 1 <<< 24
   @history_flag_meta 1 <<< 12
 
   def encode_record_flags(record, sidecar) do
@@ -57,6 +58,7 @@ defmodule Ferricstore.Flow.Codec.Support do
       @record_flag_terminal_retention_until_ms,
       nil
     )
+    |> record_flag_int(record, :max_active_ms, @record_flag_max_active_ms, nil)
     |> record_flag_bin(record, :partition_key, @record_flag_partition_key)
     |> record_flag_bin(record, :payload_ref, @record_flag_payload_ref)
     |> record_flag_bin(record, :parent_flow_id, @record_flag_parent_flow_id)

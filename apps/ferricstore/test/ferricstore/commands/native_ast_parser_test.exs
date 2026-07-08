@@ -102,6 +102,8 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
                "1000",
                "PRIORITY",
                "2",
+               "MAX_ACTIVE_MS",
+               "30000",
                "PARTITION",
                "tenant-a",
                "ATTRIBUTE",
@@ -112,7 +114,20 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert create_opts[:type] == "checkout"
     assert create_opts[:state] == "queued"
     assert create_opts[:payload] == "payload"
+    assert create_opts[:max_active_ms] == 30_000
     assert create_opts[:attributes] == %{"tenant" => "acme"}
+
+    assert {:ok, "FLOW.CREATE", _args, {:flow_create, "flow-infinity", create_opts},
+            ["flow-infinity"]} =
+             NativeAstParser.parse("flow.create", [
+               "flow-infinity",
+               "TYPE",
+               "checkout",
+               "MAX_ACTIVE_MS",
+               "INFINITY"
+             ])
+
+    assert create_opts[:max_active_ms] == :infinity
 
     assert {:ok, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, "checkout", claim_opts}, ["checkout"]} =
              NativeAstParser.parse("flow.claim_due", [
@@ -259,6 +274,26 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              ])
   end
 
+  test "parses Flow policy max active timeout through native AST" do
+    assert {:ok, "FLOW.POLICY.SET", _args, {:flow_policy_set, "checkout", opts}, ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "MAX_ACTIVE_MS",
+               "30000"
+             ])
+
+    assert opts[:max_active_ms] == 30_000
+
+    assert {:ok, "FLOW.POLICY.SET", _args, {:flow_policy_set, "checkout", opts}, ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "MAX_ACTIVE_MS",
+               "INFINITY"
+             ])
+
+    assert opts[:max_active_ms] == :infinity
+  end
+
   test "rejects state-level Flow policy indexed attributes through native AST" do
     assert {:ok, "FLOW.POLICY.SET", _args,
             {:flow_policy_set, "checkout",
@@ -269,6 +304,17 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
                "queued",
                "INDEXED_ATTRIBUTES",
                "tenant"
+             ])
+
+    assert {:ok, "FLOW.POLICY.SET", _args,
+            {:flow_policy_set, "checkout", {:error, "ERR flow max_active_ms is type-level only"}},
+            ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "STATE",
+               "queued",
+               "MAX_ACTIVE_MS",
+               "30000"
              ])
   end
 
