@@ -403,22 +403,17 @@ defmodule Ferricstore.Commands.NativeTest do
       assert ["denied", _count, 0, _ms_reset] = result
     end
 
-    test "window resets after window_ms" do
+    test "window resets after the full sliding-window expiry horizon" do
       key = ukey("rl_reset")
+      window_ms = 1_000
+      args = [key, Integer.to_string(window_ms), "1"]
 
-      # Fill up the limit with a wider window to avoid CI timing flakes
-      for _ <- 1..3 do
-        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key, "200", "3"], dummy_store())
-      end
+      ["allowed", 1, 0, _ms_reset] = Native.handle("RATELIMIT.ADD", args, dummy_store())
+      ["denied" | _] = Native.handle("RATELIMIT.ADD", args, dummy_store())
 
-      # Should be denied
-      ["denied" | _] = Native.handle("RATELIMIT.ADD", [key, "200", "3"], dummy_store())
+      Process.sleep(window_ms * 2 + 250)
 
-      # Wait for window to expire (2x window to ensure full expiry)
-      Process.sleep(500)
-
-      # Should be allowed again
-      result = Native.handle("RATELIMIT.ADD", [key, "200", "3"], dummy_store())
+      result = Native.handle("RATELIMIT.ADD", args, dummy_store())
       assert ["allowed" | _] = result
     end
 
