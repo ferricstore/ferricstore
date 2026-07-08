@@ -66,6 +66,49 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
     end)
   end
 
+  def filter_stream_activity_for_acl(entries, nil), do: entries
+
+  def filter_stream_activity_for_acl(entries, username) when is_list(entries) do
+    Enum.filter(entries, fn
+      %{key: key} when is_binary(key) ->
+        case FerricstoreServer.Acl.check_key_access(username, key, :read) do
+          :ok -> true
+          {:error, _reason} -> false
+        end
+
+      _entry ->
+        false
+    end)
+  end
+
+  def filter_pubsub_channels_for_acl(rows, nil), do: rows
+
+  def filter_pubsub_channels_for_acl(rows, username) when is_list(rows) do
+    Enum.filter(rows, fn
+      %{channel: channel} when is_binary(channel) -> pubsub_channel_allowed?(username, channel)
+      %{pattern: pattern} when is_binary(pattern) -> pubsub_channel_allowed?(username, pattern)
+      %{target: target} when is_binary(target) -> pubsub_channel_allowed?(username, target)
+      _row -> false
+    end)
+  end
+
+  defp pubsub_channel_allowed?(username, channel) do
+    case FerricstoreServer.Acl.get_user(username) do
+      %{channels: :all} ->
+        true
+
+      %{channels: patterns} when is_list(patterns) ->
+        FerricstoreServer.Acl.channel_matches_any?(channel, patterns)
+
+      _other ->
+        false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
   defp filter_flow_query_rows_for_acl(rows, username) when is_list(rows) do
     Enum.filter(rows, fn
       row when is_map(row) ->

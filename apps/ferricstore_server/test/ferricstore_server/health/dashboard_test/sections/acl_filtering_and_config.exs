@@ -113,6 +113,162 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           refute extract_body(live) =~ denied_key
         end
 
+        test "stream activity rows are filtered by dashboard ACL key patterns" do
+          Ferricstore.Stream.ActivityLog.reset()
+
+          suffix = System.unique_integer([:positive])
+          allowed_key = "tenant-a:dash-stream:#{suffix}"
+          denied_key = "tenant-b:dash-stream:#{suffix}"
+
+          assert {:ok, _} = FerricStore.xadd(allowed_key, ["field", "visible"])
+          assert {:ok, _} = FerricStore.xadd(denied_key, ["field", "hidden"])
+
+          :ok =
+            FerricstoreServer.Acl.set_user("tenant-a-stream-dashboard", [
+              "on",
+              ">secret",
+              "~tenant-a:*",
+              "-@all",
+              "+XINFO"
+            ])
+
+          keys =
+            %{"acl_username" => "tenant-a-stream-dashboard"}
+            |> Dashboard.collect_streams_page()
+            |> Map.fetch!(:entries)
+            |> Enum.map(& &1.key)
+
+          assert allowed_key in keys
+          refute denied_key in keys
+        end
+
+        test "pubsub activity rows are filtered by dashboard ACL channel patterns" do
+          Ferricstore.PubSub.ActivityLog.reset()
+
+          suffix = System.unique_integer([:positive])
+          allowed_channel = "tenant-a:dash-pubsub:#{suffix}"
+          denied_channel = "tenant-b:dash-pubsub:#{suffix}"
+
+          :ok = Ferricstore.PubSub.subscribe(allowed_channel, self())
+          :ok = Ferricstore.PubSub.subscribe(denied_channel, self())
+
+          on_exit(fn ->
+            Ferricstore.PubSub.unsubscribe(allowed_channel, self())
+            Ferricstore.PubSub.unsubscribe(denied_channel, self())
+          end)
+
+          :ok =
+            FerricstoreServer.Acl.set_user("tenant-a-pubsub-dashboard", [
+              "on",
+              ">secret",
+              "&tenant-a:*",
+              "-@all",
+              "+PUBSUB"
+            ])
+
+          data =
+            Dashboard.collect_pubsub_page(%{
+              "acl_username" => "tenant-a-pubsub-dashboard"
+            })
+
+          channels = Enum.map(data.channels, & &1.channel)
+          targets = Enum.map(data.activity, & &1.target)
+
+          assert allowed_channel in channels
+          refute denied_channel in channels
+          assert Enum.any?(targets, &String.contains?(&1, allowed_channel))
+          refute Enum.any?(targets, &String.contains?(&1, denied_channel))
+        end
+
+        test "security page is OSS-only diagnostics and redacts password material" do
+          :ok =
+            FerricstoreServer.Acl.set_user("tenant-a-security", [
+              "on",
+              ">very-secret-password",
+              "~tenant-a:*",
+              "&tenant-a:*",
+              "-@all",
+              "+GET",
+              "+SET",
+              "+PUBSUB"
+            ])
+
+          data =
+            Dashboard.collect_security_page(%{
+              "user" => "tenant-a-security",
+              "command" => "GET",
+              "key" => "tenant-a:visible",
+              "key_access" => "read",
+              "channel" => "tenant-a:events"
+            })
+
+          html = Dashboard.render_security_page(data)
+
+          assert html =~ "Security"
+          assert html =~ "tenant-a-security"
+          assert html =~ "Command allowed"
+          assert html =~ "Key allowed"
+          assert html =~ "Channel allowed"
+          assert html =~ "ACL.LIST"
+          refute html =~ "very-secret-password"
+          refute html =~ "ACL SETUSER"
+          refute html =~ ~s(method="post")
+        end
+
+        test "security page tester shows denied command key and channel checks" do
+          :ok =
+            FerricstoreServer.Acl.set_user("tenant-a-readonly", [
+              "on",
+              ">secret",
+              "%R~tenant-a:*",
+              "&tenant-a:*",
+              "-@all",
+              "+GET"
+            ])
+
+          data =
+            Dashboard.collect_security_page(%{
+              "user" => "tenant-a-readonly",
+              "command" => "SET",
+              "key" => "tenant-a:write",
+              "key_access" => "write",
+              "channel" => "tenant-b:events"
+            })
+
+          html = Dashboard.render_security_page(data)
+
+          assert html =~ "Command denied"
+          assert html =~ "Key denied"
+          assert html =~ "Channel denied"
+        end
+
+        test "security page requires ACL LIST when dashboard is protected" do
+          Application.put_env(:ferricstore, :protected_mode, true)
+
+          :ok =
+            FerricstoreServer.Acl.set_user("security-no-acl-list", [
+              "on",
+              ">secret",
+              "~*",
+              "-@all",
+              "+INFO"
+            ])
+
+          login =
+            http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+              "username" => "security-no-acl-list",
+              "password" => "secret"
+            })
+
+          response =
+            http_get(HealthEndpoint.port(), "/dashboard/security", [
+              {"Cookie", dashboard_session_cookie(login)}
+            ])
+
+          assert extract_status_code(response) == 403
+          assert extract_body(response) =~ "ACL.LIST"
+        end
+
         test "Flow overview sampled rows are filtered by dashboard ACL key patterns" do
           Application.put_env(:ferricstore, :protected_mode, true)
 

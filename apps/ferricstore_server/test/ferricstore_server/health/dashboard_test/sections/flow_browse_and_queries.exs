@@ -355,6 +355,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
               %{
                 type: "email",
                 state: "queued",
+                mode: :fifo,
                 count: 3,
                 due_now: 2,
                 running: 0,
@@ -402,6 +403,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, "Retrying")
           assert String.contains?(html, "Failed")
           assert String.contains?(html, "Maxed")
+          assert String.contains?(html, "Mode")
+          assert String.contains?(html, "FIFO")
           assert String.contains?(html, "lease deadline passed")
           assert String.contains?(html, "terminal failed")
           assert String.contains?(html, "attempts")
@@ -416,6 +419,67 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
                    html,
                    ~s(data-tooltip="Updated quick ranges are sliding windows)
                  )
+        end
+
+        test "renders FIFO lane observability from policy and sampled records" do
+          suffix = System.unique_integer([:positive])
+          type = "dashboard-fifo-lane-#{suffix}"
+          partition_key = "tenant:dashboard-fifo-lane:#{suffix}"
+          first_id = "dashboard-fifo-lane-first-#{suffix}"
+          second_id = "dashboard-fifo-lane-second-#{suffix}"
+          now_ms = System.system_time(:millisecond)
+
+          assert {:ok, _policy} =
+                   FerricStore.flow_policy_set(type, states: %{"queued" => [mode: :fifo]})
+
+          assert :ok =
+                   FerricStore.flow_create(first_id,
+                     type: type,
+                     state: "queued",
+                     partition_key: partition_key,
+                     now_ms: now_ms - 2,
+                     run_at_ms: now_ms - 2
+                   )
+
+          assert :ok =
+                   FerricStore.flow_create(second_id,
+                     type: type,
+                     state: "queued",
+                     partition_key: partition_key,
+                     now_ms: now_ms - 1,
+                     run_at_ms: now_ms - 1
+                   )
+
+          assert {:ok, [claimed]} =
+                   FerricStore.flow_claim_due(type,
+                     state: "queued",
+                     partition_key: partition_key,
+                     worker: "dashboard-worker",
+                     limit: 10,
+                     lease_ms: 60_000,
+                     now_ms: now_ms
+                   )
+
+          assert claimed.id == first_id
+
+          data = Dashboard.collect_flow_states_page(type: type)
+          html = Dashboard.render_flow_states_page(data)
+
+          assert Enum.any?(
+                   data.states,
+                   &(&1.type == type and &1.state == "queued" and &1.mode == :fifo)
+                 )
+
+          assert Enum.any?(
+                   data.fifo_lanes,
+                   &(&1.type == type and &1.partition_key == partition_key)
+                 )
+
+          assert String.contains?(html, "FIFO Lanes")
+          assert String.contains?(html, "blocked by active flow")
+          assert String.contains?(html, first_id)
+          assert String.contains?(html, second_id)
+          assert String.contains?(html, "dashboard-worker")
         end
       end
 
@@ -691,6 +755,55 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, "tenant")
           assert String.contains?(html, "acme")
           assert String.contains?(html, "count")
+        end
+
+        test "query explorer runs FLOW.SEARCH with indexed attributes and state metadata" do
+          previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+          test_pid = self()
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn opts ->
+            send(test_pid, {:flow_search_opts, opts})
+
+            {:ok,
+             [
+               %{
+                 id: "search-flow",
+                 type: "email",
+                 state: "queued",
+                 partition_key: "tenant-a",
+                 updated_at_ms: 1_000
+               }
+             ]}
+          end)
+
+          on_exit(fn -> restore_env(:flow_dashboard_flow_search_fun, previous_search) end)
+
+          data =
+            Dashboard.collect_flow_query_page(
+              kind: "search",
+              type: "email",
+              partition_key: "tenant-a",
+              attribute_key: "tenant",
+              attribute_value: "acme",
+              state_meta_state: "review",
+              state_meta_key: "risk_tier",
+              state_meta_value: "high",
+              limit: 7
+            )
+
+          assert_receive {:flow_search_opts, opts}
+          assert Keyword.fetch!(opts, :type) == "email"
+          assert Keyword.fetch!(opts, :partition_key) == "tenant-a"
+          assert Keyword.fetch!(opts, :count) == 7
+          assert Keyword.fetch!(opts, :consistent_projection) == true
+          assert Keyword.fetch!(opts, :attributes) == %{"tenant" => "acme"}
+          assert Keyword.fetch!(opts, :state_meta) == %{"review" => %{"risk_tier" => "high"}}
+
+          html = Dashboard.render_flow_query_page(data)
+
+          assert String.contains?(html, "FLOW.SEARCH")
+          assert String.contains?(html, "State meta state")
+          assert String.contains?(html, "search-flow")
         end
 
         test "query explorer only renders fields relevant to lineage query kind" do

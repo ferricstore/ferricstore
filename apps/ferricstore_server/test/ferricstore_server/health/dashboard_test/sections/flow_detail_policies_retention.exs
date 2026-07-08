@@ -182,6 +182,69 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, "history_count=2")
         end
 
+        test "Flow detail renders FIFO state mode and lane blocker" do
+          html =
+            Dashboard.render_flow_detail_page(%{
+              id: "dashboard-flow-fifo-detail",
+              partition_key: "tenant-fifo-detail",
+              record: %{
+                id: "dashboard-flow-fifo-detail",
+                type: "dashboard-fifo-detail",
+                state: "running",
+                run_state: "queued",
+                partition_key: "tenant-fifo-detail",
+                worker: "detail-worker",
+                run_at_ms: 1_000,
+                lease_expires_at_ms: 60_000,
+                updated_at_ms: 2_000
+              },
+              record_status: :ok,
+              history: [],
+              history_status: :ok,
+              history_page: %{
+                id: "dashboard-flow-fifo-detail",
+                partition_key: "tenant-fifo-detail",
+                count: 0,
+                has_older: false,
+                has_newer: false,
+                oldest_event_id: nil,
+                newest_event_id: nil,
+                before: nil,
+                after: nil,
+                older_url: nil,
+                newer_url: nil
+              },
+              value_refs: [],
+              values_by_ref: %{},
+              values_status: :skipped,
+              waiting_reason: "running until 1970-01-01 00:01:00.000Z",
+              state_mode: :fifo,
+              fifo_lane: %{
+                type: "dashboard-fifo-detail",
+                state: "queued",
+                partition_key: "tenant-fifo-detail",
+                count: 2,
+                running: 1,
+                waiting: 1,
+                due: 1,
+                scheduled: 0,
+                head_id: "dashboard-flow-fifo-detail",
+                waiting_head_id: "dashboard-flow-fifo-next",
+                head_status: "blocked by active flow",
+                blocked_by_id: "dashboard-flow-fifo-detail",
+                blocked_by_worker: "detail-worker",
+                lease_expires_at_ms: 60_000
+              }
+            })
+
+          assert String.contains?(html, "State mode")
+          assert String.contains?(html, "FIFO")
+          assert String.contains?(html, "Logical State")
+          assert String.contains?(html, "blocked by active flow")
+          assert String.contains?(html, "dashboard-flow-fifo-next")
+          assert String.contains?(html, "detail-worker")
+        end
+
         test "Flow detail lookup is bounded when durable lookup stalls" do
           previous_timeout =
             Application.get_env(:ferricstore, :flow_dashboard_detail_fetch_timeout_ms)
@@ -355,6 +418,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, ~s(method="post"))
           assert String.contains?(html, ~s(action="/dashboard/flow/policies"))
           assert String.contains?(html, ~s(name="type"))
+          assert String.contains?(html, ~s(name="mode"))
+          assert String.contains?(html, ~s(name="indexed_attributes"))
+          assert String.contains?(html, ~s(name="indexed_state_meta"))
           assert String.contains?(html, ~s(name="max_retries"))
           assert String.contains?(html, ~s(name="retention_ttl_ms"))
           refute String.contains?(html, ~s(name="history_hot_max_events"))
@@ -383,9 +449,12 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
                        ttl_ms: 60_000,
                        history_max_events: 50
                      ],
+                     indexed_attributes: ["tenant", "priority_tier"],
+                     indexed_state_meta: "ai.model",
                      states: [
                        {"review",
                         [
+                          mode: :fifo,
                           retry: [max_retries: 1, exhausted_to: "review_failed"],
                           retention: [
                             ttl_ms: 30_000,
@@ -406,6 +475,11 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, "FLOW.POLICY.GET &lt;type&gt;")
           assert String.contains?(html, "MAX_RETRIES")
           assert String.contains?(html, "RETENTION_TTL_MS")
+          assert String.contains?(html, "MODE FIFO|PARALLEL")
+          assert String.contains?(html, "INDEXED_ATTRIBUTES")
+          assert String.contains?(html, "tenant")
+          assert String.contains?(html, "priority_tier")
+          assert String.contains?(html, "ai.model")
           assert String.contains?(html, type)
           assert String.contains?(html, "configured")
           assert String.contains?(html, "fixed 100ms")
@@ -427,6 +501,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
                        ttl_ms: 60_000,
                        history_max_events: 10
                      ],
+                     indexed_attributes: ["tenant"],
+                     indexed_state_meta: "risk_tier",
                      states: [
                        {"review",
                         [
@@ -458,9 +534,74 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert policy.retry.exhausted_to == "dead"
           assert policy.retention.ttl_ms == 120_000
           refute Map.has_key?(policy.retention, :history_hot_max_events)
+          assert policy.indexed_attributes == ["tenant"]
+          assert policy.indexed_state_meta == "risk_tier"
           assert policy.states["review"].retry.max_retries == 7
           assert policy.states["review"].retry.exhausted_to == "review_failed"
           assert policy.states["review"].retention.history_max_events == 5
+        end
+
+        test "policy form writes state-level FIFO mode without dropping existing overrides" do
+          type = "dashboard-policy-fifo-#{System.unique_integer([:positive])}"
+
+          assert {:ok, _policy} =
+                   FerricStore.flow_policy_set(type,
+                     retry: [
+                       max_retries: 2,
+                       backoff: [kind: :fixed, base_ms: 100, max_ms: 200, jitter_pct: 0],
+                       exhausted_to: "failed"
+                     ],
+                     retention: [
+                       ttl_ms: 60_000,
+                       history_max_events: 10
+                     ],
+                     states: [
+                       {"ready",
+                        [
+                          mode: :parallel,
+                          retry: [max_retries: 8, exhausted_to: "ready_failed"],
+                          retention: [
+                            ttl_ms: 90_000,
+                            history_max_events: 11
+                          ]
+                        ]}
+                     ]
+                   )
+
+          assert {:ok, ^type} =
+                   Dashboard.apply_flow_policy_form(%{
+                     "type" => type,
+                     "state" => "queued",
+                     "mode" => "fifo",
+                     "max_retries" => "4",
+                     "backoff_kind" => "linear",
+                     "base_ms" => "250",
+                     "max_ms" => "2000",
+                     "jitter_pct" => "10",
+                     "exhausted_to" => "dead",
+                     "retention_ttl_ms" => "120000",
+                     "history_max_events" => "20"
+                   })
+
+          assert {:ok, policy} = FerricStore.flow_policy_get(type)
+          assert policy.states["queued"].mode == :fifo
+          assert policy.states["queued"].retry.max_retries == 4
+          assert policy.states["ready"].mode == :parallel
+          assert policy.states["ready"].retry.max_retries == 8
+
+          html =
+            Dashboard.collect_flow_policies_page(edit_type: type)
+            |> Dashboard.render_flow_policies_page()
+
+          assert String.contains?(html, "FIFO")
+
+          assert String.contains?(
+                   html,
+                   "FIFO requires every entering Flow to carry a partition key"
+                 )
+
+          assert String.contains?(html, "queued")
+          assert String.contains?(html, "ready")
         end
       end
 

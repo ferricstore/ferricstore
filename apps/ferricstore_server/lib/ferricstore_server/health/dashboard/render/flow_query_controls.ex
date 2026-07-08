@@ -20,7 +20,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   end
 
   def render_flow_query_type_field(%{type: type} = filters) do
-    kinds = ~w(list terminals failures stuck)
+    kinds = ~w(list search terminals failures stuck)
     hidden = flow_query_hidden_attr(filters, kinds)
     disabled = flow_query_disabled_attr(filters, kinds)
 
@@ -34,7 +34,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   end
 
   def render_flow_query_state_field(%{state: state} = filters) do
-    kinds = ~w(list stats terminals failures)
+    kinds = ~w(list search stats terminals failures)
     hidden = flow_query_hidden_attr(filters, kinds)
     disabled = flow_query_disabled_attr(filters, kinds)
 
@@ -48,7 +48,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   end
 
   def render_flow_query_attribute_fields(filters) do
-    kinds = ~w(list stats)
+    kinds = ~w(list search stats)
     hidden = flow_query_hidden_attr(filters, kinds)
     disabled = flow_query_disabled_attr(filters, kinds)
     attribute_key = Map.get(filters, :attribute_key) || ""
@@ -64,6 +64,33 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
       Attribute value
       <input class="flow-search-input mono" name="attribute_value" value="#{escape_attr(attribute_value)}" placeholder="acme"#{disabled}>
       <span class="flow-field-help">Used only when attribute key is present.</span>
+    </label>
+    """
+  end
+
+  def render_flow_query_state_meta_fields(filters) do
+    kinds = ~w(search)
+    hidden = flow_query_hidden_attr(filters, kinds)
+    disabled = flow_query_disabled_attr(filters, kinds)
+    state = Map.get(filters, :state_meta_state) || ""
+    key = Map.get(filters, :state_meta_key) || ""
+    value = Map.get(filters, :state_meta_value) || ""
+
+    """
+    <label class="flow-query-field" data-flow-query-field="state_meta_state" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
+      State meta state
+      <input class="flow-search-input mono" name="state_meta_state" value="#{escape_attr(state)}" placeholder="review"#{disabled}>
+      <span class="flow-field-help">Logical state that owns the metadata entry.</span>
+    </label>
+    <label class="flow-query-field" data-flow-query-field="state_meta_key" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
+      State meta key
+      <input class="flow-search-input mono" name="state_meta_key" value="#{escape_attr(key)}" placeholder="risk_tier"#{disabled}>
+      <span class="flow-field-help">Policy-indexed state metadata key.</span>
+    </label>
+    <label class="flow-query-field" data-flow-query-field="state_meta_value" data-flow-query-kinds="#{flow_query_kinds_attr(kinds)}"#{hidden}>
+      State meta value
+      <input class="flow-search-input mono" name="state_meta_value" value="#{escape_attr(value)}" placeholder="high"#{disabled}>
+      <span class="flow-field-help">Scalar value for the indexed metadata key.</span>
     </label>
     """
   end
@@ -94,7 +121,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   end
 
   def render_flow_query_time_fields(filters) do
-    kinds = ~w(list terminals failures stuck by_parent by_root by_correlation)
+    kinds = ~w(list search terminals failures stuck by_parent by_root by_correlation)
     hidden = flow_query_hidden_attr(filters, kinds)
     disabled = flow_query_disabled_attr(filters, kinds)
 
@@ -113,7 +140,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   end
 
   def render_flow_query_direction_field(filters) do
-    kinds = ~w(list terminals failures stuck by_parent by_root by_correlation)
+    kinds = ~w(list search terminals failures stuck by_parent by_root by_correlation)
     checked = if filters.rev, do: "checked", else: ""
     hidden = flow_query_hidden_attr(filters, kinds)
     disabled = flow_query_disabled_attr(filters, kinds)
@@ -218,6 +245,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   def flow_query_kind_options do
     [
       {"list", "FLOW.LIST"},
+      {"search", "FLOW.SEARCH"},
       {"stats", "FLOW.STATS"},
       {"terminals", "FLOW.TERMINALS"},
       {"failures", "FLOW.FAILURES"},
@@ -241,6 +269,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         purpose: "List workflows by type.",
         detail:
           "Use optional state, partition, time range, direction, and attribute filters to keep the result bounded."
+      },
+      "search" => %{
+        command: "FLOW.SEARCH",
+        purpose: "Search policy-indexed Flow metadata.",
+        detail:
+          "Use indexed attribute filters and optional indexed state metadata filters. Search is bounded, projection-consistent, and payloads stay unloaded."
       },
       "stats" => %{
         command: "FLOW.STATS",

@@ -320,6 +320,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
     """
     <div class="section-title">#{escape(title)} <span class="badge badge-idle">#{length(commands)}</span></div>
+    <div class="table-scroll" role="region" aria-label="#{escape(title)}" tabindex="0">
     <table>
       <thead>
         <tr><th>Command</th><th>Scope</th><th>Mode</th><th>Notes</th></tr>
@@ -328,6 +329,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
         #{rows}
       </tbody>
     </table>
+    </div>
     """
   end
 

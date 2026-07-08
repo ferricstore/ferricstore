@@ -30,7 +30,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   additional ports or dependencies are required.
   """
 
-  alias FerricstoreServer.Health.Dashboard.Data.{KV, Operational}
+  alias FerricstoreServer.Health.Dashboard.Data.{KV, Messaging, Operational, Security}
   alias FerricstoreServer.Health.Dashboard.LivePayload
   alias FerricstoreServer.Health.Dashboard.Templates
   alias FerricstoreServer.Health.Dashboard.Types
@@ -139,6 +139,50 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec render_config_page(Types.config_page_data() | map()) :: binary()
   def render_config_page(data) do
     render_template(Templates.config(%{data: data}))
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Management Capabilities Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects the read-only management capability contract exposed by this server.
+  """
+  @spec collect_capabilities_page() :: map()
+  def collect_capabilities_page do
+    %{
+      capabilities: FerricStore.ManagementCapabilities.capabilities(),
+      command_reference: management_capabilities_command_reference(),
+      generated_at_ms: System.system_time(:millisecond)
+    }
+  end
+
+  @doc """
+  Renders the management capabilities sub-page.
+  """
+  @spec render_capabilities_page(map()) :: binary()
+  def render_capabilities_page(data) do
+    render_template(Templates.capabilities(%{data: data}))
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Security / ACL Diagnostics Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects OSS ACL diagnostics and effective access checks for operators.
+  """
+  @spec collect_security_page(keyword() | map()) :: map()
+  def collect_security_page(opts \\ []) do
+    Security.collect_page(opts)
+  end
+
+  @doc """
+  Renders the read-only security diagnostics sub-page.
+  """
+  @spec render_security_page(map()) :: binary()
+  def render_security_page(data) do
+    render_template(Templates.security(%{data: data}))
   end
 
   # ---------------------------------------------------------------------------
@@ -346,6 +390,38 @@ defmodule FerricstoreServer.Health.Dashboard do
     render_template(Templates.reads(%{data: data}))
   end
 
+  @doc """
+  Collects metadata-only stream append and mutation activity.
+  """
+  @spec collect_streams_page(keyword() | map()) :: map()
+  def collect_streams_page(opts \\ []) do
+    Messaging.collect_streams_page(opts)
+  end
+
+  @doc """
+  Renders the stream activity page.
+  """
+  @spec render_streams_page(map()) :: binary()
+  def render_streams_page(data) do
+    render_template(Templates.streams(%{data: data}))
+  end
+
+  @doc """
+  Collects metadata-only Pub/Sub subscription and publish activity.
+  """
+  @spec collect_pubsub_page(keyword() | map()) :: map()
+  def collect_pubsub_page(opts \\ []) do
+    Messaging.collect_pubsub_page(opts)
+  end
+
+  @doc """
+  Renders the Pub/Sub activity page.
+  """
+  @spec render_pubsub_page(map()) :: binary()
+  def render_pubsub_page(data) do
+    render_template(Templates.pubsub(%{data: data}))
+  end
+
   # ---------------------------------------------------------------------------
   # Public API -- FerricFlow Sub-pages
   # ---------------------------------------------------------------------------
@@ -413,6 +489,13 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec apply_flow_rewind_form(map()) ::
           {:ok, binary(), binary() | nil} | {:error, binary()}
   def apply_flow_rewind_form(params), do: Detail.apply_rewind_form(params)
+
+  @doc """
+  Applies the Flow detail signal form.
+  """
+  @spec apply_flow_signal_form(map()) ::
+          {:ok, binary(), binary() | nil} | {:error, binary()}
+  def apply_flow_signal_form(params), do: Detail.apply_signal_form(params)
 
   @doc """
   Converts a Flow policy editor query string into a small flash map.
@@ -683,6 +766,54 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec render_template(binary()) :: binary()
   defp render_template(html), do: String.trim_leading(html)
+
+  defp management_capabilities_command_reference do
+    [
+      %{
+        command: "FERRICSTORE.CAPABILITIES",
+        scope: "server",
+        mutability: "read-only",
+        notes:
+          "Returns supported control-plane features so SDK callers can enable only safe actions."
+      },
+      %{
+        command: "FERRICSTORE.TELEMETRY CLUSTER",
+        scope: "cluster",
+        mutability: "read-only",
+        notes: "Returns health and capability metadata without payload search."
+      },
+      %{
+        command: "FERRICSTORE.TELEMETRY NAMESPACE <prefix>",
+        scope: "namespace",
+        mutability: "read-only",
+        notes: "Returns safe namespace usage counters when the server supports them."
+      },
+      %{
+        command: "FERRICSTORE.TELEMETRY FLOW.QUERY",
+        scope: "flow",
+        mutability: "read-only",
+        notes: "Returns Flow metadata and attributes only."
+      },
+      %{
+        command: "ACL SETUSER | DELUSER | GETUSER | LIST | SAVE",
+        scope: "access control",
+        mutability: "conditional",
+        notes: "Available only when acl_management is supported by the deployed server."
+      },
+      %{
+        command: "FERRICSTORE.NAMESPACE ENSURE | GET | LIST | DELETE",
+        scope: "namespace",
+        mutability: "conditional",
+        notes: "Available only when namespace_management is supported by the deployed server."
+      },
+      %{
+        command: "FERRICSTORE.QUOTA SET | GET | USAGE",
+        scope: "namespace",
+        mutability: "conditional",
+        notes: "Available only when quota_management is supported by the deployed server."
+      }
+    ]
+  end
 
   # ---------------------------------------------------------------------------
   # HTML rendering -- Main Dashboard

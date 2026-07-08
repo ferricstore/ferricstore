@@ -609,8 +609,10 @@ defmodule FerricstoreServer.Health.Endpoint do
     unless Auth.observability_authorized?(peer, headers) do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
-      case FlowPaths.decode_flow_rewind_action(encoded_action) do
-        {:ok, id} ->
+      cond do
+        match?({:ok, _id}, FlowPaths.decode_flow_rewind_action(encoded_action)) ->
+          {:ok, id} = FlowPaths.decode_flow_rewind_action(encoded_action)
+
           params =
             body
             |> FlowPaths.decode_form_body()
@@ -662,7 +664,61 @@ defmodule FerricstoreServer.Health.Endpoint do
               )
           end
 
-        :not_found ->
+        match?({:ok, _id}, FlowPaths.decode_flow_signal_action(encoded_action)) ->
+          {:ok, id} = FlowPaths.decode_flow_signal_action(encoded_action)
+
+          params =
+            body
+            |> FlowPaths.decode_form_body()
+            |> Map.put_new("id", id)
+
+          case Auth.authorize_command_request(
+                 peer,
+                 headers,
+                 RouteRequirements.flow_signal_form_requirement(id, params),
+                 :html
+               ) do
+            :ok ->
+              location =
+                case FerricstoreServer.Health.Dashboard.apply_flow_signal_form(params) do
+                  {:ok, id, partition_key} ->
+                    FlowPaths.flow_detail_location(id, partition_key, %{"status" => "signaled"})
+
+                  {:error, reason} ->
+                    partition_key = Map.get(params, "partition_key", "")
+
+                    FlowPaths.flow_detail_location(id, partition_key, %{
+                      "status" => "error",
+                      "message" => reason
+                    })
+                end
+
+              send_redirect_response(socket, transport, location)
+
+            {:redirect_login, location} ->
+              send_redirect_response(socket, transport, location)
+
+            {:unauthorized, reason} ->
+              send_response(
+                socket,
+                transport,
+                401,
+                "Unauthorized",
+                "application/json",
+                Jason.encode!(%{error: reason})
+              )
+
+            {:forbidden, requirement, reason} ->
+              send_forbidden_response(
+                socket,
+                transport,
+                "/dashboard/flow/" <> encoded_action,
+                requirement,
+                reason
+              )
+          end
+
+        true ->
           send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
       end
     end
@@ -768,6 +824,25 @@ defmodule FerricstoreServer.Health.Endpoint do
     DashboardHandlers.handle_config_page(socket, transport, peer, headers)
   end
 
+  defp dispatch_request(socket, transport, "GET", "/dashboard/capabilities", peer, headers) do
+    DashboardHandlers.handle_capabilities_page(socket, transport, peer, headers)
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/security", peer, headers) do
+    DashboardHandlers.handle_security_page(socket, transport, peer, headers, "")
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/security?" <> query,
+         peer,
+         headers
+       ) do
+    DashboardHandlers.handle_security_page(socket, transport, peer, headers, query)
+  end
+
   defp dispatch_request(socket, transport, "GET", "/dashboard/raft", peer, headers) do
     DashboardHandlers.handle_raft_page(socket, transport, peer, headers)
   end
@@ -813,6 +888,14 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/reads", peer, headers) do
     DashboardHandlers.handle_reads_page(socket, transport, peer, headers)
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/streams", peer, headers) do
+    DashboardHandlers.handle_streams_page(socket, transport, peer, headers)
+  end
+
+  defp dispatch_request(socket, transport, "GET", "/dashboard/pubsub", peer, headers) do
+    DashboardHandlers.handle_pubsub_page(socket, transport, peer, headers)
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/prefixes", peer, headers) do

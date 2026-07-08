@@ -2,13 +2,14 @@
 <%= page_head("Flow Due - FerricStore", 2, chartjs: true) %>
 <body data-dashboard-live-page="flow-due" data-dashboard-live-url="/dashboard/api/flow/due" data-dashboard-live-interval-ms="2000">
 <div class="layout">
-<%= render_sidebar_static("flow") %>
+<%= render_sidebar_static("flow_due") %>
 <main class="main-content">
 <%= render_subpage_header("Due / Scheduled") %>
 <div class="content">
 <%= render_page_intro("Due / Scheduled", "Inspect work that is claimable now, delayed for later, or expired and eligible for reclaim.") %>
 <%= render_flow_subnav("due") %>
 <%= render_live_component("flow_due_chart", render_flow_due_chart(data.due_now, data.scheduled)) %>
+<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit)) %>
 <%= render_live_component("flow_due_now", render_flow_due_records("Due Now", data.due_now, data.total_sampled, data.sample_limit)) %>
 <%= render_live_component("flow_scheduled", render_flow_due_records("Scheduled Future", data.scheduled, data.total_sampled, data.sample_limit)) %>
 </div>

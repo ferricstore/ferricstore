@@ -46,6 +46,7 @@ defmodule Ferricstore.Commands.Stream do
   alias Ferricstore.Commands.Stream.Mutations
   alias Ferricstore.Commands.Stream.Tables
   alias Ferricstore.Commands.Stream.Waiters
+  alias Ferricstore.Stream.ActivityLog
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
 
@@ -169,7 +170,7 @@ defmodule Ferricstore.Commands.Stream do
   def handle("XTRIM", [key | rest], store) do
     case Args.parse_trim_opts(rest) do
       {:ok, trim_opts} ->
-        Mutations.trim(key, trim_opts, store)
+        record_xtrim_result(key, trim_opts, Mutations.trim(key, trim_opts, store))
 
       {:error, _} = err ->
         err
@@ -185,7 +186,7 @@ defmodule Ferricstore.Commands.Stream do
   # -------------------------------------------------------------------------
 
   def handle("XDEL", [key | ids], store) when ids != [] do
-    Mutations.xdel(key, ids, store)
+    record_xdel_result(key, Mutations.xdel(key, ids, store))
   end
 
   def handle("XDEL", _args, _store) do
@@ -300,10 +301,12 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   def handle_ast({:xtrim, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:xtrim, key, trim_opts}, store), do: Mutations.trim(key, trim_opts, store)
+
+  def handle_ast({:xtrim, key, trim_opts}, store),
+    do: record_xtrim_result(key, trim_opts, Mutations.trim(key, trim_opts, store))
 
   def handle_ast({:xdel, key, ids}, store) when is_list(ids) and ids != [],
-    do: Mutations.xdel(key, ids, store)
+    do: record_xdel_result(key, Mutations.xdel(key, ids, store))
 
   def handle_ast({:xinfo_stream, key}, store), do: Info.stream(key, store)
   def handle_ast({:xinfo, {:error, reason}}, _store), do: {:error, reason}
@@ -421,12 +424,15 @@ defmodule Ferricstore.Commands.Stream do
 
     # Check if stream exists when NOMKSTREAM is set
     case meta_entries do
-      [] when nomkstream -> nil
-      meta_entries -> do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, store)
+      [] when nomkstream ->
+        nil
+
+      meta_entries ->
+        do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, nomkstream, store)
     end
   end
 
-  defp do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, store) do
+  defp do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, nomkstream, store) do
     with type_status when type_status in [:ok, {:ok, :created}, :no_marker] <-
            stream_type_status(key, store) do
       {last_ms, last_seq} =
@@ -464,6 +470,7 @@ defmodule Ferricstore.Commands.Stream do
 
               # Notify any XREAD BLOCK waiters watching this stream.
               notify_stream_waiters(key)
+              ActivityLog.record_xadd(key, id_str, div(length(fields), 2), trim_opts, nomkstream)
 
               id_str
 
@@ -489,6 +496,20 @@ defmodule Ferricstore.Commands.Stream do
 
   defp rollback_new_stream_type_marker(_key, _store, :ok, write_error), do: write_error
   defp rollback_new_stream_type_marker(_key, _store, :no_marker, write_error), do: write_error
+
+  defp record_xtrim_result(key, trim_opts, result) when is_integer(result) do
+    ActivityLog.record_xtrim(key, result, trim_opts)
+    result
+  end
+
+  defp record_xtrim_result(_key, _trim_opts, result), do: result
+
+  defp record_xdel_result(key, result) when is_integer(result) do
+    ActivityLog.record_xdel(key, result)
+    result
+  end
+
+  defp record_xdel_result(_key, result), do: result
 
   defp stream_type_status(key, store) do
     if Ops.has_compound?(store) do
@@ -571,7 +592,7 @@ defmodule Ferricstore.Commands.Stream do
 
     case xread_results(stream_ids, count, store, []) do
       {:error, _} = err -> err
-      results -> Enum.reverse(results)
+      results -> record_xread_result(stream_ids, Enum.reverse(results))
     end
   end
 
@@ -683,7 +704,7 @@ defmodule Ferricstore.Commands.Stream do
 
     case xreadgroup_results(group, consumer, stream_ids, count, store, []) do
       {:error, _} = err -> err
-      results -> Enum.reverse(results)
+      results -> record_xreadgroup_result(group, consumer, stream_ids, Enum.reverse(results))
     end
   end
 
@@ -858,7 +879,7 @@ defmodule Ferricstore.Commands.Stream do
           end)
 
         case Groups.persist(store, key, group, last_delivered, consumers, new_pending) do
-          :ok -> acked
+          :ok -> record_xack_result(key, group, acked)
           {:error, _reason} = error -> error
         end
     end
@@ -900,4 +921,23 @@ defmodule Ferricstore.Commands.Stream do
 
   defp maybe_take_tuples(entries, :infinity), do: entries
   defp maybe_take_tuples(entries, n), do: Enum.take(entries, n)
+
+  defp record_xread_result(_stream_ids, []), do: []
+
+  defp record_xread_result(stream_ids, results) do
+    ActivityLog.record_xread(stream_ids, results)
+    results
+  end
+
+  defp record_xreadgroup_result(_group, _consumer, _stream_ids, []), do: []
+
+  defp record_xreadgroup_result(group, consumer, stream_ids, results) do
+    ActivityLog.record_xreadgroup(group, consumer, stream_ids, results)
+    results
+  end
+
+  defp record_xack_result(key, group, acked) when is_integer(acked) do
+    ActivityLog.record_xack(key, group, acked)
+    acked
+  end
 end

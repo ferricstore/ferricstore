@@ -23,9 +23,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     backoff = flow_policy_field(retry, :backoff, Ferricstore.Flow.RetryPolicy.default().backoff)
     retention = Map.get(policy, :retention, Ferricstore.Flow.RetryPolicy.default_retention())
 
+    indexed_attributes =
+      policy |> Map.get(:indexed_attributes, []) |> flow_policy_indexed_attributes_string()
+
     %{
       type: type,
       state: "",
+      mode: :parallel,
+      indexed_attributes: indexed_attributes,
+      indexed_state_meta: flow_policy_field(policy, :indexed_state_meta, "") || "",
       max_retries: flow_policy_field(retry, :max_retries, 3),
       backoff_kind: flow_policy_field(backoff, :kind, :exponential),
       base_ms: flow_policy_field(backoff, :base_ms, 1_000),
@@ -43,6 +49,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   def render_flow_policy_editor(data) do
     editor = Map.get(data, :editor, flow_policy_editor_data(""))
     flash = render_flow_policy_flash(Map.get(data, :flash))
+    indexed_attributes = Map.get(editor, :indexed_attributes) || ""
+    indexed_state_meta = Map.get(editor, :indexed_state_meta) || ""
 
     """
     <div id="flow-policy-editor" class="flow-policy-panel">
@@ -57,6 +65,18 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
           <label class="flow-policy-field">
             <span>State override</span>
             <input class="flow-search-input mono" type="text" name="state" value="#{escape_attr(editor.state)}" autocomplete="off" placeholder="optional" title="Optional state-specific override for this type">
+          </label>
+          <label class="flow-policy-field">
+            <span>State mode</span>
+            #{render_flow_policy_mode_select(Map.get(editor, :mode, :parallel))}
+          </label>
+          <label class="flow-policy-field">
+            <span>Indexed attrs</span>
+            <input class="flow-search-input mono" type="text" name="indexed_attributes" value="#{escape_attr(indexed_attributes)}" autocomplete="off" placeholder="tenant, region" title="Comma-separated type-level indexed attributes used by FLOW.SEARCH">
+          </label>
+          <label class="flow-policy-field">
+            <span>Indexed state meta</span>
+            <input class="flow-search-input mono" type="text" name="indexed_state_meta" value="#{escape_attr(indexed_state_meta)}" autocomplete="off" placeholder="risk_tier" title="Optional type-level state metadata key used by FLOW.SEARCH STATE_META">
           </label>
           <label class="flow-policy-field">
             <span>Max retries</span>
@@ -120,11 +140,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
     ttl = format_duration_ms(Map.get(editor, :retention_ttl_ms, 0))
     history = format_number(Map.get(editor, :history_max_events, 0))
+    mode = flow_policy_mode_label(Map.get(editor, :mode, :parallel))
+    indexed_attributes = Map.get(editor, :indexed_attributes) || ""
+    indexed_state_meta = Map.get(editor, :indexed_state_meta) || ""
 
     """
     <div class="flow-policy-preview">
       <div class="flow-policy-preview-title">Review before saving</div>
       <div>Scope: <span class="mono">#{escape(scope)}</span></div>
+      <div>State mode: <span class="mono">#{escape(mode)}</span>. FIFO requires every entering Flow to carry a partition key and rejects priority.</div>
+      <div>Indexes: attributes <span class="mono">#{escape(if(indexed_attributes == "", do: "-", else: indexed_attributes))}</span>, state meta <span class="mono">#{escape(if(indexed_state_meta == "", do: "-", else: indexed_state_meta))}</span></div>
       <div>Retry: #{format_number(Map.get(editor, :max_retries, 0))} attempts, #{escape(to_string(Map.get(editor, :backoff_kind, :exponential)))} backoff, exhausted to <span class="mono">#{escape(to_string(Map.get(editor, :exhausted_to, "failed")))}</span></div>
       <div>Retention: keep terminal Flow records for #{escape(ttl)} and retain up to #{history} history events before cleanup.</div>
       <div class="flow-filter-note">Requires +FLOW.POLICY.SET. The save operation writes durable policy config; active Flow records keep their current state.</div>
@@ -142,6 +167,22 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       end)
 
     ~s(<select class="flow-search-input" name="backoff_kind" title="Retry delay strategy">#{options}</select>)
+  end
+
+  def render_flow_policy_mode_select(current) do
+    current = current |> to_string() |> String.downcase()
+
+    [
+      {"parallel", "Parallel"},
+      {"fifo", "FIFO"}
+    ]
+    |> Enum.map_join("\n", fn {mode, label} ->
+      selected = if mode == current, do: ~s( selected), else: ""
+      ~s(<option value="#{mode}"#{selected}>#{label}</option>)
+    end)
+    |> then(fn options ->
+      ~s(<select class="flow-search-input" name="mode" title="State-level scheduling mode. FIFO applies only when State override is set.">#{options}</select>)
+    end)
   end
 
   def render_flow_policy_commands do
@@ -165,6 +206,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
           "Controls how long terminal Flow state, history, and generated values are retained."
       },
       %{
+        command: "FLOW.POLICY.SET <type> STATE <state> MODE FIFO|PARALLEL",
+        scope: "Flow state",
+        mutability: "read-write",
+        notes:
+          "Sets state-level scheduling mode. FIFO preserves per-partition order, requires partition keys, and rejects priority."
+      },
+      %{
+        command: "FLOW.POLICY.SET <type> INDEXED_ATTRIBUTES <names> INDEXED_STATE_META <key>",
+        scope: "Flow type",
+        mutability: "read-write",
+        notes: "Configures type-level metadata indexes used by bounded FLOW.SEARCH queries."
+      },
+      %{
         command: "FLOW.POLICY.GET <type> [STATE <state>]",
         scope: "Flow type",
         mutability: "read-only",
@@ -180,7 +234,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         [] ->
           """
           <tr>
-            <td colspan="8" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
+            <td colspan="9" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
           </tr>
           """
 
@@ -198,6 +252,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         <tr>
           <th>Type</th>
           <th>Source</th>
+          <th>Indexes</th>
           <th>Retries</th>
           <th>Backoff</th>
           <th>Exhausted To</th>
@@ -237,7 +292,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     <tr>
       <td class="mono">#{escape(row.type)}</td>
       <td><span class="badge badge-pressure">error</span></td>
-      <td colspan="6" class="c-red">#{escape(error)}</td>
+      <td colspan="7" class="c-red">#{escape(error)}</td>
     </tr>
     """
   end
@@ -250,6 +305,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     <tr>
       <td class="mono">#{escape(row.type)}</td>
       <td><span class="badge #{flow_policy_source_class(row.source)}">#{escape(row.source)}</span></td>
+      <td>#{render_flow_policy_indexes(row)}</td>
       <td>#{format_number(flow_policy_field(retry, :max_retries, 0))}</td>
       <td>#{escape(flow_policy_backoff_summary(flow_policy_field(retry, :backoff, %{})))}</td>
       <td class="mono">#{escape(to_string(flow_policy_field(retry, :exhausted_to, "failed")))}</td>
@@ -276,12 +332,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       |> Enum.map_join("", fn state ->
         retry = Map.get(state, :retry, %{})
         retention = Map.get(state, :retention, %{})
+        mode = Map.get(state, :mode, :parallel)
 
         title =
-          "max retries #{flow_policy_field(retry, :max_retries, 0)}, " <>
+          "#{flow_policy_mode_label(mode)}, max retries #{flow_policy_field(retry, :max_retries, 0)}, " <>
             flow_policy_retention_summary(retention)
 
-        ~s(<span class="flow-pill" title="#{escape_attr(title)}">#{escape(state.state)}</span>)
+        ~s(<span class="flow-pill" title="#{escape_attr(title)}">#{escape(state.state)} #{escape(flow_policy_mode_label(mode))}</span>)
       end)
 
     extra = length(states) - @flow_dashboard_policy_state_preview_limit
@@ -322,6 +379,40 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
   def flow_policy_retention_summary(_retention), do: "-"
 
+  def render_flow_policy_indexes(row) do
+    attrs =
+      row
+      |> Map.get(:indexed_attributes, [])
+      |> List.wrap()
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.map_join(", ", &to_string/1)
+
+    state_meta = Map.get(row, :indexed_state_meta)
+
+    parts =
+      []
+      |> flow_policy_maybe_index_part("attrs", attrs)
+      |> flow_policy_maybe_index_part("state_meta", state_meta)
+      |> Enum.reverse()
+
+    case parts do
+      [] ->
+        ~s(<span class="c-muted">-</span>)
+
+      parts ->
+        Enum.map_join(parts, " ", fn part ->
+          ~s(<span class="flow-pill">#{escape(part)}</span>)
+        end)
+    end
+  end
+
+  defp flow_policy_maybe_index_part(parts, _label, value) when value in [nil, ""], do: parts
+  defp flow_policy_maybe_index_part(parts, label, value), do: ["#{label}: #{value}" | parts]
+
+  def flow_policy_mode_label(:fifo), do: "FIFO"
+  def flow_policy_mode_label("fifo"), do: "FIFO"
+  def flow_policy_mode_label(_mode), do: "parallel"
+
   def flow_policy_field(map, key, default) when is_map(map) and is_atom(key) do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))
   end
@@ -335,7 +426,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       retention:
         Ferricstore.Flow.RetryPolicy.default_retention()
         |> Map.delete(:history_hot_max_events),
+      indexed_attributes: [],
+      indexed_state_meta: nil,
       states: %{}
     }
   end
+
+  defp flow_policy_indexed_attributes_string(names) when is_list(names) do
+    names
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.map_join(", ", &to_string/1)
+  end
+
+  defp flow_policy_indexed_attributes_string(_names), do: ""
 end

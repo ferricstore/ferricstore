@@ -2,7 +2,7 @@
 <%= page_head("Flow Lineage - FerricStore", nil) %>
 <body>
 <div class="layout">
-<%= render_sidebar_static("flow") %>
+<%= render_sidebar_static("flow_lineage") %>
 <main class="main-content">
 <%= render_subpage_header("Flow Lineage") %>
 <div class="content">

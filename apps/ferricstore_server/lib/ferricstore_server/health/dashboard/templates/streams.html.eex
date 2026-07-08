@@ -1,0 +1,20 @@
+<% data = assigns.data %>
+<%= page_head("Streams - FerricStore", 5) %>
+<body data-dashboard-live-page="streams" data-dashboard-live-url="/dashboard/api/streams" data-dashboard-live-interval-ms="5000">
+<div class="layout">
+<%= render_sidebar_static("streams") %>
+<main class="main-content">
+<%= render_subpage_header("Streams") %>
+<div class="content">
+<%= render_page_intro("Streams", "Inspect recent stream append and mutation activity without exposing stream payload fields or values.") %>
+<%= render_messaging_subnav("streams") %>
+<%= render_live_component("streams_summary", render_stream_activity_summary(data)) %>
+<%= render_live_component("streams_top", render_stream_top_streams(data)) %>
+<%= render_live_component("streams_consumers", render_stream_consumers(data)) %>
+<%= render_live_component("streams_waiters", render_stream_waiters(data)) %>
+<%= render_live_component("streams_log", render_stream_activity_log(data)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

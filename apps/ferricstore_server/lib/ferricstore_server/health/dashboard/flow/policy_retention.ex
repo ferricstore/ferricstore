@@ -47,10 +47,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   def apply_policy_form(params) when is_map(params) do
     with {:ok, type} <- flow_policy_required_form_value(params, "type", "flow type"),
          {:ok, state} <- flow_policy_optional_form_value(params, "state"),
+         {:ok, mode} <- flow_policy_form_mode(params),
          {:ok, retry} <- flow_policy_form_retry_opts(params),
          {:ok, retention} <- flow_policy_form_retention_opts(params),
+         {:ok, indexes} <- flow_policy_form_index_opts(params),
          {:ok, existing_opts} <- flow_policy_existing_set_opts(type),
-         opts = flow_policy_merge_form_opts(existing_opts, state, retry, retention),
+         opts = flow_policy_merge_form_opts(existing_opts, state, mode, retry, retention, indexes),
          {:ok, _policy} <- FerricStore.flow_policy_set(type, opts) do
       {:ok, type}
     else
@@ -313,6 +315,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
           source: source,
           retry: Map.get(policy, :retry, %{}),
           retention: Map.get(policy, :retention, %{}),
+          indexed_attributes: Map.get(policy, :indexed_attributes, []),
+          indexed_state_meta: Map.get(policy, :indexed_state_meta),
           states: flow_policy_state_rows(Map.get(policy, :states, %{})),
           error: nil
         }
@@ -357,6 +361,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     |> Enum.map(fn {state, policy} ->
       %{
         state: to_string(state),
+        mode: flow_policy_field(policy, :mode, :parallel),
         retry: Map.get(policy, :retry, %{}),
         retention: Map.get(policy, :retention, %{})
       }
@@ -390,9 +395,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     backoff = flow_policy_field(retry, :backoff, Ferricstore.Flow.RetryPolicy.default().backoff)
     retention = Map.get(policy, :retention, Ferricstore.Flow.RetryPolicy.default_retention())
 
+    indexed_attributes =
+      policy
+      |> Map.get(:indexed_attributes, [])
+      |> flow_policy_indexed_attributes_string()
+
     %{
       type: type,
       state: "",
+      mode: :parallel,
+      indexed_attributes: indexed_attributes,
+      indexed_state_meta: flow_policy_field(policy, :indexed_state_meta, "") || "",
       max_retries: flow_policy_field(retry, :max_retries, 3),
       backoff_kind: flow_policy_field(backoff, :kind, :exponential),
       base_ms: flow_policy_field(backoff, :base_ms, 1_000),
@@ -437,6 +450,16 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       retention: flow_policy_retention_to_set_opts(Map.get(policy, :retention, %{})),
       states: flow_policy_states_to_set_opts(Map.get(policy, :states, %{}))
     ]
+    |> flow_policy_maybe_put_opt(
+      :indexed_attributes,
+      flow_policy_field(policy, :indexed_attributes, [])
+    )
+    |> flow_policy_maybe_put_opt(
+      :indexed_state_meta,
+      flow_policy_field(policy, :indexed_state_meta, nil)
+    )
+    |> flow_policy_maybe_put_opt(:version, flow_policy_field(policy, :version, nil))
+    |> flow_policy_maybe_put_opt(:governance, flow_policy_field(policy, :governance, nil))
   end
 
   @spec flow_policy_states_to_set_opts(map() | term()) :: list()
@@ -444,9 +467,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     Enum.map(states, fn {state, policy} ->
       {to_string(state),
        [
+         mode: flow_policy_field(policy, :mode, :parallel),
          retry: flow_policy_retry_to_set_opts(Map.get(policy, :retry, %{})),
          retention: flow_policy_retention_to_set_opts(Map.get(policy, :retention, %{}))
-       ]}
+       ]
+       |> flow_policy_maybe_put_opt(:governance, flow_policy_field(policy, :governance, nil))}
     end)
   end
 
@@ -482,19 +507,35 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   defp flow_policy_retention_to_set_opts(_retention),
     do: flow_policy_retention_to_set_opts(Ferricstore.Flow.RetryPolicy.default_retention())
 
-  @spec flow_policy_merge_form_opts(keyword(), binary() | nil, keyword(), keyword()) :: keyword()
-  defp flow_policy_merge_form_opts(existing_opts, nil, retry, retention) do
+  @spec flow_policy_merge_form_opts(
+          keyword(),
+          binary() | nil,
+          atom(),
+          keyword(),
+          keyword(),
+          keyword()
+        ) ::
+          keyword()
+  defp flow_policy_merge_form_opts(existing_opts, nil, _mode, retry, retention, indexes) do
     existing_opts
     |> Keyword.put(:retry, retry)
     |> Keyword.put(:retention, retention)
+    |> flow_policy_apply_index_action(
+      :indexed_attributes,
+      Keyword.get(indexes, :indexed_attributes, :preserve)
+    )
+    |> flow_policy_apply_index_action(
+      :indexed_state_meta,
+      Keyword.get(indexes, :indexed_state_meta, :preserve)
+    )
   end
 
-  defp flow_policy_merge_form_opts(existing_opts, state, retry, retention)
+  defp flow_policy_merge_form_opts(existing_opts, state, mode, retry, retention, _indexes)
        when is_binary(state) do
     states =
       existing_opts
       |> Keyword.get(:states, [])
-      |> flow_policy_put_state_policy(state, retry: retry, retention: retention)
+      |> flow_policy_put_state_policy(state, mode: mode, retry: retry, retention: retention)
 
     Keyword.put(existing_opts, :states, states)
   end
@@ -533,6 +574,65 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
          ttl_ms: ttl_ms,
          history_max_events: history_max_events
        ]}
+    end
+  end
+
+  @spec flow_policy_form_mode(map()) :: {:ok, :parallel | :fifo} | {:error, binary()}
+  defp flow_policy_form_mode(params) do
+    case params
+         |> Map.get("mode", "parallel")
+         |> flow_policy_clean_form_value()
+         |> String.downcase() do
+      "parallel" -> {:ok, :parallel}
+      "fifo" -> {:ok, :fifo}
+      _ -> {:error, "ERR flow state mode must be parallel or fifo"}
+    end
+  end
+
+  @spec flow_policy_form_index_opts(map()) :: {:ok, keyword()} | {:error, binary()}
+  defp flow_policy_form_index_opts(params) do
+    with {:ok, indexed_attributes} <- flow_policy_form_indexed_attributes(params),
+         {:ok, indexed_state_meta} <- flow_policy_form_indexed_state_meta(params) do
+      opts =
+        []
+        |> flow_policy_maybe_put_index_action(:indexed_attributes, indexed_attributes)
+        |> flow_policy_maybe_put_index_action(:indexed_state_meta, indexed_state_meta)
+
+      {:ok, opts}
+    end
+  end
+
+  @spec flow_policy_form_indexed_attributes(map()) ::
+          {:ok, :preserve | {:set, [binary()]}} | {:error, binary()}
+  defp flow_policy_form_indexed_attributes(params) do
+    if Map.has_key?(params, "indexed_attributes") do
+      attrs =
+        params
+        |> Map.get("indexed_attributes", "")
+        |> flow_policy_clean_form_value()
+
+      names =
+        attrs
+        |> String.split([",", " ", "\n", "\t"], trim: true)
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.uniq()
+
+      {:ok, {:set, names}}
+    else
+      {:ok, :preserve}
+    end
+  end
+
+  @spec flow_policy_form_indexed_state_meta(map()) :: {:ok, :preserve | {:set, binary() | nil}}
+  defp flow_policy_form_indexed_state_meta(params) do
+    if Map.has_key?(params, "indexed_state_meta") do
+      with {:ok, indexed_state_meta} <-
+             flow_policy_optional_form_value(params, "indexed_state_meta") do
+        {:ok, {:set, indexed_state_meta}}
+      end
+    else
+      {:ok, :preserve}
     end
   end
 
@@ -584,6 +684,31 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   @spec flow_policy_clean_form_value(term()) :: binary()
   defp flow_policy_clean_form_value(value) when is_binary(value), do: String.trim(value)
   defp flow_policy_clean_form_value(value), do: value |> to_string() |> String.trim()
+
+  defp flow_policy_maybe_put_opt(opts, _key, value) when value in [nil, []], do: opts
+  defp flow_policy_maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp flow_policy_put_nullable_opt(opts, key, nil), do: Keyword.delete(opts, key)
+  defp flow_policy_put_nullable_opt(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp flow_policy_apply_index_action(opts, _key, :preserve), do: opts
+
+  defp flow_policy_apply_index_action(opts, :indexed_state_meta, {:set, value}) do
+    flow_policy_put_nullable_opt(opts, :indexed_state_meta, value)
+  end
+
+  defp flow_policy_apply_index_action(opts, key, {:set, value}), do: Keyword.put(opts, key, value)
+
+  defp flow_policy_maybe_put_index_action(opts, _key, :preserve), do: opts
+  defp flow_policy_maybe_put_index_action(opts, key, action), do: Keyword.put(opts, key, action)
+
+  defp flow_policy_indexed_attributes_string(names) when is_list(names) do
+    names
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.map_join(", ", &to_string/1)
+  end
+
+  defp flow_policy_indexed_attributes_string(_names), do: ""
 
   @spec flow_retention_form_limit(term()) :: {:ok, pos_integer()} | {:error, binary()}
   defp flow_retention_form_limit(nil), do: {:ok, @flow_dashboard_retention_default_limit}

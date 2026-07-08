@@ -2,7 +2,7 @@
 <%= page_head("FerricFlow Retention - FerricStore", nil) %>
 <body>
   <div class="layout">
-    <%= render_sidebar_static("flow") %>
+    <%= render_sidebar_static("flow_retention") %>
     <main class="main-content">
       <%= render_subpage_header("FerricFlow Retention") %>
       <div class="content">

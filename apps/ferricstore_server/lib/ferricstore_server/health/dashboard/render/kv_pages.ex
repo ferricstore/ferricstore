@@ -15,8 +15,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       %{
         name: "Structured Values",
         purpose: "Compound primitives stored as internal keys.",
-        commands:
-          ~w(HGET HSET HMGET HGETALL LPUSH RPUSH LPOP RPOP SADD SMEMBERS ZADD ZRANGE XADD XREAD)
+        commands: ~w(HGET HSET HMGET HGETALL LPUSH RPUSH LPOP RPOP SADD SMEMBERS ZADD ZRANGE)
+      },
+      %{
+        name: "Streams",
+        purpose: "Append-only stream records, blocking reads, and consumer groups.",
+        commands: ~w(XADD XLEN XRANGE XREVRANGE XREAD XTRIM XDEL XINFO XGROUP XREADGROUP XACK)
+      },
+      %{
+        name: "Pub/Sub",
+        purpose: "Ephemeral channel fanout and subscription introspection.",
+        commands: ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE)
       },
       %{
         name: "Large / Cold Values",
@@ -177,7 +186,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
           |> Enum.map_join(" ", &~s(<span class="flow-pill mono">#{escape(&1)}</span>))
 
         """
-        <div class="kv-command-group">
+        <div class="kv-command-group" id="#{command_group_anchor(group.name)}">
           <div class="kv-command-title">#{escape(group.name)}</div>
           <div class="kv-command-purpose">#{escape(group.purpose)}</div>
           <div>#{commands}</div>
@@ -189,6 +198,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
     <div class="section-title">Command Groups</div>
     <div class="kv-command-grid">#{body}</div>
     """
+  end
+
+  defp command_group_anchor("Pub/Sub"), do: "pubsub"
+
+  defp command_group_anchor(name) when is_binary(name) do
+    name
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]+/, "-")
+    |> String.trim("-")
+    |> escape_attr()
   end
 
   def render_reads_summary(data) do

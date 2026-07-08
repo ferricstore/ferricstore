@@ -68,6 +68,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
   def render_flow_detail(data) do
     record = data.record
     state = flow_record_state(record)
+    logical_state = flow_record_logical_state(record)
+    state_mode = Map.get(data, :state_mode, :parallel)
 
     """
     <div class="section-title">Flow Detail <span class="badge #{flow_state_badge_class(state)}">#{escape(state)}</span></div>
@@ -83,16 +85,35 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
         <div class="flow-card-detail">computed from current durable state</div>
       </div>
       <div class="flow-card">
+        <div class="flow-card-label">State mode</div>
+        <div class="flow-card-value #{flow_detail_mode_class(state_mode)}" style="font-size:1rem;">#{escape(flow_detail_mode_label(state_mode))}</div>
+        <div class="flow-card-detail">logical state #{escape(logical_state)}</div>
+      </div>
+      <div class="flow-card">
         <div class="flow-card-label">Fencing</div>
         <div class="flow-card-value">#{escape(to_string(flow_field(record, :fencing_token, "-")))}</div>
         <div class="flow-card-detail">lease safety token</div>
       </div>
     </div>
     #{render_flow_detail_table(record)}
+    #{render_flow_detail_fifo_lane(data)}
     #{render_flow_detail_signals(data)}
     #{render_flow_rewind_action(data)}
+    #{render_flow_signal_action(data)}
     """
   end
+
+  def render_flow_detail_fifo_lane(%{fifo_lane: %{} = lane}) do
+    render_flow_fifo_lanes([lane], Map.get(lane, :count, 1), Map.get(lane, :count, 1))
+  end
+
+  def render_flow_detail_fifo_lane(%{state_mode: :fifo}) do
+    """
+    <div class="flow-help">This Flow is in a FIFO state, but no lane peers were visible in the bounded dashboard sample.</div>
+    """
+  end
+
+  def render_flow_detail_fifo_lane(_data), do: ""
 
   def render_flow_detail_signals(%{record: %{} = record, history: history})
       when is_list(history) do
@@ -107,6 +128,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     fields = [
       {"Type", flow_record_type(record)},
       {"State", flow_record_state(record)},
+      {"Logical State", flow_record_logical_state(record)},
       {"Partition", flow_record_partition_key(record) || "auto/global"},
       {"Worker", flow_record_worker(record) || "-"},
       {"Priority", flow_field(record, :priority, 0)},
@@ -149,6 +171,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
     </table>
     """
   end
+
+  defp flow_detail_mode_label(:fifo), do: "FIFO"
+  defp flow_detail_mode_label("fifo"), do: "FIFO"
+  defp flow_detail_mode_label(_mode), do: "parallel"
+
+  defp flow_detail_mode_class(:fifo), do: "c-green"
+  defp flow_detail_mode_class("fifo"), do: "c-green"
+  defp flow_detail_mode_class(_mode), do: ""
 
   def render_flow_attribute_badges(record) do
     attrs = flow_record_attributes(record)
@@ -251,6 +281,53 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowDetail do
   end
 
   def render_flow_rewind_action(_data), do: ""
+
+  def render_flow_signal_action(%{record: %{} = record} = data) do
+    id = flow_record_id(record)
+
+    partition_key =
+      flow_detail_url_partition_key(
+        Map.get(data, :partition_key) || flow_record_partition_key(record)
+      )
+
+    action = "/dashboard/flow/" <> URI.encode(id, &URI.char_unreserved?/1) <> "/signal"
+    partition_input = render_flow_rewind_partition_input(partition_key)
+
+    """
+    <div class="flow-policy-panel">
+      <div class="section-title">Send Signal #{info_icon("External signal records a signal payload event and can optionally transition the flow state.")}</div>
+      <form class="flow-policy-form" action="#{escape_attr(action)}" method="post">
+        <input type="hidden" name="id" value="#{escape_attr(id)}">
+        #{partition_input}
+        <div class="flow-policy-grid">
+          <label class="flow-policy-field">
+            <span>Signal Name</span>
+            <input class="flow-search-input mono" type="text" name="signal" required placeholder="e.g. payment_received" title="Required signal name">
+          </label>
+          <label class="flow-policy-field">
+            <span>Transition To (optional)</span>
+            <input class="flow-search-input mono" type="text" name="transition_to" placeholder="e.g. processing" title="Optional state to transition to upon receiving the signal">
+          </label>
+        </div>
+        <div class="flow-policy-grid">
+          <label class="flow-policy-field">
+            <span>Idempotency Key (optional)</span>
+            <input class="flow-search-input mono" type="text" name="idempotency_key" placeholder="unique token" title="Optional unique signal deduplication key">
+          </label>
+          <label class="flow-policy-field">
+            <span>Gated If State (optional)</span>
+            <input class="flow-search-input mono" type="text" name="if_state" placeholder="e.g. payment_pending" title="Optional state constraint: signal only applies if the flow is currently in this state">
+          </label>
+        </div>
+        <div class="flow-policy-actions">
+          <button class="flow-search-button" type="submit">Send Signal</button>
+        </div>
+      </form>
+    </div>
+    """
+  end
+
+  def render_flow_signal_action(_data), do: ""
 
   def render_flow_rewind_partition_input(partition_key)
       when is_binary(partition_key) and partition_key != "" do

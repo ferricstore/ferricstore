@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   @moduledoc false
 
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
+  alias FerricstoreServer.Health.Dashboard.Flow.Fifo
   alias FerricstoreServer.Health.Dashboard.Flow.Projection
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
@@ -80,9 +81,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
       |> filter_flow_records_by_type(filters.type)
 
     filtered_records = filter_flow_records(type_records, filters)
+    fifo_records = filter_flow_records_for_fifo_lanes(type_records, filters)
 
     %{
-      states: flow_state_summaries(filtered_records),
+      states: filtered_records |> flow_state_summaries() |> Fifo.annotate_state_summaries(),
+      fifo_lanes: Fifo.lane_summaries(fifo_records),
       records: flow_recent_records(filtered_records, filters.limit),
       available_types: flow_available_types(type_records ++ records),
       available_states:
@@ -155,6 +158,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     %{
       workers: flow_worker_summaries(records),
       running_records: Enum.filter(records, &(flow_record_state(&1) == "running")),
+      fifo_lanes: Fifo.lane_summaries(records),
       total_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit
     }
@@ -170,9 +174,34 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     %{
       due_now: Enum.filter(records, &flow_due_now?/1),
       scheduled: records |> Enum.filter(&flow_scheduled_future?/1) |> flow_recent_records(80),
+      fifo_lanes: Fifo.lane_summaries(records),
       total_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit
     }
+  end
+
+  defp filter_flow_records_for_fifo_lanes(records, filters) when is_map(filters) do
+    records
+    |> filter_flow_fifo_records_by_logical_state(Map.get(filters, :state))
+    |> filter_flow_records_by_name(Map.get(filters, :q))
+    |> filter_flow_records_by_updated_window(Map.get(filters, :from_ms), Map.get(filters, :to_ms))
+  end
+
+  defp filter_flow_fifo_records_by_logical_state(records, nil), do: records
+
+  defp filter_flow_fifo_records_by_logical_state(records, state) when is_binary(state) do
+    Enum.filter(records, &(flow_record_logical_state(&1) == state))
+  end
+
+  defp filter_flow_records_by_updated_window(records, nil, nil), do: records
+
+  defp filter_flow_records_by_updated_window(records, from_ms, to_ms) do
+    Enum.filter(records, fn record ->
+      updated_at = flow_record_updated_at_ms(record)
+      after_from? = not is_integer(from_ms) or updated_at >= from_ms
+      before_to? = not is_integer(to_ms) or updated_at <= to_ms
+      after_from? and before_to?
+    end)
   end
 
   defp collect_flow_states_terminal_records(filters, available_types) do

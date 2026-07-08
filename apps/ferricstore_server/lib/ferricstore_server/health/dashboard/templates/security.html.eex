@@ -1,0 +1,15 @@
+<% data = assigns.data %>
+<%= page_head("Security - FerricStore", nil) %>
+<body>
+<div class="layout">
+<%= render_sidebar_static("security") %>
+<main class="main-content">
+<%= render_subpage_header("Security") %>
+<div class="content">
+<%= render_page_intro("Security", "Inspect OSS ACL state, dashboard route requirements, and effective command/key/channel access without exposing credential mutation controls.") %>
+<%= render_acl_security(data) %>
+</div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,19 @@
+<% data = assigns.data %>
+<%= page_head("Pub/Sub - FerricStore", 5) %>
+<body data-dashboard-live-page="pubsub" data-dashboard-live-url="/dashboard/api/pubsub" data-dashboard-live-interval-ms="5000">
+<div class="layout">
+<%= render_sidebar_static("pubsub") %>
+<main class="main-content">
+<%= render_subpage_header("Pub/Sub") %>
+<div class="content">
+<%= render_page_intro("Pub/Sub", "Inspect active Pub/Sub subscriptions and publish activity without exposing message bodies.") %>
+<%= render_messaging_subnav("pubsub") %>
+<%= render_live_component("pubsub_summary", render_pubsub_summary(data)) %>
+<%= render_live_component("pubsub_channels", render_pubsub_channels(data)) %>
+<%= render_live_component("pubsub_patterns", render_pubsub_patterns(data)) %>
+<%= render_live_component("pubsub_activity", render_pubsub_activity(data)) %>
+</div>
+</main>
+</div>
+</body>
+</html>

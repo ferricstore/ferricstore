@@ -13,6 +13,7 @@
     <%= render_flow_query_type_field(filters) %>
     <%= render_flow_query_state_field(filters) %>
     <%= render_flow_query_attribute_fields(filters) %>
+    <%= render_flow_query_state_meta_fields(filters) %>
     <%= render_flow_query_id_field(filters) %>
     <%= render_flow_query_partition_field(filters) %>
     <label>

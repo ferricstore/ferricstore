@@ -217,6 +217,8 @@ defmodule Ferricstore.Application do
           [
             Ferricstore.Stats,
             Ferricstore.SlowLog,
+            Ferricstore.Stream.ActivityLog,
+            Ferricstore.PubSub.ActivityLog,
             Ferricstore.AuditLog,
             Ferricstore.Config,
             Ferricstore.NamespaceConfig,

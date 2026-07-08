@@ -2,7 +2,7 @@
 <%= page_head("FerricFlow Governance - FerricStore", nil) %>
 <body>
   <div class="layout">
-    <%= render_sidebar_static("flow") %>
+    <%= render_sidebar_static("flow_governance") %>
     <main class="main-content">
       <%= render_subpage_header("FerricFlow Governance") %>
       <div class="content">

@@ -35,6 +35,20 @@ defmodule FerricstoreServer.Health.Endpoint.FlowPaths do
     end
   end
 
+  @spec decode_flow_signal_action(binary()) :: {:ok, binary()} | :not_found
+  def decode_flow_signal_action(encoded_action) do
+    suffix = "/signal"
+
+    if String.ends_with?(encoded_action, suffix) do
+      encoded_id =
+        binary_part(encoded_action, 0, byte_size(encoded_action) - byte_size(suffix))
+
+      {:ok, URI.decode(encoded_id)}
+    else
+      :not_found
+    end
+  end
+
   @spec flow_detail_location(binary(), binary() | nil) :: binary()
   def flow_detail_location(id, ""),
     do: flow_detail_path(id)

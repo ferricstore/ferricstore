@@ -21,6 +21,9 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <meta name="description" content="FerricStore operational dashboard">
       <title>#{escape(title)}</title>
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
       <style>
       #{Styles.stylesheet()}
     </style>
@@ -390,6 +393,23 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     ~s(<nav class="flow-tabs" aria-label="KV dashboard sections">#{links}</nav>)
   end
 
+  def render_messaging_subnav(active) do
+    items = [
+      {"streams", "/dashboard/streams", "Streams", "Append and stream mutation activity"},
+      {"pubsub", "/dashboard/pubsub", "Pub/Sub", "Active subscriptions and publish activity"}
+    ]
+
+    links =
+      Enum.map_join(items, "\n", fn {key, href, label, title} ->
+        active_class = if key == active, do: " active", else: ""
+        current = if key == active, do: ~s( aria-current="page"), else: ""
+
+        ~s(<a class="flow-tab#{active_class}" href="#{href}"#{current} title="#{escape_attr(title)}">#{escape(label)}</a>)
+      end)
+
+    ~s(<nav class="flow-tabs" aria-label="Messaging dashboard sections">#{links}</nav>)
+  end
+
   # Sidebar with live badge data (used on main dashboard)
   def render_sidebar(data, active) do
     slowlog_count = length(data.slowlog)
@@ -415,9 +435,12 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
       "config" => config_badge,
       "clients" => conns_badge,
       "storage" => storage_badge,
+      "streams" => "",
       "keyspace" => "",
       "reads" => "",
       "commands" => "",
+      "capabilities" => "",
+      "security" => "",
       "doctor" => ""
     })
   end
@@ -431,45 +454,18 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
       "config" => "",
       "clients" => "",
       "storage" => "",
+      "streams" => "",
       "keyspace" => "",
       "reads" => "",
       "commands" => "",
+      "capabilities" => "",
+      "security" => "",
       "doctor" => ""
     })
   end
 
   def sidebar_html(active, badges) do
-    items = [
-      {"overview", "/dashboard", "Overview"},
-      {"flow", "/dashboard/flow", "FerricFlow"},
-      {"keyspace", "/dashboard/keyspace", "Keyspace"},
-      {"reads", "/dashboard/reads", "Read Path"},
-      {"commands", "/dashboard/commands", "Commands"},
-      {"slowlog", "/dashboard/slowlog", "Slow Log"},
-      {"merge", "/dashboard/merge", "Merge Status"},
-      {"storage", "/dashboard/storage", "Storage"},
-      {"doctor", "/dashboard/doctor", "Doctor"},
-      {"raft", "/dashboard/raft", "Consensus"},
-      {"config", "/dashboard/config", "Config"},
-      {"clients", "/dashboard/clients", "Clients"},
-      {"prefixes", "/dashboard/prefixes", "Key Prefixes"}
-    ]
-
-    links =
-      Enum.map_join(items, "\n", fn {key, href, label} ->
-        active_class = if key == active, do: " active", else: ""
-        current_attr = if key == active, do: ~s( aria-current="page"), else: ""
-        badge_val = Map.get(badges, key, "")
-
-        badge_html =
-          if badge_val != "" and badge_val != nil do
-            ~s(<span class="nav-badge">#{escape(to_string(badge_val))}</span>)
-          else
-            ""
-          end
-
-        ~s(<a class="#{active_class}" href="#{href}"#{current_attr}><span class="nav-label">#{escape(label)}</span>#{badge_html}</a>)
-      end)
+    links = Enum.map_join(sidebar_sections(), "\n", &render_sidebar_section(&1, active, badges))
 
     """
     <nav class="sidebar" aria-label="Dashboard sections">
@@ -477,4 +473,84 @@ defmodule FerricstoreServer.Health.Dashboard.Layout do
     </nav>
     """
   end
+
+  defp sidebar_sections do
+    [
+      {"System", [{"overview", "/dashboard", "Overview", :primary}]},
+      {"FerricFlow",
+       [
+         {"flow", "/dashboard/flow", "Overview", :primary},
+         {"flow_states", "/dashboard/flow/states", "States / FIFO", :sub},
+         {"flow_workers", "/dashboard/flow/workers", "Workers", :sub},
+         {"flow_due", "/dashboard/flow/due", "Due Work", :sub},
+         {"flow_schedules", "/dashboard/flow/schedules", "Schedules", :sub},
+         {"flow_failures", "/dashboard/flow/failures", "Failures", :sub},
+         {"flow_lineage", "/dashboard/flow/lineage", "Lineage", :sub},
+         {"flow_query", "/dashboard/flow/query", "Query Explorer", :sub},
+         {"flow_signals", "/dashboard/flow/signals", "Signals", :sub},
+         {"flow_policies", "/dashboard/flow/policies", "Policies", :sub},
+         {"flow_governance", "/dashboard/flow/governance", "Governance", :sub},
+         {"flow_retention", "/dashboard/flow/retention", "Retention", :sub}
+       ]},
+      {"KV / Data",
+       [
+         {"keyspace", "/dashboard/keyspace", "Keyspace", :primary},
+         {"prefixes", "/dashboard/prefixes", "Prefixes", :sub},
+         {"reads", "/dashboard/reads", "Read Path", :sub},
+         {"storage", "/dashboard/storage", "Storage", :sub},
+         {"commands", "/dashboard/commands", "Command Catalog", :sub}
+       ]},
+      {"Messaging",
+       [
+         {"streams", "/dashboard/streams", "Streams", :primary},
+         {"pubsub", "/dashboard/pubsub", "Pub/Sub", :primary}
+       ]},
+      {"Operations",
+       [
+         {"slowlog", "/dashboard/slowlog", "Slow Log", :primary},
+         {"merge", "/dashboard/merge", "Merge Status", :primary},
+         {"clients", "/dashboard/clients", "Clients", :primary},
+         {"raft", "/dashboard/raft", "Consensus", :primary}
+       ]},
+      {"Control Plane",
+       [
+         {"security", "/dashboard/security", "Security", :primary},
+         {"capabilities", "/dashboard/capabilities", "Capabilities", :primary},
+         {"config", "/dashboard/config", "Config", :primary},
+         {"doctor", "/dashboard/doctor", "Doctor", :primary}
+       ]}
+    ]
+  end
+
+  defp render_sidebar_section({section, items}, active, badges) do
+    rendered_items =
+      Enum.map_join(items, "\n", fn {key, href, label, depth} ->
+        render_sidebar_link(key, href, label, depth, active, badges)
+      end)
+
+    """
+    <div class="nav-section">#{escape(section)}</div>
+    #{rendered_items}
+    """
+  end
+
+  defp render_sidebar_link(key, href, label, depth, active, badges) do
+    active? = sidebar_item_active?(key, active)
+    active_class = if active?, do: " active", else: ""
+    depth_class = if depth == :sub, do: " nav-subitem", else: ""
+    current_attr = if active?, do: ~s( aria-current="page"), else: ""
+    badge_val = Map.get(badges, key, "")
+
+    badge_html =
+      if badge_val != "" and badge_val != nil do
+        ~s(<span class="nav-badge">#{escape(to_string(badge_val))}</span>)
+      else
+        ""
+      end
+
+    ~s(<a class="#{active_class}#{depth_class}" href="#{href}"#{current_attr}><span class="nav-label">#{escape(label)}</span>#{badge_html}</a>)
+  end
+
+  defp sidebar_item_active?("flow", "flow_detail"), do: true
+  defp sidebar_item_active?(key, active), do: key == active
 end

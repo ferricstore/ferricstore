@@ -17,6 +17,10 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.OperationalPages do
                 {"/dashboard/clients", "Clients"},
                 {"/dashboard/storage", "Storage"},
                 {"/dashboard/raft", "Raft"},
+                {"/dashboard/security", "Security"},
+                {"/dashboard/capabilities", "Capabilities"},
+                {"/dashboard/streams", "Streams"},
+                {"/dashboard/pubsub", "Pub/Sub"},
                 {"/dashboard/prefixes", "Prefixes"}
               ] do
             response = http_get(port, path)
@@ -58,6 +62,125 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.OperationalPages do
 
           assert String.contains?(raft_html, "Raft")
           assert String.contains?(storage_html, "Storage")
+        end
+
+        test "renders management capabilities without mutation forms" do
+          html =
+            Dashboard.collect_capabilities_page()
+            |> Dashboard.render_capabilities_page()
+
+          assert String.contains?(html, "Management Capabilities")
+          assert String.contains?(html, "FERRICSTORE.CAPABILITIES")
+          assert String.contains?(html, "flow_observability")
+          assert String.contains?(html, "unsupported")
+          refute String.contains?(html, ~s(method="post"))
+          refute String.contains?(html, "COMMAND_EXEC")
+        end
+
+        test "command catalog exposes messaging anchors" do
+          html =
+            Dashboard.collect_commands_page()
+            |> Dashboard.render_commands_page()
+
+          assert String.contains?(html, ~s(id="streams"))
+          assert String.contains?(html, "XREADGROUP")
+          assert String.contains?(html, ~s(id="pubsub"))
+          assert String.contains?(html, "PUBLISH")
+        end
+
+        test "stream activity page shows append metadata without payload fields" do
+          Ferricstore.Stream.ActivityLog.reset()
+
+          {:ok, entry_id} =
+            FerricStore.xadd("dashboard:stream:activity", [
+              "secret_field",
+              "secret-value"
+            ])
+
+          html =
+            Dashboard.collect_streams_page()
+            |> Dashboard.render_streams_page()
+
+          assert String.contains?(html, "Stream Activity")
+          assert String.contains?(html, "dashboard:stream:activity")
+          assert String.contains?(html, entry_id)
+          assert String.contains?(html, "1 field pairs")
+          refute String.contains?(html, "secret_field")
+          refute String.contains?(html, "secret-value")
+        end
+
+        test "stream activity page shows consumer metadata without payload fields" do
+          Ferricstore.Stream.ActivityLog.reset()
+
+          key = "dashboard:stream:consumer:#{System.unique_integer([:positive])}"
+          store = FerricStore.API.Store.build_stream_store(key)
+
+          assert {:ok, entry_id} = FerricStore.xadd(key, ["payload_field", "payload-value"])
+
+          assert :ok =
+                   Ferricstore.Commands.Stream.handle("XGROUP", ["CREATE", key, "g1", "0"], store)
+
+          assert [[^key, [[^entry_id | _fields]]]] =
+                   Ferricstore.Commands.Stream.handle(
+                     "XREADGROUP",
+                     ["GROUP", "g1", "c1", "STREAMS", key, ">"],
+                     store
+                   )
+
+          assert 1 == Ferricstore.Commands.Stream.handle("XACK", [key, "g1", entry_id], store)
+
+          html =
+            Dashboard.collect_streams_page()
+            |> Dashboard.render_streams_page()
+
+          assert String.contains?(html, "Stream Consumers")
+          assert String.contains?(html, "XREADGROUP")
+          assert String.contains?(html, "XACK")
+          assert String.contains?(html, "g1 / c1")
+          assert String.contains?(html, "consumer")
+          refute String.contains?(html, "payload_field")
+          refute String.contains?(html, "payload-value")
+        end
+
+        test "stream activity live payload renders recent append components" do
+          Ferricstore.Stream.ActivityLog.reset()
+
+          {:ok, _entry_id} = FerricStore.xadd("dashboard:stream:live", ["kind", "created"])
+
+          assert {:ok, payload} = Dashboard.live_payload("streams")
+          assert is_integer(payload.generated_at_ms)
+          assert Map.has_key?(payload.components, "streams_summary")
+          assert payload.components["streams_log"] =~ "dashboard:stream:live"
+          refute payload.components["streams_log"] =~ "created"
+        end
+
+        test "pubsub page shows subscriptions and publish metadata without payload bodies" do
+          Ferricstore.PubSub.ActivityLog.reset()
+
+          channel = "dashboard:pubsub:#{System.unique_integer([:positive])}"
+          pattern = "dashboard:pubsub:*"
+
+          :ok = Ferricstore.PubSub.subscribe(channel, self())
+          :ok = Ferricstore.PubSub.psubscribe(pattern, self())
+
+          on_exit(fn ->
+            Ferricstore.PubSub.unsubscribe(channel, self())
+            Ferricstore.PubSub.punsubscribe(pattern, self())
+          end)
+
+          assert 2 == Ferricstore.Commands.PubSub.handle("PUBLISH", [channel, "secret-message"])
+
+          html =
+            Dashboard.collect_pubsub_page()
+            |> Dashboard.render_pubsub_page()
+
+          assert String.contains?(html, "Pub/Sub Activity")
+          assert String.contains?(html, channel)
+          assert String.contains?(html, pattern)
+          assert String.contains?(html, "PUBLISH")
+          assert String.contains?(html, "SUBSCRIBE")
+          assert String.contains?(html, "receiver")
+          refute String.contains?(html, "secret-message")
         end
       end
     end

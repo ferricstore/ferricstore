@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   @moduledoc false
 
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
-  alias FerricstoreServer.Health.Dashboard.Data.{KV, Operational}
+  alias FerricstoreServer.Health.Dashboard.Data.{KV, Messaging, Operational}
   alias FerricstoreServer.Health.Dashboard.Flow.{Browse, Detail, Projection, Query}
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
@@ -18,6 +18,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   import FerricstoreServer.Health.Dashboard.Render.FlowOverview
   import FerricstoreServer.Health.Dashboard.Render.FlowTables
   import FerricstoreServer.Health.Dashboard.Render.KVPages, except: [kv_command_groups: 0]
+  import FerricstoreServer.Health.Dashboard.Render.MessagingPages
   import FerricstoreServer.Health.Dashboard.Render.Overview
   import FerricstoreServer.Health.Dashboard.Render.Prefixes
 
@@ -81,6 +82,29 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   def live_payload("flow/signals", opts), do: live_flow_signals_payload("", opts)
   def live_payload("flow/signals?" <> query, opts), do: live_flow_signals_payload(query, opts)
+
+  def live_payload("streams", opts) do
+    data = Messaging.collect_streams_page(opts)
+
+    live_component_payload(%{
+      "streams_summary" => render_stream_activity_summary(data),
+      "streams_top" => render_stream_top_streams(data),
+      "streams_consumers" => render_stream_consumers(data),
+      "streams_waiters" => render_stream_waiters(data),
+      "streams_log" => render_stream_activity_log(data)
+    })
+  end
+
+  def live_payload("pubsub", opts) do
+    data = Messaging.collect_pubsub_page(opts)
+
+    live_component_payload(%{
+      "pubsub_summary" => render_pubsub_summary(data),
+      "pubsub_channels" => render_pubsub_channels(data),
+      "pubsub_patterns" => render_pubsub_patterns(data),
+      "pubsub_activity" => render_pubsub_activity(data)
+    })
+  end
 
   def live_payload(path, _opts), do: live_payload(path)
 
@@ -166,6 +190,29 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     })
   end
 
+  def live_payload("streams") do
+    data = Messaging.collect_streams_page()
+
+    live_component_payload(%{
+      "streams_summary" => render_stream_activity_summary(data),
+      "streams_top" => render_stream_top_streams(data),
+      "streams_consumers" => render_stream_consumers(data),
+      "streams_waiters" => render_stream_waiters(data),
+      "streams_log" => render_stream_activity_log(data)
+    })
+  end
+
+  def live_payload("pubsub") do
+    data = Messaging.collect_pubsub_page()
+
+    live_component_payload(%{
+      "pubsub_summary" => render_pubsub_summary(data),
+      "pubsub_channels" => render_pubsub_channels(data),
+      "pubsub_patterns" => render_pubsub_patterns(data),
+      "pubsub_activity" => render_pubsub_activity(data)
+    })
+  end
+
   def live_payload("prefixes") do
     data = KV.collect_prefixes_page()
 
@@ -217,6 +264,12 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     live_component_payload(%{
       "flow_workers_chart" => render_flow_workers_chart(data.workers),
       "flow_workers" => render_flow_workers(data.workers),
+      "flow_fifo_lanes" =>
+        render_flow_fifo_lanes(
+          Map.get(data, :fifo_lanes, []),
+          data.total_sampled,
+          data.sample_limit
+        ),
       "flow_running_records" =>
         render_flow_running_records(data.running_records, data.total_sampled, data.sample_limit)
     })
@@ -225,6 +278,12 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   defp live_flow_due_payload(data) do
     live_component_payload(%{
       "flow_due_chart" => render_flow_due_chart(data.due_now, data.scheduled),
+      "flow_fifo_lanes" =>
+        render_flow_fifo_lanes(
+          Map.get(data, :fifo_lanes, []),
+          data.total_sampled,
+          data.sample_limit
+        ),
       "flow_due_now" =>
         render_flow_due_records("Due Now", data.due_now, data.total_sampled, data.sample_limit),
       "flow_scheduled" =>
@@ -353,6 +412,12 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
           data.filtered_sampled,
           data.sample_limit,
           data.filters
+        ),
+      "flow_fifo_lanes" =>
+        render_flow_fifo_lanes(
+          Map.get(data, :fifo_lanes, []),
+          data.total_sampled,
+          data.sample_limit
         ),
       "flow_recent_records" => render_flow_recent_records(data.records, data.limit)
     })

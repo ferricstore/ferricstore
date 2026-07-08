@@ -7,6 +7,13 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
   def flow_record_type(record), do: flow_field_string(record, :type, "")
   def flow_record_state(record), do: flow_field_string(record, :state, "unknown")
 
+  def flow_record_logical_state(record) do
+    case flow_record_state(record) do
+      "running" -> flow_field_string(record, :run_state, "queued")
+      state -> state
+    end
+  end
+
   def flow_record_worker(record) do
     case flow_first_non_empty_binary(record, [:worker, :lease_owner]) do
       worker when is_binary(worker) -> worker
@@ -35,6 +42,12 @@ defmodule FerricstoreServer.Health.Dashboard.FlowRecord do
 
   def flow_record_updated_at_ms(record),
     do: flow_first_integer(record, [:updated_at_ms, :created_at_ms, :run_at_ms]) || 0
+
+  def flow_record_created_at_ms(record),
+    do: flow_first_integer(record, [:created_at_ms, :updated_at_ms, :run_at_ms]) || 0
+
+  def flow_record_state_enter_seq(record),
+    do: flow_first_integer(record, [:state_enter_seq])
 
   def flow_record_lease_expires_at_ms(record),
     do: flow_first_integer(record, [:lease_expires_at_ms, :lease_deadline_ms, :lease_until_ms])

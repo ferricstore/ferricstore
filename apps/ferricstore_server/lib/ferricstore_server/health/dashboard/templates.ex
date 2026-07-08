@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
 
   import FerricstoreServer.Health.Dashboard.Layout
   import FerricstoreServer.Health.Dashboard.Render.Admin
+  import FerricstoreServer.Health.Dashboard.Render.Capabilities
   import FerricstoreServer.Health.Dashboard.Render.DoctorPages
   import FerricstoreServer.Health.Dashboard.Render.FlowCharts
   import FerricstoreServer.Health.Dashboard.Render.FlowComponents
@@ -24,8 +25,10 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
     except: [default_flow_projection_health: 0]
 
   import FerricstoreServer.Health.Dashboard.Render.KVPages, except: [kv_command_groups: 0]
+  import FerricstoreServer.Health.Dashboard.Render.MessagingPages
   import FerricstoreServer.Health.Dashboard.Render.Overview
   import FerricstoreServer.Health.Dashboard.Render.Prefixes
+  import FerricstoreServer.Health.Dashboard.Render.Security
 
   @templates_dir Path.expand("templates", __DIR__)
 
@@ -42,6 +45,19 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
   ])
 
   EEx.function_from_file(:def, :config, Path.join(@templates_dir, "config.html.eex"), [
+    :assigns
+  ])
+
+  EEx.function_from_file(
+    :def,
+    :capabilities,
+    Path.join(@templates_dir, "capabilities.html.eex"),
+    [
+      :assigns
+    ]
+  )
+
+  EEx.function_from_file(:def, :security, Path.join(@templates_dir, "security.html.eex"), [
     :assigns
   ])
 
@@ -74,6 +90,14 @@ defmodule FerricstoreServer.Health.Dashboard.Templates do
   ])
 
   EEx.function_from_file(:def, :reads, Path.join(@templates_dir, "reads.html.eex"), [
+    :assigns
+  ])
+
+  EEx.function_from_file(:def, :streams, Path.join(@templates_dir, "streams.html.eex"), [
+    :assigns
+  ])
+
+  EEx.function_from_file(:def, :pubsub, Path.join(@templates_dir, "pubsub.html.eex"), [
     :assigns
   ])
 

@@ -29,10 +29,14 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/consensus" -> {"CLUSTER.STATUS", []}
       "/dashboard/clients" -> {"CLIENT.LIST", []}
       "/dashboard/storage" -> {"INFO", []}
+      "/dashboard/capabilities" -> {"FERRICSTORE.CAPABILITIES", []}
+      "/dashboard/security" -> {"ACL.LIST", []}
       "/dashboard/doctor" -> {"FERRICSTORE.DOCTOR", []}
       "/dashboard/keyspace" -> keyspace_requirement(query)
       "/dashboard/commands" -> {"INFO", []}
       "/dashboard/reads" -> {"INFO", []}
+      "/dashboard/streams" -> {"XINFO", []}
+      "/dashboard/pubsub" -> {"PUBSUB", []}
       "/dashboard/prefixes" -> {"SCAN", []}
       "/dashboard/flow" -> {"FLOW.LIST", []}
       "/dashboard/flow/lookup" -> flow_lookup_requirement(query)
@@ -65,6 +69,8 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/api/keyspace" -> keyspace_requirement(query)
       "/dashboard/api/commands" -> {"INFO", []}
       "/dashboard/api/reads" -> {"INFO", []}
+      "/dashboard/api/streams" -> {"XINFO", []}
+      "/dashboard/api/pubsub" -> {"PUBSUB", []}
       "/dashboard/api/prefixes" -> {"SCAN", []}
       _ -> flow_detail_or_default_requirement(clean_path, query)
     end
@@ -154,6 +160,24 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       {"FLOW.REWIND", []}
     else
       {"FLOW.REWIND", key: {key, :write}}
+    end
+  end
+
+  @spec flow_signal_form_requirement(binary(), map()) :: requirement()
+  def flow_signal_form_requirement(id, params) do
+    key =
+      params
+      |> Map.get("partition_key", "")
+      |> String.trim()
+      |> case do
+        "" -> id
+        partition_key -> partition_key
+      end
+
+    if key == "" do
+      {"FLOW.SIGNAL", []}
+    else
+      {"FLOW.SIGNAL", key: {key, :write}}
     end
   end
 
@@ -323,7 +347,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     do: {command, key: {key, :read}}
 
   defp flow_query_key_requirement(command, kind, _key, partition_key, type)
-       when kind in ["failures", "list", "stuck", "terminals"] do
+       when kind in ["failures", "list", "search", "stats", "stuck", "terminals"] do
     cond do
       partition_key != "" -> {command, key: {partition_key, :read}}
       type != "" -> {command, key: {type, :read}}
@@ -342,6 +366,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   defp flow_query_command_requirement(kind) when is_binary(kind) do
     case kind do
       "terminals" -> "FLOW.TERMINALS"
+      "search" -> "FLOW.SEARCH"
       "failures" -> "FLOW.FAILURES"
       "stuck" -> "FLOW.STUCK"
       "stats" -> "FLOW.STATS"
@@ -356,9 +381,15 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   defp flow_query_command_requirement(_kind), do: "FLOW.LIST"
 
   defp flow_rewind_or_default_requirement("/dashboard/flow/" <> encoded_action) do
-    case FlowPaths.decode_flow_rewind_action(encoded_action) do
-      {:ok, _id} -> {"FLOW.REWIND", []}
-      :not_found -> {"FLOW.REWIND", []}
+    cond do
+      match?({:ok, _id}, FlowPaths.decode_flow_rewind_action(encoded_action)) ->
+        {"FLOW.REWIND", []}
+
+      match?({:ok, _id}, FlowPaths.decode_flow_signal_action(encoded_action)) ->
+        {"FLOW.SIGNAL", []}
+
+      true ->
+        {"FLOW.REWIND", []}
     end
   end
 

@@ -39,6 +39,32 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
     )
   end
 
+  def handle_capabilities_page(socket, transport, peer, headers) do
+    render_static_page(
+      socket,
+      transport,
+      peer,
+      headers,
+      &Dashboard.collect_capabilities_page/0,
+      &Dashboard.render_capabilities_page/1
+    )
+  end
+
+  def handle_security_page(socket, transport, peer, headers, query) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data =
+        query
+        |> URI.decode_query()
+        |> Map.merge(Auth.dashboard_collect_opts(peer, headers))
+        |> Dashboard.collect_security_page()
+
+      body = Dashboard.render_security_page(data)
+      Response.send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
   def handle_raft_page(socket, transport, peer, headers) do
     unless Auth.observability_authorized?(peer, headers) do
       Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
@@ -106,6 +132,26 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
       &Dashboard.collect_reads_page/0,
       &Dashboard.render_reads_page/1
     )
+  end
+
+  def handle_streams_page(socket, transport, peer, headers) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = Dashboard.collect_streams_page(Auth.dashboard_collect_opts(peer, headers))
+      body = Dashboard.render_streams_page(data)
+      Response.send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  def handle_pubsub_page(socket, transport, peer, headers) do
+    unless Auth.observability_authorized?(peer, headers) do
+      Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = Dashboard.collect_pubsub_page(Auth.dashboard_collect_opts(peer, headers))
+      body = Dashboard.render_pubsub_page(data)
+      Response.send_html_response(socket, transport, 200, "OK", body)
+    end
   end
 
   def handle_prefixes_page(socket, transport, peer, headers) do

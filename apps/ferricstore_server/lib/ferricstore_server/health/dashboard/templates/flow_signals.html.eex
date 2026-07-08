@@ -2,7 +2,7 @@
 <%= page_head("Flow Signals - FerricStore", 2) %>
 <body data-dashboard-live-page="flow-signals" data-dashboard-live-url="<%= flow_signals_live_url(flow_signals_page_filters(data)) %>" data-dashboard-live-interval-ms="2000">
 <div class="layout">
-<%= render_sidebar_static("flow") %>
+<%= render_sidebar_static("flow_signals") %>
 <main class="main-content">
 <%= render_subpage_header("Flow Signals") %>
 <div class="content">

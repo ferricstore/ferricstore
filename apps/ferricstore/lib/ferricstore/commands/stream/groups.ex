@@ -66,6 +66,29 @@ defmodule Ferricstore.Commands.Stream.Groups do
     :ets.match_delete(@groups_table, {{stream_key, :_}, :_, :_, :_})
   end
 
+  @spec snapshot(non_neg_integer()) :: [map()]
+  def snapshot(limit \\ 100) do
+    ensure_table()
+
+    @groups_table
+    |> :ets.tab2list()
+    |> Enum.map(fn {{key, group}, last_delivered, consumers, pending} ->
+      %{
+        key: key,
+        group: group,
+        last_delivered: last_delivered,
+        consumers: map_size(consumers),
+        pending: map_size(pending)
+      }
+    end)
+    |> Enum.sort_by(fn row -> {row.pending, row.consumers} end, :desc)
+    |> Enum.take(max(limit, 0))
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
+
   @spec with_lock(binary(), binary(), (-> result)) :: result when result: term()
   def with_lock(key, group, fun) when is_function(fun, 0) do
     lock = {key, group}

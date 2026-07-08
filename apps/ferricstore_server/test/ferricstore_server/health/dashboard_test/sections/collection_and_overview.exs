@@ -220,6 +220,18 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.CollectionAndOverview 
           assert String.contains?(html, "FerricFlow")
         end
 
+        test "groups sidebar by dashboard subject", %{html: html} do
+          assert String.contains?(html, ~s(<div class="nav-section">FerricFlow</div>))
+          assert String.contains?(html, ~s(href="/dashboard/flow/states"))
+          assert String.contains?(html, "States / FIFO")
+          assert String.contains?(html, ~s(<div class="nav-section">KV / Data</div>))
+          assert String.contains?(html, ~s(<div class="nav-section">Messaging</div>))
+          assert String.contains?(html, ~s(href="/dashboard/streams"))
+          assert String.contains?(html, ~s(href="/dashboard/pubsub"))
+          assert String.contains?(html, ~s(<div class="nav-section">Control Plane</div>))
+          assert String.contains?(html, ~s(href="/dashboard/security"))
+        end
+
         test "contains run ID in footer", %{data: data, html: html} do
           # Footer shows first 8 characters of the run_id
           short_id = String.slice(data.overview.run_id, 0, 8)

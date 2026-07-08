@@ -42,6 +42,8 @@ defmodule Ferricstore.PubSub do
 
   use GenServer
 
+  alias Ferricstore.PubSub.ActivityLog
+
   @channels_table :ferricstore_pubsub
   @channel_cache_table :ferricstore_pubsub_channel_cache
   @patterns_table :ferricstore_pubsub_patterns
@@ -85,6 +87,7 @@ defmodule Ferricstore.PubSub do
   def subscribe(channel, pid) when is_binary(channel) and is_pid(pid) do
     :ets.insert(@channels_table, {channel, pid})
     exact_subscription_changed([channel], pid)
+    ActivityLog.record_subscription("SUBSCRIBE", :channel, [channel])
     :ok
   end
 
@@ -101,6 +104,7 @@ defmodule Ferricstore.PubSub do
     entries = subscription_entries(channels, pid, [])
     :ets.insert(@channels_table, entries)
     exact_subscription_changed(unique_channels(channels), pid)
+    ActivityLog.record_subscription("SUBSCRIBE", :channel, unique_channels(channels))
     :ok
   end
 
@@ -123,6 +127,7 @@ defmodule Ferricstore.PubSub do
   def unsubscribe(channel, pid) when is_binary(channel) and is_pid(pid) do
     :ets.match_delete(@channels_table, {channel, pid})
     exact_unsubscription_changed([channel], pid)
+    ActivityLog.record_subscription("UNSUBSCRIBE", :channel, [channel])
     :ok
   end
 
@@ -138,6 +143,7 @@ defmodule Ferricstore.PubSub do
     end)
 
     exact_unsubscription_changed(unique_channels(channels), pid)
+    ActivityLog.record_subscription("UNSUBSCRIBE", :channel, unique_channels(channels))
     :ok
   end
 
@@ -162,6 +168,7 @@ defmodule Ferricstore.PubSub do
     # object twice remains idempotent without scanning the pattern bucket first.
     :ets.insert(@patterns_table, {pattern, pid, pattern_matcher(pattern)})
     ensure_monitor(pid)
+    ActivityLog.record_subscription("PSUBSCRIBE", :pattern, [pattern])
     :ok
   end
 
@@ -175,6 +182,7 @@ defmodule Ferricstore.PubSub do
     entries = pattern_subscription_entries(patterns, pid, [])
     :ets.insert(@patterns_table, entries)
     ensure_monitor(pid)
+    ActivityLog.record_subscription("PSUBSCRIBE", :pattern, unique_channels(patterns))
     :ok
   end
 
@@ -197,6 +205,7 @@ defmodule Ferricstore.PubSub do
     # match_delete with a wildcard for the matcher marker
     :ets.match_delete(@patterns_table, {pattern, pid, :_})
     maybe_demonitor(pid)
+    ActivityLog.record_subscription("PUNSUBSCRIBE", :pattern, [pattern])
     :ok
   end
 
@@ -212,6 +221,7 @@ defmodule Ferricstore.PubSub do
     end)
 
     maybe_demonitor(pid)
+    ActivityLog.record_subscription("PUNSUBSCRIBE", :pattern, unique_channels(patterns))
     :ok
   end
 
@@ -257,7 +267,29 @@ defmodule Ferricstore.PubSub do
         )
       end
 
-    channel_count + pattern_count
+    total = channel_count + pattern_count
+    ActivityLog.record_publish(channel, byte_size(message), total)
+    total
+  end
+
+  @doc """
+  Returns bounded Pub/Sub subscription metadata for observability dashboards.
+  """
+  @spec subscription_snapshot(non_neg_integer()) :: map()
+  def subscription_snapshot(limit \\ 100) do
+    limit = max(limit, 0)
+    channels = channel_snapshot(limit)
+    patterns = pattern_snapshot(limit)
+    exact_subscriptions = safe_ets_size(@channels_table)
+    pattern_subscriptions = safe_ets_size(@patterns_table)
+
+    %{
+      channels: channels,
+      patterns: patterns,
+      exact_subscriptions: exact_subscriptions,
+      pattern_subscriptions: pattern_subscriptions,
+      active_subscribers: active_subscriber_count()
+    }
   end
 
   @doc """
@@ -446,6 +478,80 @@ defmodule Ferricstore.PubSub do
 
   defp pattern_subscription_entries([pattern | rest], pid, acc) when is_binary(pattern) do
     pattern_subscription_entries(rest, pid, [{pattern, pid, pattern_matcher(pattern)} | acc])
+  end
+
+  defp channel_snapshot(limit) do
+    if :ets.whereis(@channel_cache_table) == :undefined do
+      []
+    else
+      @channel_cache_table
+      |> :ets.tab2list()
+      |> Enum.map(fn {channel, pids} ->
+        %{channel: channel, subscribers: length(pids)}
+      end)
+      |> Enum.sort_by(& &1.subscribers, :desc)
+      |> Enum.take(limit)
+    end
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
+
+  defp pattern_snapshot(limit) do
+    if :ets.whereis(@patterns_table) == :undefined do
+      []
+    else
+      @patterns_table
+      |> :ets.tab2list()
+      |> Enum.group_by(fn {pattern, _pid, _matcher} -> pattern end)
+      |> Enum.map(fn {pattern, entries} ->
+        %{pattern: pattern, subscribers: length(entries)}
+      end)
+      |> Enum.sort_by(& &1.subscribers, :desc)
+      |> Enum.take(limit)
+    end
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
+
+  defp active_subscriber_count do
+    exact_pids =
+      if :ets.whereis(@channels_table) == :undefined do
+        []
+      else
+        @channels_table
+        |> :ets.tab2list()
+        |> Enum.map(fn {_channel, pid} -> pid end)
+      end
+
+    pattern_pids =
+      if :ets.whereis(@patterns_table) == :undefined do
+        []
+      else
+        @patterns_table
+        |> :ets.tab2list()
+        |> Enum.map(fn {_pattern, pid, _matcher} -> pid end)
+      end
+
+    (exact_pids ++ pattern_pids)
+    |> Enum.uniq()
+    |> length()
+  rescue
+    _ -> 0
+  catch
+    :exit, _ -> 0
+  end
+
+  defp safe_ets_size(table) do
+    case :ets.info(table, :size) do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
+  rescue
+    ArgumentError -> 0
   end
 
   defp maybe_demonitor(pid) do

@@ -23,6 +23,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables do
   defdelegate flow_state_operational_hint(state), to: Records
   defdelegate render_flow_state_breakdown(types), to: Records
   defdelegate render_flow_custom_states(states), to: Records
+  defdelegate render_flow_fifo_lanes(lanes, total_sampled, sample_limit), to: Records
   defdelegate render_flow_workers(workers), to: Records
   defdelegate render_flow_running_records(records, total_sampled, sample_limit), to: Records
   defdelegate render_flow_due_records(title, records, total_sampled, sample_limit), to: Records

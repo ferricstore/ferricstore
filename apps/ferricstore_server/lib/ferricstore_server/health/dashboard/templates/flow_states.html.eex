@@ -2,7 +2,7 @@
 <%= page_head("Flow States - FerricStore", 2, chartjs: true) %>
 <body data-dashboard-live-page="flow-states" data-dashboard-live-url="<%= flow_states_live_url(flow_states_page_filters(data)) %>" data-dashboard-live-interval-ms="2000">
 <div class="layout">
-<%= render_sidebar_static("flow") %>
+<%= render_sidebar_static("flow_states") %>
 <main class="main-content">
 <%= render_subpage_header("Flow States") %>
 <div class="content">
@@ -11,6 +11,7 @@
 <%= render_flow_type_filter(data) %>
 <%= render_live_component("flow_states_chart", render_flow_states_chart(data.states)) %>
 <%= render_live_component("flow_states_table", render_flow_states_table(data.states, data.total_sampled, data.filtered_sampled, data.sample_limit, flow_states_page_filters(data))) %>
+<%= render_live_component("flow_fifo_lanes", render_flow_fifo_lanes(Map.get(data, :fifo_lanes, []), data.total_sampled, data.sample_limit)) %>
 <%= render_live_component("flow_recent_records", render_flow_recent_records(data.records, flow_states_page_limit(data))) %>
 </div>
 </main>

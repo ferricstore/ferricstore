@@ -2,7 +2,7 @@
 <%= page_head("Flow Detail - FerricStore", 2, chartjs: true) %>
 <body data-dashboard-live-page="flow-detail" data-dashboard-live-url="<%= flow_detail_live_url(data.id, Map.get(data, :partition_key), Map.get(data, :history_page)) %>" data-dashboard-live-interval-ms="2000">
 <div class="layout">
-<%= render_sidebar_static("flow") %>
+<%= render_sidebar_static("flow_detail") %>
 <main class="main-content">
 <%= render_subpage_header("Flow Detail") %>
 <div class="content">

@@ -1,0 +1,15 @@
+<% data = assigns.data %>
+<%= page_head("Capabilities - FerricStore", nil) %>
+<body>
+<div class="layout">
+<%= render_sidebar_static("capabilities") %>
+<main class="main-content">
+<%= render_subpage_header("Capabilities") %>
+<div class="content">
+<%= render_page_intro("Management Capabilities", "Read-only capability flags and stable management command shapes exposed by this server.") %>
+<%= render_management_capabilities(data) %>
+</div>
+</main>
+</div>
+</body>
+</html>

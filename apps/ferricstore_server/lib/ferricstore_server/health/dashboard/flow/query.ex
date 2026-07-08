@@ -96,6 +96,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       :attribute_value,
       normalize_flow_name_filter(Map.get(params, "attribute_value"))
     )
+    |> maybe_put_query_opt(
+      :state_meta_state,
+      normalize_flow_state_filter(Map.get(params, "state_meta_state"))
+    )
+    |> maybe_put_query_opt(
+      :state_meta_key,
+      normalize_flow_name_filter(Map.get(params, "state_meta_key"))
+    )
+    |> maybe_put_query_opt(
+      :state_meta_value,
+      normalize_flow_name_filter(Map.get(params, "state_meta_value"))
+    )
     |> maybe_put_query_opt(:id, normalize_flow_name_filter(Map.get(params, "id")))
     |> maybe_put_query_opt(
       :partition_key,
@@ -261,6 +273,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       state: normalize_flow_state_filter(Keyword.get(opts, :state)),
       attribute_key: normalize_flow_name_filter(Keyword.get(opts, :attribute_key)),
       attribute_value: normalize_flow_name_filter(Keyword.get(opts, :attribute_value)),
+      state_meta_state: normalize_flow_state_filter(Keyword.get(opts, :state_meta_state)),
+      state_meta_key: normalize_flow_name_filter(Keyword.get(opts, :state_meta_key)),
+      state_meta_value: normalize_flow_name_filter(Keyword.get(opts, :state_meta_value)),
       id: normalize_flow_name_filter(Keyword.get(opts, :id)),
       partition_key: normalize_flow_partition_query(Keyword.get(opts, :partition_key)),
       limit: normalize_flow_limit_filter(Keyword.get(opts, :limit)),
@@ -271,6 +286,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp normalize_flow_query_kind("terminals"), do: "terminals"
+  defp normalize_flow_query_kind("search"), do: "search"
   defp normalize_flow_query_kind("stats"), do: "stats"
   defp normalize_flow_query_kind("failures"), do: "failures"
   defp normalize_flow_query_kind("stuck"), do: "stuck"
@@ -309,7 +325,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp flow_query_plan(%{kind: kind, type: type})
-       when kind in ["list", "stats", "terminals", "failures", "stuck"] and
+       when kind in ["list", "search", "stats", "terminals", "failures", "stuck"] and
               (not is_binary(type) or type == "") do
     {:idle, flow_query_kind_command(kind), "Enter a workflow type"}
   end
@@ -342,6 +358,32 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   defp flow_query_plan(%{kind: "by_correlation", id: id} = filters) do
     opts = flow_query_index_opts(filters)
     {:ok, "FLOW.BY_CORRELATION", fn -> flow_dashboard_flow_by_correlation(id, opts) end}
+  end
+
+  defp flow_query_plan(%{kind: "search"} = filters) do
+    attributes = flow_query_attribute_filter(filters)
+    state_meta = flow_query_state_meta_filter(filters)
+
+    if is_nil(attributes) and is_nil(state_meta) do
+      {:idle, "FLOW.SEARCH", "Enter an indexed attribute or state metadata filter"}
+    else
+      opts =
+        [
+          type: filters.type,
+          count: filters.limit,
+          consistent_projection: true
+        ]
+        |> maybe_put_query_opt(:state, filters.state)
+        |> maybe_put_query_opt(:partition_key, filters.partition_key)
+        |> maybe_put_query_opt(:from_ms, filters.from_ms)
+        |> maybe_put_query_opt(:to_ms, filters.to_ms)
+        |> maybe_put_query_opt(:rev, if(filters.rev, do: true, else: nil))
+        |> maybe_put_query_opt(:attributes, attributes)
+        |> maybe_put_query_opt(:state_meta, state_meta)
+        |> Enum.reverse()
+
+      {:ok, "FLOW.SEARCH", fn -> flow_dashboard_flow_search(opts) end}
+    end
   end
 
   defp flow_query_plan(%{kind: "terminals", type: type} = filters) do
@@ -395,6 +437,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   defp flow_query_attribute_filter(_filters), do: nil
 
+  defp flow_query_state_meta_filter(%{
+         state_meta_state: state,
+         state_meta_key: key,
+         state_meta_value: value
+       })
+       when is_binary(state) and state != "" and is_binary(key) and key != "" and
+              is_binary(value) and value != "",
+       do: %{state => %{key => value}}
+
+  defp flow_query_state_meta_filter(_filters), do: nil
+
   defp flow_query_terminal_opts(filters) do
     filters
     |> flow_query_index_opts()
@@ -402,6 +455,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp flow_query_kind_command("terminals"), do: "FLOW.TERMINALS"
+  defp flow_query_kind_command("search"), do: "FLOW.SEARCH"
   defp flow_query_kind_command("stats"), do: "FLOW.STATS"
   defp flow_query_kind_command("failures"), do: "FLOW.FAILURES"
   defp flow_query_kind_command("stuck"), do: "FLOW.STUCK"

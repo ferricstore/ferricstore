@@ -18,7 +18,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     rows =
       case states do
         [] ->
-          ~s(<tr><td colspan="11" class="c-muted">No Flow states discovered for this type filter</td></tr>)
+          ~s(<tr><td colspan="12" class="c-muted">No Flow states discovered for this type filter</td></tr>)
 
         _ ->
           Enum.map_join(states, "\n", fn state ->
@@ -32,6 +32,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
             <tr>
               <td class="mono">#{escape(state.type)}</td>
               <td class="#{flow_state_class(state.state)}">#{escape(state.state)}</td>
+              <td>#{render_flow_state_mode_badge(Map.get(state, :mode, :parallel))}</td>
               <td>#{format_number(state.count)}</td>
               <td class="#{due_class}">#{format_number(state.due_now)}</td>
               <td>#{format_number(state.running)}</td>
@@ -55,6 +56,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
         <tr>
           <th>Type</th>
           <th>State</th>
+          <th>Mode #{info_icon("FIFO states preserve per-partition order and let at most one active Flow block each partition lane. Parallel is the default.")}</th>
           <th>Sample Count</th>
           <th>Due Now #{info_icon("Non-terminal flows with run_at/next_run_at at or before now. Workers should be able to claim them.")}</th>
           <th>Running #{info_icon("Flows currently leased to workers through FLOW.CLAIM_DUE.")}</th>
@@ -72,6 +74,69 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Records do
     </table>
     """
   end
+
+  def render_flow_fifo_lanes(lanes, total_sampled, sample_limit) do
+    rows =
+      case lanes do
+        [] ->
+          ~s(<tr><td colspan="11" class="c-muted">No FIFO lanes discovered in the current bounded sample.</td></tr>)
+
+        _ ->
+          Enum.map_join(lanes, "\n", &render_flow_fifo_lane_row/1)
+      end
+
+    """
+    <div class="section-title">FIFO Lanes <span class="badge badge-idle">#{format_number(length(lanes))}</span> <span class="badge badge-idle">sampled #{format_number(total_sampled)} / #{format_number(sample_limit)}</span></div>
+    <div class="flow-help">FIFO lanes are grouped by type, logical state, and partition key. A live running head blocks only that lane; other partitions and other states can still be claimed.</div>
+    <table>
+      <thead>
+        <tr><th>Type</th><th>State</th><th>Partition</th><th>Status</th><th>Head</th><th>Next</th><th>Blocked By</th><th>Worker</th><th>Waiting</th><th>Due</th><th>Lease Expires</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    """
+  end
+
+  defp render_flow_fifo_lane_row(lane) do
+    status = Map.get(lane, :head_status, "idle")
+    status_class = flow_fifo_lane_status_class(status)
+    head_id = Map.get(lane, :head_id)
+    waiting_head_id = Map.get(lane, :waiting_head_id)
+    blocked_by_id = Map.get(lane, :blocked_by_id)
+
+    """
+    <tr>
+      <td class="mono">#{escape(Map.get(lane, :type, ""))}</td>
+      <td class="#{flow_state_class(Map.get(lane, :state, ""))}">#{escape(Map.get(lane, :state, ""))}</td>
+      <td class="mono">#{escape(Map.get(lane, :partition_key, ""))}</td>
+      <td><span class="badge #{status_class}">#{escape(status)}</span></td>
+      <td class="mono">#{render_optional_flow_link(head_id, Map.get(lane, :partition_key))}</td>
+      <td class="mono">#{render_optional_flow_link(waiting_head_id, Map.get(lane, :partition_key))}</td>
+      <td class="mono">#{render_optional_flow_link(blocked_by_id, Map.get(lane, :partition_key))}</td>
+      <td class="mono">#{escape(Map.get(lane, :blocked_by_worker) || "-")}</td>
+      <td>#{format_number(Map.get(lane, :waiting, 0))}</td>
+      <td>#{format_number(Map.get(lane, :due, 0))}</td>
+      <td>#{format_timestamp_ms_or_dash(Map.get(lane, :lease_expires_at_ms))}</td>
+    </tr>
+    """
+  end
+
+  defp render_optional_flow_link(id, partition_key) when is_binary(id) and id != "" do
+    render_flow_id_link(id, partition_key)
+  end
+
+  defp render_optional_flow_link(_id, _partition_key), do: "-"
+
+  defp flow_fifo_lane_status_class("blocked by active flow"), do: "badge-pressure"
+  defp flow_fifo_lane_status_class("blocked by expired lease"), do: "badge-pressure"
+  defp flow_fifo_lane_status_class("head claimable"), do: "badge-ok"
+  defp flow_fifo_lane_status_class(_status), do: "badge-idle"
+
+  defp render_flow_state_mode_badge(:fifo), do: ~s(<span class="badge badge-ok">FIFO</span>)
+  defp render_flow_state_mode_badge("fifo"), do: render_flow_state_mode_badge(:fifo)
+  defp render_flow_state_mode_badge(_mode), do: ~s(<span class="badge badge-idle">parallel</span>)
 
   def flow_state_operational_hint(state) do
     cond do

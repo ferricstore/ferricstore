@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   @moduledoc false
 
+  alias FerricstoreServer.Health.Dashboard.Flow.Fifo
   alias FerricstoreServer.Health.Dashboard.Flow.PolicyRetention
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
@@ -40,6 +41,31 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   end
 
   def apply_rewind_form(_params), do: {:error, "ERR rewind form must be a map"}
+
+  @spec apply_signal_form(map()) :: {:ok, binary(), binary() | nil} | {:error, binary()}
+  def apply_signal_form(params) when is_map(params) do
+    with {:ok, id} <- flow_rewind_required_form_value(params, "id", "flow id"),
+         partition_key = normalize_flow_partition_query(Map.get(params, "partition_key")),
+         {:ok, signal} <- flow_rewind_required_form_value(params, "signal", "signal name"),
+         {:ok, transition_to} <- flow_signal_optional_binary(params, "transition_to"),
+         {:ok, idempotency_key} <- flow_signal_optional_binary(params, "idempotency_key"),
+         {:ok, if_state} <- flow_signal_optional_binary(params, "if_state"),
+         opts =
+           flow_signal_opts(partition_key,
+             signal: signal,
+             transition_to: transition_to,
+             idempotency_key: idempotency_key,
+             if_state: if_state
+           ),
+         :ok <- flow_signal_apply(id, opts) do
+      {:ok, id, flow_detail_url_partition_key(partition_key)}
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, inspect(reason)}
+    end
+  end
+
+  def apply_signal_form(_params), do: {:error, "ERR signal form must be a map"}
 
   @spec opts_from_query(binary()) :: keyword()
   def opts_from_query(query) when is_binary(query) do
@@ -84,6 +110,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     record_partition_key = if is_map(record), do: flow_record_partition_key(record), else: nil
     detail_partition_key = flow_detail_url_partition_key(partition_key || record_partition_key)
     history_page = flow_detail_history_page_links(id, detail_partition_key, history_page)
+    {state_mode, fifo_lane} = flow_detail_fifo_lane(record)
 
     %{
       id: id,
@@ -98,14 +125,63 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
       values_by_ref: values_by_ref,
       values_status: values_status,
       waiting_reason: flow_waiting_reason(record),
+      state_mode: state_mode,
+      fifo_lane: fifo_lane,
       generated_at_ms: System.system_time(:millisecond)
     }
+  end
+
+  defp flow_detail_fifo_lane(%{} = record) do
+    type = flow_record_type(record)
+    logical_state = flow_record_logical_state(record)
+    partition_key = flow_record_partition_key(record)
+    mode = Fifo.effective_state_mode(type, logical_state)
+
+    lane =
+      if mode == :fifo and is_binary(partition_key) and partition_key != "" do
+        @flow_dashboard_sample_limit
+        |> collect_flow_records_sample()
+        |> Enum.filter(&same_fifo_lane?(&1, type, logical_state, partition_key))
+        |> include_flow_record(record)
+        |> Fifo.lane_summaries()
+        |> Enum.find(fn lane ->
+          lane.type == type and lane.state == logical_state and
+            lane.partition_key == partition_key
+        end)
+      end
+
+    {mode, lane}
+  rescue
+    _ -> {:parallel, nil}
+  catch
+    :exit, _ -> {:parallel, nil}
+  end
+
+  defp flow_detail_fifo_lane(_record), do: {:parallel, nil}
+
+  defp same_fifo_lane?(record, type, state, partition_key) when is_map(record) do
+    flow_record_type(record) == type and
+      flow_record_logical_state(record) == state and
+      flow_record_partition_key(record) == partition_key
+  end
+
+  defp same_fifo_lane?(_record, _type, _state, _partition_key), do: false
+
+  defp include_flow_record(records, %{} = record) when is_list(records) do
+    id = flow_record_id(record)
+
+    records
+    |> Enum.reject(&(flow_record_id(&1) == id))
+    |> Kernel.++([record])
   end
 
   defp flash_from_params(params) do
     case Map.get(params, "status") do
       "rewound" ->
         %{kind: :ok, message: "Flow rewound"}
+
+      "signaled" ->
+        %{kind: :ok, message: "Signal sent successfully"}
 
       "error" ->
         message =
@@ -120,6 +196,41 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
     end
   rescue
     _ -> nil
+  end
+
+  defp flow_signal_optional_binary(params, key) do
+    case Map.get(params, key) do
+      nil ->
+        {:ok, nil}
+
+      "" ->
+        {:ok, nil}
+
+      value when is_binary(value) ->
+        value = String.trim(value)
+        if value == "", do: {:ok, nil}, else: {:ok, value}
+
+      _ ->
+        {:error, "ERR #{key} must be a string"}
+    end
+  end
+
+  defp flow_signal_opts(partition_key, opts) do
+    opts = Enum.reject(opts, fn {_key, value} -> is_nil(value) end)
+
+    case partition_key do
+      key when is_binary(key) and key != "" -> Keyword.put(opts, :partition_key, key)
+      _ -> opts
+    end
+  end
+
+  defp flow_signal_apply(id, opts) do
+    case FerricStore.flow_signal(id, opts) do
+      :ok -> :ok
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, dashboard_internal_error("ERR FLOW.SIGNAL failed", reason)}
+      other -> {:error, dashboard_internal_error("ERR unexpected FLOW.SIGNAL result", other)}
+    end
   end
 
   defp flow_rewind_confirmed(params) do
