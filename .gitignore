@@ -39,6 +39,7 @@ ferricstore-*.tar
 
 # Runtime data files (created when the server runs).
 /data/
+/data_dev/
 
 # Compiled NIF shared library (built by cargo via mix).
 /priv/native/*.so
