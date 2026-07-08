@@ -29,6 +29,23 @@ docker run -p 6388:6388 \
 The official container image is `ghcr.io/ferricstore/ferricstore`. The current
 release tag is `0.7.0` and is published for `linux/amd64` and `linux/arm64`.
 
+If a previous local run is still holding the default ports, install the helper
+plugin once:
+
+```bash
+mkdir -p ~/.docker/cli-plugins
+ln -sf "$(pwd)/tools/docker-ferric" ~/.docker/cli-plugins/docker-ferric
+```
+
+Then clean the common local FerricStore containers:
+
+```bash
+docker ferric clean
+```
+
+This removes `ferricstore-n8n-4shards` and `ferricstore-local`, but leaves named
+Docker volumes intact.
+
 Smoke test with the Python SDK:
 
 ```bash

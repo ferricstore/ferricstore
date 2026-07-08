@@ -1,0 +1,76 @@
+#!/usr/bin/env sh
+set -eu
+
+VERSION="0.1.0"
+DEFAULT_CONTAINERS="ferricstore-n8n-4shards ferricstore-local"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  docker ferric clean
+  docker ferric help
+
+Commands:
+  clean   Remove common local FerricStore Docker containers.
+  help    Show this help.
+
+The clean command removes:
+  ferricstore-n8n-4shards
+  ferricstore-local
+
+Named Docker volumes are not removed.
+EOF
+}
+
+metadata() {
+  cat <<EOF
+{"SchemaVersion":"0.1.0","Vendor":"FerricStore","Version":"${VERSION}","ShortDescription":"FerricStore local Docker helpers"}
+EOF
+}
+
+require_docker() {
+  if ! docker info >/dev/null 2>&1; then
+    echo "docker ferric: Docker daemon is not reachable" >&2
+    exit 1
+  fi
+}
+
+clean() {
+  require_docker
+
+  for container in ${DEFAULT_CONTAINERS}; do
+    if docker container inspect "${container}" >/dev/null 2>&1; then
+      docker rm -f "${container}"
+    else
+      echo "Skipped missing container: ${container}"
+    fi
+  done
+}
+
+case "${1:-help}" in
+  docker-cli-plugin-metadata)
+    metadata
+    ;;
+  clean)
+    shift
+    if [ "$#" -ne 0 ]; then
+      echo "docker ferric clean: unexpected argument: $1" >&2
+      echo >&2
+      usage >&2
+      exit 64
+    fi
+    clean
+    ;;
+  help | --help | -h)
+    usage
+    ;;
+  version | --version | -v)
+    echo "${VERSION}"
+    ;;
+  *)
+    echo "docker ferric: unknown command: $1" >&2
+    echo >&2
+    usage >&2
+    exit 64
+    ;;
+esac

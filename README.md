@@ -75,6 +75,18 @@ docker pull ghcr.io/ferricstore/ferricstore:0.7.5
 Current release images are published as multi-arch images for `linux/amd64`
 and `linux/arm64`.
 
+If old local containers are still holding the default ports, install the Docker
+CLI helper once:
+
+```bash
+mkdir -p ~/.docker/cli-plugins
+ln -sf "$(pwd)/tools/docker-ferric" ~/.docker/cli-plugins/docker-ferric
+docker ferric clean
+```
+
+`docker ferric clean` removes `ferricstore-n8n-4shards` and `ferricstore-local`
+without removing named Docker volumes.
+
 ## First Flow Over The Ferric Native Protocol
 
 FerricFlow commands are exposed over FerricStore's native binary TCP protocol, so SDK clients can use multiplexed lanes, request ids, ACLs, TLS, and bounded backpressure. Durability is the default contract: a workflow command returns success only after the state change is accepted through the quorum path and written to disk.

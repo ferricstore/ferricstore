@@ -81,6 +81,18 @@ docker pull ghcr.io/ferricstore/ferricstore:0.4.1
 Current release images are published as multi-arch images for `linux/amd64`
 and `linux/arm64`.
 
+For local Docker retries, the repository includes a Docker CLI plugin helper:
+
+```bash
+mkdir -p ~/.docker/cli-plugins
+ln -sf "$(pwd)/tools/docker-ferric" ~/.docker/cli-plugins/docker-ferric
+docker ferric clean
+```
+
+`docker ferric clean` force-removes the common local containers
+`ferricstore-n8n-4shards` and `ferricstore-local`. It does not remove named
+volumes.
+
 ### Docker Production Notes
 
 For write-heavy workloads, prefer a direct data mount on durable fast storage and
