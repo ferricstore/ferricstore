@@ -20,21 +20,26 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
     acl_username = DashboardAccess.keyspace_acl_username(opts)
 
-    records =
+    visible_records =
       sampled_records
       |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+
+    records =
+      visible_records
       |> filter_flow_records_by_partition(filters.partition_key)
 
     types = flow_type_summaries(records)
 
     %{
       summary: flow_page_summary(types, records),
-      projection: Projection.collect_health(),
+      projection:
+        if(is_binary(acl_username), do: %{restricted: true}, else: Projection.collect_health()),
       types: types,
       records: flow_recent_records(records, @flow_dashboard_overview_recent_limit),
       workers: flow_worker_summaries(records),
       filters: filters,
-      total_sampled: length(sampled_records),
+      total_sampled:
+        if(is_binary(acl_username), do: length(visible_records), else: length(sampled_records)),
       filtered_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit,
       generated_at_ms: System.system_time(:millisecond)

@@ -8,7 +8,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   command catalog.
   """
 
-  alias Ferricstore.Commands.{Catalog, Extension}
+  alias Ferricstore.Commands.{Catalog, Extension, KeyDiscovery}
 
   @max_flow_ref_size 4096
   @extra_command_names ~w(
@@ -83,6 +83,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
     TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF
     TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK
     TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE
+    CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO
+    FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR
   )
   @management_scoped_commands ~w(FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
 
@@ -364,7 +366,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     cmd = String.upcase(name)
     parsed_args = Enum.map(args, &to_command_binary/1)
     ast = make_ast(cmd, Map.get(@command_tags, cmd), parsed_args)
-    keys = command_keys(cmd, parsed_args)
+    keys = command_keys(cmd, parsed_args, ast)
     {:ok, cmd, parsed_args, ast, keys}
   end
 
@@ -954,19 +956,257 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast(_cmd, tag, args), do: {tag, args}
 
+  defp command_keys("FLOW." <> _rest, _args, ast) do
+    case flow_ast_keys(ast) do
+      keys when is_list(keys) and keys != [] -> Enum.uniq(keys)
+      _unclassified_or_invalid -> ["*"]
+    end
+  end
+
+  defp command_keys(cmd, args, _ast), do: command_keys(cmd, args)
+
   defp command_keys(cmd, args) when cmd in @management_scoped_commands do
     management_command_keys(cmd, args)
   end
 
   defp command_keys(cmd, args) do
-    case Catalog.get_keys_upper(cmd, args) do
+    case KeyDiscovery.extract(cmd, args) do
       {:ok, keys} ->
         keys
 
-      {:error, _} ->
-        static_or_extension_keys(cmd, args)
+      :not_dynamic ->
+        case Catalog.get_keys_upper(cmd, args) do
+          {:ok, keys} -> keys
+          {:error, _} -> static_or_extension_keys(cmd, args)
+        end
     end
   end
+
+  defp flow_ast_keys({:flow_value_put, _value, opts}) when is_list(opts) do
+    case Keyword.get(opts, :partition_key) do
+      partition when is_binary(partition) and partition != "" ->
+        [flow_acl_partition_key(partition)]
+
+      _none ->
+        flow_nonempty_key(Keyword.get(opts, :owner_flow_id))
+    end
+  end
+
+  defp flow_ast_keys({tag, id, opts})
+       when tag in [
+              :flow_create,
+              :flow_signal,
+              :flow_get,
+              :flow_cancel,
+              :flow_rewind,
+              :flow_history
+            ] and is_binary(id) and is_list(opts),
+       do: [flow_partition_or_id(opts, id)]
+
+  defp flow_ast_keys({tag, id, _token, opts})
+       when tag in [:flow_extend_lease, :flow_complete, :flow_retry, :flow_fail] and
+              is_binary(id) and is_list(opts),
+       do: [flow_partition_or_id(opts, id)]
+
+  defp flow_ast_keys({:flow_transition, id, _from, _to, opts})
+       when is_binary(id) and is_list(opts),
+       do: [flow_partition_or_id(opts, id)]
+
+  defp flow_ast_keys({tag, type, opts})
+       when tag in [:flow_policy_set, :flow_policy_get] and is_binary(type) and is_list(opts),
+       do: [type]
+
+  defp flow_ast_keys({tag, type, _invalid_opts})
+       when tag in [:flow_policy_set, :flow_policy_get] and is_binary(type),
+       do: [type]
+
+  defp flow_ast_keys({tag, _selector, opts})
+       when tag in [:flow_claim_due, :flow_reclaim] and is_list(opts),
+       do: flow_partition_query_keys(opts, :claim)
+
+  defp flow_ast_keys({tag, _selector, opts})
+       when tag in [
+              :flow_list,
+              :flow_attributes,
+              :flow_stats,
+              :flow_terminals,
+              :flow_failures,
+              :flow_info,
+              :flow_stuck,
+              :flow_by_parent,
+              :flow_by_root,
+              :flow_by_correlation
+            ] and is_list(opts),
+       do: flow_partition_query_keys(opts, :query)
+
+  defp flow_ast_keys({:flow_attribute_values, _type, _attribute, opts}) when is_list(opts),
+    do: flow_partition_query_keys(opts, :query)
+
+  defp flow_ast_keys({:flow_search, opts}) when is_list(opts),
+    do: flow_partition_query_keys(opts, :query)
+
+  defp flow_ast_keys({:flow_retention_cleanup, opts}) when is_list(opts), do: ["*"]
+
+  defp flow_ast_keys({tag, partition_key, items, opts})
+       when tag in [
+              :flow_create_many,
+              :flow_complete_many,
+              :flow_retry_many,
+              :flow_fail_many,
+              :flow_cancel_many
+            ] and is_list(items) and is_list(opts),
+       do: flow_batch_ast_keys(partition_key, items)
+
+  defp flow_ast_keys({:flow_transition_many, partition_key, _from, _to, items, opts})
+       when is_list(items) and is_list(opts),
+       do: flow_batch_ast_keys(partition_key, items)
+
+  defp flow_ast_keys({:flow_spawn_children, parent_id, children, opts})
+       when is_binary(parent_id) and is_list(children) and is_list(opts) do
+    parent_key = flow_partition_or_id(opts, parent_id)
+
+    child_keys =
+      children
+      |> Enum.map(&flow_item_partition/1)
+      |> Enum.reject(&is_nil/1)
+
+    [parent_key | child_keys]
+  end
+
+  defp flow_ast_keys({tag, [key | _args]})
+       when tag in [
+              :flow_step_continue,
+              :flow_start_and_claim,
+              :flow_schedule_get,
+              :flow_schedule_delete,
+              :flow_schedule_fire,
+              :flow_schedule_pause,
+              :flow_schedule_resume,
+              :flow_effect_reserve,
+              :flow_effect_confirm,
+              :flow_effect_fail,
+              :flow_effect_compensate,
+              :flow_effect_get,
+              :flow_governance_ledger,
+              :flow_approval_approve,
+              :flow_approval_reject,
+              :flow_approval_get,
+              :flow_circuit_open,
+              :flow_circuit_close,
+              :flow_circuit_get,
+              :flow_budget_reserve,
+              :flow_budget_commit,
+              :flow_budget_release,
+              :flow_budget_get,
+              :flow_limit_lease,
+              :flow_limit_spend,
+              :flow_limit_release,
+              :flow_limit_get
+            ] and is_binary(key) and key != "",
+       do: [key]
+
+  defp flow_ast_keys({tag, _args})
+       when tag in [
+              :flow_schedule_fire_due,
+              :flow_schedule_list,
+              :flow_approval_list,
+              :flow_governance_overview,
+              :flow_budget_list,
+              :flow_limit_list
+            ],
+       do: ["*"]
+
+  defp flow_ast_keys(_ast), do: nil
+
+  defp flow_partition_or_id(opts, id) do
+    case Keyword.get(opts, :partition_key) do
+      partition when is_binary(partition) and partition != "" -> flow_acl_partition_key(partition)
+      _none -> id
+    end
+  end
+
+  defp flow_partition_query_keys(opts, mode) do
+    list_keys =
+      case Keyword.get(opts, :partition_keys) do
+        partitions when is_list(partitions) -> partitions
+        _none -> []
+      end
+
+    keys =
+      case Keyword.get(opts, :partition_key) do
+        partition when is_binary(partition) and partition != "" -> [partition | list_keys]
+        _none -> list_keys
+      end
+
+    case keys do
+      [] -> ["*"]
+      keys -> Enum.map(keys, &flow_query_acl_partition(&1, mode))
+    end
+  end
+
+  defp flow_query_acl_partition(partition, :claim) when is_binary(partition) do
+    if String.upcase(partition) in ["AUTO", "ANY", "GLOBAL"],
+      do: "*",
+      else: partition
+  end
+
+  defp flow_query_acl_partition(partition, _mode), do: flow_acl_partition_key(partition)
+
+  defp flow_batch_ast_keys(partition_key, _items)
+       when is_binary(partition_key) and partition_key != "",
+       do: [flow_acl_partition_key(partition_key)]
+
+  defp flow_batch_ast_keys(_partition_key, items) do
+    items
+    |> Enum.map(fn item -> flow_item_partition(item) || flow_item_acl_id(item) || "*" end)
+    |> case do
+      [] -> ["*"]
+      keys -> keys
+    end
+  end
+
+  defp flow_item_partition({_id, opts}) when is_list(opts) do
+    case Keyword.get(opts, :partition_key) do
+      partition when is_binary(partition) and partition != "" -> flow_acl_partition_key(partition)
+      _none -> nil
+    end
+  end
+
+  defp flow_item_partition({:id, _id, :partition_key, partition_key})
+       when is_binary(partition_key),
+       do: flow_acl_partition_key(partition_key)
+
+  defp flow_item_partition(item) when is_tuple(item) do
+    case tagged_tuple_value(Tuple.to_list(item), :partition_key) do
+      partition_key when is_binary(partition_key) and partition_key != "" ->
+        flow_acl_partition_key(partition_key)
+
+      _none ->
+        nil
+    end
+  end
+
+  defp flow_item_partition(_item), do: nil
+
+  defp flow_item_acl_id({id, _opts}) when is_binary(id), do: id
+
+  defp flow_item_acl_id(item) when is_tuple(item) do
+    case Tuple.to_list(item) do
+      [:id, id | _rest] when is_binary(id) -> id
+      [id | _rest] when is_binary(id) -> id
+      _other -> nil
+    end
+  end
+
+  defp flow_item_acl_id(id) when is_binary(id), do: id
+  defp flow_item_acl_id(_item), do: nil
+
+  defp tagged_tuple_value([key, value | _rest], key), do: value
+  defp tagged_tuple_value([_value | rest], key), do: tagged_tuple_value(rest, key)
+  defp tagged_tuple_value([], _key), do: nil
+
+  defp flow_nonempty_key(value) when is_binary(value) and value != "", do: [value]
+  defp flow_nonempty_key(_value), do: ["*"]
 
   defp static_or_extension_keys(cmd, args) do
     if MapSet.member?(@supported_command_names, cmd) do

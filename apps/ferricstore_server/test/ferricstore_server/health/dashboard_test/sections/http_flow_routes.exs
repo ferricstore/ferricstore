@@ -207,6 +207,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
               "max_ms" => "500",
               "jitter_pct" => "5",
               "exhausted_to" => "dead",
+              "max_active_ms" => "30000",
               "retention_ttl_ms" => "60000",
               "history_max_events" => "25"
             })
@@ -219,6 +220,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           assert policy.retry.max_retries == 6
           assert policy.retry.backoff.kind == :fixed
           assert policy.retry.exhausted_to == "dead"
+          assert policy.max_active_ms == 30_000
           assert policy.retention.ttl_ms == 60_000
           refute Map.has_key?(policy.retention, :history_hot_max_events)
           assert policy.retention.history_max_events == 25
@@ -234,7 +236,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
 
           Application.put_env(:ferricstore, :flow_dashboard_retention_cleanup_fun, fn opts ->
             send(test_pid, {:retention_cleanup, opts})
-            {:ok, %{flows: 1, history: 2, values: 3}}
+            {:ok, %{active_timeouts: 4, flows: 1, history: 2, values: 3}}
           end)
 
           on_exit(fn ->
@@ -252,6 +254,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           location = extract_header(response, "location")
           assert location =~ "/dashboard/flow/retention?"
           assert location =~ "status=ok"
+          assert location =~ "active_timeouts=4"
           assert location =~ "flows=1"
           assert location =~ "history=2"
           assert location =~ "values=3"
@@ -260,6 +263,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           get_response = http_get(port, location)
           assert get_response =~ "HTTP/1.1 200 OK"
           assert get_response |> extract_body() |> String.contains?("Cleanup completed")
+          assert get_response |> extract_body() |> String.contains?("4 active flows timed out")
         end
 
         test "POST /dashboard/flow/policies redirects invalid forms to a visible error" do

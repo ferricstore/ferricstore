@@ -337,11 +337,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         with {:ok, locator} <- flow_hibernation_locator_from_hot(state, key, record) do
           candidate_record = Map.put(record, :state_key, key)
 
+          active_index_reverse_value =
+            case Ferricstore.Flow.LMDB.get(
+                   flow_lmdb_record_path(state),
+                   Ferricstore.Flow.LMDB.active_by_state_key_key(key)
+                 ) do
+              {:ok, reverse_value} when is_binary(reverse_value) -> reverse_value
+              _missing -> nil
+            end
+
           ops =
             Hibernation.demotion_ops(%{
               locator: locator,
               record: candidate_record,
-              state_value: state_value
+              state_value: state_value,
+              active_index_reverse_value: active_index_reverse_value
             })
 
           action =
@@ -708,13 +718,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
               {:error, :active_file_unavailable}
 
             {_file_path, _file_id} ->
-              record_pending_original(state, key)
-              queue_pending_delete(key, prob_path)
+              if cross_shard_pending_active?() do
+                ctx = cross_shard_pending_ctx(state)
+                record_cross_shard_pending_original(ctx, key)
 
-              unless standalone_staged_apply?() do
-                track_keydir_binary_remove(state, key)
-                :ets.delete(state.ets, key)
-                maybe_queue_lmdb_state_delete(state, key)
+                track_keydir_binary_delta_for_keydir(
+                  state,
+                  ctx.keydir,
+                  ctx.index,
+                  key,
+                  nil,
+                  0
+                )
+
+                :ets.delete(ctx.keydir, key)
+                queue_cross_shard_pending_delete(ctx, key)
+                maybe_queue_lmdb_state_delete_after_publish(state, key)
+              else
+                record_pending_original(state, key)
+                queue_pending_delete(key, prob_path)
+
+                unless standalone_staged_apply?() do
+                  track_keydir_binary_remove(state, key)
+                  :ets.delete(state.ets, key)
+                  maybe_queue_lmdb_state_delete(state, key)
+                end
               end
 
               :ok

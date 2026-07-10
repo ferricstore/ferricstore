@@ -977,24 +977,361 @@ defmodule Ferricstore.Store.Router.Part08 do
 
       @doc false
       def flow_retention_cleanup(ctx, attrs) when is_map(attrs) do
+        flow_retention_cleanup_planned(ctx, attrs)
+      end
+
+      defp flow_retention_cleanup_planned(ctx, attrs) do
+        attrs = flow_retention_planning_attrs(attrs)
+        active_attrs = Map.put(attrs, :plan_kind, :active)
+        terminal_plan_attrs = Map.put(attrs, :plan_kind, :terminal)
+
+        with {:ok, active_plans} <- flow_retention_plan_shards(ctx, active_attrs),
+             {:ok, terminal_plans} <- flow_retention_plan_shards(ctx, terminal_plan_attrs),
+             {:ok, active_result} <-
+               flow_retention_cleanup_active(ctx, active_attrs, active_plans) do
+          remaining_limit = max(attrs.limit - Map.get(active_result, :active_timeouts, 0), 0)
+
+          if remaining_limit == 0 do
+            {:ok, Map.take(active_result, [:flows, :history, :values, :active_timeouts])}
+          else
+            terminal_attrs =
+              attrs
+              |> Map.put(:plan_kind, :terminal)
+              |> Map.put(:limit, remaining_limit)
+
+            flow_retention_cleanup_terminal_shards(
+              ctx,
+              terminal_attrs,
+              terminal_plans,
+              active_result
+            )
+          end
+        end
+      end
+
+      defp flow_retention_plan_shards(ctx, attrs) do
+        initial = %{
+          plans: [],
+          remaining_limit: Map.get(attrs, :limit, 100),
+          remaining_keys: Map.fetch!(attrs, :cleanup_key_budget),
+          remaining_bytes: Map.fetch!(attrs, :cleanup_byte_budget)
+        }
+
         0..(ctx.shard_count - 1)
-        |> Enum.reduce_while(
-          {:ok, %{flows: 0, history: 0, values: 0, active_timeouts: 0}},
-          fn idx, {:ok, acc} ->
-            key = "__flow_retention_cleanup__:#{idx}"
+        |> Enum.reduce_while({:ok, initial}, fn
+          _idx, {:ok, %{remaining_limit: remaining_limit} = acc}
+          when remaining_limit <= 0 ->
+            {:halt, {:ok, acc}}
 
-            case raft_write(ctx, idx, key, {:flow_retention_cleanup, key, attrs}) do
-              {:ok, result} when is_map(result) ->
-                {:cont, {:ok, merge_flow_cleanup_counts(acc, result)}}
+          idx, {:ok, acc} ->
+            shard_attrs =
+              attrs
+              |> Map.put(:limit, acc.remaining_limit)
+              |> Map.put(:cleanup_key_budget, acc.remaining_keys)
+              |> Map.put(:cleanup_byte_budget, acc.remaining_bytes)
 
-              {:error, _reason} = error ->
-                {:halt, error}
+            case flow_retention_plan_shard(ctx, idx, shard_attrs) do
+              {:ok, {:ok, plan}} ->
+                candidates = flow_retention_plan_kind_candidates(plan, attrs.plan_kind)
+
+                if Enum.all?(candidates, fn
+                     %{
+                       expected_version: version,
+                       expected_guard: guard,
+                       planned_key_count: key_count
+                     }
+                     when is_integer(version) and is_binary(guard) and is_integer(key_count) and
+                            key_count > 0 ->
+                       true
+
+                     _invalid ->
+                       false
+                   end) do
+                  {selected, remaining_limit, remaining_keys, remaining_bytes} =
+                    flow_retention_take_planned_candidates(
+                      candidates,
+                      idx,
+                      acc.remaining_limit,
+                      acc.remaining_keys,
+                      acc.remaining_bytes
+                    )
+
+                  plan = flow_retention_put_plan_kind_candidates(plan, attrs.plan_kind, selected)
+
+                  {:cont,
+                   {:ok,
+                    %{
+                      acc
+                      | plans: [plan | acc.plans],
+                        remaining_limit: remaining_limit,
+                        remaining_keys: remaining_keys,
+                        remaining_bytes: remaining_bytes
+                    }}}
+                else
+                  {:halt, {:error, "ERR invalid flow retention candidate"}}
+                end
+
+              :unavailable ->
+                {:halt, {:error, "ERR flow retention cleanup planning unavailable"}}
 
               _other ->
-                {:halt, {:error, "ERR flow retention cleanup failed"}}
+                {:halt, {:error, "ERR flow retention cleanup planning failed"}}
+            end
+        end)
+        |> case do
+          {:ok, %{plans: plans}} -> {:ok, Enum.reverse(plans)}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp flow_retention_plan_kind_candidates(plan, :active), do: plan.active_candidates
+      defp flow_retention_plan_kind_candidates(plan, :terminal), do: plan.terminal_candidates
+
+      defp flow_retention_put_plan_kind_candidates(plan, :active, candidates) do
+        %{plan | active_candidates: candidates, terminal_candidates: []}
+      end
+
+      defp flow_retention_put_plan_kind_candidates(plan, :terminal, candidates) do
+        %{plan | active_candidates: [], terminal_candidates: candidates}
+      end
+
+      defp flow_retention_take_planned_candidates(
+             candidates,
+             shard_index,
+             remaining_limit,
+             remaining_keys,
+             remaining_bytes
+           ) do
+        {selected, remaining_limit, remaining_keys, remaining_bytes} =
+          Enum.reduce_while(
+            candidates,
+            {[], remaining_limit, remaining_keys, remaining_bytes},
+            fn candidate, {selected, limit, keys, bytes} ->
+              candidate = Map.put(candidate, :shard_index, shard_index)
+              candidate_keys = Map.fetch!(candidate, :planned_key_count)
+              candidate_bytes = :erlang.external_size(candidate)
+
+              cond do
+                limit <= 0 or keys <= 0 or bytes <= 0 ->
+                  {:halt, {selected, limit, keys, bytes}}
+
+                candidate_keys > keys or candidate_bytes > bytes ->
+                  {:cont, {selected, limit, keys, bytes}}
+
+                true ->
+                  {:cont,
+                   {
+                     [candidate | selected],
+                     limit - 1,
+                     keys - candidate_keys,
+                     bytes - candidate_bytes
+                   }}
+              end
+            end
+          )
+
+        {Enum.reverse(selected), remaining_limit, remaining_keys, remaining_bytes}
+      end
+
+      defp flow_retention_plan_shard(ctx, idx, attrs) do
+        if selected_waraft_ctx?(ctx) do
+          flow_retention_plan_waraft_snapshot(ctx, idx, attrs)
+        else
+          safe_read_call(ctx, idx, {:flow_retention_plan, attrs})
+        end
+      end
+
+      defp flow_retention_plan_waraft_snapshot(ctx, idx, attrs) do
+        {active_file_id, active_file_path, shard_data_path} =
+          Ferricstore.Store.ActiveFile.get(ctx, idx)
+
+        {flow_index_name, flow_lookup_name} = NativeFlowIndex.table_names(ctx.name, idx)
+
+        state = %{
+          shard_index: idx,
+          shard_data_path: shard_data_path,
+          shard_data_path_expanded: Path.expand(shard_data_path),
+          active_file_id: active_file_id,
+          active_file_path: active_file_path,
+          ets: elem(ctx.keydir_refs, idx),
+          data_dir: ctx.data_dir,
+          data_dir_expanded: Path.expand(ctx.data_dir),
+          instance_ctx: ctx,
+          instance_name: ctx.name,
+          flow_index_name: flow_index_name,
+          flow_lookup_name: flow_lookup_name,
+          flow_lmdb_path: Ferricstore.Flow.LMDB.path(shard_data_path),
+          flow_lmdb_mirror?: false
+        }
+
+        {:ok, Ferricstore.Raft.StateMachine.flow_retention_plan(state, attrs)}
+      end
+
+      defp flow_retention_cleanup_active(ctx, attrs, plans) do
+        active_candidates =
+          plans
+          |> Enum.flat_map(& &1.active_candidates)
+          |> flow_retention_command_candidates(ctx, attrs, :active)
+
+        with :ok <- flow_retention_run_after_plan_hook(:active, active_candidates) do
+          if active_candidates == [] do
+            {:ok,
+             %{
+               flows: 0,
+               history: 0,
+               values: 0,
+               active_timeouts: 0,
+               shard_counts: %{},
+               candidate_count: 0
+             }}
+          else
+            key = "__flow_retention_cleanup__:active"
+
+            active_attrs = %{
+              now_ms: Map.fetch!(attrs, :now_ms),
+              active_candidates: active_candidates
+            }
+
+            entry = {:flow_cross_retention_cleanup, active_attrs}
+            command = flow_cross_shard_tx_command(ctx, entry)
+
+            with :ok <- flow_retention_run_command_hook(:active, command) do
+              case flow_cross_shard_tx(ctx, [key], entry) do
+                {:ok, result} when is_map(result) ->
+                  {:ok, Map.put(result, :candidate_count, Map.get(result, :active_timeouts, 0))}
+
+                {:error, _reason} = error ->
+                  error
+
+                _other ->
+                  {:error, "ERR flow retention cleanup failed"}
+              end
             end
           end
+        end
+      end
+
+      defp flow_retention_cleanup_terminal_shards(ctx, attrs, plans, active_result) do
+        initial =
+          Map.take(active_result, [:flows, :history, :values, :active_timeouts])
+
+        terminal_candidates =
+          plans
+          |> Enum.flat_map(& &1.terminal_candidates)
+          |> flow_retention_command_candidates(ctx, attrs, :terminal)
+
+        with :ok <- flow_retention_run_after_plan_hook(:terminal, terminal_candidates) do
+          if terminal_candidates == [] do
+            {:ok, initial}
+          else
+            key = "__flow_retention_cleanup__:terminal"
+
+            terminal_attrs = %{
+              now_ms: Map.fetch!(attrs, :now_ms),
+              terminal_candidates: terminal_candidates
+            }
+
+            entry = {:flow_cross_retention_cleanup, terminal_attrs}
+            command = flow_cross_shard_tx_command(ctx, entry)
+
+            with :ok <- flow_retention_run_command_hook(:terminal, command) do
+              case flow_cross_shard_tx(ctx, [key], entry) do
+                {:ok, terminal_result} when is_map(terminal_result) ->
+                  {:ok, merge_flow_cleanup_counts(initial, terminal_result)}
+
+                {:error, _reason} = error ->
+                  error
+
+                _other ->
+                  {:error, "ERR flow retention cleanup failed"}
+              end
+            end
+          end
+        end
+      end
+
+      defp flow_retention_command_candidates(candidates, ctx, attrs, kind) do
+        field = if(kind == :active, do: :active_candidates, else: :terminal_candidates)
+        empty_attrs = %{field => [], now_ms: Map.fetch!(attrs, :now_ms)}
+
+        base_bytes =
+          ctx
+          |> flow_cross_shard_tx_command({:flow_cross_retention_cleanup, empty_attrs})
+          |> :erlang.external_size()
+
+        byte_budget = Map.fetch!(attrs, :cleanup_byte_budget)
+        key_budget = Map.fetch!(attrs, :cleanup_key_budget)
+        limit = Map.get(attrs, :limit, 100)
+
+        {selected, _keys, _bytes, _count} =
+          Enum.reduce_while(candidates, {[], 0, base_bytes, 0}, fn candidate,
+                                                                   {selected, keys, bytes, count} ->
+            candidate_keys = Map.fetch!(candidate, :planned_key_count)
+            candidate_bytes = :erlang.external_size(candidate) + 32
+
+            if count >= limit or keys >= key_budget or bytes >= byte_budget do
+              {:halt, {selected, keys, bytes, count}}
+            else
+              if keys + candidate_keys > key_budget or bytes + candidate_bytes > byte_budget do
+                {:cont, {selected, keys, bytes, count}}
+              else
+                {:cont,
+                 {
+                   [candidate | selected],
+                   keys + candidate_keys,
+                   bytes + candidate_bytes,
+                   count + 1
+                 }}
+              end
+            end
+          end)
+
+        selected = Enum.reverse(selected)
+        command_attrs = %{field => selected, now_ms: Map.fetch!(attrs, :now_ms)}
+
+        actual_bytes =
+          ctx
+          |> flow_cross_shard_tx_command({:flow_cross_retention_cleanup, command_attrs})
+          |> :erlang.external_size()
+
+        if actual_bytes <= byte_budget, do: selected, else: []
+      end
+
+      defp flow_retention_planning_attrs(attrs) do
+        attrs
+        |> Map.put_new(
+          :cleanup_key_budget,
+          flow_retention_positive_config(:flow_retention_cleanup_key_budget, 1_024, 8)
         )
+        |> Map.put_new(
+          :cleanup_byte_budget,
+          flow_retention_positive_config(
+            :flow_retention_cleanup_byte_budget,
+            8 * 1_024 * 1_024,
+            4_096
+          )
+        )
+      end
+
+      defp flow_retention_positive_config(key, default, minimum) do
+        case Application.get_env(:ferricstore, key, default) do
+          value when is_integer(value) and value > 0 -> max(value, minimum)
+          _invalid -> default
+        end
+      end
+
+      defp flow_retention_run_after_plan_hook(kind, candidates) do
+        case Application.get_env(:ferricstore, :flow_retention_after_plan_hook) do
+          hook when is_function(hook, 2) -> hook.(kind, candidates)
+          _missing -> :ok
+        end
+      end
+
+      defp flow_retention_run_command_hook(kind, command) do
+        case Application.get_env(:ferricstore, :flow_retention_command_hook) do
+          hook when is_function(hook, 2) -> hook.(kind, command)
+          _missing -> :ok
+        end
       end
 
       defp merge_flow_cleanup_counts(left, right) do

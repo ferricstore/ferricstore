@@ -1274,6 +1274,251 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert {:ok, nil} = FerricStore.flow_get(other_id, partition_key: partition)
   end
 
+  test "retention apply consumes explicit versioned candidates without lagged projection reads" do
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+    router_source = Ferricstore.Test.SourceFiles.router_source()
+
+    cleanup_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "do_flow_retention_cleanup"
+      )
+
+    cross_cleanup_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "do_flow_cross_retention_cleanup"
+      )
+
+    router_cleanup_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        router_source,
+        "flow_retention_plan_shards"
+      )
+
+    terminal_planner_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_plan_terminal_candidate"
+      )
+
+    terminal_apply_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_apply_terminal_candidate"
+      )
+
+    assert cleanup_source =~ "terminal_candidates"
+    assert cross_cleanup_source =~ "active_candidates"
+    assert router_cleanup_source =~ "expected_version"
+    assert terminal_planner_source =~ "cleanup_plan"
+    assert terminal_apply_source =~ "cleanup_plan"
+
+    refute cleanup_source =~ "flow_retention_expired_state_entries"
+    refute cleanup_source =~ "flow_retention_expired_lmdb_state_keys"
+    refute cleanup_source =~ "flow_retention_history_projection_pending?"
+    refute cleanup_source =~ "flow_retention_lmdb_projection_pending?"
+    refute cross_cleanup_source =~ "flow_active_timeout_expired_state_entries"
+  end
+
+  test "retention planning is bounded and uses one all-shard active transaction" do
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+    router_source = Ferricstore.Test.SourceFiles.router_source()
+
+    cleanup_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        router_source,
+        "flow_retention_cleanup_planned"
+      )
+
+    active_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        router_source,
+        "flow_retention_cleanup_active"
+      )
+
+    terminal_planner_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_plan_terminal_candidates"
+      )
+
+    assert cleanup_source =~ "flow_retention_plan_shards"
+    assert cleanup_source =~ "flow_retention_cleanup_active"
+    refute cleanup_source =~ "flow_retention_cleanup_shard"
+
+    assert length(Regex.scan(~r/flow_cross_shard_tx\(/, active_source)) == 1
+    assert terminal_planner_source =~ "expired_terminal_state_keys"
+    refute terminal_planner_source =~ "flow_retention_expired_state_entries"
+    refute terminal_planner_source =~ "safe_ets_select"
+  end
+
+  test "retention uses durable shared ref counts without global reference scans" do
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+    router_source = Ferricstore.Test.SourceFiles.router_source()
+
+    tracker_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_track_shared_value_refs"
+      )
+
+    cleanup_executor_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_cleanup_record"
+      )
+
+    terminal_cleanup_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        router_source,
+        "flow_retention_cleanup_terminal_shards"
+      )
+
+    assert tracker_source =~ "shared_value_ref_registry_key"
+    assert tracker_source =~ "flow_increment_shared_value_ref_counts"
+    assert cleanup_executor_source =~ "flow_retention_enqueue_shared_value_orphans"
+    assert terminal_cleanup_source =~ "flow_cross_shard_tx"
+
+    refute state_machine_source =~ "flow_retention_value_refs_used_by_other_states"
+    refute state_machine_source =~ "flow_retention_reference_scan_states"
+    refute state_machine_source =~ "flow_retention_reference_scan_hook"
+  end
+
+  test "retention cleanup ownership planning uses the bounded durable member index" do
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    cleanup_planner_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_build_cleanup_plan"
+      )
+
+    assert cleanup_planner_source =~ "flow_retention_cleanup_member_entries"
+
+    refute state_machine_source =~ "defp flow_retention_shared_value_links("
+    refute state_machine_source =~ "defp flow_retention_owned_value_keys_page("
+    refute state_machine_source =~ "defp flow_retention_governance_keys("
+    refute state_machine_source =~ "defp flow_retention_keys_with_prefix("
+  end
+
+  test "retention apply requires the durable flow identity guard" do
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    active_planner_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_plan_active_candidate"
+      )
+
+    terminal_planner_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_plan_terminal_candidate"
+      )
+
+    apply_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        state_machine_source,
+        "flow_retention_apply_candidate_record"
+      )
+
+    assert active_planner_source =~ "expected_guard"
+    assert terminal_planner_source =~ "expected_guard"
+    assert apply_source =~ "flow_retention_current_guard"
+
+    {guard_pos, _length} = :binary.match(apply_source, "flow_retention_current_guard")
+    {fallback_pos, _length} = :binary.match(apply_source, ":miss -> planned_record")
+    assert guard_pos < fallback_pos
+  end
+
+  test "same-shard child spawning acquires shared refs in the retention ordering domain" do
+    router_source = Ferricstore.Test.SourceFiles.router_source()
+
+    serialized_ops_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        router_source,
+        "flow_shared_ref_write_op?"
+      )
+
+    [_, serialized_ops] = Regex.run(~r/when op in \[(.*?)\]/s, serialized_ops_source)
+    assert serialized_ops =~ ":flow_spawn_children"
+  end
+
+  test "startup refreshes active file size after retention metadata backfill writes" do
+    startup_source =
+      __DIR__
+      |> Path.join("../../lib/ferricstore/store/shard/startup.ex")
+      |> Path.expand()
+      |> File.read!()
+
+    recovery_source =
+      __DIR__
+      |> Path.join("../../lib/ferricstore/raft/waraft_storage/sections/recovery.ex")
+      |> Path.expand()
+      |> File.read!()
+
+    assert Regex.match?(
+             ~r/reconcile_startup_shard\(.*?active_file_size = startup_file_size\(active_file_path\)/s,
+             startup_source
+           )
+
+    assert Regex.match?(
+             ~r/reconcile_startup_shard\(.*?active_file_size = recovery_file_size\(active_file_path\)/s,
+             recovery_source
+           )
+
+    assert Regex.match?(
+             ~r/force_full_reconcile\?: true.*?active_file_size: recovery_file_size\(sm_state.active_file_path\)/s,
+             recovery_source
+           )
+  end
+
+  test "state_meta policy reindex is bounded and deterministic during Raft apply" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    reindex_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_state_keys_for_policy_reindex"
+      )
+
+    refute reindex_source =~ ":ets.foldl",
+           "policy changes must not perform an unbounded keydir fold inside Raft apply"
+
+    assert reindex_source =~ "@flow_policy_reindex_max_keydir_entries"
+    assert reindex_source =~ ":ets.select"
+    assert reindex_source =~ "FlowKeys.registry_key?"
+    assert reindex_source =~ "Enum.sort"
+    assert reindex_source =~ "{:error,"
+  end
+
+  test "Flow policy updates commit all shard copies in one fatal cross-shard transaction" do
+    router_source = Ferricstore.Test.SourceFiles.router_source()
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    assert [_, policy_put_source] =
+             String.split(router_source, "      def flow_policy_put_all", parts: 2)
+
+    assert [policy_put_source, _] =
+             String.split(policy_put_source, "      def flow_get", parts: 2)
+
+    refute policy_put_source =~ "Enum.reduce_while",
+           "separate shard writes leave earlier policy copies committed after a later failure"
+
+    assert policy_put_source =~ "flow_policy_put_all_command"
+    assert router_source =~ "{:cross_shard_tx, shard_batches}"
+    assert router_source =~ "|> Map.keys()"
+
+    assert state_machine_source =~
+             "{:flow_cross_policy_put, shard_index, key, value, expire_at_ms}"
+
+    assert state_machine_source =~ "%{shard_index: shard_index}"
+
+    assert state_machine_source =~
+             "{:flow_cross_policy_put, _shard_index, _key, _value, _expire_at_ms}"
+  end
+
   defp create_many_and_claim(partition, ids, type, now_ms) do
     assert :ok =
              FerricStore.flow_create_many(partition, ids,

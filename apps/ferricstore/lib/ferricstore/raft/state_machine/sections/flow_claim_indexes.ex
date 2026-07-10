@@ -44,17 +44,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
-      defp flow_apply_claim_batch(_state, _due_key, [], [], _now_ms), do: :ok
+      defp flow_apply_claim_batch(_state, _due_key, [], [], [], _now_ms), do: :ok
 
-      defp flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
+      defp flow_apply_claim_batch(
+             state,
+             due_key,
+             plans,
+             stale_due_ids,
+             deferred_timeout_records,
+             now_ms
+           ) do
+        stale_due_entries =
+          Enum.map(stale_due_ids, &{due_key, &1}) ++
+            flow_deferred_timeout_due_index_deletes(deferred_timeout_records)
+
         phase_meta =
           state
           |> flow_claim_due_phase_meta()
-          |> Map.merge(%{plans: length(plans), stale_due_ids: length(stale_due_ids)})
+          |> Map.merge(%{plans: length(plans), stale_due_ids: length(stale_due_entries)})
 
         with :ok <-
                flow_claim_due_phase(:delete_stale_due, phase_meta, fn ->
-                 flow_zset_delete_members_from_key(state, due_key, stale_due_ids)
+                 flow_zset_lifecycle_index_delete_grouped(state, stale_due_entries)
                end),
              :ok <-
                flow_claim_due_phase(:move_indexes, phase_meta, fn ->
@@ -70,6 +81,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
                end) do
           :ok
         end
+      end
+
+      defp flow_deferred_timeout_due_index_deletes(records) do
+        Enum.flat_map(records, fn record ->
+          entries =
+            case flow_due_index_key(record) do
+              key when is_binary(key) -> [{key, record.id}]
+              nil -> []
+            end
+
+          if flow_due_any_index_enabled?() do
+            case flow_due_any_index_key(record) do
+              key when is_binary(key) -> [{key, record.id} | entries]
+              nil -> entries
+            end
+          else
+            entries
+          end
+        end)
       end
 
       defp flow_claim_move_indexes(_state, []), do: :ok
@@ -624,6 +654,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
         with :ok <- flow_transition_move_due_indexes(state, plans),
              :ok <- flow_transition_move_state_indexes(state, plans),
              :ok <- flow_transition_move_metadata_indexes(state, plans),
+             :ok <- flow_transition_move_active_timeout_indexes(state, plans),
+             :ok <- flow_transition_move_terminal_retention_indexes(state, plans),
              :ok <- flow_transition_delete_old_secondary_indexes(state, plans) do
           flow_transition_put_new_running_indexes(state, plans)
         end
@@ -632,10 +664,97 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       defp flow_terminal_transition_move_indexes(state, plans) do
         with :ok <- flow_transition_move_due_indexes(state, plans),
              :ok <- flow_transition_move_state_indexes(state, plans),
-             :ok <- flow_transition_move_metadata_indexes(state, plans) do
+             :ok <- flow_transition_move_metadata_indexes(state, plans),
+             :ok <- flow_transition_move_active_timeout_indexes(state, plans),
+             :ok <- flow_transition_move_terminal_retention_indexes(state, plans) do
           flow_transition_delete_old_secondary_indexes(state, plans)
         end
       end
+
+      defp flow_transition_move_active_timeout_indexes(state, plans) do
+        {moves, deletes, puts} =
+          Enum.reduce(plans, {[], [], []}, fn plan, {moves, deletes, puts} ->
+            {record, next} = flow_claim_plan_pair(plan)
+
+            flow_active_timeout_index_plan(
+              flow_active_timeout_index_entry(record),
+              flow_active_timeout_index_entry(next),
+              moves,
+              deletes,
+              puts
+            )
+          end)
+
+        with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
+             :ok <- flow_zset_index_delete_grouped(state, Enum.reverse(deletes)) do
+          flow_index_put_new_entries(state, Enum.reverse(puts))
+        end
+      end
+
+      defp flow_transition_move_terminal_retention_indexes(state, plans) do
+        {moves, deletes, puts} =
+          Enum.reduce(plans, {[], [], []}, fn plan, {moves, deletes, puts} ->
+            {record, next} = flow_claim_plan_pair(plan)
+
+            flow_active_timeout_index_plan(
+              flow_terminal_retention_index_entry(record),
+              flow_terminal_retention_index_entry(next),
+              moves,
+              deletes,
+              puts
+            )
+          end)
+
+        with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
+             :ok <- flow_zset_index_delete_grouped(state, Enum.reverse(deletes)) do
+          flow_index_put_new_entries(state, Enum.reverse(puts))
+        end
+      end
+
+      defp flow_active_timeout_index_plan(nil, nil, moves, deletes, puts),
+        do: {moves, deletes, puts}
+
+      defp flow_active_timeout_index_plan(
+             {key, member, old_score},
+             {key, member, new_score},
+             moves,
+             deletes,
+             puts
+           ) do
+        if old_score == new_score do
+          {moves, deletes, puts}
+        else
+          {[{key, key, member, new_score} | moves], deletes, puts}
+        end
+      end
+
+      defp flow_active_timeout_index_plan(
+             {old_key, old_member, _old_score},
+             nil,
+             moves,
+             deletes,
+             puts
+           ),
+           do: {moves, [{old_key, old_member} | deletes], puts}
+
+      defp flow_active_timeout_index_plan(
+             nil,
+             {new_key, new_member, new_score},
+             moves,
+             deletes,
+             puts
+           ),
+           do: {moves, deletes, [{new_key, new_member, new_score} | puts]}
+
+      defp flow_active_timeout_index_plan(
+             {old_key, old_member, _old_score},
+             {new_key, new_member, new_score},
+             moves,
+             deletes,
+             puts
+           ),
+           do:
+             {moves, [{old_key, old_member} | deletes], [{new_key, new_member, new_score} | puts]}
 
       defp flow_transition_move_due_indexes(state, plans) do
         if flow_transition_plans_due_index_empty?(plans) do

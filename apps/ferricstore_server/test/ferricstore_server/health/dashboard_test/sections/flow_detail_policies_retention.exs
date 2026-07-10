@@ -422,6 +422,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, ~s(name="indexed_attributes"))
           assert String.contains?(html, ~s(name="indexed_state_meta"))
           assert String.contains?(html, ~s(name="max_retries"))
+          assert String.contains?(html, ~s(name="max_active_ms"))
           assert String.contains?(html, ~s(name="retention_ttl_ms"))
           refute String.contains?(html, ~s(name="history_hot_max_events"))
           refute String.contains?(html, "Hot history")
@@ -440,6 +441,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           assert {:ok, _policy} =
                    FerricStore.flow_policy_set(type,
+                     max_active_ms: 45_000,
                      retry: [
                        max_retries: 5,
                        backoff: [kind: :fixed, base_ms: 100, max_ms: 500, jitter_pct: 0],
@@ -492,6 +494,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           assert {:ok, _policy} =
                    FerricStore.flow_policy_set(type,
+                     max_active_ms: 45_000,
                      retry: [
                        max_retries: 2,
                        backoff: [kind: :fixed, base_ms: 100, max_ms: 200, jitter_pct: 0],
@@ -530,6 +533,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           assert {:ok, policy} = FerricStore.flow_policy_get(type)
           assert policy.retry.max_retries == 4
+          assert policy.max_active_ms == 45_000
           assert policy.retry.backoff.kind == :linear
           assert policy.retry.exhausted_to == "dead"
           assert policy.retention.ttl_ms == 120_000
@@ -539,6 +543,34 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert policy.states["review"].retry.max_retries == 7
           assert policy.states["review"].retry.exhausted_to == "review_failed"
           assert policy.states["review"].retention.history_max_events == 5
+        end
+
+        test "policy form updates the type-level max active runtime" do
+          type = "dashboard-policy-active-limit-#{System.unique_integer([:positive])}"
+
+          assert {:ok, ^type} =
+                   Dashboard.apply_flow_policy_form(%{
+                     "type" => type,
+                     "max_active_ms" => "90000",
+                     "max_retries" => "4",
+                     "backoff_kind" => "linear",
+                     "base_ms" => "250",
+                     "max_ms" => "2000",
+                     "jitter_pct" => "10",
+                     "exhausted_to" => "dead",
+                     "retention_ttl_ms" => "120000",
+                     "history_max_events" => "20"
+                   })
+
+          assert {:ok, %{max_active_ms: 90_000}} = FerricStore.flow_policy_get(type)
+
+          html =
+            Dashboard.collect_flow_policies_page(edit_type: type)
+            |> Dashboard.render_flow_policies_page()
+
+          assert String.contains?(html, ~s(name="max_active_ms"))
+          assert String.contains?(html, ~s(value="90000"))
+          assert String.contains?(html, "Max Active")
         end
 
         test "policy form writes state-level FIFO mode without dropping existing overrides" do
@@ -656,10 +688,24 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
               total_sampled: 2,
               terminal_sampled: 1,
               active_sampled: 1,
-              eligible_sampled: 1,
+              eligible_sampled: 2,
+              terminal_eligible_sampled: 1,
+              active_timeout_eligible_sampled: 1,
               storage: %{total_disk_bytes: 1_234_567},
               projection: Dashboard.default_flow_projection_health(),
               flash: nil,
+              active_timeout_candidates: [
+                %{
+                  id: "active-timeout-flow-1",
+                  type: "email",
+                  state: "running",
+                  partition_key: "tenant-a",
+                  created_at_ms: now_ms - 10_000,
+                  max_active_ms: 5_000,
+                  updated_at_ms: now_ms - 2_000,
+                  attempts: 1
+                }
+              ],
               candidates: [
                 %{
                   id: "retention-flow-1",
@@ -679,7 +725,29 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
           assert String.contains?(html, "Run Cleanup")
           assert String.contains?(html, "FLOW.RETENTION_CLEANUP")
           assert String.contains?(html, "retention-flow-1")
+          assert String.contains?(html, "active-timeout-flow-1")
+          assert String.contains?(html, "Active Timeouts")
+          assert String.contains?(html, "fails overdue active Flow records")
           assert String.contains?(html, "terminal Flow records")
+          refute String.contains?(html, "Active Flow records are not touched")
+        end
+
+        test "collects overdue active flows in the sampled retention preview" do
+          now_ms = System.system_time(:millisecond)
+          id = "dashboard-active-timeout-preview-#{System.unique_integer([:positive])}"
+
+          assert :ok =
+                   FerricStore.flow_create(id,
+                     type: "dashboard-active-timeout",
+                     state: "queued",
+                     now_ms: now_ms - 10_000,
+                     max_active_ms: 1_000
+                   )
+
+          data = Dashboard.collect_flow_retention_page(limit: 25)
+
+          assert data.active_timeout_eligible_sampled == 1
+          assert Enum.any?(data.active_timeout_candidates, &(&1.id == id))
         end
 
         test "dry-run form does not execute cleanup and cleanup form delegates with limit" do
@@ -687,7 +755,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           Application.put_env(:ferricstore, :flow_dashboard_retention_cleanup_fun, fn opts ->
             send(test_pid, {:retention_cleanup, opts})
-            {:ok, %{flows: 1, history: 2, values: 3}}
+            {:ok, %{active_timeouts: 4, flows: 1, history: 2, values: 3}}
           end)
 
           on_exit(fn ->
@@ -702,7 +770,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           refute_received {:retention_cleanup, _opts}
 
-          assert {:ok, :cleanup, %{flows: 1, history: 2, values: 3, limit: 7}} =
+          assert {:ok, :cleanup, %{active_timeouts: 4, flows: 1, history: 2, values: 3, limit: 7}} =
                    Dashboard.apply_flow_retention_form(%{
                      "action" => "cleanup",
                      "limit" => "7",

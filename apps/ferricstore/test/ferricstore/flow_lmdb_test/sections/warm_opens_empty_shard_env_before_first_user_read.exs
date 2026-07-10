@@ -41,6 +41,31 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
         assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "key")
       end
 
+      test "clear reopens a cached env after its directory was replaced" do
+        path =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_replaced_#{System.unique_integer([:positive])}"
+          )
+
+        on_exit(fn ->
+          Ferricstore.Flow.LMDB.release_all()
+          File.rm_rf!(path)
+        end)
+
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "old", "value"}])
+        assert Ferricstore.Flow.LMDB.env_present?(path)
+
+        File.rm_rf!(path)
+        File.mkdir_p!(path)
+        refute Ferricstore.Flow.LMDB.env_present?(path)
+
+        assert :ok = Ferricstore.Flow.LMDB.clear(path)
+        assert Ferricstore.Flow.LMDB.env_present?(path)
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, "new", "value"}])
+        assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "new")
+      end
+
       test "mode parser normalizes every legacy value to lagged" do
         assert Ferricstore.Flow.LMDB.normalize_mode("off") == :lagged
         assert Ferricstore.Flow.LMDB.normalize_mode("false") == :lagged
@@ -142,6 +167,99 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
 
         assert {:ok, []} =
                  Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, third_key, 10)
+      end
+
+      test "bounded prefix pages honor item and cumulative byte limits without stalling" do
+        path =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_prefix_bounded_#{System.unique_integer([:positive])}"
+          )
+
+        on_exit(fn -> File.rm_rf!(path) end)
+
+        prefix = "flow-bounded:test:"
+
+        rows = [
+          {prefix <> "001", "one"},
+          {prefix <> "002", "two-two"},
+          {prefix <> "003", String.duplicate("x", 128)}
+        ]
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(
+                   path,
+                   Enum.map(rows, fn {key, value} -> {:put, key, value} end) ++
+                     [{:put, "flow-bounded:other:001", "skip"}]
+                 )
+
+        [{first_key, first_value}, {second_key, second_value}, {third_key, third_value}] = rows
+        first_bytes = byte_size(first_key) + byte_size(first_value)
+        second_bytes = byte_size(second_key) + byte_size(second_value)
+
+        assert {:ok, [^first_key, ^second_key]} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
+                   path,
+                   prefix,
+                   <<>>,
+                   2,
+                   first_bytes + second_bytes
+                 )
+                 |> then(fn {:ok, entries} -> {:ok, Enum.map(entries, &elem(&1, 0))} end)
+
+        assert {:ok, [{^first_key, ^first_value}]} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
+                   path,
+                   prefix,
+                   <<>>,
+                   10,
+                   first_bytes
+                 )
+
+        assert {:ok, [{^second_key, ^second_value}]} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
+                   path,
+                   prefix,
+                   first_key,
+                   10,
+                   second_bytes
+                 )
+
+        assert {:ok, [{^third_key, ^third_value}]} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
+                   path,
+                   prefix,
+                   second_key,
+                   10,
+                   10_000
+                 )
+
+        assert {:ok, []} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
+                   path,
+                   prefix,
+                   third_key,
+                   10,
+                   10_000
+                 )
+
+        assert {:ok, [{^first_key, ^first_value}]} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
+                   path,
+                   prefix,
+                   <<>>,
+                   10,
+                   1
+                 )
+
+        assert {:ok, []} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
+                   path,
+                   prefix,
+                   <<>>,
+                   0,
+                   1_000
+                 )
       end
 
       test "segment value pin scan accepts exact limit only when a future pin bounds it" do

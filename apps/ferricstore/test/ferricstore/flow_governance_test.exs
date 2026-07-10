@@ -1647,6 +1647,128 @@ defmodule Ferricstore.FlowGovernanceTest do
     assert {:ok, []} = FerricStore.flow_governance_ledger(id, partition_key: @partition)
   end
 
+  test "terminal retention serializes with racing effect and ledger owner writes" do
+    ctx = FerricStore.Instance.get(:default)
+    parent = self()
+    old_write_hook = Application.get_env(:ferricstore, :flow_retention_owned_write_hook)
+    old_plan_hook = Application.get_env(:ferricstore, :flow_retention_after_plan_hook)
+
+    on_exit(fn ->
+      restore_env(:flow_retention_owned_write_hook, old_write_hook)
+      restore_env(:flow_retention_after_plan_hook, old_plan_hook)
+    end)
+
+    for kind <- [:effect, :ledger] do
+      type = unique_flow_id("gov-retention-race-#{kind}-type")
+      id = unique_flow_id("gov-retention-race-#{kind}")
+      now = System.system_time(:millisecond)
+
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: type,
+                 state: "queued",
+                 partition_key: @partition,
+                 run_at_ms: now,
+                 now_ms: now,
+                 retention_ttl_ms: 10
+               )
+
+      assert {:ok, [claimed]} =
+               FerricStore.flow_claim_due(type,
+                 states: ["queued"],
+                 partition_key: @partition,
+                 worker: "worker-retention-race",
+                 limit: 1,
+                 now_ms: now + 1
+               )
+
+      assert :ok =
+               FerricStore.flow_complete(id, claimed.lease_token,
+                 partition_key: @partition,
+                 fencing_token: claimed.fencing_token,
+                 now_ms: now + 2
+               )
+
+      state_blob = Ferricstore.Store.Router.flow_get(ctx, id, @partition)
+      record = Ferricstore.Flow.Codec.decode_record(state_blob)
+
+      key =
+        case kind do
+          :effect -> Ferricstore.Flow.Keys.governance_effect_key(id, "racing", @partition)
+          :ledger -> Ferricstore.Flow.Keys.governance_ledger_key(id, "racing", @partition)
+        end
+
+      owner = %{
+        id: id,
+        partition_key: @partition,
+        state_key: Ferricstore.Flow.Keys.state_key(id, @partition),
+        expected_guard: Ferricstore.Flow.RetentionGuard.encode(record)
+      }
+
+      release_ref = make_ref()
+
+      Application.put_env(:ferricstore, :flow_retention_owned_write_hook, fn
+        %{id: ^id}, ^key ->
+          send(parent, {:governance_owner_write_paused, key, self(), release_ref})
+
+          receive do
+            {:release_governance_owner_write, ^release_ref} -> :ok
+          after
+            10_000 -> {:error, :governance_owner_write_hook_timeout}
+          end
+
+        _owner, _key ->
+          :ok
+      end)
+
+      Application.put_env(:ferricstore, :flow_retention_after_plan_hook, fn
+        :terminal, candidates when is_list(candidates) ->
+          if Enum.any?(candidates, &(&1.record.id == id)) do
+            send(parent, {:governance_cleanup_planned, key})
+          end
+
+          :ok
+
+        _kind, _candidates ->
+          :ok
+      end)
+
+      set_opts = %{
+        expire_at_ms: 0,
+        nx: false,
+        xx: false,
+        get: false,
+        keepttl: false,
+        flow_retention_owner: owner
+      }
+
+      write_task =
+        Task.async(fn -> Ferricstore.Store.Router.set(ctx, key, "governance", set_opts) end)
+
+      assert_receive {:governance_owner_write_paused, ^key, apply_pid, ^release_ref}, 5_000
+
+      cleanup_task =
+        Task.async(fn ->
+          FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 1_000)
+        end)
+
+      assert_receive {:governance_cleanup_planned, ^key}, 5_000
+      assert Task.yield(cleanup_task, 500) == nil
+      send(apply_pid, {:release_governance_owner_write, release_ref})
+
+      assert :ok = Task.await(write_task, 10_000)
+      assert {:ok, %{flows: 0}} = Task.await(cleanup_task, 10_000)
+      assert Ferricstore.Store.Router.get(ctx, key) == "governance"
+
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+      assert {:ok, %{flows: 1}} =
+               FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 1_001)
+
+      assert Ferricstore.Store.Router.get(ctx, key) == nil
+    end
+  end
+
   defp create_and_claim!(id, type) do
     assert :ok =
              FerricStore.flow_create(id,
@@ -1668,4 +1790,7 @@ defmodule Ferricstore.FlowGovernanceTest do
 
     claimed
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

@@ -42,6 +42,27 @@ defmodule Ferricstore.Flow.Keys do
     end
   end
 
+  def state_key_from_registry_key(registry_key) when is_binary(registry_key) do
+    case :binary.match(registry_key, "}:r:") do
+      {pos, marker_size} when pos >= 2 ->
+        id_offset = pos + marker_size
+        id_size = byte_size(registry_key) - id_offset
+
+        if id_size > 0 do
+          tag = binary_part(registry_key, 2, pos + 1 - 2)
+          id = binary_part(registry_key, id_offset, id_size)
+          {:ok, "f:" <> tag <> ":s:" <> id}
+        else
+          :error
+        end
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  def state_key_from_registry_key(_registry_key), do: :error
+
   def history_key(id, partition_key \\ nil)
 
   def history_key(id, nil) when is_binary(id) do
@@ -71,6 +92,59 @@ defmodule Ferricstore.Flow.Keys do
       when is_binary(owner_flow_id) do
     "f:" <> tag(partition_key) <> ":svl:" <> owner_flow_id <> ":"
   end
+
+  def shared_value_ref_registry_key(flow_id, partition_key \\ nil) when is_binary(flow_id) do
+    "f:" <> tag(partition_key) <> ":svr:" <> flow_id
+  end
+
+  def shared_value_ref_count_key(ref, shard_index)
+      when is_binary(ref) and is_integer(shard_index) and shard_index >= 0 do
+    digest = :crypto.hash(:sha256, ref) |> Base.url_encode64(padding: false)
+    "f:" <> @global_tag <> ":svc:" <> Integer.to_string(shard_index) <> ":" <> digest
+  end
+
+  def shared_value_orphan_key(ref) when is_binary(ref) do
+    digest = :crypto.hash(:sha256, ref) |> Base.url_encode64(padding: false)
+    "f:" <> @global_tag <> ":svo:" <> digest
+  end
+
+  def retention_guard_key(id, partition_key \\ nil) when is_binary(id) do
+    "f:" <> tag(partition_key) <> ":rtg:" <> id
+  end
+
+  def retention_cleanup_index_key(id, partition_key \\ nil) when is_binary(id) do
+    "f:" <> tag(partition_key) <> ":i:rtc:" <> id
+  end
+
+  def retention_cleanup_member_prefix(id, partition_key \\ nil) when is_binary(id) do
+    "f:" <> tag(partition_key) <> ":rtm:" <> id <> ":"
+  end
+
+  def retention_cleanup_member_key(id, owned_key, partition_key \\ nil)
+      when is_binary(id) and is_binary(owned_key) do
+    digest = :crypto.hash(:sha256, owned_key) |> Base.url_encode64(padding: false)
+    retention_cleanup_member_prefix(id, partition_key) <> digest
+  end
+
+  def shared_value_ref_backfill_key(shard_index)
+      when is_integer(shard_index) and shard_index >= 0 do
+    "f:" <> @global_tag <> ":svb:1:" <> Integer.to_string(shard_index)
+  end
+
+  def shared_value_ref_backfill_key?("f:" <> @global_tag <> ":svb:1:" <> shard_index),
+    do: shard_index != ""
+
+  def shared_value_ref_backfill_key?(_key), do: false
+
+  def retention_cleanup_member?(<<"f:{", rest::binary>>),
+    do: :binary.match(rest, "}:rtm:") != :nomatch
+
+  def retention_cleanup_member?(_key), do: false
+
+  def shared_value_ref?(<<"f:{", rest::binary>>),
+    do: :binary.match(rest, "}:v:s:") != :nomatch
+
+  def shared_value_ref?(_ref), do: false
 
   def signal_idempotency_key(id, idempotency_key, partition_key \\ nil)
       when is_binary(id) and is_binary(idempotency_key) do
@@ -178,6 +252,10 @@ defmodule Ferricstore.Flow.Keys do
   def worker_index_key(worker, partition_key \\ nil) do
     "f:" <> tag(partition_key) <> ":i:w:" <> worker
   end
+
+  def active_timeout_index_key, do: "f:" <> @global_tag <> ":i:active-timeout"
+
+  def terminal_retention_index_key, do: "f:" <> @global_tag <> ":i:terminal-retention"
 
   def parent_index_key(parent_flow_id, partition_key \\ nil) do
     "f:" <> tag(partition_key) <> ":i:p:" <> parent_flow_id

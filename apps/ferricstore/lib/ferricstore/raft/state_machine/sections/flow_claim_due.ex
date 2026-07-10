@@ -677,7 +677,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
         entries = [
           {FlowKeys.state_index_key(type, flow_state, partition_key), id, updated_score}
-          | flow_metadata_index_entries(record)
+          | flow_metadata_index_entries(record) ++
+              flow_active_timeout_index_entries(record) ++
+              flow_terminal_retention_index_entries(record)
         ]
 
         case Map.get(record, :next_run_at_ms) do

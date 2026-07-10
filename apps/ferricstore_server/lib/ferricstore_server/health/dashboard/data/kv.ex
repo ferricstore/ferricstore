@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
   @moduledoc false
 
   alias Ferricstore.Stats
+  alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.{BlobRef, CompoundKey}
   alias FerricstoreServer.Health.Dashboard.Access
   alias FerricstoreServer.Health.Dashboard.Data.Operational
@@ -15,6 +16,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
 
   @keyspace_dashboard_default_limit 50
   @keyspace_dashboard_max_limit 500
+  @keyspace_dashboard_max_scan 10_000
   @keyspace_dashboard_select_batch 256
 
   def collect_prefixes_page do
@@ -92,72 +94,83 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
   end
 
   defp sample_prefix_counts do
-    max_sample = 10_000
-    sc = shard_count()
-    per_shard = div(max_sample, max(sc, 1))
+    {counts_map, total, _scanned} =
+      Enum.reduce_while(
+        0..(shard_count() - 1),
+        {%{}, 0, 0},
+        fn index, {counts, total, scanned} ->
+          budget = @keyspace_dashboard_max_scan - scanned
 
-    {counts_map, total} =
-      Enum.reduce(0..(sc - 1), {%{}, 0}, fn i, {acc_map, acc_total} ->
-        keydir = :"keydir_#{i}"
+          if budget <= 0 do
+            {:halt, {counts, total, scanned}}
+          else
+            reducer = fn {key, _val, _exp, _lfu, _fid, _off, _vsize}, {acc, count} ->
+              if InternalKey.reserved?(key) do
+                {:cont, {acc, count}}
+              else
+                prefix = Stats.extract_prefix(key)
+                {:cont, {Map.update(acc, prefix, 1, &(&1 + 1)), count + 1}}
+              end
+            end
 
-        try do
-          {shard_map, shard_count_val} =
-            :ets.foldl(
-              fn {key, _val, _exp, _lfu, _fid, _off, _vsize}, {m, c} ->
-                if c >= per_shard do
-                  {m, c}
-                else
-                  prefix = Stats.extract_prefix(key)
-                  {Map.update(m, prefix, 1, &(&1 + 1)), c + 1}
-                end
-              end,
-              {%{}, 0},
-              keydir
-            )
+            {{counts, total}, shard_scanned} =
+              bounded_keydir_reduce(:"keydir_#{index}", budget, {counts, total}, reducer)
 
-          {Map.merge(acc_map, shard_map, fn _k, v1, v2 -> v1 + v2 end),
-           acc_total + shard_count_val}
-        rescue
-          _ -> {acc_map, acc_total}
-        catch
-          :exit, _ -> {acc_map, acc_total}
+            {:cont, {counts, total, scanned + shard_scanned}}
+          end
         end
-      end)
+      )
 
     {Enum.to_list(counts_map), total}
   end
 
   defp collect_keyspace_rows(%{key: key} = filters) when key != "" do
-    rows =
-      0..(shard_count() - 1)
-      |> Enum.flat_map(fn index ->
-        keydir = :"keydir_#{index}"
+    if InternalKey.reserved?(key) do
+      {[], 0}
+    else
+      rows =
+        0..(shard_count() - 1)
+        |> Enum.flat_map(fn index ->
+          keydir = :"keydir_#{index}"
 
-        [key, CompoundKey.type_key(key), CompoundKey.list_meta_key(key)]
-        |> Enum.flat_map(&lookup_keyspace_row(keydir, index, &1))
-      end)
-      |> Enum.uniq_by(& &1.physical_key)
-      |> Enum.reject(&(not filters.include_internal and &1.internal? and &1.key != key))
-      |> Enum.take(filters.limit)
+          [key, CompoundKey.type_key(key), CompoundKey.list_meta_key(key)]
+          |> Enum.flat_map(&lookup_keyspace_row(keydir, index, &1))
+        end)
+        |> Enum.uniq_by(& &1.physical_key)
+        |> Enum.reject(&(not filters.include_internal and &1.internal? and &1.key != key))
+        |> Enum.take(filters.limit)
 
-    {rows, length(rows)}
+      {rows, length(rows)}
+    end
   end
 
   defp collect_keyspace_rows(filters) do
     {rows, scanned} =
       Enum.reduce_while(0..(shard_count() - 1), {[], 0}, fn index, {rows, scanned} ->
-        remaining = filters.limit - length(rows)
+        budget = @keyspace_dashboard_max_scan - scanned
 
-        if remaining <= 0 do
+        if length(rows) >= filters.limit or budget <= 0 do
           {:halt, {rows, scanned}}
         else
-          keydir = :"keydir_#{index}"
-          {shard_rows, shard_scanned} = sample_keyspace_rows(keydir, index, filters, remaining)
-          {:cont, {rows ++ shard_rows, scanned + shard_scanned}}
+          reducer = fn entry, acc ->
+            row = keyspace_entry_row(index, entry)
+
+            if keyspace_row_matches?(row, filters) do
+              rows = [row | acc]
+              if length(rows) >= filters.limit, do: {:halt, rows}, else: {:cont, rows}
+            else
+              {:cont, acc}
+            end
+          end
+
+          {rows, shard_scanned} =
+            bounded_keydir_reduce(:"keydir_#{index}", budget, rows, reducer)
+
+          {:cont, {rows, scanned + shard_scanned}}
         end
       end)
 
-    {Enum.take(rows, filters.limit), scanned}
+    {rows |> Enum.reverse() |> Enum.take(filters.limit), scanned}
   end
 
   defp lookup_keyspace_row(keydir, index, key) do
@@ -170,57 +183,60 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
     end
   end
 
-  defp sample_keyspace_rows(keydir, index, filters, remaining) do
+  defp bounded_keydir_reduce(_keydir, budget, acc, _reducer) when budget <= 0,
+    do: {acc, 0}
+
+  defp bounded_keydir_reduce(keydir, budget, acc, reducer) do
     match_spec = [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6", :"$7"}, [], [:"$_"]}]
 
     try do
-      case :ets.select(keydir, match_spec, @keyspace_dashboard_select_batch) do
+      page_size = min(@keyspace_dashboard_select_batch, budget)
+
+      case :ets.select(keydir, match_spec, page_size) do
         :"$end_of_table" ->
-          {[], 0}
+          {acc, 0}
 
         {entries, continuation} ->
-          continue_keyspace_rows(entries, continuation, index, filters, remaining, [], 0)
+          continue_bounded_reduce(entries, continuation, budget, acc, 0, reducer)
       end
     rescue
-      ArgumentError -> {[], 0}
+      ArgumentError -> {acc, 0}
     catch
-      :exit, _ -> {[], 0}
+      :exit, _ -> {acc, 0}
     end
   end
 
-  defp continue_keyspace_rows(entries, continuation, index, filters, remaining, rows, scanned) do
-    {rows, scanned} =
-      Enum.reduce_while(entries, {rows, scanned}, fn entry, {acc, scan_acc} ->
-        row = keyspace_entry_row(index, entry)
+  defp continue_bounded_reduce(_entries, _continuation, 0, acc, scanned, _reducer),
+    do: {acc, scanned}
 
-        cond do
-          length(acc) >= remaining -> {:halt, {acc, scan_acc}}
-          keyspace_row_matches?(row, filters) -> {:cont, {[row | acc], scan_acc + 1}}
-          true -> {:cont, {acc, scan_acc + 1}}
-        end
-      end)
+  defp continue_bounded_reduce([entry | rest], continuation, budget, acc, scanned, reducer) do
+    case reducer.(entry, acc) do
+      {:cont, acc} ->
+        continue_bounded_reduce(rest, continuation, budget - 1, acc, scanned + 1, reducer)
 
-    cond do
-      length(rows) >= remaining ->
-        {Enum.reverse(rows), scanned}
+      {:halt, acc} ->
+        {acc, scanned + 1}
+    end
+  end
 
-      continuation == :"$end_of_table" ->
-        {Enum.reverse(rows), scanned}
+  defp continue_bounded_reduce([], continuation, budget, acc, scanned, reducer) do
+    case continuation do
+      :"$end_of_table" ->
+        {acc, scanned}
 
-      true ->
+      continuation ->
         case :ets.select(continuation) do
           :"$end_of_table" ->
-            {Enum.reverse(rows), scanned}
+            {acc, scanned}
 
-          {next_entries, next_continuation} ->
-            continue_keyspace_rows(
-              next_entries,
+          {entries, next_continuation} ->
+            continue_bounded_reduce(
+              entries,
               next_continuation,
-              index,
-              filters,
-              remaining,
-              rows,
-              scanned
+              budget,
+              acc,
+              scanned,
+              reducer
             )
         end
     end
@@ -248,7 +264,10 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
   defp keyspace_logical_key(key), do: CompoundKey.extract_redis_key(key)
 
   defp keyspace_row_matches?(row, filters) do
-    internal_ok? = filters.include_internal or not row.internal?
+    internal_ok? =
+      not InternalKey.reserved?(row.physical_key) and
+        (filters.include_internal or not row.internal?)
+
     prefix_ok? = filters.prefix == "" or String.starts_with?(row.key, filters.prefix)
     internal_ok? and prefix_ok?
   end

@@ -76,6 +76,7 @@ if config_env() == :prod do
          value -> String.to_integer(value)
        end),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
+    health_probe_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PROBE_PORT", "6381")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
     shard_count:
       (
@@ -304,11 +305,73 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   # Security
   # ---------------------------------------------------------------------------
+  positive_integer_env = fn name, default ->
+    case Integer.parse(System.get_env(name, Integer.to_string(default))) do
+      {value, ""} when value > 0 -> value
+      _other -> raise "#{name} must be a positive integer"
+    end
+  end
+
+  dashboard_cookie_secure =
+    case System.get_env("FERRICSTORE_DASHBOARD_COOKIE_SECURE", "auto")
+         |> String.trim()
+         |> String.downcase() do
+      "auto" -> :auto
+      value when value in ["1", "true", "yes", "y", "on"] -> true
+      value when value in ["0", "false", "no", "n", "off"] -> false
+      _other -> raise "FERRICSTORE_DASHBOARD_COOKIE_SECURE must be auto, true, or false"
+    end
+
+  dashboard_allowed_origins =
+    System.get_env("FERRICSTORE_DASHBOARD_ALLOWED_ORIGINS", "")
+    |> String.split([",", " "], trim: true)
+
+  dashboard_trusted_proxies =
+    System.get_env("FERRICSTORE_DASHBOARD_TRUSTED_PROXIES", "")
+    |> String.split([",", " "], trim: true)
+
+  Enum.each(dashboard_trusted_proxies, fn entry ->
+    {address, prefix} =
+      case String.split(entry, "/", parts: 2) do
+        [address] -> {address, nil}
+        [address, prefix] -> {address, prefix}
+      end
+
+    parsed_address =
+      case :inet.parse_address(String.to_charlist(address)) do
+        {:ok, parsed} -> parsed
+        _other -> raise "FERRICSTORE_DASHBOARD_TRUSTED_PROXIES contains invalid address #{entry}"
+      end
+
+    if prefix do
+      max_prefix = if tuple_size(parsed_address) == 4, do: 32, else: 128
+
+      case Integer.parse(prefix) do
+        {value, ""} when value >= 0 and value <= max_prefix -> :ok
+        _other -> raise "FERRICSTORE_DASHBOARD_TRUSTED_PROXIES contains invalid CIDR #{entry}"
+      end
+    end
+  end)
+
   config :ferricstore,
     protected_mode: boolean_env.("FERRICSTORE_PROTECTED_MODE", true),
     maxclients: String.to_integer(System.get_env("FERRICSTORE_MAXCLIENTS", "10000")),
     audit_log_enabled: boolean_env.("FERRICSTORE_AUDIT_LOG", false),
-    acl_auto_save: boolean_env.("FERRICSTORE_ACL_AUTO_SAVE", false)
+    acl_auto_save: boolean_env.("FERRICSTORE_ACL_AUTO_SAVE", false),
+    dashboard_remote_access: boolean_env.("FERRICSTORE_DASHBOARD_REMOTE_ACCESS", false),
+    dashboard_allow_insecure_http:
+      boolean_env.("FERRICSTORE_DASHBOARD_ALLOW_INSECURE_HTTP", false),
+    dashboard_trust_proxy_headers:
+      boolean_env.("FERRICSTORE_DASHBOARD_TRUST_PROXY_HEADERS", false),
+    dashboard_trusted_proxies: dashboard_trusted_proxies,
+    dashboard_cookie_secure: dashboard_cookie_secure,
+    dashboard_allowed_origins: dashboard_allowed_origins,
+    auth_rate_limit_max_attempts:
+      positive_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_MAX_ATTEMPTS", 10),
+    auth_rate_limit_window_ms:
+      positive_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_WINDOW_MS", 60_000),
+    auth_rate_limit_max_entries:
+      positive_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_MAX_ENTRIES", 10_000)
 
   # ---------------------------------------------------------------------------
   # Connection

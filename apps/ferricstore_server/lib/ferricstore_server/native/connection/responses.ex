@@ -23,14 +23,25 @@ defmodule FerricstoreServer.Native.Connection.Responses do
     Codec.encode_command_response_frames(opcode, lane_id, request_id, status, value,
       compression: state.compression,
       compact_flow_responses: state.compact_flow_responses,
-      chunk_bytes: state.response_chunk_bytes
+      chunk_bytes: response_chunk_bytes(state)
     )
   end
 
   def encode_event(state, opcode, value) do
     Codec.encode_response_frames(opcode, 0, 0, :ok, value,
       compression: state.compression,
-      chunk_bytes: state.response_chunk_bytes
+      chunk_bytes: response_chunk_bytes(state)
+    )
+  end
+
+  defp response_chunk_bytes(state) do
+    max_frame_bytes =
+      Map.get(state, :max_frame_bytes) ||
+        Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024)
+
+    Codec.effective_response_chunk_bytes(
+      Map.get(state, :response_chunk_bytes, 0),
+      max_frame_bytes
     )
   end
 

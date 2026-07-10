@@ -253,6 +253,48 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     [{state_index_key, record.id, updated_score}]
     |> maybe_add_due_index_entry(record, partition_key)
     |> maybe_add_running_index_entries(record, partition_key)
+    |> maybe_add_active_timeout_entry(record)
+    |> maybe_add_terminal_retention_entry(record)
+  end
+
+  defp maybe_add_active_timeout_entry(entries, record) do
+    case {Map.get(record, :state), Map.get(record, :created_at_ms),
+          Map.get(record, :max_active_ms)} do
+      {flow_state, created_at_ms, max_active_ms}
+      when is_integer(created_at_ms) and is_integer(max_active_ms) and max_active_ms > 0 ->
+        if LMDB.terminal_state?(flow_state) do
+          entries
+        else
+          state_key = Flow.Keys.state_key(record.id, Map.get(record, :partition_key))
+
+          [
+            {Flow.Keys.active_timeout_index_key(), state_key, created_at_ms + max_active_ms}
+            | entries
+          ]
+        end
+
+      _other ->
+        entries
+    end
+  end
+
+  defp maybe_add_terminal_retention_entry(entries, record) do
+    case {Map.get(record, :state), Map.get(record, :terminal_retention_until_ms)} do
+      {flow_state, retention_until_ms} when is_integer(retention_until_ms) ->
+        if LMDB.terminal_state?(flow_state) do
+          state_key = Flow.Keys.state_key(record.id, Map.get(record, :partition_key))
+
+          [
+            {Flow.Keys.terminal_retention_index_key(), state_key, retention_until_ms}
+            | entries
+          ]
+        else
+          entries
+        end
+
+      _other ->
+        entries
+    end
   end
 
   defp maybe_add_due_index_entry(

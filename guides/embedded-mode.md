@@ -39,7 +39,7 @@ config :ferricstore, :eviction_policy, :volatile_lru
 
 In embedded mode, these options are **not used** and can be omitted:
 - `:native_port` (no TCP listener)
-- `:health_port` (no HTTP endpoint)
+- `:health_port`, `:health_probe_port` (no HTTP endpoints)
 - `:native_tls_port`, `:native_tls_cert_file`, `:native_tls_key_file` (no TLS)
 - `:native_response_chunk_bytes` and response coalescing settings (no TCP sends)
 
@@ -803,7 +803,8 @@ defmodule MyApp.Sessions do
     data_dir: "/data/sessions",
     shard_count: 2,
     max_memory_bytes: 512_000_000,
-    eviction_policy: :volatile_lfu
+    eviction_policy: :volatile_lfu,
+    flow_retention_sweeper: [interval_ms: 60_000, limit: 500]
 end
 
 defmodule MyApp.PageCache do
@@ -847,6 +848,11 @@ MyApp.Sessions.set("sess:abc", session_data, ttl: :timer.minutes(30))
 MyApp.PageCache.set("page:/home", html, ttl: :timer.hours(1))
 {:ok, nil} = MyApp.PageCache.get("sess:abc")  # not found here
 ```
+
+Each named instance starts its own Flow retention sweeper. Configure it with
+`:flow_retention_sweeper` when the default interval or batch limit is not
+appropriate. The sweeper enforces `max_active_ms` and terminal retention only
+against that instance's shards.
 
 ### When to Use Multiple Instances
 

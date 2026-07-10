@@ -28,14 +28,23 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
         _ -> 0
       end
 
+    global_metrics =
+      if Map.get(storage, :restricted, false) or Map.get(projection, :restricted, false) do
+        ""
+      else
+        """
+        #{render_flow_stat_card("Disk", format_bytes(Map.get(storage, :total_disk_bytes, 0)), "current data directory footprint")}
+        #{render_flow_stat_card("Query Index Lag", pending, "cold query-index work pending before cleanup")}
+        """
+      end
+
     """
     <div class="section-title">Sample Preview <span class="badge badge-idle">sampled #{format_number(Map.get(data, :total_sampled, 0))} / #{format_number(Map.get(data, :sample_limit, @flow_dashboard_sample_limit))}</span></div>
     <div class="flow-card-grid">
-      #{render_flow_stat_card("Eligible", Map.get(data, :eligible_sampled, 0), "expired terminal Flow records in sample")}
-      #{render_flow_stat_card("Terminal", Map.get(data, :terminal_sampled, 0), "completed, failed, or cancelled records")}
-      #{render_flow_stat_card("Active", Map.get(data, :active_sampled, 0), "not eligible for retention cleanup")}
-      #{render_flow_stat_card("Disk", format_bytes(Map.get(storage, :total_disk_bytes, 0)), "current data directory footprint")}
-      #{render_flow_stat_card("Query Index Lag", pending, "cold query-index work pending before cleanup")}
+      #{render_flow_stat_card("Active Timeouts", Map.get(data, :active_timeout_eligible_sampled, 0), "overdue active Flow records that cleanup will fail")}
+      #{render_flow_stat_card("Terminal Deletes", Map.get(data, :terminal_eligible_sampled, 0), "expired terminal Flow records that cleanup will remove")}
+      #{render_flow_stat_card("Active Sample", Map.get(data, :active_sampled, 0), "all non-terminal Flow records in the sample")}
+      #{global_metrics}
     </div>
     """
   end
@@ -46,28 +55,28 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
     """
     <div id="flow-retention-maintenance" class="flow-policy-panel">
-      <div class="section-title">Retention Cleanup #{info_icon("Deletes terminal Flow state, history, and generated values whose retention TTL has expired. Active Flow records are not touched.")}</div>
+      <div class="section-title">Retention Cleanup #{info_icon("Fails overdue active Flow records whose max active runtime expired, then deletes terminal Flow data whose retention TTL expired.")}</div>
       #{flash}
       <div class="pressure-alert level-warning">
         <div class="pressure-details">
-          Dry Run only previews sampled eligible records. Run Cleanup executes the durable FLOW.RETENTION_CLEANUP command globally with the supplied limit. A sampled preview of zero is not proof that global cleanup will remove zero rows.
+          Dry Run only previews sampled eligible records. Run Cleanup fails overdue active Flow records before deleting expired terminal Flow records, and executes globally with the supplied per-shard limit. A sampled preview of zero is not proof that global cleanup will change zero records.
         </div>
       </div>
       <form class="flow-policy-form" action="/dashboard/flow/retention" method="post">
         <div class="flow-policy-grid">
           <label class="flow-policy-field">
             <span>Limit</span>
-            <input class="flow-search-input mono" type="number" name="limit" min="1" max="#{@flow_dashboard_retention_max_limit}" value="#{limit}" required title="Maximum terminal Flow records to clean in this command">
+            <input class="flow-search-input mono" type="number" name="limit" min="1" max="#{@flow_dashboard_retention_max_limit}" value="#{limit}" required title="Maximum active timeouts and terminal deletions to process per shard">
           </label>
         </div>
         <label class="flow-check-label" title="Required before the destructive cleanup command is accepted.">
           <input type="checkbox" name="confirm_cleanup" value="true">
-          I reviewed the sample preview and understand cleanup is global.
+          I understand cleanup is global and may fail active Flow records whose max active runtime expired.
         </label>
         <div class="flow-filter-note">Requires +FLOW.RETENTION_CLEANUP. Use Dry Run first; cleanup is intentionally separate from the sampled preview.</div>
         <div class="flow-policy-actions">
-          <button class="flow-search-button" type="submit" name="action" value="dry_run" title="Preview eligible terminal records without deleting data">Dry Run</button>
-          <button class="flow-search-button flow-danger-button" type="submit" name="action" value="cleanup" title="Run durable retention cleanup now">Run Cleanup</button>
+          <button class="flow-search-button" type="submit" name="action" value="dry_run" title="Preview active timeouts and terminal deletions without changing data">Dry Run</button>
+          <button class="flow-search-button flow-danger-button" type="submit" name="action" value="cleanup" title="Fail overdue active records and run durable terminal cleanup now">Run Cleanup</button>
         </div>
       </form>
     </div>
@@ -80,7 +89,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
   def render_flow_retention_flash(%{kind: :ok, counts: counts, limit: limit}) do
     message =
-      "Cleanup completed: #{format_number(Map.get(counts, :flows, 0))} flows, " <>
+      "Cleanup completed: #{format_number(Map.get(counts, :active_timeouts, 0))} active flows timed out, " <>
+        "#{format_number(Map.get(counts, :flows, 0))} terminal flows, " <>
         "#{format_number(Map.get(counts, :history, 0))} history rows, " <>
         "#{format_number(Map.get(counts, :values, 0))} values removed (limit #{format_number(limit)})."
 
@@ -104,7 +114,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
         scope: "Flow data",
         mutability: "read-write",
         notes:
-          "Deletes expired terminal Flow records, their durable history, generated payload/result/error values, and shared value links."
+          "Fails active Flow records past max_active_ms, then deletes expired terminal records, durable history, generated values, and shared value links under one limit."
       },
       %{
         command: "FLOW.POLICY.SET <type> RETENTION_TTL_MS <ms>",
@@ -118,8 +128,50 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
 
   def render_flow_retention_candidates(data) do
     candidates = Map.get(data, :candidates, [])
+    active_timeout_candidates = Map.get(data, :active_timeout_candidates, [])
     now_ms = Map.get(data, :now_ms, System.system_time(:millisecond))
 
+    render_flow_active_timeout_candidates(active_timeout_candidates, now_ms) <>
+      render_flow_terminal_retention_candidates(candidates, now_ms)
+  end
+
+  defp render_flow_active_timeout_candidates(candidates, now_ms) do
+    rows =
+      case candidates do
+        [] ->
+          """
+          <tr>
+            <td colspan="8" class="c-muted">No overdue active Flow records found in the dashboard sample.</td>
+          </tr>
+          """
+
+        _ ->
+          Enum.map_join(candidates, "\n", &render_flow_active_timeout_candidate_row(&1, now_ms))
+      end
+
+    """
+    <div class="section-title">Sampled Active Timeouts <span class="badge badge-idle">#{format_number(length(candidates))}</span></div>
+    <table>
+      <thead>
+        <tr>
+          <th>Flow</th>
+          <th>Type</th>
+          <th>State</th>
+          <th>Partition</th>
+          <th>Max Active</th>
+          <th>Timeout At</th>
+          <th>Overdue For</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    """
+  end
+
+  defp render_flow_terminal_retention_candidates(candidates, now_ms) do
     rows =
       case candidates do
         [] ->
@@ -134,7 +186,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
       end
 
     """
-    <div class="section-title">Sampled Cleanup Candidates <span class="badge badge-idle">#{format_number(length(candidates))}</span></div>
+    <div class="section-title">Sampled Terminal Deletions <span class="badge badge-idle">#{format_number(length(candidates))}</span></div>
     <table>
       <thead>
         <tr>
@@ -152,6 +204,29 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowRetention do
         #{rows}
       </tbody>
     </table>
+    """
+  end
+
+  defp render_flow_active_timeout_candidate_row(record, now_ms) do
+    id = flow_record_id(record)
+    partition_key = flow_record_partition_key(record)
+    created_at_ms = flow_record_created_at_ms(record)
+    max_active_ms = flow_first_integer(record, [:max_active_ms]) || 0
+    timeout_at_ms = created_at_ms + max_active_ms
+    overdue_for_ms = max(now_ms - timeout_at_ms, 0)
+    href = flow_detail_path(id, flow_detail_url_partition_key(partition_key))
+
+    """
+    <tr>
+      <td><a class="mono" href="#{href}">#{escape(id)}</a></td>
+      <td class="mono">#{escape(flow_record_type(record))}</td>
+      <td><span class="flow-pill">#{escape(flow_record_state(record))}</span></td>
+      <td class="mono">#{escape(partition_key || "-")}</td>
+      <td>#{format_duration_ms(max_active_ms)}</td>
+      <td>#{format_timestamp_ms_or_dash(timeout_at_ms)}</td>
+      <td>#{format_duration_ms(overdue_for_ms)}</td>
+      <td>#{format_timestamp_ms_or_dash(created_at_ms)}</td>
+    </tr>
     """
   end
 

@@ -44,240 +44,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
-      defp flow_retention_value_refs_used_by_lmdb_histories_after(
-             _path,
-             _prefix,
-             _after_key,
-             limit,
-             _state,
-             _owner_record,
-             target_refs,
-             _referenced
-           )
-           when limit <= 0,
-           do: target_refs
-
-      defp flow_retention_value_refs_used_by_lmdb_histories_after(
-             path,
-             prefix,
-             after_key,
-             limit,
-             state,
-             owner_record,
-             target_refs,
-             referenced
-           ) do
-        case Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, after_key, limit) do
-          {:ok, []} ->
-            referenced
-
-          {:ok, entries} ->
-            referenced =
-              Enum.reduce_while(entries, referenced, fn {_history_index_key, lmdb_value}, acc ->
-                acc =
-                  case Ferricstore.Flow.LMDB.decode_history_index_value(lmdb_value) do
-                    {:ok, {_event_id, _event_ms, _expire_at_ms, compound_key}} ->
-                      if flow_retention_same_flow_history_key?(compound_key, owner_record) do
-                        acc
-                      else
-                        state
-                        |> flow_retention_history_value_from_lmdb(lmdb_value)
-                        |> flow_retention_value_refs_used_by_history_value(target_refs, acc)
-                      end
-
-                    :error ->
-                      acc
-                  end
-
-                if MapSet.size(acc) >= MapSet.size(target_refs),
-                  do: {:halt, acc},
-                  else: {:cont, acc}
-              end)
-
-            cond do
-              MapSet.size(referenced) >= MapSet.size(target_refs) ->
-                referenced
-
-              length(entries) < limit ->
-                referenced
-
-              true ->
-                {last_key, _last_value} = List.last(entries)
-
-                flow_retention_value_refs_used_by_lmdb_histories_after(
-                  path,
-                  prefix,
-                  last_key,
-                  limit,
-                  state,
-                  owner_record,
-                  target_refs,
-                  referenced
-                )
-            end
-
-          {:error, _reason} ->
-            MapSet.union(referenced, target_refs)
-        end
-      end
-
-      defp flow_retention_value_refs_used_by_history_value(value, target_refs, referenced)
-           when is_binary(value) do
-        value
-        |> flow_retention_all_history_value_refs()
-        |> Enum.reduce(referenced, fn ref, acc ->
-          if MapSet.member?(target_refs, ref), do: MapSet.put(acc, ref), else: acc
-        end)
-      end
-
-      defp flow_retention_value_refs_used_by_history_value(_value, _target_refs, referenced),
-        do: referenced
-
-      defp flow_retention_same_flow_history_key?(key, owner_record) when is_binary(key) do
-        with id when is_binary(id) <- flow_retention_record_id(owner_record) do
-          partition_key = flow_retention_record_partition_key(owner_record)
-          history_key = FlowKeys.history_key(id, partition_key)
-          history_index_prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
-
-          key == history_key or
-            String.starts_with?(key, history_key <> <<0>>) or
-            String.starts_with?(key, "X:" <> history_key <> <<0>>) or
-            String.starts_with?(key, history_index_prefix)
-        else
-          _other -> false
-        end
-      end
-
-      defp flow_retention_same_flow_history_key?(_key, _owner_record), do: false
-
-      defp flow_retention_same_flow_record?(record, owner_record) do
-        flow_retention_record_id(record) == flow_retention_record_id(owner_record) and
-          flow_retention_record_partition_key(record) ==
-            flow_retention_record_partition_key(owner_record)
-      end
-
-      defp flow_retention_record_id(record) when is_map(record),
-        do: Map.get(record, :id) || Map.get(record, "id")
-
-      defp flow_retention_record_id(_record), do: nil
-
-      defp flow_retention_record_partition_key(record) when is_map(record),
-        do: Map.get(record, :partition_key) || Map.get(record, "partition_key")
-
-      defp flow_retention_record_partition_key(_record), do: nil
-
       defp flow_retention_keydir_available?(state) do
         :ets.info(state.ets, :name) != :undefined
       rescue
         ArgumentError -> false
-      end
-
-      defp flow_retention_shared_value_links(state, record) do
-        prefix =
-          FlowKeys.shared_value_link_prefix(
-            Map.fetch!(record, :id),
-            Map.get(record, :partition_key)
-          )
-
-        prefix_len = byte_size(prefix)
-
-        match_spec = [
-          {{:"$1", :_, :_, :_, :_, :_, :_},
-           [
-             {:andalso, {:is_binary, :"$1"},
-              {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-           ], [:"$1"]}
-        ]
-
-        keys = safe_ets_select(state.ets, match_spec)
-        values = sm_store_batch_get(state, keys, &sm_file_path/2)
-
-        keys
-        |> Enum.zip(values)
-        |> Enum.flat_map(fn
-          {key, ref} when is_binary(ref) and ref != "" -> [{key, ref}]
-          _other -> []
-        end)
-      end
-
-      defp flow_retention_owned_value_keys_page(state, %{id: id} = record) when is_binary(id) do
-        limit = flow_retention_value_lmdb_scan_limit()
-
-        {keys, complete?} =
-          record
-          |> flow_retention_owned_value_prefixes()
-          |> flow_retention_owned_value_keys_page_prefixes(state, record, limit, [])
-
-        keys =
-          keys
-          |> Enum.filter(&flow_retention_owned_value_ref?(&1, record))
-          |> Enum.uniq()
-
-        {keys, complete?}
-      end
-
-      defp flow_retention_owned_value_keys_page(_state, _record), do: {[], true}
-
-      defp flow_retention_owned_value_keys_page_prefixes(
-             _prefixes,
-             _state,
-             _record,
-             remaining,
-             acc
-           )
-           when remaining <= 0,
-           do: {Enum.reverse(acc), false}
-
-      defp flow_retention_owned_value_keys_page_prefixes([], _state, _record, _remaining, acc),
-        do: {Enum.reverse(acc), true}
-
-      defp flow_retention_owned_value_keys_page_prefixes(
-             [prefix | rest],
-             state,
-             record,
-             remaining,
-             acc
-           ) do
-        {ets_keys, ets_complete?} = flow_retention_keys_with_prefix_page(state, prefix, remaining)
-        remaining = remaining - length(ets_keys)
-        acc = Enum.reverse(ets_keys, acc)
-
-        cond do
-          not ets_complete? ->
-            {Enum.reverse(acc), false}
-
-          remaining <= 0 ->
-            {Enum.reverse(acc), false}
-
-          true ->
-            {lmdb_keys, lmdb_complete?} =
-              flow_retention_lmdb_keys_with_prefix_page(state, prefix, remaining)
-
-            remaining = remaining - length(lmdb_keys)
-            acc = Enum.reverse(lmdb_keys, acc)
-
-            cond do
-              not lmdb_complete? ->
-                {Enum.reverse(acc), false}
-
-              remaining <= 0 and rest != [] ->
-                {Enum.reverse(acc), false}
-
-              true ->
-                flow_retention_owned_value_keys_page_prefixes(rest, state, record, remaining, acc)
-            end
-        end
-      end
-
-      defp flow_retention_owned_value_prefixes(%{id: id} = record) do
-        partition_key = Map.get(record, :partition_key)
-
-        [:payload, :result, :error, :shared]
-        |> Enum.map(fn kind ->
-          key = FlowKeys.value_key(id, kind, 0, partition_key)
-          flow_retention_owned_value_ref_prefix(key)
-        end)
       end
 
       defp flow_retention_keys_with_prefix_page(_state, prefix, _limit)
@@ -302,38 +72,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         safe_ets_select_page(state.ets, match_spec, limit)
       end
 
-      defp flow_retention_lmdb_keys_with_prefix_page(_state, prefix, _limit)
-           when not is_binary(prefix),
-           do: {[], true}
-
-      defp flow_retention_lmdb_keys_with_prefix_page(_state, _prefix, limit) when limit <= 0,
-        do: {[], false}
-
-      defp flow_retention_lmdb_keys_with_prefix_page(state, prefix, limit) do
-        path = flow_lmdb_record_path(state)
-
-        case flow_retention_lmdb_projection_state(state) do
-          :available ->
-            case Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, <<>>, limit) do
-              {:ok, entries} ->
-                keys = Enum.map(entries, fn {key, _value} -> key end)
-                {keys, length(entries) < limit}
-
-              {:error, _reason} ->
-                {[], false}
-            end
-
-          :empty ->
-            {[], true}
-
-          :unavailable ->
-            {[], false}
-        end
-      end
-
-      defp flow_retention_history_entries(state, history_key) do
-        limit = flow_retention_history_lmdb_scan_limit()
-
+      defp flow_retention_history_entries(state, history_key, limit)
+           when is_integer(limit) and limit > 0 do
         with {:ok, lmdb_entries, lmdb_complete?} <-
                flow_retention_lmdb_history_entries(state, history_key, limit) do
           remaining = max(limit - length(lmdb_entries), 0)
@@ -347,7 +87,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
             true ->
               {ets_entries, ets_complete?} =
-                flow_retention_ets_history_entries(state, history_key, remaining)
+                flow_retention_native_history_entries(state, history_key, remaining)
 
               entries =
                 (lmdb_entries ++ ets_entries)
@@ -357,6 +97,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
           end
         end
       end
+
+      defp flow_retention_history_entries(_state, _history_key, _limit),
+        do: {:ok, [], false}
 
       defp flow_retention_lmdb_history_entries(_state, _history_key, remaining)
            when remaining <= 0,
@@ -405,30 +148,113 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         end)
       end
 
-      defp flow_retention_ets_history_entries(state, history_key, limit) do
-        prefix = "X:" <> history_key <> <<0>>
-        prefix_len = byte_size(prefix)
+      defp flow_retention_native_history_entries(state, history_key, limit) do
+        case flow_native_index(state) do
+          nil ->
+            {[], false}
 
-        match_spec = [
-          {{:"$1", :_, :_, :_, :_, :_, :_},
-           [
-             {:andalso, {:is_binary, :"$1"},
-              {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-           ], [:"$1"]}
-        ]
+          native ->
+            entries =
+              native
+              |> NativeFlowIndex.range_slice(history_key, :neg_inf, :inf, false, 0, limit)
+              |> Enum.map(fn {event_id, _event_ms} ->
+                {"X:" <> history_key <> <<0>> <> event_id, event_id}
+              end)
 
-        {ets_keys, ets_complete?} =
-          state.ets
-          |> safe_ets_select_page(match_spec, limit)
+            {entries, NativeFlowIndex.count_all(native, history_key) <= length(entries)}
+        end
+      end
 
-        ets_entries =
-          ets_keys
-          |> Enum.map(fn key ->
-            {key, binary_part(key, prefix_len, byte_size(key) - prefix_len)}
-          end)
+      defp flow_retention_cleanup_member_entries(state, %{id: id} = record, limit)
+           when is_binary(id) and is_integer(limit) and limit >= 0 do
+        index_key =
+          FlowKeys.retention_cleanup_index_key(id, Map.get(record, :partition_key))
 
-        {ets_entries, ets_complete?}
+        case flow_native_index(state) do
+          nil ->
+            {[], false}
+
+          native ->
+            member_keys =
+              if limit == 0 do
+                []
+              else
+                native
+                |> NativeFlowIndex.range_slice(index_key, :neg_inf, :inf, false, 0, limit)
+                |> Enum.map(fn {member_key, _score} -> member_key end)
+              end
+
+            entries =
+              member_keys
+              |> Enum.zip(sm_store_batch_get(state, member_keys, &sm_file_path/2))
+              |> Enum.map(fn
+                {member_key, value} when is_binary(value) ->
+                  case Ferricstore.Flow.RetentionCleanupMember.decode(value) do
+                    {:ok, {^index_key, owned_key}} ->
+                      if flow_retention_cleanup_owned_key?(owned_key, record),
+                        do: {member_key, owned_key},
+                        else: {member_key, nil}
+
+                    _invalid ->
+                      {member_key, nil}
+                  end
+
+                {member_key, _missing} ->
+                  {member_key, nil}
+              end)
+
+            {entries, NativeFlowIndex.count_all(native, index_key) <= length(member_keys)}
+        end
+      end
+
+      defp flow_retention_cleanup_member_entries(_state, _record, _limit), do: {[], false}
+
+      defp flow_retention_cleanup_owned_key?(owned_key, %{id: id} = record)
+           when is_binary(owned_key) and is_binary(id) do
+        partition_key = Map.get(record, :partition_key)
+
+        flow_retention_owned_value_ref?(owned_key, record) or
+          String.starts_with?(
+            owned_key,
+            FlowKeys.shared_value_link_prefix(id, partition_key)
+          ) or
+          String.starts_with?(
+            owned_key,
+            FlowKeys.governance_effect_key_prefix(id, partition_key)
+          ) or
+          String.starts_with?(
+            owned_key,
+            FlowKeys.governance_ledger_key_prefix(id, partition_key)
+          ) or
+          owned_key == FlowKeys.governance_ledger_index_key(id, partition_key)
+      end
+
+      defp flow_retention_cleanup_owned_key?(_owned_key, _record), do: false
+
+      defp flow_retention_cleanup_members_complete?(state, index_key, entries) do
+        member_keys = Enum.map(entries, &elem(&1, 0))
+
+        case flow_native_index(state) do
+          nil ->
+            false
+
+          native ->
+            NativeFlowIndex.count_all(native, index_key) == length(member_keys) and
+              Enum.all?(member_keys, fn member_key ->
+                flow_index_score_of(state, index_key, member_key) != :miss
+              end)
+        end
+      end
+
+      defp flow_retention_delete_cleanup_members(_state, _index_key, []), do: :ok
+
+      defp flow_retention_delete_cleanup_members(state, index_key, entries) do
+        member_keys = Enum.map(entries, &elem(&1, 0))
+
+        with :ok <- flow_index_delete_members(state, index_key, member_keys),
+             {:ok, _deleted} <- flow_retention_delete_keys(state, member_keys) do
+          :ok
+        end
       end
 
       defp flow_retention_delete_history_index(_state, _history_key, []), do: :ok
@@ -448,18 +274,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         end
       end
 
-      defp flow_retention_history_lmdb_scan_limit do
-        :ferricstore
-        |> Application.get_env(:flow_lmdb_history_cleanup_scan_limit, 100_000)
-        |> flow_retention_positive_integer(100_000)
-      end
-
-      defp flow_retention_value_lmdb_scan_limit do
-        :ferricstore
-        |> Application.get_env(:flow_lmdb_value_cleanup_scan_limit, 100_000)
-        |> flow_retention_positive_integer(100_000)
-      end
-
       defp flow_retention_positive_integer(value, _default) when is_integer(value) and value > 0,
         do: value
 
@@ -471,6 +285,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
       end
 
       defp flow_retention_positive_integer(_value, default), do: default
+
+      defp flow_retention_history_lmdb_scan_limit do
+        :ferricstore
+        |> Application.get_env(:flow_lmdb_history_cleanup_scan_limit, 100_000)
+        |> flow_retention_positive_integer(100_000)
+      end
+
+      defp flow_retention_value_lmdb_scan_limit do
+        :ferricstore
+        |> Application.get_env(:flow_lmdb_value_cleanup_scan_limit, 100_000)
+        |> flow_retention_positive_integer(100_000)
+      end
 
       defp flow_event_ms(event_id) when is_binary(event_id) do
         event_id
@@ -490,94 +316,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
       defp flow_retention_history_entry_event_id({_key, event_id}), do: event_id
       defp flow_retention_history_entry_event_id({_key, event_id, _lmdb_value}), do: event_id
-
-      defp flow_retention_history_values(state, entries) do
-        keys = Enum.map(entries, &flow_retention_history_entry_key/1)
-        hot_values = sm_store_batch_get(state, keys, &sm_file_path/2)
-
-        entries
-        |> Enum.zip(hot_values)
-        |> Enum.map(fn
-          {_entry, value} when is_binary(value) ->
-            value
-
-          {{_key, _event_id, lmdb_value}, _missing} ->
-            flow_retention_history_value_from_lmdb(state, lmdb_value)
-
-          {_entry, _missing} ->
-            nil
-        end)
-      end
-
-      defp flow_retention_history_value_from_lmdb(state, lmdb_value) when is_binary(lmdb_value) do
-        case Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value) do
-          {:ok,
-           {_event_id, _event_ms, _expire_at_ms, _compound_key,
-            {:flow_history, _file_id} = file_ref, offset, _value_size}}
-          when is_integer(offset) and offset >= 0 ->
-            case Ferricstore.Flow.HistoryProjector.read_value(
-                   state.shard_data_path,
-                   file_ref,
-                   offset
-                 ) do
-              {:ok, value} when is_binary(value) -> value
-              _ -> nil
-            end
-
-          _ ->
-            nil
-        end
-      end
-
-      defp flow_retention_history_value_from_lmdb(_state, _lmdb_value), do: nil
-
-      defp flow_retention_all_history_value_refs(value) when is_binary(value) do
-        value
-        |> Flow.decode_history_fields()
-        |> flow_history_fields_to_map()
-        |> flow_retention_all_record_value_refs()
-      end
-
-      defp flow_retention_all_history_value_refs(_value), do: []
-
-      defp flow_retention_record_value_refs(record) do
-        record_refs =
-          [:payload_ref, :result_ref, :error_ref]
-          |> Enum.flat_map(fn key ->
-            string_key = Atom.to_string(key)
-            [Map.get(record, key), Map.get(record, string_key)]
-          end)
-
-        named_refs =
-          record
-          |> flow_retention_named_value_refs()
-          |> Map.values()
-          |> Enum.map(&Map.get(&1, :ref))
-
-        (record_refs ++ named_refs)
-        |> Enum.filter(&flow_retention_owned_value_ref?(&1, record))
-      end
-
-      defp flow_retention_all_record_value_refs(record) when is_map(record) do
-        direct_refs =
-          [:payload_ref, :result_ref, :error_ref]
-          |> Enum.flat_map(fn key ->
-            string_key = Atom.to_string(key)
-            [Map.get(record, key), Map.get(record, string_key)]
-          end)
-
-        named_refs =
-          record
-          |> flow_retention_named_value_refs()
-          |> Map.values()
-          |> Enum.map(&Map.get(&1, :ref))
-
-        (direct_refs ++ named_refs)
-        |> Enum.filter(&is_binary/1)
-        |> Enum.uniq()
-      end
-
-      defp flow_retention_all_record_value_refs(_record), do: []
 
       defp flow_retention_owned_value_ref?(ref, record) when is_binary(ref) and is_map(record) do
         with id when is_binary(id) <- Map.get(record, :id) || Map.get(record, "id") do
@@ -655,35 +393,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
           {parsed, ""} when parsed >= 0 -> true
           _other -> false
         end
-      end
-
-      defp flow_retention_named_value_refs(%{} = record) do
-        cond do
-          Map.has_key?(record, :value_refs) ->
-            flow_record_value_refs(record)
-
-          refs = Map.get(record, "value_refs") ->
-            flow_normalize_value_refs(refs)
-
-          true ->
-            %{}
-        end
-      end
-
-      defp flow_retention_named_value_refs(_record), do: %{}
-
-      defp flow_retention_history_value_refs(values) do
-        values
-        |> Enum.flat_map(fn
-          value when is_binary(value) ->
-            value
-            |> Flow.decode_history_fields()
-            |> flow_history_fields_to_map()
-            |> flow_retention_record_value_refs()
-
-          _other ->
-            []
-        end)
       end
 
       defp flow_owned_value_ref?(<<"f:{", rest::binary>>),

@@ -629,41 +629,175 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              claimed_count,
              claimed
            ) do
-        {plans, stale_due_ids} =
-          flow_plan_claim_candidates(
+        with {:ok, candidates, deferred_timeout_records} <-
+               flow_timeout_expired_claim_candidates(
+                 state,
+                 due_key,
+                 partition_key,
+                 candidates,
+                 now_ms
+               ) do
+          {plans, stale_due_ids} =
+            flow_plan_claim_candidates(
+              state,
+              due_key,
+              type,
+              expected_state,
+              worker,
+              lease_ms,
+              now_ms,
+              partition_key,
+              candidates,
+              remaining
+            )
+
+          phase_meta =
+            state
+            |> flow_claim_due_phase_meta(partition_key, nil, remaining)
+            |> Map.merge(%{candidates: length(candidates)})
+
+          case flow_apply_claim_batch(
+                 state,
+                 due_key,
+                 plans,
+                 stale_due_ids,
+                 deferred_timeout_records,
+                 now_ms
+               ) do
+            :ok ->
+              next_claimed =
+                flow_claim_due_phase(:return_assemble, phase_meta, fn ->
+                  Enum.reduce(plans, claimed, fn plan, acc ->
+                    {_record, next} = flow_claim_plan_pair(plan)
+                    [next | acc]
+                  end)
+                end)
+
+              {claimed_count + length(plans), next_claimed}
+
+            {:error, _reason} = error ->
+              error
+          end
+        end
+      end
+
+      defp flow_timeout_expired_claim_candidates(
+             state,
+             due_key,
+             partition_key,
+             candidates,
+             now_ms
+           ) do
+        records = flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
+
+        if Enum.any?(records, fn
+             record when is_map(record) -> flow_active_timeout_expired_record?(record, now_ms)
+             _other -> false
+           end) do
+          flow_timeout_expired_claim_candidates_fresh(
             state,
             due_key,
-            type,
-            expected_state,
-            worker,
-            lease_ms,
-            now_ms,
             partition_key,
             candidates,
-            remaining
+            now_ms
           )
+        else
+          {:ok, candidates, []}
+        end
+      end
 
-        phase_meta =
-          state
-          |> flow_claim_due_phase_meta(partition_key, nil, remaining)
-          |> Map.merge(%{candidates: length(candidates)})
+      defp flow_timeout_expired_claim_candidates_fresh(
+             state,
+             due_key,
+             partition_key,
+             candidates,
+             now_ms
+           ) do
+        candidates
+        |> Enum.reduce_while({:ok, [], []}, fn candidate, {:ok, active_acc, deferred_acc} ->
+          record =
+            case flow_read_claim_candidate_records(
+                   state,
+                   partition_key,
+                   due_key,
+                   [candidate]
+                 ) do
+              [record] -> record
+              _other -> nil
+            end
 
-        case flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
-          :ok ->
-            next_claimed =
-              flow_claim_due_phase(:return_assemble, phase_meta, fn ->
-                Enum.reduce(plans, claimed, fn plan, acc ->
-                  {_record, next} = flow_claim_plan_pair(plan)
-                  [next | acc]
-                end)
-              end)
-
-            {claimed_count + length(plans), next_claimed}
+          case flow_maybe_timeout_claim_record(state, record, now_ms) do
+            :active -> {:cont, {:ok, [candidate | active_acc], deferred_acc}}
+            :deferred -> {:cont, {:ok, active_acc, [record | deferred_acc]}}
+            :timed_out -> {:cont, {:ok, active_acc, deferred_acc}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, active_candidates, deferred_timeout_records} ->
+            {:ok, Enum.reverse(active_candidates), Enum.reverse(deferred_timeout_records)}
 
           {:error, _reason} = error ->
             error
         end
       end
+
+      defp flow_maybe_timeout_claim_record(state, record, now_ms) when is_map(record) do
+        if flow_active_timeout_expired_record?(record, now_ms) and
+             flow_claim_timeout_requires_cross_shard?(state, record) do
+          :deferred
+        else
+          flow_maybe_timeout_active_record(state, record, now_ms)
+        end
+      end
+
+      defp flow_maybe_timeout_claim_record(_state, _record, _now_ms), do: :active
+
+      defp flow_claim_timeout_requires_cross_shard?(
+             state,
+             %{parent_flow_id: parent_id} = record
+           )
+           when is_binary(parent_id) and parent_id != "" do
+        not cross_shard_pending_active?() and flow_parent_on_other_shard?(state, record)
+      end
+
+      defp flow_claim_timeout_requires_cross_shard?(_state, _record), do: false
+
+      defp flow_parent_on_other_shard?(
+             state,
+             %{id: child_id, parent_flow_id: parent_id} = record
+           )
+           when is_binary(child_id) and is_binary(parent_id) and parent_id != "" do
+        child_partition_key = Map.get(record, :partition_key)
+        parent_partition_key = Map.get(record, :parent_partition_key) || child_partition_key
+        child_key = FlowKeys.state_key(child_id, child_partition_key)
+        parent_key = FlowKeys.state_key(parent_id, parent_partition_key)
+
+        case cross_shard_instance_ctx(state) do
+          %{shard_count: shard_count} = ctx when is_integer(shard_count) and shard_count > 0 ->
+            Router.shard_for(ctx, child_key) != Router.shard_for(ctx, parent_key)
+
+          _other ->
+            false
+        end
+      end
+
+      defp flow_parent_on_other_shard?(_state, _record), do: false
+
+      defp flow_maybe_timeout_active_record(state, record, now_ms) when is_map(record) do
+        if flow_active_timeout_expired_record?(record, now_ms) do
+          state_key = FlowKeys.state_key(Map.fetch!(record, :id), Map.get(record, :partition_key))
+
+          case flow_active_timeout_record(state, state_key, record, now_ms) do
+            {:ok, _counts} -> :timed_out
+            {:error, _reason} = error -> error
+          end
+        else
+          :active
+        end
+      end
+
+      defp flow_maybe_timeout_active_record(_state, _record, _now_ms), do: :active
 
       defp flow_plan_claim_candidates(
              state,

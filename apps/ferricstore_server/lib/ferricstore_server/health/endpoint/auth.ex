@@ -17,11 +17,22 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
           | {:unauthorized, binary()}
           | {:redirect_login, binary()}
           | {:forbidden, RouteRequirements.requirement(), binary()}
-  def authorize_request(_method, "/dashboard/login", _peer, _headers), do: :ok
-  def authorize_request(_method, "/dashboard/login?" <> _query, _peer, _headers), do: :ok
-  def authorize_request("POST", "/dashboard/logout", _peer, _headers), do: :ok
-
   def authorize_request(method, path, peer, headers) do
+    if RouteRequirements.dashboard_path?(path) and not dashboard_transport_allowed?(peer, headers) do
+      {:forbidden, {"DASHBOARD", []}, dashboard_transport_error(peer, headers)}
+    else
+      do_authorize_request(method, path, peer, headers)
+    end
+  end
+
+  defp do_authorize_request(_method, "/dashboard/login", _peer, _headers), do: :ok
+
+  defp do_authorize_request(_method, "/dashboard/login?" <> _query, _peer, _headers),
+    do: :ok
+
+  defp do_authorize_request("POST", "/dashboard/logout", _peer, _headers), do: :ok
+
+  defp do_authorize_request(method, path, peer, headers) do
     cond do
       RouteRequirements.dashboard_path?(path) ->
         authorize_dashboard_request(method, path, peer, headers)
@@ -32,6 +43,16 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
       true ->
         :ok
     end
+  end
+
+  @doc false
+  @spec dashboard_transport_allowed?(term(), map()) :: boolean()
+  def dashboard_transport_allowed?(peer, headers) do
+    (loopback_peer?(peer) and not Session.trusted_proxy_peer?(peer) and
+       not Map.has_key?(headers, "x-forwarded-proto")) or
+      (Application.get_env(:ferricstore, :dashboard_remote_access, false) == true and
+         (Session.secure_request?(peer, headers) or
+            Application.get_env(:ferricstore, :dashboard_allow_insecure_http, false) == true))
   end
 
   @spec authorize_command_request(term(), map(), RouteRequirements.requirement(), :html | :json) ::
@@ -143,4 +164,18 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
   defp loopback_peer?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
   defp loopback_peer?({0, 0, 0, 0, 0, 65_535, 32_512, _}), do: true
   defp loopback_peer?(_peer), do: false
+
+  defp dashboard_transport_error(peer, headers) do
+    if not loopback_peer?(peer) and
+         Application.get_env(:ferricstore, :dashboard_remote_access, false) != true do
+      "remote dashboard access is disabled"
+    else
+      if Session.secure_request?(peer, headers) or
+           Application.get_env(:ferricstore, :dashboard_allow_insecure_http, false) == true do
+        "remote dashboard access is disabled"
+      else
+        "secure dashboard transport is required"
+      end
+    end
+  end
 end

@@ -181,9 +181,23 @@ defmodule Ferricstore.Flow.LMDB do
     clear_cached_terminal_counts_for_path(path)
 
     if Ferricstore.FS.dir?(path) do
-      NIF.lmdb_clear(path, map_size())
+      with :ok <- release_detached_env(path) do
+        NIF.lmdb_clear(path, map_size())
+      end
     else
       :ok
+    end
+  end
+
+  defp release_detached_env(path) do
+    if env_present?(path) do
+      :ok
+    else
+      case NIF.lmdb_release(path) do
+        {:ok, _released} -> :ok
+        {:busy, count} -> {:error, {:lmdb_env_busy, count}}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
@@ -232,6 +246,24 @@ defmodule Ferricstore.Flow.LMDB do
     if Ferricstore.FS.dir?(path),
       do: NIF.lmdb_prefix_entries_after(path, prefix, after_key, limit, map_size()),
       else: {:ok, []}
+  end
+
+  def prefix_entries_after_bounded(path, prefix, after_key, max_items, max_bytes)
+      when is_binary(path) and is_binary(prefix) and is_binary(after_key) and
+             is_integer(max_items) and max_items >= 0 and is_integer(max_bytes) and
+             max_bytes >= 0 do
+    if Ferricstore.FS.dir?(path) do
+      NIF.lmdb_prefix_entries_after_bounded(
+        path,
+        prefix,
+        after_key,
+        max_items,
+        max_bytes,
+        map_size()
+      )
+    else
+      {:ok, []}
+    end
   end
 
   def prefix_entries(path, prefix, limit, false), do: prefix_entries(path, prefix, limit)
@@ -325,6 +357,59 @@ defmodule Ferricstore.Flow.LMDB do
       reverse_value
     }
   end
+
+  def active_timeout_index_put_ops(state_key, record, expire_at_ms, reverse_value \\ nil)
+      when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) do
+    cleanup_ops =
+      record
+      |> active_non_timeout_index_delete_ops()
+      |> Kernel.++(active_timeout_previous_index_delete_ops(state_key, reverse_value))
+      |> Enum.uniq()
+
+    case active_timeout_deadline(record) do
+      {:ok, deadline_ms} ->
+        index_key = Ferricstore.Flow.Keys.active_timeout_index_key()
+        active_key = active_index_key(index_key, state_key, deadline_ms)
+
+        value =
+          encode_active_index_value(
+            index_key,
+            state_key,
+            deadline_ms,
+            expire_at_ms,
+            state_key
+          )
+
+        reverse_value = encode_active_index_reverse_value([active_key])
+
+        cleanup_ops ++
+          [
+            {:put, active_by_state_key_key(state_key), reverse_value},
+            {:put, active_key, value}
+          ]
+
+      :none ->
+        cleanup_ops ++ [{:delete, active_by_state_key_key(state_key)}]
+    end
+  end
+
+  defp active_non_timeout_index_delete_ops(record) do
+    timeout_index_key = Ferricstore.Flow.Keys.active_timeout_index_key()
+
+    record
+    |> active_flow_index_entries()
+    |> Enum.reject(fn {index_key, _id, _score} -> index_key == timeout_index_key end)
+    |> Enum.map(fn {index_key, id, score} ->
+      {:delete, active_index_key(index_key, id, score)}
+    end)
+  end
+
+  defp active_timeout_previous_index_delete_ops(state_key, reverse_value)
+       when is_binary(reverse_value) do
+    active_index_delete_ops_from_reverse(state_key, reverse_value)
+  end
+
+  defp active_timeout_previous_index_delete_ops(_state_key, _reverse_value), do: []
 
   def active_index_delete_ops_from_reverse(state_key, reverse_value) when is_binary(state_key) do
     reverse_key = active_by_state_key_key(state_key)
@@ -594,6 +679,9 @@ defmodule Ferricstore.Flow.LMDB do
   def expired_terminal_state_keys(path, now_ms, limit),
     do: Ferricstore.Flow.LMDB.Retention.expired_terminal_state_keys(path, now_ms, limit)
 
+  def expired_active_timeout_state_keys(path, now_ms, limit),
+    do: Ferricstore.Flow.LMDB.Retention.expired_active_timeout_state_keys(path, now_ms, limit)
+
   def sweep_expired_history(path, now_ms, limit),
     do: Ferricstore.Flow.LMDB.Retention.sweep_expired_history(path, now_ms, limit)
 
@@ -656,6 +744,35 @@ defmodule Ferricstore.Flow.LMDB do
     [{state_index_key, id, updated_score}]
     |> maybe_add_due_active_entry(record, partition_key)
     |> maybe_add_running_active_entries(record, partition_key)
+    |> maybe_add_active_timeout_entry(record)
+  end
+
+  defp maybe_add_active_timeout_entry(entries, record) do
+    case active_timeout_deadline(record) do
+      {:ok, deadline_ms} ->
+        state_key =
+          Ferricstore.Flow.Keys.state_key(record.id, Map.get(record, :partition_key))
+
+        [
+          {Ferricstore.Flow.Keys.active_timeout_index_key(), state_key, deadline_ms}
+          | entries
+        ]
+
+      :none ->
+        entries
+    end
+  end
+
+  defp active_timeout_deadline(record) do
+    case {Map.get(record, :state), Map.get(record, :created_at_ms),
+          Map.get(record, :max_active_ms)} do
+      {flow_state, created_at_ms, max_active_ms}
+      when is_integer(created_at_ms) and is_integer(max_active_ms) and max_active_ms > 0 ->
+        if terminal_state?(flow_state), do: :none, else: {:ok, created_at_ms + max_active_ms}
+
+      _other ->
+        :none
+    end
   end
 
   defp maybe_add_due_active_entry(

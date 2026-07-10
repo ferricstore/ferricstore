@@ -438,8 +438,68 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
 
         with :ok <-
                flow_index_put_new_lifecycle_members(state, state_index_key, [{id, updated_score}]),
-             :ok <- flow_metadata_index_put(state, record, updated_score) do
+             :ok <- flow_metadata_index_put(state, record, updated_score),
+             :ok <- flow_active_timeout_index_put(state, record),
+             :ok <- flow_terminal_retention_index_put(state, record) do
           flow_running_index_put(state, record)
+        end
+      end
+
+      defp flow_active_timeout_index_put(state, record) do
+        flow_index_put_new_entries(state, flow_active_timeout_index_entries(record))
+      end
+
+      defp flow_active_timeout_index_entries(record) do
+        case flow_active_timeout_index_entry(record) do
+          nil -> []
+          entry -> [entry]
+        end
+      end
+
+      defp flow_active_timeout_index_entry(record) do
+        case {Map.get(record, :state), Map.get(record, :created_at_ms),
+              Map.get(record, :max_active_ms), Map.get(record, :id)} do
+          {flow_state, created_at_ms, max_active_ms, id}
+          when is_binary(id) and is_integer(created_at_ms) and is_integer(max_active_ms) and
+                 max_active_ms > 0 ->
+            if Ferricstore.Flow.LMDB.terminal_state?(flow_state) do
+              nil
+            else
+              state_key = FlowKeys.state_key(id, Map.get(record, :partition_key))
+
+              {FlowKeys.active_timeout_index_key(), state_key, created_at_ms + max_active_ms}
+            end
+
+          _other ->
+            nil
+        end
+      end
+
+      defp flow_terminal_retention_index_put(state, record) do
+        flow_index_put_new_entries(state, flow_terminal_retention_index_entries(record))
+      end
+
+      defp flow_terminal_retention_index_entries(record) do
+        case flow_terminal_retention_index_entry(record) do
+          nil -> []
+          entry -> [entry]
+        end
+      end
+
+      defp flow_terminal_retention_index_entry(record) do
+        case {Map.get(record, :state), Map.get(record, :terminal_retention_until_ms),
+              Map.get(record, :id)} do
+          {flow_state, retention_until_ms, id}
+          when is_binary(id) and is_integer(retention_until_ms) ->
+            if Ferricstore.Flow.LMDB.terminal_state?(flow_state) do
+              state_key = FlowKeys.state_key(id, Map.get(record, :partition_key))
+              {FlowKeys.terminal_retention_index_key(), state_key, retention_until_ms}
+            else
+              nil
+            end
+
+          _other ->
+            nil
         end
       end
 

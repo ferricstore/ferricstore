@@ -66,6 +66,34 @@ defmodule Ferricstore.Flow.LMDB.Retention do
 
   def expired_terminal_state_keys(_path, _now_ms, _limit), do: {:ok, []}
 
+  def expired_active_timeout_state_keys(path, now_ms, limit)
+      when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
+    index_key = Ferricstore.Flow.Keys.active_timeout_index_key()
+
+    with {:ok, entries} <-
+           Access.prefix_entries(path, IndexCodec.active_index_prefix(index_key), limit) do
+      state_keys =
+        Enum.reduce_while(entries, [], fn {_key, value}, acc ->
+          case IndexCodec.decode_active_index_value(value) do
+            {:ok, {^index_key, _member, deadline_ms, _expire_at_ms, state_key}}
+            when deadline_ms <= now_ms ->
+              {:cont, [state_key | acc]}
+
+            {:ok, {^index_key, _member, deadline_ms, _expire_at_ms, _state_key}}
+            when deadline_ms > now_ms ->
+              {:halt, acc}
+
+            _invalid ->
+              {:cont, acc}
+          end
+        end)
+
+      {:ok, Enum.reverse(state_keys)}
+    end
+  end
+
+  def expired_active_timeout_state_keys(_path, _now_ms, _limit), do: {:ok, []}
+
   def sweep_expired_history(path, now_ms, limit)
       when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
     with {:ok, entries} <-

@@ -42,6 +42,8 @@ defmodule FerricStore do
     * `:eviction_policy` — `:volatile_lfu` | `:allkeys_lfu` | `:noeviction` (default: `:volatile_lfu`)
     * `:hot_cache_max_value_size` — max value size for ETS caching (default: 65536)
     * `:read_sample_rate` — LFU sampling rate (default: 100)
+    * `:flow_retention_sweeper` — per-instance Flow timeout/retention sweeper
+      options such as `:initial_delay_ms`, `:interval_ms`, and `:limit`
   """
 
   defmacro __using__(opts) do
@@ -202,175 +204,245 @@ defmodule FerricStore do
   alias FerricStore.API.Streams, as: StreamsAPI
   alias FerricStore.API.Strings, as: StringsAPI
   alias FerricStore.API.System, as: SystemAPI
+  import FerricStore.API.PublicAccess, only: [defguardeddelegate: 2]
 
   @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | write_error()
-  defdelegate set(key, value, opts \\ []), to: StringsAPI
-  defdelegate get(key, opts \\ []), to: StringsAPI
-  defdelegate del(key), to: StringsAPI
-  defdelegate incr(key), to: StringsAPI
-  defdelegate decr(key), to: StringsAPI
-  defdelegate decr_by(key, amount), to: StringsAPI
-  defdelegate incr_by(key, amount), to: StringsAPI
-  defdelegate incr_by_float(key, amount), to: StringsAPI
-  defdelegate mget(keys), to: StringsAPI
-  defdelegate mset(pairs), to: StringsAPI
-  defdelegate append(key, suffix), to: StringsAPI
-  defdelegate strlen(key), to: StringsAPI
-  defdelegate getset(key, value), to: StringsAPI
-  defdelegate getdel(key), to: StringsAPI
-  defdelegate getex(key, opts \\ []), to: StringsAPI
-  defdelegate setnx(key, value), to: StringsAPI
-  defdelegate setex(key, seconds, value), to: StringsAPI
-  defdelegate psetex(key, milliseconds, value), to: StringsAPI
-  defdelegate getrange(key, start, stop), to: StringsAPI
-  defdelegate setrange(key, offset, value), to: StringsAPI
-  defdelegate msetnx(pairs), to: StringsAPI
+  defguardeddelegate(set(key, value, opts \\ []), to: StringsAPI, keys: [key])
+  defguardeddelegate(get(key, opts \\ []), to: StringsAPI, keys: [key])
+  defguardeddelegate(del(key), to: StringsAPI, keys: FerricStore.API.PublicAccess.keys(key))
+  defguardeddelegate(incr(key), to: StringsAPI, keys: [key])
+  defguardeddelegate(decr(key), to: StringsAPI, keys: [key])
+  defguardeddelegate(decr_by(key, amount), to: StringsAPI, keys: [key])
+  defguardeddelegate(incr_by(key, amount), to: StringsAPI, keys: [key])
+  defguardeddelegate(incr_by_float(key, amount), to: StringsAPI, keys: [key])
+  defguardeddelegate(mget(keys), to: StringsAPI, keys: keys)
 
-  defdelegate hset(key, fields), to: HashesAPI
-  defdelegate hget(key, field), to: HashesAPI
-  defdelegate hgetall(key), to: HashesAPI
-  defdelegate hdel(key, fields), to: HashesAPI
-  defdelegate hexists(key, field), to: HashesAPI
-  defdelegate hlen(key), to: HashesAPI
-  defdelegate hkeys(key), to: HashesAPI
-  defdelegate hvals(key), to: HashesAPI
-  defdelegate hmget(key, fields), to: HashesAPI
-  defdelegate hincrby(key, field, amount), to: HashesAPI
-  defdelegate hincrbyfloat(key, field, amount), to: HashesAPI
-  defdelegate hsetnx(key, field, value), to: HashesAPI
-  defdelegate hrandfield(key, count \\ nil), to: HashesAPI
-  defdelegate hstrlen(key, field), to: HashesAPI
+  defguardeddelegate(mset(pairs),
+    to: StringsAPI,
+    keys: FerricStore.API.PublicAccess.pair_keys(pairs)
+  )
 
-  defdelegate lpush(key, elements), to: ListsAPI
-  defdelegate rpush(key, elements), to: ListsAPI
-  defdelegate lpop(key, count \\ 1), to: ListsAPI
-  defdelegate rpop(key, count \\ 1), to: ListsAPI
-  defdelegate lrange(key, start, stop), to: ListsAPI
-  defdelegate llen(key), to: ListsAPI
-  defdelegate lindex(key, index), to: ListsAPI
-  defdelegate lset(key, index, element), to: ListsAPI
-  defdelegate lrem(key, count, element), to: ListsAPI
-  defdelegate linsert(key, direction, pivot, element), to: ListsAPI
-  defdelegate lmove(source, destination, from_dir, to_dir), to: ListsAPI
-  defdelegate lpos(key, element, opts \\ []), to: ListsAPI
+  defguardeddelegate(append(key, suffix), to: StringsAPI, keys: [key])
+  defguardeddelegate(strlen(key), to: StringsAPI, keys: [key])
+  defguardeddelegate(getset(key, value), to: StringsAPI, keys: [key])
+  defguardeddelegate(getdel(key), to: StringsAPI, keys: [key])
+  defguardeddelegate(getex(key, opts \\ []), to: StringsAPI, keys: [key])
+  defguardeddelegate(setnx(key, value), to: StringsAPI, keys: [key])
+  defguardeddelegate(setex(key, seconds, value), to: StringsAPI, keys: [key])
+  defguardeddelegate(psetex(key, milliseconds, value), to: StringsAPI, keys: [key])
+  defguardeddelegate(getrange(key, start, stop), to: StringsAPI, keys: [key])
+  defguardeddelegate(setrange(key, offset, value), to: StringsAPI, keys: [key])
 
-  defdelegate sadd(key, members), to: SetsAPI
-  defdelegate srem(key, members), to: SetsAPI
-  defdelegate smembers(key), to: SetsAPI
-  defdelegate sismember(key, member), to: SetsAPI
-  defdelegate scard(key), to: SetsAPI
-  defdelegate smismember(key, members), to: SetsAPI
-  defdelegate srandmember(key, count \\ nil), to: SetsAPI
-  defdelegate spop(key, count \\ nil), to: SetsAPI
-  defdelegate sdiff(keys), to: SetsAPI
-  defdelegate sinter(keys), to: SetsAPI
-  defdelegate sunion(keys), to: SetsAPI
-  defdelegate sdiffstore(destination, keys), to: SetsAPI
-  defdelegate sinterstore(destination, keys), to: SetsAPI
-  defdelegate sunionstore(destination, keys), to: SetsAPI
-  defdelegate sintercard(keys, opts \\ []), to: SetsAPI
+  defguardeddelegate(msetnx(pairs),
+    to: StringsAPI,
+    keys: FerricStore.API.PublicAccess.pair_keys(pairs)
+  )
 
-  defdelegate zadd(key, score_member_pairs), to: SortedSetsAPI
-  defdelegate zrange(key, start, stop, opts \\ []), to: SortedSetsAPI
-  defdelegate zscore(key, member), to: SortedSetsAPI
-  defdelegate zcard(key), to: SortedSetsAPI
-  defdelegate zrem(key, members), to: SortedSetsAPI
-  defdelegate zrank(key, member), to: SortedSetsAPI
-  defdelegate zrevrank(key, member), to: SortedSetsAPI
-  defdelegate zrangebyscore(key, min, max, opts \\ []), to: SortedSetsAPI
-  defdelegate zcount(key, min, max), to: SortedSetsAPI
-  defdelegate zincrby(key, increment, member), to: SortedSetsAPI
-  defdelegate zrandmember(key, count \\ nil), to: SortedSetsAPI
-  defdelegate zpopmin(key, count \\ 1), to: SortedSetsAPI
-  defdelegate zpopmax(key, count \\ 1), to: SortedSetsAPI
-  defdelegate zmscore(key, members), to: SortedSetsAPI
+  defguardeddelegate(hset(key, fields), to: HashesAPI, keys: [key])
+  defguardeddelegate(hget(key, field), to: HashesAPI, keys: [key])
+  defguardeddelegate(hgetall(key), to: HashesAPI, keys: [key])
+  defguardeddelegate(hdel(key, fields), to: HashesAPI, keys: [key])
+  defguardeddelegate(hexists(key, field), to: HashesAPI, keys: [key])
+  defguardeddelegate(hlen(key), to: HashesAPI, keys: [key])
+  defguardeddelegate(hkeys(key), to: HashesAPI, keys: [key])
+  defguardeddelegate(hvals(key), to: HashesAPI, keys: [key])
+  defguardeddelegate(hmget(key, fields), to: HashesAPI, keys: [key])
+  defguardeddelegate(hincrby(key, field, amount), to: HashesAPI, keys: [key])
+  defguardeddelegate(hincrbyfloat(key, field, amount), to: HashesAPI, keys: [key])
+  defguardeddelegate(hsetnx(key, field, value), to: HashesAPI, keys: [key])
+  defguardeddelegate(hrandfield(key, count \\ nil), to: HashesAPI, keys: [key])
+  defguardeddelegate(hstrlen(key, field), to: HashesAPI, keys: [key])
 
-  defdelegate cas(key, expected, new_value, opts \\ []), to: GenericAPI
-  defdelegate fetch_or_compute(key, opts), to: GenericAPI
-  defdelegate fetch_or_compute_result(key, value, opts), to: GenericAPI
-  defdelegate exists(key), to: GenericAPI
+  defguardeddelegate(lpush(key, elements), to: ListsAPI, keys: [key])
+  defguardeddelegate(rpush(key, elements), to: ListsAPI, keys: [key])
+  defguardeddelegate(lpop(key, count \\ 1), to: ListsAPI, keys: [key])
+  defguardeddelegate(rpop(key, count \\ 1), to: ListsAPI, keys: [key])
+  defguardeddelegate(lrange(key, start, stop), to: ListsAPI, keys: [key])
+  defguardeddelegate(llen(key), to: ListsAPI, keys: [key])
+  defguardeddelegate(lindex(key, index), to: ListsAPI, keys: [key])
+  defguardeddelegate(lset(key, index, element), to: ListsAPI, keys: [key])
+  defguardeddelegate(lrem(key, count, element), to: ListsAPI, keys: [key])
+  defguardeddelegate(linsert(key, direction, pivot, element), to: ListsAPI, keys: [key])
+
+  defguardeddelegate(lmove(source, destination, from_dir, to_dir),
+    to: ListsAPI,
+    keys: [source, destination]
+  )
+
+  defguardeddelegate(lpos(key, element, opts \\ []), to: ListsAPI, keys: [key])
+
+  defguardeddelegate(sadd(key, members), to: SetsAPI, keys: [key])
+  defguardeddelegate(srem(key, members), to: SetsAPI, keys: [key])
+  defguardeddelegate(smembers(key), to: SetsAPI, keys: [key])
+  defguardeddelegate(sismember(key, member), to: SetsAPI, keys: [key])
+  defguardeddelegate(scard(key), to: SetsAPI, keys: [key])
+  defguardeddelegate(smismember(key, members), to: SetsAPI, keys: [key])
+  defguardeddelegate(srandmember(key, count \\ nil), to: SetsAPI, keys: [key])
+  defguardeddelegate(spop(key, count \\ nil), to: SetsAPI, keys: [key])
+  defguardeddelegate(sdiff(keys), to: SetsAPI, keys: keys)
+  defguardeddelegate(sinter(keys), to: SetsAPI, keys: keys)
+  defguardeddelegate(sunion(keys), to: SetsAPI, keys: keys)
+
+  defguardeddelegate(sdiffstore(destination, keys),
+    to: SetsAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(destination, keys)
+  )
+
+  defguardeddelegate(sinterstore(destination, keys),
+    to: SetsAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(destination, keys)
+  )
+
+  defguardeddelegate(sunionstore(destination, keys),
+    to: SetsAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(destination, keys)
+  )
+
+  defguardeddelegate(sintercard(keys, opts \\ []), to: SetsAPI, keys: keys)
+
+  defguardeddelegate(zadd(key, score_member_pairs), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zrange(key, start, stop, opts \\ []), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zscore(key, member), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zcard(key), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zrem(key, members), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zrank(key, member), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zrevrank(key, member), to: SortedSetsAPI, keys: [key])
+
+  defguardeddelegate(zrangebyscore(key, min, max, opts \\ []),
+    to: SortedSetsAPI,
+    keys: [key]
+  )
+
+  defguardeddelegate(zcount(key, min, max), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zincrby(key, increment, member), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zrandmember(key, count \\ nil), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zpopmin(key, count \\ 1), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zpopmax(key, count \\ 1), to: SortedSetsAPI, keys: [key])
+  defguardeddelegate(zmscore(key, members), to: SortedSetsAPI, keys: [key])
+
+  defguardeddelegate(cas(key, expected, new_value, opts \\ []), to: GenericAPI, keys: [key])
+  defguardeddelegate(fetch_or_compute(key, opts), to: GenericAPI, keys: [key])
+
+  defguardeddelegate(fetch_or_compute_result(key, value, opts),
+    to: GenericAPI,
+    keys: [key]
+  )
+
+  defguardeddelegate(exists(key), to: GenericAPI, keys: [key])
   defdelegate keys(pattern \\ "*"), to: GenericAPI
   defdelegate dbsize(), to: GenericAPI
   defdelegate flushdb(), to: GenericAPI
-  defdelegate expire(key, ttl_ms), to: GenericAPI
-  defdelegate ttl(key), to: GenericAPI
-  defdelegate copy(source, destination, opts \\ []), to: GenericAPI
-  defdelegate rename(source, destination), to: GenericAPI
-  defdelegate renamenx(source, destination), to: GenericAPI
-  defdelegate type(key), to: GenericAPI
+  defguardeddelegate(expire(key, ttl_ms), to: GenericAPI, keys: [key])
+  defguardeddelegate(ttl(key), to: GenericAPI, keys: [key])
+
+  defguardeddelegate(copy(source, destination, opts \\ []),
+    to: GenericAPI,
+    keys: [source, destination]
+  )
+
+  defguardeddelegate(rename(source, destination),
+    to: GenericAPI,
+    keys: [source, destination]
+  )
+
+  defguardeddelegate(renamenx(source, destination),
+    to: GenericAPI,
+    keys: [source, destination]
+  )
+
+  defguardeddelegate(type(key), to: GenericAPI, keys: [key])
   defdelegate randomkey(), to: GenericAPI
-  defdelegate persist(key), to: GenericAPI
-  defdelegate pexpire(key, ttl_ms), to: GenericAPI
-  defdelegate expireat(key, unix_ts_seconds), to: GenericAPI
-  defdelegate pexpireat(key, unix_ts_ms), to: GenericAPI
-  defdelegate expiretime(key), to: GenericAPI
-  defdelegate pexpiretime(key), to: GenericAPI
-  defdelegate pttl(key), to: GenericAPI
+  defguardeddelegate(persist(key), to: GenericAPI, keys: [key])
+  defguardeddelegate(pexpire(key, ttl_ms), to: GenericAPI, keys: [key])
+  defguardeddelegate(expireat(key, unix_ts_seconds), to: GenericAPI, keys: [key])
+  defguardeddelegate(pexpireat(key, unix_ts_ms), to: GenericAPI, keys: [key])
+  defguardeddelegate(expiretime(key), to: GenericAPI, keys: [key])
+  defguardeddelegate(pexpiretime(key), to: GenericAPI, keys: [key])
+  defguardeddelegate(pttl(key), to: GenericAPI, keys: [key])
 
-  defdelegate setbit(key, offset, bit_value), to: BitmapAPI
-  defdelegate getbit(key, offset), to: BitmapAPI
-  defdelegate bitcount(key, opts \\ []), to: BitmapAPI
-  defdelegate bitop(op, dest_key, source_keys), to: BitmapAPI
-  defdelegate bitpos(key, bit_value, opts \\ []), to: BitmapAPI
+  defguardeddelegate(setbit(key, offset, bit_value), to: BitmapAPI, keys: [key])
+  defguardeddelegate(getbit(key, offset), to: BitmapAPI, keys: [key])
+  defguardeddelegate(bitcount(key, opts \\ []), to: BitmapAPI, keys: [key])
 
-  defdelegate xadd(key, fields), to: StreamsAPI
-  defdelegate xlen(key), to: StreamsAPI
-  defdelegate xrange(key, start, stop, opts \\ []), to: StreamsAPI
-  defdelegate xrevrange(key, stop, start, opts \\ []), to: StreamsAPI
-  defdelegate xtrim(key, opts), to: StreamsAPI
+  defguardeddelegate(bitop(op, dest_key, source_keys),
+    to: BitmapAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(dest_key, source_keys)
+  )
 
-  defdelegate bf_reserve(key, error_rate, capacity), to: ProbabilisticAPI
-  defdelegate bf_add(key, element), to: ProbabilisticAPI
-  defdelegate bf_madd(key, elements), to: ProbabilisticAPI
-  defdelegate bf_exists(key, element), to: ProbabilisticAPI
-  defdelegate bf_mexists(key, elements), to: ProbabilisticAPI
-  defdelegate bf_card(key), to: ProbabilisticAPI
-  defdelegate bf_info(key), to: ProbabilisticAPI
-  defdelegate cf_reserve(key, capacity), to: ProbabilisticAPI
-  defdelegate cf_add(key, element), to: ProbabilisticAPI
-  defdelegate cf_addnx(key, element), to: ProbabilisticAPI
-  defdelegate cf_del(key, element), to: ProbabilisticAPI
-  defdelegate cf_exists(key, element), to: ProbabilisticAPI
-  defdelegate cf_mexists(key, elements), to: ProbabilisticAPI
-  defdelegate cf_count(key, element), to: ProbabilisticAPI
-  defdelegate cf_info(key), to: ProbabilisticAPI
-  defdelegate cms_initbydim(key, width, depth), to: ProbabilisticAPI
-  defdelegate cms_initbyprob(key, error, probability), to: ProbabilisticAPI
-  defdelegate cms_incrby(key, pairs), to: ProbabilisticAPI
-  defdelegate cms_query(key, elements), to: ProbabilisticAPI
-  defdelegate cms_info(key), to: ProbabilisticAPI
-  defdelegate topk_reserve(key, k), to: ProbabilisticAPI
-  defdelegate topk_add(key, elements), to: ProbabilisticAPI
-  defdelegate topk_query(key, elements), to: ProbabilisticAPI
-  defdelegate topk_list(key), to: ProbabilisticAPI
-  defdelegate topk_info(key), to: ProbabilisticAPI
-  defdelegate tdigest_create(key), to: ProbabilisticAPI
-  defdelegate tdigest_add(key, values), to: ProbabilisticAPI
-  defdelegate tdigest_quantile(key, quantiles), to: ProbabilisticAPI
-  defdelegate tdigest_cdf(key, values), to: ProbabilisticAPI
-  defdelegate tdigest_min(key), to: ProbabilisticAPI
-  defdelegate tdigest_max(key), to: ProbabilisticAPI
-  defdelegate tdigest_info(key), to: ProbabilisticAPI
-  defdelegate tdigest_reset(key), to: ProbabilisticAPI
-  defdelegate tdigest_trimmed_mean(key, lo, hi), to: ProbabilisticAPI
-  defdelegate tdigest_rank(key, values), to: ProbabilisticAPI
-  defdelegate tdigest_revrank(key, values), to: ProbabilisticAPI
-  defdelegate tdigest_byrank(key, ranks), to: ProbabilisticAPI
-  defdelegate tdigest_byrevrank(key, ranks), to: ProbabilisticAPI
+  defguardeddelegate(bitpos(key, bit_value, opts \\ []), to: BitmapAPI, keys: [key])
 
-  defdelegate geoadd(key, members), to: GeoAPI
-  defdelegate geodist(key, member1, member2, unit \\ "m"), to: GeoAPI
-  defdelegate geohash(key, members), to: GeoAPI
-  defdelegate geopos(key, members), to: GeoAPI
+  defguardeddelegate(xadd(key, fields), to: StreamsAPI, keys: [key])
+  defguardeddelegate(xlen(key), to: StreamsAPI, keys: [key])
+  defguardeddelegate(xrange(key, start, stop, opts \\ []), to: StreamsAPI, keys: [key])
+  defguardeddelegate(xrevrange(key, stop, start, opts \\ []), to: StreamsAPI, keys: [key])
+  defguardeddelegate(xtrim(key, opts), to: StreamsAPI, keys: [key])
 
-  defdelegate lock(key, owner, ttl_ms), to: LocksAPI
-  defdelegate unlock(key, owner), to: LocksAPI
-  defdelegate extend(key, owner, ttl_ms), to: LocksAPI
-  defdelegate ratelimit_add(key, window_ms, max, count \\ 1), to: LocksAPI
+  defguardeddelegate(bf_reserve(key, error_rate, capacity), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(bf_add(key, element), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(bf_madd(key, elements), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(bf_exists(key, element), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(bf_mexists(key, elements), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(bf_card(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(bf_info(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_reserve(key, capacity), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_add(key, element), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_addnx(key, element), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_del(key, element), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_exists(key, element), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_mexists(key, elements), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_count(key, element), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cf_info(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cms_initbydim(key, width, depth), to: ProbabilisticAPI, keys: [key])
 
-  defdelegate pfadd(key, elements), to: HyperLogLogAPI
-  defdelegate pfcount(keys), to: HyperLogLogAPI
-  defdelegate pfmerge(dest_key, source_keys), to: HyperLogLogAPI
+  defguardeddelegate(cms_initbyprob(key, error, probability),
+    to: ProbabilisticAPI,
+    keys: [key]
+  )
+
+  defguardeddelegate(cms_incrby(key, pairs), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cms_query(key, elements), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(cms_info(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(topk_reserve(key, k), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(topk_add(key, elements), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(topk_query(key, elements), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(topk_list(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(topk_info(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_create(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_add(key, values), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_quantile(key, quantiles), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_cdf(key, values), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_min(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_max(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_info(key), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_reset(key), to: ProbabilisticAPI, keys: [key])
+
+  defguardeddelegate(tdigest_trimmed_mean(key, lo, hi),
+    to: ProbabilisticAPI,
+    keys: [key]
+  )
+
+  defguardeddelegate(tdigest_rank(key, values), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_revrank(key, values), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_byrank(key, ranks), to: ProbabilisticAPI, keys: [key])
+  defguardeddelegate(tdigest_byrevrank(key, ranks), to: ProbabilisticAPI, keys: [key])
+
+  defguardeddelegate(geoadd(key, members), to: GeoAPI, keys: [key])
+  defguardeddelegate(geodist(key, member1, member2, unit \\ "m"), to: GeoAPI, keys: [key])
+  defguardeddelegate(geohash(key, members), to: GeoAPI, keys: [key])
+  defguardeddelegate(geopos(key, members), to: GeoAPI, keys: [key])
+
+  defguardeddelegate(lock(key, owner, ttl_ms), to: LocksAPI, keys: [key])
+  defguardeddelegate(unlock(key, owner), to: LocksAPI, keys: [key])
+  defguardeddelegate(extend(key, owner, ttl_ms), to: LocksAPI, keys: [key])
+  defguardeddelegate(ratelimit_add(key, window_ms, max, count \\ 1), to: LocksAPI, keys: [key])
+
+  defguardeddelegate(pfadd(key, elements), to: HyperLogLogAPI, keys: [key])
+  defguardeddelegate(pfcount(keys), to: HyperLogLogAPI, keys: keys)
+
+  defguardeddelegate(pfmerge(dest_key, source_keys),
+    to: HyperLogLogAPI,
+    keys: FerricStore.API.PublicAccess.destination_keys(dest_key, source_keys)
+  )
 
   defdelegate multi(fun), to: SystemAPI
   defdelegate ping(), to: SystemAPI
@@ -378,10 +450,14 @@ defmodule FerricStore do
   @spec flushall() :: :ok | {:error, term()}
   defdelegate flushall(), to: SystemAPI
   defdelegate pipeline(fun), to: SystemAPI
-  defdelegate batch_get(keys), to: SystemAPI
+  defguardeddelegate(batch_get(keys), to: SystemAPI, keys: keys)
   defdelegate packed_batch_get(packed_keys), to: SystemAPI
-  @spec batch_set([{binary(), binary()}]) :: [:ok | write_error()]
-  defdelegate batch_set(kv_pairs), to: SystemAPI
+  @spec batch_set([{binary(), binary()}]) :: [:ok | write_error()] | write_error()
+  defguardeddelegate(batch_set(kv_pairs),
+    to: SystemAPI,
+    keys: FerricStore.API.PublicAccess.pair_keys(kv_pairs)
+  )
+
   # ---------------------------------------------------------------------------
   # Flow API
   # ---------------------------------------------------------------------------

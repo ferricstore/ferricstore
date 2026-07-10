@@ -3,12 +3,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @moduletag :global_state
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.AuthRateLimiter
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Commands
   alias FerricstoreServer.Native.Session
 
   @op_hello 0x0001
+  @op_auth 0x0002
   @op_route 0x0006
   @op_shards 0x0007
   @op_options 0x000B
@@ -16,9 +18,27 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_command_exec 0x0100
   @op_set 0x0102
   @op_flow_create 0x0201
+  @op_flow_get 0x0202
   @op_flow_claim_due 0x0203
+  @op_flow_value_put 0x020B
+  @op_flow_list 0x020E
+  @op_flow_create_many 0x020F
+  @op_flow_complete_many 0x0210
+  @op_flow_reclaim 0x0215
+  @op_flow_by_parent 0x0219
+  @op_flow_by_root 0x021A
+  @op_flow_by_correlation 0x021B
   @op_flow_policy_set 0x021E
+  @op_flow_spawn_children 0x0220
+  @op_flow_start_and_claim 0x0223
+  @op_flow_run_steps_many 0x0224
+  @op_flow_schedule_create 0x0225
+  @op_flow_schedule_delete 0x0227
+  @op_flow_schedule_fire 0x022A
+  @op_flow_stats 0x022D
   @op_flow_search 0x0230
+  @op_flow_approval_request 0x0246
+  @op_flow_approval_get 0x0249
   @op_flow_circuit_open 0x024A
   @op_flow_circuit_get 0x024C
   @op_flow_budget_reserve 0x024D
@@ -133,6 +153,16 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "GET" in opcode_names(payload)
     assert "SET" in opcode_names(payload)
     refute "GET.COMPACT" in opcode_names(payload)
+
+    for command <- [
+          "FLOW.CREATE",
+          "FLOW.CREATE_MANY",
+          "FLOW.POLICY.SET",
+          "FLOW.SPAWN_CHILDREN",
+          "FLOW.START_AND_CLAIM"
+        ] do
+      assert "max_active_ms" in payload.schemas[command]["fields"]
+    end
   end
 
   test "HELLO returns native route metadata only" do
@@ -165,6 +195,111 @@ defmodule FerricstoreServer.Native.CommandsTest do
     refute Map.has_key?(payload.route, :native_host)
     refute Map.has_key?(payload.route, :native_port)
     refute Map.has_key?(payload.route, :endpoint)
+  end
+
+  test "native AUTH does not reveal whether an ACL username exists" do
+    assert :ok = Acl.set_user("known_auth_user", ["on", ">secret"])
+
+    assert {:auth, known_error, _state} =
+             Commands.execute(
+               @op_auth,
+               %{"username" => "known_auth_user", "password" => "wrong"},
+               state()
+             )
+
+    assert {:auth, missing_error, _state} =
+             Commands.execute(
+               @op_auth,
+               %{"username" => "missing_auth_user", "password" => "wrong"},
+               state()
+             )
+
+    assert known_error == missing_error
+    assert known_error =~ "WRONGPASS"
+  end
+
+  test "native AUTH rate limits repeated password verification by peer IP" do
+    previous_max_attempts = Application.get_env(:ferricstore, :auth_rate_limit_max_attempts)
+    previous_window_ms = Application.get_env(:ferricstore, :auth_rate_limit_window_ms)
+
+    Application.put_env(:ferricstore, :auth_rate_limit_max_attempts, 1)
+    Application.put_env(:ferricstore, :auth_rate_limit_window_ms, 60_000)
+    :ok = AuthRateLimiter.reset()
+
+    on_exit(fn ->
+      restore_env(:auth_rate_limit_max_attempts, previous_max_attempts)
+      restore_env(:auth_rate_limit_window_ms, previous_window_ms)
+      AuthRateLimiter.reset()
+    end)
+
+    assert :ok = Acl.set_user("rate_limited_auth_user", ["on", ">secret"])
+    state = state(%{peer: {{10, 20, 30, 40}, 12_345}})
+
+    assert {:auth, first_error, _state} =
+             Commands.execute(
+               @op_auth,
+               %{"username" => "rate_limited_auth_user", "password" => "wrong"},
+               state
+             )
+
+    assert first_error =~ "WRONGPASS"
+
+    assert {:auth, limited_error, _state} =
+             Commands.execute(
+               @op_auth,
+               %{"username" => "rate_limited_auth_user", "password" => "wrong"},
+               %{state | peer: {{10, 20, 30, 40}, 54_321}}
+             )
+
+    assert limited_error =~ "too many authentication attempts"
+  end
+
+  test "successful native AUTH does not consume the failure budget" do
+    previous_max_attempts = Application.get_env(:ferricstore, :auth_rate_limit_max_attempts)
+    username = "successful_rate_limited_auth_user"
+
+    Application.put_env(:ferricstore, :auth_rate_limit_max_attempts, 1)
+    :ok = AuthRateLimiter.reset()
+    assert :ok = Acl.set_user(username, ["on", ">secret"])
+
+    on_exit(fn ->
+      Acl.del_user(username)
+      restore_env(:auth_rate_limit_max_attempts, previous_max_attempts)
+      AuthRateLimiter.reset()
+    end)
+
+    state = state(%{peer: {{10, 20, 31, 40}, 12_345}})
+
+    for port <- [12_345, 54_321] do
+      assert {:ok, "OK", _state} =
+               Commands.execute(
+                 @op_auth,
+                 %{"username" => username, "password" => "secret"},
+                 %{state | peer: {{10, 20, 31, 40}, port}}
+               )
+    end
+  end
+
+  test "native AUTH rejects oversized credentials before authentication" do
+    assert {:auth, username_error, _state} =
+             Commands.execute(
+               @op_auth,
+               %{"username" => :binary.copy("u", 1_025), "password" => "password"},
+               state()
+             )
+
+    assert username_error =~ "username exceeds 1024 bytes"
+    refute username_error =~ "too many authentication attempts"
+
+    assert {:auth, password_error, _state} =
+             Commands.execute(
+               @op_auth,
+               %{"username" => "default", "password" => :binary.copy("p", 4_097)},
+               state()
+             )
+
+    assert password_error =~ "password exceeds 4096 bytes"
+    refute password_error =~ "WRONGPASS"
   end
 
   test "ROUTE returns leader-aware native endpoint metadata" do
@@ -228,6 +363,119 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.indexed_attributes == ["tenant", "region"]
     assert payload.indexed_state_meta == "version"
     assert payload.retry.max_retries == 5
+  end
+
+  test "FLOW.POLICY.SET accepts max_active_ms through native opcode" do
+    type = "native-policy-active-limit-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert {:ok, %{max_active_ms: 30_000}, _state} =
+             Commands.execute(
+               @op_flow_policy_set,
+               %{"type" => type, "max_active_ms" => 30_000},
+               state()
+             )
+  end
+
+  test "native Flow creation opcodes accept max_active_ms" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    create_id = "native-active-create-#{suffix}"
+    many_id = "native-active-create-many-#{suffix}"
+    start_id = "native-active-start-#{suffix}"
+    partition = "native-active-partition-#{suffix}"
+
+    assert {:ok, "OK", _state} =
+             Commands.execute(
+               @op_flow_create,
+               %{
+                 "id" => create_id,
+                 "type" => "native-active",
+                 "state" => "queued",
+                 "now_ms" => 1_000,
+                 "max_active_ms" => 10_000
+               },
+               state()
+             )
+
+    assert {:ok, created} = FerricStore.flow_get(create_id)
+    assert created.max_active_ms == 10_000
+
+    assert {:ok, _payload, _state} =
+             Commands.execute(
+               @op_flow_create_many,
+               %{
+                 "items" => [%{"id" => many_id, "max_active_ms" => 20_000}],
+                 "partition_key" => partition,
+                 "type" => "native-active",
+                 "state" => "queued",
+                 "now_ms" => 1_000
+               },
+               state()
+             )
+
+    assert {:ok, created_many} =
+             FerricStore.flow_get(many_id, partition_key: partition)
+
+    assert created_many.max_active_ms == 20_000
+
+    assert {:ok, started, _state} =
+             Commands.execute(
+               @op_flow_start_and_claim,
+               %{
+                 "id" => start_id,
+                 "type" => "native-active",
+                 "initial_state" => "queued",
+                 "worker" => "native-worker",
+                 "now_ms" => 1_000,
+                 "max_active_ms" => 30_000
+               },
+               state()
+             )
+
+    assert started.max_active_ms == 30_000
+  end
+
+  test "FLOW.SPAWN_CHILDREN accepts max_active_ms in child payloads" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    parent_id = "native-active-parent-#{suffix}"
+    child_id = "native-active-child-#{suffix}"
+    partition = "native-active-family-#{suffix}"
+
+    assert :ok =
+             FerricStore.flow_create(parent_id,
+               type: "native-parent",
+               state: "dispatch",
+               partition_key: partition,
+               now_ms: 1_000
+             )
+
+    assert {:ok, parent} = FerricStore.flow_get(parent_id, partition_key: partition)
+
+    assert {:ok, _payload, _state} =
+             Commands.execute(
+               @op_flow_spawn_children,
+               %{
+                 "id" => parent_id,
+                 "children" => [
+                   %{
+                     "id" => child_id,
+                     "type" => "native-child",
+                     "max_active_ms" => 40_000
+                   }
+                 ],
+                 "partition_key" => partition,
+                 "group_id" => "native-group",
+                 "wait" => "none",
+                 "success" => "dispatched",
+                 "failure" => "dispatch_failed",
+                 "from_state" => "dispatch",
+                 "fencing_token" => parent.fencing_token,
+                 "now_ms" => 1_010
+               },
+               state()
+             )
+
+    assert {:ok, child} = FerricStore.flow_get(child_id, partition_key: partition)
+    assert child.max_active_ms == 40_000
   end
 
   test "native Flow opcodes enforce FIFO lane claims" do
@@ -532,19 +780,26 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload =~ "acl.setuser"
   end
 
-  test "COMMAND_EXEC dispatches ACL subcommands through server management adapter" do
+  @tag :acl_command_exec_replication
+  test "COMMAND_EXEC dispatches replicated ACL mutations and invalidates cached sessions" do
+    join_acl_invalidation_group()
+
     {status, payload, _state} =
       Commands.execute(
         @op_command_exec,
         %{
           "command" => "ACL",
-          "args" => ["SETUSER", "native-target", "on", "nopass", "+PING", "~*"]
+          "args" => ["SETUSER", "native-target", "on", "nopass", "-@all", "+GET", "~tenant:*"]
         },
         state()
       )
 
     assert status == :ok
     assert payload == "OK"
+    assert_receive {:acl_invalidate, "native-target"}
+
+    target_state = state_as("native-target")
+    assert_native_get_ok("tenant:key", target_state)
 
     {status, payload, _state} =
       Commands.execute(
@@ -565,6 +820,10 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == 1
+    assert_receive {:acl_invalidate, "native-target"}
+
+    target_state = ConnAuth.maybe_refresh_acl_cache(target_state, "native-target")
+    assert_native_get_denied("tenant:key", target_state)
   end
 
   test "COMMAND_EXEC enforces scoped keys for management commands" do
@@ -676,6 +935,375 @@ defmodule FerricstoreServer.Native.CommandsTest do
                  "type" => "checkout",
                  "attributes" => %{"tenant" => "acme"},
                  "partition_key" => "tenant:b"
+               },
+               state
+             )
+
+    assert message =~ "keys mentioned"
+  end
+
+  test "typed FLOW commands authorize the effective partition instead of the flow id" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    for {opcode, payload} <- [
+          {@op_flow_get, %{"id" => "tenant:a:flow", "partition_key" => "tenant:b:partition"}},
+          {@op_flow_claim_due,
+           %{"type" => "tenant:a:type", "partition_key" => "tenant:b:partition"}},
+          {@op_flow_list,
+           %{"type" => "tenant:a:type", "opts" => %{"partition_key" => "tenant:b:partition"}}}
+        ] do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+      assert message =~ "keys mentioned"
+    end
+  end
+
+  test "typed FLOW commands authorize nested options that override direct partitions" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    for {opcode, payload} <- [
+          {@op_flow_get,
+           %{
+             "id" => "tenant:a:flow",
+             "partition_key" => "tenant:a:direct",
+             "opts" => %{"partition_key" => "tenant:b:nested"}
+           }},
+          {@op_flow_claim_due,
+           %{
+             "type" => "tenant:a:type",
+             "worker" => "worker",
+             "partition_key" => "tenant:a:direct",
+             "opts" => %{"partition_key" => "tenant:b:nested"}
+           }},
+          {@op_flow_list,
+           %{
+             "type" => "tenant:a:type",
+             "partition_key" => "tenant:a:direct",
+             "opts" => %{"partition_key" => "tenant:b:nested"}
+           }},
+          {@op_flow_search,
+           %{
+             "type" => "checkout",
+             "partition_key" => "tenant:a:direct",
+             "opts" => %{"partition_key" => "tenant:b:nested"}
+           }}
+        ] do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+      assert message =~ "keys mentioned"
+    end
+  end
+
+  test "typed FLOW.CLAIM_DUE authorizes every requested partition" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_flow_claim_due,
+               %{
+                 "type" => "tenant:a:type",
+                 "partition_keys" => ["tenant:a:partition", "tenant:b:partition"]
+               },
+               state
+             )
+
+    assert message =~ "keys mentioned"
+  end
+
+  test "typed FLOW partition-wide commands require unrestricted scope without a partition" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    for {opcode, payload} <- [
+          {@op_flow_claim_due, %{"type" => "tenant:a:type", "worker" => "worker"}},
+          {@op_flow_list, %{"type" => "tenant:a:type"}}
+        ] do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+      assert message =~ "keys mentioned"
+    end
+  end
+
+  test "typed FLOW relationship queries require unrestricted scope without a partition" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    for {opcode, field} <- [
+          {@op_flow_by_parent, "parent_id"},
+          {@op_flow_by_root, "root_id"},
+          {@op_flow_by_correlation, "correlation_id"}
+        ] do
+      assert {:noperm, message, _state} =
+               Commands.execute(opcode, %{field => "tenant:a:selector"}, state)
+
+      assert message =~ "keys mentioned"
+    end
+  end
+
+  test "claim selectors AUTO ANY and GLOBAL require unrestricted key scope" do
+    assert :ok =
+             Acl.set_user("claim_selector_guard", [
+               "on",
+               "nopass",
+               "-@all",
+               "+FLOW.CLAIM_DUE",
+               "+FLOW.RECLAIM",
+               "~AUTO",
+               "~ANY",
+               "~GLOBAL"
+             ])
+
+    state = state_as("claim_selector_guard")
+
+    for selector <- ["AUTO", "ANY", "GLOBAL"] do
+      for {opcode, payload} <- [
+            {@op_flow_claim_due,
+             %{"type" => "claim-selector", "worker" => "worker", "partition_key" => selector}},
+            {@op_flow_reclaim, %{"type" => "claim-selector", "partition_key" => selector}}
+          ] do
+        assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+        assert message =~ "keys mentioned"
+      end
+    end
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{
+                 "command" => "FLOW.CLAIM_DUE",
+                 "args" => [
+                   "claim-selector",
+                   "WORKER",
+                   "worker",
+                   "PARTITION",
+                   "AUTO"
+                 ]
+               },
+               state
+             )
+
+    assert message =~ "keys mentioned"
+  end
+
+  test "raw FLOW ACL extraction cannot confuse option values with partition options" do
+    assert :ok =
+             Acl.set_user("raw_flow_option_guard", [
+               "on",
+               "nopass",
+               "-@all",
+               "+FLOW.CLAIM_DUE",
+               "~LEASE_MS"
+             ])
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{
+                 "command" => "FLOW.CLAIM_DUE",
+                 "args" => [
+                   "tenant:a:type",
+                   "WORKER",
+                   "PARTITION",
+                   "LEASE_MS",
+                   "30000"
+                 ]
+               },
+               state_as("raw_flow_option_guard")
+             )
+
+    assert message =~ "keys mentioned"
+  end
+
+  test "typed FLOW batch commands authorize shared and item partitions" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+    suffix = System.unique_integer([:positive, :monotonic])
+
+    for payload <- [
+          %{
+            "partition_key" => "tenant:b:partition",
+            "items" => [%{"id" => "tenant:a:shared", "payload" => %{}}]
+          },
+          %{
+            "items" => [
+              %{
+                "id" => "tenant:a:mixed",
+                "partition_key" => "tenant:b:partition",
+                "payload" => %{}
+              }
+            ]
+          },
+          %{
+            "type" => "batch-list",
+            "state" => "queued",
+            "items" => [["tenant:a:list:#{suffix}", "tenant:b:partition", %{}]]
+          },
+          %{
+            "type" => "batch-nested-options",
+            "state" => "queued",
+            "opts" => %{"partition_key" => "tenant:a:ignored"},
+            "items" => [
+              %{
+                "id" => "tenant:a:nested:#{suffix}",
+                "partition_key" => "tenant:b:partition",
+                "payload" => %{}
+              }
+            ]
+          }
+        ] do
+      assert {:noperm, message, _state} =
+               Commands.execute(@op_flow_create_many, payload, state)
+
+      assert message =~ "keys mentioned"
+    end
+  end
+
+  test "compact FLOW batches authorize auto-partitioned normalized item ids" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    payload = %{
+      "items" => [
+        {:id, "tenant:b:compact", :lease_token, "lease", :fencing_token, 1}
+      ],
+      __wire_flow_items_normalized__: true,
+      __wire_flow_opts__: []
+    }
+
+    assert {:noperm, message, _state} =
+             Commands.execute(@op_flow_complete_many, payload, state)
+
+    assert message =~ "keys mentioned"
+  end
+
+  test "FLOW.RUN_STEPS_MANY authorizes each effective item partition" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_flow_run_steps_many,
+               %{
+                 "partition_key" => "tenant:a:decoy",
+                 "type" => "checkout",
+                 "worker" => "worker-1",
+                 "states" => ["queued", "done"],
+                 "items" => [
+                   %{"id" => "tenant:b:flow", "partition_key" => "tenant:b:partition"}
+                 ]
+               },
+               state
+             )
+
+    assert message =~ "keys mentioned"
+
+    {status, _payload, _state} =
+      Commands.execute(
+        @op_flow_run_steps_many,
+        %{
+          "type" => "checkout",
+          "worker" => "worker-1",
+          "states" => ["queued", "done"],
+          "items" => [%{"id" => "tenant:a:auto"}]
+        },
+        state
+      )
+
+    refute status == :noperm
+  end
+
+  test "typed FLOW global queries require unrestricted key scope" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:noperm, message, _state} =
+             Commands.execute(@op_flow_stats, %{"type" => "tenant:a:type"}, state)
+
+    assert message =~ "keys mentioned"
+
+    {status, _payload, _state} =
+      Commands.execute(
+        @op_flow_stats,
+        %{"type" => "tenant:a:type", "partition_key" => "tenant:a:partition"},
+        state
+      )
+
+    refute status == :noperm
+  end
+
+  test "anonymous FLOW.VALUE.PUT requires unrestricted scope in typed and raw paths" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:noperm, message, _state} =
+             Commands.execute(@op_flow_value_put, %{"value" => "secret"}, state)
+
+    assert message =~ "keys mentioned"
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "FLOW.VALUE.PUT", "args" => ["secret"]},
+               state
+             )
+
+    assert message =~ "keys mentioned"
+  end
+
+  test "schedule ACLs ignore unsupported decoy partitions and protect target partitions" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    for opcode <- [@op_flow_schedule_fire, @op_flow_schedule_delete] do
+      assert {:noperm, message, _state} =
+               Commands.execute(
+                 opcode,
+                 %{"id" => "tenant:b:schedule", "partition_key" => "tenant:a:decoy"},
+                 state
+               )
+
+      assert message =~ "keys mentioned"
+    end
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_flow_schedule_create,
+               %{
+                 "id" => "tenant:a:schedule",
+                 "kind" => "delay",
+                 "delay_ms" => 1_000,
+                 "target" => %{
+                   "id" => "tenant:b:target",
+                   "type" => "scheduled",
+                   "partition_key" => "tenant:b:partition"
+                 }
+               },
+               state
+             )
+
+    assert message =~ "keys mentioned"
+  end
+
+  test "approval ACLs ignore decoy partitions and protect requested flow scope" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_flow_approval_get,
+               %{"id" => "tenant:b:approval", "partition_key" => "tenant:a:decoy"},
+               state
+             )
+
+    assert message =~ "keys mentioned"
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_flow_approval_request,
+               %{
+                 "id" => "tenant:a:approval",
+                 "flow_id" => "tenant:b:flow",
+                 "scope" => "tenant:b:scope"
                },
                state
              )
@@ -803,6 +1431,31 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert_native_get_denied("tenant:a:key", old_state)
     assert_native_get_ok("tenant:a:key", new_state)
+  end
+
+  @tag :acl_direct_invalidation
+  test "direct ACL mutations invalidate cached native permissions" do
+    join_acl_invalidation_group()
+
+    assert :ok =
+             Acl.set_user("direct-revoke", [
+               "on",
+               "nopass",
+               "-@all",
+               "+get",
+               "~tenant:direct:*"
+             ])
+
+    assert_receive {:acl_invalidate, "direct-revoke"}
+
+    state = state_as("direct-revoke")
+    assert_native_get_ok("tenant:direct:key", state)
+
+    assert :ok = Acl.set_user("direct-revoke", ["off"])
+    assert_receive {:acl_invalidate, "direct-revoke"}
+
+    state = ConnAuth.maybe_refresh_acl_cache(state, "direct-revoke")
+    assert_native_get_denied("tenant:direct:key", state)
   end
 
   test "replicated ACL delete denies active native service credential sessions" do
@@ -988,6 +1641,9 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert message =~ "NOPERM"
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   defp flow_record_ids(records) when is_list(records) do
     Enum.map(records, fn record ->

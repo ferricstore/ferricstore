@@ -50,22 +50,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
 
         with {:ok, record} <- flow_require_record(child_state, id, partition_key) do
-          case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
-            {:ok, :noop} ->
-              :ok
+          case flow_maybe_timeout_active_record(child_state, record, now_ms) do
+            :active ->
+              case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
+                {:ok, :noop} ->
+                  :ok
 
-            {:ok, record, next} ->
-              with :ok <-
-                     flow_apply_complete_local(
-                       child_state,
-                       record,
-                       next,
-                       partition_key,
-                       now_ms,
-                       attrs
-                     ) do
-                flow_apply_child_terminal_chain(state, next, "completed", now_ms)
+                {:ok, record, next} ->
+                  with :ok <-
+                         flow_apply_complete_local(
+                           child_state,
+                           record,
+                           next,
+                           partition_key,
+                           now_ms,
+                           attrs
+                         ) do
+                    flow_apply_child_terminal_chain(state, next, "completed", now_ms)
+                  end
+
+                {:error, _reason} = error ->
+                  error
               end
+
+            :timed_out ->
+              {:ok, {:error, "ERR flow max_active_ms exceeded"}}
 
             {:error, _reason} = error ->
               error
@@ -596,7 +605,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
                   status in ["completed", "failed", "cancelled"] do
         parent_partition_key = Map.get(child, :parent_partition_key) || partition_key
 
-        if parent_partition_key != partition_key and not cross_shard_pending_active?() do
+        parent_on_other_shard? = flow_parent_on_other_shard?(state, child)
+
+        if parent_on_other_shard? and not cross_shard_pending_active?() do
           :ok
         else
           parent_state =
@@ -912,55 +923,187 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
 
       defp do_flow_retention_cleanup(state, attrs) do
         now_ms = flow_attrs_now_ms(attrs)
-        limit = Map.get(attrs, :limit, 100)
 
-        active_entries = flow_active_timeout_expired_state_entries(state, now_ms, limit)
-
-        active_result =
-          Enum.reduce_while(active_entries, flow_retention_zero_counts(), fn entry, {:ok, acc} ->
-            case flow_active_timeout_entry(state, entry, now_ms) do
-              {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
-              {:error, _reason} = error -> {:halt, error}
-            end
-          end)
-
-        with {:ok, active_acc} <- active_result do
-          if flow_retention_history_projection_pending?(state) do
-            {:ok, active_acc}
-          else
-            remaining_limit = max(limit - Map.get(active_acc, :active_timeouts, 0), 0)
-            ets_entries = flow_retention_expired_state_entries(state, now_ms, remaining_limit)
-
-            ets_result =
-              Enum.reduce_while(ets_entries, {:ok, active_acc}, fn entry, {:ok, acc} ->
-                case flow_retention_cleanup_entry(state, entry) do
-                  {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
-                  {:error, _reason} = error -> {:halt, error}
-                end
-              end)
-
-            with {:ok, acc} <- ets_result do
-              seen =
-                ets_entries
-                |> Enum.map(fn {state_key, _value, _expire_at_ms, _fid, _offset, _value_size} ->
-                  state_key
-                end)
-                |> MapSet.new()
-
-              state
-              |> flow_retention_expired_lmdb_state_keys(
-                now_ms,
-                max(remaining_limit - MapSet.size(seen), 0),
-                seen
-              )
-              |> Enum.reduce_while({:ok, acc}, fn state_key, {:ok, acc} ->
-                case flow_retention_cleanup_lmdb_state_key(state, state_key, now_ms) do
-                  {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
-                  {:error, _reason} = error -> {:halt, error}
-                end
-              end)
-            end
+        attrs
+        |> Map.get(:terminal_candidates, [])
+        |> Enum.reduce_while(flow_retention_zero_counts(), fn candidate, {:ok, acc} ->
+          case flow_retention_apply_terminal_candidate(state, candidate, now_ms) do
+            {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+            {:error, _reason} = error -> {:halt, error}
           end
+        end)
+      end
+
+      defp do_flow_cross_terminal_retention_cleanup(
+             state,
+             %{terminal_candidates: candidates} = attrs
+           )
+           when is_list(candidates) do
+        now_ms = flow_attrs_now_ms(attrs)
+        previous_anchor = Process.get(:flow_retention_cross_shard_anchor)
+        previous_orphans = Process.get(:flow_retention_shared_value_orphans)
+        previous_released = Process.get(:flow_retention_released_shared_refs)
+        Process.put(:flow_retention_cross_shard_anchor, state)
+        Process.put(:flow_retention_shared_value_orphans, %{})
+        Process.put(:flow_retention_released_shared_refs, MapSet.new())
+
+        try do
+          result =
+            Enum.reduce_while(candidates, flow_retention_zero_counts(), fn
+              %{shard_index: shard_index} = candidate, {:ok, acc}
+              when is_integer(shard_index) and shard_index >= 0 ->
+                target_state = cross_shard_state_for_index(state, shard_index)
+
+                case flow_retention_apply_terminal_candidate(target_state, candidate, now_ms) do
+                  {:ok, counts} ->
+                    {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+
+                  {:error, _reason} = error ->
+                    {:halt, error}
+                end
+
+              _invalid, _acc ->
+                {:halt, {:error, "ERR invalid flow retention candidate"}}
+            end)
+
+          with {:ok, counts} <- result,
+               {:ok, deleted_values} <- flow_retention_finalize_shared_value_orphans(state) do
+            {:ok, Map.update!(counts, :values, &(&1 + deleted_values))}
+          end
+        after
+          flow_restore_process_value(:flow_retention_cross_shard_anchor, previous_anchor)
+          flow_restore_process_value(:flow_retention_shared_value_orphans, previous_orphans)
+          flow_restore_process_value(:flow_retention_released_shared_refs, previous_released)
+        end
+      end
+
+      defp do_flow_cross_retention_cleanup(state, %{active_candidates: candidates} = attrs)
+           when is_list(candidates) do
+        now_ms = flow_attrs_now_ms(attrs)
+
+        Enum.reduce_while(
+          candidates,
+          {:ok, %{flows: 0, history: 0, values: 0, active_timeouts: 0, shard_counts: %{}}},
+          fn
+            %{shard_index: shard_index} = candidate, {:ok, acc}
+            when is_integer(shard_index) and shard_index >= 0 ->
+              target_state = cross_shard_state_for_index(state, shard_index)
+
+              case flow_retention_apply_active_candidate(target_state, candidate, now_ms) do
+                {:ok, counts} ->
+                  shard_counts =
+                    Map.update(
+                      acc.shard_counts,
+                      shard_index,
+                      counts,
+                      &flow_retention_merge_counts(&1, counts)
+                    )
+
+                  next =
+                    acc
+                    |> flow_retention_merge_counts(counts)
+                    |> Map.put(:shard_counts, shard_counts)
+
+                  {:cont, {:ok, next}}
+
+                {:error, _reason} = error ->
+                  {:halt, error}
+              end
+
+            _invalid, _acc ->
+              {:halt, {:error, "ERR invalid flow retention candidate"}}
+          end
+        )
+      end
+
+      defp do_flow_cross_retention_cleanup(state, %{terminal_candidates: candidates} = attrs)
+           when is_list(candidates),
+           do: do_flow_cross_terminal_retention_cleanup(state, attrs)
+
+      defp do_flow_cross_retention_cleanup(_state, _attrs),
+        do: {:error, "ERR invalid flow retention shard"}
+
+      defp flow_restore_process_value(key, nil), do: Process.delete(key)
+      defp flow_restore_process_value(key, value), do: Process.put(key, value)
+
+      defp flow_retention_apply_active_candidate(state, candidate, now_ms) do
+        case flow_retention_apply_candidate_record(state, candidate) do
+          record when is_map(record) ->
+            if flow_active_timeout_expired_record?(record, now_ms) do
+              flow_active_timeout_record(state, candidate.state_key, record, now_ms)
+            else
+              flow_retention_zero_counts()
+            end
+
+          nil ->
+            flow_retention_zero_counts()
+        end
+      end
+
+      defp flow_retention_apply_terminal_candidate(state, candidate, now_ms) do
+        case {flow_retention_apply_candidate_record(state, candidate),
+              Map.get(candidate, :cleanup_plan)} do
+          {record, cleanup_plan} when is_map(record) and is_map(cleanup_plan) ->
+            if flow_retention_expired_terminal_record?(record, now_ms) do
+              flow_retention_cleanup_record(
+                state,
+                candidate.state_key,
+                record,
+                cleanup_plan
+              )
+            else
+              flow_retention_zero_counts()
+            end
+
+          {_missing_or_stale, _cleanup_plan} ->
+            flow_retention_zero_counts()
+        end
+      end
+
+      defp flow_retention_apply_candidate_record(
+             state,
+             %{
+               state_key: state_key,
+               expected_version: expected_version,
+               guard_key: guard_key,
+               expected_guard: expected_guard,
+               record: planned_record
+             }
+           )
+           when is_binary(state_key) and is_integer(expected_version) and
+                  is_binary(guard_key) and is_binary(expected_guard) and
+                  is_map(planned_record) do
+        if flow_retention_current_guard(state, guard_key) == expected_guard do
+          current_record =
+            case flow_active_timeout_pending_record(state, state_key) do
+              {:ok, record} ->
+                record
+
+              :deleted ->
+                nil
+
+              :miss ->
+                case flow_retention_current_state_record(state, state_key) do
+                  {:ok, record} -> record
+                  :miss -> planned_record
+                end
+            end
+
+          case current_record do
+            %{version: ^expected_version} = record -> record
+            _stale_or_missing -> nil
+          end
+        else
+          nil
+        end
+      end
+
+      defp flow_retention_apply_candidate_record(_state, _candidate), do: nil
+
+      defp flow_retention_current_guard(state, guard_key) do
+        case sm_store_batch_get(state, [guard_key], &sm_file_path/2) do
+          [guard] when is_binary(guard) -> guard
+          _missing -> nil
         end
       end
 
@@ -988,26 +1131,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         end
       rescue
         _ -> true
-      end
-
-      defp flow_retention_expired_lmdb_state_keys(_state, _now_ms, remaining, _seen)
-           when remaining <= 0,
-           do: []
-
-      defp flow_retention_expired_lmdb_state_keys(state, now_ms, remaining, seen) do
-        case Ferricstore.Flow.LMDB.expired_terminal_state_keys(
-               flow_lmdb_record_path(state),
-               now_ms,
-               remaining
-             ) do
-          {:ok, state_keys} ->
-            state_keys
-            |> Enum.reject(&MapSet.member?(seen, &1))
-            |> Enum.filter(&flow_retention_state_key_owned_by_shard?(state, &1))
-
-          {:error, _reason} ->
-            []
-        end
       end
     end
   end

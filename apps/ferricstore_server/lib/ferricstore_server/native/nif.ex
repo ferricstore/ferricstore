@@ -26,7 +26,7 @@ defmodule FerricstoreServer.Native.NIF do
           {non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer(), binary()}
 
   @spec decode_frames(binary(), non_neg_integer()) ::
-          {:ok, [frame()], binary()} | {:error, binary()}
+          {:ok, [frame()], binary(), :more | :done} | {:error, binary()}
   def decode_frames(_buffer, _max_frame_bytes), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec encode_frame(

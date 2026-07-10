@@ -125,6 +125,268 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
                  )
       end
 
+      test "shared-ref upgrade backfill is durable, watermarked, and restart-idempotent" do
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_shared_ref_backfill_#{System.unique_integer([:positive])}"
+          )
+
+        instance_name = :"shared_ref_backfill_#{System.unique_integer([:positive])}"
+        shard_index = 0
+        keydir = :ets.new(:shared_ref_backfill_keydir, [:set, :public])
+        recovered = :ets.new(:shared_ref_backfill_recovered, [:set, :public])
+        old_hook = Application.get_env(:ferricstore, :flow_shared_ref_backfill_write_hook)
+
+        on_exit(fn ->
+          restore_env(:flow_shared_ref_backfill_write_hook, old_hook)
+          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+          if :ets.info(recovered) != :undefined, do: :ets.delete(recovered)
+          File.rm_rf!(data_dir)
+        end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        active_file_path = Ferricstore.Store.Shard.ETS.file_path(shard_path, 0)
+        File.touch!(active_file_path)
+
+        shared_ref =
+          Ferricstore.Flow.Keys.value_key("owner:doc", :shared, 1, "owner-partition")
+
+        owned_result_ref =
+          Ferricstore.Flow.Keys.value_key("consumer", :result, 1, "consumer-partition")
+
+        record =
+          active_lmdb_record("consumer", "shared-ref-upgrade", "queued",
+            partition_key: "consumer-partition",
+            updated_at_ms: 10,
+            next_run_at_ms: 20
+          )
+          |> Map.merge(%{
+            state_enter_seq: 77,
+            payload_ref: shared_ref,
+            result_ref: owned_result_ref
+          })
+
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+
+        assert {:ok, locations} =
+                 Ferricstore.Bitcask.NIF.v2_append_batch(active_file_path, [
+                   {state_key, encoded, 0},
+                   {owned_result_ref, Ferricstore.Flow.encode_value("owned-result"), 0}
+                 ])
+
+        Enum.zip(
+          [
+            {state_key, encoded},
+            {owned_result_ref, Ferricstore.Flow.encode_value("owned-result")}
+          ],
+          locations
+        )
+        |> Enum.each(fn {{key, value}, {offset, _record_size}} ->
+          :ets.insert(keydir, {key, value, 0, 0, 0, offset, byte_size(value)})
+        end)
+
+        ctx = %{
+          name: instance_name,
+          data_dir: data_dir,
+          shard_count: 1,
+          keydir_refs: {keydir},
+          blob_side_channel_threshold_bytes: 0
+        }
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(instance_name, shard_index)
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+        write_calls = :atomics.new(1, signed: false)
+
+        Application.put_env(:ferricstore, :flow_shared_ref_backfill_write_hook, fn path, rows ->
+          case :atomics.add_get(write_calls, 1, 1) do
+            2 -> {:error, :interrupted_before_watermark}
+            _ -> Ferricstore.Bitcask.NIF.v2_append_batch(path, rows)
+          end
+        end)
+
+        watermark_key = Ferricstore.Flow.Keys.shared_value_ref_backfill_key(shard_index)
+
+        assert_raise RuntimeError, ~r/interrupted_before_watermark/, fn ->
+          Ferricstore.Flow.SharedRefBackfill.run!(
+            shard_path,
+            keydir,
+            shard_index,
+            ctx,
+            flow_index,
+            flow_lookup,
+            active_file_id: 0,
+            active_file_path: active_file_path
+          )
+        end
+
+        refute :ets.member(keydir, watermark_key)
+        Application.delete_env(:ferricstore, :flow_shared_ref_backfill_write_hook)
+
+        assert :ok =
+                 Ferricstore.Flow.SharedRefBackfill.run!(
+                   shard_path,
+                   keydir,
+                   shard_index,
+                   ctx,
+                   flow_index,
+                   flow_lookup,
+                   active_file_id: 0,
+                   active_file_path: active_file_path
+                 )
+
+        registry_key =
+          Ferricstore.Flow.Keys.shared_value_ref_registry_key(
+            record.id,
+            record.partition_key
+          )
+
+        count_key = Ferricstore.Flow.Keys.shared_value_ref_count_key(shared_ref, shard_index)
+        guard_key = Ferricstore.Flow.Keys.retention_guard_key(record.id, record.partition_key)
+
+        assert [{^registry_key, registry, 0, _lfu, 0, _offset, _size}] =
+                 :ets.lookup(keydir, registry_key)
+
+        assert :erlang.binary_to_term(registry, [:safe]) == [shared_ref]
+        assert [{^count_key, count, 0, _lfu, 0, _offset, _size}] = :ets.lookup(keydir, count_key)
+        assert :erlang.binary_to_term(count, [:safe]) == 1
+        assert :ets.member(keydir, guard_key)
+        assert :ets.member(keydir, watermark_key)
+
+        cleanup_index_key =
+          Ferricstore.Flow.Keys.retention_cleanup_index_key(record.id, record.partition_key)
+
+        assert [{cleanup_member_key, +0.0}] =
+                 Ferricstore.Flow.NativeOrderedIndex.range_slice(
+                   flow_index,
+                   cleanup_index_key,
+                   :neg_inf,
+                   :inf,
+                   false,
+                   0,
+                   :all
+                 )
+
+        assert [{^cleanup_member_key, cleanup_member, 0, _lfu, 0, _offset, _size}] =
+                 :ets.lookup(keydir, cleanup_member_key)
+
+        assert {:ok, {^cleanup_index_key, ^owned_result_ref}} =
+                 Ferricstore.Flow.RetentionCleanupMember.decode(cleanup_member)
+
+        Ferricstore.Store.Shard.Lifecycle.recover_keydir(
+          shard_path,
+          recovered,
+          shard_index,
+          ctx
+        )
+
+        assert :ets.member(recovered, registry_key)
+        assert :ets.member(recovered, count_key)
+        assert :ets.member(recovered, guard_key)
+        assert :ets.member(recovered, cleanup_member_key)
+        assert :ets.member(recovered, watermark_key)
+
+        Application.put_env(:ferricstore, :flow_shared_ref_backfill_write_hook, fn _path, _rows ->
+          {:error, :watermarked_backfill_must_not_write}
+        end)
+
+        assert :ok =
+                 Ferricstore.Flow.SharedRefBackfill.run!(
+                   shard_path,
+                   keydir,
+                   shard_index,
+                   ctx,
+                   flow_index,
+                   flow_lookup,
+                   active_file_id: 0,
+                   active_file_path: active_file_path
+                 )
+      end
+
+      test "shared-ref upgrade backfill loads consumer state from LMDB when keydir is cold-only" do
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_shared_ref_lmdb_backfill_#{System.unique_integer([:positive])}"
+          )
+
+        instance_name = :"shared_ref_lmdb_backfill_#{System.unique_integer([:positive])}"
+        shard_index = 0
+        keydir = :ets.new(:shared_ref_lmdb_backfill_keydir, [:set, :public])
+
+        on_exit(fn ->
+          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+          File.rm_rf!(data_dir)
+        end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        active_file_path = Ferricstore.Store.Shard.ETS.file_path(shard_path, 0)
+        File.touch!(active_file_path)
+
+        shared_ref =
+          Ferricstore.Flow.Keys.value_key("cold-owner:doc", :shared, 1, "cold-owner")
+
+        record =
+          active_lmdb_record("cold-consumer", "shared-ref-upgrade", "queued",
+            partition_key: "cold-consumer",
+            updated_at_ms: 10,
+            next_run_at_ms: 20
+          )
+          |> Map.merge(%{state_enter_seq: 88, payload_ref: shared_ref})
+
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(Ferricstore.Flow.LMDB.path(shard_path), [
+                   {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)}
+                 ])
+
+        ctx = %{
+          name: instance_name,
+          data_dir: data_dir,
+          shard_count: 1,
+          keydir_refs: {keydir},
+          blob_side_channel_threshold_bytes: 0
+        }
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(instance_name, shard_index)
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        assert :ok =
+                 Ferricstore.Flow.SharedRefBackfill.run!(
+                   shard_path,
+                   keydir,
+                   shard_index,
+                   ctx,
+                   flow_index,
+                   flow_lookup,
+                   active_file_id: 0,
+                   active_file_path: active_file_path
+                 )
+
+        registry_key =
+          Ferricstore.Flow.Keys.shared_value_ref_registry_key(
+            record.id,
+            record.partition_key
+          )
+
+        count_key = Ferricstore.Flow.Keys.shared_value_ref_count_key(shared_ref, shard_index)
+        guard_key = Ferricstore.Flow.Keys.retention_guard_key(record.id, record.partition_key)
+
+        assert :ets.member(keydir, registry_key)
+        assert :ets.member(keydir, count_key)
+        assert :ets.member(keydir, guard_key)
+        refute :ets.member(keydir, state_key)
+      end
+
       test "LMDB startup rebuild scans terminal reverse projection once per shard" do
         data_dir =
           Path.join(

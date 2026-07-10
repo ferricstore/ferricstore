@@ -3,6 +3,11 @@ defmodule FerricstoreServer.Acl.Password do
 
   @pbkdf2_iterations 100_000
   @pbkdf2_key_length 32
+  @dummy_hash String.duplicate("A", 64)
+
+  @doc false
+  @spec dummy_hash() :: binary()
+  def dummy_hash, do: @dummy_hash
 
   @spec hash(binary()) :: binary()
   def hash(password) do

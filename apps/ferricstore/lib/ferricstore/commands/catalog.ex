@@ -36,7 +36,7 @@ defmodule Ferricstore.Commands.Catalog do
         }
 
   alias Ferricstore.Commands.Catalog.Entries
-  alias Ferricstore.Commands.Extension
+  alias Ferricstore.Commands.{Extension, KeyDiscovery}
 
   @doc "Returns the full list of command entries."
   @spec all() :: [command_entry()]
@@ -99,20 +99,7 @@ defmodule Ferricstore.Commands.Catalog do
   """
   @spec get_keys(binary(), [binary()]) :: {:ok, [binary()]} | {:error, binary()}
   def get_keys(name, args) when is_binary(name) and is_list(args) do
-    upper_name = String.upcase(name)
-
-    with :not_flow <- flow_dynamic_keys(upper_name, args) do
-      case lookup(name) do
-        {:ok, %{first_key: 0}} ->
-          {:ok, []}
-
-        {:ok, %{first_key: first, last_key: last, step: step}} ->
-          extract_keys(first, last, step, args)
-
-        :error ->
-          {:error, "ERR Invalid command specified"}
-      end
-    end
+    get_keys_upper(String.upcase(name), args)
   end
 
   @doc """
@@ -120,277 +107,44 @@ defmodule Ferricstore.Commands.Catalog do
   avoiding the `String.downcase/1` call inside `lookup/1`.
   """
   @spec get_keys_upper(binary(), [binary()]) :: {:ok, [binary()]} | {:error, binary()}
+  def get_keys_upper("FLOW." <> _rest = name, args) when is_list(args) do
+    case Ferricstore.Commands.NativeAstParser.parse(name, args) do
+      {:ok, ^name, _parsed_args, {:unknown, ^name, _unknown_args}, _keys} ->
+        case Extension.keys(name, args) do
+          {:ok, keys} -> {:ok, keys}
+          :error -> {:error, "ERR Invalid command specified"}
+        end
+
+      {:ok, ^name, _parsed_args, _ast, keys} ->
+        {:ok, keys}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   def get_keys_upper(name, args) when is_binary(name) and is_list(args) do
-    with :not_flow <- flow_dynamic_keys(name, args) do
-      case lookup_upper(name) do
-        {:ok, %{first_key: 0}} ->
-          {:ok, []}
+    case KeyDiscovery.extract(name, args) do
+      {:ok, keys} ->
+        {:ok, keys}
 
-        {:ok, %{first_key: first, last_key: last, step: step}} ->
-          extract_keys(first, last, step, args)
+      :not_dynamic ->
+        case lookup_upper(name) do
+          {:ok, %{first_key: 0}} ->
+            {:ok, []}
 
-        :error ->
-          {:error, "ERR Invalid command specified"}
-      end
+          {:ok, %{first_key: first, last_key: last, step: step}} ->
+            extract_keys(first, last, step, args)
+
+          :error ->
+            {:error, "ERR Invalid command specified"}
+        end
     end
   end
-
-  defp flow_dynamic_keys("FLOW.CREATE_MANY", args),
-    do: {:ok, args_at(args, flow_create_many_key_indices(args))}
-
-  defp flow_dynamic_keys("FLOW.SPAWN_CHILDREN", args),
-    do: {:ok, args_at(args, flow_spawn_children_key_indices(args))}
-
-  defp flow_dynamic_keys("FLOW.COMPLETE_MANY", args),
-    do: {:ok, args_at(args, flow_complete_many_key_indices(args))}
-
-  defp flow_dynamic_keys("FLOW.RETRY_MANY", args),
-    do: {:ok, args_at(args, flow_complete_many_key_indices(args))}
-
-  defp flow_dynamic_keys("FLOW.FAIL_MANY", args),
-    do: {:ok, args_at(args, flow_complete_many_key_indices(args))}
-
-  defp flow_dynamic_keys("FLOW.CANCEL_MANY", args),
-    do: {:ok, args_at(args, flow_cancel_many_key_indices(args))}
-
-  defp flow_dynamic_keys("FLOW.TRANSITION_MANY", args),
-    do: {:ok, args_at(args, flow_transition_many_key_indices(args))}
-
-  defp flow_dynamic_keys("FLOW.VALUE.PUT", args),
-    do: {:ok, args_at(args, flow_partition_key_indices(args, 1))}
-
-  defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.CREATE", "FLOW.GET", "FLOW.HISTORY", "FLOW.SIGNAL"],
-       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
-
-  defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.COMPLETE", "FLOW.RETRY", "FLOW.FAIL", "FLOW.EXTEND_LEASE"],
-       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 2))}
-
-  defp flow_dynamic_keys("FLOW.TRANSITION", args),
-    do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 3))}
-
-  defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.CANCEL", "FLOW.REWIND"],
-       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
-
-  defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.BY_PARENT", "FLOW.BY_ROOT", "FLOW.BY_CORRELATION"],
-       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
-
-  defp flow_dynamic_keys(name, args)
-       when name in [
-              "FLOW.CLAIM_DUE",
-              "FLOW.RECLAIM",
-              "FLOW.LIST",
-              "FLOW.TERMINALS",
-              "FLOW.FAILURES",
-              "FLOW.INFO",
-              "FLOW.STUCK"
-            ],
-       do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
-
-  defp flow_dynamic_keys(name, args)
-       when name in [
-              "FLOW.SEARCH",
-              "FLOW.STATS",
-              "FLOW.ATTRIBUTES"
-            ],
-       do: {:ok, flow_partition_keys_or_global(args, 0)}
-
-  defp flow_dynamic_keys("FLOW.ATTRIBUTE_VALUES", args),
-    do: {:ok, flow_partition_keys_or_global(args, 0)}
-
-  defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.POLICY.SET", "FLOW.POLICY.GET"],
-       do: {:ok, Enum.take(args, 1)}
-
-  defp flow_dynamic_keys(_name, _args), do: :not_flow
-
-  defp flow_partition_or_first_key_indices([], _option_start), do: []
-
-  defp flow_partition_or_first_key_indices(args, option_start) do
-    case flow_partition_key_indices(args, option_start) do
-      [] -> [0]
-      indices -> dedup_indices(indices)
-    end
-  end
-
-  defp flow_partition_key_indices(args, option_start) do
-    flow_partition_key_indices_until(args, option_start, length(args))
-  end
-
-  defp flow_partition_keys_or_global(args, option_start) do
-    case args_at(args, flow_partition_key_indices(args, option_start)) do
-      [] -> ["*"]
-      keys -> Enum.map(keys, &flow_acl_partition_key/1)
-    end
-  end
-
-  defp flow_acl_partition_key("GLOBAL"), do: "*"
-  defp flow_acl_partition_key(value), do: value
-
-  defp flow_partition_key_indices_until(args, option_start, option_end) do
-    option_end = min(option_end, length(args))
-
-    option_start..max(option_start, option_end - 1)
-    |> Enum.reduce([], fn idx, acc ->
-      cond do
-        idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITION") ->
-          [idx + 1 | acc]
-
-        idx + 1 < option_end and arg_eq?(Enum.at(args, idx), "PARTITIONS") ->
-          flow_partition_count_indices(args, idx + 1, option_end) ++ acc
-
-        true ->
-          acc
-      end
-    end)
-    |> Enum.reverse()
-  end
-
-  defp flow_partition_count_indices(args, count_idx, option_end) do
-    with count_arg when not is_nil(count_arg) <- Enum.at(args, count_idx),
-         {count, ""} when count > 0 <- Integer.parse(to_string(count_arg)),
-         true <- count_idx + count < option_end do
-      Enum.to_list((count_idx + 1)..(count_idx + count))
-    else
-      _ -> []
-    end
-  end
-
-  defp flow_create_many_key_indices([]), do: []
-
-  defp flow_create_many_key_indices(args) do
-    if not arg_eq?(hd(args), "MIXED") do
-      [0]
-    else
-      case option_index(args, 1, "ITEMS") do
-        nil ->
-          [0]
-
-        items_idx ->
-          item_width =
-            if flow_option_present_until?(args, 1, items_idx, "PAYLOAD_REF"), do: 2, else: 3
-
-          repeated_item_partition_indices(args, items_idx + 1, item_width)
-      end
-    end
-  end
-
-  defp flow_option_present_until?(args, start, option_end, option) do
-    start..max(start, option_end - 1)
-    |> Enum.any?(fn idx ->
-      rem(idx - start, 2) == 0 and idx < option_end and arg_eq?(Enum.at(args, idx), option)
-    end)
-  end
-
-  defp flow_spawn_children_key_indices(args) do
-    option_end = option_index(args, 1, "ITEMS") || length(args)
-    partition_keys = flow_partition_key_indices_until(args, 1, option_end)
-
-    partition_keys =
-      if option_end + 1 < length(args) and arg_eq?(Enum.at(args, option_end + 1), "MIXED") do
-        partition_keys ++ repeated_item_partition_indices(args, option_end + 2, 4)
-      else
-        partition_keys
-      end
-
-    case partition_keys do
-      [] -> Enum.take(0..(length(args) - 1), min(length(args), 1))
-      keys -> dedup_indices(keys)
-    end
-  end
-
-  defp flow_transition_many_key_indices([]), do: []
-
-  defp flow_transition_many_key_indices(args) do
-    if not arg_eq?(hd(args), "MIXED") do
-      [0]
-    else
-      case option_index(args, 3, "ITEMS") do
-        nil -> [0]
-        items_idx -> repeated_item_partition_indices(args, items_idx + 1, 4)
-      end
-    end
-  end
-
-  defp flow_complete_many_key_indices([]), do: []
-
-  defp flow_complete_many_key_indices(args) do
-    if not arg_eq?(hd(args), "MIXED") do
-      [0]
-    else
-      case option_index(args, 1, "ITEMS") do
-        nil -> [0]
-        items_idx -> repeated_item_partition_indices(args, items_idx + 1, 4)
-      end
-    end
-  end
-
-  defp flow_cancel_many_key_indices([]), do: []
-
-  defp flow_cancel_many_key_indices(args) do
-    if not arg_eq?(hd(args), "MIXED") do
-      [0]
-    else
-      case option_index(args, 1, "ITEMS") do
-        nil -> [0]
-        items_idx -> repeated_item_partition_indices(args, items_idx + 1, 3)
-      end
-    end
-  end
-
-  defp repeated_item_partition_indices(args, start_idx, step) do
-    do_repeated_item_partition_indices(args, start_idx, step, [])
-  end
-
-  defp do_repeated_item_partition_indices(args, idx, step, acc) do
-    if idx + step - 1 < length(args) do
-      do_repeated_item_partition_indices(args, idx + step, step, [idx + 1 | acc])
-    else
-      Enum.reverse(acc)
-    end
-  end
-
-  defp option_index(args, start, name), do: option_index(args, start, name, length(args))
-
-  defp option_index(_args, idx, _name, len) when idx >= len, do: nil
-
-  defp option_index(args, idx, name, len) do
-    if arg_eq?(Enum.at(args, idx), name) do
-      idx
-    else
-      option_index(args, idx + 2, name, len)
-    end
-  end
-
-  defp dedup_indices(indices), do: Enum.uniq(indices)
-
-  defp args_at(args, indices) do
-    indices
-    |> Enum.map(&Enum.at(args, &1))
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp arg_eq?(arg, expected) when is_binary(arg) and is_binary(expected),
-    do: ascii_eq_ignore_case?(arg, expected)
-
-  defp arg_eq?(_arg, _expected), do: false
 
   defp extension_commands do
     Extension.non_shadowing_commands()
   end
-
-  defp ascii_eq_ignore_case?(left, right) when byte_size(left) != byte_size(right), do: false
-  defp ascii_eq_ignore_case?(<<>>, <<>>), do: true
-
-  defp ascii_eq_ignore_case?(<<left, left_rest::binary>>, <<right, right_rest::binary>>) do
-    ascii_upper(left) == ascii_upper(right) and ascii_eq_ignore_case?(left_rest, right_rest)
-  end
-
-  defp ascii_upper(char) when char >= ?a and char <= ?z, do: char - 32
-  defp ascii_upper(char), do: char
 
   # Shared key extraction logic.
   defp extract_keys(first, last, step, args) do

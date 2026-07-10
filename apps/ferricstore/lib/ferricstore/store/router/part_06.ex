@@ -179,20 +179,50 @@ defmodule Ferricstore.Store.Router.Part06 do
           true ->
             case check_keydir_full(ctx, key) do
               :ok ->
-                0..(ctx.shard_count - 1)
-                |> Enum.reduce_while(:ok, fn idx, :ok ->
-                  case raft_write(ctx, idx, key, {:flow_policy_put, key, value, expire_at_ms}) do
-                    :ok -> {:cont, :ok}
-                    {:error, _reason} = error -> {:halt, error}
-                    other -> {:halt, other}
-                  end
-                end)
+                anchor_idx = 0
+                command = flow_policy_put_all_command(ctx, key, value, expire_at_ms)
+
+                ctx
+                |> raft_write(anchor_idx, "f:{flow-policy}:tx", command)
+                |> flow_policy_put_all_result(ctx, anchor_idx)
 
               {:error, _} = err ->
                 err
             end
         end
       end
+
+      defp flow_policy_put_all_command(ctx, key, value, expire_at_ms) do
+        shard_batches =
+          0..(ctx.shard_count - 1)
+          |> Enum.map(fn shard_idx ->
+            entry = {:flow_cross_policy_put, shard_idx, key, value, expire_at_ms}
+            {shard_idx, [{shard_idx, entry}], nil}
+          end)
+
+        {:cross_shard_tx, shard_batches}
+      end
+
+      defp flow_policy_put_all_result(results, ctx, anchor_idx) when is_map(results) do
+        expected_shards = Enum.to_list(0..(ctx.shard_count - 1))
+        exact_shards? = results |> Map.keys() |> Enum.sort() == expected_shards
+
+        if exact_shards? and Enum.all?(expected_shards, &(Map.get(results, &1) == [:ok])) do
+          Enum.each(expected_shards, fn
+            ^anchor_idx -> :ok
+            shard_idx -> bump_write_version(ctx, shard_idx)
+          end)
+
+          :ok
+        else
+          {:error, "ERR flow policy transaction returned incomplete shard results"}
+        end
+      end
+
+      defp flow_policy_put_all_result({:error, _reason} = error, _ctx, _anchor_idx), do: error
+
+      defp flow_policy_put_all_result(_other, _ctx, _anchor_idx),
+        do: {:error, "ERR flow policy transaction failed"}
 
       @doc false
       def flow_get(ctx, id, partition_key) when is_binary(id) do
@@ -682,10 +712,23 @@ defmodule Ferricstore.Store.Router.Part06 do
       defp flow_cross_shard_tx(ctx, keys, entry) do
         _route_keys = keys
 
+        command = flow_cross_shard_tx_command(ctx, entry)
+        anchor_idx = 0
+
+        result =
+          raft_write(ctx, anchor_idx, "f:{flow-cross-shard}:tx", command)
+
+        case result do
+          %{^anchor_idx => [reply]} -> reply
+          {:error, _reason} = error -> error
+          other -> other
+        end
+      end
+
+      defp flow_cross_shard_tx_command(ctx, entry) do
         # Flow child closure can discover additional child shards while applying
         # parent terminal policies, so take a conservative all-shard transaction.
         shards = Enum.to_list(0..(ctx.shard_count - 1))
-
         anchor_idx = hd(shards)
 
         shard_batches =
@@ -694,14 +737,7 @@ defmodule Ferricstore.Store.Router.Part06 do
             shard_idx -> {shard_idx, [], nil}
           end)
 
-        result =
-          raft_write(ctx, anchor_idx, "f:{flow-cross-shard}:tx", {:cross_shard_tx, shard_batches})
-
-        case result do
-          %{^anchor_idx => [reply]} -> reply
-          {:error, _reason} = error -> error
-          other -> other
-        end
+        {:cross_shard_tx, shard_batches}
       end
 
       defp flow_many_by_shard(ctx, attrs_list, command, _batch_id)

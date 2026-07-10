@@ -132,30 +132,38 @@ defmodule FerricStore.Pipe do
   def execute(%__MODULE__{commands: []}), do: []
 
   def execute(%__MODULE__{commands: commands}) do
-    ordered = Enum.reverse(commands)
-    ctx = FerricStore.Instance.get(:default)
+    with :ok <- authorize_commands(commands) do
+      ordered = Enum.reverse(commands)
+      ctx = FerricStore.Instance.get(:default)
 
-    case classify_batch(ordered) do
-      :all_gets ->
-        keys = Enum.map(ordered, fn {:get, k} -> k end)
-        values = Ferricstore.Store.Router.batch_get(ctx, keys)
-        pipeline_get_results(ctx, keys, values)
+      case classify_batch(ordered) do
+        :all_gets ->
+          keys = Enum.map(ordered, fn {:get, k} -> k end)
+          values = Ferricstore.Store.Router.batch_get(ctx, keys)
+          pipeline_get_results(ctx, keys, values)
 
-      :all_sets ->
-        kv_pairs = Enum.map(ordered, fn {:set, k, v, _opts} -> {k, v} end)
-        execute_batch_sets(ctx, ordered, kv_pairs)
+        :all_sets ->
+          kv_pairs = Enum.map(ordered, fn {:set, k, v, _opts} -> {k, v} end)
+          execute_batch_sets(ctx, ordered, kv_pairs)
 
-      {:mixed_get_set, _} ->
-        execute_mixed_get_set(ctx, ordered)
+        {:mixed_get_set, _} ->
+          execute_mixed_get_set(ctx, ordered)
 
-      :complex ->
-        queue = Enum.map(ordered, &to_resp_command/1)
-        raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+        :complex ->
+          queue = Enum.map(ordered, &to_resp_command/1)
+          raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
 
-        ordered
-        |> Enum.zip(raw_results)
-        |> Enum.map(fn {cmd, raw} -> normalize_result(cmd, raw) end)
+          ordered
+          |> Enum.zip(raw_results)
+          |> Enum.map(fn {cmd, raw} -> normalize_result(cmd, raw) end)
+      end
     end
+  end
+
+  defp authorize_commands(commands) do
+    commands
+    |> Enum.map(&elem(&1, 1))
+    |> Ferricstore.Flow.InternalKey.authorize_public()
   end
 
   defp classify_batch(commands) do

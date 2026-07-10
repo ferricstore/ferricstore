@@ -47,6 +47,39 @@ FerricFlow resolves retry policy in this order:
 | Command outcome | `retry(...)` can provide per-attempt error/result data. |
 | Default | Safe default behavior if no policy is installed. |
 
+## Maximum Active Runtime
+
+`max_active_ms` bounds the total non-terminal lifetime of a Flow, measured from
+`created_at_ms`. Queue wait, scheduled delay, running work, and retry backoff all
+count toward the same deadline.
+
+The value is type-level and must be between `1` and `31_536_000_000`
+milliseconds. It cannot be configured inside a state policy. A create command
+can override the type policy for one Flow, and `infinity` opts that Flow out.
+
+```text
+FLOW.POLICY.SET order MAX_ACTIVE_MS 300000
+FLOW.CREATE order-1 TYPE order STATE queued MAX_ACTIVE_MS 60000
+FLOW.CREATE order-no-deadline TYPE order STATE queued MAX_ACTIVE_MS INFINITY
+```
+
+```elixir
+FerricStore.flow_policy_set("order", max_active_ms: :timer.minutes(5))
+
+FerricStore.flow_create("order-1",
+  type: "order",
+  state: "queued",
+  max_active_ms: :timer.minutes(1)
+)
+```
+
+At or after the deadline, FerricFlow changes a non-terminal record to `failed`,
+clears its lease and due time, starts terminal retention, and records a `failed`
+history event with `reason: "max_active_ms"`. Claim and completion paths recheck
+the deadline, and the instance retention sweeper handles inactive and
+cold records. `FLOW.RETENTION_CLEANUP` reports these transitions as
+`active_timeouts` before using the remaining batch budget for terminal deletion.
+
 ## Python SDK
 
 ```python

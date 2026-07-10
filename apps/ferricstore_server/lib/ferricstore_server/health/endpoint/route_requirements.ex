@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   @moduledoc false
 
+  alias FerricstoreServer.Health.Dashboard.Flow.Schedules
   alias FerricstoreServer.Health.Endpoint.FlowPaths
 
   @type requirement :: {binary(), keyword()}
@@ -43,13 +44,13 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/flow/states" -> {"FLOW.LIST", []}
       "/dashboard/flow/workers" -> {"FLOW.LIST", []}
       "/dashboard/flow/due" -> {"FLOW.LIST", []}
-      "/dashboard/flow/schedules" -> {"FLOW.SCHEDULE.LIST", []}
+      "/dashboard/flow/schedules" -> {"FLOW.SCHEDULE.LIST", key: {"*", :read}}
       "/dashboard/flow/failures" -> flow_index_view_requirement("FLOW.FAILURES", query)
       "/dashboard/flow/lineage" -> flow_lineage_requirement(query)
       "/dashboard/flow/query" -> flow_query_requirement(query)
       "/dashboard/flow/signals" -> {"FLOW.HISTORY", []}
       "/dashboard/flow/policies" -> {"FLOW.POLICY.GET", []}
-      "/dashboard/flow/governance" -> {"FLOW.GOVERNANCE.OVERVIEW", []}
+      "/dashboard/flow/governance" -> {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
       "/dashboard/flow/retention" -> {"FLOW.LIST", []}
       "/dashboard/flow/config" -> {"CONFIG", []}
       "/dashboard/flow/projections" -> {"FLOW.LIST", []}
@@ -126,22 +127,29 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     end
   end
 
+  @spec flow_schedule_form_requirement(map()) :: requirement()
+  def flow_schedule_form_requirement(params) do
+    command = Schedules.form_command(params)
+    id = params |> Map.get("id", "") |> String.trim()
+
+    if id == "" do
+      {command, []}
+    else
+      {command, key: {id, :write}}
+    end
+  end
+
   @spec flow_reclaim_form_requirement(map()) :: requirement()
   def flow_reclaim_form_requirement(params) do
-    type =
-      params
-      |> Map.get("type", "")
-      |> String.trim()
-
     partition_key =
       params
       |> Map.get("partition_key", "")
       |> String.trim()
 
-    cond do
-      partition_key != "" -> {"FLOW.RECLAIM", key: {partition_key, :write}}
-      type != "" -> {"FLOW.RECLAIM", key: {type, :write}}
-      true -> {"FLOW.RECLAIM", []}
+    if partition_key == "" do
+      {"FLOW.RECLAIM", key: {"*", :write}}
+    else
+      {"FLOW.RECLAIM", key: {partition_key, :write}}
     end
   end
 
@@ -326,15 +334,10 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       |> Map.get("partition_key", "")
       |> String.trim()
 
-    type =
-      params
-      |> Map.get("type", "")
-      |> String.trim()
-
-    cond do
-      partition_key != "" -> {command, key: {partition_key, :read}}
-      type != "" -> {command, key: {type, :read}}
-      true -> {command, []}
+    if partition_key == "" do
+      {command, key: {"*", :read}}
+    else
+      {command, key: {partition_key, :read}}
     end
   rescue
     _ -> {command, []}
@@ -346,12 +349,12 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   defp flow_query_key_requirement(command, "history", key, _partition_key, _type),
     do: {command, key: {key, :read}}
 
-  defp flow_query_key_requirement(command, kind, _key, partition_key, type)
+  defp flow_query_key_requirement(command, kind, _key, partition_key, _type)
        when kind in ["failures", "list", "search", "stats", "stuck", "terminals"] do
-    cond do
-      partition_key != "" -> {command, key: {partition_key, :read}}
-      type != "" -> {command, key: {type, :read}}
-      true -> {command, []}
+    if partition_key == "" do
+      {command, key: {"*", :read}}
+    else
+      {command, key: {partition_key, :read}}
     end
   end
 

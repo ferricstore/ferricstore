@@ -36,6 +36,65 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     end
   end
 
+  test "every Flow command has a non-empty ACL scope" do
+    commands =
+      CommandCategories.categories()
+      |> Map.fetch!("ALL")
+      |> Enum.filter(&String.starts_with?(&1, "FLOW."))
+
+    for command <- commands do
+      {name, args} = parser_call(command)
+      assert {:ok, _upper, _parsed_args, _ast, keys} = NativeAstParser.parse(name, args)
+      refute keys == [], "expected #{command} to require an ACL scope"
+    end
+  end
+
+  test "Flow ACL extraction uses parsed options rather than matching option values" do
+    assert {:ok, "FLOW.CLAIM_DUE", _args,
+            {:flow_claim_due, "tenant:a:type", [worker: "PARTITION", lease_ms: 30_000]}, ["*"]} =
+             NativeAstParser.parse("FLOW.CLAIM_DUE", [
+               "tenant:a:type",
+               "WORKER",
+               "PARTITION",
+               "LEASE_MS",
+               "30000"
+             ])
+  end
+
+  test "Flow batch ACL extraction preserves mixed item partitions" do
+    assert {:ok, "FLOW.CANCEL_MANY", _args,
+            {:flow_cancel_many, nil,
+             [{:id, "tenant:a:flow", :partition_key, "tenant:b:partition", :fencing_token, 7}],
+             []}, ["tenant:b:partition"]} =
+             NativeAstParser.parse("FLOW.CANCEL_MANY", [
+               "MIXED",
+               "ITEMS",
+               "tenant:a:flow",
+               "tenant:b:partition",
+               "7"
+             ])
+  end
+
+  test "generic Flow command families expose their unambiguous ACL scopes" do
+    for {command, args, expected_keys} <- [
+          {"FLOW.STEP_CONTINUE", ["tenant:a:flow"], ["tenant:a:flow"]},
+          {"FLOW.START_AND_CLAIM", ["tenant:a:flow"], ["tenant:a:flow"]},
+          {"FLOW.SCHEDULE.GET", ["tenant:a:schedule"], ["tenant:a:schedule"]},
+          {"FLOW.APPROVAL.GET", ["tenant:a:approval"], ["tenant:a:approval"]},
+          {"FLOW.EFFECT.GET", ["tenant:a:flow"], ["tenant:a:flow"]},
+          {"FLOW.GOVERNANCE.LEDGER", ["tenant:a:flow"], ["tenant:a:flow"]},
+          {"FLOW.CIRCUIT.OPEN", ["tenant:a:scope"], ["tenant:a:scope"]},
+          {"FLOW.BUDGET.COMMIT", ["tenant:a:scope"], ["tenant:a:scope"]},
+          {"FLOW.LIMIT.SPEND", ["tenant:a:scope"], ["tenant:a:scope"]},
+          {"FLOW.SCHEDULE.FIRE_DUE", [], ["*"]},
+          {"FLOW.APPROVAL.LIST", [], ["*"]},
+          {"FLOW.GOVERNANCE.OVERVIEW", [], ["*"]}
+        ] do
+      assert {:ok, ^command, _parsed_args, _ast, ^expected_keys} =
+               NativeAstParser.parse(command, args)
+    end
+  end
+
   test "parses hot string command ASTs directly" do
     assert {:ok, "GET", ["k"], {:get, "k"}, ["k"]} = NativeAstParser.parse("get", ["k"])
 
@@ -88,6 +147,71 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              NativeAstParser.parse("bf.reserve", ["bf", "0.01", "1000"])
   end
 
+  test "merge commands expose destination and every source key" do
+    assert {:ok, "CMS.MERGE", _args, {:cms_merge, "cms:dest", ["cms:one", "cms:two"], [2, 3]},
+            ["cms:dest", "cms:one", "cms:two"]} =
+             NativeAstParser.parse("CMS.MERGE", [
+               "cms:dest",
+               "2",
+               "cms:one",
+               "cms:two",
+               "WEIGHTS",
+               "2",
+               "3"
+             ])
+
+    assert {:ok, "TDIGEST.MERGE", _args,
+            {:tdigest_merge, "tdigest:dest", ["tdigest:one", "tdigest:two"], [override: true]},
+            ["tdigest:dest", "tdigest:one", "tdigest:two"]} =
+             NativeAstParser.parse("TDIGEST.MERGE", [
+               "tdigest:dest",
+               "2",
+               "tdigest:one",
+               "tdigest:two",
+               "OVERRIDE"
+             ])
+  end
+
+  test "counted and variadic commands expose every data key" do
+    for {command, args, expected_keys} <- [
+          {"SINTERCARD", ["2", "set:one", "set:two", "LIMIT", "1"], ["set:one", "set:two"]},
+          {"PFCOUNT", ["hll:one", "hll:two"], ["hll:one", "hll:two"]}
+        ] do
+      assert {:ok, ^command, _parsed_args, _ast, ^expected_keys} =
+               NativeAstParser.parse(command, args)
+    end
+  end
+
+  test "subcommand operations expose the data key instead of the subcommand" do
+    for {command, args, expected_keys} <- [
+          {"OBJECT", ["ENCODING", "object:key"], ["object:key"]},
+          {"MEMORY", ["USAGE", "memory:key"], ["memory:key"]},
+          {"XINFO", ["STREAM", "stream:key"], ["stream:key"]},
+          {"XGROUP", ["CREATE", "stream:key", "group-1", "$", "MKSTREAM"], ["stream:key"]}
+        ] do
+      assert {:ok, ^command, _parsed_args, _ast, ^expected_keys} =
+               NativeAstParser.parse(command, args)
+    end
+  end
+
+  test "extra native operations expose their first key" do
+    for {command, args} <- [
+          {"CAS", ["native:key", "expected", "replacement"]},
+          {"LOCK", ["native:key", "owner", "100"]},
+          {"UNLOCK", ["native:key", "owner"]},
+          {"EXTEND", ["native:key", "owner", "100"]},
+          {"RATELIMIT.ADD", ["native:key", "100", "10"]},
+          {"KEY_INFO", ["native:key"]},
+          {"FERRICSTORE.KEY_INFO", ["native:key"]},
+          {"FETCH_OR_COMPUTE", ["native:key", "100", "hint"]},
+          {"FETCH_OR_COMPUTE_RESULT", ["native:key", "value", "100"]},
+          {"FETCH_OR_COMPUTE_ERROR", ["native:key", "error"]}
+        ] do
+      assert {:ok, ^command, _parsed_args, _ast, ["native:key"]} =
+               NativeAstParser.parse(command, args)
+    end
+  end
+
   test "parses Flow create claim terminal and query ASTs" do
     assert {:ok, "FLOW.CREATE", _args, {:flow_create, "flow-1", create_opts}, ["tenant-a"]} =
              NativeAstParser.parse("flow.create", [
@@ -129,7 +253,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
 
     assert create_opts[:max_active_ms] == :infinity
 
-    assert {:ok, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, "checkout", claim_opts}, ["checkout"]} =
+    assert {:ok, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, "checkout", claim_opts}, ["*"]} =
              NativeAstParser.parse("flow.claim_due", [
                "checkout",
                "WORKER",

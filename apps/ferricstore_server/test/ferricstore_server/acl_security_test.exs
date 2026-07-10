@@ -337,6 +337,26 @@ defmodule FerricstoreServer.AclSecurityTest do
       refute Acl.has_configured_users?()
     end
 
+    @tag :acl_protected_mode_scan
+    test "protected-mode connection checks do not materialize the ACL table" do
+      source =
+        __DIR__
+        |> Path.join("../../lib/ferricstore_server/acl/protection.ex")
+        |> Path.expand()
+        |> File.read!()
+
+      refute source =~ ":ets.tab2list",
+             "the per-connection protected-mode gate must not copy every ACL user"
+
+      refute source =~ ":ets.select",
+             "the per-connection protected-mode gate must not scan every ACL user"
+
+      assert source =~ "Tables.configured_user?(table)"
+
+      assert source =~
+               "protected_mode?() and not localhost?(peer) and not has_configured_users?()"
+    end
+
     test "localhost? recognizes IPv4 loopback" do
       assert Acl.localhost?({{127, 0, 0, 1}, 12_345})
     end
@@ -461,6 +481,24 @@ defmodule FerricstoreServer.AclSecurityTest do
 
       assert {:error, msg} = Acl.set_user("alice", ["on"])
       assert msg =~ "max ACL users reached"
+    end
+
+    @tag :acl_load_user_limit
+    test "ACL LOAD rejects snapshots above the user limit without replacing live users" do
+      Application.put_env(:ferricstore, :max_acl_users, 2)
+      assert :ok = Acl.set_user("kept", ["on", "nopass"])
+
+      contents = """
+      user default on nopass ~* &* +@all
+      user loaded-a on nopass ~* &* +@all
+      user loaded-b on nopass ~* &* +@all
+      """
+
+      assert {:error, message} = Acl.load_contents(contents)
+      assert message =~ "max ACL users reached"
+      assert Acl.get_user("kept") != nil
+      assert Acl.get_user("loaded-a") == nil
+      assert Acl.get_user("loaded-b") == nil
     end
   end
 

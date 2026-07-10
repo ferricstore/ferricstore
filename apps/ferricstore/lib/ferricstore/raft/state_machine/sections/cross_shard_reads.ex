@@ -106,23 +106,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         shard_idx =
           if instance_ctx, do: Router.shard_for(instance_ctx, key), else: anchor_state.shard_index
 
+        cross_shard_state_for_index(anchor_state, shard_idx, instance_ctx)
+      end
+
+      defp cross_shard_state_for_index(anchor_state, shard_idx)
+           when is_integer(shard_idx) and shard_idx >= 0 do
+        cross_shard_state_for_index(
+          anchor_state,
+          shard_idx,
+          cross_shard_instance_ctx(anchor_state)
+        )
+      end
+
+      defp cross_shard_state_for_index(anchor_state, shard_idx, instance_ctx) do
         ctx = cross_shard_ctx(anchor_state, shard_idx, anchor_state.data_dir, instance_ctx)
 
-        %{
-          anchor_state
-          | shard_index: ctx.index,
-            ets: ctx.keydir,
-            shard_data_path: ctx.shard_data_path,
-            shard_data_path_expanded: Path.expand(ctx.shard_data_path),
-            active_file_path: ctx.active_file_path,
-            active_file_id: ctx.active_file_id,
-            zset_score_index_name: ctx.zset_score_index_name,
-            zset_score_lookup_name: ctx.zset_score_lookup_name,
-            flow_index_name: ctx.flow_index_name,
-            flow_lookup_name: ctx.flow_lookup_name,
-            flow_lmdb_path: Ferricstore.Flow.LMDB.path(ctx.shard_data_path),
-            flow_lmdb_mirror?: false
-        }
+        Map.merge(anchor_state, %{
+          shard_index: ctx.index,
+          ets: ctx.keydir,
+          shard_data_path: ctx.shard_data_path,
+          shard_data_path_expanded: Path.expand(ctx.shard_data_path),
+          active_file_path: ctx.active_file_path,
+          active_file_id: ctx.active_file_id,
+          zset_score_index_name: ctx.zset_score_index_name,
+          zset_score_lookup_name: ctx.zset_score_lookup_name,
+          flow_index_name: ctx.flow_index_name,
+          flow_lookup_name: ctx.flow_lookup_name,
+          flow_lmdb_path: Ferricstore.Flow.LMDB.path(ctx.shard_data_path),
+          flow_lmdb_mirror?: false
+        })
       end
 
       defp cross_shard_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx} = state) do

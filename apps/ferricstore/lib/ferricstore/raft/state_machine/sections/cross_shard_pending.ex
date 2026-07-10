@@ -143,7 +143,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         Enum.reduce_while(successful_groups, {:ok, state}, fn group, {:ok, acc_state} ->
           {idx, file_path, file_id, keydir, entries} = cross_shard_successful_group_parts(group)
 
-          case cross_shard_compensation_batch(idx, keydir, file_path, entries, originals) do
+          case cross_shard_compensation_batch(
+                 acc_state,
+                 idx,
+                 keydir,
+                 file_path,
+                 entries,
+                 originals
+               ) do
             {:ok, []} ->
               {:cont, {:ok, acc_state}}
 
@@ -190,14 +197,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
            ),
            do: {idx, file_path, file_id, keydir, entries}
 
-      defp cross_shard_compensation_batch(idx, keydir, file_path, entries, originals) do
+      defp cross_shard_compensation_batch(state, idx, keydir, file_path, entries, originals) do
         entries
         |> Enum.map(&cross_shard_pending_key/1)
         |> Enum.uniq()
         |> Enum.reduce_while({:ok, []}, fn key, {:ok, acc} ->
           original = Map.get(originals, {keydir, key}, {idx, :missing})
 
-          case cross_shard_compensation_batch_entry(key, original, file_path) do
+          case cross_shard_compensation_batch_entry(state, key, original, file_path) do
             {:ok, batch_entries} -> {:cont, {:ok, [batch_entries | acc]}}
             {:error, reason} -> {:halt, {:error, reason}}
           end
@@ -215,11 +222,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
       defp cross_shard_pending_key({:delete, _idx, _keydir, _file_path, _file_id, key}), do: key
 
-      defp cross_shard_compensation_batch_entry(key, {_idx, :missing}, _file_path) do
+      defp cross_shard_compensation_batch_entry(_state, key, {_idx, :missing}, _file_path) do
         {:ok, [{:delete, key, nil}]}
       end
 
       defp cross_shard_compensation_batch_entry(
+             _state,
              key,
              {_idx,
               {:entry, {original_key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}}},
@@ -230,16 +238,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       end
 
       defp cross_shard_compensation_batch_entry(
+             state,
              key,
-             {_idx,
+             {idx,
               {:entry, {original_key, nil, expire_at_ms, _lfu, file_id, offset, _value_size}}},
              file_path
            )
            when original_key == key do
-        shard_data_path = Path.dirname(file_path)
-        old_path = sm_file_path_from_path(shard_data_path, file_id)
-
-        case ColdRead.pread_keyed(old_path, offset, key, @cold_read_timeout_ms) do
+        case cross_shard_compensation_read(state, idx, file_path, file_id, offset, key) do
           {:ok, value} when is_binary(value) ->
             {:ok, [{:put, key, value, expire_at_ms}]}
 
@@ -251,8 +257,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         end
       end
 
-      defp cross_shard_compensation_batch_entry(key, original, _file_path),
+      defp cross_shard_compensation_batch_entry(_state, key, original, _file_path),
         do: {:error, {:compensation_original_mismatch, key, original}}
+
+      defp cross_shard_compensation_read(_state, _idx, file_path, file_id, offset, key)
+           when is_integer(file_id) and file_id >= 0 do
+        shard_data_path = Path.dirname(file_path)
+        old_path = sm_file_path_from_path(shard_data_path, file_id)
+        ColdRead.pread_keyed(old_path, offset, key, @cold_read_timeout_ms)
+      end
+
+      defp cross_shard_compensation_read(state, idx, _file_path, file_id, _offset, key)
+           when is_tuple(file_id) do
+        ctx = cross_shard_compensation_reader_ctx(state)
+
+        Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
+          ctx,
+          idx,
+          file_id,
+          key
+        )
+      end
+
+      defp cross_shard_compensation_read(_state, _idx, _file_path, file_id, _offset, _key),
+        do: {:error, {:invalid_file_id, file_id}}
+
+      defp cross_shard_compensation_reader_ctx(%{instance_ctx: %{data_dir: data_dir}})
+           when is_binary(data_dir),
+           do: %{data_dir: data_dir}
+
+      defp cross_shard_compensation_reader_ctx(%{data_dir: data_dir}) when is_binary(data_dir),
+        do: %{data_dir: data_dir}
 
       defp record_cross_shard_pending_original(ctx, key) do
         originals = Process.get(:sm_cross_shard_pending_originals, %{})

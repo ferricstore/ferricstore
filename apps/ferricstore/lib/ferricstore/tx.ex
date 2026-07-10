@@ -121,12 +121,20 @@ defmodule FerricStore.Tx do
   def execute(%__MODULE__{commands: []}), do: []
 
   def execute(%__MODULE__{commands: commands}) do
-    queue =
-      commands
-      |> Enum.reverse()
-      |> Enum.map(&to_resp_command/1)
+    with :ok <- authorize_commands(commands) do
+      queue =
+        commands
+        |> Enum.reverse()
+        |> Enum.map(&to_resp_command/1)
 
-    Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+      Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+    end
+  end
+
+  defp authorize_commands(commands) do
+    commands
+    |> Enum.map(&elem(&1, 1))
+    |> Ferricstore.Flow.InternalKey.authorize_public()
   end
 
   defp to_resp_command({:set, key, value, opts}) do

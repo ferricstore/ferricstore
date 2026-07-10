@@ -105,11 +105,15 @@ defmodule FerricStore.API.System do
     * `{:ok, results}` - a list of results for each piped command, in order.
 
   """
-  @spec pipeline((FerricStore.Pipe.t() -> FerricStore.Pipe.t())) :: {:ok, [term()]}
+  @spec pipeline((FerricStore.Pipe.t() -> FerricStore.Pipe.t())) ::
+          {:ok, [term()]} | write_error()
   def pipeline(fun) when is_function(fun, 1) do
     pipe = fun.(FerricStore.Pipe.new())
-    results = FerricStore.Pipe.execute(pipe)
-    {:ok, results}
+
+    case FerricStore.Pipe.execute(pipe) do
+      {:error, _reason} = error -> error
+      results -> {:ok, results}
+    end
   end
 
   @doc """
@@ -118,10 +122,12 @@ defmodule FerricStore.API.System do
   Goes directly to `Router.batch_get` — single HLC timestamp, zero GenServer,
   zero Pipe struct overhead. Designed for erpc callers.
   """
-  @spec batch_get([binary()]) :: [binary() | nil]
+  @spec batch_get([binary()]) :: [binary() | nil] | write_error()
   def batch_get(keys) when is_list(keys) do
-    ctx = FerricStore.Instance.get(:default)
-    Ferricstore.Store.Router.batch_get(ctx, keys)
+    with :ok <- Ferricstore.Flow.InternalKey.authorize_public(keys) do
+      ctx = FerricStore.Instance.get(:default)
+      Ferricstore.Store.Router.batch_get(ctx, keys)
+    end
   end
 
   @doc """
@@ -134,13 +140,16 @@ defmodule FerricStore.API.System do
   One flat binary over distribution instead of a list of N binaries —
   eliminates per-element external term format encoding.
   """
-  @spec packed_batch_get(binary()) :: binary()
+  @spec packed_batch_get(binary()) :: binary() | write_error()
   def packed_batch_get(packed_keys) when is_binary(packed_keys) do
     ctx = FerricStore.Instance.get(:default)
     <<count::32, rest::binary>> = packed_keys
     keys = unpack_keys(rest, count, [])
-    values = Ferricstore.Store.Router.batch_get(ctx, keys)
-    pack_values(values, [])
+
+    with :ok <- Ferricstore.Flow.InternalKey.authorize_public(keys) do
+      values = Ferricstore.Store.Router.batch_get(ctx, keys)
+      pack_values(values, [])
+    end
   end
 
   defp unpack_keys(_rest, 0, acc), do: Enum.reverse(acc)
@@ -164,9 +173,14 @@ defmodule FerricStore.API.System do
 
   Routes through `Router.batch_quorum_put`. Designed for erpc callers.
   """
-  @spec batch_set([{binary(), binary()}]) :: [:ok | write_error()]
+  @spec batch_set([{binary(), binary()}]) :: [:ok | write_error()] | write_error()
   def batch_set(kv_pairs) when is_list(kv_pairs) do
-    ctx = FerricStore.Instance.get(:default)
-    Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
+    with :ok <-
+           kv_pairs
+           |> FerricStore.API.PublicAccess.pair_keys()
+           |> Ferricstore.Flow.InternalKey.authorize_public() do
+      ctx = FerricStore.Instance.get(:default)
+      Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
+    end
   end
 end

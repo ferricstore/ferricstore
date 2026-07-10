@@ -6,7 +6,8 @@ defmodule FerricstoreServer.Application do
 
     * Ferric native protocol TCP listener (`FerricstoreServer.Native.Listener`)
     * Ferric native protocol TLS listener (`FerricstoreServer.Native.TlsListener`) -- optional
-    * HTTP health/metrics endpoint (`FerricstoreServer.Health.Endpoint`)
+    * HTTP dashboard/metrics endpoint (`FerricstoreServer.Health.Endpoint`)
+    * Isolated liveness/readiness endpoint (`FerricstoreServer.Health.ProbeEndpoint`)
 
   This application depends on `:ferricstore` (the core engine). It injects
   server-specific callbacks (connected clients count, RSS tracking, server
@@ -16,6 +17,8 @@ defmodule FerricstoreServer.Application do
 
   use Application
 
+  alias FerricstoreServer.Native.Connection.FrameBuffer
+
   require Logger
 
   @impl true
@@ -24,6 +27,11 @@ defmodule FerricstoreServer.Application do
 
     native_port = Application.get_env(:ferricstore, :native_port, 6388)
     health_port = Application.get_env(:ferricstore, :health_port, 4000)
+    health_probe_port = Application.get_env(:ferricstore, :health_probe_port, 4001)
+
+    :ferricstore
+    |> Application.get_env(:native_max_frame_bytes, 16 * 1024 * 1024)
+    |> FrameBuffer.validate_max_frame_bytes!()
 
     configure_management_adapters()
     FerricstoreServer.Connection.Registry.init_table()
@@ -31,11 +39,16 @@ defmodule FerricstoreServer.Application do
     children =
       [
         FerricstoreServer.Acl,
+        FerricstoreServer.AuthRateLimiter,
+        FerricstoreServer.Health.Dashboard.StorageSnapshotCache,
         pg_child_spec(),
         native_listener_spec(native_port)
       ] ++
         native_tls_listener_children() ++
-        [FerricstoreServer.Health.Endpoint.child_spec(health_port)]
+        [
+          FerricstoreServer.Health.Endpoint.child_spec(health_port),
+          FerricstoreServer.Health.ProbeEndpoint.child_spec(health_probe_port)
+        ]
 
     opts = [
       strategy: :one_for_one,

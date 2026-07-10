@@ -7,6 +7,8 @@ defmodule FerricstoreServer.Native.Listener do
 
   @listener_ref __MODULE__
 
+  alias FerricstoreServer.Native.Connection.FrameBuffer
+
   @spec ref() :: atom()
   def ref, do: @listener_ref
 
@@ -33,13 +35,16 @@ defmodule FerricstoreServer.Native.Listener do
       ]
     }
 
+    max_frame_bytes =
+      opts
+      |> Keyword.get(
+        :max_frame_bytes,
+        Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024)
+      )
+      |> FrameBuffer.validate_max_frame_bytes!()
+
     protocol_opts = %{
-      max_frame_bytes:
-        Keyword.get(
-          opts,
-          :max_frame_bytes,
-          Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024)
-        ),
+      max_frame_bytes: max_frame_bytes,
       max_lanes:
         Keyword.get(
           opts,

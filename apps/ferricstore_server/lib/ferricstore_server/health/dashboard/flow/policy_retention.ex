@@ -14,14 +14,31 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   @flow_dashboard_retention_default_limit 100
   @flow_dashboard_retention_max_limit 10_000
   @flow_dashboard_retention_candidate_preview_limit 100
+  @flow_policy_max_active_ms 31_536_000_000
   @flow_terminal_states ~w(completed failed cancelled)
 
   def collect_policies_page(opts \\ []) when is_list(opts) do
     records = collect_flow_records_sample(@flow_dashboard_sample_limit)
-    active_types = flow_available_types(records)
+    acl_username = DashboardAccess.keyspace_acl_username(opts)
+
+    active_types =
+      records
+      |> flow_available_types()
+      |> filter_flow_policy_types_for_acl(acl_username)
+
     policy_scan = collect_flow_policy_type_scan(@flow_dashboard_policy_scan_limit)
-    configured_types = Map.get(policy_scan, :types, MapSet.new())
-    edit_type = opts |> Keyword.get(:edit_type, "") |> flow_policy_clean_form_value()
+
+    configured_types =
+      policy_scan
+      |> Map.get(:types, MapSet.new())
+      |> filter_flow_policy_types_for_acl(acl_username)
+      |> MapSet.new()
+
+    edit_type =
+      opts
+      |> Keyword.get(:edit_type, "")
+      |> flow_policy_clean_form_value()
+      |> authorized_flow_policy_edit_type(acl_username)
 
     types =
       active_types
@@ -39,7 +56,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       configured_types: MapSet.size(configured_types),
       total_sampled: length(records),
       sample_limit: @flow_dashboard_sample_limit,
-      policy_scan: Map.delete(policy_scan, :types),
+      policy_scan: flow_policy_scan_metadata(policy_scan, acl_username),
       generated_at_ms: System.system_time(:millisecond)
     }
   end
@@ -50,9 +67,19 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
          {:ok, mode} <- flow_policy_form_mode(params),
          {:ok, retry} <- flow_policy_form_retry_opts(params),
          {:ok, retention} <- flow_policy_form_retention_opts(params),
+         {:ok, max_active_ms} <- flow_policy_form_max_active_ms(params),
          {:ok, indexes} <- flow_policy_form_index_opts(params),
          {:ok, existing_opts} <- flow_policy_existing_set_opts(type),
-         opts = flow_policy_merge_form_opts(existing_opts, state, mode, retry, retention, indexes),
+         opts =
+           flow_policy_merge_form_opts(
+             existing_opts,
+             state,
+             mode,
+             retry,
+             retention,
+             max_active_ms,
+             indexes
+           ),
          {:ok, _policy} <- FerricStore.flow_policy_set(type, opts) do
       {:ok, type}
     else
@@ -91,29 +118,48 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       flow_retention_limit!(Keyword.get(opts, :limit, @flow_dashboard_retention_default_limit))
 
     sampled_records = collect_flow_records_sample(@flow_dashboard_sample_limit)
+    acl_username = DashboardAccess.keyspace_acl_username(opts)
 
     records =
       DashboardAccess.filter_flow_records_for_acl(
         sampled_records,
-        DashboardAccess.keyspace_acl_username(opts)
+        acl_username
       )
 
-    candidates = flow_retention_candidates(records, now_ms)
+    restricted_metrics? = is_binary(acl_username)
+
+    terminal_candidates = flow_retention_candidates(records, now_ms)
+    active_timeout_candidates = flow_active_timeout_candidates(records, now_ms)
     terminal_sampled = Enum.count(records, &flow_retention_terminal_record?/1)
+    preview_limit = min(limit, @flow_dashboard_retention_candidate_preview_limit)
+    active_timeout_preview = Enum.take(active_timeout_candidates, preview_limit)
+
+    terminal_preview =
+      Enum.take(terminal_candidates, max(preview_limit - length(active_timeout_preview), 0))
 
     %{
       now_ms: now_ms,
       limit: limit,
       sample_limit: @flow_dashboard_sample_limit,
-      total_sampled: length(sampled_records),
+      total_sampled: if(restricted_metrics?, do: length(records), else: length(sampled_records)),
       filtered_sampled: length(records),
       terminal_sampled: terminal_sampled,
       active_sampled: max(length(records) - terminal_sampled, 0),
-      eligible_sampled: length(candidates),
-      candidates:
-        candidates |> Enum.take(min(limit, @flow_dashboard_retention_candidate_preview_limit)),
-      storage: Operational.collect_storage_summary(),
-      projection: FerricstoreServer.Health.Dashboard.collect_flow_projection_health(),
+      eligible_sampled: length(active_timeout_candidates) + length(terminal_candidates),
+      active_timeout_eligible_sampled: length(active_timeout_candidates),
+      terminal_eligible_sampled: length(terminal_candidates),
+      active_timeout_candidates: active_timeout_preview,
+      candidates: terminal_preview,
+      storage:
+        if(restricted_metrics?,
+          do: %{restricted: true},
+          else: Operational.collect_storage_summary()
+        ),
+      projection:
+        if(restricted_metrics?,
+          do: %{restricted: true},
+          else: FerricstoreServer.Health.Dashboard.collect_flow_projection_health()
+        ),
       flash: Keyword.get(opts, :flash),
       generated_at_ms: now_ms
     }
@@ -164,6 +210,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
           message: "Cleanup completed",
           limit: flow_retention_limit!(Map.get(params, "limit")),
           counts: %{
+            active_timeouts: flow_retention_query_integer(params, "active_timeouts"),
             flows: flow_retention_query_integer(params, "flows"),
             history: flow_retention_query_integer(params, "history"),
             values: flow_retention_query_integer(params, "values")
@@ -315,6 +362,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
           source: source,
           retry: Map.get(policy, :retry, %{}),
           retention: Map.get(policy, :retention, %{}),
+          max_active_ms: flow_policy_field(policy, :max_active_ms, nil),
           indexed_attributes: Map.get(policy, :indexed_attributes, []),
           indexed_state_meta: Map.get(policy, :indexed_state_meta),
           states: flow_policy_state_rows(Map.get(policy, :states, %{})),
@@ -327,6 +375,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
           source: source,
           retry: %{},
           retention: %{},
+          max_active_ms: nil,
           states: [],
           error: reason
         }
@@ -350,6 +399,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       source: flow_policy_source(type, configured_types),
       retry: %{},
       retention: %{},
+      max_active_ms: nil,
       states: [],
       error: error
     }
@@ -374,6 +424,33 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   @spec maybe_include_policy_edit_type([binary()], binary()) :: [binary()]
   defp maybe_include_policy_edit_type(types, ""), do: types
   defp maybe_include_policy_edit_type(types, type), do: [type | types]
+
+  defp filter_flow_policy_types_for_acl(types, nil), do: Enum.to_list(types)
+
+  defp filter_flow_policy_types_for_acl(types, username) do
+    Enum.filter(types, &flow_policy_type_read_allowed?(&1, username))
+  end
+
+  defp authorized_flow_policy_edit_type("", _username), do: ""
+  defp authorized_flow_policy_edit_type(type, nil), do: type
+
+  defp authorized_flow_policy_edit_type(type, username) do
+    if flow_policy_type_read_allowed?(type, username), do: type, else: ""
+  end
+
+  defp flow_policy_type_read_allowed?(type, username) do
+    case FerricstoreServer.Acl.check_key_access(username, type, :read) do
+      :ok -> true
+      {:error, _reason} -> false
+    end
+  rescue
+    _error -> false
+  catch
+    :exit, _reason -> false
+  end
+
+  defp flow_policy_scan_metadata(policy_scan, nil), do: Map.delete(policy_scan, :types)
+  defp flow_policy_scan_metadata(_policy_scan, _username), do: %{restricted: true}
 
   @spec flow_policy_editor_data(binary() | nil) :: map()
   defp flow_policy_editor_data(type) do
@@ -412,6 +489,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       max_ms: flow_policy_field(backoff, :max_ms, 30_000),
       jitter_pct: flow_policy_field(backoff, :jitter_pct, 20),
       exhausted_to: flow_policy_field(retry, :exhausted_to, "failed"),
+      max_active_ms: flow_policy_field(policy, :max_active_ms, nil) || "",
       retention_ttl_ms: flow_policy_field(retention, :ttl_ms, 604_800_000),
       history_max_events: flow_policy_field(retention, :history_max_events, 100_000)
     }
@@ -421,6 +499,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   defp flow_policy_default_response(type) do
     %{
       type: type,
+      max_active_ms: nil,
       retry: Ferricstore.Flow.RetryPolicy.default(),
       retention:
         Ferricstore.Flow.RetryPolicy.default_retention()
@@ -453,6 +532,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     |> flow_policy_maybe_put_opt(
       :indexed_attributes,
       flow_policy_field(policy, :indexed_attributes, [])
+    )
+    |> flow_policy_maybe_put_opt(
+      :max_active_ms,
+      flow_policy_field(policy, :max_active_ms, nil)
     )
     |> flow_policy_maybe_put_opt(
       :indexed_state_meta,
@@ -513,13 +596,23 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
           atom(),
           keyword(),
           keyword(),
+          :preserve | {:set, pos_integer() | nil},
           keyword()
         ) ::
           keyword()
-  defp flow_policy_merge_form_opts(existing_opts, nil, _mode, retry, retention, indexes) do
+  defp flow_policy_merge_form_opts(
+         existing_opts,
+         nil,
+         _mode,
+         retry,
+         retention,
+         max_active_ms,
+         indexes
+       ) do
     existing_opts
     |> Keyword.put(:retry, retry)
     |> Keyword.put(:retention, retention)
+    |> flow_policy_apply_max_active_action(max_active_ms)
     |> flow_policy_apply_index_action(
       :indexed_attributes,
       Keyword.get(indexes, :indexed_attributes, :preserve)
@@ -530,8 +623,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     )
   end
 
-  defp flow_policy_merge_form_opts(existing_opts, state, mode, retry, retention, _indexes)
+  defp flow_policy_merge_form_opts(
+         existing_opts,
+         state,
+         mode,
+         retry,
+         retention,
+         max_active_ms,
+         _indexes
+       )
        when is_binary(state) do
+    existing_opts = flow_policy_apply_max_active_action(existing_opts, max_active_ms)
+
     states =
       existing_opts
       |> Keyword.get(:states, [])
@@ -575,6 +678,46 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
          history_max_events: history_max_events
        ]}
     end
+  end
+
+  @spec flow_policy_form_max_active_ms(map()) ::
+          {:ok, :preserve | {:set, pos_integer() | nil}} | {:error, binary()}
+  defp flow_policy_form_max_active_ms(params) do
+    if Map.has_key?(params, "max_active_ms") do
+      params
+      |> Map.get("max_active_ms")
+      |> flow_policy_parse_max_active_ms()
+    else
+      {:ok, :preserve}
+    end
+  end
+
+  defp flow_policy_parse_max_active_ms(value) when is_integer(value) do
+    if value > 0 and value <= @flow_policy_max_active_ms do
+      {:ok, {:set, value}}
+    else
+      flow_policy_max_active_ms_error()
+    end
+  end
+
+  defp flow_policy_parse_max_active_ms(value) when is_binary(value) do
+    case value |> String.trim() |> String.downcase() do
+      value when value in ["", "infinity", "unlimited"] ->
+        {:ok, {:set, nil}}
+
+      value ->
+        case Integer.parse(value) do
+          {integer, ""} -> flow_policy_parse_max_active_ms(integer)
+          _ -> flow_policy_max_active_ms_error()
+        end
+    end
+  end
+
+  defp flow_policy_parse_max_active_ms(_value), do: flow_policy_max_active_ms_error()
+
+  defp flow_policy_max_active_ms_error do
+    {:error,
+     "ERR flow max_active_ms must be between 1 and #{@flow_policy_max_active_ms} or infinity"}
   end
 
   @spec flow_policy_form_mode(map()) :: {:ok, :parallel | :fifo} | {:error, binary()}
@@ -699,6 +842,14 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
   defp flow_policy_apply_index_action(opts, key, {:set, value}), do: Keyword.put(opts, key, value)
 
+  defp flow_policy_apply_max_active_action(opts, :preserve), do: opts
+
+  defp flow_policy_apply_max_active_action(opts, {:set, nil}),
+    do: Keyword.delete(opts, :max_active_ms)
+
+  defp flow_policy_apply_max_active_action(opts, {:set, value}),
+    do: Keyword.put(opts, :max_active_ms, value)
+
   defp flow_policy_maybe_put_index_action(opts, _key, :preserve), do: opts
   defp flow_policy_maybe_put_index_action(opts, key, action), do: Keyword.put(opts, key, action)
 
@@ -746,6 +897,35 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
     |> Enum.sort_by(&flow_retention_until_ms/1, :asc)
   end
 
+  @spec flow_active_timeout_candidates([map()], integer()) :: [map()]
+  defp flow_active_timeout_candidates(records, now_ms) do
+    records
+    |> Enum.filter(&flow_active_timeout_candidate?(&1, now_ms))
+    |> Enum.sort_by(&flow_active_timeout_at_ms/1, :asc)
+  end
+
+  @spec flow_active_timeout_candidate?(map(), integer()) :: boolean()
+  defp flow_active_timeout_candidate?(record, now_ms) do
+    not flow_retention_terminal_record?(record) and
+      case flow_active_timeout_at_ms(record) do
+        timeout_at_ms when is_integer(timeout_at_ms) -> timeout_at_ms <= now_ms
+        _ -> false
+      end
+  end
+
+  @spec flow_active_timeout_at_ms(map()) :: integer() | nil
+  defp flow_active_timeout_at_ms(record) do
+    case {flow_first_integer(record, [:created_at_ms]),
+          flow_first_integer(record, [:max_active_ms])} do
+      {created_at_ms, max_active_ms}
+      when is_integer(created_at_ms) and is_integer(max_active_ms) and max_active_ms > 0 ->
+        created_at_ms + max_active_ms
+
+      _ ->
+        nil
+    end
+  end
+
   @spec flow_retention_candidate?(map(), integer()) :: boolean()
   defp flow_retention_candidate?(record, now_ms) do
     case flow_retention_until_ms(record) do
@@ -777,6 +957,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   defp flow_retention_cleanup_counts(result, limit) do
     %{
       limit: limit,
+      active_timeouts: flow_retention_count(result, :active_timeouts),
       flows: flow_retention_count(result, :flows),
       history: flow_retention_count(result, :history),
       values: flow_retention_count(result, :values)

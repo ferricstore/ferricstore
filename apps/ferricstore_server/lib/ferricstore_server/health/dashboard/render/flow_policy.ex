@@ -38,6 +38,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       max_ms: flow_policy_field(backoff, :max_ms, 30_000),
       jitter_pct: flow_policy_field(backoff, :jitter_pct, 20),
       exhausted_to: flow_policy_field(retry, :exhausted_to, "failed"),
+      max_active_ms: flow_policy_field(policy, :max_active_ms, nil) || "",
       retention_ttl_ms: flow_policy_field(retention, :ttl_ms, 604_800_000),
       history_max_events: flow_policy_field(retention, :history_max_events, 100_000)
     }
@@ -51,6 +52,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     flash = render_flow_policy_flash(Map.get(data, :flash))
     indexed_attributes = Map.get(editor, :indexed_attributes) || ""
     indexed_state_meta = Map.get(editor, :indexed_state_meta) || ""
+    max_active_ms = Map.get(editor, :max_active_ms) || ""
 
     """
     <div id="flow-policy-editor" class="flow-policy-panel">
@@ -103,6 +105,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
             <input class="flow-search-input mono" type="text" name="exhausted_to" value="#{escape_attr(editor.exhausted_to)}" autocomplete="off" required title="Terminal state used when retry attempts are exhausted">
           </label>
           <label class="flow-policy-field">
+            <span>Max active ms</span>
+            <input class="flow-search-input mono" type="number" name="max_active_ms" min="1" max="31536000000" value="#{escape_attr(to_string(max_active_ms))}" placeholder="unlimited" title="Maximum runtime for new active Flow records; leave blank for unlimited">
+          </label>
+          <label class="flow-policy-field">
             <span>Retention ttl ms</span>
             <input class="flow-search-input mono" type="number" name="retention_ttl_ms" min="1" value="#{editor.retention_ttl_ms}" required title="How long terminal state, history, and generated values are retained">
           </label>
@@ -144,6 +150,12 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     indexed_attributes = Map.get(editor, :indexed_attributes) || ""
     indexed_state_meta = Map.get(editor, :indexed_state_meta) || ""
 
+    max_active =
+      case Map.get(editor, :max_active_ms) do
+        value when is_integer(value) and value > 0 -> format_duration_ms(value)
+        _ -> "unlimited"
+      end
+
     """
     <div class="flow-policy-preview">
       <div class="flow-policy-preview-title">Review before saving</div>
@@ -151,6 +163,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       <div>State mode: <span class="mono">#{escape(mode)}</span>. FIFO requires every entering Flow to carry a partition key and rejects priority.</div>
       <div>Indexes: attributes <span class="mono">#{escape(if(indexed_attributes == "", do: "-", else: indexed_attributes))}</span>, state meta <span class="mono">#{escape(if(indexed_state_meta == "", do: "-", else: indexed_state_meta))}</span></div>
       <div>Retry: #{format_number(Map.get(editor, :max_retries, 0))} attempts, #{escape(to_string(Map.get(editor, :backoff_kind, :exponential)))} backoff, exhausted to <span class="mono">#{escape(to_string(Map.get(editor, :exhausted_to, "failed")))}</span></div>
+      <div>Max active: <span class="mono">#{escape(max_active)}</span> for each new Flow record of this type.</div>
       <div>Retention: keep terminal Flow records for #{escape(ttl)} and retain up to #{history} history events before cleanup.</div>
       <div class="flow-filter-note">Requires +FLOW.POLICY.SET. The save operation writes durable policy config; active Flow records keep their current state.</div>
     </div>
@@ -206,6 +219,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
           "Controls how long terminal Flow state, history, and generated values are retained."
       },
       %{
+        command: "FLOW.POLICY.SET <type> MAX_ACTIVE_MS <ms|INFINITY>",
+        scope: "Flow type",
+        mutability: "read-write",
+        notes:
+          "Sets the maximum runtime copied onto new Flow records. INFINITY disables active runtime expiry."
+      },
+      %{
         command: "FLOW.POLICY.SET <type> STATE <state> MODE FIFO|PARALLEL",
         scope: "Flow state",
         mutability: "read-write",
@@ -223,7 +243,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         scope: "Flow type",
         mutability: "read-only",
         notes:
-          "Reads the effective retry and retention policy, including defaults and state overrides."
+          "Reads the effective active-runtime, retry, and retention policy, including state overrides."
       }
     ]
   end
@@ -234,7 +254,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         [] ->
           """
           <tr>
-            <td colspan="9" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
+            <td colspan="10" class="c-muted">No Flow types or policy overrides found in the current sample.</td>
           </tr>
           """
 
@@ -256,6 +276,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
           <th>Retries</th>
           <th>Backoff</th>
           <th>Exhausted To</th>
+          <th>Max Active</th>
           <th>Retention</th>
           <th>State Overrides</th>
           <th>Actions</th>
@@ -265,6 +286,14 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         #{rows}
       </tbody>
     </table>
+    """
+  end
+
+  def render_flow_policy_scan_note(%{restricted: true}) do
+    """
+    <div class="flow-help">
+      Shows effective policies limited to authorized Flow types discovered by the bounded policy scan.
+    </div>
     """
   end
 
@@ -292,7 +321,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
     <tr>
       <td class="mono">#{escape(row.type)}</td>
       <td><span class="badge badge-pressure">error</span></td>
-      <td colspan="7" class="c-red">#{escape(error)}</td>
+      <td colspan="8" class="c-red">#{escape(error)}</td>
     </tr>
     """
   end
@@ -309,6 +338,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
       <td>#{format_number(flow_policy_field(retry, :max_retries, 0))}</td>
       <td>#{escape(flow_policy_backoff_summary(flow_policy_field(retry, :backoff, %{})))}</td>
       <td class="mono">#{escape(to_string(flow_policy_field(retry, :exhausted_to, "failed")))}</td>
+      <td>#{escape(flow_policy_max_active_summary(Map.get(row, :max_active_ms)))}</td>
       <td>#{escape(flow_policy_retention_summary(retention))}</td>
       <td>#{render_flow_policy_state_overrides(Map.get(row, :states, []))}</td>
       <td><a class="flow-search-button flow-policy-action" href="#{flow_policy_edit_url(row.type)}">Edit</a></td>
@@ -379,6 +409,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
 
   def flow_policy_retention_summary(_retention), do: "-"
 
+  def flow_policy_max_active_summary(value) when is_integer(value) and value > 0,
+    do: format_duration_ms(value)
+
+  def flow_policy_max_active_summary(_value), do: "unlimited"
+
   def render_flow_policy_indexes(row) do
     attrs =
       row
@@ -422,6 +457,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
   defp flow_policy_default_response(type) do
     %{
       type: type,
+      max_active_ms: nil,
       retry: Ferricstore.Flow.RetryPolicy.default(),
       retention:
         Ferricstore.Flow.RetryPolicy.default_retention()

@@ -72,7 +72,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       filters: filters,
       result:
         flow_query_execute(filters)
-        |> DashboardAccess.flow_query_filter_result_for_acl(acl_username),
+        |> DashboardAccess.flow_query_filter_result_for_acl(
+          acl_username,
+          flow_query_acl_scope(filters)
+        ),
       available_types: flow_available_types(sampled_records),
       total_sampled: length(sampled_records),
       sample_limit: @flow_dashboard_sample_limit,
@@ -121,6 +124,17 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   def query_opts_from_query(_query), do: []
+
+  defp flow_query_acl_scope(filters) when is_map(filters) do
+    partition_key = Map.get(filters, :partition_key)
+    id = Map.get(filters, :id)
+
+    cond do
+      is_binary(partition_key) and partition_key != "" -> partition_key
+      Map.get(filters, :kind) == "history" and is_binary(id) and id != "" -> id
+      true -> "*"
+    end
+  end
 
   @spec collect_signals_page(keyword()) :: map()
   def collect_signals_page(opts \\ []) when is_list(opts) do

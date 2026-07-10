@@ -520,6 +520,18 @@ FerricStore.flow_policy_set("billing", states: ...)
 Command-local retry policy still wins over stored policy. This is useful when
 you want production defaults set once at boot.
 
+Install a type-level maximum active runtime through `install_policy/1`, or
+override it on one create call:
+
+```elixir
+BillingFlow.install_policy(max_active_ms: :timer.minutes(10))
+BillingFlow.create(attrs, max_active_ms: :timer.minutes(2))
+BillingFlow.create(attrs, max_active_ms: :infinity)
+```
+
+The deadline starts at Flow creation and includes queue wait, scheduled delay,
+running work, and retry backoff. It is not a per-state setting.
+
 ## Optional Worker
 
 You may use your own cron, Oban, Broadway, GenServer loop, or Kubernetes job.

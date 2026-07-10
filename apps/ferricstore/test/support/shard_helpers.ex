@@ -95,6 +95,14 @@ defmodule Ferricstore.Test.ShardHelpers do
     flush_timeout = 30_000
     ready_timeout = min(flush_timeout, 10_000)
 
+    backfill_watermarks =
+      Map.new(0..(shard_count - 1), fn shard_index ->
+        key = Ferricstore.Flow.Keys.shared_value_ref_backfill_key(shard_index)
+
+        {shard_index,
+         :ets.lookup(elem(FerricStore.Instance.get(:default).keydir_refs, shard_index), key)}
+      end)
+
     # Flush background BitcaskWriter so deferred writes are on disk
     # before we snapshot keys for deletion.
     Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
@@ -114,7 +122,9 @@ defmodule Ferricstore.Test.ShardHelpers do
 
       keys =
         try do
-          GenServer.call(shard, :keys, flush_timeout)
+          shard
+          |> GenServer.call(:keys, flush_timeout)
+          |> Enum.reject(&Ferricstore.Flow.Keys.shared_value_ref_backfill_key?/1)
         catch
           :exit, _ -> []
         end
@@ -154,6 +164,8 @@ defmodule Ferricstore.Test.ShardHelpers do
       rescue
         ArgumentError -> :ok
       end
+
+      Enum.each(Map.get(backfill_watermarks, i, []), &:ets.insert(:"keydir_#{i}", &1))
     end)
 
     # Clear disk pressure flags. A previous test may have hit a transient

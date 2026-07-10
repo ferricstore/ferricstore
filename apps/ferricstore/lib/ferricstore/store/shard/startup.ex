@@ -113,12 +113,16 @@ defmodule Ferricstore.Store.Shard.Startup do
                 zset_score_index,
                 zset_score_lookup,
                 flow_index,
-                flow_lookup
+                flow_lookup,
+                active_file_id: active_file_id,
+                active_file_path: active_file_path
               )
             end
 
             :ok
           end)
+
+          active_file_size = startup_file_size(active_file_path)
 
           keydir = publish_startup_keydir(keydir, keydir_name, ctx)
 
@@ -204,6 +208,13 @@ defmodule Ferricstore.Store.Shard.Startup do
       end
 
       defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
+
+      defp startup_file_size(path) do
+        case File.stat(path) do
+          {:ok, %{size: size}} when is_integer(size) and size >= 0 -> size
+          _missing -> 0
+        end
+      end
 
       defp ensure_zset_index_table!(table_name, table_type) do
         case :ets.whereis(table_name) do

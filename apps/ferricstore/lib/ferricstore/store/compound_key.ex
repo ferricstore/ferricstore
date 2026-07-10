@@ -42,6 +42,8 @@ defmodule Ferricstore.Store.CompoundKey do
 
   @separator <<0>>
 
+  alias Ferricstore.Flow.InternalKey
+
   @type data_type :: :hash | :list | :set | :zset | :stream
 
   # -------------------------------------------------------------------
@@ -461,6 +463,14 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec user_visible_keys([binary()]) :: [binary()]
   def user_visible_keys(raw_keys) do
+    raw_keys
+    |> storage_logical_keys()
+    |> Enum.reject(&InternalKey.internal?/1)
+  end
+
+  @doc false
+  @spec storage_logical_keys([binary()]) :: [binary()]
+  def storage_logical_keys(raw_keys) do
     {type_keys, other_keys} =
       Enum.reduce(raw_keys, {[], []}, fn key, {tk, ok} ->
         case key do

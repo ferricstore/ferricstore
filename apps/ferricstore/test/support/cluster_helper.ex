@@ -739,6 +739,7 @@ defmodule Ferricstore.Test.ClusterHelper do
       {:data_dir, data_dir},
       {:native_port, 0},
       {:health_port, 0},
+      {:health_probe_port, 0},
       {:shard_count, shards},
       {:cluster_nodes, []},
       {:cluster_auto_join, false},

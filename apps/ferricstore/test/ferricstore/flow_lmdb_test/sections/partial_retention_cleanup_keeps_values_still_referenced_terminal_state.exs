@@ -72,12 +72,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
         assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
       end
 
-      test "retention cleanup keeps shared value when LMDB reference scan is unavailable" do
+      test "retention cleanup keeps a shared value referenced by a cold-only consumer" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
         old_async_history = Application.get_env(:ferricstore, :flow_async_history)
-
-        old_reference_hook =
-          Application.get_env(:ferricstore, :flow_retention_reference_scan_hook)
 
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
         Application.put_env(:ferricstore, :flow_async_history, true)
@@ -85,21 +82,10 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
         ctx =
           Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
 
-        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
-
-        lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
-        held_lmdb_path = lmdb_path <> ".held"
-
         on_exit(fn ->
-          if File.exists?(held_lmdb_path) do
-            File.rm_rf!(lmdb_path)
-            File.rename(held_lmdb_path, lmdb_path)
-          end
-
           Ferricstore.Test.IsolatedInstance.checkin(ctx)
           restore_env(:flow_lmdb_mode, old_mode)
           restore_env(:flow_async_history, old_async_history)
-          restore_env(:flow_retention_reference_scan_hook, old_reference_hook)
         end)
 
         now = System.system_time(:millisecond)
@@ -109,7 +95,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
         owner_type = "retention-lmdb-reference-owner"
         consumer_type = "retention-lmdb-reference-consumer"
         doc = "shared-doc"
-        parent = self()
 
         assert :ok =
                  Ferricstore.Flow.create(ctx, owner_id,
@@ -166,17 +151,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
 
         delete_keydir_entries_containing!(ctx, 0, consumer_id)
 
-        Application.put_env(:ferricstore, :flow_retention_reference_scan_hook, fn record, refs ->
-          if Map.get(record, :id) == owner_id and shared_ref in refs and File.exists?(lmdb_path) do
-            send(parent, :retention_reference_scan_started)
-            File.rm_rf!(held_lmdb_path)
-            File.rename!(lmdb_path, held_lmdb_path)
-            File.mkdir_p!(lmdb_path)
-          end
-
-          :ok
-        end)
-
         totals =
           Enum.reduce_while(1..10, %{flows: 0, history: 0, values: 0}, fn _, acc ->
             {:ok, cleaned} =
@@ -194,12 +168,11 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
           end)
 
         assert totals.flows == 1
-        assert_received :retention_reference_scan_started
         assert totals.values == 0
         assert {:ok, [^doc]} = Ferricstore.Flow.value_mget(ctx, [shared_ref])
       end
 
-      test "retention cleanup preserves owned values when another shard has unprojected Flow rows" do
+      test "unrelated unprojected rows do not block owned value cleanup" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
 
@@ -290,8 +263,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                  Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
 
         assert cleaned.flows == 1
-        assert cleaned.values == 0
-        assert {:ok, [^doc]} = Ferricstore.Flow.value_mget(ctx, [doc_ref])
+        assert cleaned.values == 1
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        assert {:ok, [nil]} = Ferricstore.Flow.value_mget(ctx, [doc_ref])
       end
 
       test "retention cleanup caps owned value cleanup per command" do
@@ -355,6 +329,32 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
             assert :ok = Ferricstore.Store.Router.put(ctx, ref, encoded, 0)
             ref
           end
+
+        cleanup_index_key =
+          Ferricstore.Flow.Keys.retention_cleanup_index_key(id, partition_key)
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(ctx.name, 0)
+
+        native = Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup)
+
+        Enum.each(extra_refs, fn ref ->
+          member_key =
+            Ferricstore.Flow.Keys.retention_cleanup_member_key(id, ref, partition_key)
+
+          member =
+            Ferricstore.Flow.RetentionCleanupMember.encode(cleanup_index_key, ref)
+
+          assert :ok = Ferricstore.Store.Router.put(ctx, member_key, member, 0)
+
+          assert :ok =
+                   Ferricstore.Flow.NativeOrderedIndex.put_new_member(
+                     native,
+                     cleanup_index_key,
+                     member_key,
+                     0
+                   )
+        end)
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         Process.sleep(5)

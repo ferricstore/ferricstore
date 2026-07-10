@@ -32,7 +32,8 @@ config :ferricstore, :mode, :embedded
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
 | `:native_port` | `integer` | `6388` | Standalone only | TCP port for the Ferric native protocol listener. Use `0` for an OS-assigned ephemeral port (useful in tests). |
-| `:health_port` | `integer` | `4000` | Standalone only | HTTP port for health checks and Prometheus metrics. Use `0` for ephemeral. |
+| `:health_port` | `integer` | `4000` | Standalone only | Legacy combined dashboard, metrics, and health HTTP port. Use `0` for ephemeral. |
+| `:health_probe_port` | `integer` | `4001` | Standalone only | Isolated liveness/readiness port recommended for orchestrators. Use `0` for ephemeral. |
 | `:socket_active_mode` | `:once \| true \| integer` | `true` | Standalone only | TCP socket active mode. `:once` reads one message at a time (back-pressure friendly). `true` pushes all data without flow control (highest throughput). An integer N reads N messages then switches to passive. |
 
 The TCP listener also sets the following socket options (not configurable at runtime):
@@ -48,6 +49,7 @@ The TCP listener also sets the following socket options (not configurable at run
 ```elixir
 config :ferricstore, :native_port, 6388
 config :ferricstore, :health_port, 4000
+config :ferricstore, :health_probe_port, 4001
 ```
 
 ## Storage
@@ -386,14 +388,14 @@ runaway transactions or pipelines.
 | Option | Type | Default | Hard Cap | Applies to | Description |
 |--------|------|---------|----------|------------|-------------|
 | `:max_value_size` | `integer` | `1_048_576` (1 MB) | `67_108_864` (64 MB) | Both | Maximum value size in bytes. Enforced during native body validation and in embedded `FerricStore.set/3`. The hard cap of 64 MB is non-configurable. |
-| `:native_max_frame_bytes` | `integer` | `16_777_216` (16 MB) | — | Standalone only | Maximum native frame body size before command dispatch. |
+| `:native_max_frame_bytes` | `integer` | `16_777_216` (16 MB) | `134_217_704` (128 MiB minus the 24-byte header) | Standalone only | Maximum native frame body size before command dispatch. Startup rejects values outside `1..134_217_704`. |
 | `:native_max_lanes_per_connection` | `integer` | `1024` | — | Standalone only | Maximum active native protocol lanes per connection. |
 | `:native_lane_max_queue` | `integer` | `1024` | — | Standalone only | Maximum queued/inflight requests per native lane before `busy` responses. |
 | `:native_max_inflight_per_connection` | `integer` | `4096` | — | Standalone only | Maximum total in-flight native requests per connection. |
 | `:native_max_inflight_per_lane` | `integer` | `1024` | — | Standalone only | Maximum in-flight native requests per lane. |
 | `:native_max_pending_chunks` | `integer` | `1024` | — | Standalone only | Maximum incomplete chunked request streams per connection. |
 | `:native_max_pending_chunk_bytes` | `integer` | `67_108_864` (64 MB) | — | Standalone only | Maximum memory held by incomplete native request chunks per connection. |
-| Connection buffer limit | compile-time | `134_217_728` (128 MB) | — | Standalone only | Maximum bytes accumulated in a connection's receive buffer before the connection is closed. Not configurable at runtime (module attribute in `Native.Connection`). |
+| Connection buffer limit | compile-time | `134_217_728` (128 MiB) | — | Standalone only | Maximum incomplete wire bytes accumulated before the connection is closed. A complete boundary-sized frame may carry at most 64 KiB of coalesced continuation into immediate decode. Defined in `Native.Connection.FrameBuffer`. |
 | MULTI queue limit | compile-time | `100_000` | — | Standalone only | Maximum commands queued inside a `MULTI` transaction. When exceeded, the transaction is auto-discarded and an error is returned. |
 
 ### Max value size
@@ -434,7 +436,7 @@ memory.
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:native_response_chunk_bytes` | `integer` | `0` | Standalone only | Maximum native response payload bytes per chunk. `0` disables response chunking. |
+| `:native_response_chunk_bytes` | `integer` | `0` | Standalone only | Preferred maximum native response payload bytes per chunk. `0` uses `native_max_frame_bytes`; larger values are clamped to that frame limit. |
 | `:native_response_coalesce_max` | `integer` | `64` | Standalone only | Maximum ready responses to coalesce into one socket flush. |
 | `:native_response_coalesce_bytes` | `integer` | `8_388_608` (8 MB) | Standalone only | Approximate byte limit for coalesced response iodata before flushing. |
 
@@ -447,7 +449,8 @@ config :ferricstore,
 
 The legacy `:sendfile_threshold` server option is retained for older/internal
 direct file-send helpers. The native TCP/TLS data plane uses response
-framing, coalescing, and chunking instead.
+framing, coalescing, and chunking instead. Every emitted response frame stays
+within the connection's advertised `native_max_frame_bytes` limit.
 
 ## TLS
 
@@ -681,6 +684,7 @@ config :libcluster,
 # config/test.exs
 config :ferricstore, :native_port, 0
 config :ferricstore, :health_port, 0
+config :ferricstore, :health_probe_port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
 config :ferricstore, :shard_count, 4
 config :ferricstore, :sync_flush_timeout_ms, 1_000
@@ -734,7 +738,8 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_NATIVE_PORT` | `6388` | TCP port for the Ferric native protocol listener |
 | `FERRICSTORE_NATIVE_ADVERTISE_HOST` | derived from node name / localhost | Hostname or IP advertised to native SDKs in `HELLO`, `ROUTE`, and `SHARDS` |
 | `FERRICSTORE_NATIVE_ADVERTISE_PORT` | live native listener port | Port advertised to native SDKs for plaintext native connections |
-| `FERRICSTORE_HEALTH_PORT` | `6389` | HTTP health/metrics port |
+| `FERRICSTORE_HEALTH_PORT` | `6380` | Legacy combined dashboard, metrics, and health HTTP port |
+| `FERRICSTORE_HEALTH_PROBE_PORT` | `6381` | Isolated liveness/readiness probe port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, WARaft segments, mmap) |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards. `0` = `System.schedulers_online()` |
 
@@ -782,6 +787,15 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_MAXCLIENTS` | `10000` | Max concurrent TCP connections |
 | `FERRICSTORE_AUDIT_LOG` | `false` | Enable audit logging |
 | `FERRICSTORE_ACL_AUTO_SAVE` | `false` | Auto-save ACL changes to disk |
+| `FERRICSTORE_DASHBOARD_REMOTE_ACCESS` | `false` | Permit dashboard requests from non-loopback peers |
+| `FERRICSTORE_DASHBOARD_ALLOW_INSECURE_HTTP` | `false` | Permit explicitly enabled remote dashboard access over plaintext HTTP |
+| `FERRICSTORE_DASHBOARD_TRUST_PROXY_HEADERS` | `false` | Honor forwarded dashboard scheme/host headers from configured trusted proxies |
+| `FERRICSTORE_DASHBOARD_TRUSTED_PROXIES` | unset | Comma-separated proxy IPs/CIDRs allowed to supply forwarded headers |
+| `FERRICSTORE_DASHBOARD_COOKIE_SECURE` | `auto` | Set dashboard cookies Secure automatically, always, or never |
+| `FERRICSTORE_DASHBOARD_ALLOWED_ORIGINS` | unset | Additional comma-separated Origins accepted for dashboard POSTs |
+| `FERRICSTORE_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | `10` | Authentication attempts allowed per username and source IP window |
+| `FERRICSTORE_AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Authentication rate-limit window in milliseconds |
+| `FERRICSTORE_AUTH_RATE_LIMIT_MAX_ENTRIES` | `10000` | Maximum bounded authentication limiter entries |
 
 ### TLS
 

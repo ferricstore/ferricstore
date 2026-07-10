@@ -39,10 +39,18 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
     Enum.filter(records, &flow_record_acl_allowed?(&1, username))
   end
 
-  def flow_query_filter_result_for_acl(result, nil), do: result
+  def flow_query_filter_result_for_acl(result, username),
+    do: flow_query_filter_result_for_acl(result, username, "*")
 
-  def flow_query_filter_result_for_acl(result, username) when is_map(result) do
-    rows = result |> Map.get(:rows, []) |> filter_flow_query_rows_for_acl(username)
+  def flow_query_filter_result_for_acl(result, nil, _request_scope), do: result
+
+  def flow_query_filter_result_for_acl(result, username, request_scope) when is_map(result) do
+    scope_allowed? = flow_acl_key_allowed?(username, request_scope)
+
+    rows =
+      result
+      |> Map.get(:rows, [])
+      |> filter_flow_query_rows_for_acl(username, scope_allowed?)
 
     result
     |> Map.put(:rows, rows)
@@ -109,18 +117,31 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
     :exit, _ -> false
   end
 
-  defp filter_flow_query_rows_for_acl(rows, username) when is_list(rows) do
+  defp filter_flow_query_rows_for_acl(rows, username, scope_allowed?) when is_list(rows) do
     Enum.filter(rows, fn
       row when is_map(row) ->
         case flow_record_acl_keys(row) do
-          [] -> true
+          [] -> scope_allowed?
           _keys -> flow_record_acl_allowed?(row, username)
         end
 
       _row ->
-        true
+        scope_allowed?
     end)
   end
+
+  defp flow_acl_key_allowed?(username, key) when is_binary(key) and key != "" do
+    case FerricstoreServer.Acl.check_key_access(username, key, :read) do
+      :ok -> true
+      {:error, _reason} -> false
+    end
+  rescue
+    _error -> false
+  catch
+    :exit, _reason -> false
+  end
+
+  defp flow_acl_key_allowed?(_username, _key), do: false
 
   defp flow_record_acl_allowed?(record, username) when is_map(record) do
     keys = flow_record_acl_keys(record)
@@ -141,8 +162,9 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
   defp flow_record_acl_allowed?(_record, _username), do: false
 
   defp flow_record_acl_keys(record) when is_map(record) do
-    [flow_record_partition_key(record), flow_record_id(record), flow_record_type(record)]
-    |> Enum.filter(&(is_binary(&1) and &1 != ""))
-    |> Enum.uniq()
+    case flow_record_partition_key(record) do
+      partition_key when is_binary(partition_key) and partition_key != "" -> [partition_key]
+      _other -> [flow_record_id(record)] |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    end
   end
 end

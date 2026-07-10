@@ -174,8 +174,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           zset_score_index,
           zset_score_lookup,
           flow_index,
-          flow_lookup
+          flow_lookup,
+          active_file_id: active_file_id,
+          active_file_path: active_file_path
         )
+
+        active_file_size = recovery_file_size(active_file_path)
 
         Ferricstore.Store.ActiveFile.publish(
           ctx,
@@ -238,10 +242,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           sm_state.flow_index_name,
           sm_state.flow_lookup_name,
           force_full_reconcile?: true,
-          reason: :segment_replay
+          reason: :segment_replay,
+          active_file_id: sm_state.active_file_id,
+          active_file_path: sm_state.active_file_path
         )
 
-        sm_state
+        %{sm_state | active_file_size: recovery_file_size(sm_state.active_file_path)}
+      end
+
+      defp recovery_file_size(path) do
+        case File.stat(path) do
+          {:ok, %{size: size}} when is_integer(size) and size >= 0 -> size
+          _missing -> 0
+        end
       end
 
       defp recover_segment_projection_log(root_dir, sm_state, metadata_position) do

@@ -368,6 +368,48 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitState
                  )
       end
 
+      test "flow_spawn_children idempotency includes child max_active_ms" do
+        parent = uid("flow-parent-idempotent-child-max-active")
+        child = uid("flow-child-idempotent-max-active")
+        partition = uid("tenant")
+
+        assert {:ok, created_parent} =
+                 flow_create_and_get(parent,
+                   type: "parent",
+                   state: "dispatch",
+                   partition_key: partition
+                 )
+
+        opts = [
+          group_id: "fanout",
+          wait: :all,
+          wait_state: "waiting_children",
+          on_child_failed: :ignore,
+          on_parent_closed: :abandon_children,
+          exhaust_to: %{success: "children_done", failure: "children_failed"},
+          partition_key: partition,
+          from_state: "dispatch",
+          fencing_token: created_parent.fencing_token
+        ]
+
+        assert {:ok, _waiting} =
+                 flow_spawn_children_and_get(
+                   parent,
+                   [%{id: child, type: "child", max_active_ms: 1_000}],
+                   opts
+                 )
+
+        assert {:error, "ERR flow child group idempotency conflict"} =
+                 flow_spawn_children_and_get(
+                   parent,
+                   [%{id: child, type: "child", max_active_ms: 2_000}],
+                   opts
+                 )
+
+        assert {:ok, child_record} = FerricStore.flow_get(child, partition_key: partition)
+        assert child_record.max_active_ms == 1_000
+      end
+
       test "flow_spawn_children remains idempotent after child progress" do
         parent = uid("flow-parent-idempotent-progress")
         child_a = uid("flow-child-idempotent-progress-a")

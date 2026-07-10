@@ -3,7 +3,7 @@ defmodule Ferricstore.Flow.HibernationTest do
   @moduletag :flow
   @moduletag :global_state
 
-  alias Ferricstore.Flow.{Hibernation, Locator}
+  alias Ferricstore.Flow.{Hibernation, Keys, LMDB, Locator}
 
   test "demotable requires far-future waiting unleased non-terminal flow" do
     now = 1_000
@@ -118,7 +118,7 @@ defmodule Ferricstore.Flow.HibernationTest do
     ops = Hibernation.demotion_ops(candidate())
     park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key("flow/state/tenant-1/flow-1")
 
-    assert length(ops) == 3
+    assert length(ops) >= 3
     assert Enum.any?(ops, &match?({:put, ^park_key, _value}, &1))
 
     assert Enum.any?(ops, fn
@@ -131,6 +131,108 @@ defmodule Ferricstore.Flow.HibernationTest do
            end)
 
     assert Enum.any?(ops, &match?({:put, _reverse_key, ^park_key}, &1))
+
+    refute Enum.any?(ops, fn
+             {:put, "flow-active-index:" <> _rest, _value} -> true
+             _other -> false
+           end)
+  end
+
+  test "demotion persists only the max-active timeout row in the active projection" do
+    state_key = Keys.state_key("flow-1", "tenant-1")
+
+    candidate =
+      candidate()
+      |> put_in([:record, :state_key], state_key)
+      |> put_in([:record, :created_at_ms], 1_000)
+      |> put_in([:record, :max_active_ms], 5_000)
+
+    ops = Hibernation.demotion_ops(candidate)
+    timeout_index_key = Keys.active_timeout_index_key()
+
+    assert [{:put, active_key, active_value}] =
+             Enum.filter(ops, fn
+               {:put, "flow-active-index:" <> _rest, _value} -> true
+               _other -> false
+             end)
+
+    assert {:ok, {^timeout_index_key, ^state_key, 6_000, 0, ^state_key}} =
+             LMDB.decode_active_index_value(active_value)
+
+    reverse_key = LMDB.active_by_state_key_key(state_key)
+
+    assert {:put, ^reverse_key, reverse_value} =
+             Enum.find(ops, &match?({:put, ^reverse_key, _value}, &1))
+
+    assert {:ok, [^active_key]} = LMDB.decode_active_index_reverse_value(reverse_value)
+
+    state_active_key =
+      LMDB.active_index_key(Keys.state_index_key("email", "waiting", "tenant-1"), "flow-1", 0)
+
+    due_active_key =
+      LMDB.active_index_key(
+        Keys.due_key("email", "waiting", 0, "tenant-1"),
+        "flow-1",
+        900_000
+      )
+
+    assert {:delete, state_active_key} in ops
+    assert {:delete, due_active_key} in ops
+  end
+
+  test "demotion replaces a full durable active projection without orphaned rows" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_hibernation_timeout_projection_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    lmdb_path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> LMDB.path()
+
+    state_key = Keys.state_key("flow-1", "tenant-1")
+
+    candidate =
+      candidate()
+      |> put_in([:record, :state_key], state_key)
+      |> put_in([:record, :created_at_ms], 1_000)
+      |> put_in([:record, :max_active_ms], 5_000)
+
+    previous_record =
+      candidate.record
+      |> Map.put(:state, "queued")
+      |> Map.put(:updated_at_ms, 500)
+      |> Map.put(:next_run_at_ms, 800_000)
+
+    full_projection_ops =
+      previous_record
+      |> then(&LMDB.active_index_put_ops_with_reverse(state_key, &1, 0))
+      |> elem(0)
+
+    assert :ok = LMDB.write_batch(lmdb_path, full_projection_ops)
+
+    assert {:ok, previous_reverse_value} =
+             LMDB.get(lmdb_path, LMDB.active_by_state_key_key(state_key))
+
+    candidate = Map.put(candidate, :active_index_reverse_value, previous_reverse_value)
+
+    assert :ok = LMDB.write_batch(lmdb_path, Hibernation.demotion_ops(candidate))
+
+    timeout_index_key = Keys.active_timeout_index_key()
+
+    assert {:ok, [{active_key, active_value}]} =
+             LMDB.prefix_entries(lmdb_path, LMDB.active_index_global_prefix(), 10)
+
+    assert {:ok, {^timeout_index_key, ^state_key, 6_000, 0, ^state_key}} =
+             LMDB.decode_active_index_value(active_value)
+
+    assert {:ok, reverse_value} = LMDB.get(lmdb_path, LMDB.active_by_state_key_key(state_key))
+    assert {:ok, [^active_key]} = LMDB.decode_active_index_reverse_value(reverse_value)
   end
 
   test "rebuild cold ops reconstructs only demotable far-future flows from durable candidates" do
@@ -145,7 +247,7 @@ defmodule Ferricstore.Flow.HibernationTest do
         safety_margin_ms: 60_000
       )
 
-    assert length(ops) == 3
+    assert length(ops) >= 3
     assert Enum.any?(ops, fn {:put, key, _value} -> String.starts_with?(key, "flow:park:v1:") end)
     assert Enum.any?(ops, fn {:put, key, _value} -> String.starts_with?(key, "flow:due:v1:") end)
   end

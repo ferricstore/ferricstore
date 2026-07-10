@@ -54,6 +54,33 @@ defmodule Ferricstore.FlowTest.Sections.FlushdbClearsFlowLmdbTerminalProjections
         assert :ok = FerricStore.flushdb()
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
+        for index <- 0..(ctx.shard_count - 1) do
+          keydir = elem(ctx.keydir_refs, index)
+          marker_key = Ferricstore.Flow.Keys.shared_value_ref_backfill_key(index)
+          progress_key = Ferricstore.Flow.SharedRefBackfill.progress_key(index)
+
+          assert [{^marker_key, <<1>>, 0, _lfu, _fid, _offset, 1}] =
+                   :ets.lookup(keydir, marker_key)
+
+          assert [_progress] = :ets.lookup(keydir, progress_key)
+          assert Ferricstore.Flow.SharedRefBackfill.verified_complete?(ctx.name, index)
+
+          certificate_key = Ferricstore.Flow.SharedRefBackfill.completion_key(index)
+
+          certificate_path =
+            ctx.data_dir
+            |> Ferricstore.DataDir.shard_data_path(index)
+            |> Ferricstore.Flow.LMDB.path()
+
+          assert {:ok, certificate} =
+                   Ferricstore.Flow.LMDB.get(certificate_path, certificate_key)
+
+          assert {:shared_ref_backfill_complete, 2, ^index, run_id} =
+                   :erlang.binary_to_term(certificate, [:safe])
+
+          assert is_binary(run_id) and run_id != ""
+        end
+
         assert {:ok, []} =
                  Ferricstore.Flow.LMDB.expired_terminal_state_keys(lmdb_path, cleanup_now, 10)
 
@@ -64,6 +91,44 @@ defmodule Ferricstore.FlowTest.Sections.FlushdbClearsFlowLmdbTerminalProjections
                  })
 
         assert FerricStore.flow_get(completed.id, partition_key: partition_key) == {:ok, nil}
+
+        after_flush_id = uid("flow-flushdb-retention-ready")
+        after_flush_now = cleanup_now + 1_000
+
+        assert :ok =
+                 FerricStore.flow_create(after_flush_id,
+                   type: "flushdb-retention-ready",
+                   state: "queued",
+                   partition_key: partition_key,
+                   run_at_ms: after_flush_now,
+                   retention_ttl_ms: 10,
+                   now_ms: after_flush_now
+                 )
+
+        assert {:ok, [after_flush_claimed]} =
+                 FerricStore.flow_claim_due("flushdb-retention-ready",
+                   worker: "worker-flushdb-retention-ready",
+                   partition_key: partition_key,
+                   now_ms: after_flush_now
+                 )
+
+        assert :ok =
+                 FerricStore.flow_complete(after_flush_id, after_flush_claimed.lease_token,
+                   fencing_token: after_flush_claimed.fencing_token,
+                   partition_key: partition_key,
+                   now_ms: after_flush_now + 10
+                 )
+
+        assert {:ok, %{flows: 1}} =
+                 FerricStore.flow_retention_cleanup(
+                   limit: 10,
+                   now_ms: after_flush_now + 100
+                 )
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        assert {:ok, nil} =
+                 FerricStore.flow_get(after_flush_id, partition_key: partition_key)
       end
 
       test "retention cleanup deletes owned payload refs from trimmed history" do

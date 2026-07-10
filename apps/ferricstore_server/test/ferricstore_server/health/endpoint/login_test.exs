@@ -1,7 +1,20 @@
 defmodule FerricstoreServer.Health.Endpoint.LoginTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
+  @moduletag :global_state
 
+  alias FerricstoreServer.Acl
   alias FerricstoreServer.Health.Endpoint.Login
+
+  setup do
+    {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+    Acl.reset!()
+
+    on_exit(fn ->
+      Acl.reset!()
+    end)
+
+    :ok
+  end
 
   test "location encodes sanitized next path" do
     assert Login.location("/dashboard/flow?type=email") ==
@@ -23,5 +36,12 @@ defmodule FerricstoreServer.Health.Endpoint.LoginTest do
     assert html =~ "&lt;bad&gt;"
     assert html =~ "/dashboard/flow?x=&quot;bad&quot;"
     assert html =~ "FerricStore Dashboard"
+  end
+
+  test "authenticate delegates to shared ACL authentication" do
+    assert :ok = Acl.set_user("known", ["on", ">secret", "~*", "+@all"])
+
+    assert {:error, _reason} = Login.authenticate("missing", "wrong")
+    assert {:ok, "known"} = Login.authenticate("known", "secret")
   end
 end

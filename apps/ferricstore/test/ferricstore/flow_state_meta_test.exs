@@ -149,6 +149,18 @@ defmodule Ferricstore.FlowStateMetaTest do
                now_ms: 1_002
              )
 
+    state_key = Ferricstore.Flow.Keys.state_key(id, @partition)
+    registry_key = Ferricstore.Flow.Keys.registry_key(id, @partition)
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, state_key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    flush_lmdb!()
+    assert [] = :ets.lookup(keydir, state_key)
+
+    assert [{^registry_key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}] =
+             :ets.lookup(keydir, registry_key)
+
     assert {:ok, policy} = FerricStore.flow_policy_set(type, indexed_state_meta: "version")
     assert policy.indexed_state_meta == "version"
 

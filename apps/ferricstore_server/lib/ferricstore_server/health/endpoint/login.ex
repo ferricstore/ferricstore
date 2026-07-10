@@ -1,6 +1,54 @@
 defmodule FerricstoreServer.Health.Endpoint.Login do
   @moduledoc false
 
+  alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.Password
+
+  @authentication_error "WRONGPASS invalid username-password pair or user is disabled."
+
+  @spec authenticate(binary(), binary()) :: {:ok, binary()} | {:error, binary()}
+  def authenticate(username, password) do
+    case authenticate_session(username, password) do
+      {:ok, username, _auth_epoch} -> {:ok, username}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
+  @spec authenticate_session(binary(), binary()) ::
+          {:ok, binary(), non_neg_integer()} | {:error, binary()}
+  def authenticate_session(username, password)
+      when is_binary(username) and is_binary(password) do
+    case Acl.get_user(username) do
+      %{enabled: true, password: stored_hash, auth_epoch: auth_epoch}
+      when is_binary(stored_hash) ->
+        if Password.verify(password, stored_hash) do
+          {:ok, username, auth_epoch}
+        else
+          authentication_error()
+        end
+
+      _missing_disabled_or_passwordless ->
+        _verified = Password.verify(password, Password.dummy_hash())
+        authentication_error()
+    end
+  end
+
+  def authenticate_session(_username, _password), do: authentication_error()
+
+  @doc false
+  @spec peer_string(term()) :: binary()
+  def peer_string(peer) when is_tuple(peer) do
+    case :inet.ntoa(peer) do
+      address when is_list(address) -> List.to_string(address)
+      _other -> inspect(peer)
+    end
+  rescue
+    _error -> inspect(peer)
+  end
+
+  def peer_string(_peer), do: "unknown"
+
   def location(path) do
     "/dashboard/login?" <> URI.encode_query(%{"next" => sanitize_next(path)})
   end
@@ -73,4 +121,6 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
   end
 
   defp html_escape(value), do: value |> to_string() |> html_escape()
+
+  defp authentication_error, do: {:error, @authentication_error}
 end

@@ -95,6 +95,12 @@ Operational rule: current Flow state is authoritative; projection lag affects qu
 
 Retention deletes logical Flow records after terminal TTLs and history/value policies allow it. Disk space may not be reclaimed immediately because append-only storage still needs compaction/release to catch up.
 
+`max_active_ms` is a separate lifecycle guard. It fails non-terminal Flows when
+their creation-based deadline elapses, including queued, scheduled, running,
+retrying, and cold/hibernated records. Timeout failure uses the normal terminal
+history, retention, and parent/child coordination paths. Monitor the
+`active_timeouts` cleanup count alongside terminal deletion backlog.
+
 Use retention to bound:
 
 - terminal Flow records;
@@ -113,6 +119,7 @@ Alert on sustained growth in:
 - blob protection/hardened value counts;
 - Raft apply/release cursor gaps;
 - terminal retention backlog.
+- active timeout backlog or repeated timeout catch-up sweeps.
 
 ## Starting Points
 

@@ -28,6 +28,8 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
   alias FerricstoreServer.Health.Dashboard
   alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
+  alias FerricstoreServer.AuthRateLimiter
+  alias FerricstoreServer.Health.Endpoint.Session, as: DashboardSession
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Test.ShardHelpers
 
@@ -37,12 +39,14 @@ defmodule FerricstoreServer.Health.DashboardTest do
     protected_mode = Application.get_env(:ferricstore, :protected_mode)
 
     Application.put_env(:ferricstore, :protected_mode, false)
+    AuthRateLimiter.reset()
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
       restore_env(:protected_mode, protected_mode)
       Ferricstore.NamespaceConfig.reset_all()
       FerricstoreServer.Acl.reset!()
+      AuthRateLimiter.reset()
     end)
 
     :ok
@@ -352,6 +356,10 @@ defmodule FerricstoreServer.Health.DashboardTest do
   end
 
   defp http_post_form(port, path, params, headers) do
+    {csrf_token, csrf_set_cookie} = DashboardSession.csrf_pair()
+    csrf_cookie = csrf_set_cookie |> String.split(";", parts: 2) |> hd()
+    params = Map.put_new(params, "_csrf_token", csrf_token)
+    headers = put_request_cookie(headers, csrf_cookie)
     body = URI.encode_query(params)
 
     {:ok, conn} =
@@ -377,6 +385,19 @@ defmodule FerricstoreServer.Health.DashboardTest do
     response = recv_all(conn, "")
     :gen_tcp.close(conn)
     response
+  end
+
+  defp put_request_cookie(headers, cookie) do
+    {cookies, other_headers} =
+      Enum.split_with(headers, fn {name, _value} -> String.downcase(name) == "cookie" end)
+
+    combined =
+      case cookies do
+        [] -> cookie
+        [{_name, value} | _rest] -> value <> "; " <> cookie
+      end
+
+    [{"Cookie", combined} | other_headers]
   end
 
   defp recv_all(conn, acc) do

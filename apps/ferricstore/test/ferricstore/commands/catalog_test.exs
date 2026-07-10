@@ -330,6 +330,64 @@ defmodule Ferricstore.Commands.CatalogTest do
       assert {:ok, ["flow-1"]} = Catalog.get_keys("FLOW.SIGNAL", ["flow-1", "SIGNAL", "paid"])
     end
 
+    test "Flow partition-wide commands require global scope when no partition is supplied" do
+      assert {:ok, ["*"]} =
+               Catalog.get_keys("FLOW.CLAIM_DUE", ["tenant:a:type", "WORKER", "worker"])
+
+      assert {:ok, ["tenant:a:partition"]} =
+               Catalog.get_keys("FLOW.CLAIM_DUE", [
+                 "tenant:a:type",
+                 "WORKER",
+                 "worker",
+                 "PARTITION",
+                 "tenant:a:partition"
+               ])
+
+      assert {:ok, ["*"]} = Catalog.get_keys("FLOW.LIST", ["tenant:a:type"])
+    end
+
+    test "Flow claim selectors use global ACL scope instead of literal selector names" do
+      for command <- ["FLOW.CLAIM_DUE", "FLOW.RECLAIM"], selector <- ["AUTO", "ANY", "GLOBAL"] do
+        assert {:ok, ["*"]} =
+                 Catalog.get_keys(command, ["claim-selector", "PARTITION", selector])
+      end
+    end
+
+    test "Flow key discovery parses option boundaries" do
+      assert {:ok, ["*"]} =
+               Catalog.get_keys("FLOW.CLAIM_DUE", [
+                 "tenant:a:type",
+                 "WORKER",
+                 "PARTITION",
+                 "LEASE_MS",
+                 "30000"
+               ])
+
+      assert {:ok, ["tenant:a:schedule"]} =
+               Catalog.get_keys("FLOW.SCHEDULE.GET", ["tenant:a:schedule"])
+
+      assert {:ok, ["tenant:a:scope"]} =
+               Catalog.get_keys("FLOW.BUDGET.COMMIT", ["tenant:a:scope"])
+    end
+
+    test "anonymous Flow value puts require global ACL scope" do
+      assert {:ok, ["*"]} = Catalog.get_keys("FLOW.VALUE.PUT", ["payload"])
+
+      assert {:ok, ["tenant:a:partition"]} =
+               Catalog.get_keys("FLOW.VALUE.PUT", [
+                 "payload",
+                 "PARTITION",
+                 "tenant:a:partition"
+               ])
+
+      assert {:ok, ["tenant:a:flow"]} =
+               Catalog.get_keys("FLOW.VALUE.PUT", [
+                 "payload",
+                 "OWNER_FLOW_ID",
+                 "tenant:a:flow"
+               ])
+    end
+
     test "returns empty list for PING (no key command)" do
       assert {:ok, []} = Catalog.get_keys("PING", [])
     end

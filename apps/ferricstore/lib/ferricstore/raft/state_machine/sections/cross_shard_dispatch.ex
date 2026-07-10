@@ -275,6 +275,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp dispatch_cross_shard_entry(
+             {:flow_shared_ref_write, shard_index, command},
+             _sandbox_namespace,
+             _store,
+             state
+           )
+           when is_integer(shard_index) and shard_index >= 0 and is_tuple(command) do
+        state
+        |> cross_shard_state_for_index(shard_index)
+        |> apply_single(command)
+      end
+
+      defp dispatch_cross_shard_entry(
+             {:flow_cross_policy_put, shard_index, key, value, expire_at_ms},
+             _sandbox_namespace,
+             %{shard_index: shard_index},
+             state
+           )
+           when is_integer(shard_index) and shard_index >= 0 and is_binary(key) and
+                  is_binary(value) and is_integer(expire_at_ms) and expire_at_ms >= 0 do
+        target_state = cross_shard_state_for_index(state, shard_index)
+
+        with_lmdb_mirror_shard(target_state, fn ->
+          do_flow_policy_put(target_state, key, value, expire_at_ms)
+        end)
+      end
+
+      defp dispatch_cross_shard_entry(
              {orig_idx, entry},
              sandbox_namespace,
              store,
@@ -308,6 +335,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         else
           {:error, "ERR invalid flow cross-shard terminal op"}
         end
+      end
+
+      defp dispatch_cross_shard_entry(
+             {:flow_cross_retention_cleanup, attrs},
+             _sandbox_namespace,
+             _store,
+             state
+           ) do
+        do_flow_cross_retention_cleanup(state, attrs)
       end
 
       defp dispatch_cross_shard_entry(entry, sandbox_namespace, store, _state) do
@@ -352,6 +388,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
       defp cross_shard_fatal_entry_error(
              {:flow_cross_terminal_many, _op, _attrs_list},
+             {:error, _reason} = error
+           ),
+           do: error
+
+      defp cross_shard_fatal_entry_error(
+             {:flow_cross_retention_cleanup, _attrs},
+             {:error, _reason} = error
+           ),
+           do: error
+
+      defp cross_shard_fatal_entry_error(
+             {:flow_shared_ref_write, _shard_index, _command},
+             {:error, _reason} = error
+           ),
+           do: error
+
+      defp cross_shard_fatal_entry_error(
+             {:flow_cross_policy_put, _shard_index, _key, _value, _expire_at_ms},
              {:error, _reason} = error
            ),
            do: error

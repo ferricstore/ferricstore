@@ -573,19 +573,26 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert {:ok, nil} = FerricStore.get(created.payload_ref)
       end
 
-      test "retention cleanup preserves owner named values referenced by a live flow" do
+      test "retention cleanup reclaims unreferenced owner named shared values without scanning" do
         ctx = FerricStore.Instance.get(:default)
-        owner_id = uid("flow-retention-owned-shared-owner")
-        consumer_id = uid("flow-retention-owned-shared-consumer")
-        partition_key = uid("tenant-retention-owned-shared")
+        id = uid("flow-retention-shared-value-lifecycle")
+        partition_key = uid("tenant-retention-shared-value-lifecycle")
         create_now = System.system_time(:millisecond) + 60_000
         complete_now = create_now + 1_000
         cleanup_now = complete_now + 1_000
+        parent = self()
+        old_hook = Application.get_env(:ferricstore, :flow_retention_reference_scan_hook)
 
-        assert {:ok, _owner} =
-                 flow_create_and_get(owner_id,
-                   type: "retention-owned-shared-owner",
-                   state: "queued",
+        Application.put_env(:ferricstore, :flow_retention_reference_scan_hook, fn record, refs ->
+          send(parent, {:retention_reference_scan, Map.get(record, :id), refs})
+          :ok
+        end)
+
+        on_exit(fn -> restore_env(:flow_retention_reference_scan_hook, old_hook) end)
+
+        assert {:ok, _created} =
+                 flow_create_and_get(id,
+                   type: "retention-shared-value-lifecycle",
                    partition_key: partition_key,
                    run_at_ms: create_now,
                    retention_ttl_ms: 20,
@@ -595,13 +602,76 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert {:ok, %{ref: shared_ref}} =
                  FerricStore.flow_value_put("shared-doc",
                    partition_key: partition_key,
+                   owner_flow_id: id,
+                   name: "doc",
+                   now_ms: create_now + 1
+                 )
+
+        assert {:ok, [claimed]} =
+                 FerricStore.flow_claim_due("retention-shared-value-lifecycle",
+                   partition_key: partition_key,
+                   worker: "worker-retention-shared-value-lifecycle",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: create_now + 2
+                 )
+
+        assert {:ok, completed} =
+                 flow_complete_and_get(id, claimed.lease_token,
+                   partition_key: partition_key,
+                   fencing_token: claimed.fencing_token,
+                   now_ms: complete_now
+                 )
+
+        assert completed.terminal_retention_until_ms == complete_now + 20
+
+        shard_index = shard_for(Ferricstore.Flow.Keys.state_key(id, partition_key))
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        assert {:ok, %{flows: 1}} =
+                 Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
+                   limit: 10,
+                   now_ms: cleanup_now
+                 })
+
+        refute_receive {:retention_reference_scan, ^id, _refs}, 50
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        assert {:ok, [nil]} = FerricStore.flow_value_mget([shared_ref])
+      end
+
+      test "retention cleanup preserves owner named values referenced by a live flow" do
+        ctx = FerricStore.Instance.get(:default)
+        owner_id = uid("flow-retention-owned-shared-owner")
+        consumer_id = uid("flow-retention-owned-shared-consumer")
+        {owner_partition, _same_partition, consumer_partition} = mixed_partition_keys()
+        create_now = System.system_time(:millisecond) + 60_000
+        complete_now = create_now + 1_000
+        cleanup_now = complete_now + 1_000
+
+        assert {:ok, _owner} =
+                 flow_create_and_get(owner_id,
+                   type: "retention-owned-shared-owner",
+                   state: "queued",
+                   partition_key: owner_partition,
+                   run_at_ms: create_now,
+                   retention_ttl_ms: 20,
+                   now_ms: create_now
+                 )
+
+        assert {:ok, %{ref: shared_ref}} =
+                 FerricStore.flow_value_put("shared-doc",
+                   partition_key: owner_partition,
                    owner_flow_id: owner_id,
                    name: "doc",
                    now_ms: create_now + 1
                  )
 
         assert {:ok, owner_with_value} =
-                 FerricStore.flow_get(owner_id, partition_key: partition_key, values: ["doc"])
+                 FerricStore.flow_get(owner_id,
+                   partition_key: owner_partition,
+                   values: ["doc"]
+                 )
 
         assert owner_with_value.values == %{"doc" => "shared-doc"}
 
@@ -609,7 +679,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
                  flow_create_and_get(consumer_id,
                    type: "retention-owned-shared-consumer",
                    state: "queued",
-                   partition_key: partition_key,
+                   partition_key: consumer_partition,
                    value_refs: %{"doc" => shared_ref},
                    run_at_ms: create_now,
                    retention_ttl_ms: 20,
@@ -618,9 +688,12 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
 
         assert consumer.value_refs["doc"].ref == shared_ref
 
+        assert shard_for(Ferricstore.Flow.Keys.state_key(owner_id, owner_partition)) !=
+                 shard_for(Ferricstore.Flow.Keys.state_key(consumer_id, consumer_partition))
+
         assert {:ok, [claimed]} =
                  FerricStore.flow_claim_due("retention-owned-shared-owner",
-                   partition_key: partition_key,
+                   partition_key: owner_partition,
                    worker: "worker-retention-owned-shared-owner",
                    lease_ms: 30_000,
                    limit: 1,
@@ -629,14 +702,14 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
 
         assert {:ok, completed} =
                  flow_complete_and_get(owner_id, claimed.lease_token,
-                   partition_key: partition_key,
+                   partition_key: owner_partition,
                    fencing_token: claimed.fencing_token,
                    now_ms: complete_now
                  )
 
         assert completed.terminal_retention_until_ms == complete_now + 20
 
-        shard_index = shard_for(Ferricstore.Flow.Keys.state_key(owner_id, partition_key))
+        shard_index = shard_for(Ferricstore.Flow.Keys.state_key(owner_id, owner_partition))
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index)
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
@@ -649,9 +722,596 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert {:ok, ["shared-doc"]} = FerricStore.flow_value_mget([shared_ref])
 
         assert {:ok, survivor} =
-                 FerricStore.flow_get(consumer_id, partition_key: partition_key, values: ["doc"])
+                 FerricStore.flow_get(consumer_id,
+                   partition_key: consumer_partition,
+                   values: ["doc"]
+                 )
 
         assert survivor.values == %{"doc" => "shared-doc"}
+
+        assert {:ok, [consumer_claim]} =
+                 FerricStore.flow_claim_due("retention-owned-shared-consumer",
+                   partition_key: consumer_partition,
+                   worker: "worker-retention-owned-shared-consumer",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: cleanup_now + 1
+                 )
+
+        consumer_complete_now = cleanup_now + 2
+
+        assert {:ok, _completed_consumer} =
+                 flow_complete_and_get(consumer_id, consumer_claim.lease_token,
+                   partition_key: consumer_partition,
+                   fencing_token: consumer_claim.fencing_token,
+                   now_ms: consumer_complete_now
+                 )
+
+        consumer_shard =
+          shard_for(Ferricstore.Flow.Keys.state_key(consumer_id, consumer_partition))
+
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, consumer_shard)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        assert {:ok, %{flows: 1}} =
+                 Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
+                   limit: 10,
+                   now_ms: consumer_complete_now + 100
+                 })
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        assert {:ok, [nil]} = FerricStore.flow_value_mget([shared_ref])
+      end
+
+      test "retention cleanup preserves an owner shared value used as a payload ref" do
+        ctx = FerricStore.Instance.get(:default)
+        owner_id = uid("flow-retention-shared-payload-owner")
+        consumer_id = uid("flow-retention-shared-payload-consumer")
+        {owner_partition, _same_partition, consumer_partition} = mixed_partition_keys()
+        create_now = System.system_time(:millisecond) + 60_000
+        complete_now = create_now + 1_000
+
+        assert {:ok, _owner} =
+                 flow_create_and_get(owner_id,
+                   type: "retention-shared-payload-owner",
+                   state: "queued",
+                   partition_key: owner_partition,
+                   run_at_ms: create_now,
+                   retention_ttl_ms: 20,
+                   now_ms: create_now
+                 )
+
+        assert {:ok, %{ref: shared_ref}} =
+                 FerricStore.flow_value_put("shared-payload",
+                   partition_key: owner_partition,
+                   owner_flow_id: owner_id,
+                   name: "payload",
+                   now_ms: create_now + 1
+                 )
+
+        assert {:ok, consumer} =
+                 flow_create_and_get(consumer_id,
+                   type: "retention-shared-payload-consumer",
+                   state: "queued",
+                   partition_key: consumer_partition,
+                   payload_ref: shared_ref,
+                   run_at_ms: create_now,
+                   now_ms: create_now + 2
+                 )
+
+        assert consumer.payload_ref == shared_ref
+
+        assert {:ok, [claimed]} =
+                 FerricStore.flow_claim_due("retention-shared-payload-owner",
+                   partition_key: owner_partition,
+                   worker: "worker-retention-shared-payload-owner",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: create_now + 3
+                 )
+
+        assert {:ok, _completed} =
+                 flow_complete_and_get(owner_id, claimed.lease_token,
+                   partition_key: owner_partition,
+                   fencing_token: claimed.fencing_token,
+                   now_ms: complete_now
+                 )
+
+        owner_shard = shard_for(Ferricstore.Flow.Keys.state_key(owner_id, owner_partition))
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, owner_shard)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        assert {:ok, %{flows: 1}} =
+                 Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
+                   limit: 10,
+                   now_ms: complete_now + 1_000
+                 })
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        assert {:ok, ["shared-payload"]} = FerricStore.flow_value_mget([shared_ref])
+      end
+
+      test "retention tracks named payload result and error shared refs" do
+        ctx = FerricStore.Instance.get(:default)
+        owner_id = uid("flow-retention-direct-ref-owner")
+        {owner_partition, _same_partition, consumer_partition} = mixed_partition_keys()
+        create_now = System.system_time(:millisecond) + 60_000
+        complete_now = create_now + 1_000
+
+        assert {:ok, _owner} =
+                 flow_create_and_get(owner_id,
+                   type: "retention-direct-ref-owner",
+                   state: "queued",
+                   partition_key: owner_partition,
+                   run_at_ms: create_now,
+                   retention_ttl_ms: 20,
+                   now_ms: create_now
+                 )
+
+        assert {:ok, %{ref: shared_ref}} =
+                 FerricStore.flow_value_put("shared-direct-ref",
+                   partition_key: owner_partition,
+                   owner_flow_id: owner_id,
+                   name: "doc",
+                   now_ms: create_now + 1
+                 )
+
+        named_id = uid("flow-retention-direct-ref-named")
+        payload_id = uid("flow-retention-direct-ref-payload")
+
+        assert {:ok, named} =
+                 flow_create_and_get(named_id,
+                   type: "retention-direct-ref-named",
+                   state: "queued",
+                   partition_key: consumer_partition,
+                   value_refs: %{"doc" => shared_ref},
+                   run_at_ms: create_now,
+                   now_ms: create_now + 2
+                 )
+
+        assert named.value_refs["doc"].ref == shared_ref
+
+        assert {:ok, payload} =
+                 flow_create_and_get(payload_id,
+                   type: "retention-direct-ref-payload",
+                   state: "queued",
+                   partition_key: consumer_partition,
+                   payload_ref: shared_ref,
+                   run_at_ms: create_now,
+                   now_ms: create_now + 3
+                 )
+
+        assert payload.payload_ref == shared_ref
+
+        terminal_refs =
+          for kind <- [:result, :error], into: %{} do
+            id = uid("flow-retention-direct-ref-#{kind}")
+            type = uid("retention-direct-ref-#{kind}-type")
+
+            assert :ok =
+                     FerricStore.flow_create(id,
+                       type: type,
+                       state: "queued",
+                       partition_key: consumer_partition,
+                       run_at_ms: create_now,
+                       now_ms: create_now + 4
+                     )
+
+            assert {:ok, [claimed]} =
+                     FerricStore.flow_claim_due(type,
+                       partition_key: consumer_partition,
+                       worker: "worker-retention-direct-ref-#{kind}",
+                       limit: 1,
+                       now_ms: create_now + 5
+                     )
+
+            ref_field = if(kind == :result, do: :result_ref, else: :error_ref)
+
+            attrs = %{
+              ref_field => shared_ref,
+              id: id,
+              lease_token: claimed.lease_token,
+              fencing_token: claimed.fencing_token,
+              partition_key: consumer_partition,
+              now_ms: create_now + 6
+            }
+
+            result =
+              case kind do
+                :result -> Ferricstore.Store.Router.flow_complete(ctx, attrs)
+                :error -> Ferricstore.Store.Router.flow_fail(ctx, attrs)
+              end
+
+            assert result == :ok
+            assert {:ok, record} = FerricStore.flow_get(id, partition_key: consumer_partition)
+            assert Map.fetch!(record, ref_field) == shared_ref
+            {kind, id}
+          end
+
+        assert Map.keys(terminal_refs) |> Enum.sort() == [:error, :result]
+
+        assert {:ok, [owner_claim]} =
+                 FerricStore.flow_claim_due("retention-direct-ref-owner",
+                   partition_key: owner_partition,
+                   worker: "worker-retention-direct-ref-owner",
+                   limit: 1,
+                   now_ms: create_now + 7
+                 )
+
+        assert {:ok, _completed_owner} =
+                 flow_complete_and_get(owner_id, owner_claim.lease_token,
+                   partition_key: owner_partition,
+                   fencing_token: owner_claim.fencing_token,
+                   now_ms: complete_now
+                 )
+
+        for shard_index <- 0..(ctx.shard_count - 1) do
+          assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index)
+        end
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        assert {:ok, %{flows: 1}} =
+                 FerricStore.flow_retention_cleanup(limit: 10, now_ms: complete_now + 1_000)
+
+        assert {:ok, ["shared-direct-ref"]} = FerricStore.flow_value_mget([shared_ref])
+      end
+
+      test "bounded partial and full cleanup preserve a shared value with a live consumer" do
+        ctx = FerricStore.Instance.get(:default)
+        owner_id = uid("flow-retention-partial-shared-owner")
+        consumer_id = uid("flow-retention-partial-shared-consumer")
+        {owner_partition, _same_partition, consumer_partition} = mixed_partition_keys()
+        create_now = System.system_time(:millisecond) + 60_000
+        complete_now = create_now + 1_000
+        cleanup_now = complete_now + 1_000
+        old_budget = Application.get_env(:ferricstore, :flow_retention_cleanup_key_budget)
+        Application.put_env(:ferricstore, :flow_retention_cleanup_key_budget, 8)
+
+        on_exit(fn -> restore_env(:flow_retention_cleanup_key_budget, old_budget) end)
+
+        assert {:ok, _owner} =
+                 flow_create_and_get(owner_id,
+                   type: "retention-partial-shared-owner",
+                   state: "queued",
+                   partition_key: owner_partition,
+                   run_at_ms: create_now,
+                   retention_ttl_ms: 20,
+                   now_ms: create_now
+                 )
+
+        assert {:ok, %{ref: shared_ref}} =
+                 FerricStore.flow_value_put("shared-partial",
+                   partition_key: owner_partition,
+                   owner_flow_id: owner_id,
+                   name: "doc",
+                   now_ms: create_now + 1
+                 )
+
+        assert {:ok, _consumer} =
+                 flow_create_and_get(consumer_id,
+                   type: "retention-partial-shared-consumer",
+                   state: "queued",
+                   partition_key: consumer_partition,
+                   value_refs: %{"doc" => shared_ref},
+                   run_at_ms: create_now,
+                   now_ms: create_now + 2
+                 )
+
+        assert {:ok, [claimed]} =
+                 FerricStore.flow_claim_due("retention-partial-shared-owner",
+                   partition_key: owner_partition,
+                   worker: "worker-retention-partial-shared-owner",
+                   limit: 1,
+                   now_ms: create_now + 3
+                 )
+
+        assert {:ok, _completed} =
+                 flow_complete_and_get(owner_id, claimed.lease_token,
+                   partition_key: owner_partition,
+                   fencing_token: claimed.fencing_token,
+                   now_ms: complete_now
+                 )
+
+        owner_shard = shard_for(Ferricstore.Flow.Keys.state_key(owner_id, owner_partition))
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, owner_shard)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        assert {:ok, %{flows: 0}} =
+                 Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
+                   limit: 10,
+                   now_ms: cleanup_now
+                 })
+
+        assert {:ok, ["shared-partial"]} = FerricStore.flow_value_mget([shared_ref])
+
+        assert {:ok, %{state: "completed"}} =
+                 FerricStore.flow_get(owner_id, partition_key: owner_partition)
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        assert {:ok, %{flows: 1}} =
+                 Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
+                   limit: 10,
+                   now_ms: cleanup_now + 1
+                 })
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        assert {:ok, nil} = FerricStore.flow_get(owner_id, partition_key: owner_partition)
+        assert {:ok, ["shared-partial"]} = FerricStore.flow_value_mget([shared_ref])
+      end
+
+      test "retention cleanup serializes with a racing shared value consumer" do
+        ctx = FerricStore.Instance.get(:default)
+        owner_id = uid("flow-retention-racing-shared-owner")
+        consumer_id = uid("flow-retention-racing-shared-consumer")
+        {owner_partition, _same_partition, consumer_partition} = mixed_partition_keys()
+        create_now = System.system_time(:millisecond) + 60_000
+        complete_now = create_now + 1_000
+        cleanup_now = complete_now + 1_000
+        parent = self()
+        release_ref = make_ref()
+
+        assert {:ok, _owner} =
+                 flow_create_and_get(owner_id,
+                   type: "retention-racing-shared-owner",
+                   state: "queued",
+                   partition_key: owner_partition,
+                   run_at_ms: create_now,
+                   retention_ttl_ms: 20,
+                   now_ms: create_now
+                 )
+
+        assert {:ok, %{ref: shared_ref}} =
+                 FerricStore.flow_value_put("shared-doc",
+                   partition_key: owner_partition,
+                   owner_flow_id: owner_id,
+                   name: "doc",
+                   now_ms: create_now + 1
+                 )
+
+        assert {:ok, [claimed]} =
+                 FerricStore.flow_claim_due("retention-racing-shared-owner",
+                   partition_key: owner_partition,
+                   worker: "worker-retention-racing-shared-owner",
+                   lease_ms: 30_000,
+                   limit: 1,
+                   now_ms: create_now + 2
+                 )
+
+        assert {:ok, completed} =
+                 flow_complete_and_get(owner_id, claimed.lease_token,
+                   partition_key: owner_partition,
+                   fencing_token: claimed.fencing_token,
+                   now_ms: complete_now
+                 )
+
+        assert completed.terminal_retention_until_ms == complete_now + 20
+
+        owner_shard = shard_for(Ferricstore.Flow.Keys.state_key(owner_id, owner_partition))
+
+        consumer_shard =
+          shard_for(Ferricstore.Flow.Keys.state_key(consumer_id, consumer_partition))
+
+        assert owner_shard != consumer_shard
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, owner_shard)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        old_hook =
+          Application.get_env(:ferricstore, :flow_shared_value_ref_acquisition_hook)
+
+        Application.put_env(
+          :ferricstore,
+          :flow_shared_value_ref_acquisition_hook,
+          fn record, refs ->
+            if Map.get(record, :id) == consumer_id and shared_ref in refs do
+              send(parent, {:shared_ref_acquisition_paused, self(), release_ref})
+
+              receive do
+                {:release_shared_ref_acquisition, ^release_ref} -> :ok
+              after
+                10_000 -> {:error, :shared_ref_acquisition_hook_timeout}
+              end
+            else
+              :ok
+            end
+          end
+        )
+
+        on_exit(fn ->
+          restore_env(:flow_shared_value_ref_acquisition_hook, old_hook)
+        end)
+
+        consumer_task =
+          Task.async(fn ->
+            flow_create_and_get(consumer_id,
+              type: "retention-racing-shared-consumer",
+              state: "queued",
+              partition_key: consumer_partition,
+              value_refs: %{"doc" => shared_ref},
+              run_at_ms: create_now,
+              retention_ttl_ms: 20,
+              now_ms: create_now + 3
+            )
+          end)
+
+        assert_receive {:shared_ref_acquisition_paused, apply_pid, ^release_ref}, 5_000
+
+        cleanup_task =
+          Task.async(fn ->
+            Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
+              limit: 10,
+              now_ms: cleanup_now
+            })
+          end)
+
+        cleanup_while_consumer_paused = Task.yield(cleanup_task, 1_000)
+        send(apply_pid, {:release_shared_ref_acquisition, release_ref})
+
+        assert {:ok, consumer} = Task.await(consumer_task, 10_000)
+        assert consumer.value_refs["doc"].ref == shared_ref
+
+        cleanup_result =
+          case cleanup_while_consumer_paused do
+            nil -> Task.await(cleanup_task, 10_000)
+            {:ok, result} -> result
+          end
+
+        assert cleanup_while_consumer_paused == nil
+        assert {:ok, %{flows: 1}} = cleanup_result
+        assert {:ok, ["shared-doc"]} = FerricStore.flow_value_mget([shared_ref])
+      end
+
+      test "retention cleanup serializes with same-shard child shared ref acquisition" do
+        ctx = FerricStore.Instance.get(:default)
+        owner_id = uid("flow-retention-spawn-shared-owner")
+        parent_id = uid("flow-retention-spawn-shared-parent")
+        child_id = uid("flow-retention-spawn-shared-child")
+        {parent_partition, child_partition, owner_partition} = mixed_partition_keys()
+        create_now = System.system_time(:millisecond) + 60_000
+        complete_now = create_now + 1_000
+        cleanup_now = complete_now + 1_000
+        parent = self()
+        release_ref = make_ref()
+
+        assert shard_for(Ferricstore.Flow.Keys.state_key(parent_id, parent_partition)) ==
+                 shard_for(Ferricstore.Flow.Keys.state_key(child_id, child_partition))
+
+        assert {:ok, _owner} =
+                 flow_create_and_get(owner_id,
+                   type: "retention-spawn-shared-owner",
+                   state: "queued",
+                   partition_key: owner_partition,
+                   run_at_ms: create_now,
+                   retention_ttl_ms: 20,
+                   now_ms: create_now
+                 )
+
+        assert {:ok, %{ref: shared_ref}} =
+                 FerricStore.flow_value_put("shared-spawn",
+                   partition_key: owner_partition,
+                   owner_flow_id: owner_id,
+                   name: "doc",
+                   now_ms: create_now + 1
+                 )
+
+        assert {:ok, _parent} =
+                 flow_create_and_get(parent_id,
+                   type: "retention-spawn-shared-parent",
+                   state: "queued",
+                   partition_key: parent_partition,
+                   run_at_ms: create_now,
+                   now_ms: create_now + 2
+                 )
+
+        assert {:ok, [owner_claim]} =
+                 FerricStore.flow_claim_due("retention-spawn-shared-owner",
+                   partition_key: owner_partition,
+                   worker: "worker-retention-spawn-shared-owner",
+                   limit: 1,
+                   now_ms: create_now + 3
+                 )
+
+        assert {:ok, [parent_claim]} =
+                 FerricStore.flow_claim_due("retention-spawn-shared-parent",
+                   partition_key: parent_partition,
+                   worker: "worker-retention-spawn-shared-parent",
+                   limit: 1,
+                   now_ms: create_now + 3
+                 )
+
+        assert {:ok, _completed} =
+                 flow_complete_and_get(owner_id, owner_claim.lease_token,
+                   partition_key: owner_partition,
+                   fencing_token: owner_claim.fencing_token,
+                   now_ms: complete_now
+                 )
+
+        owner_shard = shard_for(Ferricstore.Flow.Keys.state_key(owner_id, owner_partition))
+        assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, owner_shard)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        old_hook =
+          Application.get_env(:ferricstore, :flow_shared_value_ref_acquisition_hook)
+
+        Application.put_env(
+          :ferricstore,
+          :flow_shared_value_ref_acquisition_hook,
+          fn record, refs ->
+            if Map.get(record, :id) == child_id and shared_ref in refs do
+              send(parent, {:spawn_shared_ref_acquisition_paused, self(), release_ref})
+
+              receive do
+                {:release_spawn_shared_ref_acquisition, ^release_ref} -> :ok
+              after
+                10_000 -> {:error, :spawn_shared_ref_acquisition_hook_timeout}
+              end
+            else
+              :ok
+            end
+          end
+        )
+
+        on_exit(fn ->
+          restore_env(:flow_shared_value_ref_acquisition_hook, old_hook)
+        end)
+
+        spawn_task =
+          Task.async(fn ->
+            FerricStore.flow_spawn_children(
+              parent_id,
+              [
+                %{
+                  id: child_id,
+                  type: "retention-spawn-shared-child",
+                  partition_key: child_partition,
+                  value_refs: %{"doc" => shared_ref},
+                  run_at_ms: create_now
+                }
+              ],
+              partition_key: parent_partition,
+              lease_token: parent_claim.lease_token,
+              fencing_token: parent_claim.fencing_token,
+              group_id: "retention-spawn-shared-group",
+              wait_state: "waiting_children",
+              success: "completed",
+              failure: "failed",
+              now_ms: create_now + 4
+            )
+          end)
+
+        assert_receive {:spawn_shared_ref_acquisition_paused, apply_pid, ^release_ref}, 5_000
+
+        cleanup_task =
+          Task.async(fn ->
+            Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
+              limit: 10,
+              now_ms: cleanup_now
+            })
+          end)
+
+        cleanup_while_spawn_paused = Task.yield(cleanup_task, 1_000)
+        send(apply_pid, {:release_spawn_shared_ref_acquisition, release_ref})
+
+        assert :ok = Task.await(spawn_task, 10_000)
+
+        cleanup_result =
+          case cleanup_while_spawn_paused do
+            nil -> Task.await(cleanup_task, 10_000)
+            {:ok, result} -> result
+          end
+
+        assert cleanup_while_spawn_paused == nil
+        assert {:ok, %{flows: 1}} = cleanup_result
+        assert {:ok, ["shared-spawn"]} = FerricStore.flow_value_mget([shared_ref])
+
+        assert {:ok, child} =
+                 FerricStore.flow_get(child_id,
+                   partition_key: child_partition,
+                   values: ["doc"]
+                 )
+
+        assert child.values == %{"doc" => "shared-spawn"}
       end
 
       test "retention cleanup preserves owner named values referenced by retained history" do

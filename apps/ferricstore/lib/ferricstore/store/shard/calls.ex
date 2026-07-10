@@ -42,6 +42,17 @@ defmodule Ferricstore.Store.Shard.Calls do
       def handle_call({:get_meta, key}, from, state),
         do: ShardReads.handle_get_meta(key, from, state)
 
+      def handle_call({:flow_retention_plan, attrs}, _from, state) when is_map(attrs) do
+        planner_state =
+          state
+          |> Map.put(:shard_index, state.index)
+          |> Map.put(:flow_lmdb_path, Ferricstore.Flow.LMDB.path(state.shard_data_path))
+          |> Map.put(:flow_index_name, state.flow_index)
+          |> Map.put(:flow_lookup_name, state.flow_lookup)
+
+        {:reply, Ferricstore.Raft.StateMachine.flow_retention_plan(planner_state, attrs), state}
+      end
+
       # Compound key scan: returns all live entries matching a prefix.
       # Used by HSCAN, SSCAN, ZSCAN via the compound_scan store callback.
       # Uses :ets.select match spec instead of :ets.foldl full-table scan.

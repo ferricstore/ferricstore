@@ -241,16 +241,8 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
         |> Auth.dashboard_flow_collect_opts(peer, headers)
         |> Dashboard.collect_flow_page()
 
-      body = data |> Dashboard.live_flow_payload() |> Jason.encode!()
-
-      Response.send_response(
-        socket,
-        transport,
-        200,
-        "OK",
-        "application/json; charset=utf-8",
-        body
-      )
+      payload = Dashboard.live_flow_payload(data)
+      Response.send_live_json_response(socket, transport, payload)
     end
   end
 
@@ -306,10 +298,12 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
       params = FlowPaths.decode_form_body(query)
 
       data =
-        Dashboard.collect_flow_policies_page(
+        [
           flash: Dashboard.flow_policy_flash_from_query(query),
           edit_type: Map.get(params, "edit", "")
-        )
+        ]
+        |> Auth.dashboard_flow_collect_opts(peer, headers)
+        |> Dashboard.collect_flow_policies_page()
 
       body = Dashboard.render_flow_policies_page(data)
       Response.send_html_response(socket, transport, 200, "OK", body)

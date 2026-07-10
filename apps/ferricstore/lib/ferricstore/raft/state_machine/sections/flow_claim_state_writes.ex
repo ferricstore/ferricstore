@@ -551,7 +551,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                 Process.put(:sm_pending_fast_staged_put_batch, true)
 
                 safe_ets_insert(state.ets, entries)
-                :ok
+                flow_track_state_retention_metadata_batch(state, key_records)
 
               {:error, _reason} = error ->
                 error
@@ -637,7 +637,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                 Process.put(:sm_pending_fast_staged_put_batch, true)
 
                 safe_ets_insert(state.ets, entries)
-                :ok
+                flow_track_state_retention_metadata_batch(state, key_records)
 
               {:error, _reason} = error ->
                 error
@@ -780,7 +780,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
           flow_zset_put_many_new(state, key, Enum.reverse(member_score_pairs))
         end)
 
-        flow_index_put_new_entries(state, Enum.flat_map(records, &flow_metadata_index_entries/1))
+        secondary_entries =
+          Enum.flat_map(records, fn record ->
+            flow_metadata_index_entries(record) ++
+              flow_active_timeout_index_entries(record) ++
+              flow_terminal_retention_index_entries(record)
+          end)
+
+        flow_index_put_new_entries(state, secondary_entries)
 
         :ok
       end
@@ -808,7 +815,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
         with :ok <- flow_put_lifecycle_index_groups(lifecycle_groups, state) do
           plans
-          |> Enum.flat_map(fn %{metadata_index_entries: entries} -> entries end)
+          |> Enum.flat_map(fn %{record: record, metadata_index_entries: entries} ->
+            entries ++
+              flow_active_timeout_index_entries(record) ++
+              flow_terminal_retention_index_entries(record)
+          end)
           |> then(&flow_index_put_new_entries(state, &1))
         end
       end

@@ -633,6 +633,7 @@ defmodule Ferricstore.Flow do
       with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.complete_attrs(id, lease_token, opts) do
         Router.flow_complete(ctx, attrs)
       end
+      |> normalize_committed_error()
       |> maybe_release_governance_limit(ctx, opts)
 
     FlowTelemetry.observe(:complete, started, result, %{flow_id: id, _count: 1})
@@ -680,6 +681,9 @@ defmodule Ferricstore.Flow do
 
   def complete_many(_ctx, _partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
+
+  defp normalize_committed_error({:ok, {:error, reason}}), do: {:error, reason}
+  defp normalize_committed_error(result), do: result
 
   def transition(ctx, id, from_state, to_state, opts \\ [])
       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do

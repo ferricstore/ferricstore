@@ -15,12 +15,14 @@ defmodule FerricstoreServer.Native.Commands do
   alias Ferricstore.{AuditLog, Stats}
   alias Ferricstore.Flow.{ClaimDueAPI, ClaimWaiters}
   alias Ferricstore.Flow.Codec, as: FlowCodec
+  alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Store.{CompoundKey, Ops, Router}
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.SlotMap
+  alias FerricstoreServer.AuthRateLimiter
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.RouteMetadata
@@ -411,6 +413,7 @@ defmodule FerricstoreServer.Native.Commands do
     "lease_token" => :lease_token,
     "limit" => :limit,
     "local_cache" => :local_cache,
+    "max_active_ms" => :max_active_ms,
     "max_attempts" => :max_attempts,
     "max_bytes" => :max_bytes,
     "max_fires" => :max_fires,
@@ -521,18 +524,13 @@ defmodule FerricstoreServer.Native.Commands do
   def execute(opcode, payload, %{acl_cache: :full_access, require_auth: false} = state) do
     payload = normalize_payload(payload)
 
-    case check_deadline(payload) do
-      :ok ->
-        case check_native_resource_limits(opcode, payload, state) do
-          :ok ->
-            do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
-
-          {:error, reason} ->
-            {:error, FerricStore.ResourceLimits.error_message(reason), state}
-        end
-
-      {:error, status, reason} ->
-        {status, reason, state}
+    with :ok <- check_deadline(payload),
+         :ok <- authorize_public_opcode(opcode, payload),
+         :ok <- check_native_resource_limits(opcode, payload, state) do
+      do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
+    else
+      {:error, reason} -> {:error, FerricStore.ResourceLimits.error_message(reason), state}
+      {:error, status, reason} -> {status, reason, state}
     end
   rescue
     error ->
@@ -545,6 +543,7 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, command} <- fetch_command(opcode),
          :ok <- check_deadline(payload),
          :ok <- authorize(command, opcode, payload, state),
+         :ok <- authorize_public_opcode(opcode, payload),
          :ok <- check_native_resource_limits(opcode, payload, state) do
       do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
     else
@@ -737,7 +736,24 @@ defmodule FerricstoreServer.Native.Commands do
     password = Map.get(payload, "password")
 
     if is_binary(username) and is_binary(password) do
-      do_auth(username, password, state)
+      case AuthRateLimiter.permit(state.peer, username, password) do
+        {:ok, reservation} ->
+          result = do_auth(username, password, state)
+
+          if match?({:ok, _response, _state}, result) do
+            :ok = AuthRateLimiter.release_success(reservation)
+          end
+
+          result
+
+        {:error, {:rate_limited, retry_after_ms}} ->
+          auth_failure(username, state)
+
+          {:auth, "ERR too many authentication attempts; retry after #{retry_after_ms} ms", state}
+
+        {:error, reason} when is_binary(reason) ->
+          {:auth, reason, state}
+      end
     else
       {:auth, "ERR native AUTH requires username/password binaries", state}
     end
@@ -2100,6 +2116,14 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp authorize_public_opcode(opcode, payload) do
+    if Map.has_key?(@flow_commands, opcode) do
+      :ok
+    else
+      opcode |> keys(payload) |> InternalKey.authorize_public()
+    end
+  end
+
   defp check_key_acl_cached(:full_access, _opcode, _payload), do: :ok
   defp check_key_acl_cached(%{keys: :all}, _opcode, _payload), do: :ok
 
@@ -2131,6 +2155,78 @@ defmodule FerricstoreServer.Native.Commands do
         end
     end
   end
+
+  @flow_partition_or_id_opcodes [
+    @op_flow_create,
+    @op_flow_get,
+    @op_flow_complete,
+    @op_flow_transition,
+    @op_flow_step_continue,
+    @op_flow_start_and_claim,
+    @op_flow_retry,
+    @op_flow_fail,
+    @op_flow_cancel,
+    @op_flow_extend_lease,
+    @op_flow_history,
+    @op_flow_signal,
+    @op_flow_rewind,
+    @op_flow_effect_reserve,
+    @op_flow_effect_confirm,
+    @op_flow_effect_fail,
+    @op_flow_effect_compensate,
+    @op_flow_effect_get,
+    @op_flow_governance_ledger
+  ]
+
+  @flow_schedule_id_opcodes [
+    @op_flow_schedule_get,
+    @op_flow_schedule_fire,
+    @op_flow_schedule_pause,
+    @op_flow_schedule_resume,
+    @op_flow_schedule_delete
+  ]
+
+  @flow_approval_id_opcodes [
+    @op_flow_approval_approve,
+    @op_flow_approval_reject,
+    @op_flow_approval_get
+  ]
+
+  @flow_batch_opcodes [
+    @op_flow_create_many,
+    @op_flow_complete_many,
+    @op_flow_transition_many,
+    @op_flow_retry_many,
+    @op_flow_fail_many,
+    @op_flow_cancel_many,
+    @op_flow_run_steps_many
+  ]
+
+  @flow_partition_wide_opcodes [
+    @op_flow_list,
+    @op_flow_terminals,
+    @op_flow_failures,
+    @op_flow_info,
+    @op_flow_stuck
+  ]
+
+  @flow_partition_or_global_opcodes [
+    @op_flow_stats,
+    @op_flow_attributes,
+    @op_flow_attribute_values,
+    @op_flow_search
+  ]
+
+  @flow_global_opcodes [
+    @op_flow_value_mget,
+    @op_flow_retention_cleanup,
+    @op_flow_schedule_fire_due,
+    @op_flow_schedule_list,
+    @op_flow_approval_list,
+    @op_flow_governance_overview,
+    @op_flow_budget_list,
+    @op_flow_limit_list
+  ]
 
   defp keys(opcode, payload)
        when opcode in [
@@ -2175,55 +2271,49 @@ defmodule FerricstoreServer.Native.Commands do
   defp keys(@op_mset, payload),
     do: payload |> Map.get("pairs", []) |> Enum.map(&pair_key/1) |> binary_list()
 
-  defp keys(opcode, payload)
-       when opcode in [
-              @op_flow_create,
-              @op_flow_get,
-              @op_flow_complete,
-              @op_flow_transition,
-              @op_flow_step_continue,
-              @op_flow_start_and_claim,
-              @op_flow_retry,
-              @op_flow_fail,
-              @op_flow_cancel,
-              @op_flow_extend_lease,
-              @op_flow_history,
-              @op_flow_signal,
-              @op_flow_rewind,
-              @op_flow_effect_reserve,
-              @op_flow_effect_confirm,
-              @op_flow_effect_fail,
-              @op_flow_effect_compensate,
-              @op_flow_effect_get,
-              @op_flow_governance_ledger,
-              @op_flow_approval_request,
-              @op_flow_approval_approve,
-              @op_flow_approval_reject,
-              @op_flow_approval_get,
-              @op_flow_spawn_children,
-              @op_flow_schedule_create,
-              @op_flow_schedule_get,
-              @op_flow_schedule_fire,
-              @op_flow_schedule_pause,
-              @op_flow_schedule_resume,
-              @op_flow_schedule_delete
-            ],
-       do: binary_list([Map.get(payload, "id")])
+  defp keys(opcode, payload) when opcode in @flow_partition_or_id_opcodes,
+    do: flow_partition_or_fallback(payload, [Map.get(payload, "id")])
 
-  defp keys(opcode, payload)
-       when opcode in [
-              @op_flow_create_many,
-              @op_flow_complete_many,
-              @op_flow_transition_many,
-              @op_flow_retry_many,
-              @op_flow_fail_many,
-              @op_flow_cancel_many,
-              @op_flow_run_steps_many
-            ],
-       do: flow_item_ids(payload)
+  defp keys(@op_flow_schedule_create, payload), do: flow_schedule_create_acl_keys(payload)
+
+  defp keys(opcode, payload) when opcode in @flow_schedule_id_opcodes,
+    do: binary_list([Map.get(payload, "id")])
+
+  defp keys(@op_flow_approval_request, payload), do: flow_approval_request_acl_keys(payload)
+
+  defp keys(opcode, payload) when opcode in @flow_approval_id_opcodes,
+    do: binary_list([Map.get(payload, "id")])
+
+  defp keys(opcode, payload) when opcode in @flow_batch_opcodes,
+    do: flow_batch_acl_keys(opcode, payload)
+
+  defp keys(opcode, payload) when opcode in [@op_flow_claim_due, @op_flow_reclaim],
+    do: flow_claim_due_acl_keys(payload)
+
+  defp keys(opcode, payload) when opcode in @flow_partition_wide_opcodes,
+    do: flow_partition_or_global(payload)
+
+  defp keys(opcode, payload) when opcode in @flow_partition_or_global_opcodes,
+    do: flow_partition_or_global(payload)
+
+  defp keys(opcode, _payload) when opcode in @flow_global_opcodes, do: ["*"]
+
+  defp keys(opcode, payload) when opcode in [@op_flow_policy_set, @op_flow_policy_get],
+    do: binary_list([Map.get(payload, "type")])
+
+  defp keys(@op_flow_by_parent, payload),
+    do: flow_partition_or_global(payload)
+
+  defp keys(@op_flow_by_root, payload),
+    do: flow_partition_or_global(payload)
+
+  defp keys(@op_flow_by_correlation, payload),
+    do: flow_partition_or_global(payload)
+
+  defp keys(@op_flow_spawn_children, payload), do: flow_spawn_acl_keys(payload)
 
   defp keys(@op_flow_value_put, payload),
-    do: binary_list([Map.get(payload, "owner_flow_id") || Map.get(payload, "id")])
+    do: flow_value_put_acl_keys(payload)
 
   defp keys(opcode, payload)
        when opcode in [
@@ -2241,19 +2331,270 @@ defmodule FerricstoreServer.Native.Commands do
             ],
        do: binary_list([Map.get(payload, "scope")])
 
-  defp keys(@op_flow_search, payload), do: flow_search_acl_keys(payload)
-
+  defp keys(opcode, _payload) when is_map_key(@flow_commands, opcode), do: ["*"]
   defp keys(_opcode, _payload), do: []
 
-  defp flow_search_acl_keys(payload) do
+  defp flow_partition_or_global(payload) do
     case payload_flow_option(payload, "partition_key") do
-      value when is_binary(value) and value not in ["", "GLOBAL"] -> [value]
+      value when is_binary(value) and value != "" -> [value]
       _other -> ["*"]
     end
   end
 
+  defp flow_partition_or_fallback(payload, fallback) do
+    case payload_flow_option(payload, "partition_key") do
+      value when is_binary(value) and value != "" ->
+        [value]
+
+      _other ->
+        binary_list(fallback)
+    end
+  end
+
+  defp flow_batch_acl_keys(@op_flow_run_steps_many, payload) do
+    payload
+    |> Map.get("items", [])
+    |> flow_run_steps_acl_keys()
+  end
+
+  defp flow_batch_acl_keys(opcode, payload) do
+    case Map.get(payload, "partition_key") do
+      value when is_binary(value) and value != "" ->
+        [value]
+
+      _other ->
+        flow_item_acl_keys(Map.get(payload, "items", []), opcode)
+    end
+  end
+
+  defp flow_run_steps_acl_keys(items) when is_list(items) and items != [] do
+    items
+    |> Enum.map(&flow_run_steps_item_acl_key/1)
+    |> Enum.map(fn
+      value when is_binary(value) and value != "" -> value
+      _unknown -> "*"
+    end)
+    |> Enum.uniq()
+  end
+
+  defp flow_run_steps_acl_keys(_items), do: ["*"]
+
+  defp flow_run_steps_item_acl_key(%{} = item) do
+    Map.get(item, "partition_key") || Map.get(item, :partition_key) ||
+      flow_acl_id(Map.get(item, "id") || Map.get(item, :id))
+  end
+
+  defp flow_run_steps_item_acl_key({:id, id, :partition_key, partition_key})
+       when is_binary(id),
+       do: partition_key
+
+  defp flow_run_steps_item_acl_key({:id, id}) when is_binary(id),
+    do: id
+
+  defp flow_run_steps_item_acl_key(id) when is_binary(id), do: id
+  defp flow_run_steps_item_acl_key(_item), do: nil
+
+  defp flow_acl_id(id) when is_binary(id) and id != "", do: id
+  defp flow_acl_id(_id), do: nil
+
+  defp flow_claim_due_acl_keys(payload) do
+    partition_keys =
+      case payload_flow_option(payload, "partition_keys") do
+        values when is_list(values) -> binary_list(values)
+        _other -> []
+      end
+
+    partition_keys =
+      case payload_flow_option(payload, "partition_key") do
+        value when is_binary(value) and value != "" ->
+          [flow_claim_acl_partition(value) | partition_keys]
+
+        _other ->
+          partition_keys
+      end
+
+    case Enum.uniq(partition_keys) do
+      [] -> ["*"]
+      keys -> keys
+    end
+  end
+
+  defp flow_claim_acl_partition(value) when is_binary(value) do
+    if String.upcase(value) in ["AUTO", "ANY", "GLOBAL"], do: "*", else: value
+  end
+
+  defp flow_spawn_acl_keys(payload) do
+    parent_keys = flow_partition_or_fallback(payload, [Map.get(payload, "id")])
+    child_keys = flow_spawn_child_acl_keys(Map.get(payload, "children", []))
+    Enum.uniq(parent_keys ++ child_keys)
+  end
+
+  defp flow_value_put_acl_keys(payload) do
+    case payload_flow_option(payload, "partition_key") do
+      value when is_binary(value) and value != "" ->
+        [value]
+
+      _other ->
+        case payload_flow_option(payload, "owner_flow_id") do
+          owner_flow_id when is_binary(owner_flow_id) and owner_flow_id != "" -> [owner_flow_id]
+          _anonymous -> ["*"]
+        end
+    end
+  end
+
+  defp flow_schedule_create_acl_keys(payload) do
+    schedule_id = Map.get(payload, "id")
+    target_key = payload |> payload_flow_option("target") |> flow_schedule_target_acl_key()
+    binary_list([schedule_id, target_key || "*"])
+  end
+
+  defp flow_schedule_target_acl_key(%{} = target) do
+    Map.get(target, "partition_key") || Map.get(target, :partition_key) ||
+      Map.get(target, "id") || Map.get(target, :id) || Map.get(target, "id_prefix") ||
+      Map.get(target, :id_prefix)
+  end
+
+  defp flow_schedule_target_acl_key(target) when is_list(target) do
+    Keyword.get(target, :partition_key) || Keyword.get(target, :id) ||
+      Keyword.get(target, :id_prefix)
+  end
+
+  defp flow_schedule_target_acl_key(_target), do: nil
+
+  defp flow_approval_request_acl_keys(payload) do
+    [
+      Map.get(payload, "id"),
+      payload_flow_option(payload, "flow_id"),
+      payload_flow_option(payload, "scope")
+    ]
+    |> binary_list()
+    |> Enum.uniq()
+  end
+
+  defp flow_spawn_child_acl_keys(children) when is_list(children) do
+    children
+    |> Enum.map(fn
+      %{} = child ->
+        Map.get(child, "partition_key") || Map.get(child, :partition_key)
+
+      [_id, partition_key, _payload] ->
+        partition_key
+
+      {:id, _id, :partition_key, partition_key, :payload, _payload} ->
+        partition_key
+
+      {_id, partition_key, _payload} ->
+        partition_key
+
+      _child ->
+        nil
+    end)
+    |> binary_list()
+    |> Enum.uniq()
+  end
+
+  defp flow_spawn_child_acl_keys(_children), do: []
+
+  defp flow_item_acl_keys(items, opcode) when is_list(items) do
+    items
+    |> Enum.map(&flow_item_acl_key(&1, opcode))
+    |> binary_list()
+    |> Enum.uniq()
+  end
+
+  defp flow_item_acl_keys(_items, _opcode), do: []
+
+  defp flow_item_acl_key(%{} = item, _opcode) do
+    Map.get(item, "partition_key") || Map.get(item, :partition_key) || Map.get(item, "id") ||
+      Map.get(item, :id)
+  end
+
+  defp flow_item_acl_key([_id, partition_key, _payload], @op_flow_create_many),
+    do: partition_key
+
+  defp flow_item_acl_key([_id, partition_key, _lease_token, _fencing_token], opcode)
+       when opcode in [
+              @op_flow_complete_many,
+              @op_flow_transition_many,
+              @op_flow_retry_many,
+              @op_flow_fail_many
+            ],
+       do: partition_key
+
+  defp flow_item_acl_key([_id, partition_key, _fencing_token], @op_flow_cancel_many),
+    do: partition_key
+
+  defp flow_item_acl_key([id | _rest], _opcode), do: id
+
+  defp flow_item_acl_key(
+         {:id, _id, :partition_key, partition_key, :payload, _payload},
+         _opcode
+       ),
+       do: partition_key
+
+  defp flow_item_acl_key(
+         {:id, _id, :partition_key, partition_key, :lease_token, _lease_token, :fencing_token,
+          _fencing_token},
+         _opcode
+       ),
+       do: partition_key
+
+  defp flow_item_acl_key(
+         {:id, _id, :partition_key, partition_key, :fencing_token, _fencing_token},
+         _opcode
+       ),
+       do: partition_key
+
+  defp flow_item_acl_key(
+         {:id, _id, :partition_key, partition_key, :fencing_token, _fencing_token, :lease_token,
+          _lease_token},
+         _opcode
+       ),
+       do: partition_key
+
+  defp flow_item_acl_key({:id, id, :payload, _payload}, _opcode), do: id
+  defp flow_item_acl_key({:id, id, :fencing_token, _token}, _opcode), do: id
+
+  defp flow_item_acl_key(
+         {:id, id, :lease_token, _lease_token, :fencing_token, _fencing_token},
+         _opcode
+       ),
+       do: id
+
+  defp flow_item_acl_key(
+         {:id, id, :fencing_token, _fencing_token, :lease_token, _lease_token},
+         _opcode
+       ),
+       do: id
+
+  defp flow_item_acl_key({_id, partition_key, _payload}, @op_flow_create_many),
+    do: partition_key
+
+  defp flow_item_acl_key({_id, partition_key, _lease_token, _fencing_token}, opcode)
+       when opcode in [
+              @op_flow_complete_many,
+              @op_flow_transition_many,
+              @op_flow_retry_many,
+              @op_flow_fail_many
+            ],
+       do: partition_key
+
+  defp flow_item_acl_key({_id, partition_key, _fencing_token}, @op_flow_cancel_many),
+    do: partition_key
+
+  defp flow_item_acl_key({id, _payload}, _opcode), do: id
+  defp flow_item_acl_key({id, _second, _third}, _opcode), do: id
+  defp flow_item_acl_key({id, _second, _third, _fourth}, _opcode), do: id
+  defp flow_item_acl_key(_item, _opcode), do: nil
+
   defp payload_flow_option(payload, key) when is_map(payload) do
-    Map.get(payload, key) || payload |> Map.get("opts", %{}) |> option_map() |> Map.get(key)
+    opts = payload |> Map.get("opts", %{}) |> option_map()
+
+    if Map.has_key?(opts, key) do
+      Map.get(opts, key)
+    else
+      Map.get(payload, key)
+    end
   end
 
   defp key_acl_command(opcode)
@@ -2272,6 +2613,13 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_get,
               @op_flow_history,
               @op_flow_list,
+              @op_flow_terminals,
+              @op_flow_failures,
+              @op_flow_by_parent,
+              @op_flow_by_root,
+              @op_flow_by_correlation,
+              @op_flow_info,
+              @op_flow_stuck,
               @op_flow_stats,
               @op_flow_attributes,
               @op_flow_attribute_values,
@@ -2281,9 +2629,13 @@ defmodule FerricstoreServer.Native.Commands do
               @op_flow_effect_get,
               @op_flow_governance_ledger,
               @op_flow_approval_get,
+              @op_flow_approval_list,
+              @op_flow_governance_overview,
               @op_flow_circuit_get,
               @op_flow_budget_get,
+              @op_flow_budget_list,
               @op_flow_limit_get,
+              @op_flow_limit_list,
               @op_flow_schedule_get,
               @op_flow_schedule_list,
               @op_cluster_keyslot,
@@ -2300,61 +2652,6 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp binary_list(values) when is_list(values), do: Enum.filter(values, &is_binary/1)
   defp binary_list(_), do: []
-
-  defp flow_item_ids(%{"items" => items}) when is_list(items) do
-    items
-    |> Enum.map(fn
-      %{"id" => id} ->
-        id
-
-      %{id: id} ->
-        id
-
-      [id | _rest] ->
-        id
-
-      {:id, id, :payload, _payload} ->
-        id
-
-      {:id, id, :partition_key, _partition_key, :payload, _payload} ->
-        id
-
-      {:id, id, :lease_token, _lease_token, :fencing_token, _fencing_token} ->
-        id
-
-      {:id, id, :fencing_token, _fencing_token} ->
-        id
-
-      {:id, id, :fencing_token, _fencing_token, :lease_token, _lease_token} ->
-        id
-
-      {:id, id, :partition_key, _partition_key, :lease_token, _lease_token, :fencing_token,
-       _fencing_token} ->
-        id
-
-      {:id, id, :partition_key, _partition_key, :fencing_token, _fencing_token} ->
-        id
-
-      {:id, id, :partition_key, _partition_key, :fencing_token, _fencing_token, :lease_token,
-       _lease_token} ->
-        id
-
-      {id, _payload} ->
-        id
-
-      {id, _partition_key, _payload} ->
-        id
-
-      {id, _partition_key, _lease_token, _fencing_token} ->
-        id
-
-      _ ->
-        nil
-    end)
-    |> binary_list()
-  end
-
-  defp flow_item_ids(_payload), do: []
 
   defp complete_auth(username, state) do
     AuditLog.log(:auth_success, %{username: username, client_ip: format_peer(state.peer)})
@@ -2635,6 +2932,29 @@ defmodule FerricstoreServer.Native.Commands do
           "due_after_ms",
           "priority",
           "retention_ttl_ms",
+          "max_active_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.CREATE_MANY" => %{
+        "required" => ["items"],
+        "fields" => [
+          "items",
+          "partition_key",
+          "type",
+          "state",
+          "payload",
+          "payload_ref",
+          "attributes",
+          "run_at_ms",
+          "priority",
+          "retention_ttl_ms",
+          "max_active_ms",
+          "history_hot_max_events",
+          "history_max_events",
+          "independent",
+          "return",
+          "now_ms",
           "deadline_ms"
         ]
       },
@@ -2718,6 +3038,21 @@ defmodule FerricstoreServer.Native.Commands do
           "deadline_ms"
         ]
       },
+      "FLOW.POLICY.SET" => %{
+        "required" => ["type"],
+        "fields" => [
+          "type",
+          "max_active_ms",
+          "retry",
+          "retention",
+          "states",
+          "indexed_attributes",
+          "indexed_state_meta",
+          "version",
+          "governance",
+          "deadline_ms"
+        ]
+      },
       "FLOW.STEP_CONTINUE" => %{
         "required" => ["id", "lease_token", "from_state", "to_state", "fencing_token"],
         "fields" => [
@@ -2763,6 +3098,7 @@ defmodule FerricstoreServer.Native.Commands do
           "correlation_id",
           "priority",
           "retention_ttl_ms",
+          "max_active_ms",
           "history_hot_max_events",
           "history_max_events",
           "now_ms",
@@ -2822,6 +3158,7 @@ defmodule FerricstoreServer.Native.Commands do
           "fencing_token",
           "on_child_failed",
           "on_parent_closed",
+          "max_active_ms",
           "now_ms",
           "deadline_ms"
         ]
@@ -3017,28 +3354,41 @@ defmodule FerricstoreServer.Native.Commands do
 
     requirepass = requirepass()
     has_requirepass = requirepass not in [nil, ""]
+    passwordless_acl_user? = match?(%{enabled: true, password: nil}, user)
 
     cond do
-      not has_acl_password and not has_requirepass ->
-        auth_failure(username, state)
-
-        {:auth,
-         "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?",
-         state}
-
       has_acl_password ->
         acl_auth(username, password, state)
 
       username == "default" and constant_time_equal?(password, requirepass) ->
         complete_auth(username, state)
 
-      username == "default" ->
+      username == "default" and has_requirepass ->
         auth_failure(username, state)
         {:auth, "WRONGPASS invalid username-password pair or user is disabled.", state}
+
+      username == "default" ->
+        if passwordless_acl_user? do
+          auth_without_configured_password(username, password, state)
+        else
+          acl_auth(username, password, state)
+        end
+
+      passwordless_acl_user? and not has_requirepass ->
+        auth_without_configured_password(username, password, state)
 
       true ->
         acl_auth(username, password, state)
     end
+  end
+
+  defp auth_without_configured_password(username, password, state) do
+    _result = FerricstoreServer.Acl.authenticate(username, password)
+    auth_failure(username, state)
+
+    {:auth,
+     "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?",
+     state}
   end
 
   defp acl_auth(username, password, state) do
@@ -3411,6 +3761,7 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, request_context} <- request_context(payload, state),
          {:ok, commands} <- pipeline_commands(payload),
          {:ok, atomicity} <- pipeline_atomicity(payload),
+         :ok <- authorize_pipeline_public_keys(commands),
          :ok <- validate_pipeline_atomicity(commands, atomicity, state) do
       execute_pipeline_commands(commands, pipeline_return_format(payload), state, request_context)
     else
@@ -3494,6 +3845,29 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp pipeline_commands(_payload), do: {:error, "ERR native pipeline requires commands list"}
 
+  defp authorize_pipeline_public_keys(commands) do
+    Enum.reduce_while(commands, :ok, fn command, :ok ->
+      case authorize_pipeline_public_command(command) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp authorize_pipeline_public_command(%{opcode: @op_command_exec, body: body}) do
+    with {:ok, command} <- require_binary(body, "command"),
+         {:ok, args} <- raw_command_args(body),
+         {:ok, cmd, _parsed_args, _ast, keys} <-
+           Ferricstore.Commands.Dispatcher.parse_raw(command, args) do
+      InternalKey.authorize_command(cmd, keys)
+    else
+      _parse_or_validation_error -> :ok
+    end
+  end
+
+  defp authorize_pipeline_public_command(%{opcode: opcode, body: body}),
+    do: authorize_public_opcode(opcode, body)
+
   defp validate_compact_pipeline(mode, items, payload, state)
        when mode in [
               1,
@@ -3545,7 +3919,8 @@ defmodule FerricstoreServer.Native.Commands do
         {:error, "ERR native compact mixed PIPELINE cannot reorder dependent keys"}
 
       true ->
-        with {:ok, atomicity} <- pipeline_atomicity(payload),
+        with :ok <- authorize_compact_pipeline_public_keys(mode, items),
+             {:ok, atomicity} <- pipeline_atomicity(payload),
              :ok <- validate_compact_pipeline_atomicity(mode, items, atomicity, state) do
           :ok
         end
@@ -3733,6 +4108,15 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp valid_flow_get_meta_opts?(_opts), do: false
+
+  defp authorize_compact_pipeline_public_keys(mode, items)
+       when mode in [1, 2, 5, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32] do
+    mode
+    |> compact_pipeline_keys(items)
+    |> InternalKey.authorize_public()
+  end
+
+  defp authorize_compact_pipeline_public_keys(_mode, _items), do: :ok
 
   defp safe_compact_mixed_pipeline?(items),
     do: safe_compact_mixed_pipeline?(items, MapSet.new(), MapSet.new())

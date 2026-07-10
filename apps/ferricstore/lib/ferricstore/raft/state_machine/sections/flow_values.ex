@@ -325,7 +325,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_maybe_put_shared_value_link(state, link_key, ref, record)
            when is_binary(link_key) and is_binary(ref) do
         with :ok <- flow_validate_key_size(link_key) do
-          raw_put_cold(state, link_key, ref, flow_record_expire_at(record))
+          with :ok <- raw_put_cold(state, link_key, ref, flow_record_expire_at(record)) do
+            flow_track_retention_cleanup_key(state, record, link_key)
+          end
         end
       end
 
@@ -482,28 +484,190 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       end
 
       defp flow_put_state_record_encoded(state, key, value, expire_at_ms, record) do
-        cond do
-          flow_lmdb_projection_enabled?(state) ->
-            flow_mirror_put_state_record(state, key, value, expire_at_ms, record)
-            maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
-            maybe_queue_flow_hibernation_candidate(state, key, record, value)
-
-          flow_record_has_indexed_attributes?(record) ->
-            with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
+        result =
+          cond do
+            flow_lmdb_projection_enabled?(state) ->
+              flow_mirror_put_state_record(state, key, value, expire_at_ms, record)
               maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
               maybe_queue_flow_hibernation_candidate(state, key, record, value)
+
+            flow_record_has_indexed_attributes?(record) ->
+              with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
+                maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
+                maybe_queue_flow_hibernation_candidate(state, key, record, value)
+              end
+
+            Ferricstore.Flow.LMDB.mode() == :lagged and
+                Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) ->
+              with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
+                queue_pending_lmdb_projection_dirty()
+              end
+
+            true ->
+              with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
+                maybe_queue_flow_hibernation_candidate(state, key, record, value)
+              end
+          end
+
+        with :ok <- result,
+             :ok <- flow_put_retention_guard(state, record),
+             :ok <- flow_track_retention_cleanup_keys(state, record) do
+          flow_track_shared_value_refs(state, record)
+        end
+      end
+
+      defp flow_put_retention_guard(state, %{id: id} = record) when is_binary(id) do
+        guard_key = FlowKeys.retention_guard_key(id, Map.get(record, :partition_key))
+        guard = Ferricstore.Flow.RetentionGuard.encode(record)
+        flow_put_hot_value(state, guard_key, guard, 0)
+      end
+
+      defp flow_track_retention_cleanup_keys(state, record) do
+        record
+        |> flow_record_shared_and_private_value_refs()
+        |> Enum.filter(&flow_retention_owned_value_ref?(&1, record))
+        |> Enum.uniq()
+        |> Enum.reduce_while(:ok, fn owned_key, :ok ->
+          case flow_track_retention_cleanup_key(state, record, owned_key) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp flow_record_shared_and_private_value_refs(record) do
+        direct_refs =
+          Enum.map([:payload_ref, :result_ref, :error_ref], &Map.get(record, &1))
+
+        named_refs =
+          record
+          |> flow_record_value_refs()
+          |> Map.values()
+          |> Enum.flat_map(fn
+            %{ref: ref} when is_binary(ref) -> [ref]
+            _entry -> []
+          end)
+
+        Enum.filter(direct_refs ++ named_refs, &is_binary/1)
+      end
+
+      defp flow_track_retention_cleanup_key(state, %{id: id} = record, owned_key)
+           when is_binary(id) and is_binary(owned_key) do
+        partition_key = Map.get(record, :partition_key)
+        index_key = FlowKeys.retention_cleanup_index_key(id, partition_key)
+        member_key = FlowKeys.retention_cleanup_member_key(id, owned_key, partition_key)
+
+        case flow_index_score_of(state, index_key, member_key) do
+          :miss ->
+            member = Ferricstore.Flow.RetentionCleanupMember.encode(index_key, owned_key)
+
+            with :ok <- flow_put_hot_value(state, member_key, member, 0) do
+              flow_index_put_new_members(state, index_key, [{member_key, 0}])
             end
 
-          Ferricstore.Flow.LMDB.mode() == :lagged and
-              Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) ->
-            with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
-              queue_pending_lmdb_projection_dirty()
+          _present ->
+            :ok
+        end
+      end
+
+      defp flow_track_state_retention_metadata_batch(state, key_records) do
+        Enum.reduce_while(key_records, :ok, fn {_key, record}, :ok ->
+          with :ok <- flow_put_retention_guard(state, record),
+               :ok <- flow_track_retention_cleanup_keys(state, record),
+               :ok <- flow_track_shared_value_refs(state, record) do
+            {:cont, :ok}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp flow_track_shared_value_refs(state, record) do
+        refs =
+          record
+          |> flow_record_shared_value_refs()
+          |> Enum.filter(&FlowKeys.shared_value_ref?/1)
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        case refs do
+          [] ->
+            :ok
+
+          refs ->
+            registry_key =
+              FlowKeys.shared_value_ref_registry_key(
+                Map.fetch!(record, :id),
+                Map.get(record, :partition_key)
+              )
+
+            existing = flow_shared_value_ref_registry(state, registry_key)
+            new_refs = refs -- existing
+
+            with :ok <- flow_maybe_run_shared_value_ref_acquisition_hook(record, new_refs),
+                 :ok <- flow_increment_shared_value_ref_counts(state, new_refs) do
+              registry = Enum.sort(Enum.uniq(existing ++ new_refs))
+              flow_put_hot_value(state, registry_key, :erlang.term_to_binary(registry), 0)
+            end
+        end
+      end
+
+      defp flow_record_shared_value_refs(record) do
+        flow_record_shared_and_private_value_refs(record)
+      end
+
+      defp flow_maybe_run_shared_value_ref_acquisition_hook(_record, []), do: :ok
+
+      defp flow_maybe_run_shared_value_ref_acquisition_hook(record, refs) do
+        case Application.get_env(:ferricstore, :flow_shared_value_ref_acquisition_hook) do
+          fun when is_function(fun, 2) -> fun.(record, refs)
+          _missing -> :ok
+        end
+      end
+
+      defp flow_shared_value_ref_registry(state, registry_key) do
+        case sm_store_batch_get(state, [registry_key], &sm_file_path/2) do
+          [value] when is_binary(value) ->
+            try do
+              value
+              |> :erlang.binary_to_term([:safe])
+              |> Enum.filter(&FlowKeys.shared_value_ref?/1)
+              |> Enum.uniq()
+              |> Enum.sort()
+            rescue
+              _ -> []
             end
 
-          true ->
-            with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
-              maybe_queue_flow_hibernation_candidate(state, key, record, value)
+          _missing ->
+            []
+        end
+      end
+
+      defp flow_increment_shared_value_ref_counts(_state, []), do: :ok
+
+      defp flow_increment_shared_value_ref_counts(state, refs) do
+        Enum.reduce_while(refs, :ok, fn ref, :ok ->
+          count_key = FlowKeys.shared_value_ref_count_key(ref, state.shard_index)
+          count = flow_shared_value_ref_count(state, count_key)
+          :ok = flow_put_hot_value(state, count_key, :erlang.term_to_binary(count + 1), 0)
+          {:cont, :ok}
+        end)
+      end
+
+      defp flow_shared_value_ref_count(state, count_key) do
+        case sm_store_batch_get(state, [count_key], &sm_file_path/2) do
+          [value] when is_binary(value) ->
+            try do
+              case :erlang.binary_to_term(value, [:safe]) do
+                count when is_integer(count) and count > 0 -> count
+                _invalid -> 0
+              end
+            rescue
+              _ -> 0
             end
+
+          _missing ->
+            0
         end
       end
 
@@ -724,6 +888,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       end
 
       defp do_set(state, key, value, expire_at_ms, opts) do
+        with {:ok, owner_state, owner_record} <-
+               flow_validate_retention_owned_write(state, opts),
+             :ok <- flow_maybe_run_retention_owned_write_hook(owner_record, key) do
+          do_set_validated(
+            state,
+            key,
+            value,
+            expire_at_ms,
+            opts,
+            owner_state,
+            owner_record
+          )
+        end
+      end
+
+      defp do_set_validated(
+             state,
+             key,
+             value,
+             expire_at_ms,
+             opts,
+             owner_state,
+             owner_record
+           ) do
         compound_data_structure? = compound_data_structure_key?(state, key)
         get? = Map.get(opts, :get, false)
         current = set_current_meta(state, key, get?)
@@ -760,9 +948,58 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
                 expire_at_ms
               end
 
-            do_put(state, key, value, effective_expire_at_ms)
-            if get?, do: old_value, else: :ok
+            with :ok <- do_put(state, key, value, effective_expire_at_ms),
+                 :ok <-
+                   flow_maybe_track_retention_owned_key(
+                     owner_state,
+                     owner_record,
+                     key
+                   ) do
+              if get?, do: old_value, else: :ok
+            end
         end
+      end
+
+      defp flow_validate_retention_owned_write(state, opts) do
+        case Map.get(opts, :flow_retention_owner) do
+          nil ->
+            {:ok, nil, nil}
+
+          %{
+            id: id,
+            partition_key: partition_key,
+            state_key: state_key,
+            expected_guard: expected_guard
+          }
+          when is_binary(id) and (is_binary(partition_key) or is_nil(partition_key)) and
+                 is_binary(state_key) and is_binary(expected_guard) ->
+            owner_state = cross_shard_state_for_key(state, state_key)
+            guard_key = FlowKeys.retention_guard_key(id, partition_key)
+
+            if flow_retention_current_guard(owner_state, guard_key) == expected_guard do
+              {:ok, owner_state, %{id: id, partition_key: partition_key}}
+            else
+              {:error, "ERR stale flow governance owner"}
+            end
+
+          _invalid_owner ->
+            {:error, "ERR invalid flow retention owner"}
+        end
+      end
+
+      defp flow_maybe_run_retention_owned_write_hook(nil, _key), do: :ok
+
+      defp flow_maybe_run_retention_owned_write_hook(owner_record, key) do
+        case Application.get_env(:ferricstore, :flow_retention_owned_write_hook) do
+          hook when is_function(hook, 2) -> hook.(owner_record, key)
+          _missing -> :ok
+        end
+      end
+
+      defp flow_maybe_track_retention_owned_key(nil, nil, _key), do: :ok
+
+      defp flow_maybe_track_retention_owned_key(owner_state, owner_record, key) do
+        flow_track_retention_cleanup_key(owner_state, owner_record, key)
       end
 
       defp set_current_meta(state, key, true), do: do_get_meta(state, key)

@@ -46,6 +46,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Transaction.Ast, as: TxAst
 
       @flow_state_enter_seq_offset_span 4_294_967_296
+      @flow_policy_reindex_max_keydir_entries 10_000
 
       defp flow_create_existing_state(state, %{idempotent: true}, state_key) do
         flow_read_record_by_key(state, state_key)
@@ -520,6 +521,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           :run_at_ms,
           :priority,
           :retention_ttl_ms,
+          :max_active_ms,
           :history_hot_max_events,
           :history_max_events,
           :correlation_id,
@@ -794,37 +796,58 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       end
 
       defp flow_reindex_state_meta_policy_records(state, type, indexed_key) do
-        state
-        |> flow_state_keys_for_policy_reindex()
-        |> Enum.reduce_while(:ok, fn state_key, :ok ->
-          case flow_read_record_by_key(state, state_key) do
-            %{type: ^type} = record ->
-              case flow_reindex_state_meta_policy_record(state, state_key, record, indexed_key) do
-                :ok -> {:cont, :ok}
-                {:error, _reason} = error -> {:halt, error}
-              end
+        with {:ok, state_keys} <- flow_state_keys_for_policy_reindex(state) do
+          Enum.reduce_while(state_keys, :ok, fn state_key, :ok ->
+            case flow_read_record_by_key(state, state_key) do
+              %{type: ^type} = record ->
+                case flow_reindex_state_meta_policy_record(state, state_key, record, indexed_key) do
+                  :ok -> {:cont, :ok}
+                  {:error, _reason} = error -> {:halt, error}
+                end
 
-            _other ->
-              {:cont, :ok}
-          end
-        end)
+              _other ->
+                {:cont, :ok}
+            end
+          end)
+        end
       end
 
       defp flow_state_keys_for_policy_reindex(%{ets: ets}) do
-        :ets.foldl(
-          fn
-            {key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}, acc
-            when is_binary(key) ->
-              if FlowKeys.state_key?(key), do: [key | acc], else: acc
+        case :ets.info(ets, :size) do
+          size when is_integer(size) and size <= @flow_policy_reindex_max_keydir_entries ->
+            keys =
+              :ets.select(ets, [
+                {{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}
+              ])
 
-            _entry, acc ->
-              acc
-          end,
-          [],
-          ets
-        )
+            state_keys =
+              Enum.reduce(keys, MapSet.new(), fn key, acc ->
+                cond do
+                  FlowKeys.state_key?(key) ->
+                    MapSet.put(acc, key)
+
+                  FlowKeys.registry_key?(key) ->
+                    case FlowKeys.state_key_from_registry_key(key) do
+                      {:ok, state_key} -> MapSet.put(acc, state_key)
+                      :error -> acc
+                    end
+
+                  true ->
+                    acc
+                end
+              end)
+
+            {:ok, state_keys |> MapSet.to_list() |> Enum.sort()}
+
+          size when is_integer(size) ->
+            {:error,
+             "ERR flow policy reindex exceeds #{@flow_policy_reindex_max_keydir_entries} shard keys"}
+
+          _other ->
+            {:error, "ERR flow policy reindex keydir unavailable"}
+        end
       rescue
-        _ -> []
+        ArgumentError -> {:error, "ERR flow policy reindex keydir unavailable"}
       end
 
       defp flow_reindex_state_meta_policy_record(state, state_key, record, indexed_key) do

@@ -5,11 +5,14 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
+  alias FerricstoreServer.Health.Dashboard.StorageSnapshotCache
 
   import FerricstoreServer.Health.Dashboard.Format, only: [safe_ets_size: 1]
 
   import FerricstoreServer.Health.Dashboard.Render.Admin,
     only: [config_command_reference: 0, runtime_config_parameter_reference: 0]
+
+  @default_storage_summary_ttl_ms 30_000
 
   def collect_dashboard(flow_summary) do
     %{
@@ -54,25 +57,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   end
 
   def collect_storage_page do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
-
-    shard_storage =
-      Enum.map(0..(shard_count() - 1), fn index ->
-        shard_dir = DataDir.shard_data_path(data_dir, index)
-        {disk_bytes, data_files, hint_files} = scan_shard_dir(shard_dir)
-
-        %{
-          index: index,
-          disk_bytes: disk_bytes,
-          data_file_count: data_files,
-          hint_file_count: hint_files
-        }
-      end)
-
-    {total_disk, data_files, hint_files} = scan_storage_tree(data_dir)
-    total_files = data_files + hint_files
-
-    %{shards: shard_storage, total_disk_bytes: total_disk, total_files: total_files}
+    collect_storage_snapshot()
   end
 
   def collect_overview do
@@ -91,7 +76,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   end
 
   def collect_shards do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
+    disk_bytes_by_shard = storage_disk_bytes_by_shard(collect_storage_snapshot())
 
     Enum.map(0..(shard_count() - 1), fn index ->
       keydir = :"keydir_#{index}"
@@ -120,15 +105,12 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
           ArgumentError -> {"down", 0, 0}
         end
 
-      shard_dir = DataDir.shard_data_path(data_dir, index)
-      {disk_bytes, _, _} = scan_shard_dir(shard_dir)
-
       %{
         index: index,
         status: status,
         keys: keys,
         ets_memory_bytes: ets_mem,
-        disk_bytes: disk_bytes
+        disk_bytes: Map.get(disk_bytes_by_shard, index, 0)
       }
     end)
   end
@@ -283,9 +265,213 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   end
 
   def collect_storage_summary do
+    %{total_disk_bytes: total_disk_bytes} = collect_storage_snapshot()
+    %{total_disk_bytes: total_disk_bytes}
+  end
+
+  defp collect_storage_snapshot do
     data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
-    {total_disk, _, _} = scan_storage_tree(data_dir)
-    %{total_disk_bytes: total_disk}
+    shard_count = shard_count()
+    cache_ttl_ms = storage_summary_cache_ttl_ms()
+    now_ms = System.monotonic_time(:millisecond)
+
+    case cached_storage_snapshot(data_dir, shard_count, now_ms, cache_ttl_ms) do
+      {:ok, snapshot} -> snapshot
+      :miss -> refresh_storage_snapshot(data_dir, shard_count, cache_ttl_ms)
+    end
+  end
+
+  defp refresh_storage_snapshot(data_dir, shard_count, cache_ttl_ms) do
+    lock_id = {{__MODULE__, :storage_summary_refresh}, self()}
+
+    case :global.trans(
+           lock_id,
+           fn ->
+             now_ms = System.monotonic_time(:millisecond)
+
+             case cached_storage_snapshot(data_dir, shard_count, now_ms, cache_ttl_ms) do
+               {:ok, snapshot} -> snapshot
+               :miss -> scan_and_cache_storage_snapshot(data_dir, shard_count, now_ms)
+             end
+           end,
+           [node()]
+         ) do
+      {:aborted, _reason} ->
+        scan_and_cache_storage_snapshot(
+          data_dir,
+          shard_count,
+          System.monotonic_time(:millisecond)
+        )
+
+      snapshot ->
+        snapshot
+    end
+  catch
+    :exit, _reason ->
+      scan_storage_snapshot(data_dir, shard_count)
+  end
+
+  defp cached_storage_snapshot(data_dir, shard_count, now_ms, cache_ttl_ms)
+       when cache_ttl_ms > 0 do
+    case StorageSnapshotCache.lookup() do
+      {:ok, {^data_dir, ^shard_count}, cached_at_ms, snapshot}
+      when is_integer(cached_at_ms) and now_ms >= cached_at_ms and
+             now_ms - cached_at_ms < cache_ttl_ms ->
+        {:ok, snapshot}
+
+      _other ->
+        :miss
+    end
+  end
+
+  defp cached_storage_snapshot(_data_dir, _shard_count, _now_ms, _cache_ttl_ms), do: :miss
+
+  defp scan_and_cache_storage_snapshot(data_dir, shard_count, now_ms) do
+    snapshot = scan_storage_snapshot(data_dir, shard_count)
+
+    cached_at_ms = max(now_ms, System.monotonic_time(:millisecond))
+
+    StorageSnapshotCache.put({data_dir, shard_count}, cached_at_ms, snapshot)
+
+    snapshot
+  end
+
+  defp scan_storage_snapshot(data_dir, shard_count) do
+    observer = storage_scan_observer()
+    notify_storage_scan(observer, {:scan_started, data_dir})
+
+    shard_roots =
+      Map.new(0..(shard_count - 1), fn index ->
+        {DataDir.shard_data_path(data_dir, index), index}
+      end)
+
+    {total_disk, data_files, hint_files, shard_totals} =
+      scan_storage_snapshot_tree(
+        data_dir,
+        shard_roots,
+        nil,
+        %{},
+        observer
+      )
+
+    shard_storage =
+      Enum.map(0..(shard_count - 1), fn index ->
+        {disk_bytes, shard_data_files, shard_hint_files} =
+          Map.get(shard_totals, index, {0, 0, 0})
+
+        %{
+          index: index,
+          disk_bytes: disk_bytes,
+          data_file_count: shard_data_files,
+          hint_file_count: shard_hint_files
+        }
+      end)
+
+    notify_storage_scan(observer, {:scan_finished, data_dir})
+
+    %{
+      shards: shard_storage,
+      total_disk_bytes: total_disk,
+      total_files: data_files + hint_files
+    }
+  end
+
+  defp scan_storage_snapshot_tree(path, shard_roots, current_shard, shard_totals, observer) do
+    notify_storage_scan(observer, {:path, path})
+    current_shard = Map.get(shard_roots, path, current_shard)
+
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: size}} ->
+        file = Path.basename(path)
+        data_files = if String.ends_with?(file, ".log"), do: 1, else: 0
+        hint_files = if String.ends_with?(file, ".hint"), do: 1, else: 0
+
+        shard_totals =
+          add_shard_storage_total(
+            shard_totals,
+            current_shard,
+            size,
+            data_files,
+            hint_files
+          )
+
+        {size, data_files, hint_files, shard_totals}
+
+      {:ok, %{type: :directory}} ->
+        case Ferricstore.FS.ls(path) do
+          {:ok, files} ->
+            Enum.reduce(files, {0, 0, 0, shard_totals}, fn file, {bytes, data, hints, totals} ->
+              {child_bytes, child_data, child_hints, totals} =
+                scan_storage_snapshot_tree(
+                  Path.join(path, file),
+                  shard_roots,
+                  current_shard,
+                  totals,
+                  observer
+                )
+
+              {bytes + child_bytes, data + child_data, hints + child_hints, totals}
+            end)
+
+          {:error, _reason} ->
+            {0, 0, 0, shard_totals}
+        end
+
+      {:ok, _other} ->
+        {0, 0, 0, shard_totals}
+
+      {:error, _reason} ->
+        {0, 0, 0, shard_totals}
+    end
+  end
+
+  defp add_shard_storage_total(shard_totals, shard, bytes, data_files, hint_files)
+       when is_integer(shard) do
+    Map.update(
+      shard_totals,
+      shard,
+      {bytes, data_files, hint_files},
+      fn {current_bytes, current_data, current_hints} ->
+        {current_bytes + bytes, current_data + data_files, current_hints + hint_files}
+      end
+    )
+  end
+
+  defp add_shard_storage_total(shard_totals, _shard, _bytes, _data_files, _hint_files),
+    do: shard_totals
+
+  defp storage_scan_observer do
+    case Application.get_env(:ferricstore, :dashboard_storage_scan_observer) do
+      observer when is_function(observer, 1) -> observer
+      _other -> nil
+    end
+  end
+
+  defp notify_storage_scan(nil, _event), do: :ok
+
+  defp notify_storage_scan(observer, event) do
+    observer.(event)
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp storage_disk_bytes_by_shard(%{shards: shards}) when is_list(shards) do
+    Map.new(shards, fn shard -> {shard.index, shard.disk_bytes} end)
+  end
+
+  defp storage_disk_bytes_by_shard(_snapshot), do: %{}
+
+  defp storage_summary_cache_ttl_ms do
+    case Application.get_env(
+           :ferricstore,
+           :dashboard_storage_summary_ttl_ms,
+           @default_storage_summary_ttl_ms
+         ) do
+      value when is_integer(value) and value >= 0 -> value
+      _other -> @default_storage_summary_ttl_ms
+    end
   end
 
   def scan_shard_dir(shard_dir), do: scan_storage_tree(shard_dir)

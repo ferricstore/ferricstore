@@ -386,6 +386,113 @@ fn lmdb_prefix_entries_after<'a>(
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+fn lmdb_prefix_entries_after_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    after_key: Binary<'a>,
+    max_items: u64,
+    max_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let item_cap = usize::try_from(max_items).unwrap_or(usize::MAX);
+            let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut entries = Vec::new();
+            let mut entry_bytes = 0usize;
+
+            if item_cap == 0 {
+                return Ok((atoms::ok(), entries).encode(env));
+            }
+
+            if after_key.as_slice().is_empty() {
+                let iter = match store.db.prefix_iter(&rtxn, prefix.as_slice()) {
+                    Ok(iter) => iter,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                for item in iter {
+                    if entries.len() >= item_cap {
+                        break;
+                    }
+
+                    match item {
+                        Ok((key, value)) => {
+                            let row_bytes = key.len().saturating_add(value.len());
+                            let next_bytes = entry_bytes.saturating_add(row_bytes);
+
+                            if !entries.is_empty() && next_bytes > byte_cap {
+                                break;
+                            }
+
+                            let key_term = binary_term(env, key)?;
+                            let value_term = binary_term(env, value)?;
+                            entries.push((key_term, value_term).encode(env));
+                            entry_bytes = next_bytes;
+
+                            if entry_bytes > byte_cap {
+                                break;
+                            }
+                        }
+                        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                    }
+                }
+            } else {
+                let range = (
+                    std::ops::Bound::Excluded(after_key.as_slice()),
+                    std::ops::Bound::Unbounded,
+                );
+                let iter = match store.db.range(&rtxn, &range) {
+                    Ok(iter) => iter,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                for item in iter {
+                    if entries.len() >= item_cap {
+                        break;
+                    }
+
+                    match item {
+                        Ok((key, value)) => {
+                            if !key.starts_with(prefix.as_slice()) {
+                                break;
+                            }
+
+                            let row_bytes = key.len().saturating_add(value.len());
+                            let next_bytes = entry_bytes.saturating_add(row_bytes);
+
+                            if !entries.is_empty() && next_bytes > byte_cap {
+                                break;
+                            }
+
+                            let key_term = binary_term(env, key)?;
+                            let value_term = binary_term(env, value)?;
+                            entries.push((key_term, value_term).encode(env));
+                            entry_bytes = next_bytes;
+
+                            if entry_bytes > byte_cap {
+                                break;
+                            }
+                        }
+                        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                    }
+                }
+            }
+
+            Ok((atoms::ok(), entries).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_entries_reverse<'a>(
     env: Env<'a>,
     path: String,
@@ -556,6 +663,34 @@ fn lmdb_release_all<'a>(env: Env<'a>) -> NifResult<Term<'a>> {
 
     let released = guard.len();
     guard.clear();
+    Ok((atoms::ok(), released).encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn lmdb_release<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    let stores = match LMDB_STORES.get() {
+        Some(stores) => stores,
+        None => return Ok((atoms::ok(), 0usize).encode(env)),
+    };
+
+    let cache_key = match std::fs::canonicalize(&path) {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+    };
+
+    let mut guard = match stores.lock() {
+        Ok(guard) => guard,
+        Err(_) => return Ok((atoms::error(), "lmdb cache poisoned").encode(env)),
+    };
+
+    if guard
+        .get(&cache_key)
+        .is_some_and(|store| Arc::strong_count(store) > 1)
+    {
+        return Ok((atoms::busy(), 1usize).encode(env));
+    }
+
+    let released = usize::from(guard.remove(&cache_key).is_some());
     Ok((atoms::ok(), released).encode(env))
 }
 

@@ -9,6 +9,7 @@ config :logger, level: :warning
 # Tests that need the protocol port call Application.get_env(:ferricstore, :native_port).
 config :ferricstore, :native_port, 0
 config :ferricstore, :health_port, 0
+config :ferricstore, :health_probe_port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
 
 # Use a fixed shard count in tests for deterministic behavior.

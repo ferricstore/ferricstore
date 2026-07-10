@@ -124,6 +124,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
 
   defp numeric_metric_value(_value), do: 0
 
+  def render_flow_projection_health(%{restricted: true}), do: ""
+
   def render_flow_projection_health(data) do
     data = Map.merge(default_flow_projection_health(), data)
     rollup = flow_projection_rollup(Map.get(data, :metrics, []))

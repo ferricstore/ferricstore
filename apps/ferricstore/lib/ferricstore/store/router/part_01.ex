@@ -282,8 +282,15 @@ defmodule Ferricstore.Store.Router.Part01 do
       # Dispatches default-instance writes through quorum. Internal async
       # IO/WAL/read machinery remains separate from client acknowledgement policy.
       @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
-      defp raft_write(ctx, idx, _key, command) do
+      defp raft_write(ctx, idx, key, command) do
         cond do
+          flow_shared_ref_acquisition_command?(command) ->
+            flow_cross_shard_tx(
+              ctx,
+              [key],
+              {:flow_shared_ref_write, idx, command}
+            )
+
           durable_raft_ctx?(ctx) ->
             quorum_write(ctx, idx, command)
 
@@ -293,6 +300,123 @@ defmodule Ferricstore.Store.Router.Part01 do
             GenServer.call(elem(ctx.shard_names, idx), command)
         end
       end
+
+      defp flow_shared_ref_acquisition_command?({:cross_shard_tx, _shard_batches}), do: false
+
+      defp flow_shared_ref_acquisition_command?({:set, _key, _value, _expire_at_ms, opts})
+           when is_map(opts) do
+        case Map.get(opts, :flow_retention_owner) do
+          %{
+            id: id,
+            state_key: state_key,
+            expected_guard: expected_guard
+          }
+          when is_binary(id) and is_binary(state_key) and is_binary(expected_guard) ->
+            true
+
+          _not_flow_owned ->
+            false
+        end
+      end
+
+      defp flow_shared_ref_acquisition_command?(command)
+           when is_tuple(command) and tuple_size(command) >= 2 do
+        op = elem(command, 0)
+
+        if flow_shared_ref_write_op?(op) do
+          command
+          |> elem(tuple_size(command) - 1)
+          |> flow_attrs_acquire_shared_ref?()
+        else
+          false
+        end
+      end
+
+      defp flow_shared_ref_acquisition_command?(_command), do: false
+
+      defp flow_shared_ref_write_op?(op)
+           when op in [
+                  :flow_create,
+                  :flow_create_many,
+                  :flow_create_pipeline_batch,
+                  :flow_start_and_claim_pipeline_batch,
+                  :flow_named_value_put,
+                  :flow_named_value_put_pipeline_batch,
+                  :flow_signal,
+                  :flow_signal_many,
+                  :flow_spawn_children,
+                  :flow_run_steps_many,
+                  :flow_complete,
+                  :flow_complete_many,
+                  :flow_terminal_pipeline_batch,
+                  :flow_transition,
+                  :flow_transition_many,
+                  :flow_reschedule,
+                  :flow_schedule_replace,
+                  :flow_start_and_claim,
+                  :flow_step_continue,
+                  :flow_step_continue_many,
+                  :flow_retry,
+                  :flow_retry_many,
+                  :flow_fail,
+                  :flow_fail_many,
+                  :flow_cancel,
+                  :flow_cancel_many,
+                  :flow_rewind
+                ],
+           do: true
+
+      defp flow_shared_ref_write_op?(_op), do: false
+
+      defp flow_attrs_acquire_shared_ref?(attrs) when is_map(attrs) do
+        Enum.any?(attrs, fn
+          {key, refs}
+          when key in [
+                 :payload_ref,
+                 :result_ref,
+                 :error_ref,
+                 :value_refs,
+                 "payload_ref",
+                 "result_ref",
+                 "error_ref",
+                 "value_refs"
+               ] ->
+            flow_term_has_shared_ref?(refs)
+
+          {_key, nested} when is_map(nested) or is_list(nested) ->
+            flow_attrs_acquire_shared_ref?(nested)
+
+          _other ->
+            false
+        end)
+      end
+
+      defp flow_attrs_acquire_shared_ref?(attrs) when is_list(attrs),
+        do: Enum.any?(attrs, &flow_attrs_acquire_shared_ref?/1)
+
+      defp flow_attrs_acquire_shared_ref?(_attrs), do: false
+
+      defp flow_term_has_shared_ref?(ref) when is_binary(ref) do
+        if Ferricstore.Flow.Keys.shared_value_ref?(ref) do
+          true
+        else
+          case Jason.decode(ref) do
+            {:ok, decoded} -> flow_term_has_shared_ref?(decoded)
+            {:error, _reason} -> false
+          end
+        end
+      end
+
+      defp flow_term_has_shared_ref?(refs) when is_map(refs),
+        do: Enum.any?(refs, fn {_key, value} -> flow_term_has_shared_ref?(value) end)
+
+      defp flow_term_has_shared_ref?(refs) when is_list(refs),
+        do: Enum.any?(refs, &flow_term_has_shared_ref?/1)
+
+      defp flow_term_has_shared_ref?(ref) when is_tuple(ref),
+        do: ref |> Tuple.to_list() |> Enum.any?(&flow_term_has_shared_ref?/1)
+
+      defp flow_term_has_shared_ref?(_ref), do: false
 
       defp shard_under_disk_pressure?(ctx, idx) do
         size = :atomics.info(ctx.disk_pressure).size

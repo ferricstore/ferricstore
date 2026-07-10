@@ -82,6 +82,10 @@ request chunks:  same lane_id/opcode/request_id, 0x20 on all non-final chunks
 response chunks: same lane_id/opcode/request_id, full response body split
 ```
 
+The server never emits a response frame body larger than the
+`max_frame_bytes` advertised for the connection. A configured response chunk
+size above that limit is clamped, and `0` selects the frame limit.
+
 Compressed chunked payloads are compressed as one logical body, then split.
 Receivers reassemble chunks first, then decompress if `0x08` is present on the
 final logical response. The server bounds incomplete request chunk streams per
@@ -387,7 +391,11 @@ Flow bodies are maps with command fields plus options. For example:
 
 ```text
 FLOW.CREATE:
-{"id": "flow-1", "type": "email", "state": "queued", "payload": <typed value>}
+{"id": "flow-1", "type": "email", "state": "queued", "payload": <typed value>,
+ "max_active_ms": 60000}
+
+FLOW.POLICY.SET:
+{"type": "email", "max_active_ms": 300000}
 
 FLOW.CLAIM_DUE:
 {"type": "email", "state": "queued", "worker": "w1", "limit": 100, "lease_ms": 30000}
@@ -494,7 +502,8 @@ AUTH           -> supports ACL users and requirepass-compatible default auth
 ACL checks     -> command and key checks before dispatch
 require_tls    -> plaintext native connections are rejected when enabled
 maxclients     -> connection limit across native TCP/TLS listeners
-frame caps     -> native_max_frame_bytes and per-connection buffer limit
+frame caps     -> native_max_frame_bytes (max 134,217,704 body bytes), 128 MiB incomplete buffer,
+                  and at most 64 KiB coalesced continuation after a complete first frame
 lane caps      -> native_max_lanes_per_connection and native_lane_max_queue
 ```
 

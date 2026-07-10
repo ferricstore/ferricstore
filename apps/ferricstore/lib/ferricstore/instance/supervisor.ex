@@ -99,6 +99,30 @@ defmodule FerricStore.Instance.Supervisor do
         end)
       end
 
+    retention_sweeper_children =
+      if name == :default do
+        []
+      else
+        sweeper_opts =
+          opts
+          |> Keyword.get(:flow_retention_sweeper, [])
+          |> case do
+            value when is_list(value) -> value
+            _other -> []
+          end
+          |> Keyword.merge(
+            name: Ferricstore.Flow.RetentionSweeper.name(ctx),
+            instance_ctx: ctx
+          )
+
+        [
+          Supervisor.child_spec(
+            {Ferricstore.Flow.RetentionSweeper, sweeper_opts},
+            id: :"#{name}.FlowRetentionSweeper"
+          )
+        ]
+      end
+
     children =
       cleanup_children ++
         merge_children ++
@@ -118,7 +142,10 @@ defmodule FerricStore.Instance.Supervisor do
              data_dir: ctx.data_dir,
              shard_count: ctx.shard_count,
              instance_ctx: ctx
-           ]},
+           ]}
+        ] ++
+        retention_sweeper_children ++
+        [
           Supervisor.child_spec(
             {Ferricstore.Store.BlobGCSweeper, name: :"#{name}.BlobGCSweeper", instance_ctx: ctx},
             id: :"#{name}.BlobGCSweeper"

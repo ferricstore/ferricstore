@@ -951,12 +951,13 @@ defmodule FerricStore.Impl do
 
   @spec keys(FerricStore.Instance.t(), keyword()) :: {:ok, [binary()]}
   def keys(ctx, _opts \\ []) do
-    {:ok, Router.keys(ctx)}
+    {:ok, ctx |> Router.keys() |> Ferricstore.Store.CompoundKey.user_visible_keys()}
   end
 
   @spec dbsize(FerricStore.Instance.t()) :: {:ok, non_neg_integer()}
   def dbsize(ctx) do
-    {:ok, Router.dbsize(ctx)}
+    {:ok, keys} = keys(ctx)
+    {:ok, length(keys)}
   end
 
   @spec flushdb(FerricStore.Instance.t()) :: :ok | {:error, term()}

@@ -26,8 +26,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   produces HTML. The endpoint routes to the appropriate pair.
 
   The dashboard is served by `FerricstoreServer.Health.Endpoint` at `GET /dashboard*`.
-  Since it reuses the existing Ranch health listener (default port 9090), no
-  additional ports or dependencies are required.
+  Liveness and readiness probes use the independent
+  `FerricstoreServer.Health.ProbeEndpoint` listener so slow dashboard requests
+  cannot exhaust probe connections.
   """
 
   alias FerricstoreServer.Health.Dashboard.Data.{KV, Messaging, Operational, Security}

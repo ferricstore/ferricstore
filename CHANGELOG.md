@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Added type-level and per-Flow `max_active_ms` limits with durable timeout failure history, cold-record enforcement, and parent/child coordination.
+- Exposed maximum active runtime through embedded, native TCP, workflow, and dashboard policy surfaces, including an `infinity` override.
+- Made Flow timeout sweeping instance-scoped and surfaced active timeout candidates and counts in retention maintenance views.
+- Hardened native and health-server request handling with bounded decode/output work, HTTP framing and deadlines, CSRF/session checks, login throttling, and dashboard ACL redaction.
+- Reserved internal Flow storage keys across public command, pipeline, transaction, embedded, and dashboard paths, and made shared-reference/retention backfills bounded, resumable, and fail-closed across destructive resets.
+- Made Flow policy fan-out failure-atomic with bounded deterministic hot-record reindexing, repaired WARaft cold-row compensation, and routed ACL mutations through replicated invalidating paths with bounded protected-mode and load checks.
+
 ## 0.7.4 - 2026-07-07
 
 - Fixed lagged LMDB terminal Flow cleanup so stale cold keydir rows are pruned only after durable projection while startup rebuild remains non-destructive.

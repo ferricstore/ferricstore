@@ -25,35 +25,42 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   ## Configuration
 
-      config :ferricstore, :health_port, 4000
+      config :ferricstore,
+        health_port: 4000,
+        health_probe_port: 4001
 
-  Set to `0` in test to use an ephemeral port (see `port/0`).
+  `health_port` retains the combined dashboard, metrics, and health endpoint
+  for compatibility. Point orchestrator probes at `health_probe_port`, which
+  is served by an independent listener and cannot be exhausted by dashboard
+  connections. Set either port to `0` in tests for an ephemeral binding.
 
   ## Kubernetes integration
 
       livenessProbe:
         httpGet:
           path: /health/live
-          port: 4000
+          port: 4001
         initialDelaySeconds: 2
         periodSeconds: 10
 
       readinessProbe:
         httpGet:
           path: /health/ready
-          port: 4000
+          port: 4001
         initialDelaySeconds: 2
         periodSeconds: 5
   """
 
   @behaviour :ranch_protocol
 
-  alias FerricstoreServer.Acl
+  alias Ferricstore.AuditLog
+  alias FerricstoreServer.AuthRateLimiter
   alias FerricstoreServer.Health.Endpoint.Auth
   alias FerricstoreServer.Health.Endpoint.DashboardHandlers
   alias FerricstoreServer.Health.Endpoint.Forbidden
   alias FerricstoreServer.Health.Endpoint.Login
   alias FerricstoreServer.Health.Endpoint.FlowPaths
+  alias FerricstoreServer.Health.Endpoint.Probes
   alias FerricstoreServer.Health.Endpoint.Request
   alias FerricstoreServer.Health.Endpoint.Response
   alias FerricstoreServer.Health.Endpoint.RouteRequirements
@@ -75,6 +82,17 @@ defmodule FerricstoreServer.Health.Endpoint do
   @spec port() :: :inet.port_number()
   def port do
     :ranch.get_port(@listener_ref)
+  end
+
+  @doc """
+  Returns the actual TCP port for the isolated liveness/readiness listener.
+
+  Use this port for orchestrator probes. `port/0` intentionally continues to
+  return the legacy combined dashboard and metrics listener port.
+  """
+  @spec probe_port() :: :inet.port_number()
+  def probe_port do
+    FerricstoreServer.Health.ProbeEndpoint.port()
   end
 
   @doc """
@@ -152,6 +170,17 @@ defmodule FerricstoreServer.Health.Endpoint do
   @spec handle_request(:inet.socket(), module(), String.t(), String.t(), term(), map(), binary()) ::
           :ok
   defp handle_request(socket, transport, method, path, peer, headers, body) do
+    :ok = Session.prepare_request(peer, headers)
+
+    with :ok <- Session.validate_state_change(method, path, peer, headers, body) do
+      authorize_and_dispatch(socket, transport, method, path, peer, headers, body)
+    else
+      {:error, reason} ->
+        send_forbidden_response(socket, transport, path, {"CSRF", []}, reason)
+    end
+  end
+
+  defp authorize_and_dispatch(socket, transport, method, path, peer, headers, body) do
     case Auth.authorize_request(method, path, peer, headers) do
       :ok ->
         dispatch_request(socket, transport, method, path, peer, headers, body)
@@ -203,8 +232,8 @@ defmodule FerricstoreServer.Health.Endpoint do
          transport,
          "POST",
          "/dashboard/login",
-         _peer,
-         _headers,
+         peer,
+         headers,
          body
        ) do
     params = FlowPaths.decode_form_body(body)
@@ -212,13 +241,34 @@ defmodule FerricstoreServer.Health.Endpoint do
     password = Map.get(params, "password", "")
     next = Login.sanitize_next(Map.get(params, "next", ""))
 
-    case Acl.authenticate(username, password) do
-      {:ok, user} ->
-        send_redirect_response(socket, transport, next, [
-          {"Set-Cookie", Session.session_cookie(user)}
-        ])
+    case AuthRateLimiter.permit(Session.client_peer(peer, headers), username, password) do
+      {:ok, reservation} ->
+        authenticate_dashboard_login(
+          socket,
+          transport,
+          peer,
+          headers,
+          username,
+          password,
+          reservation,
+          next
+        )
+
+      {:error, {:rate_limited, retry_after_ms}} ->
+        audit_dashboard_login(:auth_failure, peer, username, true)
+
+        send_html_response(
+          socket,
+          transport,
+          429,
+          "Too Many Requests",
+          Login.render_page(next, "Too many login attempts. Try again later."),
+          [{"Retry-After", Integer.to_string(div(retry_after_ms + 999, 1_000))}]
+        )
 
       {:error, reason} ->
+        audit_dashboard_login(:auth_failure, peer, username, false)
+
         send_html_response(
           socket,
           transport,
@@ -234,12 +284,12 @@ defmodule FerricstoreServer.Health.Endpoint do
          transport,
          "POST",
          "/dashboard/logout",
-         _peer,
-         _headers,
+         peer,
+         headers,
          _body
        ) do
     send_redirect_response(socket, transport, "/dashboard/login", [
-      {"Set-Cookie", Session.clear_session_cookie()}
+      {"Set-Cookie", Session.clear_session_cookie(peer, headers)}
     ])
   end
 
@@ -420,9 +470,9 @@ defmodule FerricstoreServer.Health.Endpoint do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
       params = FlowPaths.decode_form_body(body)
-      command = FerricstoreServer.Health.Dashboard.flow_schedule_form_command(params)
+      requirement = RouteRequirements.flow_schedule_form_requirement(params)
 
-      case Auth.authorize_command_request(peer, headers, {command, []}, :html) do
+      case Auth.authorize_command_request(peer, headers, requirement, :html) do
         :ok ->
           location =
             case FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params) do
@@ -497,6 +547,7 @@ defmodule FerricstoreServer.Health.Endpoint do
                   URI.encode_query(%{
                     "status" => "ok",
                     "limit" => Map.get(result, :limit, 100),
+                    "active_timeouts" => Map.get(result, :active_timeouts, 0),
                     "flows" => Map.get(result, :flows, 0),
                     "history" => Map.get(result, :history, 0),
                     "values" => Map.get(result, :values, 0)
@@ -730,30 +781,13 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   @spec dispatch_request(:inet.socket(), module(), String.t(), String.t(), term(), map()) :: :ok
   defp dispatch_request(socket, transport, "GET", "/health/live", _peer, _headers) do
-    send_response(socket, transport, 200, "OK", ~s({"status":"alive"}))
+    {status_code, status_text, body} = Probes.live_response()
+    send_response(socket, transport, status_code, status_text, body)
   end
 
   defp dispatch_request(socket, transport, "GET", "/health/ready", _peer, _headers) do
-    health = Ferricstore.Health.check()
-
-    body =
-      Jason.encode!(%{
-        status: Atom.to_string(health.status),
-        shard_count: health.shard_count,
-        shards:
-          Enum.map(health.shards, fn shard ->
-            %{index: shard.index, status: shard.status, keys: shard.keys}
-          end),
-        uptime_seconds: health.uptime_seconds
-      })
-
-    case health.status do
-      :ok ->
-        send_response(socket, transport, 200, "OK", body)
-
-      :starting ->
-        send_response(socket, transport, 503, "Service Unavailable", body)
-    end
+    {status_code, status_text, body} = Probes.ready_response()
+    send_response(socket, transport, status_code, status_text, body)
   end
 
   defp dispatch_request(socket, transport, "GET", "/favicon.ico", _peer, _headers) do
@@ -775,8 +809,8 @@ defmodule FerricstoreServer.Health.Endpoint do
       send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
     else
       data = FerricstoreServer.Health.Dashboard.collect()
-      body = data |> FerricstoreServer.Health.Dashboard.live_overview_payload() |> Jason.encode!()
-      send_response(socket, transport, 200, "OK", "application/json; charset=utf-8", body)
+      payload = FerricstoreServer.Health.Dashboard.live_overview_payload(data)
+      Response.send_live_json_response(socket, transport, payload)
     end
   end
 
@@ -797,14 +831,7 @@ defmodule FerricstoreServer.Health.Endpoint do
              Auth.dashboard_collect_opts(peer, headers)
            ) do
         {:ok, payload} ->
-          send_response(
-            socket,
-            transport,
-            200,
-            "OK",
-            "application/json; charset=utf-8",
-            Jason.encode!(payload)
-          )
+          Response.send_live_json_response(socket, transport, payload)
 
         :not_found ->
           send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
@@ -1118,6 +1145,47 @@ defmodule FerricstoreServer.Health.Endpoint do
     )
   end
 
+  defp audit_dashboard_login(event, peer, username, rate_limited) do
+    AuditLog.log(event, %{
+      username: username,
+      client_ip: Login.peer_string(peer),
+      surface: :dashboard,
+      rate_limited: rate_limited
+    })
+  end
+
+  defp authenticate_dashboard_login(
+         socket,
+         transport,
+         peer,
+         headers,
+         username,
+         password,
+         reservation,
+         next
+       ) do
+    case Login.authenticate_session(username, password) do
+      {:ok, user, auth_epoch} ->
+        :ok = AuthRateLimiter.release_success(reservation)
+        audit_dashboard_login(:auth_success, peer, username, false)
+
+        send_redirect_response(socket, transport, next, [
+          {"Set-Cookie", Session.session_cookie(user, auth_epoch, peer, headers)}
+        ])
+
+      {:error, reason} ->
+        audit_dashboard_login(:auth_failure, peer, username, false)
+
+        send_html_response(
+          socket,
+          transport,
+          401,
+          "Unauthorized",
+          Login.render_page(next, reason)
+        )
+    end
+  end
+
   defp send_forbidden_response(socket, transport, path, requirement, reason) do
     Forbidden.send_response(socket, transport, path, requirement, reason)
   end
@@ -1134,6 +1202,17 @@ defmodule FerricstoreServer.Health.Endpoint do
   @spec send_html_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok
   defp send_html_response(socket, transport, status_code, status_text, body) do
     Response.send_html_response(socket, transport, status_code, status_text, body)
+  end
+
+  defp send_html_response(socket, transport, status_code, status_text, body, extra_headers) do
+    Response.send_html_response(
+      socket,
+      transport,
+      status_code,
+      status_text,
+      body,
+      extra_headers
+    )
   end
 
   @spec send_text_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok

@@ -8,6 +8,8 @@ defmodule FerricstoreServer.Native.TlsListener do
 
   @listener_ref __MODULE__
 
+  alias FerricstoreServer.Native.Connection.FrameBuffer
+
   @spec ref() :: atom()
   def ref, do: @listener_ref
 
@@ -89,7 +91,9 @@ defmodule FerricstoreServer.Native.TlsListener do
   defp native_protocol_opts do
     %{
       max_frame_bytes:
-        Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024),
+        :ferricstore
+        |> Application.get_env(:native_max_frame_bytes, 16 * 1024 * 1024)
+        |> FrameBuffer.validate_max_frame_bytes!(),
       max_lanes: Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
       lane_max_queue: Application.get_env(:ferricstore, :native_lane_max_queue, 1024)
     }

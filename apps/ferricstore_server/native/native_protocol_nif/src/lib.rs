@@ -11,6 +11,8 @@ const COMPACT_OK_LIST: u8 = 0x81;
 const COMPACT_KV_GET: u8 = 0x82;
 const COMPACT_KV_MGET: u8 = 0x83;
 const COMPACT_KV_MGET_FIXED: u8 = 0x89;
+const MAX_FRAMES_PER_DECODE: usize = 128;
+const MAX_FRAME_BODY_BYTES: usize = 128 * 1024 * 1024 - HEADER_SIZE;
 
 #[derive(Debug, PartialEq, Eq)]
 struct FrameSlice<'a> {
@@ -21,14 +23,15 @@ struct FrameSlice<'a> {
     body: &'a [u8],
 }
 
-#[rustler::nif(schedule = "Normal")]
+// One pass may still copy one configured max-size frame, which can exceed a normal scheduler slice.
+#[rustler::nif(schedule = "DirtyCpu")]
 fn decode_frames<'a>(
     env: Env<'a>,
     buffer: Binary<'a>,
     max_frame_bytes: u32,
 ) -> NifResult<Term<'a>> {
     let bytes = buffer.as_slice();
-    let (frame_slices, offset) = match scan_frames(bytes, max_frame_bytes) {
+    let (frame_slices, offset, has_more) = match scan_frames(bytes, max_frame_bytes) {
         Ok(result) => result,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };
@@ -53,16 +56,28 @@ fn decode_frames<'a>(
         );
     }
 
-    let rest_bytes = &bytes[offset..];
-    let mut rest = OwnedBinary::new(rest_bytes.len())
-        .ok_or_else(|| rustler::Error::Term(Box::new("native rest allocation failed")))?;
-    rest.as_mut_slice().copy_from_slice(rest_bytes);
-    let rest_term = Binary::from_owned(rest, env);
+    let rest_len = bytes.len() - offset;
 
-    Ok((atoms::ok(), frames, rest_term).encode(env))
+    let rest_term = if has_more {
+        buffer.make_subbinary(offset, rest_len)?
+    } else {
+        let rest_bytes = &bytes[offset..];
+        let mut rest = OwnedBinary::new(rest_len)
+            .ok_or_else(|| rustler::Error::Term(Box::new("native rest allocation failed")))?;
+        rest.as_mut_slice().copy_from_slice(rest_bytes);
+        Binary::from_owned(rest, env)
+    };
+
+    let continuation = if has_more {
+        atoms::more()
+    } else {
+        atoms::done()
+    };
+
+    Ok((atoms::ok(), frames, rest_term, continuation).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn encode_frame<'a>(
     env: Env<'a>,
     opcode: u16,
@@ -73,6 +88,7 @@ fn encode_frame<'a>(
     response: bool,
 ) -> NifResult<Term<'a>> {
     let body = body.as_slice();
+    let body_len = validate_frame_body_len(body.len())?;
     let len = HEADER_SIZE + body.len();
     let mut out = OwnedBinary::new(len)
         .ok_or_else(|| rustler::Error::Term(Box::new("native frame allocation failed")))?;
@@ -88,7 +104,7 @@ fn encode_frame<'a>(
     bytes[6..10].copy_from_slice(&lane_id.to_be_bytes());
     bytes[10..12].copy_from_slice(&opcode.to_be_bytes());
     bytes[12..20].copy_from_slice(&request_id.to_be_bytes());
-    bytes[20..24].copy_from_slice(&(body.len() as u32).to_be_bytes());
+    bytes[20..24].copy_from_slice(&body_len.to_be_bytes());
     bytes[24..].copy_from_slice(body);
 
     Ok(Binary::from_owned(out, env).encode(env))
@@ -142,7 +158,7 @@ fn encode_compact_kv_get_response_frame<'a>(
     Ok(Binary::from_owned(frame, env).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn encode_compact_kv_mget_response_frame<'a>(
     env: Env<'a>,
     opcode: u16,
@@ -164,7 +180,7 @@ fn encode_compact_kv_mget_response_frame<'a>(
     Ok(Binary::from_owned(frame, env).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn encode_compact_kv_mget<'a>(env: Env<'a>, values: Term<'a>) -> NifResult<Term<'a>> {
     let payload = match build_compact_kv_mget_payload(values) {
         Some(payload) => payload,
@@ -174,11 +190,20 @@ fn encode_compact_kv_mget<'a>(env: Env<'a>, values: Term<'a>) -> NifResult<Term<
     Ok(Binary::from_owned(payload, env).encode(env))
 }
 
-fn scan_frames(bytes: &[u8], max_frame_bytes: u32) -> Result<(Vec<FrameSlice<'_>>, usize), String> {
+fn scan_frames(
+    bytes: &[u8],
+    max_frame_bytes: u32,
+) -> Result<(Vec<FrameSlice<'_>>, usize, bool), String> {
     let mut offset = 0usize;
     let mut frames = Vec::new();
+    let mut decoded_bytes = 0usize;
+    let max_decode_bytes = max_frame_bytes as usize + HEADER_SIZE;
 
     while bytes.len().saturating_sub(offset) >= HEADER_SIZE {
+        if frames.len() >= MAX_FRAMES_PER_DECODE {
+            return Ok((frames, offset, true));
+        }
+
         if &bytes[offset..offset + 4] != MAGIC {
             return Err("ERR native invalid frame magic".to_string());
         }
@@ -205,10 +230,15 @@ fn scan_frames(bytes: &[u8], max_frame_bytes: u32) -> Result<(Vec<FrameSlice<'_>
             return Err("ERR native frame exceeds max_frame_bytes".to_string());
         }
 
-        let frame_end = offset + HEADER_SIZE + body_len;
+        let frame_size = HEADER_SIZE + body_len;
+        let frame_end = offset + frame_size;
 
         if bytes.len() < frame_end {
             break;
+        }
+
+        if decoded_bytes + frame_size > max_decode_bytes {
+            return Ok((frames, offset, true));
         }
 
         frames.push(FrameSlice {
@@ -220,9 +250,10 @@ fn scan_frames(bytes: &[u8], max_frame_bytes: u32) -> Result<(Vec<FrameSlice<'_>
         });
 
         offset = frame_end;
+        decoded_bytes += frame_size;
     }
 
-    Ok((frames, offset))
+    Ok((frames, offset, false))
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -456,6 +487,9 @@ fn build_custom_ok_response_frame(
     payload: &[u8],
 ) -> Option<OwnedBinary> {
     let body_len = 2usize.checked_add(payload.len())?;
+    if body_len > MAX_FRAME_BODY_BYTES {
+        return None;
+    }
     let mut out = OwnedBinary::new(HEADER_SIZE + body_len)?;
     write_custom_ok_response_frame(
         out.as_mut_slice(),
@@ -467,6 +501,17 @@ fn build_custom_ok_response_frame(
     );
 
     Some(out)
+}
+
+fn validate_frame_body_len(body_len: usize) -> NifResult<u32> {
+    if body_len > MAX_FRAME_BODY_BYTES {
+        return Err(rustler::Error::Term(Box::new(
+            "native frame body exceeds protocol limit",
+        )));
+    }
+
+    u32::try_from(body_len)
+        .map_err(|_| rustler::Error::Term(Box::new("native frame body exceeds u32 length")))
 }
 
 fn write_custom_ok_response_frame(
@@ -505,7 +550,9 @@ mod atoms {
     rustler::atoms! {
         ok,
         error,
-        nil
+        nil,
+        more,
+        done
     }
 }
 
@@ -538,9 +585,10 @@ mod tests {
         let mut bytes = first.clone();
         bytes.extend_from_slice(&second[..partial_second_len]);
 
-        let (frames, offset) = scan_frames(&bytes, 1024).expect("scan succeeds");
+        let (frames, offset, has_more) = scan_frames(&bytes, 1024).expect("scan succeeds");
 
         assert_eq!(offset, first.len());
+        assert!(!has_more);
         assert_eq!(
             frames,
             vec![FrameSlice {
@@ -551,6 +599,43 @@ mod tests {
                 body: first_body
             }]
         );
+    }
+
+    #[test]
+    fn scan_frames_bounds_tiny_frame_batches_and_preserves_the_continuation() {
+        let frames: Vec<Vec<u8>> = (1..=129)
+            .map(|request_id| frame(0x0003, 0, request_id, 0, b""))
+            .collect();
+        let bytes: Vec<u8> = frames.iter().flatten().copied().collect();
+
+        let (decoded, offset, has_more) =
+            scan_frames(&bytes, 16 * 1024 * 1024).expect("scan succeeds");
+
+        assert_eq!(decoded.len(), 128);
+        assert_eq!(offset, frames[..128].iter().map(Vec::len).sum());
+        assert_eq!(&bytes[offset..], frames[128].as_slice());
+        assert!(has_more);
+    }
+
+    #[test]
+    fn scan_frames_bounds_total_wire_bytes_per_decode() {
+        let first = frame(0x0102, 7, 1, 0, &[1; 700]);
+        let second = frame(0x0102, 7, 2, 0, &[2; 700]);
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&second);
+
+        let (decoded, offset, has_more) = scan_frames(&bytes, 1024).expect("scan succeeds");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(offset, first.len());
+        assert!(has_more);
+
+        let (decoded, offset, has_more) =
+            scan_frames(&bytes[offset..], 1024).expect("continuation succeeds");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(offset, second.len());
+        assert!(!has_more);
     }
 
     #[test]
@@ -572,6 +657,17 @@ mod tests {
             scan_frames(&bytes, 2),
             Err("ERR native frame exceeds max_frame_bytes".to_string())
         );
+    }
+
+    #[test]
+    fn encoder_body_length_rejects_values_above_the_protocol_limit() {
+        assert_eq!(validate_frame_body_len(0).expect("zero-length body"), 0);
+        assert_eq!(
+            validate_frame_body_len(MAX_FRAME_BODY_BYTES).expect("maximum body"),
+            MAX_FRAME_BODY_BYTES as u32
+        );
+        assert!(validate_frame_body_len(MAX_FRAME_BODY_BYTES + 1).is_err());
+        assert!(validate_frame_body_len(u32::MAX as usize + 1).is_err());
     }
 
     #[test]

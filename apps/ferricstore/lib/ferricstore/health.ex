@@ -19,13 +19,13 @@ defmodule Ferricstore.Health do
 
   ## Usage by Kubernetes
 
-  Configure a readiness probe pointing at the HTTP endpoint served by
-  `Ferricstore.Health.Endpoint`:
+  In standalone mode, configure readiness probes against the isolated
+  `FerricstoreServer.Health.ProbeEndpoint` listener:
 
       readinessProbe:
         httpGet:
           path: /health/ready
-          port: 9090
+          port: 4001
         initialDelaySeconds: 2
         periodSeconds: 5
   """

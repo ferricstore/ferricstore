@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Native.Session do
   @moduledoc false
 
   alias Ferricstore.PubSub, as: PS
+  alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Coordinator, as: TxCoordinator
   alias FerricstoreServer.Acl.Protection
@@ -55,14 +56,20 @@ defmodule FerricstoreServer.Native.Session do
       true ->
         acl_cmd = ConnAuth.acl_command_name(cmd, args, ast)
 
-        with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
-             :ok <- authorize_channels(cmd, args, state),
-             :ok <- ConnAuth.check_keys_cached(state.acl_cache, acl_cmd, keys) do
-          :ok
-        else
+        case InternalKey.authorize_command(cmd, keys) do
+          :ok ->
+            with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
+                 :ok <- authorize_channels(cmd, args, state),
+                 :ok <- ConnAuth.check_keys_cached(state.acl_cache, acl_cmd, keys) do
+              :ok
+            else
+              {:error, reason} ->
+                log_acl_denial(state, acl_cmd)
+                {:error, :noperm, reason}
+            end
+
           {:error, reason} ->
-            log_acl_denial(state, acl_cmd)
-            {:error, :noperm, reason}
+            {:error, :error, reason}
         end
     end
   end

@@ -24,7 +24,7 @@ defmodule FerricstoreServer.Acl.Protection do
   @spec check_protected_mode({:inet.ip_address(), :inet.port_number()} | nil) ::
           :ok | {:error, binary()}
   def check_protected_mode(peer) do
-    if protected_mode?() and not has_configured_users?() and not localhost?(peer) do
+    if protected_mode?() and not localhost?(peer) and not has_configured_users?() do
       {:error,
        "DENIED FerricStore is running in protected mode because protected mode is enabled and no password is configured for the default user. Connections are only accepted from localhost."}
     else
@@ -60,14 +60,9 @@ defmodule FerricstoreServer.Acl.Protection do
   end
 
   defp configured_users_in_table?(table) do
-    if table_exists?(table) do
-      Enum.any?(:ets.tab2list(table), fn
-        {_name, %{enabled: true, password: password}} when is_binary(password) -> true
-        _ -> false
-      end)
-    else
-      false
-    end
+    if table_exists?(table), do: Tables.configured_user?(table), else: false
+  rescue
+    ArgumentError -> false
   end
 
   defp table_exists?(table) do

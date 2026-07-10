@@ -10,6 +10,7 @@ defmodule Ferricstore.Flow.Governance.Effect do
   alias Ferricstore.Flow.Governance.Policy
   alias Ferricstore.Flow.Governance.Telemetry
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.RetentionGuard
   alias Ferricstore.Store.Router
 
   @terminal_statuses [:confirmed, :failed, :compensated]
@@ -49,7 +50,8 @@ defmodule Ferricstore.Flow.Governance.Effect do
                nx: true,
                xx: false,
                get: false,
-               keepttl: false
+               keepttl: false,
+               flow_retention_owner: retention_owner(record)
              }) do
         case set_result do
           :ok ->
@@ -449,6 +451,18 @@ defmodule Ferricstore.Flow.Governance.Effect do
 
   defp write_ledger(ctx, record, event, effect, now_ms) do
     Ledger.append(ctx, record, event, effect, now_ms)
+  end
+
+  defp retention_owner(record) do
+    id = Map.fetch!(record, :id)
+    partition_key = Map.get(record, :partition_key)
+
+    %{
+      id: id,
+      partition_key: partition_key,
+      state_key: Keys.state_key(id, partition_key),
+      expected_guard: RetentionGuard.encode(record)
+    }
   end
 
   defp encode_effect(effect), do: :erlang.term_to_binary({:flow_governance_effect_v1, effect})

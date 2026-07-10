@@ -169,10 +169,25 @@ defmodule Ferricstore.Flow.Hibernation do
         version: version
       )
 
+    active_index_ops =
+      case Map.get(record, :state_key) do
+        state_key when is_binary(state_key) ->
+          LMDB.active_timeout_index_put_ops(
+            state_key,
+            record,
+            0,
+            Map.get(candidate, :active_index_reverse_value)
+          )
+
+        _missing ->
+          []
+      end
+
     [
       {:put, park_key, park},
       {:put, due_key, park_key},
       {:put, LMDB.cold_by_segment_key(locator), park_key}
+      | active_index_ops
     ]
   end
 

@@ -21,6 +21,12 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
 
     assert RouteRequirements.dashboard_route_requirement("GET", "/dashboard/clients") ==
              {"CLIENT.LIST", []}
+
+    assert RouteRequirements.dashboard_route_requirement("GET", "/dashboard/flow/schedules") ==
+             {"FLOW.SCHEDULE.LIST", key: {"*", :read}}
+
+    assert RouteRequirements.dashboard_route_requirement("GET", "/dashboard/flow/governance") ==
+             {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
   end
 
   test "dashboard_route_requirement scopes keyspace and flow lookup reads" do
@@ -55,6 +61,16 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
              "GET",
              "/dashboard/flow/query?kind=stats&type=email&partition_key=tenant-a"
            ) == {"FLOW.STATS", key: {"tenant-a", :read}}
+
+    assert RouteRequirements.dashboard_route_requirement(
+             "GET",
+             "/dashboard/flow/query?kind=stats&type=email"
+           ) == {"FLOW.STATS", key: {"*", :read}}
+
+    assert RouteRequirements.dashboard_route_requirement(
+             "GET",
+             "/dashboard/flow/failures?type=email"
+           ) == {"FLOW.FAILURES", key: {"*", :read}}
   end
 
   test "dashboard_route_requirement scopes flow detail and value requests" do
@@ -90,10 +106,18 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
     assert RouteRequirements.flow_policy_form_requirement(%{"type" => "email"}) ==
              {"FLOW.POLICY.SET", key: {"email", :write}}
 
+    assert RouteRequirements.flow_schedule_form_requirement(%{
+             "action" => "pause",
+             "id" => "tenant-a:schedule:daily"
+           }) == {"FLOW.SCHEDULE.PAUSE", key: {"tenant-a:schedule:daily", :write}}
+
     assert RouteRequirements.flow_reclaim_form_requirement(%{
              "type" => "email",
              "partition_key" => "tenant-a"
            }) == {"FLOW.RECLAIM", key: {"tenant-a", :write}}
+
+    assert RouteRequirements.flow_reclaim_form_requirement(%{"type" => "email"}) ==
+             {"FLOW.RECLAIM", key: {"*", :write}}
 
     assert RouteRequirements.flow_rewind_form_requirement("flow-1", %{}) ==
              {"FLOW.REWIND", key: {"flow-1", :write}}

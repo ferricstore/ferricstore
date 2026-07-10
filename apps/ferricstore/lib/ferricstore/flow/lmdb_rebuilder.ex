@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   alias Ferricstore.Flow.LMDBRebuilder.TerminalProjection
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+  alias Ferricstore.Flow.SharedRefBackfill
 
   @batch_size 512
 
@@ -175,113 +176,126 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       ) do
     lmdb_path = LMDB.path(shard_path)
 
-    cond do
-      Keyword.get(opts, :force_full_reconcile?, false) ->
-        flush_marker? = LMDB.flush_in_progress?(lmdb_path)
+    result =
+      cond do
+        Keyword.get(opts, :force_full_reconcile?, false) ->
+          flush_marker? = LMDB.flush_in_progress?(lmdb_path)
 
-        :ok =
-          reconcile_shard(
-            shard_path,
-            keydir,
-            shard_index,
-            instance_ctx,
-            zset_score_index,
-            zset_score_lookup,
-            flow_index,
-            flow_lookup
+          :ok =
+            reconcile_shard(
+              shard_path,
+              keydir,
+              shard_index,
+              instance_ctx,
+              zset_score_index,
+              zset_score_lookup,
+              flow_index,
+              flow_lookup
+            )
+
+          if flush_marker? do
+            # The forced path is used after WARaft segment replay mutates the keydir.
+            # If a previous LMDB flush marker also survived a crash, the full
+            # reconcile repaired the projection and can clear it now.
+            :ok = LMDB.write_batch(lmdb_path, [LMDB.flush_in_progress_delete_op()])
+          end
+
+          :telemetry.execute(
+            [:ferricstore, :flow, :lmdb_startup_rebuild],
+            %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+            %{
+              shard_index: shard_index,
+              mode: :default_waraft_active_projection,
+              reason: Keyword.get(opts, :reason, :forced_full_reconcile)
+            }
           )
 
-        if flush_marker? do
-          # The forced path is used after WARaft segment replay mutates the keydir.
-          # If a previous LMDB flush marker also survived a crash, the full
-          # reconcile repaired the projection and can clear it now.
+          :ok
+
+        LMDB.flush_in_progress?(lmdb_path) ->
+          :ok =
+            reconcile_shard(
+              shard_path,
+              keydir,
+              shard_index,
+              instance_ctx,
+              zset_score_index,
+              zset_score_lookup,
+              flow_index,
+              flow_lookup
+            )
+
+          # A crash can leave the marker behind after LMDB has only part of one
+          # logical projection. Full reconcile repairs from the durable Flow source,
+          # then clears the marker so future boots can take the cheap active rebuild.
           :ok = LMDB.write_batch(lmdb_path, [LMDB.flush_in_progress_delete_op()])
-        end
 
-        :telemetry.execute(
-          [:ferricstore, :flow, :lmdb_startup_rebuild],
-          %{lmdb_active_rebuilt: 0, full_reconcile: 1},
-          %{
-            shard_index: shard_index,
-            mode: :default_waraft_active_projection,
-            reason: Keyword.get(opts, :reason, :forced_full_reconcile)
-          }
-        )
-
-        :ok
-
-      LMDB.flush_in_progress?(lmdb_path) ->
-        :ok =
-          reconcile_shard(
-            shard_path,
-            keydir,
-            shard_index,
-            instance_ctx,
-            zset_score_index,
-            zset_score_lookup,
-            flow_index,
-            flow_lookup
+          :telemetry.execute(
+            [:ferricstore, :flow, :lmdb_startup_rebuild],
+            %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+            %{
+              shard_index: shard_index,
+              mode: :default_waraft_active_projection,
+              reason: :incomplete_lmdb_flush
+            }
           )
 
-        # A crash can leave the marker behind after LMDB has only part of one
-        # logical projection. Full reconcile repairs from the durable Flow source,
-        # then clears the marker so future boots can take the cheap active rebuild.
-        :ok = LMDB.write_batch(lmdb_path, [LMDB.flush_in_progress_delete_op()])
+          :ok
 
-        :telemetry.execute(
-          [:ferricstore, :flow, :lmdb_startup_rebuild],
-          %{lmdb_active_rebuilt: 0, full_reconcile: 1},
-          %{
-            shard_index: shard_index,
-            mode: :default_waraft_active_projection,
-            reason: :incomplete_lmdb_flush
-          }
-        )
+        not LMDB.env_present?(lmdb_path) ->
+          :ok =
+            reconcile_shard(
+              shard_path,
+              keydir,
+              shard_index,
+              instance_ctx,
+              zset_score_index,
+              zset_score_lookup,
+              flow_index,
+              flow_lookup
+            )
 
-        :ok
-
-      not LMDB.env_present?(lmdb_path) ->
-        :ok =
-          reconcile_shard(
-            shard_path,
-            keydir,
-            shard_index,
-            instance_ctx,
-            zset_score_index,
-            zset_score_lookup,
-            flow_index,
-            flow_lookup
+          :telemetry.execute(
+            [:ferricstore, :flow, :lmdb_startup_rebuild],
+            %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+            %{
+              shard_index: shard_index,
+              mode: :default_waraft_active_projection,
+              reason: :missing_lmdb_env
+            }
           )
 
-        :telemetry.execute(
-          [:ferricstore, :flow, :lmdb_startup_rebuild],
-          %{lmdb_active_rebuilt: 0, full_reconcile: 1},
-          %{
-            shard_index: shard_index,
-            mode: :default_waraft_active_projection,
-            reason: :missing_lmdb_env
-          }
-        )
+          :ok
 
-        :ok
+        true ->
+          rebuilt =
+            ActiveIndexes.rebuild_flow_indexes_from_lmdb(
+              lmdb_path,
+              zset_score_index,
+              zset_score_lookup,
+              flow_index,
+              flow_lookup
+            )
 
-      true ->
-        rebuilt =
-          ActiveIndexes.rebuild_flow_indexes_from_lmdb(
-            lmdb_path,
-            zset_score_index,
-            zset_score_lookup,
-            flow_index,
-            flow_lookup
+          :telemetry.execute(
+            [:ferricstore, :flow, :lmdb_startup_rebuild],
+            %{lmdb_active_rebuilt: rebuilt, full_reconcile: 0},
+            %{shard_index: shard_index, mode: :default_waraft_active_projection}
           )
 
-        :telemetry.execute(
-          [:ferricstore, :flow, :lmdb_startup_rebuild],
-          %{lmdb_active_rebuilt: rebuilt, full_reconcile: 0},
-          %{shard_index: shard_index, mode: :default_waraft_active_projection}
-        )
+          :ok
+      end
 
-        :ok
+    with :ok <- result do
+      SharedRefBackfill.run!(
+        shard_path,
+        keydir,
+        shard_index,
+        instance_ctx,
+        flow_index,
+        flow_lookup,
+        opts
+      )
     end
   end
 
@@ -294,18 +308,29 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         zset_score_lookup,
         flow_index,
         flow_lookup,
-        _opts
+        opts
       ) do
-    reconcile_shard(
-      shard_path,
-      keydir,
-      shard_index,
-      instance_ctx,
-      zset_score_index,
-      zset_score_lookup,
-      flow_index,
-      flow_lookup
-    )
+    with :ok <-
+           reconcile_shard(
+             shard_path,
+             keydir,
+             shard_index,
+             instance_ctx,
+             zset_score_index,
+             zset_score_lookup,
+             flow_index,
+             flow_lookup
+           ) do
+      SharedRefBackfill.run!(
+        shard_path,
+        keydir,
+        shard_index,
+        instance_ctx,
+        flow_index,
+        flow_lookup,
+        opts
+      )
+    end
   end
 
   defp reconcile_batch(

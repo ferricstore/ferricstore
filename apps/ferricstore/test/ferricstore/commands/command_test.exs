@@ -203,6 +203,24 @@ defmodule Ferricstore.Commands.CommandTest do
       assert result == ["k1", "k2"]
     end
 
+    test "returns every dynamic data key instead of static metadata positions" do
+      for {invocation, expected_keys} <- [
+            {["TDIGEST.MERGE", "td:dest", "2", "td:one", "td:two", "OVERRIDE"],
+             ["td:dest", "td:one", "td:two"]},
+            {["CMS.MERGE", "cms:dest", "2", "cms:one", "cms:two", "WEIGHTS", "2", "3"],
+             ["cms:dest", "cms:one", "cms:two"]},
+            {["SINTERCARD", "2", "set:one", "set:two", "LIMIT", "1"], ["set:one", "set:two"]},
+            {["PFCOUNT", "hll:one", "hll:two"], ["hll:one", "hll:two"]},
+            {["OBJECT", "ENCODING", "object:key"], ["object:key"]},
+            {["MEMORY", "USAGE", "memory:key"], ["memory:key"]},
+            {["XINFO", "STREAM", "stream:key"], ["stream:key"]},
+            {["XGROUP", "CREATE", "stream:key", "group-1", "$", "MKSTREAM"], ["stream:key"]}
+          ] do
+        assert ^expected_keys =
+                 Server.handle("COMMAND", ["GETKEYS" | invocation], MockStore.make())
+      end
+    end
+
     test "returns empty list for PING (no keys)" do
       result = Server.handle("COMMAND", ["GETKEYS", "PING"], MockStore.make())
       assert result == []

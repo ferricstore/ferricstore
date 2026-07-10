@@ -15,9 +15,8 @@ defmodule FerricstoreServer.Native.Connection do
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Connection.Send
   alias FerricstoreServer.Native.{Blocking, Codec, Commands, Lane, Session}
-  alias FerricstoreServer.Native.Connection.{Chunks, Responses}
+  alias FerricstoreServer.Native.Connection.{Chunks, FrameBuffer, Responses}
 
-  @max_buffer_size 134_217_728
   @op_goaway 0x000A
   @op_command_exec 0x0100
   @control_lane 0
@@ -56,7 +55,7 @@ defmodule FerricstoreServer.Native.Connection do
     :command_state,
     :idle_timeout_ms,
     compression: :none,
-    buffer: "",
+    buffer: %FrameBuffer{},
     lanes: %{},
     chunk_buffers: %{},
     pending_chunk_bytes: 0,
@@ -76,6 +75,8 @@ defmodule FerricstoreServer.Native.Connection do
     authenticated: false,
     require_auth: false,
     compact_flow_responses: false,
+    decode_paused: false,
+    decode_pending: false,
     username: "default",
     acl_cache: nil,
     active_mode: 100,
@@ -102,6 +103,19 @@ defmodule FerricstoreServer.Native.Connection do
       transport.close(socket)
     else
       active_mode = Application.get_env(:ferricstore, :socket_active_mode, 100)
+
+      max_frame_bytes =
+        Map.get(opts, :max_frame_bytes) ||
+          Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024)
+
+      max_frame_bytes = FrameBuffer.validate_max_frame_bytes!(max_frame_bytes)
+
+      response_chunk_bytes =
+        Codec.effective_response_chunk_bytes(
+          Application.get_env(:ferricstore, :native_response_chunk_bytes, 0),
+          max_frame_bytes
+        )
+
       :ok = transport.setopts(socket, active: active_mode)
 
       Stats.incr_connections()
@@ -139,9 +153,7 @@ defmodule FerricstoreServer.Native.Connection do
                 require_auth: Commands.default_requires_auth?(),
                 acl_cache: FerricstoreServer.Connection.Auth.build_acl_cache("default"),
                 active_mode: active_mode,
-                max_frame_bytes:
-                  Map.get(opts, :max_frame_bytes) ||
-                    Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024),
+                max_frame_bytes: max_frame_bytes,
                 max_lanes:
                   Map.get(opts, :max_lanes) ||
                     Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
@@ -152,8 +164,7 @@ defmodule FerricstoreServer.Native.Connection do
                   Application.get_env(:ferricstore, :native_max_inflight_per_connection, 4096),
                 max_inflight_per_lane:
                   Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024),
-                response_chunk_bytes:
-                  Application.get_env(:ferricstore, :native_response_chunk_bytes, 0),
+                response_chunk_bytes: response_chunk_bytes,
                 max_pending_chunks:
                   Application.get_env(:ferricstore, :native_max_pending_chunks, 1024),
                 max_pending_chunk_bytes:
@@ -184,7 +195,7 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   def loop(%__MODULE__{socket: socket, transport: transport, active_mode: active_mode} = state) do
-    if active_mode == :once do
+    if active_mode == :once and not state.decode_paused do
       transport.setopts(socket, active: :once)
     end
 
@@ -197,13 +208,14 @@ defmodule FerricstoreServer.Native.Connection do
       {:ssl, ^socket, data} ->
         handle_data(state, data)
 
+      :native_decode_continue ->
+        decode_buffer(%{state | decode_pending: false})
+
       {:tcp_passive, ^socket} ->
-        transport.setopts(socket, active: active_mode)
-        loop(state)
+        loop(maybe_reactivate_input(state))
 
       {:ssl_passive, ^socket} ->
-        transport.setopts(socket, active: active_mode)
-        loop(state)
+        loop(maybe_reactivate_input(state))
 
       {:tcp_closed, ^socket} ->
         cleanup_connection(state)
@@ -339,42 +351,98 @@ defmodule FerricstoreServer.Native.Connection do
   defp idle_receive_timeout(_state), do: :infinity
 
   defp handle_data(state, data) do
-    buffer =
-      case state.buffer do
-        "" -> data
-        buffered -> buffered <> data
-      end
+    case FrameBuffer.append(
+           state.buffer,
+           data,
+           state.max_frame_bytes,
+           FrameBuffer.max_buffer_bytes()
+         ) do
+      {:incomplete, buffer} ->
+        loop(%{state | buffer: buffer})
 
-    if byte_size(buffer) > @max_buffer_size do
-      send_native_error(state.socket, state.transport, "ERR native client buffer exceeded limit")
-      cleanup_connection(state)
-      state.transport.close(state.socket)
-    else
-      decode_started_us = monotonic_us()
+      {:ready, buffer} ->
+        decode_buffer(%{state | buffer: buffer})
 
-      case Codec.decode_frames(buffer, state.max_frame_bytes) do
-        {:ok, frames, rest} ->
-          decode_us = monotonic_us() - decode_started_us
-          {responses, state} = dispatch_frames(frames, %{state | buffer: rest}, [], decode_us)
+      {:error, :buffer_limit} ->
+        send_native_error(
+          state.socket,
+          state.transport,
+          "ERR native client buffer exceeded limit"
+        )
 
-          case responses do
-            [] -> :ok
-            _ -> native_send(state, Enum.reverse(responses), :response)
-          end
+        cleanup_connection(state)
+        state.transport.close(state.socket)
+    end
+  end
 
-          if state.close_after_reply do
-            cleanup_connection(state)
-            state.transport.close(state.socket)
-          else
-            loop(state)
-          end
+  defp decode_buffer(state) do
+    decode_started_us = monotonic_us()
+    buffer = FrameBuffer.materialize(state.buffer)
 
-        {:error, reason} ->
-          send_native_error(state.socket, state.transport, reason)
+    case Codec.decode_frames(buffer, state.max_frame_bytes) do
+      {:ok, frames, rest, continuation} ->
+        decode_us = monotonic_us() - decode_started_us
+
+        state =
+          state
+          |> Map.put(:buffer, FrameBuffer.from_binary(rest, state.max_frame_bytes))
+          |> update_decode_backpressure(continuation)
+
+        {responses, state} = dispatch_frames(frames, state, [], decode_us)
+
+        case responses do
+          [] -> :ok
+          _ -> native_send(state, Enum.reverse(responses), :response)
+        end
+
+        if state.close_after_reply do
           cleanup_connection(state)
           state.transport.close(state.socket)
-      end
+        else
+          loop(state)
+        end
+
+      {:error, reason} ->
+        send_native_error(state.socket, state.transport, reason)
+        cleanup_connection(state)
+        state.transport.close(state.socket)
     end
+  end
+
+  defp update_decode_backpressure(state, :more) do
+    state = pause_input(state)
+
+    if state.decode_pending do
+      state
+    else
+      send(self(), :native_decode_continue)
+      %{state | decode_pending: true}
+    end
+  end
+
+  defp update_decode_backpressure(state, :done), do: resume_input(state)
+
+  defp pause_input(%{decode_paused: true} = state), do: state
+
+  defp pause_input(state) do
+    state.transport.setopts(state.socket, active: false)
+    %{state | decode_paused: true}
+  end
+
+  defp resume_input(%{decode_paused: false} = state), do: state
+
+  defp resume_input(%{active_mode: :once} = state), do: %{state | decode_paused: false}
+
+  defp resume_input(state) do
+    state.transport.setopts(state.socket, active: state.active_mode)
+    %{state | decode_paused: false}
+  end
+
+  defp maybe_reactivate_input(%{decode_paused: true} = state), do: state
+
+  defp maybe_reactivate_input(state) do
+    state.transport.setopts(state.socket, active: state.active_mode)
+    state
   end
 
   defp dispatch_frames(frames, state, responses, decode_us) do
@@ -856,6 +924,7 @@ defmodule FerricstoreServer.Native.Connection do
       pubsub_patterns: state.pubsub_patterns,
       compression: state.compression,
       compact_flow_responses: state.compact_flow_responses,
+      max_frame_bytes: state.max_frame_bytes,
       response_chunk_bytes: state.response_chunk_bytes,
       close_after_reply: false
     }

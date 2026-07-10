@@ -500,13 +500,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
         partition_key = Map.get(attrs, :partition_key)
 
         with {:ok, record} <- flow_require_record(state, id, partition_key) do
-          case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
-            {:ok, :noop} ->
-              :ok
+          case flow_maybe_timeout_active_record(state, record, now_ms) do
+            :active ->
+              case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
+                {:ok, :noop} ->
+                  :ok
 
-            {:ok, record, next} ->
-              next = flow_refresh_indexed_attributes(state, next)
-              flow_apply_complete(state, record, next, partition_key, now_ms, attrs)
+                {:ok, record, next} ->
+                  next = flow_refresh_indexed_attributes(state, next)
+                  flow_apply_complete(state, record, next, partition_key, now_ms, attrs)
+
+                {:error, _reason} = error ->
+                  error
+              end
+
+            :timed_out ->
+              {:ok, {:error, "ERR flow max_active_ms exceeded"}}
 
             {:error, _reason} = error ->
               error
@@ -530,54 +539,59 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
         do: {:error, "ERR flow items must be a non-empty list"}
 
       defp flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
-        if flow_duplicate_terminal_noop?(record, attrs, "completed") do
-          {:ok, :noop}
-        else
-          with :ok <- flow_require_running_lease(record, lease_token),
-               :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
-            version = Map.fetch!(record, :version) + 1
-            id = Map.fetch!(record, :id)
-            partition_key = Map.get(record, :partition_key)
+        cond do
+          flow_active_timeout_expired_record?(record, now_ms) ->
+            {:error, "ERR flow max_active_ms exceeded"}
 
-            payload_ref =
-              flow_value_ref(
-                attrs,
-                :payload,
-                id,
-                version,
-                partition_key,
-                Map.get(record, :payload_ref)
-              )
+          flow_duplicate_terminal_noop?(record, attrs, "completed") ->
+            {:ok, :noop}
 
-            result_ref = flow_value_ref(attrs, :result, id, version, partition_key)
-            retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
+          true ->
+            with :ok <- flow_require_running_lease(record, lease_token),
+                 :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+              version = Map.fetch!(record, :version) + 1
+              id = Map.fetch!(record, :id)
+              partition_key = Map.get(record, :partition_key)
 
-            with {:ok, value_refs} <-
-                   flow_named_value_refs(record, attrs, id, version, partition_key) do
-              next =
-                %{
-                  record
-                  | state: "completed",
-                    version: version,
-                    updated_at_ms: now_ms,
-                    payload_ref: payload_ref,
-                    result_ref: result_ref,
-                    ttl_ms: nil,
-                    retention_ttl_ms: retention_ttl_ms,
-                    lease_owner: nil,
-                    lease_token: nil,
-                    lease_deadline_ms: 0,
-                    next_run_at_ms: nil
-                }
-                |> flow_put_record_value_refs(value_refs)
-                |> flow_apply_attribute_updates(attrs)
-                |> flow_stamp_terminal_retention(now_ms)
+              payload_ref =
+                flow_value_ref(
+                  attrs,
+                  :payload,
+                  id,
+                  version,
+                  partition_key,
+                  Map.get(record, :payload_ref)
+                )
 
-              with :ok <- flow_validate_terminal_state_index_key(next) do
-                {:ok, record, next}
+              result_ref = flow_value_ref(attrs, :result, id, version, partition_key)
+              retention_ttl_ms = Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms)
+
+              with {:ok, value_refs} <-
+                     flow_named_value_refs(record, attrs, id, version, partition_key) do
+                next =
+                  %{
+                    record
+                    | state: "completed",
+                      version: version,
+                      updated_at_ms: now_ms,
+                      payload_ref: payload_ref,
+                      result_ref: result_ref,
+                      ttl_ms: nil,
+                      retention_ttl_ms: retention_ttl_ms,
+                      lease_owner: nil,
+                      lease_token: nil,
+                      lease_deadline_ms: 0,
+                      next_run_at_ms: nil
+                  }
+                  |> flow_put_record_value_refs(value_refs)
+                  |> flow_apply_attribute_updates(attrs)
+                  |> flow_stamp_terminal_retention(now_ms)
+
+                with :ok <- flow_validate_terminal_state_index_key(next) do
+                  {:ok, record, next}
+                end
               end
             end
-          end
         end
       end
 

@@ -103,7 +103,8 @@ FerricstoreServer.Supervisor (:one_for_one)  [standalone mode only]
 ├── FerricstoreServer.Acl                 # Server-side ACL state and invalidation hooks
 ├── Ranch TCP Listener                    # Native protocol connections
 ├── Ranch TLS Listener                    # Optional encrypted native connections
-└── Health HTTP Endpoint                  # /health/ready + /metrics + dashboard
+├── Dashboard/Metrics HTTP Endpoint       # /dashboard + /metrics + legacy health routes
+└── Isolated Health Probe Endpoint        # /health/live + /health/ready
 ```
 
 ### Startup Sequence
@@ -295,7 +296,9 @@ come from ETS. Cold values are read from the Bitcask/blob location stored in
 the ETS keydir, then encoded as native response frames. The native connection
 can coalesce adjacent responses and can split large responses into chunks using
 `native_response_coalesce_max`, `native_response_coalesce_bytes`, and
-`native_response_chunk_bytes`.
+`native_response_chunk_bytes`. Response chunking is always capped by the
+connection's advertised maximum frame size; a configured value of `0` selects
+that frame-size cap automatically.
 
 Large cold values still return through native frames, so request-id
 correlation, lane ordering, TLS parity, compact response payloads, and bounded
@@ -678,8 +681,8 @@ malicious or malformed input:
 
 | Input | Limit | Enforced At |
 |-------|-------|-------------|
-| Native frame body | `native_max_frame_bytes` | Native frame decoder |
-| Connection receive buffer | 128 MB | `Native.Connection` |
+| Native frame body | `native_max_frame_bytes` (max 128 MiB minus header) | Native frame decoder |
+| Connection receive buffer | 128 MiB incomplete input, plus at most 64 KiB after a complete first frame | `Native.Connection.FrameBuffer` |
 | Pending request chunks | `native_max_pending_chunks` | `Native.Connection` |
 | Pending chunk bytes | `native_max_pending_chunk_bytes` | `Native.Connection` |
 | Lanes per connection | `native_max_lanes_per_connection` | `Native.Connection` |

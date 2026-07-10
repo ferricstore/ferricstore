@@ -104,6 +104,97 @@ defmodule Ferricstore.InstanceTest do
       assert status.shard_index == 0
     end
 
+    test "custom instances automatically sweep overdue Flow records" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_retention_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedFlow.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} =
+               EmbeddedFlow.start_link(
+                 data_dir: root,
+                 shard_count: 1,
+                 flow_retention_sweeper: [initial_delay_ms: 0, interval_ms: 10]
+               )
+
+      sweeper_name = :"#{EmbeddedFlow}.Flow.RetentionSweeper"
+      assert is_pid(Process.whereis(sweeper_name))
+
+      now = System.system_time(:millisecond)
+      id = "embedded-flow-active-timeout"
+
+      assert :ok =
+               EmbeddedFlow.flow_create(id,
+                 type: "embedded-active-timeout",
+                 max_active_ms: 5,
+                 run_at_ms: now + 60_000,
+                 now_ms: now
+               )
+
+      assert eventually(fn ->
+               case EmbeddedFlow.flow_get(id, full: true) do
+                 {:ok, %{state: "failed", error: %{reason: "max_active_ms"}}} -> true
+                 _other -> false
+               end
+             end)
+    end
+
+    test "custom instances persist active timeout failure while rejecting completion" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_timeout_complete_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedFlow.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} = EmbeddedFlow.start_link(data_dir: root, shard_count: 1)
+
+      id = "embedded-flow-timeout-complete"
+      type = "embedded-flow-timeout-complete"
+      create_now = System.system_time(:millisecond) + 60_000
+      timeout_now = create_now + 100
+
+      assert :ok =
+               EmbeddedFlow.flow_create(id,
+                 type: type,
+                 max_active_ms: 100,
+                 run_at_ms: create_now,
+                 now_ms: create_now
+               )
+
+      assert {:ok, [claimed]} =
+               EmbeddedFlow.flow_claim_due(type,
+                 worker: "embedded-timeout-worker",
+                 lease_ms: 1_000,
+                 now_ms: create_now
+               )
+
+      assert {:error, reason} =
+               EmbeddedFlow.flow_complete(id, claimed.lease_token,
+                 fencing_token: claimed.fencing_token,
+                 now_ms: timeout_now
+               )
+
+      assert reason =~ "max_active_ms"
+
+      assert {:ok, %{state: "failed", error: %{reason: "max_active_ms"}}} =
+               EmbeddedFlow.flow_get(id, full: true)
+    end
+
     test "custom shard rotations notify the custom merge scheduler" do
       root =
         Path.join(
@@ -635,6 +726,31 @@ defmodule Ferricstore.InstanceTest do
       after
         Ferricstore.Store.DiskPressure.clear(ctx, shard_index)
         Ferricstore.Store.Router.delete(ctx, key)
+      end
+    end
+
+    test "flushdb invalidates Flow retention trust before a destructive failure" do
+      ctx = FerricStore.Instance.get(:default)
+
+      Enum.each(0..(ctx.shard_count - 1), fn shard_index ->
+        :persistent_term.put(
+          {Ferricstore.Flow.SharedRefBackfill, :verified_complete, ctx.name, shard_index},
+          true
+        )
+      end)
+
+      broken_ctx = %{
+        ctx
+        | keydir_refs: put_elem(ctx.keydir_refs, 1, make_ref())
+      }
+
+      on_exit(fn -> FerricStore.Impl.flushdb(ctx) end)
+
+      assert {:error, {:flush_internal_keydir_unavailable, %ArgumentError{}}} =
+               Ferricstore.Store.Ops.flush(broken_ctx)
+
+      for shard_index <- 0..(ctx.shard_count - 1) do
+        refute Ferricstore.Flow.SharedRefBackfill.verified_complete?(ctx.name, shard_index)
       end
     end
 

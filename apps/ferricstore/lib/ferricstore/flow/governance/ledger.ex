@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.Governance.Ledger do
 
   alias Ferricstore.Flow.Governance.AtomicRecord
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.RetentionGuard
   alias Ferricstore.Store.Router
 
   @default_max_events 1_000
@@ -34,15 +35,26 @@ defmodule Ferricstore.Flow.Governance.Ledger do
 
     event_key = Keys.governance_ledger_key(flow_id, event_id, partition_key)
     index_key = Keys.governance_ledger_index_key(flow_id, partition_key)
+    retention_owner = retention_owner(record)
 
-    with :ok <- Router.put(ctx, event_key, encode_event(event), 0) do
+    event_opts = %{
+      expire_at_ms: 0,
+      nx: false,
+      xx: false,
+      get: false,
+      keepttl: false,
+      flow_retention_owner: retention_owner
+    }
+
+    with :ok <- Router.set(ctx, event_key, encode_event(event), event_opts) do
       AtomicRecord.mutate(
         ctx,
         index_key,
         &decode_index/1,
         &encode_index/1,
         fn -> {:ok, []} end,
-        fn events -> {:ok, put_event(events, event, @default_max_events), :ok} end
+        fn events -> {:ok, put_event(events, event, @default_max_events), :ok} end,
+        flow_retention_owner: retention_owner
       )
     end
   end
@@ -123,6 +135,18 @@ defmodule Ferricstore.Flow.Governance.Ledger do
     do: Enum.take(events, -max_events)
 
   defp trim(events, _max_events), do: events
+
+  defp retention_owner(record) do
+    id = Map.fetch!(record, :id)
+    partition_key = Map.get(record, :partition_key)
+
+    %{
+      id: id,
+      partition_key: partition_key,
+      state_key: Keys.state_key(id, partition_key),
+      expected_guard: RetentionGuard.encode(record)
+    }
+  end
 
   defp in_window?(event, from_ms, to_ms) do
     at_ms = Map.get(event, :at_ms, 0)

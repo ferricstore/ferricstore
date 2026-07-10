@@ -113,6 +113,7 @@ defmodule FerricstoreServer.Acl do
   @typedoc "A user record stored in the ACL table."
   @type user :: %{
           enabled: boolean(),
+          auth_epoch: non_neg_integer(),
           password: binary() | nil,
           commands: :all | MapSet.t(binary()),
           denied_commands: MapSet.t(binary()),
@@ -324,23 +325,42 @@ defmodule FerricstoreServer.Acl do
   """
   @spec authenticate(binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def authenticate(username, password) do
+    authenticate(username, password, &Password.verify/2)
+  end
+
+  @doc false
+  @spec authenticate(binary(), binary(), (binary(), binary() -> boolean())) ::
+          {:ok, binary()} | {:error, binary()}
+  def authenticate(username, password, verifier) when is_function(verifier, 2) do
     case get_user(username) do
       nil ->
-        {:error, "WRONGPASS invalid username-password pair or user is disabled."}
+        verify_dummy_password(password, verifier)
+        authentication_error()
 
       %{enabled: false} ->
-        {:error, "WRONGPASS invalid username-password pair or user is disabled."}
+        verify_dummy_password(password, verifier)
+        authentication_error()
 
       %{password: nil} ->
+        verify_dummy_password(password, verifier)
         {:ok, username}
 
       %{password: stored_hash} ->
-        if Password.verify(password, stored_hash) do
+        if verifier.(password, stored_hash) do
           {:ok, username}
         else
-          {:error, "WRONGPASS invalid username-password pair or user is disabled."}
+          authentication_error()
         end
     end
+  end
+
+  defp verify_dummy_password(password, verifier) do
+    _verified = verifier.(password, Password.dummy_hash())
+    :ok
+  end
+
+  defp authentication_error do
+    {:error, "WRONGPASS invalid username-password pair or user is disabled."}
   end
 
   @doc """
@@ -553,63 +573,16 @@ defmodule FerricstoreServer.Acl do
   This ensures ACL mutations are applied consistently across the cluster.
   """
   @spec handle_raft_command(term()) :: term()
-  def handle_raft_command({:acl_setuser, username, rules}) do
-    case set_user(username, rules) do
-      :ok ->
-        FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(username)
-        :ok
+  def handle_raft_command({:acl_setuser, username, rules}), do: set_user(username, rules)
 
-      {:error, _reason} = error ->
-        error
-    end
-  end
+  def handle_raft_command({:acl_deluser, username}), do: del_user(username)
 
-  def handle_raft_command({:acl_deluser, username}) do
-    case del_user(username) do
-      :ok ->
-        FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(username)
-        :ok
+  def handle_raft_command({:acl_delusers, usernames}), do: del_users(usernames)
 
-      {:error, _reason} = error ->
-        error
-    end
-  end
+  def handle_raft_command({:acl_reset}), do: reset!()
 
-  def handle_raft_command({:acl_delusers, usernames}) do
-    case del_users(usernames) do
-      :ok ->
-        usernames
-        |> Enum.uniq()
-        |> Enum.each(&FerricstoreServer.Connection.Auth.broadcast_acl_invalidation/1)
-
-        :ok
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  def handle_raft_command({:acl_reset}) do
-    case reset!() do
-      :ok ->
-        FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(:all)
-        :ok
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  def handle_raft_command({:acl_load, contents}) when is_binary(contents) do
-    case load_contents(contents) do
-      :ok ->
-        FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(:all)
-        :ok
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
+  def handle_raft_command({:acl_load, contents}) when is_binary(contents),
+    do: load_contents(contents)
 
   def handle_raft_command(_unknown), do: {:error, :unknown_acl_command}
 
@@ -757,13 +730,13 @@ defmodule FerricstoreServer.Acl do
 
     # Auto-load from file on startup (design doc section 7 startup sequence)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    state = %{table: table, save_timer: nil}
+    state = %{table: table, save_timer: nil, auth_epoch: 0}
 
     state =
-      case Persistence.auto_load_from_file(data_dir) do
-        :ok ->
+      case Persistence.auto_load_from_file(data_dir, state.auth_epoch) do
+        {:ok, auth_epoch} ->
           Logger.info("ACL loaded from #{acl_file_path(data_dir)}")
-          state
+          %{state | auth_epoch: auth_epoch}
 
         {:error, :enoent} ->
           # No file -- start with default user only (normal for fresh installs)
@@ -804,7 +777,12 @@ defmodule FerricstoreServer.Acl do
 
       case Rules.apply_rules(base, rules) do
         {:ok, updated} ->
+          auth_epoch = state.auth_epoch + 1
+          updated = Map.put(updated, :auth_epoch, auth_epoch)
           :ets.insert(table, {username, updated})
+          :ok = Tables.update_configured_user_witness(username, updated)
+          :ok = broadcast_acl_invalidation(username)
+          state = %{state | auth_epoch: auth_epoch}
           {:reply, :ok, maybe_schedule_auto_save(state)}
 
         {:error, _reason} = err ->
@@ -826,6 +804,9 @@ defmodule FerricstoreServer.Acl do
 
       _ ->
         :ets.delete(table, username)
+        :ok = Tables.remove_configured_user_witnesses([username])
+        :ok = broadcast_acl_invalidation(username)
+        state = %{state | auth_epoch: state.auth_epoch + 1}
         {:reply, :ok, maybe_schedule_auto_save(state)}
     end
   end
@@ -835,10 +816,12 @@ defmodule FerricstoreServer.Acl do
       :ok ->
         table = Tables.active_table()
 
-        usernames
-        |> Enum.uniq()
-        |> Enum.each(&:ets.delete(table, &1))
+        usernames = Enum.uniq(usernames)
+        Enum.each(usernames, &:ets.delete(table, &1))
+        :ok = Tables.remove_configured_user_witnesses(usernames)
+        Enum.each(usernames, &broadcast_acl_invalidation/1)
 
+        state = %{state | auth_epoch: state.auth_epoch + length(usernames)}
         {:reply, :ok, maybe_schedule_auto_save(state)}
 
       {:error, _reason} = error ->
@@ -847,42 +830,52 @@ defmodule FerricstoreServer.Acl do
   end
 
   def handle_call(:reset, _from, state) do
+    auth_epoch = state.auth_epoch + 1
     :ets.delete_all_objects(ensure_active_table())
-    Tables.insert_default_user()
-    {:reply, :ok, state}
+    :ok = Tables.clear_configured_user_witness()
+    Tables.insert_default_user(auth_epoch)
+    :ok = broadcast_acl_invalidation(:all)
+    {:reply, :ok, %{state | auth_epoch: auth_epoch}}
   end
 
   # --- ACL SAVE ---
 
   def handle_call(:acl_save, _from, state) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    {:reply, Persistence.save(data_dir), state}
+    {:reply, Persistence.save(data_dir, state.auth_epoch), state}
   end
 
   def handle_call({:acl_save, data_dir}, _from, state) do
-    {:reply, Persistence.save(data_dir), state}
+    {:reply, Persistence.save(data_dir, state.auth_epoch), state}
   end
 
   # --- ACL LOAD ---
 
   def handle_call(:acl_load, _from, state) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    {:reply, Persistence.load(data_dir), state}
+    load_acl_file(data_dir, state)
   end
 
   def handle_call({:acl_load, data_dir}, _from, state) do
-    {:reply, Persistence.load(data_dir), state}
+    load_acl_file(data_dir, state)
   end
 
   def handle_call({:acl_load_contents, contents}, _from, state) do
-    {:reply, Persistence.load_contents(contents), state}
+    case Persistence.load_contents(contents, state.auth_epoch) do
+      {:ok, auth_epoch} ->
+        :ok = broadcast_acl_invalidation(:all)
+        {:reply, :ok, %{state | auth_epoch: auth_epoch}}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
   end
 
   @impl true
   def handle_info(:auto_save, state) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
 
-    case Persistence.save(data_dir) do
+    case Persistence.save(data_dir, state.auth_epoch) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("ACL auto-save failed: #{reason}")
     end
@@ -914,6 +907,20 @@ defmodule FerricstoreServer.Acl do
       state
     end
   end
+
+  defp load_acl_file(data_dir, state) do
+    case Persistence.load(data_dir, state.auth_epoch) do
+      {:ok, auth_epoch} ->
+        :ok = broadcast_acl_invalidation(:all)
+        {:reply, :ok, %{state | auth_epoch: auth_epoch}}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  defp broadcast_acl_invalidation(username),
+    do: FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(username)
 
   defp ensure_active_table do
     table = Tables.active_table()

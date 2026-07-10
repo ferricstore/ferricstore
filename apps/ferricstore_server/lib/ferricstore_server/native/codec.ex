@@ -12,6 +12,7 @@ defmodule FerricstoreServer.Native.Codec do
   """
 
   alias FerricstoreServer.Native.NIF
+  alias FerricstoreServer.Native.Connection.FrameBuffer
 
   @version 1
 
@@ -175,6 +176,17 @@ defmodule FerricstoreServer.Native.Codec do
   @spec status_codes() :: map()
   def status_codes, do: @status_codes
 
+  @doc false
+  @spec effective_response_chunk_bytes(term(), term()) :: pos_integer()
+  def effective_response_chunk_bytes(configured_chunk_bytes, max_frame_bytes) do
+    max_frame_bytes = FrameBuffer.validate_max_frame_bytes!(max_frame_bytes)
+
+    case configured_chunk_bytes do
+      value when is_integer(value) and value > 0 -> min(value, max_frame_bytes)
+      _disabled_or_invalid -> max_frame_bytes
+    end
+  end
+
   @spec compact_tags() :: map()
   def compact_tags do
     %{
@@ -187,8 +199,9 @@ defmodule FerricstoreServer.Native.Codec do
   end
 
   @spec decode_frames(binary(), pos_integer()) ::
-          {:ok, [frame()], binary()} | {:error, binary()}
+          {:ok, [frame()], binary(), :more | :done} | {:error, binary()}
   def decode_frames(buffer, max_frame_bytes) when is_binary(buffer) do
+    max_frame_bytes = FrameBuffer.validate_max_frame_bytes!(max_frame_bytes)
     NIF.decode_frames(buffer, max_frame_bytes)
   end
 
@@ -548,6 +561,7 @@ defmodule FerricstoreServer.Native.Codec do
   def encode_frame(opcode, lane_id, request_id, body, flags \\ 0, direction \\ :request)
       when is_integer(opcode) and is_integer(lane_id) and is_integer(request_id) and
              is_binary(body) do
+    _body_bytes = FrameBuffer.validate_frame_body_bytes!(byte_size(body))
     NIF.encode_frame(opcode, lane_id, request_id, body, flags, direction == :response)
   end
 

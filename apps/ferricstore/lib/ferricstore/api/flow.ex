@@ -9,7 +9,10 @@ defmodule FerricStore.API.Flow do
   Creates a durable Flow record.
 
   Required option: `:type`.
-  Common options: `:state`, `:payload`, `:run_at_ms`, `:priority`.
+  Common options: `:state`, `:payload`, `:run_at_ms`, `:priority`, and
+  `:max_active_ms`. The maximum active runtime is measured from creation and
+  must be between `1` and `31_536_000_000` milliseconds. Use `:infinity` to
+  opt one Flow out of a type-level maximum.
   When `:payload` is provided, Flow stores the value internally and returns a
   generated `:payload_ref`.
   """
@@ -130,9 +133,11 @@ defmodule FerricStore.API.Flow do
   def flow_get(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
-  Stores retry/backpressure policy defaults for a Flow type.
+  Stores retry/backpressure and lifecycle policy defaults for a Flow type.
 
-  Command-local retry policy still wins over these defaults.
+  `:max_active_ms` is type-level and applies to newly created Flows. A create
+  option overrides it for one Flow; `:infinity` disables the type default for
+  that Flow. Command-local retry policy still wins over retry defaults.
   """
   @spec flow_policy_set(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_policy_set(type, opts) when is_binary(type) and is_list(opts) do
@@ -625,10 +630,12 @@ defmodule FerricStore.API.Flow do
     do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
-  Removes expired terminal Flow state, history rows, and generated value payload keys.
+  Fails active Flows whose `max_active_ms` deadline elapsed, then removes
+  expired terminal Flow state, history rows, and generated value payload keys.
 
-  This is a bounded cleanup pass; pass `limit: n` to cap the number of expired
-  terminal flows cleaned per shard.
+  This is a bounded cleanup pass; pass `limit: n` to share a per-shard work
+  budget between active timeouts and expired terminal cleanup. The result's
+  `:active_timeouts` count reports Flows transitioned to `failed`.
   """
   @spec flow_retention_cleanup(keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_retention_cleanup(opts \\ [])

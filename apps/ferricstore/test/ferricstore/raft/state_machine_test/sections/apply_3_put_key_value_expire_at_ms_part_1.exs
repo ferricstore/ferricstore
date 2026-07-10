@@ -315,6 +315,100 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           end
         end
 
+        @tag :flow_policy_atomicity
+        test "cross-shard Flow policy put rolls back every shard when reindex is rejected", %{
+          state: state,
+          ets: ets,
+          active_file_path: shard0_file
+        } do
+          root =
+            Path.join(
+              System.tmp_dir!(),
+              "sm_cross_policy_#{System.unique_integer([:positive])}"
+            )
+
+          shard0 = 0
+          shard1 = 1
+          shard1_path = Ferricstore.DataDir.shard_data_path(root, shard1)
+          shard1_file = Path.join(shard1_path, "00000.log")
+          File.mkdir_p!(shard1_path)
+          File.touch!(shard1_file)
+
+          ets1 =
+            :ets.new(:"sm_cross_policy_#{System.unique_integer([:positive])}", [:set, :public])
+
+          filler_rows =
+            Enum.map(1..10_001, fn index ->
+              key = "unrelated:#{index}"
+              {key, <<1>>, 0, Ferricstore.Store.LFU.initial(), 0, 0, 1}
+            end)
+
+          true = :ets.insert(ets1, filler_rows)
+
+          instance_ctx = %{
+            name: :"sm_cross_policy_#{System.unique_integer([:positive])}",
+            data_dir: root,
+            shard_count: 2,
+            keydir_refs: List.to_tuple([ets, ets1]),
+            keydir_binary_bytes: :atomics.new(2, signed: false),
+            checkpoint_flags: :atomics.new(2, signed: false),
+            checkpoint_in_flight: :atomics.new(2, signed: false),
+            disk_pressure: :atomics.new(2, signed: false),
+            hot_cache_max_value_size: 64
+          }
+
+          Ferricstore.Store.ActiveFile.init(2)
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            shard0,
+            0,
+            shard0_file,
+            state.shard_data_path
+          )
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            shard1,
+            0,
+            shard1_file,
+            shard1_path
+          )
+
+          type = "atomic-policy"
+          policy_key = Ferricstore.Flow.Keys.policy_key(type)
+
+          {:ok, policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type,
+              indexed_state_meta: "version"
+            )
+
+          policy_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy)
+
+          command =
+            {:cross_shard_tx,
+             [
+               {shard0, [{0, {:flow_cross_policy_put, shard0, policy_key, policy_value, 0}}],
+                nil},
+               {shard1, [{1, {:flow_cross_policy_put, shard1, policy_key, policy_value, 0}}], nil}
+             ]}
+
+          try do
+            state = %{state | shard_index: shard0, instance_ctx: instance_ctx}
+
+            {_new_state, {:error, error}} =
+              StateMachine.apply(%{system_time: Ferricstore.HLC.now_ms()}, command, state)
+
+            assert error =~ "flow policy reindex exceeds"
+            assert [] = :ets.lookup(ets, policy_key)
+            assert [] = :ets.lookup(ets1, policy_key)
+          after
+            :ets.delete(ets1)
+            Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+            File.rm_rf!(root)
+          end
+        end
+
         test "failed cross-shard multi-target overwrite restores replayable original record", %{
           state: state,
           ets: ets,
@@ -415,6 +509,91 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             :ets.delete(ets1)
             Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
             File.rm_rf!(root)
+          end
+        end
+
+        @tag :cross_shard_waraft_compensation
+        test "cross-shard compensation restores a cold WARaft apply-projection original", %{
+          state: state,
+          ets: ets,
+          active_file_path: shard0_file
+        } do
+          shard0 = 0
+          shard1 = 1
+          root = state.data_dir
+          shard1_path = Ferricstore.DataDir.shard_data_path(root, shard1)
+          shard1_bad_active = Path.join(shard1_path, "active_is_directory.log")
+
+          ets1 =
+            :ets.new(:"sm_cross_waraft_#{System.unique_integer([:positive])}", [:set, :public])
+
+          instance_ctx = %{
+            name: :"sm_cross_waraft_#{System.unique_integer([:positive])}",
+            data_dir: root,
+            shard_count: 2,
+            keydir_refs: List.to_tuple([ets, ets1]),
+            keydir_binary_bytes: :atomics.new(2, signed: false),
+            checkpoint_flags: :atomics.new(2, signed: false),
+            checkpoint_in_flight: :atomics.new(2, signed: false),
+            disk_pressure: :atomics.new(2, signed: false),
+            hot_cache_max_value_size: 64
+          }
+
+          key = "partial_waraft_existing"
+          old_value = "old-segment-value"
+          projection_index = 91
+
+          assert :ok =
+                   Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                     root,
+                     shard0,
+                     projection_index,
+                     [{key, old_value, 0}]
+                   )
+
+          original_row =
+            {key, nil, 0, Ferricstore.Store.LFU.initial(),
+             {:waraft_apply_projection, projection_index}, 0, byte_size(old_value)}
+
+          :ets.insert(ets, original_row)
+          File.mkdir_p!(shard1_bad_active)
+          Ferricstore.Store.ActiveFile.init(2)
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            shard0,
+            0,
+            shard0_file,
+            state.shard_data_path
+          )
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            shard1,
+            0,
+            shard1_bad_active,
+            shard1_path
+          )
+
+          try do
+            state = %{state | shard_index: shard0, instance_ctx: instance_ctx}
+
+            {_new_state, {:error, {:bitcask_append_failed, _reason}}} =
+              StateMachine.apply(
+                %{system_time: Ferricstore.HLC.now_ms()},
+                {:cross_shard_tx,
+                 [
+                   {shard0, [{"SET", [key, "new-value"]}], nil},
+                   {shard1, [{"SET", ["partial_waraft_failure", "fail"]}], nil}
+                 ]},
+                state
+              )
+
+            assert [^original_row] = :ets.lookup(ets, key)
+          after
+            :ets.delete(ets1)
+            Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+            File.rm_rf!(shard1_path)
           end
         end
 

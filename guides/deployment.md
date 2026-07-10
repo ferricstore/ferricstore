@@ -27,7 +27,8 @@ Environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRICSTORE_NATIVE_PORT` | `6388` | Ferric native protocol TCP listen port |
-| `FERRICSTORE_HEALTH_PORT` | `6380` | Health endpoint port |
+| `FERRICSTORE_HEALTH_PORT` | `6380` | Legacy dashboard, metrics, and health port |
+| `FERRICSTORE_HEALTH_PROBE_PORT` | `6381` | Isolated liveness/readiness port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Bitcask + WAL data directory |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards (0 = CPU count) |
 | `FERRICSTORE_PROTECTED_MODE` | `true` | Reject non-localhost without auth |
@@ -158,7 +159,10 @@ spec:
         - name: ferricstore
           image: ghcr.io/ferricstore/ferricstore:0.4.1
           ports:
-            - containerPort: 6388
+            - name: native
+              containerPort: 6388
+            - name: health-probe
+              containerPort: 6381
           env:
             - name: FERRICSTORE_PROTECTED_MODE
               value: "false"
@@ -169,6 +173,14 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: health-probe
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: health-probe
       volumes:
         - name: data
           emptyDir: {}

@@ -49,6 +49,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TDigest
   alias Ferricstore.Commands.TopK
+  alias Ferricstore.Flow.InternalKey
 
   @string_raw_commands ~w(GET SET DEL EXISTS MGET MSET INCR DECR INCRBY DECRBY INCRBYFLOAT APPEND STRLEN GETSET GETDEL GETEX SETNX SETEX PSETEX GETRANGE SETRANGE MSETNX)
   @expiry_raw_commands ~w(EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST)
@@ -787,14 +788,20 @@ defmodule Ferricstore.Commands.Dispatcher do
     case parse_raw(name, args) do
       {:ok, cmd, parsed_args, ast, keys} ->
         result =
-          case check_raw_resource_limits(cmd, parsed_args, keys, store) do
+          case authorize_public_keys(cmd, keys) do
             :ok ->
-              result = dispatch_ast(ast, store)
-              record_raw_activity(result, cmd, keys, store)
-              result
+              case check_raw_resource_limits(cmd, parsed_args, keys, store) do
+                :ok ->
+                  result = dispatch_ast(ast, store)
+                  record_raw_activity(result, cmd, keys, store)
+                  result
+
+                {:error, reason} ->
+                  {:error, FerricStore.ResourceLimits.error_message(reason)}
+              end
 
             {:error, reason} ->
-              {:error, FerricStore.ResourceLimits.error_message(reason)}
+              {:error, reason}
           end
 
         log_raw_dispatch(cmd, parsed_args, start)
@@ -817,6 +824,8 @@ defmodule Ferricstore.Commands.Dispatcher do
     duration = System.monotonic_time(:microsecond) - start
     Ferricstore.SlowLog.maybe_log([cmd | args], duration)
   end
+
+  defp authorize_public_keys(cmd, keys), do: InternalKey.authorize_command(cmd, keys)
 
   defp record_raw_activity({:error, _reason}, _cmd, _keys, _store), do: :ok
   defp record_raw_activity(_result, _cmd, [], _store), do: :ok

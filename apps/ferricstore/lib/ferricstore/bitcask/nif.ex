@@ -513,6 +513,10 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, non_neg_integer()} | {:busy, non_neg_integer()} | {:error, term()}
   def lmdb_release_all, do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_release(binary()) ::
+          {:ok, non_neg_integer()} | {:busy, non_neg_integer()} | {:error, term()}
+  def lmdb_release(_path), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_prefix_entries(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
@@ -528,6 +532,25 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, [{binary(), binary()}]} | {:error, term()}
   def lmdb_prefix_entries_after(_path, _prefix, _after_key, _limit, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_prefix_entries_after_bounded(
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{binary(), binary()}]} | {:error, term()}
+  def lmdb_prefix_entries_after_bounded(
+        _path,
+        _prefix,
+        _after_key,
+        _max_items,
+        _max_bytes,
+        _map_size
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   @spec lmdb_prefix_entries_reverse(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}

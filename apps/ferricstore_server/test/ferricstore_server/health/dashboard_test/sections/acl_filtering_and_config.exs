@@ -113,6 +113,64 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           refute extract_body(live) =~ denied_key
         end
 
+        test "Flow record ACL filtering never treats the Flow type as its key scope" do
+          records = [
+            %{id: "flow-a", partition_key: "tenant-a:partition", type: "shared-type"},
+            %{id: "flow-b", partition_key: "tenant-b:partition", type: "shared-type"}
+          ]
+
+          :ok =
+            FerricstoreServer.Acl.set_user("flow-type-only", [
+              "on",
+              ">secret",
+              "%R~shared-type",
+              "-@all",
+              "+FLOW.LIST"
+            ])
+
+          assert FerricstoreServer.Health.Dashboard.Access.filter_flow_records_for_acl(
+                   records,
+                   "flow-type-only"
+                 ) == []
+        end
+
+        test "Flow query aggregate rows require their canonical request scope" do
+          row = %{type: "shared-type", state: "completed", count: 2}
+          result = %{rows: [row], message: "1 row"}
+
+          :ok =
+            FerricstoreServer.Acl.set_user("flow-query-type-only", [
+              "on",
+              ">secret",
+              "%R~shared-type",
+              "-@all",
+              "+FLOW.STATS"
+            ])
+
+          assert %{rows: []} =
+                   FerricstoreServer.Health.Dashboard.Access.flow_query_filter_result_for_acl(
+                     result,
+                     "flow-query-type-only",
+                     "*"
+                   )
+
+          :ok =
+            FerricstoreServer.Acl.set_user("flow-query-tenant", [
+              "on",
+              ">secret",
+              "%R~tenant-a:*",
+              "-@all",
+              "+FLOW.STATS"
+            ])
+
+          assert %{rows: [^row]} =
+                   FerricstoreServer.Health.Dashboard.Access.flow_query_filter_result_for_acl(
+                     result,
+                     "flow-query-tenant",
+                     "tenant-a:partition"
+                   )
+        end
+
         test "stream activity rows are filtered by dashboard ACL key patterns" do
           Ferricstore.Stream.ActivityLog.reset()
 
@@ -321,13 +379,20 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
 
           refute Enum.any?(denied_records, &(&1.id == denied_id))
 
-          allowed_records =
+          allowed_data =
             Dashboard.collect_flow_page(
               partition_key: allowed_partition,
               acl_username: "tenant-a-flow-dashboard"
-            ).records
+            )
+
+          allowed_records = allowed_data.records
 
           assert Enum.any?(allowed_records, &(&1.id == allowed_id))
+          assert allowed_data.total_sampled == allowed_data.filtered_sampled
+          assert allowed_data.projection == %{restricted: true}
+
+          refute Dashboard.render_flow_page(allowed_data) =~
+                   "cold/query projection runs after durable Flow writes"
 
           login =
             http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
@@ -402,15 +467,19 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               "+FLOW.LIST"
             ])
 
-          filtered_ids =
+          restricted_data =
             Dashboard.collect_flow_retention_page(
               limit: 200,
               acl_username: "tenant-a-retention-dashboard"
-            ).candidates
-            |> Enum.map(& &1.id)
+            )
+
+          filtered_ids = Enum.map(restricted_data.candidates, & &1.id)
 
           assert allowed_id in filtered_ids
           refute denied_id in filtered_ids
+          assert restricted_data.total_sampled == restricted_data.filtered_sampled
+          assert restricted_data.storage == %{restricted: true}
+          assert restricted_data.projection == %{restricted: true}
 
           login =
             http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
@@ -426,6 +495,63 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           assert extract_status_code(page) == 200
           assert extract_body(page) =~ allowed_id
           refute extract_body(page) =~ denied_id
+          refute extract_body(page) =~ "current data directory footprint"
+          refute extract_body(page) =~ "cold query-index work pending"
+        end
+
+        test "Flow policy page filters configured types and editor data by type ACL" do
+          Application.put_env(:ferricstore, :protected_mode, true)
+
+          suffix = System.unique_integer([:positive])
+          allowed_type = "tenant-a:policy:#{suffix}"
+          denied_type = "tenant-b:policy:#{suffix}"
+
+          assert {:ok, _policy} =
+                   FerricStore.flow_policy_set(allowed_type, max_active_ms: 11_000)
+
+          assert {:ok, _policy} =
+                   FerricStore.flow_policy_set(denied_type, max_active_ms: 22_000)
+
+          :ok =
+            FerricstoreServer.Acl.set_user("tenant-a-policy-dashboard", [
+              "on",
+              ">secret",
+              "%R~tenant-a:policy:*",
+              "-@all",
+              "+FLOW.POLICY.GET"
+            ])
+
+          data =
+            Dashboard.collect_flow_policies_page(
+              acl_username: "tenant-a-policy-dashboard",
+              edit_type: denied_type
+            )
+
+          types = Enum.map(data.policies, & &1.type)
+          assert allowed_type in types
+          refute denied_type in types
+          assert data.editor.type == ""
+          assert data.policy_scan == %{restricted: true}
+
+          login =
+            http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+              "username" => "tenant-a-policy-dashboard",
+              "password" => "secret"
+            })
+
+          query = URI.encode_query(%{"edit" => denied_type})
+
+          page =
+            http_get(HealthEndpoint.port(), "/dashboard/flow/policies?#{query}", [
+              {"Cookie", dashboard_session_cookie(login)}
+            ])
+
+          body = extract_body(page)
+          assert extract_status_code(page) == 200
+          assert body =~ allowed_type
+          refute body =~ denied_type
+          assert body =~ "limited to authorized Flow types"
+          refute body =~ "entries inspected"
         end
 
         test "removed Flow projections live endpoint is not authorized as a Flow id" do

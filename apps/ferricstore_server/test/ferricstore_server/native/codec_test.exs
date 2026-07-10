@@ -20,14 +20,31 @@ defmodule FerricstoreServer.Native.CodecTest do
     body = Codec.encode_value(%{"key" => "a", "value" => "b"})
     frame = Codec.encode_frame(0x0102, 7, 42, body)
 
-    assert {:ok, [{7, 0x0102, 42, 0, ^body}], ""} = Codec.decode_frames(frame, 1024)
+    assert {:ok, [{7, 0x0102, 42, 0, ^body}], "", :done} =
+             Codec.decode_frames(frame, 1024)
   end
 
   test "native NIF decodes the same frame tuple shape as the Elixir codec" do
     body = Codec.encode_value(%{"key" => "a", "value" => "b"})
     frame = Codec.encode_frame(0x0102, 7, 42, body)
 
-    assert {:ok, [{7, 0x0102, 42, 0, ^body}], ""} = NIF.decode_frames(frame, 1024)
+    assert {:ok, [{7, 0x0102, 42, 0, ^body}], "", :done} =
+             NIF.decode_frames(frame, 1024)
+  end
+
+  test "frame decoding bounds one pass and preserves buffered continuation frames" do
+    encoded =
+      1..129
+      |> Enum.map(&Codec.encode_frame(0x0003, 0, &1, ""))
+      |> IO.iodata_to_binary()
+
+    assert {:ok, first_batch, rest, :more} =
+             Codec.decode_frames(encoded, 16 * 1024 * 1024)
+
+    assert Enum.map(first_batch, &elem(&1, 2)) == Enum.to_list(1..128)
+
+    assert {:ok, [{0, 0x0003, 129, 0, ""}], "", :done} =
+             Codec.decode_frames(rest, 16 * 1024 * 1024)
   end
 
   test "native NIF encodes the same frame header as the Elixir codec" do
@@ -42,7 +59,7 @@ defmodule FerricstoreServer.Native.CodecTest do
     frame = Codec.encode_frame(0x0101, 3, 9, body)
     partial = binary_part(frame, 0, byte_size(frame) - 2)
 
-    assert {:ok, [], ^partial} = Codec.decode_frames(partial, 1024)
+    assert {:ok, [], ^partial, :done} = Codec.decode_frames(partial, 1024)
   end
 
   test "response frames use response direction bit and are rejected as client input" do

@@ -404,7 +404,15 @@ defmodule Ferricstore.Store.Router.Part05 do
       defp batch_quorum_commands(_ctx, [], _origin_node), do: []
 
       defp batch_quorum_commands(ctx, keyed_commands, origin_node) do
-        do_batch_quorum_commands(ctx, keyed_commands, origin_node)
+        if Enum.any?(keyed_commands, fn {_key, command} ->
+             flow_shared_ref_acquisition_command?(command)
+           end) do
+          Enum.map(keyed_commands, fn {key, command} ->
+            raft_write(ctx, shard_for(ctx, key), key, command)
+          end)
+        else
+          do_batch_quorum_commands(ctx, keyed_commands, origin_node)
+        end
       end
 
       defp batch_quorum_zadd_many_single(_ctx, []), do: []

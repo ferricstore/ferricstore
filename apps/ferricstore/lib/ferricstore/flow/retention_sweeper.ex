@@ -1,6 +1,6 @@
 defmodule Ferricstore.Flow.RetentionSweeper do
   @moduledoc """
-  Periodic Flow retention cleanup for terminal records and their history/value refs.
+  Periodic Flow active-timeout enforcement and terminal retention cleanup.
 
   Cleanup itself is a normal Ra-backed Flow command, so correctness stays in the
   state machine. This process only schedules small background batches.
@@ -20,9 +20,16 @@ defmodule Ferricstore.Flow.RetentionSweeper do
   @default_pressure_limit 10_000
   @default_pressure_compaction_interval_ms 60_000
 
+  @spec name(FerricStore.Instance.t() | atom()) :: atom()
+  def name(%{name: instance_name}), do: name(instance_name)
+  def name(:default), do: __MODULE__
+
+  def name(instance_name) when is_atom(instance_name),
+    do: :"#{instance_name}.Flow.RetentionSweeper"
+
   def start_link(opts \\ []) do
     if enabled?() do
-      name = Keyword.get(opts, :name, __MODULE__)
+      name = Keyword.get(opts, :name, default_name(opts))
       GenServer.start_link(__MODULE__, opts, name: name)
     else
       :ignore
@@ -91,6 +98,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
   @impl true
   def init(opts) do
+    instance_ctx = Keyword.get(opts, :instance_ctx)
+
     state = %{
       interval_ms:
         opt_pos_int(opts, :interval_ms, :flow_retention_sweeper_interval_ms, @default_interval_ms),
@@ -123,9 +132,14 @@ defmodule Ferricstore.Flow.RetentionSweeper do
           :flow_retention_sweeper_pressure_compaction_interval_ms,
           @default_pressure_compaction_interval_ms
         ),
-      pressure_detector_fun: Keyword.get(opts, :pressure_detector_fun, &pressure?/0),
-      cleanup_fun: Keyword.get(opts, :cleanup_fun, &FerricStore.flow_retention_cleanup/1),
-      compaction_fun: Keyword.get(opts, :compaction_fun, &trigger_merge_checks/0),
+      pressure_detector_fun:
+        Keyword.get(opts, :pressure_detector_fun, fn -> instance_pressure?(instance_ctx) end),
+      cleanup_fun:
+        Keyword.get(opts, :cleanup_fun, fn cleanup_opts ->
+          retention_cleanup(instance_ctx, cleanup_opts)
+        end),
+      compaction_fun:
+        Keyword.get(opts, :compaction_fun, fn -> trigger_merge_checks(instance_ctx) end),
       compaction_ref: nil,
       last_compaction_mono_ms: nil,
       consecutive_limit_hits: 0,
@@ -237,6 +251,18 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     Application.get_env(:ferricstore, :flow_retention_sweeper_enabled, true) == true
   end
 
+  defp default_name(opts) do
+    case Keyword.get(opts, :instance_ctx) do
+      %{name: instance_name} -> name(instance_name)
+      _other -> __MODULE__
+    end
+  end
+
+  defp retention_cleanup(nil, opts), do: FerricStore.flow_retention_cleanup(opts)
+
+  defp retention_cleanup(instance_ctx, opts),
+    do: FerricStore.Impl.flow_retention_cleanup(instance_ctx, opts)
+
   defp process_for(pid) when is_pid(pid), do: pid
   defp process_for(name) when is_atom(name), do: Process.whereis(name)
   defp process_for(_name), do: nil
@@ -277,9 +303,9 @@ defmodule Ferricstore.Flow.RetentionSweeper do
   defp normalize_result(other), do: {:error, %{}, other}
 
   defp cleanup_limit_hit?(counts, limit) do
-    Enum.any?([:flows, :history, :values, :active_timeouts], fn key ->
-      Map.get(counts, key, 0) >= limit
-    end)
+    Map.get(counts, :flows, 0) + Map.get(counts, :active_timeouts, 0) >= limit or
+      Map.get(counts, :history, 0) >= limit or
+      Map.get(counts, :values, 0) >= limit
   end
 
   defp emit_sweep(
@@ -359,8 +385,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     _kind, _reason -> false
   end
 
-  defp pressure? do
-    operational_pressure?() or memory_pressure?() or disk_pressure?()
+  defp instance_pressure?(instance_ctx) do
+    operational_pressure?() or memory_pressure?() or disk_pressure?(instance_ctx)
   end
 
   defp operational_pressure? do
@@ -379,8 +405,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     _kind, _reason -> false
   end
 
-  defp disk_pressure? do
-    ctx = FerricStore.Instance.get(:default)
+  defp disk_pressure?(instance_ctx) do
+    ctx = instance_ctx || FerricStore.Instance.get(:default)
 
     Enum.any?(0..(ctx.shard_count - 1), fn shard_index ->
       DiskPressure.under_pressure?(ctx, shard_index)
@@ -433,8 +459,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
       state.pressure_compaction_interval_ms
   end
 
-  defp trigger_merge_checks do
-    ctx = FerricStore.Instance.get(:default)
+  defp trigger_merge_checks(instance_ctx) do
+    ctx = instance_ctx || FerricStore.Instance.get(:default)
 
     if is_integer(ctx.shard_count) and ctx.shard_count > 0 do
       Enum.each(0..(ctx.shard_count - 1), fn shard_index ->

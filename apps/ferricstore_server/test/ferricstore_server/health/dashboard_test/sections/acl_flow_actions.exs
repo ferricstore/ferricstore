@@ -306,15 +306,15 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
                    Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), policy_key)
         end
 
-        test "dashboard failure reclaim POST enforces ACL key patterns from form type" do
+        test "dashboard failure reclaim without partition requires wildcard write access" do
           Application.put_env(:ferricstore, :protected_mode, true)
-          denied_type = "denied:reclaim:#{System.unique_integer([:positive])}"
+          type = "tenant-a:reclaim:#{System.unique_integer([:positive])}"
 
           :ok =
             FerricstoreServer.Acl.set_user("flow-reclaimer", [
               "on",
               ">secret",
-              "%W~allowed:*",
+              "%W~#{type}",
               "-@all",
               "+FLOW.RECLAIM"
             ])
@@ -331,7 +331,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               "/dashboard/flow/failures",
               %{
                 "action" => "reclaim",
-                "type" => denied_type,
+                "type" => type,
                 "limit" => "1",
                 "lease_ms" => "30000",
                 "confirm_reclaim" => "true"
@@ -341,7 +341,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
 
           assert extract_status_code(response) == 403
           assert extract_body(response) =~ "FLOW.RECLAIM"
-          assert extract_body(response) =~ "%W~#{denied_type}"
+          assert extract_body(response) =~ "%W~*"
           assert extract_body(response) =~ "write"
         end
 
@@ -383,6 +383,40 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
           assert extract_status_code(response) == 403
           assert extract_body(response) =~ "FLOW.RECLAIM"
           assert extract_body(response) =~ "%W~#{denied_partition}"
+          assert extract_body(response) =~ "write"
+        end
+
+        test "dashboard schedule POST enforces write access to the submitted schedule id" do
+          Application.put_env(:ferricstore, :protected_mode, true)
+          denied_id = "tenant-b:schedule:#{System.unique_integer([:positive])}"
+
+          :ok =
+            FerricstoreServer.Acl.set_user("flow-schedule-writer", [
+              "on",
+              ">secret",
+              "%W~tenant-a:schedule:*",
+              "-@all",
+              "+FLOW.SCHEDULE.LIST",
+              "+FLOW.SCHEDULE.PAUSE"
+            ])
+
+          login =
+            http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+              "username" => "flow-schedule-writer",
+              "password" => "secret"
+            })
+
+          response =
+            http_post_form(
+              HealthEndpoint.port(),
+              "/dashboard/flow/schedules",
+              %{"action" => "pause", "id" => denied_id},
+              [{"Cookie", dashboard_session_cookie(login)}]
+            )
+
+          assert extract_status_code(response) == 403
+          assert extract_body(response) =~ "FLOW.SCHEDULE.PAUSE"
+          assert extract_body(response) =~ "%W~#{denied_id}"
           assert extract_body(response) =~ "write"
         end
 

@@ -65,6 +65,19 @@ FLOW.STATS order STATE queued ATTRIBUTE tenant acme
 FLOW.SEARCH TYPE order STATE queued ATTRIBUTE tenant acme CONSISTENT_PROJECTION true
 ```
 
+Bound the total non-terminal lifetime of a Flow with a type policy or a
+per-create override:
+
+```text
+FLOW.POLICY.SET order MAX_ACTIVE_MS 300000
+FLOW.CREATE order-1 TYPE order STATE queued MAX_ACTIVE_MS 60000
+FLOW.CREATE order-no-deadline TYPE order STATE queued MAX_ACTIVE_MS INFINITY
+```
+
+The limit is measured from Flow creation, is type-level rather than state-level,
+and includes queued, scheduled, running, and retry time. An overdue Flow fails
+with history reason `max_active_ms`.
+
 Use attributes for values you want to filter or count by, such as tenant,
 region, campaign, device group, or model. Use value refs for large bytes or
 state-specific data. Attribute query projection is asynchronous, so use
