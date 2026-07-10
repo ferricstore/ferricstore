@@ -286,16 +286,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
       defp flow_retention_positive_integer(_value, default), do: default
 
-      defp flow_retention_history_lmdb_scan_limit do
-        :ferricstore
-        |> Application.get_env(:flow_lmdb_history_cleanup_scan_limit, 100_000)
-        |> flow_retention_positive_integer(100_000)
+      defp flow_retention_history_lmdb_scan_limit(state) do
+        state
+        |> raft_apply_context()
+        |> Map.fetch!(:flow_lmdb_history_cleanup_scan_limit)
       end
 
-      defp flow_retention_value_lmdb_scan_limit do
-        :ferricstore
-        |> Application.get_env(:flow_lmdb_value_cleanup_scan_limit, 100_000)
-        |> flow_retention_positive_integer(100_000)
+      defp flow_retention_value_lmdb_scan_limit(state) do
+        state
+        |> raft_apply_context()
+        |> Map.fetch!(:flow_lmdb_value_cleanup_scan_limit)
       end
 
       defp flow_event_ms(event_id) when is_binary(event_id) do
@@ -513,6 +513,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
                     deadline_ms,
                     now_ms
                   )
+                  |> flow_bind_governance_limit()
 
                 with {:ok, from_due_score} <- flow_claim_numeric_score(due_score),
                      :ok <- flow_validate_claim_next_record_keys(next) do
@@ -615,6 +616,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
       defp flow_claim_run_state(%{state: flow_state}), do: flow_state
 
+      defp flow_bind_governance_limit(record) when is_map(record) do
+        case Process.get(:sm_flow_governance_limit) do
+          %{reservation_ids: [reservation_id | remaining]} = reservation
+          when is_binary(reservation_id) and reservation_id != "" ->
+            Process.put(:sm_flow_governance_limit, %{reservation | reservation_ids: remaining})
+
+            reservation =
+              reservation
+              |> Map.delete(:reservation_ids)
+              |> Map.put(:reservation_id, reservation_id)
+
+            Map.put(record, :governance_limit, reservation)
+
+          %{scope: scope, shard_id: shard_id} = reservation
+          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
+            Map.put(record, :governance_limit, Map.delete(reservation, :reservation_ids))
+
+          _none ->
+            Map.delete(record, :governance_limit)
+        end
+      end
+
+      defp flow_governance_limit_active? do
+        match?(
+          %{scope: scope, shard_id: shard_id} when is_binary(scope) and is_integer(shard_id),
+          Process.get(:sm_flow_governance_limit)
+        )
+      end
+
       defp flow_claim_plan_pair(
              {:native_claim, next, _entry, _state_key, _value, _previous_history_ms}
            ),
@@ -625,6 +655,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
               _history_entry}
            ),
            do: {next, next}
+
+      defp flow_claim_plan_pair({_child_state, record, next, _attrs, _partition_key, _now_ms}),
+        do: {record, next}
+
+      defp flow_claim_plan_pair(
+             {_child_state, record, next, _attrs, _partition_key, _now_ms, _history_meta}
+           ),
+           do: {record, next}
 
       defp flow_claim_plan_pair({record, next, _from_due_score}), do: {record, next}
       defp flow_claim_plan_pair({record, next, _history_meta, _attrs}), do: {record, next}

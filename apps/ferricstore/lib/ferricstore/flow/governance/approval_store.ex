@@ -4,6 +4,8 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Governance.AtomicRecord
   alias Ferricstore.Flow.Governance.Approval
+  alias Ferricstore.Flow.Governance.ApprovalCatalogRepair
+  alias Ferricstore.Flow.Governance.Catalog
   alias Ferricstore.Flow.Governance.Decision
   alias Ferricstore.Flow.Governance.Telemetry
   alias Ferricstore.Flow.Governance.View
@@ -34,6 +36,7 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
                now_ms: now_ms
              ),
            key = Keys.governance_approval_key(id),
+           :ok <- Catalog.register(ctx, :approval, key),
            set_result <-
              Router.set(ctx, key, encode(approval), %{
                expire_at_ms: 0,
@@ -44,6 +47,7 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
              }) do
         case set_result do
           :ok ->
+            :ok = register_committed_approval(ctx, key, scope, flow_id)
             {:ok, View.public(approval)}
 
           nil ->
@@ -63,6 +67,21 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
 
   def request(_ctx, _id, _opts),
     do: {:error, "ERR flow approval opts must be a keyword list"}
+
+  defp register_committed_approval(ctx, key, scope, flow_id) do
+    [
+      Keys.governance_approval_scope_catalog_key(scope),
+      Keys.governance_approval_flow_catalog_key(flow_id)
+    ]
+    |> Enum.each(fn catalog_key ->
+      case Catalog.register_key(ctx, catalog_key, key) do
+        :ok -> :ok
+        {:error, _reason} -> ApprovalCatalogRepair.mark_dirty(ctx)
+      end
+    end)
+
+    :ok
+  end
 
   def approve(ctx, id, opts \\ []), do: decide(ctx, id, :approve, opts)
   def reject(ctx, id, opts \\ []), do: decide(ctx, id, :reject, opts)
@@ -91,34 +110,128 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
     with {:ok, limit} <- optional_limit(opts),
          {:ok, status} <- optional_status(opts),
          {:ok, scopes} <- optional_scope_filters(opts),
-         {:ok, flow_id} <- optional_filter_binary(opts, :flow_id) do
-      approvals =
-        ctx
-        |> Router.keys()
-        |> Enum.filter(&Keys.governance_approval_key?/1)
-        |> Enum.reduce([], fn key, acc ->
-          case Router.get(ctx, key) do
-            value when is_binary(value) ->
-              case decode(value) do
-                {:ok, approval} -> [View.public(approval) | acc]
-                {:error, _reason} -> acc
-              end
-
-            _other ->
-              acc
-          end
-        end)
-        |> Enum.filter(&matches_status?(&1, status))
-        |> Enum.filter(&matches_scope?(&1, scopes))
-        |> Enum.filter(&matches_binary?(&1, :flow_id, flow_id))
-        |> Enum.sort_by(&Map.get(&1, :requested_at_ms, 0), :desc)
-        |> Enum.take(limit)
-
+         {:ok, flow_id} <- optional_filter_binary(opts, :flow_id),
+         {:ok, approvals} <-
+           collect_list_approvals(ctx, status, scopes, flow_id, limit) do
       {:ok, approvals}
     end
   end
 
   def list(_ctx, _opts), do: {:error, "ERR flow approval opts must be a keyword list"}
+
+  defp collect_list_approvals(ctx, status, scopes, flow_id, limit)
+       when is_binary(flow_id) do
+    collect_approval_catalog(
+      ctx,
+      Keys.governance_approval_flow_catalog_key(flow_id),
+      {:flow, flow_id},
+      status,
+      scopes,
+      flow_id,
+      limit
+    )
+  end
+
+  defp collect_list_approvals(ctx, status, scopes, nil, limit) when is_list(scopes) do
+    scopes
+    |> Enum.reduce_while({:ok, []}, fn scope, {:ok, approvals} ->
+      case collect_approval_catalog(
+             ctx,
+             Keys.governance_approval_scope_catalog_key(scope),
+             {:scope, scope},
+             status,
+             scopes,
+             nil,
+             limit
+           ) do
+        {:ok, page} -> {:cont, {:ok, merge_approval_results(approvals, page, limit)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp collect_list_approvals(ctx, status, nil, nil, limit) do
+    Catalog.collect(
+      ctx,
+      :approval,
+      limit,
+      &load_list_approval(ctx, &1, status, nil, nil),
+      &Map.get(&1, :requested_at_ms, 0),
+      :desc
+    )
+  end
+
+  defp collect_approval_catalog(
+         ctx,
+         catalog_key,
+         exact_filter,
+         status,
+         scopes,
+         flow_id,
+         limit
+       ) do
+    with :ok <-
+           ApprovalCatalogRepair.step(
+             ctx,
+             catalog_key,
+             &approval_catalog_member?(ctx, &1, exact_filter),
+             &approval_catalog_targets(ctx, &1)
+           ) do
+      Catalog.collect_key(
+        ctx,
+        catalog_key,
+        limit,
+        &load_list_approval(ctx, &1, status, scopes, flow_id),
+        &Map.get(&1, :requested_at_ms, 0),
+        :desc
+      )
+    end
+  end
+
+  defp merge_approval_results(left, right, limit) do
+    (left ++ right)
+    |> Enum.uniq_by(&Map.get(&1, :id))
+    |> Enum.sort_by(&Map.get(&1, :requested_at_ms, 0), :desc)
+    |> Enum.take(limit)
+  end
+
+  defp load_list_approval(ctx, key, status, scopes, flow_id) do
+    with value when is_binary(value) <- Router.get(ctx, key),
+         {:ok, approval} <- decode(value),
+         approval = View.public(approval),
+         true <- matches_status?(approval, status),
+         true <- matches_scope?(approval, scopes),
+         true <- matches_binary?(approval, :flow_id, flow_id) do
+      {:ok, approval}
+    else
+      _missing_corrupt_or_filtered -> :skip
+    end
+  end
+
+  defp approval_catalog_member?(ctx, key, {dimension, expected}) do
+    with value when is_binary(value) <- Router.get(ctx, key),
+         {:ok, approval} <- decode(value) do
+      Map.get(approval, dimension_to_field(dimension)) == expected
+    else
+      _missing_or_corrupt -> false
+    end
+  end
+
+  defp approval_catalog_targets(ctx, key) do
+    with value when is_binary(value) <- Router.get(ctx, key),
+         {:ok, approval} <- decode(value) do
+      {:ok,
+       [
+         Keys.governance_approval_scope_catalog_key(approval.scope),
+         Keys.governance_approval_flow_catalog_key(approval.flow_id)
+       ]}
+    else
+      _missing_or_corrupt -> :skip
+    end
+  end
+
+  defp dimension_to_field(:scope), do: :scope
+  defp dimension_to_field(:flow), do: :flow_id
 
   defp decide(ctx, id, action, opts) when is_binary(id) and id != "" and is_list(opts) do
     result =

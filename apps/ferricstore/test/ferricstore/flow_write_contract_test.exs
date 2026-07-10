@@ -1474,23 +1474,28 @@ defmodule Ferricstore.FlowWriteContractTest do
            )
   end
 
-  test "state_meta policy reindex is bounded and deterministic during Raft apply" do
+  test "state_meta policy reindex enqueues durable bounded migration work" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    reindex_source =
-      Ferricstore.Test.SourceFiles.private_function_source!(
-        source,
-        "flow_state_keys_for_policy_reindex"
-      )
+    migration_source =
+      __DIR__
+      |> Path.join("../../lib/ferricstore/raft/state_machine/sections/flow_policy_migration.ex")
+      |> Path.expand()
+      |> File.read!()
 
-    refute reindex_source =~ ":ets.foldl",
-           "policy changes must not perform an unbounded keydir fold inside Raft apply"
+    planner_source =
+      __DIR__
+      |> Path.join("../../lib/ferricstore/flow/policy_migration.ex")
+      |> Path.expand()
+      |> File.read!()
 
-    assert reindex_source =~ "@flow_policy_reindex_max_keydir_entries"
-    assert reindex_source =~ ":ets.select"
-    assert reindex_source =~ "FlowKeys.registry_key?"
-    assert reindex_source =~ "Enum.sort"
-    assert reindex_source =~ "{:error,"
+    refute source =~ "flow_state_keys_for_policy_reindex"
+    refute source =~ "@flow_policy_reindex_max_keydir_entries"
+    assert source =~ "flow_enqueue_policy_migration"
+    assert planner_source =~ "limit + 1"
+    assert migration_source =~ "PolicyMigration.encode_catalog"
+    assert migration_source =~ "flow_policy_migration_maybe_finish_job"
+    refute migration_source =~ ":ets.foldl"
   end
 
   test "Flow policy updates commit all shard copies in one fatal cross-shard transaction" do
@@ -1509,14 +1514,14 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert policy_put_source =~ "flow_policy_put_all_command"
     assert router_source =~ "{:cross_shard_tx, shard_batches}"
     assert router_source =~ "|> Map.keys()"
-
-    assert state_machine_source =~
-             "{:flow_cross_policy_put, shard_index, key, value, expire_at_ms}"
+    assert router_source =~ "entry = {:flow_cross_policy_put"
+    refute router_source =~ "flow_policy_generation_v2"
+    refute router_source =~ "flow_cross_policy_put_v2"
+    refute state_machine_source =~ "flow_cross_policy_put_v2"
 
     assert state_machine_source =~ "%{shard_index: shard_index}"
 
-    assert state_machine_source =~
-             "{:flow_cross_policy_put, _shard_index, _key, _value, _expire_at_ms}"
+    assert state_machine_source =~ "validate_cross_shard_policy_target_sets"
   end
 
   defp create_many_and_claim(partition, ids, type, now_ms) do

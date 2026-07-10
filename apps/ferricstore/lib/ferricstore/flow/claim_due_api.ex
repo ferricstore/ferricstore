@@ -77,7 +77,17 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
          {:ok, named_values} <- named_value_return_opts(opts),
          {:ok, reclaim_expired?} <- optional_boolean(opts, :reclaim_expired, true),
          {:ok, reclaim_ratio} <- optional_reclaim_ratio(opts),
-         {:ok, governance_limit} <- optional_governance_limit(opts, limit, now),
+         {:ok, governance_limit} <-
+           optional_governance_limit(
+             ctx,
+             type,
+             state,
+             worker,
+             opts,
+             limit,
+             lease_ms,
+             now
+           ),
          {:ok, partition_key, partition_keys} <- optional_claim_partitions(opts),
          :ok <- validate_claim_due_keys(type, state, priority, partition_keys || partition_key) do
       attrs =
@@ -345,16 +355,27 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
          attrs,
          reclaim_expired?,
          reclaim_ratio,
-         %{scope: scope, shard_id: shard_id, amount: amount, now_ms: now_ms}
+         %{now_ms: now_ms} = governance_limit
        ) do
-    case Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
-           shard_id: shard_id,
-           amount: amount,
-           now_ms: now_ms
-         ) do
-      {:ok, _spent} ->
-        result = router_result(ctx, attrs, reclaim_expired?, reclaim_ratio)
-        release_unused_claim_limit(ctx, scope, shard_id, amount, result)
+    case spend_governance_limit(ctx, governance_limit) do
+      {:ok, spent} ->
+        governance_limit = put_spent_reservation_ids(governance_limit, spent)
+
+        governed_attrs =
+          attrs
+          |> Map.put(:now_ms, now_ms)
+          |> Map.put(
+            :governance_limit,
+            Map.take(governance_limit, [
+              :scope,
+              :shard_id,
+              :enforcement,
+              :reservation_ids
+            ])
+          )
+
+        result = router_result(ctx, governed_attrs, reclaim_expired?, reclaim_ratio)
+        release_unused_claim_limit(ctx, governance_limit, result)
         result
 
       {:error, _reason} = error ->
@@ -365,6 +386,54 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
         end
     end
   end
+
+  defp spend_governance_limit(ctx, governance_limit) do
+    case do_spend_governance_limit(ctx, governance_limit) do
+      {:error, _reason} when governance_limit.auto_lease? ->
+        with {:ok, _lease} <- lease_governance_limit(ctx, governance_limit) do
+          do_spend_governance_limit(ctx, governance_limit)
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp do_spend_governance_limit(ctx, governance_limit) do
+    backend = governance_limit_backend(governance_limit.enforcement)
+
+    opts = [
+      shard_id: governance_limit.shard_id,
+      amount: governance_limit.amount,
+      now_ms: governance_limit.now_ms,
+      ttl_ms: governance_limit.ttl_ms
+    ]
+
+    backend.spend(
+      ctx,
+      governance_limit.scope,
+      maybe_put_limit_configuration(opts, governance_limit)
+    )
+  end
+
+  defp lease_governance_limit(ctx, governance_limit) do
+    opts = [
+      shard_id: governance_limit.shard_id,
+      amount: max(governance_limit.amount, governance_limit.lease_size),
+      limit: governance_limit.limit,
+      ttl_ms: governance_limit.ttl_ms,
+      now_ms: governance_limit.now_ms
+    ]
+
+    opts = maybe_put_limit_configuration(opts, governance_limit)
+    Ferricstore.Flow.Governance.LimitStore.lease(ctx, governance_limit.scope, opts)
+  end
+
+  defp governance_limit_backend(:strict_global),
+    do: Ferricstore.Flow.Governance.LimitStore
+
+  defp governance_limit_backend(:approximate_global),
+    do: Ferricstore.Flow.Governance.LimitCache
 
   defp governed_claim_definitely_empty?(
          ctx,
@@ -402,23 +471,63 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
 
   defp governed_claim_definitely_empty?(_ctx, _attrs, _reclaim_expired?, _ratio), do: false
 
-  defp release_unused_claim_limit(ctx, scope, shard_id, amount, {:ok, records})
-       when is_list(records) do
-    unused = amount - length(records)
+  defp release_unused_claim_limit(ctx, governance_limit, result)
+       when is_map(governance_limit) do
+    reservation_ids = Map.get(governance_limit, :reservation_ids, [])
+    release_ids = governance_release_ids(result, reservation_ids)
 
-    if unused > 0 do
-      Ferricstore.Flow.Governance.LimitCache.release(ctx, scope,
-        shard_id: shard_id,
-        amount: unused
+    if release_ids != [] do
+      release_opts = [
+        shard_id: governance_limit.shard_id,
+        amount: length(release_ids),
+        reservation_ids: release_ids,
+        now_ms: governance_limit.now_ms
+      ]
+
+      governance_limit_backend(governance_limit.enforcement).release(
+        ctx,
+        governance_limit.scope,
+        release_opts
       )
     end
   end
 
-  defp release_unused_claim_limit(ctx, scope, shard_id, amount, {:error, _reason}) do
-    Ferricstore.Flow.Governance.LimitCache.release(ctx, scope, shard_id: shard_id, amount: amount)
+  defp release_unused_claim_limit(_ctx, _governance_limit, _result), do: :ok
+
+  @doc false
+  def governance_release_ids({:error, {:timeout, :unknown_outcome}}, reservation_ids)
+      when is_list(reservation_ids),
+      do: []
+
+  def governance_release_ids({:error, _reason}, reservation_ids) when is_list(reservation_ids),
+    do: reservation_ids
+
+  def governance_release_ids({:ok, records}, reservation_ids)
+      when is_list(records) and is_list(reservation_ids) do
+    used =
+      records
+      |> Enum.reduce(MapSet.new(), fn record, acc ->
+        case get_in(record, [:governance_limit, :reservation_id]) do
+          reservation_id when is_binary(reservation_id) -> MapSet.put(acc, reservation_id)
+          _missing -> acc
+        end
+      end)
+
+    Enum.reject(reservation_ids, &MapSet.member?(used, &1))
   end
 
-  defp release_unused_claim_limit(_ctx, _scope, _shard_id, _amount, _result), do: :ok
+  def governance_release_ids(_result, _reservation_ids), do: []
+
+  defp put_spent_reservation_ids(governance_limit, %{reservation_ids: reservation_ids})
+       when is_list(reservation_ids) do
+    if length(reservation_ids) == governance_limit.amount do
+      Map.put(governance_limit, :reservation_ids, reservation_ids)
+    else
+      governance_limit
+    end
+  end
+
+  defp put_spent_reservation_ids(governance_limit, _spent), do: governance_limit
 
   defp router_maybe(_ctx, nil), do: {:ok, []}
   defp router_maybe(_ctx, %{limit: limit}) when limit <= 0, do: {:ok, []}
@@ -513,26 +622,150 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
     end
   end
 
-  defp optional_governance_limit(opts, limit, now_ms) do
+  defp optional_governance_limit(ctx, type, state, worker, opts, limit, lease_ms, now_ms) do
     scope = Keyword.get(opts, :governance_limit_scope)
     shard_id = Keyword.get(opts, :governance_shard_id)
+    now_ms = now_ms || Ferricstore.CommandTime.now_ms()
 
     cond do
       is_nil(scope) and is_nil(shard_id) ->
-        {:ok, nil}
+        policy_governance_limit(ctx, type, state, worker, limit, lease_ms, now_ms)
 
-      is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
+      is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+          shard_id < ctx.shard_count ->
         {:ok,
          %{
            scope: scope,
            shard_id: shard_id,
            amount: limit,
-           now_ms: now_ms || Ferricstore.CommandTime.now_ms()
+           now_ms: now_ms,
+           ttl_ms: lease_ms,
+           enforcement: :approximate_global,
+           auto_lease?: false,
+           lease_size: limit,
+           limit: limit
          }}
+
+      is_binary(scope) and scope != "" and is_integer(shard_id) ->
+        {:error, "ERR flow governance_shard_id is outside the instance shard range"}
 
       true ->
         {:error,
          "ERR flow governance_limit_scope and governance_shard_id must be provided together"}
+    end
+  end
+
+  defp policy_governance_limit(ctx, type, state, worker, amount, lease_ms, now_ms) do
+    with {:ok, {policy_generation, policy}} <- Ferricstore.Flow.Policy.raw_entry(ctx, type) do
+      case resolved_running_limit(policy, state, amount) do
+        %{limit: limit} = rule when is_integer(limit) and limit >= 0 ->
+          enforcement = Map.get(rule, :enforcement, :strict_global)
+          lease_size = Map.get(rule, :lease_size, amount)
+
+          {:ok,
+           %{
+             scope: running_limit_scope(type),
+             shard_id: :erlang.phash2(worker, ctx.shard_count),
+             amount: amount,
+             now_ms: now_ms,
+             ttl_ms: lease_ms,
+             enforcement: enforcement,
+             auto_lease?: true,
+             lease_size: lease_size,
+             limit: limit,
+             config_version: policy_config_version(policy_generation, policy),
+             policy_version: Map.get(policy || %{}, :version)
+           }}
+
+        _no_running_limit ->
+          {:ok, nil}
+      end
+    end
+  end
+
+  defp resolved_running_limit(policy, state_filter, amount) do
+    policy
+    |> governance_policy_states(state_filter)
+    |> Enum.reduce([], fn state, rules ->
+      case policy
+           |> Ferricstore.Flow.Governance.Policy.resolve(state)
+           |> get_in([:limits, "running"]) do
+        %{limit: limit} = rule when is_integer(limit) and limit >= 0 -> [rule | rules]
+        _no_running_limit -> rules
+      end
+    end)
+    |> aggregate_running_limits(amount)
+  end
+
+  defp governance_policy_states(policy, :any) do
+    configured_states =
+      case policy do
+        %{states: states} when is_map(states) -> Map.keys(states)
+        _none -> []
+      end
+
+    [nil | configured_states]
+  end
+
+  defp governance_policy_states(_policy, states) when is_list(states), do: Enum.uniq(states)
+  defp governance_policy_states(_policy, state) when is_binary(state), do: [state]
+  defp governance_policy_states(_policy, _state_filter), do: [nil]
+
+  defp aggregate_running_limits([], _amount), do: nil
+
+  defp aggregate_running_limits(rules, amount) do
+    %{
+      limit: rules |> Enum.map(&Map.fetch!(&1, :limit)) |> Enum.min(),
+      lease_size:
+        rules
+        |> Enum.map(&Map.get(&1, :lease_size, amount))
+        |> Enum.min(),
+      enforcement:
+        if(Enum.any?(rules, &(Map.get(&1, :enforcement, :strict_global) == :strict_global)),
+          do: :strict_global,
+          else: :approximate_global
+        )
+    }
+  end
+
+  defp running_limit_scope(type) do
+    digest = :sha256 |> :crypto.hash(type) |> Base.url_encode64(padding: false)
+    "flow-running:" <> digest
+  end
+
+  defp policy_config_version(generation, _policy) when is_integer(generation) and generation > 0,
+    do: generation
+
+  defp policy_config_version(0, %{version: version})
+       when is_integer(version) and version >= 0,
+       do: version
+
+  defp policy_config_version(_generation, _policy), do: nil
+
+  defp maybe_put_limit_configuration(opts, governance_limit) do
+    opts =
+      case Map.get(governance_limit, :config_version) do
+        version when is_integer(version) and version >= 0 ->
+          opts
+          |> Keyword.put(:limit, governance_limit.limit)
+          |> Keyword.put(:config_version, version)
+
+        _missing ->
+          opts
+      end
+
+    case {Keyword.has_key?(opts, :limit), Map.get(governance_limit, :policy_version)} do
+      {false, _version} ->
+        opts
+
+      {true, version} when is_integer(version) and version >= 0 ->
+        Keyword.put(opts, :policy_version, version)
+
+      {true, version} when is_binary(version) and version != "" ->
+        Keyword.put(opts, :policy_version, version)
+
+      {_has_limit, _missing} ->
+        opts
     end
   end
 

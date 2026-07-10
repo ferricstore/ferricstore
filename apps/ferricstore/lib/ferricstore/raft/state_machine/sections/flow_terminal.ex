@@ -66,7 +66,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
                            now_ms,
                            attrs
                          ) do
-                    flow_apply_child_terminal_chain(state, next, "completed", now_ms)
+                    with :ok <- flow_apply_child_terminal_chain(state, next, "completed", now_ms) do
+                      flow_governance_release_result(record)
+                    end
                   end
 
                 {:error, _reason} = error ->
@@ -102,7 +104,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
                        now_ms,
                        attrs
                      ) do
-                flow_apply_child_terminal_chain(state, next, "failed", now_ms)
+                with :ok <- flow_apply_child_terminal_chain(state, next, "failed", now_ms) do
+                  flow_governance_release_result(record)
+                end
               end
 
             {:error, _reason} = error ->
@@ -132,7 +136,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
                        history_meta,
                        attrs
                      ) do
-                flow_maybe_apply_cross_terminal_chain(state, next, now_ms)
+                with :ok <- flow_maybe_apply_cross_terminal_chain(state, next, now_ms) do
+                  flow_governance_release_result(record)
+                end
               end
 
             {:error, _reason} = error ->
@@ -151,7 +157,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
              :ok <-
                flow_apply_cancel_local(child_state, record, next, attrs, partition_key, now_ms),
              :ok <- flow_apply_child_terminal_chain(state, next, "cancelled", now_ms) do
-          :ok
+          flow_governance_release_result(record)
         end
       end
 
@@ -160,7 +166,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         with :ok <- flow_transition_many_unique?(attrs_list),
              {:ok, plans} <- flow_cross_terminal_many_prepare(state, op, attrs_list),
              :ok <- flow_cross_terminal_many_apply(state, op, plans) do
-          :ok
+          flow_governance_release_results(plans)
         end
       end
 
@@ -169,7 +175,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         with :ok <- flow_transition_many_unique?(attrs_list),
              {:ok, plans} <- flow_cross_terminal_many_prepare(state, op, attrs_list),
              :ok <- flow_cross_terminal_many_apply(state, op, plans) do
-          :ok
+          flow_governance_release_results(plans)
         end
       end
 

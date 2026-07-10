@@ -898,6 +898,68 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
 
         refute File.exists?(Path.join(handle.root_dir, "snapshot_install.term"))
       end
+
+      @tag :empty_snapshot_apply_context
+      test "empty snapshots persist and install the backend apply context", %{
+        root: root,
+        ctx: ctx
+      } do
+        persisted_context =
+          Ferricstore.Raft.ApplyContext.new(flow_default_history_max_events: 23)
+
+        local_context =
+          Ferricstore.Raft.ApplyContext.new(flow_default_history_max_events: 99)
+
+        snapshot_ctx = %{ctx | apply_context: persisted_context}
+        install_ctx = %{ctx | apply_context: local_context}
+        table = :ferricstore_empty_snapshot_apply_context_test
+        context_key = {{WARaftBackend, :context}, table}
+        previous_context = :persistent_term.get(context_key, :missing)
+
+        :persistent_term.put(context_key, snapshot_ctx)
+
+        on_exit(fn ->
+          case previous_context do
+            :missing -> :persistent_term.erase(context_key)
+            previous -> :persistent_term.put(context_key, previous)
+          end
+        end)
+
+        snapshot_path = Path.join(root, "empty-snapshot-with-apply-context")
+        position = {:raft_log_pos, 0, 0}
+
+        assert :ok =
+                 WARaftStorage.make_empty_snapshot(
+                   %{table: table},
+                   snapshot_path,
+                   position,
+                   %{},
+                   nil
+                 )
+
+        metadata =
+          snapshot_path
+          |> Path.join("ferricstore_snapshot.term")
+          |> File.read!()
+          |> :erlang.binary_to_term([:safe])
+
+        assert metadata.apply_context == persisted_context
+
+        handle = %{
+          ctx: install_ctx,
+          shard_index: 0,
+          root_dir: Path.join([root, "waraft", "ferricstore_waraft_backend.1"]),
+          sm_state: nil,
+          position: position,
+          label: nil,
+          config: nil
+        }
+
+        assert {:ok, new_handle} =
+                 WARaftStorage.open_snapshot(snapshot_path, position, handle)
+
+        assert new_handle.sm_state.apply_context == persisted_context
+      end
     end
   end
 end

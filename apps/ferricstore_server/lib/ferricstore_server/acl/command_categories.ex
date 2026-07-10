@@ -1,7 +1,7 @@
 defmodule FerricstoreServer.Acl.CommandCategories do
   @moduledoc false
 
-  alias Ferricstore.Commands.Extension
+  alias Ferricstore.Commands.{Extension, KeyDiscovery}
 
   @string_read ~w(GET MGET GETRANGE STRLEN)
   @string_write ~w(
@@ -161,21 +161,6 @@ defmodule FerricstoreServer.Acl.CommandCategories do
                       @flow_write ++ @generic_write ++ @native_write
                   )
 
-  @read_key_commands MapSet.new(
-                       @read_commands
-                       |> MapSet.to_list()
-                       |> Kernel.--(~w(DBSIZE KEYS RANDOMKEY SCAN))
-                     )
-                     |> MapSet.put("WATCH")
-
-  @write_key_commands MapSet.new(@write_commands)
-
-  @read_write_key_commands MapSet.new(~w(
-                               GETSET GETDEL GETEX HGETDEL HGETEX CAS
-                               LPOP RPOP BLPOP BRPOP BLMPOP SPOP ZPOPMIN ZPOPMAX
-                               XREADGROUP
-                             ))
-
   @category_map %{
     "READ" => @read_commands,
     "WRITE" => @write_commands,
@@ -248,17 +233,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     do: MapSet.union(Map.fetch!(@category_map, "ALL"), extension_commands())
 
   @spec command_access_type(binary()) :: :read | :write | :rw
-  def command_access_type(cmd) when is_binary(cmd) do
-    cmd = String.upcase(cmd)
-
-    cond do
-      MapSet.member?(@read_write_key_commands, cmd) -> :rw
-      MapSet.member?(@read_key_commands, cmd) -> :read
-      MapSet.member?(@write_key_commands, cmd) -> :write
-      access = Extension.non_shadowing_command_access_type(cmd) -> access
-      true -> :rw
-    end
-  end
+  def command_access_type(cmd) when is_binary(cmd), do: KeyDiscovery.command_access_type(cmd)
 
   defp extension_commands do
     Extension.non_shadowing_command_names_upper()

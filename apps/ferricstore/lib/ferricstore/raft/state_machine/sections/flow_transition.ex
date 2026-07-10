@@ -946,7 +946,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
               :ok
 
             {:ok, record, next, history_meta} ->
-              flow_apply_retry(state, record, next, partition_key, now_ms, history_meta, attrs)
+              case flow_apply_retry(
+                     state,
+                     record,
+                     next,
+                     partition_key,
+                     now_ms,
+                     history_meta,
+                     attrs
+                   ) do
+                :ok -> flow_governance_release_result(record)
+                {:error, _reason} = error -> error
+              end
 
             {:error, _reason} = error ->
               error
@@ -961,7 +972,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
              {:ok, plans, has_record_values?, has_after_terminal?} <-
                flow_retry_many_prepare(state, attrs_list),
              :ok <- flow_retry_many_apply(state, plans, has_record_values?, has_after_terminal?) do
-          :ok
+          flow_governance_release_results(plans)
         end
       end
 
@@ -1193,7 +1204,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
 
             {:ok, record, next} ->
               next = flow_refresh_indexed_attributes(state, next)
-              flow_apply_fail(state, record, next, partition_key, now_ms, attrs)
+
+              case flow_apply_fail(state, record, next, partition_key, now_ms, attrs) do
+                :ok -> flow_governance_release_result(record)
+                {:error, _reason} = error -> error
+              end
 
             {:error, _reason} = error ->
               error
@@ -1208,7 +1223,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
              {:ok, plans, has_record_values?, has_after_terminal?} <-
                flow_fail_many_prepare(state, attrs_list),
              :ok <- flow_fail_many_apply(state, plans, has_record_values?, has_after_terminal?) do
-          :ok
+          flow_governance_release_results(plans)
         end
       end
 
@@ -1346,7 +1361,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
              {:ok, record, next} <- flow_prepare_cancel_existing_record(record, attrs, now_ms),
              next = flow_refresh_indexed_attributes(state, next),
              :ok <- flow_apply_cancel(state, record, next, attrs, partition_key, now_ms) do
-          :ok
+          flow_governance_release_result(record)
         end
       end
 
@@ -1357,7 +1372,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
              {:ok, plans, has_record_values?, has_after_terminal?} <-
                flow_cancel_many_prepare(state, attrs_list),
              :ok <- flow_cancel_many_apply(state, plans, has_record_values?, has_after_terminal?) do
-          :ok
+          flow_governance_release_results(plans)
         end
       end
 

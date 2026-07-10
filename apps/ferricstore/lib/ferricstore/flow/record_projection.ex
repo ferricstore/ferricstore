@@ -26,7 +26,9 @@ defmodule Ferricstore.Flow.RecordProjection do
     :state_meta
   ]
 
-  def public(record) when is_map(record), do: Map.delete(record, :state_enter_seq)
+  def public(record) when is_map(record),
+    do: Map.drop(record, [:state_enter_seq, :governance_limit])
+
   def public(record), do: record
 
   def public_result({:ok, record}) when is_map(record), do: {:ok, public(record)}

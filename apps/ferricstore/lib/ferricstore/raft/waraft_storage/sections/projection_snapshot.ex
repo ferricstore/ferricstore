@@ -295,6 +295,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
               position: handle.position,
               label: handle.label,
               config: handle.config,
+              apply_context: storage_apply_context(handle),
               payload_dirs: snapshot_payload_kinds(),
               empty_payload_dirs: empty_payload_dirs,
               storage_payload_dirs: snapshot_storage_payload_kinds(),
@@ -487,6 +488,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
            when is_map(metadata) do
         with :ok <- validate_raft_position(position),
              :ok <- validate_storage_config(config),
+             :ok <- validate_apply_context_metadata(metadata),
              :ok <- validate_snapshot_payload_metadata(metadata) do
           {:ok, metadata}
         else
@@ -497,6 +499,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
       defp validate_snapshot_metadata(%{position: position} = metadata) when is_map(metadata) do
         validation =
           with :ok <- validate_raft_position(position),
+               :ok <- validate_apply_context_metadata(metadata),
                :ok <- validate_snapshot_payload_metadata(metadata) do
             :ok
           end

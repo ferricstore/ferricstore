@@ -12,6 +12,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   @record_state_meta_key "__state_meta__"
   @record_indexed_state_meta_key "__indexed_state_meta__"
   @record_state_enter_seq_key "__state_enter_seq__"
+  @record_governance_limit_key "__governance_limit__"
   @history_value_refs_key "value_refs"
   @history_attributes_key "attributes"
   @history_state_meta_key "state_meta"
@@ -257,10 +258,11 @@ defmodule Ferricstore.Flow.Codec.Support do
     state_meta = Ferricstore.Flow.StateMeta.record(record)
     indexed_state_meta = Ferricstore.Flow.StateMeta.indexed_key(record)
     state_enter_seq = Map.get(record, :state_enter_seq)
+    governance_limit = encode_governance_limit(Map.get(record, :governance_limit))
 
     if map_size(refs) == 0 and map_size(attributes) == 0 and indexed_attributes == [] and
          map_size(state_meta) == 0 and is_nil(indexed_state_meta) and
-         not is_integer(state_enter_seq) do
+         not is_integer(state_enter_seq) and is_nil(governance_limit) do
       encode_child_groups(child_groups)
     else
       child_groups
@@ -270,6 +272,7 @@ defmodule Ferricstore.Flow.Codec.Support do
       |> maybe_put_record_state_meta(state_meta)
       |> maybe_put_record_indexed_state_meta(indexed_state_meta)
       |> maybe_put_record_state_enter_seq(state_enter_seq)
+      |> maybe_put_record_governance_limit(governance_limit)
       |> encode_child_groups()
     end
   end
@@ -294,15 +297,18 @@ defmodule Ferricstore.Flow.Codec.Support do
     {state_enter_seq, child_groups} =
       Map.pop(child_groups, @record_state_enter_seq_key, nil)
 
+    {governance_limit, child_groups} =
+      Map.pop(child_groups, @record_governance_limit_key, nil)
+
     {child_groups, decode_value_refs(encoded_refs),
      Ferricstore.Flow.Attributes.decode_sidecar(encoded_attributes),
      decode_record_indexed_attributes(indexed_attributes),
      Ferricstore.Flow.StateMeta.decode_sidecar(encoded_state_meta),
      decode_record_indexed_state_meta(indexed_state_meta),
-     decode_record_state_enter_seq(state_enter_seq)}
+     decode_record_state_enter_seq(state_enter_seq), decode_governance_limit(governance_limit)}
   end
 
-  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, [], %{}, nil, nil}
+  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, [], %{}, nil, nil, nil}
 
   def maybe_put_record_refs(groups, refs) when is_map(refs) and map_size(refs) > 0,
     do: Map.put(groups, @record_value_refs_key, encode_value_refs(refs))
@@ -339,6 +345,56 @@ defmodule Ferricstore.Flow.Codec.Support do
     do: Map.put(groups, @record_state_enter_seq_key, seq)
 
   def maybe_put_record_state_enter_seq(groups, _seq), do: groups
+
+  def maybe_put_record_governance_limit(groups, limit) when is_map(limit),
+    do: Map.put(groups, @record_governance_limit_key, limit)
+
+  def maybe_put_record_governance_limit(groups, _limit), do: groups
+
+  def encode_governance_limit(%{scope: scope, shard_id: shard_id} = limit)
+      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 do
+    encoded = %{"scope" => scope, "shard_id" => shard_id}
+
+    case Map.get(limit, :enforcement) do
+      enforcement when enforcement in [:strict_global, :approximate_global] ->
+        encoded
+        |> Map.put("enforcement", Atom.to_string(enforcement))
+        |> maybe_put_governance_reservation_id(Map.get(limit, :reservation_id))
+
+      _none ->
+        maybe_put_governance_reservation_id(encoded, Map.get(limit, :reservation_id))
+    end
+  end
+
+  def encode_governance_limit(_limit), do: nil
+
+  def decode_governance_limit(%{"scope" => scope, "shard_id" => shard_id} = limit)
+      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 do
+    decoded = %{scope: scope, shard_id: shard_id}
+
+    decoded =
+      case Map.get(limit, "enforcement") do
+        "strict_global" -> Map.put(decoded, :enforcement, :strict_global)
+        "approximate_global" -> Map.put(decoded, :enforcement, :approximate_global)
+        _none -> decoded
+      end
+
+    case Map.get(limit, "reservation_id") do
+      reservation_id when is_binary(reservation_id) and reservation_id != "" ->
+        Map.put(decoded, :reservation_id, reservation_id)
+
+      _none ->
+        decoded
+    end
+  end
+
+  def decode_governance_limit(_limit), do: nil
+
+  defp maybe_put_governance_reservation_id(encoded, reservation_id)
+       when is_binary(reservation_id) and reservation_id != "",
+       do: Map.put(encoded, "reservation_id", reservation_id)
+
+  defp maybe_put_governance_reservation_id(encoded, _reservation_id), do: encoded
 
   def decode_record_indexed_attributes(names) do
     case Ferricstore.Flow.Attributes.normalize_indexed_names(names) do

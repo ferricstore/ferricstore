@@ -10,6 +10,9 @@ All notable changes to FerricStore will be documented here.
 - Hardened native and health-server request handling with bounded decode/output work, HTTP framing and deadlines, CSRF/session checks, login throttling, and dashboard ACL redaction.
 - Reserved internal Flow storage keys across public command, pipeline, transaction, embedded, and dashboard paths, and made shared-reference/retention backfills bounded, resumable, and fail-closed across destructive resets.
 - Made Flow policy fan-out failure-atomic with bounded deterministic hot-record reindexing, repaired WARaft cold-row compensation, and routed ACL mutations through replicated invalidating paths with bounded protected-mode and load checks.
+- Added monotonic internal Flow policy generations and command-captured policy snapshots so policy-sensitive work remains deterministic across independently ordered Raft groups without replacing public policy versions.
+- Replaced synchronous Flow policy reindex scans with a durable exact-type catalog, bounded resumable catalog backfill, and replicated migration plans whose explicit candidates are safe to replay on every replica.
+- Added a shared prepared-command contract for parsing, ACL keys, routing keys, and read/write footprints, and moved Flow apply limits into a compact replicated context persisted with WARaft recovery metadata.
 
 ## 0.7.4 - 2026-07-07
 

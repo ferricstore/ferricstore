@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
   alias FerricstoreServer.Acl
   alias FerricstoreServer.AuthRateLimiter
+  alias Ferricstore.Commands.PreparedCommand
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Commands
@@ -12,11 +13,13 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_hello 0x0001
   @op_auth 0x0002
   @op_route 0x0006
+  @op_route_batch 0x000F
   @op_shards 0x0007
   @op_options 0x000B
   @op_pipeline 0x000E
   @op_command_exec 0x0100
   @op_set 0x0102
+  @op_hset 0x0110
   @op_flow_create 0x0201
   @op_flow_get 0x0202
   @op_flow_claim_due 0x0203
@@ -89,6 +92,36 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     def handle("EXT.CONTEXT", [], store),
       do: {:ok, Ferricstore.Commands.Extension.request_context(store)}
+  end
+
+  defmodule CountingKeyExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "EXT.COUNTED",
+          arity: 2,
+          flags: ["readonly"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :read,
+          summary: "Counts key discovery calls"
+        }
+      ]
+    end
+
+    @impl true
+    def keys("EXT.COUNTED", [key]) do
+      counter_key = {__MODULE__, :key_discovery_calls}
+      Process.put(counter_key, Process.get(counter_key, 0) + 1)
+      {:ok, [key]}
+    end
+
+    @impl true
+    def handle("EXT.COUNTED", [key], _store), do: {:ok, key}
   end
 
   setup do
@@ -766,6 +799,133 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload =~ "ext.write"
   end
 
+  test "COMMAND_EXEC prepares extension key metadata once" do
+    Application.put_env(:ferricstore, :command_extensions, [CountingKeyExtension])
+    counter_key = {CountingKeyExtension, :key_discovery_calls}
+    Process.delete(counter_key)
+
+    assert {:ok, "tenant:one", _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "EXT.COUNTED", "args" => ["tenant:one"]},
+               state()
+             )
+
+    assert Process.get(counter_key) == 1
+  after
+    Process.delete({CountingKeyExtension, :key_discovery_calls})
+  end
+
+  test "same_shard pipeline validates COMMAND_EXEC routing keys" do
+    ctx = FerricStore.Instance.get(:default)
+    first = "prepared:pipeline:one"
+    first_shard = Ferricstore.Store.Router.shard_for(ctx, first)
+
+    second =
+      Enum.find_value(2..1_000, fn suffix ->
+        candidate = "prepared:pipeline:#{suffix}"
+
+        if Ferricstore.Store.Router.shard_for(ctx, candidate) != first_shard,
+          do: candidate
+      end)
+
+    assert is_binary(second)
+
+    assert {:bad_request, message, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "atomicity" => "same_shard",
+                 "commands" => [
+                   %{
+                     "opcode" => @op_command_exec,
+                     "request_id" => 1,
+                     "body" => %{"command" => "MGET", "args" => [first, second]}
+                   }
+                 ]
+               },
+               state()
+             )
+
+    assert message =~ "multiple shards"
+  end
+
+  @tag :prepared_flow_routing
+  test "same_shard pipeline rejects coordinated COMMAND_EXEC Flow routing" do
+    type = "prepared-flow-routing-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert {:bad_request, message, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "atomicity" => "same_shard",
+                 "commands" => [
+                   %{
+                     "opcode" => @op_command_exec,
+                     "request_id" => 1,
+                     "body" => %{
+                       "command" => "FLOW.POLICY.GET",
+                       "args" => [type]
+                     }
+                   }
+                 ]
+               },
+               state()
+             )
+
+    assert message =~ "coordinated"
+
+    assert {:bad_request, native_message, _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{
+                 "atomicity" => "same_shard",
+                 "commands" => [
+                   %{
+                     "opcode" => @op_flow_policy_set,
+                     "request_id" => 2,
+                     "body" => %{
+                       "type" => type,
+                       "indexed_attributes" => ["tenant"]
+                     }
+                   }
+                 ]
+               },
+               state()
+             )
+
+    assert native_message =~ "coordinated"
+  end
+
+  @tag :prepared_multi_routing
+  test "same_shard pipeline rejects global data mutations and keyspace reads" do
+    for {command, args} <- [
+          {"FLUSHDB", []},
+          {"DBSIZE", []},
+          {"KEYS", ["*"]},
+          {"RANDOMKEY", []},
+          {"SCAN", ["0"]}
+        ] do
+      assert {:bad_request, message, _state} =
+               Commands.execute(
+                 @op_pipeline,
+                 %{
+                   "atomicity" => "same_shard",
+                   "commands" => [
+                     %{
+                       "opcode" => @op_command_exec,
+                       "request_id" => 1,
+                       "body" => %{"command" => command, "args" => args}
+                     }
+                   ]
+                 },
+                 state()
+               )
+
+      assert message =~ "coordinated"
+    end
+  end
+
   test "COMMAND_EXEC authorizes ACL subcommands before dispatch" do
     assert :ok = Acl.set_user("operator", ["on", "nopass", "+@all", "-acl|setuser", "~*"])
 
@@ -902,6 +1062,58 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert payload =~ "keys mentioned"
+  end
+
+  test "typed command ACLs preserve read-modify-write and routing access" do
+    assert :ok =
+             Acl.set_user("native-write-only", [
+               "on",
+               "nopass",
+               "+@all",
+               "%W~secret:*"
+             ])
+
+    write_only = state_as("native-write-only")
+
+    assert {:ok, "OK", _state} =
+             Commands.execute(
+               @op_set,
+               %{"key" => "secret:key", "value" => "initial"},
+               write_only
+             )
+
+    assert {:noperm, _message, _state} =
+             Commands.execute(
+               @op_set,
+               %{"key" => "secret:key", "value" => "replacement", "get" => true},
+               write_only
+             )
+
+    assert {:noperm, _message, _state} =
+             Commands.execute(
+               @op_hset,
+               %{"key" => "secret:hash", "fields" => %{"field" => "value"}},
+               write_only
+             )
+
+    assert :ok =
+             Acl.set_user("native-route-reader", [
+               "on",
+               "nopass",
+               "+@all",
+               "%R~route:*"
+             ])
+
+    route_reader = state_as("native-route-reader")
+
+    assert {status, _payload, _state} =
+             Commands.execute(
+               @op_route_batch,
+               %{"keys" => ["route:one", "route:two"]},
+               route_reader
+             )
+
+    refute status == :noperm
   end
 
   test "FLOW.SEARCH enforces scoped key boundaries" do
@@ -1394,6 +1606,90 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert queued_state.multi_queue_count == 1
+
+    assert [%PreparedCommand{command: "SET", write_keys: ["tenant:a:key"]}] =
+             queued_state.multi_queue
+
+    assert {:ok, ["OK"], executed_state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, queued_state)
+
+    assert executed_state.multi_state == :none
+    assert executed_state.multi_queue == []
+  end
+
+  @tag :prepared_multi_routing
+  test "native MULTI retains prepared multi-key routing through EXEC" do
+    ctx = FerricStore.Instance.get(:default)
+    first = "native-multi-routing:#{System.unique_integer([:positive, :monotonic])}:one"
+    first_idx = Ferricstore.Store.Router.shard_for(ctx, first)
+
+    second =
+      Enum.find_value(2..1_000, fn suffix ->
+        candidate = "#{first}:#{suffix}"
+
+        if Ferricstore.Store.Router.shard_for(ctx, candidate) != first_idx,
+          do: candidate
+      end)
+
+    assert is_binary(second)
+    second_idx = Ferricstore.Store.Router.shard_for(ctx, second)
+    first_before = Ferricstore.Store.WriteVersion.get(first_idx)
+    second_before = Ferricstore.Store.WriteVersion.get(second_idx)
+
+    assert {:ok, "OK", multi_state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:ok, "QUEUED", queued_state} =
+             Session.execute(
+               %{"command" => "MSET", "args" => [first, "one", second, "two"]},
+               multi_state
+             )
+
+    assert [%PreparedCommand{routing_keys: [^first, ^second]}] = queued_state.multi_queue
+
+    assert {:ok, ["OK"], _state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, queued_state)
+
+    assert Ferricstore.Store.Router.get(ctx, first) == "one"
+    assert Ferricstore.Store.Router.get(ctx, second) == "two"
+    assert Ferricstore.Store.WriteVersion.get(first_idx) == first_before + 1
+    assert Ferricstore.Store.WriteVersion.get(second_idx) == second_before + 1
+  end
+
+  @tag :prepared_multi_routing
+  test "native MULTI rejects coordinated prepared commands before queueing" do
+    assert {:ok, "OK", multi_state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:error, message, rejected_state} =
+             Session.execute(
+               %{"command" => "FLOW.POLICY.GET", "args" => ["coordinated-policy"]},
+               multi_state
+             )
+
+    assert message =~ "coordinated"
+    assert rejected_state.multi_error
+    assert rejected_state.multi_queue == []
+    assert rejected_state.multi_queue_count == 0
+
+    assert {:error, abort_message, final_state} =
+             Session.execute(%{"command" => "EXEC", "args" => []}, rejected_state)
+
+    assert abort_message =~ "EXECABORT"
+    assert final_state.multi_state == :none
+  end
+
+  @tag :prepared_multi_routing
+  test "native MULTI rejects global data mutations before queueing" do
+    assert {:ok, "OK", multi_state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+    assert {:error, message, rejected_state} =
+             Session.execute(%{"command" => "FLUSHDB", "args" => []}, multi_state)
+
+    assert message =~ "coordinated"
+    assert rejected_state.multi_error
+    assert rejected_state.multi_queue == []
   end
 
   test "replicated ACL disable denies rotated-out native service credential sessions only" do

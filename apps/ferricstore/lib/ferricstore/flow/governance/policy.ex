@@ -14,11 +14,8 @@ defmodule Ferricstore.Flow.Governance.Policy do
   @modes [:minimal, :ledger, :full]
   @denial_audit_modes [:off, :sampled, :all]
   @enforcement_modes [
-    :strict_local,
-    :shard_local,
     :strict_global,
-    :approximate_global,
-    :async_audit
+    :approximate_global
   ]
 
   def default, do: @default
@@ -123,6 +120,9 @@ defmodule Ferricstore.Flow.Governance.Policy do
           "full" -> {:ok, :full}
           _other -> {:error, "ERR invalid flow governance mode"}
         end
+
+      _other ->
+        {:error, "ERR invalid flow governance mode"}
     end
   end
 
@@ -196,6 +196,9 @@ defmodule Ferricstore.Flow.Governance.Policy do
           "all" -> {:ok, :all}
           _other -> {:error, "ERR invalid flow governance denials audit mode"}
         end
+
+      _other ->
+        {:error, "ERR invalid flow governance denials audit mode"}
     end
   end
 
@@ -398,13 +401,13 @@ defmodule Ferricstore.Flow.Governance.Policy do
 
       mode when is_binary(mode) ->
         case String.downcase(mode) do
-          "strict_local" -> {:ok, :strict_local}
-          "shard_local" -> {:ok, :shard_local}
           "strict_global" -> {:ok, :strict_global}
           "approximate_global" -> {:ok, :approximate_global}
-          "async_audit" -> {:ok, :async_audit}
           _other -> {:error, "ERR invalid flow governance enforcement mode"}
         end
+
+      _other ->
+        {:error, "ERR invalid flow governance enforcement mode"}
     end
   end
 

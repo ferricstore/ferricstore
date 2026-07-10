@@ -811,7 +811,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              candidates,
              remaining
            ) do
-        if flow_claim_fifo_planning?(state, type, state_filter, due_key) do
+        if flow_governance_limit_active?() or
+             flow_claim_fifo_planning?(state, type, state_filter, due_key) do
           flow_plan_claim_candidates_elixir(
             state,
             due_key,

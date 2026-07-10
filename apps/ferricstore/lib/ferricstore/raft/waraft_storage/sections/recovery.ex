@@ -132,7 +132,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       defp apply_projection_cache_compaction_reason({:error, reason}), do: reason
       defp apply_projection_cache_compaction_reason(other), do: other
 
-      defp build_sm_state(ctx, shard_index) do
+      defp build_sm_state(ctx, shard_index, persisted_apply_context \\ nil) do
         data_dir = ctx.data_dir
         shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
         Ferricstore.FS.mkdir_p!(shard_data_path)
@@ -198,6 +198,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           active_file_size: active_file_size,
           ets: keydir,
           instance_ctx: ctx,
+          apply_context: resolve_persisted_apply_context(persisted_apply_context, ctx),
           instance_name: instance_name,
           compound_member_index_name: compound_member_index,
           zset_score_index_name: zset_score_index,
@@ -206,6 +207,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           flow_lookup_name: flow_lookup
         })
       end
+
+      defp resolve_persisted_apply_context(%Ferricstore.Raft.ApplyContext{} = context, _ctx),
+        do: context
+
+      defp resolve_persisted_apply_context(_legacy, ctx),
+        do: storage_apply_context(%{ctx: ctx})
+
+      defp storage_apply_context(%{
+             sm_state: %{apply_context: %Ferricstore.Raft.ApplyContext{} = context}
+           }),
+           do: context
+
+      defp storage_apply_context(%{
+             ctx: %{apply_context: %Ferricstore.Raft.ApplyContext{} = context}
+           }),
+           do: context
+
+      defp storage_apply_context(_legacy), do: Ferricstore.Raft.ApplyContext.from_runtime()
 
       defp maybe_recover_segment_projected!(sm_state, root_dir, metadata) do
         metadata_position = Map.get(metadata, :position, @zero_pos)
@@ -598,7 +617,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           version: @version,
           position: handle.position,
           label: handle.label,
-          config: handle.config
+          config: handle.config,
+          apply_context: storage_apply_context(handle)
         }
 
         case Map.get(handle, :snapshot_boundary_position) do
@@ -642,17 +662,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         end
       end
 
-      defp initial_storage_metadata do
+      defp initial_storage_metadata(apply_context) do
         %{
           version: @version,
           position: @zero_pos,
           label: nil,
-          config: nil
+          config: nil,
+          apply_context: apply_context
         }
       end
 
-      defp ensure_initial_storage_metadata!(metadata, root_dir) when map_size(metadata) == 0 do
-        metadata = initial_storage_metadata()
+      defp ensure_initial_storage_metadata!(metadata, root_dir, apply_context)
+           when map_size(metadata) == 0 do
+        metadata = initial_storage_metadata(apply_context)
 
         case persist_storage_metadata(root_dir, metadata, :compact) do
           :ok ->
@@ -663,7 +685,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         end
       end
 
-      defp ensure_initial_storage_metadata!(metadata, _root_dir), do: metadata
+      defp ensure_initial_storage_metadata!(metadata, _root_dir, _apply_context), do: metadata
 
       defp persist_storage_metadata(root_dir, metadata, mode) do
         path = metadata_path(root_dir)

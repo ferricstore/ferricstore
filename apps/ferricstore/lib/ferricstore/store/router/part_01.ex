@@ -4,12 +4,17 @@ defmodule Ferricstore.Store.Router.Part01 do
   # Extracted from Router: valid_cold_file_ref .. get_with_file_ref
   defmacro __using__(_opts) do
     quote do
+      @shard_batch_read_max_keys 512
+      @shard_batch_read_max_key_size 65_535
+      @shard_batch_read_max_key_bytes 1_048_576
+
       alias Ferricstore.CommandTime
       alias Ferricstore.ErrorReasons
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+      alias Ferricstore.Flow.PolicyCommand
       alias Ferricstore.Raft.ReplyAwaiter
       alias Ferricstore.Stats
       alias Ferricstore.Store.BlobRef
@@ -73,6 +78,45 @@ defmodule Ferricstore.Store.Router.Part01 do
           emit_shard_unavailable(ctx, idx, request, :timeout)
           :unavailable
       end
+
+      @doc false
+      def read_shard_value(ctx, idx, key)
+          when is_integer(idx) and idx >= 0 and is_binary(key) do
+        keydir = resolve_keydir(ctx, idx)
+
+        case ets_get_full(ctx, idx, keydir, key, HLC.now_ms()) do
+          {:hit, value, _lfu} -> {:ok, value}
+          result when result in [:miss, :expired] -> {:ok, nil}
+          _cold_or_unavailable -> safe_read_call(ctx, idx, {:get, key})
+        end
+      end
+
+      @doc false
+      def read_shard_values(ctx, idx, keys)
+          when is_integer(idx) and idx >= 0 and is_list(keys) and
+                 length(keys) <= @shard_batch_read_max_keys do
+        if Enum.all?(keys, fn key ->
+             is_binary(key) and byte_size(key) <= @shard_batch_read_max_key_size
+           end) and
+             Enum.reduce(keys, 0, fn key, total -> total + byte_size(key) end) <=
+               @shard_batch_read_max_key_bytes do
+          case safe_read_call(ctx, idx, {:get_many, keys}) do
+            {:ok, values} when is_list(values) and length(values) == length(keys) ->
+              {:ok, values}
+
+            :unavailable ->
+              :unavailable
+
+            _invalid ->
+              {:error, "ERR invalid shard batch read response"}
+          end
+        else
+          {:error, "ERR invalid shard batch read request"}
+        end
+      end
+
+      def read_shard_values(_ctx, _idx, _keys),
+        do: {:error, "ERR invalid shard batch read request"}
 
       defp safe_write_call(ctx, idx, request) do
         GenServer.call(resolve_shard(ctx, idx), request)
@@ -283,21 +327,23 @@ defmodule Ferricstore.Store.Router.Part01 do
       # IO/WAL/read machinery remains separate from client acknowledgement policy.
       @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
       defp raft_write(ctx, idx, key, command) do
-        cond do
-          flow_shared_ref_acquisition_command?(command) ->
-            flow_cross_shard_tx(
-              ctx,
-              [key],
-              {:flow_shared_ref_write, idx, command}
-            )
+        with {:ok, command} <- PolicyCommand.stamp(ctx, command) do
+          cond do
+            flow_shared_ref_acquisition_command?(command) ->
+              flow_cross_shard_tx(
+                ctx,
+                [key],
+                {:flow_shared_ref_write, idx, command}
+              )
 
-          durable_raft_ctx?(ctx) ->
-            quorum_write(ctx, idx, command)
+            durable_raft_ctx?(ctx) ->
+              quorum_write(ctx, idx, command)
 
-          true ->
-            # Custom embedded instances are local/direct. The default application
-            # instance owns Raft durability.
-            GenServer.call(elem(ctx.shard_names, idx), command)
+            true ->
+              # Custom embedded instances are local/direct. The default application
+              # instance owns Raft durability.
+              GenServer.call(elem(ctx.shard_names, idx), command)
+          end
         end
       end
 

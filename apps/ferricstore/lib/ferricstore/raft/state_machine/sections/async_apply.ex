@@ -959,6 +959,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
+      defp apply_single(state, {:flow_governance_limit_mutate, key, attrs})
+           when is_binary(key) and is_map(attrs) do
+        do_flow_governance_limit_mutate(state, key, attrs)
+      end
+
       defp apply_single(state, {:flow_create_many, _key, attrs}) do
         apply_flow_single_with_telemetry(state, :flow_create_many, attrs, fn ->
           do_flow_create_many(state, attrs)

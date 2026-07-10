@@ -22,6 +22,68 @@ defmodule Ferricstore.Store.Router.Part07 do
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
+
+      @doc false
+      def flow_governance_limit_mutate(ctx, key, attrs)
+          when is_binary(key) and is_map(attrs) do
+        idx = shard_for(ctx, key)
+
+        case raft_write(ctx, idx, key, {:flow_governance_limit_mutate, key, attrs}) do
+          {:flow_limit_reply, reply} -> reply
+          other -> other
+        end
+      end
+
+      @doc false
+      def flow_governance_release_outbox_ack(
+            ctx,
+            shard_index,
+            expected_head,
+            up_to
+          )
+          when is_integer(shard_index) and shard_index >= 0 and shard_index < ctx.shard_count and
+                 is_integer(expected_head) and expected_head > 0 and is_integer(up_to) and
+                 up_to >= expected_head and up_to - expected_head < 256 do
+        key = Ferricstore.Flow.Keys.governance_release_outbox_meta_key(shard_index)
+
+        raft_write(
+          ctx,
+          shard_index,
+          key,
+          {:flow_governance_release_outbox_ack, key, shard_index, expected_head, up_to}
+        )
+      end
+
+      def flow_governance_release_outbox_ack(
+            _ctx,
+            _shard_index,
+            _expected_head,
+            _up_to
+          ),
+          do: {:error, "ERR invalid flow governance release outbox acknowledgement"}
+
+      @doc false
+      def flow_governance_release_outbox_mark_completed(ctx, shard_index, sequences)
+          when is_integer(shard_index) and shard_index >= 0 and shard_index < ctx.shard_count and
+                 is_list(sequences) and sequences != [] and length(sequences) <= 256 do
+        if length(Enum.uniq(sequences)) == length(sequences) and
+             Enum.all?(sequences, &(is_integer(&1) and &1 > 0)) do
+          key = Ferricstore.Flow.Keys.governance_release_outbox_meta_key(shard_index)
+
+          raft_write(
+            ctx,
+            shard_index,
+            key,
+            {:flow_governance_release_outbox_mark_completed, key, shard_index, sequences}
+          )
+        else
+          {:error, "ERR invalid flow governance release outbox completion"}
+        end
+      end
+
+      def flow_governance_release_outbox_mark_completed(_ctx, _shard_index, _sequences),
+        do: {:error, "ERR invalid flow governance release outbox completion"}
+
       @doc false
       def flow_claim_due(ctx, %{partition_key: :auto, limit: limit} = attrs)
           when is_integer(limit) and limit > 0 do

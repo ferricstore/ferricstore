@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Connection.Auth do
   allowed and broadcasts ACL invalidation to live sessions.
   """
 
+  alias Ferricstore.Commands.{KeyDiscovery, PreparedCommand}
   alias FerricstoreServer.Acl.CommandCategories
 
   @acl_pg_group :ferricstore_acl_connections
@@ -109,9 +110,34 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def check_keys_cached(%{keys: patterns}, cmd, keys) when is_list(keys) do
-    case key_access_plan(cmd, keys) do
-      {:mixed, plan} -> check_key_access_plan(plan, patterns)
-      {:uniform, access_type} -> check_all_keys(keys, access_type, patterns)
+    {read_keys, write_keys} = KeyDiscovery.access_keys(cmd, keys)
+
+    with :ok <- check_all_keys(read_keys, :read, patterns),
+         :ok <- check_all_keys(write_keys, :write, patterns) do
+      :ok
+    end
+  end
+
+  @spec check_keys_cached(map() | :full_access | :denied | nil, PreparedCommand.t()) ::
+          :ok | {:error, binary()}
+  def check_keys_cached(:denied, %PreparedCommand{}),
+    do: {:error, "NOPERM user session expired or user was deleted"}
+
+  def check_keys_cached(nil, %PreparedCommand{}),
+    do: {:error, "NOPERM user session expired or user was deleted"}
+
+  def check_keys_cached(:full_access, %PreparedCommand{}), do: :ok
+  def check_keys_cached(%{keys: :all}, %PreparedCommand{}), do: :ok
+
+  def check_keys_cached(%{keys: patterns} = cache, %PreparedCommand{} = prepared)
+      when is_list(patterns) do
+    if prepared.acl_keys == [] do
+      check_keys_cached(cache, prepared.command, [])
+    else
+      with :ok <- check_all_keys(prepared.read_keys, :read, patterns),
+           :ok <- check_all_keys(prepared.write_keys, :write, patterns) do
+        :ok
+      end
     end
   end
 
@@ -202,48 +228,6 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def constant_time_equal?(_a, _b), do: false
-
-  defp key_access_plan(cmd, keys) when is_binary(cmd) do
-    case String.upcase(cmd) do
-      "COPY" ->
-        source_destination_plan(keys, :read)
-
-      cmd
-      when cmd in ~w(BITOP PFMERGE SDIFFSTORE SINTERSTORE SUNIONSTORE GEOSEARCHSTORE CMS.MERGE TDIGEST.MERGE ZINTERSTORE ZUNIONSTORE) ->
-        destination_sources_plan(keys)
-
-      cmd when cmd in ~w(RENAME RENAMENX LMOVE BLMOVE RPOPLPUSH SMOVE) ->
-        source_destination_plan(keys, :read_write)
-
-      _ ->
-        {:uniform, command_access_type(cmd)}
-    end
-  end
-
-  defp key_access_plan(cmd, _keys), do: {:uniform, command_access_type(cmd)}
-
-  defp destination_sources_plan([dest | sources]),
-    do: {:mixed, [{dest, :write} | Enum.map(sources, &{&1, :read})]}
-
-  defp destination_sources_plan(_keys), do: {:mixed, []}
-
-  defp source_destination_plan([source, destination | _rest], :read),
-    do: {:mixed, [{source, :read}, {destination, :write}]}
-
-  defp source_destination_plan([source, destination | _rest], :read_write),
-    do: {:mixed, [{source, :read}, {source, :write}, {destination, :write}]}
-
-  defp source_destination_plan(_keys, _source_access), do: {:mixed, []}
-
-  defp check_key_access_plan([], _patterns), do: :ok
-
-  defp check_key_access_plan([{key, access_type} | rest], patterns) do
-    if FerricstoreServer.Acl.key_matches_any?(key, access_type, patterns) do
-      check_key_access_plan(rest, patterns)
-    else
-      noperm_key()
-    end
-  end
 
   defp global_keyspace_enumeration_command?(cmd),
     do: String.upcase(cmd) in @global_keyspace_enumeration_commands

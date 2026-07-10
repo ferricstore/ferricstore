@@ -63,6 +63,27 @@ defmodule Ferricstore.Flow.Keys do
 
   def state_key_from_registry_key(_registry_key), do: :error
 
+  def registry_key_from_state_key(state_key) when is_binary(state_key) do
+    case :binary.match(state_key, "}:s:") do
+      {pos, marker_size} when pos >= 2 ->
+        id_offset = pos + marker_size
+        id_size = byte_size(state_key) - id_offset
+
+        if id_size > 0 do
+          tag = binary_part(state_key, 2, pos + 1 - 2)
+          id = binary_part(state_key, id_offset, id_size)
+          {:ok, "f:" <> tag <> ":r:" <> id}
+        else
+          :error
+        end
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  def registry_key_from_state_key(_state_key), do: :error
+
   def history_key(id, partition_key \\ nil)
 
   def history_key(id, nil) when is_binary(id) do
@@ -155,6 +176,103 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> @global_tag <> ":policy:" <> type
   end
 
+  def type_catalog_member_key(type, state_key)
+      when is_binary(type) and type != "" and is_binary(state_key) do
+    case flow_key_tag_prefix(state_key, "}:s:") do
+      {:ok, tag_prefix} ->
+        tag_prefix <>
+          ":tc:1:" <> digest(type) <> ":" <> digest(state_key)
+
+      :error ->
+        raise ArgumentError, "invalid Flow state key"
+    end
+  end
+
+  def type_catalog_descriptor_key(type) when is_binary(type) and type != "" do
+    type_catalog_descriptor_key_from_digest(digest(type))
+  end
+
+  def type_catalog_descriptor_key_from_member(key) when is_binary(key) do
+    with {:ok, type_digest} <- type_catalog_digest_from_member(key) do
+      {:ok, type_catalog_descriptor_key_from_digest(type_digest)}
+    end
+  end
+
+  def type_catalog_descriptor_key_from_member(_key), do: :error
+
+  def type_catalog_member_key?(key),
+    do: match?({:ok, _type_digest}, type_catalog_digest_from_member(key))
+
+  def type_catalog_member_owns_state_key?(key, state_key)
+      when is_binary(key) and is_binary(state_key) do
+    with {:ok, _tag_prefix, remainder} <- split_internal_flow_key(key, "}:tc:1:"),
+         <<_type_digest::binary-size(43), ?:, state_digest::binary-size(43)>> <- remainder,
+         true <- valid_digest?(state_digest) do
+      state_digest == digest(state_key)
+    else
+      _invalid -> false
+    end
+  end
+
+  def type_catalog_member_owns_state_key?(_key, _state_key), do: false
+
+  def policy_migration_job_key(type) when is_binary(type) and type != "" do
+    "f:" <> @global_tag <> ":pm:1:" <> digest(type)
+  end
+
+  def policy_migration_job_prefix, do: "f:" <> @global_tag <> ":pm:1:"
+
+  def policy_migration_marker_key(type) when is_binary(type) and type != "" do
+    "f:" <> @global_tag <> ":pmg:1:" <> digest(type)
+  end
+
+  def policy_catalog_backfill_key(shard_index)
+      when is_integer(shard_index) and shard_index >= 0 do
+    "f:" <> @global_tag <> ":pcb:1:" <> Integer.to_string(shard_index)
+  end
+
+  def policy_migration_job_key?("f:" <> @global_tag <> ":pm:1:" <> type_digest),
+    do: valid_digest?(type_digest)
+
+  def policy_migration_job_key?(_key), do: false
+
+  def policy_catalog_projection_prefix(type) when is_binary(type) and type != "" do
+    <<0, "fpc:1:", digest(type)::binary, ?:>>
+  end
+
+  def policy_catalog_projection_key(type, catalog_key, generation)
+      when is_binary(type) and type != "" and is_binary(catalog_key) and
+             is_integer(generation) and generation >= 0 and generation <= 0xFFFFFFFFFFFFFFFF do
+    policy_catalog_projection_prefix(type) <>
+      <<generation::unsigned-big-64, catalog_key::binary>>
+  end
+
+  def decode_policy_catalog_projection_key(type, key)
+      when is_binary(type) and type != "" and is_binary(key) do
+    prefix = policy_catalog_projection_prefix(type)
+
+    case key do
+      <<^prefix::binary, generation::unsigned-big-64, catalog_key::binary>>
+      when catalog_key != "" ->
+        case type_catalog_descriptor_key_from_member(catalog_key) do
+          {:ok, descriptor_key} ->
+            if descriptor_key == type_catalog_descriptor_key(type) do
+              {:ok, %{catalog_key: catalog_key, migration_generation: generation}}
+            else
+              :error
+            end
+
+          :error ->
+            :error
+        end
+
+      _invalid ->
+        :error
+    end
+  end
+
+  def decode_policy_catalog_projection_key(_type, _key), do: :error
+
   def policy_type("f:" <> @global_tag <> ":policy:" <> type) when type != "", do: {:ok, type}
   def policy_type(_key), do: :error
 
@@ -218,10 +336,107 @@ defmodule Ferricstore.Flow.Keys do
 
   def governance_limit_key?(_key), do: false
 
+  def governance_limit_reservation_prefix(scope, shard_id, epoch)
+      when is_binary(scope) and is_integer(shard_id) and shard_id >= 0 and
+             is_integer(epoch) and epoch > 0 do
+    governance_limit_storage_prefix(scope) <>
+      ":reservation:" <> Integer.to_string(shard_id) <> ":" <> Integer.to_string(epoch) <> ":"
+  end
+
+  def governance_limit_reservation_key(scope, shard_id, epoch, reservation_id)
+      when is_binary(reservation_id) and reservation_id != "" do
+    governance_limit_reservation_prefix(scope, shard_id, epoch) <> digest(reservation_id)
+  end
+
+  def governance_limit_reservation_page_key(scope, shard_id, epoch, page)
+      when is_binary(scope) and is_integer(shard_id) and shard_id >= 0 and
+             is_integer(epoch) and epoch > 0 and is_integer(page) and page > 0 do
+    governance_limit_storage_prefix(scope) <>
+      ":page:" <>
+      Integer.to_string(shard_id) <>
+      ":" <> Integer.to_string(epoch) <> ":" <> Integer.to_string(page)
+  end
+
+  def governance_limit_cleanup_key(scope, sequence)
+      when is_binary(scope) and is_integer(sequence) and sequence > 0 do
+    governance_limit_storage_prefix(scope) <> ":cleanup:" <> Integer.to_string(sequence)
+  end
+
+  def governance_limit_cleanup_progress_key do
+    "f:{flow-governance}:gov:limit-storage-cleanup:progress"
+  end
+
+  def governance_limit_cache_session_head_key(node_id, instance_name)
+      when is_binary(node_id) and node_id != "" and is_binary(instance_name) and
+             instance_name != "" do
+    governance_limit_cache_session_prefix(node_id, instance_name) <> ":head"
+  end
+
+  def governance_limit_cache_session_meta_key(node_id, instance_name, session_id)
+      when is_binary(node_id) and node_id != "" and is_binary(instance_name) and
+             instance_name != "" and is_binary(session_id) and session_id != "" do
+    governance_limit_cache_session_prefix(node_id, instance_name) <>
+      ":session:" <> governance_catalog_digest(session_id) <> ":meta"
+  end
+
+  def governance_limit_cache_session_page_key(node_id, instance_name, session_id, sequence)
+      when is_binary(node_id) and node_id != "" and is_binary(instance_name) and
+             instance_name != "" and is_binary(session_id) and session_id != "" and
+             is_integer(sequence) and sequence > 0 do
+    governance_limit_cache_session_prefix(node_id, instance_name) <>
+      ":session:" <>
+      governance_catalog_digest(session_id) <> ":page:" <> Integer.to_string(sequence)
+  end
+
+  def governance_release_outbox_meta_key(shard_index)
+      when is_integer(shard_index) and shard_index >= 0 do
+    "f:{flow-governance}:gov:release-outbox:" <> Integer.to_string(shard_index) <> ":meta"
+  end
+
+  def governance_release_outbox_intent_key(shard_index, sequence)
+      when is_integer(shard_index) and shard_index >= 0 and is_integer(sequence) and sequence > 0 do
+    "f:{flow-governance}:gov:release-outbox:" <>
+      Integer.to_string(shard_index) <> ":intent:" <> Integer.to_string(sequence)
+  end
+
+  def governance_release_outbox_completed_key(shard_index, sequence)
+      when is_integer(shard_index) and shard_index >= 0 and is_integer(sequence) and sequence > 0 do
+    "f:{flow-governance}:gov:release-outbox:" <>
+      Integer.to_string(shard_index) <> ":completed:" <> Integer.to_string(sequence)
+  end
+
+  def governance_catalog_key(kind)
+      when kind in [:approval, :budget, :circuit, :limit] do
+    "f:{flow-governance}:gov:catalog:" <> Atom.to_string(kind)
+  end
+
+  def governance_approval_scope_catalog_key(scope) when is_binary(scope) do
+    "f:{flow-governance}:gov:catalog:approval:scope:" <> governance_catalog_digest(scope)
+  end
+
+  def governance_approval_flow_catalog_key(flow_id) when is_binary(flow_id) do
+    "f:{flow-governance}:gov:catalog:approval:flow:" <> governance_catalog_digest(flow_id)
+  end
+
   def policy_key?(key) when is_binary(key),
     do: String.starts_with?(key, "f:" <> @global_tag <> ":policy:")
 
   def policy_key?(_key), do: false
+
+  defp governance_catalog_digest(value) do
+    :sha256
+    |> :crypto.hash(value)
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp governance_limit_cache_session_prefix(node_id, instance_name) do
+    family = governance_catalog_digest(node_id <> <<0>> <> instance_name)
+    "f:{fgc:" <> family <> "}:gov:limit-cache-session"
+  end
+
+  defp governance_limit_storage_prefix(scope) do
+    "f:" <> tag(scope) <> ":gov:limit-storage:" <> digest(scope)
+  end
 
   def value_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:v:") != :nomatch
   def value_key?(_key), do: false
@@ -318,6 +533,17 @@ defmodule Ferricstore.Flow.Keys do
 
   def state_key?(_key), do: false
 
+  def retention_guard_key_from_state_key(state_key) when is_binary(state_key) do
+    with {:ok, tag_prefix, id} <- split_internal_flow_key(state_key, "}:s:"),
+         true <- id != "" do
+      {:ok, tag_prefix <> ":rtg:" <> id}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def retention_guard_key_from_state_key(_state_key), do: :error
+
   def registry_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:r:") != :nomatch
 
   def registry_key?(_key), do: false
@@ -341,6 +567,74 @@ defmodule Ferricstore.Flow.Keys do
     @partition_tag_prefix <>
       Base.url_encode64(:crypto.hash(:sha256, partition_key), padding: false) <> "}"
   end
+
+  defp type_catalog_descriptor_key_from_digest(type_digest) do
+    "f:" <> @global_tag <> ":td:1:" <> type_digest
+  end
+
+  defp type_catalog_digest_from_member(key) do
+    with {:ok, _tag_prefix, remainder} <- split_internal_flow_key(key, "}:tc:1:"),
+         <<type_digest::binary-size(43), ?:, state_digest::binary-size(43)>> <- remainder,
+         true <- valid_digest?(type_digest) and valid_digest?(state_digest) do
+      {:ok, type_digest}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp digest(value),
+    do: value |> then(&:crypto.hash(:sha256, &1)) |> Base.url_encode64(padding: false)
+
+  defp valid_digest?(digest) when is_binary(digest) and byte_size(digest) == 43 do
+    case Base.url_decode64(digest, padding: false) do
+      {:ok, decoded} when byte_size(decoded) == 32 ->
+        Base.url_encode64(decoded, padding: false) == digest
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp valid_digest?(_digest), do: false
+
+  defp flow_key_tag_prefix(key, marker) do
+    case split_internal_flow_key(key, marker) do
+      {:ok, tag_prefix, _remainder} -> {:ok, tag_prefix}
+      :error -> :error
+    end
+  end
+
+  defp split_internal_flow_key(<<"f:{", rest::binary>> = key, marker) do
+    case :binary.match(rest, marker) do
+      {position, marker_size} when position > 0 ->
+        tag = binary_part(rest, 0, position)
+        offset = 3 + position + marker_size
+
+        if valid_flow_tag?(tag) do
+          {:ok, binary_part(key, 0, 3 + position + 1),
+           binary_part(key, offset, byte_size(key) - offset)}
+        else
+          :error
+        end
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  defp split_internal_flow_key(_key, _marker), do: :error
+
+  defp valid_flow_tag?("f"), do: true
+
+  defp valid_flow_tag?(<<"fa:", bucket::binary>>) do
+    case Integer.parse(bucket) do
+      {number, ""} when number in 0..255 -> bucket == Integer.to_string(number)
+      _invalid -> false
+    end
+  end
+
+  defp valid_flow_tag?(<<"f:", digest::binary>>), do: valid_digest?(digest)
+  defp valid_flow_tag?(_tag), do: false
 
   def auto_partition_key(id) when is_binary(id) do
     bucket =

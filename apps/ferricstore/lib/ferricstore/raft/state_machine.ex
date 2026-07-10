@@ -194,6 +194,8 @@ defmodule Ferricstore.Raft.StateMachine do
           active_file_id: non_neg_integer(),
           active_file_path: binary(),
           ets: atom(),
+          apply_context: Ferricstore.Raft.ApplyContext.t(),
+          apply_context_encoded: Ferricstore.Raft.ApplyContext.encoded(),
           applied_count: non_neg_integer(),
           release_cursor_interval: pos_integer()
         }
@@ -211,6 +213,9 @@ defmodule Ferricstore.Raft.StateMachine do
   use Ferricstore.Raft.StateMachine.Sections.CompoundApply
   use Ferricstore.Raft.StateMachine.Sections.CrossShardPending
   use Ferricstore.Raft.StateMachine.Sections.FlowCreate
+  use Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration
+  use Ferricstore.Raft.StateMachine.Sections.FlowGovernanceLimit
+  use Ferricstore.Raft.StateMachine.Sections.FlowGovernanceReleaseOutbox
   use Ferricstore.Raft.StateMachine.Sections.FlowClaimDue
   use Ferricstore.Raft.StateMachine.Sections.FlowClaimScan
   use Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan

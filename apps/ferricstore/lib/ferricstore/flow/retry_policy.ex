@@ -1,12 +1,21 @@
 defmodule Ferricstore.Flow.RetryPolicy do
   @moduledoc false
 
+  alias Ferricstore.Raft.ApplyContext
+
   @max_retries 1_000
   @max_delay_ms 2_592_000_000
   @max_retention_ttl_ms 31_536_000_000
   @max_active_ms 31_536_000_000
   @max_history_hot_max_events 10_000
   @max_history_max_events 1_000_000
+  @max_policy_generation 9_007_199_254_740_991
+  @max_policy_snapshot_bytes 256 * 1024
+  @max_policy_snapshot_batch_bytes 4 * 1024 * 1024
+  @max_policy_envelope_overhead_bytes 1_024
+  @max_encoded_policy_bytes @max_policy_snapshot_bytes + @max_policy_envelope_overhead_bytes
+  @external_term_version 131
+  @compressed_term_tag 80
 
   @default %{
     max_retries: 3,
@@ -39,6 +48,15 @@ defmodule Ferricstore.Flow.RetryPolicy do
       ttl_ms: default_retention_ttl_ms(),
       history_hot_max_events: default_history_hot_max_events(),
       history_max_events: default_history_max_events()
+    }
+  end
+
+  @spec default_retention(ApplyContext.t()) :: map()
+  def default_retention(%ApplyContext{} = context) do
+    %{
+      ttl_ms: context.flow_default_retention_ttl_ms,
+      history_hot_max_events: context.flow_default_history_hot_max_events,
+      history_max_events: context.flow_default_history_max_events
     }
   end
 
@@ -75,7 +93,10 @@ defmodule Ferricstore.Flow.RetryPolicy do
         }
         |> drop_nil_policy_fields()
 
-      {:ok, policy}
+      case validate_flow_policy_snapshot_size(policy) do
+        :ok -> {:ok, policy}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
@@ -164,6 +185,16 @@ defmodule Ferricstore.Flow.RetryPolicy do
     |> normalize_resolved_retention_caps()
   end
 
+  @spec resolve_retention(map() | nil, binary(), map() | nil, ApplyContext.t()) :: map()
+  def resolve_retention(flow_policy, state, command_override, %ApplyContext{} = context) do
+    context
+    |> default_retention()
+    |> merge_retention(policy_retention(flow_policy))
+    |> merge_retention(state_retention(flow_policy, state))
+    |> merge_retention(command_override)
+    |> normalize_resolved_retention_caps(context)
+  end
+
   def indexed_attributes(%{indexed_attributes: names}) when is_list(names) do
     case Ferricstore.Flow.Attributes.normalize_indexed_names(names) do
       {:ok, names} -> names
@@ -239,14 +270,75 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   @spec encode_flow_policy(map()) :: binary()
   def encode_flow_policy(policy) when is_map(policy) do
-    :erlang.term_to_binary({:flow_policy_v1, policy})
+    encode_flow_policy(policy, 0)
+  end
+
+  @spec encode_flow_policy(map(), non_neg_integer()) :: binary()
+  def encode_flow_policy(policy, generation)
+      when is_map(policy) and is_integer(generation) and generation >= 0 and
+             generation <= @max_policy_generation do
+    :erlang.term_to_binary({:flow_policy_v1, generation, policy})
+  end
+
+  @spec max_policy_generation() :: pos_integer()
+  def max_policy_generation, do: @max_policy_generation
+
+  @spec max_policy_snapshot_bytes() :: pos_integer()
+  def max_policy_snapshot_bytes, do: @max_policy_snapshot_bytes
+
+  @spec max_policy_snapshot_batch_bytes() :: pos_integer()
+  def max_policy_snapshot_batch_bytes, do: @max_policy_snapshot_batch_bytes
+
+  @spec max_encoded_policy_bytes() :: pos_integer()
+  def max_encoded_policy_bytes, do: @max_encoded_policy_bytes
+
+  @spec validate_flow_policy_snapshot_size(map()) :: :ok | {:error, binary()}
+  def validate_flow_policy_snapshot_size(policy) when is_map(policy) do
+    validate_flow_policy_snapshots_size([policy])
+  end
+
+  @spec validate_flow_policy_snapshots_size([map()]) :: :ok | {:error, binary()}
+  def validate_flow_policy_snapshots_size(policies) when is_list(policies) do
+    size = Enum.reduce(policies, 0, &(:erlang.external_size(&1) + &2))
+
+    if size <= @max_policy_snapshot_bytes do
+      :ok
+    else
+      {:error, "ERR flow policy snapshot exceeds #{@max_policy_snapshot_bytes} bytes"}
+    end
+  end
+
+  @spec validate_flow_policy_snapshot_batch_size(non_neg_integer()) ::
+          :ok | {:error, binary()}
+  def validate_flow_policy_snapshot_batch_size(size)
+      when is_integer(size) and size >= 0 do
+    if size <= @max_policy_snapshot_batch_bytes do
+      :ok
+    else
+      {:error, "ERR flow policy snapshot batch exceeds #{@max_policy_snapshot_batch_bytes} bytes"}
+    end
   end
 
   @spec decode_flow_policy(binary()) :: {:ok, map()} | :error
   def decode_flow_policy(value) when is_binary(value) do
+    case decode_flow_policy_entry(value) do
+      {:ok, {_generation, policy}} -> {:ok, policy}
+      :error -> :error
+    end
+  end
+
+  def decode_flow_policy(_value), do: :error
+
+  @spec decode_flow_policy_entry(binary()) ::
+          {:ok, {non_neg_integer(), map()}} | :error
+  def decode_flow_policy_entry(<<@external_term_version, encoding_tag, _rest::binary>> = value)
+      when encoding_tag != @compressed_term_tag and
+             byte_size(value) <= @max_encoded_policy_bytes do
     case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_policy_v1, policy} when is_map(policy) ->
-        if old_max_attempts_policy?(policy), do: :error, else: {:ok, policy}
+      {:flow_policy_v1, generation, policy}
+      when is_integer(generation) and generation >= 0 and
+             generation <= @max_policy_generation and is_map(policy) ->
+        if old_max_attempts_policy?(policy), do: :error, else: {:ok, {generation, policy}}
 
       _ ->
         :error
@@ -255,7 +347,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
     _ -> :error
   end
 
-  def decode_flow_policy(_value), do: :error
+  def decode_flow_policy_entry(_value), do: :error
 
   @spec normalize(term()) :: {:ok, t()} | {:error, binary()}
   def normalize(nil), do: {:ok, default()}
@@ -686,6 +778,23 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
     retention
     |> Map.put(:history_hot_max_events, min(history_hot_max_events, history_max_events))
+    |> Map.put(:history_max_events, history_max_events)
+  end
+
+  defp normalize_resolved_retention_caps(retention, %ApplyContext{} = context) do
+    history_max_events =
+      retention
+      |> Map.fetch!(:history_max_events)
+      |> min(context.flow_max_history_max_events)
+
+    history_hot_max_events =
+      retention
+      |> Map.fetch!(:history_hot_max_events)
+      |> min(context.flow_max_history_hot_max_events)
+      |> min(history_max_events)
+
+    retention
+    |> Map.put(:history_hot_max_events, history_hot_max_events)
     |> Map.put(:history_max_events, history_max_events)
   end
 

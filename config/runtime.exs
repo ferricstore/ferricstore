@@ -217,6 +217,43 @@ if config_env() == :prod do
     flow_lmdb_max_concurrent_flushes:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
     flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
+    flow_governance_limit_storage_cleanup_interval_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_LIMIT_STORAGE_CLEANUP_INTERVAL_MS", "1000")
+      ),
+    flow_governance_limit_storage_cleanup_pages_per_tick:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_LIMIT_STORAGE_CLEANUP_PAGES_PER_TICK", "16")
+      ),
+    flow_policy_migration_worker_enabled:
+      boolean_env.("FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_ENABLED", true),
+    flow_policy_migration_worker_initial_delay_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_INITIAL_DELAY_MS", "1000")
+      ),
+    flow_policy_migration_worker_interval_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_INTERVAL_MS", "1000")
+      ),
+    flow_policy_migration_worker_catchup_delay_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_CATCHUP_DELAY_MS", "10")
+      ),
+    flow_policy_migration_worker_batch_size:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_BATCH_SIZE", "32")
+      ),
+    flow_policy_migration_worker_backfill_batch_size:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_BACKFILL_BATCH_SIZE", "256")
+      ),
+    flow_policy_migration_worker_backfill_max_bytes:
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_BACKFILL_MAX_BYTES",
+          "2097152"
+        )
+      ),
     flow_retention_sweeper_enabled:
       boolean_env.("FERRICSTORE_FLOW_RETENTION_SWEEPER_ENABLED", true),
     flow_retention_sweeper_initial_delay_ms:

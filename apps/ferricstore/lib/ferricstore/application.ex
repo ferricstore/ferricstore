@@ -228,6 +228,7 @@ defmodule Ferricstore.Application do
             Ferricstore.PrefixMetricsCache,
             Ferricstore.Waiters.Monitor,
             Ferricstore.Flow.HistoryProjector.TableOwner,
+            Ferricstore.Flow.Governance.LimitCache,
             Ferricstore.Store.BlobStore.TableOwner,
             Ferricstore.Raft.WARaftBackend.BatcherSupervisor,
             {Ferricstore.Store.KeydirTableOwner, instance_ctx: default_ctx}
@@ -240,12 +241,15 @@ defmodule Ferricstore.Application do
              data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
           ] ++
           [
+            {Ferricstore.Flow.Governance.LimitReconciler, instance_ctx: default_ctx},
+            {Ferricstore.Flow.Governance.LimitStorageCleaner, instance_ctx: default_ctx},
             {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
             Ferricstore.PubSub,
             Ferricstore.FetchOrCompute,
             {Ferricstore.OperationalGuard, instance_ctx: default_ctx},
             {Ferricstore.Flow.Scheduler, ctx: default_ctx},
             {Ferricstore.Flow.RetentionSweeper, instance_ctx: default_ctx},
+            {Ferricstore.Flow.PolicyMigrationWorker, instance_ctx: default_ctx},
             {Ferricstore.Store.BlobGCSweeper, instance_ctx: default_ctx},
             {Ferricstore.MemoryGuard, memory_guard_opts()},
             Ferricstore.Cluster.Manager
@@ -347,6 +351,7 @@ defmodule Ferricstore.Application do
 
     {shard_count, data_dir} = runtime_shutdown_config(state)
 
+    governance_cache_result = shutdown_flush_governance_limit_cache()
     waraft_result = shutdown_stop_waraft_backend()
     bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
     flow_lmdb_result = shutdown_flush_flow_lmdb_writers(shard_count)
@@ -356,15 +361,16 @@ defmodule Ferricstore.Application do
 
     elapsed = System.monotonic_time(:millisecond) - t0
 
-    case {waraft_result, bitcask_writer_result, flow_lmdb_result, bitcask_fsync_result,
-          wal_rollover_result} do
-      {:ok, :ok, :ok, :ok, :ok} ->
+    case {governance_cache_result, waraft_result, bitcask_writer_result, flow_lmdb_result,
+          bitcask_fsync_result, wal_rollover_result} do
+      {:ok, :ok, :ok, :ok, :ok, :ok} ->
         Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
-      {waraft_result, writer_result, flow_lmdb_result, bitcask_result, wal_result} ->
+      {governance_result, waraft_result, writer_result, flow_lmdb_result, bitcask_result,
+       wal_result} ->
         Logger.warning(
           "Shutdown: graceful flush complete with warnings in #{elapsed}ms " <>
-            "(waraft=#{inspect(waraft_result)}, bitcask_writer=#{inspect(writer_result)}, flow_lmdb=#{inspect(flow_lmdb_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
+            "(governance_cache=#{inspect(governance_result)}, waraft=#{inspect(waraft_result)}, bitcask_writer=#{inspect(writer_result)}, flow_lmdb=#{inspect(flow_lmdb_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
         )
     end
 
@@ -434,6 +440,19 @@ defmodule Ferricstore.Application do
     end
 
     result
+  end
+
+  defp shutdown_flush_governance_limit_cache do
+    ctx = FerricStore.Instance.get(:default)
+
+    case Ferricstore.Flow.Governance.LimitCache.flush(ctx) do
+      {:ok, _counts} -> :ok
+      {:error, _reason} = error -> error
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   defp shutdown_flush_bitcask_writers(shard_count) do

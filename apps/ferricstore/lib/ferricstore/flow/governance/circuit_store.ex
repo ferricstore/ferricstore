@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
 
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Governance.AtomicRecord
+  alias Ferricstore.Flow.Governance.Catalog
   alias Ferricstore.Flow.Governance.Circuit
   alias Ferricstore.Flow.Governance.Telemetry
   alias Ferricstore.Flow.Governance.View
@@ -19,6 +20,7 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
              scope
              |> Circuit.new(rule_opts)
              |> Circuit.record_manual_open(now_ms),
+           :ok <- Catalog.register(ctx, :circuit, Keys.governance_circuit_key(scope)),
            :ok <- Router.put(ctx, Keys.governance_circuit_key(scope), encode(circuit), 0) do
         {:ok, public(circuit)}
       end
@@ -42,7 +44,8 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
           fn circuit ->
             closed = Circuit.record_manual_close(circuit, now_ms)
             {:ok, closed, public(closed)}
-          end
+          end,
+          catalog_kind: :circuit
         )
       end
 
@@ -75,7 +78,8 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
               )
 
             {:ok, updated, public(updated)}
-          end
+          end,
+          catalog_kind: :circuit
         )
       end
 
@@ -114,7 +118,8 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
             else
               {:ok, updated, public(updated)}
             end
-          end
+          end,
+          catalog_kind: :circuit
         )
       end
 
@@ -140,35 +145,51 @@ defmodule Ferricstore.Flow.Governance.CircuitStore do
   def list(ctx, opts) when is_list(opts) do
     with {:ok, limit} <- optional_list_limit(opts),
          {:ok, scopes} <- optional_scope_filters(opts),
-         {:ok, status} <- optional_status(opts) do
-      circuits =
-        ctx
-        |> Router.keys()
-        |> Enum.filter(&Keys.governance_circuit_key?/1)
-        |> Enum.reduce([], fn key, acc ->
-          case Router.get(ctx, key) do
-            value when is_binary(value) ->
-              case decode(value) do
-                {:ok, circuit} -> [public(circuit) | acc]
-                {:error, _reason} -> acc
-              end
-
-            _other ->
-              acc
-          end
-        end)
-        |> Enum.filter(&matches_scope?(&1, scopes))
-        |> Enum.filter(&matches_status?(&1, status))
-        |> Enum.sort_by(fn circuit ->
-          {circuit_status_rank(Map.get(circuit, :status)), Map.get(circuit, :scope, "")}
-        end)
-        |> Enum.take(limit)
-
+         {:ok, status} <- optional_status(opts),
+         {:ok, circuits} <-
+           collect_list_circuits(ctx, scopes, status, limit) do
       {:ok, circuits}
     end
   end
 
   def list(_ctx, _opts), do: {:error, "ERR flow circuit opts must be a keyword list"}
+
+  defp collect_list_circuits(ctx, nil, status, limit) do
+    Catalog.collect(
+      ctx,
+      :circuit,
+      limit,
+      &load_list_circuit(ctx, &1, nil, status),
+      &circuit_list_sort_key/1
+    )
+  end
+
+  defp collect_list_circuits(ctx, scopes, status, limit) when is_list(scopes) do
+    keys = Enum.map(scopes, &Keys.governance_circuit_key/1)
+
+    Catalog.collect_keys(
+      keys,
+      limit,
+      &load_list_circuit(ctx, &1, scopes, status),
+      &circuit_list_sort_key/1
+    )
+  end
+
+  defp circuit_list_sort_key(circuit) do
+    {circuit_status_rank(Map.get(circuit, :status)), Map.get(circuit, :scope, "")}
+  end
+
+  defp load_list_circuit(ctx, key, scopes, status) do
+    with value when is_binary(value) <- Router.get(ctx, key),
+         {:ok, circuit} <- decode(value),
+         circuit = public(circuit),
+         true <- matches_scope?(circuit, scopes),
+         true <- matches_status?(circuit, status) do
+      {:ok, circuit}
+    else
+      _missing_corrupt_or_filtered -> :skip
+    end
+  end
 
   def allow(ctx, scope, now_ms) when is_binary(scope) and scope != "" do
     case get_record(ctx, scope) do

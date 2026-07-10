@@ -123,6 +123,56 @@ defmodule FerricStore.Instance.Supervisor do
         ]
       end
 
+    policy_migration_worker_children =
+      if name == :default do
+        []
+      else
+        worker_opts =
+          opts
+          |> Keyword.get(:flow_policy_migration_worker, [])
+          |> case do
+            value when is_list(value) -> value
+            _other -> []
+          end
+          |> Keyword.merge(
+            name: Ferricstore.Flow.PolicyMigrationWorker.name(ctx),
+            instance_ctx: ctx
+          )
+
+        [
+          Supervisor.child_spec(
+            {Ferricstore.Flow.PolicyMigrationWorker, worker_opts},
+            id: :"#{name}.FlowPolicyMigrationWorker"
+          )
+        ]
+      end
+
+    limit_reconciler_children =
+      if name == :default do
+        []
+      else
+        [
+          Supervisor.child_spec(
+            {Ferricstore.Flow.Governance.LimitReconciler, instance_ctx: ctx},
+            id: :"#{name}.FlowGovernanceLimitReconciler"
+          )
+        ]
+      end
+
+    limit_storage_cleaner_children =
+      if name == :default do
+        []
+      else
+        [
+          Supervisor.child_spec(
+            {Ferricstore.Flow.Governance.LimitStorageCleaner,
+             name: Ferricstore.Flow.Governance.LimitStorageCleaner.process_name(ctx),
+             instance_ctx: ctx},
+            id: :"#{name}.FlowGovernanceLimitStorageCleaner"
+          )
+        ]
+      end
+
     children =
       cleanup_children ++
         merge_children ++
@@ -145,6 +195,9 @@ defmodule FerricStore.Instance.Supervisor do
            ]}
         ] ++
         retention_sweeper_children ++
+        limit_reconciler_children ++
+        limit_storage_cleaner_children ++
+        policy_migration_worker_children ++
         [
           Supervisor.child_spec(
             {Ferricstore.Store.BlobGCSweeper, name: :"#{name}.BlobGCSweeper", instance_ctx: ctx},

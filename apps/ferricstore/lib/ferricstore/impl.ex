@@ -646,6 +646,14 @@ defmodule FerricStore.Impl do
     wrap_result(result)
   end
 
+  @spec zrank(FerricStore.Instance.t(), binary(), binary()) ::
+          {:ok, non_neg_integer() | nil} | {:error, binary()}
+  def zrank(ctx, key, member) do
+    store = build_store(ctx)
+    result = SortedSet.handle_ast({:zrank, key, to_string(member)}, store)
+    wrap_result(result)
+  end
+
   @spec zrange(FerricStore.Instance.t(), binary(), integer(), integer(), keyword()) ::
           {:ok, term()} | {:error, binary()}
   def zrange(ctx, key, start, stop, opts) do

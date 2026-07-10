@@ -751,8 +751,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
           |> rollback_rebuild_metadata(handle)
 
         _ =
-          ctx
-          |> build_sm_state(shard_index)
+          build_sm_state(ctx, shard_index, Map.get(metadata, :apply_context))
           |> maybe_recover_segment_projected!(Map.get(handle, :root_dir), metadata)
 
         :ok

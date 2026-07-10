@@ -9,7 +9,6 @@ defmodule Ferricstore.Store.Router.Part06 do
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
-      alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Raft.ReplyAwaiter
       alias Ferricstore.Stats
       alias Ferricstore.Store.BlobRef
@@ -225,6 +224,197 @@ defmodule Ferricstore.Store.Router.Part06 do
         do: {:error, "ERR flow policy transaction failed"}
 
       @doc false
+      def flow_policy_migration_step(ctx, shard_index, limit)
+          when is_integer(shard_index) and shard_index >= 0 and
+                 shard_index < ctx.shard_count and is_integer(limit) and limit > 0 and
+                 limit <= 256 do
+        case flow_policy_migration_plan(ctx, shard_index, limit) do
+          {:ok, %{idle?: true} = result} ->
+            {:ok, result}
+
+          {:ok, plan} ->
+            key = "f:{f}:policy-migration-step:" <> Integer.to_string(shard_index)
+            raft_write(ctx, shard_index, key, {:flow_policy_migration_step, plan})
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      def flow_policy_migration_step(_ctx, _shard_index, _limit),
+        do: {:error, "ERR invalid flow policy migration step"}
+
+      @doc false
+      def flow_policy_migration_pending?(ctx, shard_index)
+          when is_integer(shard_index) and shard_index >= 0 and
+                 shard_index < ctx.shard_count do
+        case Ferricstore.Flow.PolicyMigration.next_job(ctx, shard_index) do
+          {:ok, nil} -> false
+          {:ok, %{job: %{status: :active}}} -> true
+          _unavailable_or_corrupt -> false
+        end
+      end
+
+      def flow_policy_migration_pending?(_ctx, _shard_index), do: false
+
+      @doc false
+      def flow_policy_catalog_backfill_step(ctx, shard_index, request)
+          when is_integer(shard_index) and shard_index >= 0 and
+                 shard_index < ctx.shard_count and is_map(request) do
+        key = "f:{f}:policy-catalog-backfill-step:" <> Integer.to_string(shard_index)
+        raft_write(ctx, shard_index, key, {:flow_policy_catalog_backfill_step, request})
+      end
+
+      def flow_policy_catalog_backfill_step(_ctx, _shard_index, _request),
+        do: {:error, "ERR invalid flow policy catalog backfill step"}
+
+      defp flow_policy_migration_plan(ctx, shard_index, limit) do
+        with :ok <- flow_policy_migration_flush_projection(ctx, shard_index),
+             {:ok, backfill_proof} <-
+               flow_policy_catalog_backfill_proof(ctx, shard_index),
+             {:ok, mirrored_job} <-
+               Ferricstore.Flow.PolicyMigration.next_job(ctx, shard_index) do
+          flow_policy_migration_plan_mirrored_job(
+            ctx,
+            shard_index,
+            mirrored_job,
+            limit,
+            backfill_proof
+          )
+        else
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp flow_policy_migration_flush_projection(ctx, shard_index) do
+        case Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index, 30_000) do
+          :ok -> :ok
+          {:error, _reason} -> {:error, "ERR flow policy migration projection pending"}
+          _other -> {:error, "ERR flow policy migration projection pending"}
+        end
+      catch
+        :exit, _reason -> {:error, "ERR flow policy migration projection pending"}
+      end
+
+      defp flow_policy_migration_plan_mirrored_job(
+             _ctx,
+             _shard_index,
+             nil,
+             _limit,
+             _backfill_proof
+           ),
+           do: {:ok, %{processed: 0, done?: true, idle?: true}}
+
+      defp flow_policy_migration_plan_mirrored_job(
+             ctx,
+             shard_index,
+             %{key: job_key, value: mirrored_value},
+             limit,
+             backfill_proof
+           ) do
+        with {:ok, primary_value} <- read_shard_value(ctx, shard_index, job_key),
+             true <- is_binary(primary_value) and primary_value == mirrored_value,
+             {:ok, %{status: :active} = job} <-
+               Ferricstore.Flow.PolicyMigration.decode_job(primary_value),
+             {:ok, membership_revision} <-
+               flow_policy_type_membership_revision(ctx, shard_index, job.type),
+             true <- membership_revision == job.membership_revision,
+             {:ok, page} <-
+               Ferricstore.Flow.PolicyMigration.catalog_page(
+                 ctx,
+                 shard_index,
+                 job.type,
+                 job.migration_generation,
+                 limit,
+                 2 * 1_024 * 1_024
+               ) do
+          {:ok,
+           %{
+             idle?: false,
+             job_key: job_key,
+             type: job.type,
+             migration_generation: job.migration_generation,
+             membership_revision: membership_revision,
+             indexed_state_meta: job.indexed_state_meta,
+             catalog_entries: page.entries,
+             done?: page.done?,
+             backfill_proof: backfill_proof
+           }}
+        else
+          false -> {:error, "ERR flow policy migration projection pending"}
+          {:ok, nil} -> {:error, "ERR flow policy migration projection pending"}
+          :unavailable -> {:error, "ERR flow policy migration shard unavailable"}
+          :error -> {:error, "ERR flow policy migration job is corrupt"}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp flow_policy_catalog_backfill_proof(ctx, shard_index) do
+        key = Ferricstore.Flow.Keys.policy_catalog_backfill_key(shard_index)
+
+        with {:ok, source_token} <-
+               Ferricstore.Flow.PolicyMigration.source_token(ctx, shard_index) do
+          case read_shard_value(ctx, shard_index, key) do
+            {:ok, value} ->
+              case Ferricstore.Flow.PolicyMigration.decode_backfill_progress(value) do
+                {:ok, %{status: :done, source_token: ^source_token} = progress} ->
+                  if Ferricstore.Flow.PolicyMigration.mirror_matches?(
+                       ctx,
+                       shard_index,
+                       key,
+                       value
+                     ) do
+                    {:ok, %{run_token: progress.run_token, source_token: progress.source_token}}
+                  else
+                    {:error, "ERR flow policy catalog projection pending"}
+                  end
+
+                _incomplete ->
+                  {:error, "ERR flow policy catalog backfill incomplete"}
+              end
+
+            :unavailable ->
+              {:error, "ERR flow policy catalog backfill unavailable"}
+          end
+        else
+          {:error, _reason} -> {:error, "ERR flow policy catalog backfill unavailable"}
+        end
+      end
+
+      defp flow_policy_type_membership_revision(ctx, shard_index, type) do
+        key = Ferricstore.Flow.Keys.type_catalog_descriptor_key(type)
+
+        case read_shard_value(ctx, shard_index, key) do
+          {:ok, nil} ->
+            {:ok, 0}
+
+          {:ok, value} ->
+            case Ferricstore.Flow.PolicyMigration.decode_type_descriptor(value) do
+              {:ok, %{type: ^type, membership_revision: revision}} ->
+                if Ferricstore.Flow.PolicyMigration.mirror_matches?(
+                     ctx,
+                     shard_index,
+                     key,
+                     value
+                   ) do
+                  {:ok, revision}
+                else
+                  {:error, "ERR flow policy migration projection pending"}
+                end
+
+              {:ok, _collision} ->
+                {:error, "ERR flow type catalog digest collision"}
+
+              :error ->
+                {:error, "ERR flow type catalog descriptor is corrupt"}
+            end
+
+          :unavailable ->
+            :unavailable
+        end
+      end
+
+      @doc false
       def flow_get(ctx, id, partition_key) when is_binary(id) do
         key = Ferricstore.Flow.Keys.state_key(id, partition_key)
         now_ms = CommandTime.now_ms()
@@ -248,7 +438,55 @@ defmodule Ferricstore.Store.Router.Part06 do
       end
 
       @doc false
+      def flow_get_with_status(ctx, id, partition_key) when is_binary(id) do
+        key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+        now_ms = CommandTime.now_ms()
+
+        if flow_state_expired_or_deleted?(ctx, key, now_ms) do
+          nil
+        else
+          case flow_hot_value(ctx, key, now_ms) do
+            {:ok, value} ->
+              value
+
+            :fallback ->
+              case flow_batch_get_with_status(ctx, [id], partition_key) do
+                [value] -> value
+                _invalid -> :unavailable
+              end
+          end
+        end
+      end
+
+      defp flow_hot_value(ctx, key, now_ms) do
+        shard_index = shard_for(ctx, key)
+        keydir = resolve_keydir(ctx, shard_index)
+
+        case ets_get_full(ctx, shard_index, keydir, key, now_ms) do
+          {:hit, value, _lfu} when is_binary(value) ->
+            if flow_terminal_record_expired?(value, CommandTime.now_ms()),
+              do: {:ok, nil},
+              else: {:ok, value}
+
+          :expired ->
+            {:ok, nil}
+
+          _cold_missing_or_unavailable ->
+            :fallback
+        end
+      end
+
+      @doc false
       def flow_batch_get(ctx, ids, partition_key) when is_list(ids) do
+        do_flow_batch_get(ctx, ids, partition_key, :collapse_unavailable)
+      end
+
+      @doc false
+      def flow_batch_get_with_status(ctx, ids, partition_key) when is_list(ids) do
+        do_flow_batch_get(ctx, ids, partition_key, :preserve_unavailable)
+      end
+
+      defp do_flow_batch_get(ctx, ids, partition_key, availability_mode) do
         keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
         now_ms = CommandTime.now_ms()
 
@@ -256,7 +494,10 @@ defmodule Ferricstore.Store.Router.Part06 do
 
         values =
           Stats.with_cache_tracking_disabled(fn ->
-            batch_get(ctx, keys)
+            case availability_mode do
+              :preserve_unavailable -> flow_batch_read_with_status(ctx, keys)
+              :collapse_unavailable -> batch_get(ctx, keys)
+            end
           end)
 
         missing_keys =
@@ -286,12 +527,46 @@ defmodule Ferricstore.Store.Router.Part06 do
                   [] -> {nil, []}
                 end
 
+              value == :unavailable ->
+                {:unavailable, remaining}
+
               true ->
                 {nil, remaining}
             end
           end)
 
         merged
+      end
+
+      defp flow_batch_read_with_status(_ctx, []), do: []
+
+      defp flow_batch_read_with_status(ctx, keys) do
+        values_by_index =
+          keys
+          |> Enum.with_index()
+          |> Enum.group_by(fn {key, _index} -> shard_for(ctx, key) end)
+          |> Enum.reduce(%{}, fn {shard_index, indexed_keys}, acc ->
+            indexed_keys
+            |> Enum.chunk_every(512)
+            |> Enum.reduce(acc, fn indexed_chunk, values_acc ->
+              shard_keys = Enum.map(indexed_chunk, fn {key, _index} -> key end)
+
+              shard_values =
+                case read_shard_values(ctx, shard_index, shard_keys) do
+                  {:ok, values} -> values
+                  :unavailable -> List.duplicate(:unavailable, length(shard_keys))
+                  {:error, _reason} -> List.duplicate(:unavailable, length(shard_keys))
+                end
+
+              indexed_chunk
+              |> Enum.zip(shard_values)
+              |> Enum.reduce(values_acc, fn {{_key, index}, value}, chunk_acc ->
+                Map.put(chunk_acc, index, value)
+              end)
+            end)
+          end)
+
+        Enum.map(0..(length(keys) - 1), &Map.fetch!(values_by_index, &1))
       end
 
       defp flow_blocked_state_keys(ctx, keys, now_ms) do

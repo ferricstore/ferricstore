@@ -123,6 +123,132 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_policy_migration_step, plan}, state) when is_map(plan) do
+        item_count = plan |> Map.get(:catalog_entries, []) |> length()
+
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_policy_migration_step,
+          %{items: item_count},
+          fn -> do_flow_policy_migration_step(state, plan) end
+        )
+      end
+
+      def apply(meta, {:flow_governance_limit_mutate, key, attrs}, state)
+          when is_binary(key) and is_map(attrs) do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_governance_limit_mutate,
+          %{items: Map.get(attrs, :amount, 1)},
+          fn -> do_flow_governance_limit_mutate(state, key, attrs) end
+        )
+      end
+
+      def apply(meta, command, state)
+          when is_tuple(command) and tuple_size(command) > 0 and
+                 elem(command, 0) == :flow_governance_limit_mutate do
+        with_apply_time(meta, fn ->
+          old_count = state.applied_count
+          new_state = %{state | applied_count: old_count + 1}
+
+          maybe_release_cursor(
+            meta,
+            old_count,
+            new_state,
+            {:error, "ERR invalid flow limit mutation"}
+          )
+        end)
+      end
+
+      def apply(meta, {:flow_policy_catalog_backfill_step, request}, state)
+          when is_map(request) do
+        item_count = request |> Map.get(:candidates, []) |> length()
+
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_policy_catalog_backfill_step,
+          %{items: item_count},
+          fn -> do_flow_policy_catalog_backfill_step(state, request) end
+        )
+      end
+
+      def apply(
+            meta,
+            {:flow_governance_release_outbox_ack, _key, shard_index, expected_head, up_to},
+            state
+          )
+          when is_integer(shard_index) and shard_index >= 0 and is_integer(expected_head) and
+                 expected_head > 0 and is_integer(up_to) and up_to >= expected_head and
+                 up_to - expected_head < 256 do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_governance_release_outbox_ack,
+          %{items: max(up_to - expected_head + 1, 0)},
+          fn ->
+            do_flow_governance_release_outbox_ack(
+              state,
+              shard_index,
+              expected_head,
+              up_to
+            )
+          end
+        )
+      end
+
+      def apply(
+            meta,
+            {:flow_governance_release_outbox_mark_completed, _key, shard_index, sequences},
+            state
+          )
+          when is_integer(shard_index) and shard_index >= 0 and is_list(sequences) and
+                 sequences != [] and length(sequences) <= 256 do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_governance_release_outbox_mark_completed,
+          %{items: length(sequences)},
+          fn ->
+            do_flow_governance_release_outbox_mark_completed(
+              state,
+              shard_index,
+              sequences
+            )
+          end
+        )
+      end
+
+      def apply(
+            meta,
+            {:flow_governance_release_outbox_mark_completed, _key, _shard_index, _sequences},
+            state
+          ) do
+        with_apply_time(meta, fn ->
+          bump_applied(
+            meta,
+            state,
+            {:error, "ERR invalid flow governance release outbox completion"}
+          )
+        end)
+      end
+
+      def apply(
+            meta,
+            {:flow_governance_release_outbox_ack, _key, _shard_index, _expected_head, _up_to},
+            state
+          ) do
+        with_apply_time(meta, fn ->
+          bump_applied(
+            meta,
+            state,
+            {:error, "ERR invalid flow governance release outbox acknowledgement"}
+          )
+        end)
+      end
+
       def apply(meta, {:put_blob_ref, key, encoded_ref, expire_at_ms}, state) do
         apply_pending_with_time(meta, state, fn ->
           do_checked_put_blob_ref_ref_only(state, key, encoded_ref, expire_at_ms)
@@ -1065,6 +1191,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # Generic server command hook — allows server apps to replicate their own
       # commands through Raft without the library knowing what they are.
       # The server registers a raft_apply_hook callback on the Instance struct.
+      def apply(meta, {:ferricstore_apply_context, encoded, inner_command}, state)
+          when is_tuple(inner_command) do
+        if Map.get(state, :apply_context_encoded) == encoded do
+          __MODULE__.apply(meta, inner_command, state)
+        else
+          case Ferricstore.Raft.ApplyContext.decode(encoded) do
+            {:ok, context} ->
+              state =
+                state
+                |> Map.put(:apply_context, context)
+                |> Map.put(:apply_context_encoded, encoded)
+
+              __MODULE__.apply(meta, inner_command, state)
+
+            {:error, :invalid_apply_context} ->
+              with_apply_time(meta, fn ->
+                bump_applied(meta, state, {:error, "ERR invalid replicated apply context"})
+              end)
+          end
+        end
+      end
+
+      def apply(meta, {:ferricstore_apply_context, _encoded, _invalid_inner}, state) do
+        with_apply_time(meta, fn ->
+          bump_applied(meta, state, {:error, "ERR invalid replicated apply context command"})
+        end)
+      end
+
       def apply(meta, {:server_command, command}, state) do
         with_apply_time(meta, fn ->
           hook = raft_apply_hook(state)

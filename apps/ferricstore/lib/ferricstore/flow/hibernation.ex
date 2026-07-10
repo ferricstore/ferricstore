@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.Hibernation do
   @moduledoc false
 
   alias Ferricstore.Flow.{ClaimWaiters, Keys, LMDB, Locator}
+  alias Ferricstore.Raft.ApplyContext
 
   @default_hot_window_ms Application.compile_env(
                            :ferricstore,
@@ -64,6 +65,9 @@ defmodule Ferricstore.Flow.Hibernation do
     end
   end
 
+  @spec enabled?(ApplyContext.t()) :: boolean()
+  def enabled?(%ApplyContext{} = context), do: context.flow_hibernation_enabled
+
   def refresh_config! do
     :persistent_term.erase(@enabled_key)
     enabled?()
@@ -73,6 +77,17 @@ defmodule Ferricstore.Flow.Hibernation do
   def safety_margin_ms, do: @default_safety_margin_ms
   def promote_window_ms, do: @default_promote_window_ms
   def late_promote_window_ms, do: @default_late_promote_window_ms
+
+  def hot_window_ms(%ApplyContext{} = context), do: context.flow_hibernation_hot_window_ms
+
+  def safety_margin_ms(%ApplyContext{} = context),
+    do: context.flow_hibernation_safety_margin_ms
+
+  def promote_window_ms(%ApplyContext{} = context),
+    do: context.flow_hibernation_promote_window_ms
+
+  def late_promote_window_ms(%ApplyContext{} = context),
+    do: context.flow_hibernation_late_promote_window_ms
 
   @spec maybe_schedule_claim_waiter(map()) :: :ok
   def maybe_schedule_claim_waiter(%{type: type, state: state, next_run_at_ms: due_at_ms} = record)

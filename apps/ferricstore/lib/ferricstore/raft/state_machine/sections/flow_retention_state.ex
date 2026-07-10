@@ -149,8 +149,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
             end
           end)
 
-        key_budget = flow_retention_cleanup_key_budget(attrs)
-        byte_budget = flow_retention_cleanup_byte_budget(attrs)
+        key_budget = flow_retention_cleanup_key_budget(state, attrs)
+        byte_budget = flow_retention_cleanup_byte_budget(state, attrs)
 
         {candidates, _remaining_limit, _remaining_keys, _remaining_bytes} =
           state_keys
@@ -650,16 +650,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
              key_budget \\ nil
            ) do
         if flow_retention_keydir_available?(state) do
+          context = raft_apply_context(state)
+
           key_budget =
             case key_budget do
-              value when is_integer(value) and value > 0 -> max(value, 8)
-              _missing -> flow_retention_cleanup_key_budget(%{})
+              value when is_integer(value) and value > 0 ->
+                min(value, context.flow_retention_cleanup_key_budget)
+
+              _missing ->
+                flow_retention_cleanup_key_budget(state, %{})
             end
 
           history_key =
             FlowKeys.history_key(Map.fetch!(record, :id), Map.get(record, :partition_key))
 
-          history_limit = min(key_budget, flow_retention_history_lmdb_scan_limit())
+          history_limit = min(key_budget, flow_retention_history_lmdb_scan_limit(state))
 
           with {:ok, history_entries, history_complete?} <-
                  flow_retention_history_entries(state, history_key, history_limit) do
@@ -669,7 +674,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
             {cleanup_member_entries, cleanup_members_complete?} =
               if history_complete? do
                 member_limit =
-                  min(div(remaining, 2), flow_retention_value_lmdb_scan_limit())
+                  min(div(remaining, 2), flow_retention_value_lmdb_scan_limit(state))
 
                 flow_retention_cleanup_member_entries(state, record, member_limit)
               else
@@ -708,28 +713,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         end
       end
 
-      defp flow_retention_cleanup_key_budget(attrs) do
+      defp flow_retention_cleanup_key_budget(state, attrs) do
+        context = raft_apply_context(state)
+
         attrs
         |> Map.get(
           :cleanup_key_budget,
-          Application.get_env(:ferricstore, :flow_retention_cleanup_key_budget, 1_024)
+          context.flow_retention_cleanup_key_budget
         )
-        |> flow_retention_positive_integer(1_024)
-        |> max(8)
+        |> flow_retention_positive_integer(context.flow_retention_cleanup_key_budget)
+        |> min(context.flow_retention_cleanup_key_budget)
       end
 
-      defp flow_retention_cleanup_byte_budget(attrs) do
+      defp flow_retention_cleanup_byte_budget(state, attrs) do
+        context = raft_apply_context(state)
+
         attrs
         |> Map.get(
           :cleanup_byte_budget,
-          Application.get_env(
-            :ferricstore,
-            :flow_retention_cleanup_byte_budget,
-            8 * 1_024 * 1_024
-          )
+          context.flow_retention_cleanup_byte_budget
         )
-        |> flow_retention_positive_integer(8 * 1_024 * 1_024)
-        |> max(4_096)
+        |> flow_retention_positive_integer(context.flow_retention_cleanup_byte_budget)
+        |> min(context.flow_retention_cleanup_byte_budget)
       end
 
       defp flow_retention_cleanup_record(
@@ -788,6 +793,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
             with {:ok, _registry_count} <- flow_retention_delete_keys(state, [registry_key]),
                  {:ok, _governance_index_count} <-
                    flow_retention_delete_keys(state, [governance_ledger_index_key]),
+                 :ok <- flow_delete_type_catalog_member(state, record),
                  :ok <- do_delete(state, state_key),
                  :ok <- flow_release_shared_value_refs(state, record),
                  :ok <- do_delete(state, guard_key),

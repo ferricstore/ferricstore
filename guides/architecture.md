@@ -372,6 +372,28 @@ A Rust-owned KV keydir should be treated as a larger architecture change, not a 
 
 **HLC Piggybacking**: Commands can be wrapped as `{inner_command, %{hlc_ts: {physical_ms, logical}}}`. When `apply/3` processes a wrapped command, it calls `HLC.update/1` to merge the leader's clock into the local node's HLC, keeping followers causally synchronized.
 
+**Replicated Apply Context**: Policy-sensitive Flow commands carry a compact, versioned `ApplyContext` captured from the immutable instance configuration before Raft submission. Apply reads retention, cleanup, and hibernation limits from that command context rather than node-local application or process configuration. The latest applied context is stored in machine state and WARaft recovery/snapshot metadata. Ordinary KV commands keep their existing command shape and allocation path.
+
+### Flow Policy Ordering And Migration
+
+Flow policy storage has an internal monotonic generation that is separate from the public `version` field. Policy-sensitive Flow commands capture the generation and normalized policy they observed before entering a shard's Raft log. Batch commands deduplicate those snapshots by Flow type. Apply uses the captured policy for lifecycle and retry decisions, so replicas converge even when the policy Raft group and a Flow shard group are applied in different relative orders.
+
+Generation allocation is always enabled. Policy fan-out uses one cross-shard command and one generation-bearing persisted envelope; there is no rollout mode or alternate write path.
+
+Policy-derived index projection uses a generation high-water in the durable per-Flow type catalog. This makes projection updates commutative: a delayed command may retain its captured lifecycle semantics, but it cannot replace projection state installed by a newer policy generation. Catalog entries retain exact type ownership rather than relying on an in-memory prefix scan.
+
+Policy changes enqueue resumable migration work instead of synchronously scanning a shard keydir. A bounded worker first stages authoritative primary keydir membership, including registry-derived cold states, and then plans bounded catalog-member batches outside Raft apply. Each replicated migration command contains explicit, size-bounded record candidates, guards, and the policy generation; apply validates that plan without reading replica-local LMDB or selecting work from a native index. Catalog membership remains non-expiring until explicit state cleanup. Durable cursor/source metadata lets ordinary restarts resume and forces a safe restart after destructive source replacement.
+
+### Flow Limit Reservation Storage
+
+Limit owners persist fixed-size counters; exact reservation IDs live in detached
+pages of 256 entries. IDs carry the lease epoch used by their spend command.
+When all reservations in an epoch are released, apply advances the epoch and
+queues the old pages for bounded cleanup, so an old command remains fenced even
+after its tombstones are deleted. A scope may retain at most 256 pages in one
+active epoch and 256 pending cleanup tasks; new spends receive backpressure at
+those bounds instead of growing storage without limit.
+
 ## LFU Eviction
 
 FerricStore implements LFU (Least Frequently Used) eviction with time-based decay.
@@ -653,6 +675,16 @@ The protocol also has `COMMAND_EXEC` for generic command execution:
 into the same internal AST shape used by embedded command handlers. The native
 protocol separates command name and arguments; it does not parse inline text
 frames.
+
+`Ferricstore.Commands.PreparedCommand` is the shared result of that parse. It
+contains the normalized AST plus ACL keys, an explicit routing scope, routing
+keys, and separate read/write mutation footprints. Native dispatch, same-shard
+pipeline validation, blocking and session handling, transaction
+reauthorization, and `MULTI` shard planning reuse the same immutable value so
+no stage can reinterpret a command's keys differently. Coordinated Flow and
+global control commands are rejected by execution modes that promise
+single-shard semantics. Legacy parser callers receive a compatibility tuple
+derived from the prepared value.
 
 ### Per-Connection State
 

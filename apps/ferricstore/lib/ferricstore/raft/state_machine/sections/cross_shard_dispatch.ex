@@ -130,7 +130,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           with_current_ra_index(meta, fn ->
             item_count = flow_apply_item_count(attrs)
             started_at = System.monotonic_time()
-            result = with_pending_writes(state, fun)
+
+            result =
+              with_flow_policy_snapshots(attrs, fn ->
+                with_pending_writes(state, fun)
+              end)
 
             emit_flow_apply_telemetry(
               state,
@@ -148,7 +152,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       defp apply_flow_single_with_telemetry(state, command_shape, attrs, fun) do
         item_count = flow_apply_item_count(attrs)
         started_at = System.monotonic_time()
-        result = fun.()
+        result = with_flow_policy_snapshots(attrs, fun)
 
         emit_flow_apply_telemetry(
           state,
@@ -159,6 +163,152 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         )
 
         result
+      end
+
+      defp with_flow_policy_snapshots(attrs, fun) when is_function(fun, 0) do
+        with {:ok, {captured?, snapshots}} <- flow_policy_snapshots(attrs) do
+          if not captured? do
+            fun.()
+          else
+            with {:ok, merged} <- merge_flow_policy_snapshots(snapshots) do
+              previous = Process.get(:sm_flow_policy_snapshots, :undefined)
+              Process.put(:sm_flow_policy_snapshots, merged)
+
+              try do
+                fun.()
+              after
+                case previous do
+                  :undefined -> Process.delete(:sm_flow_policy_snapshots)
+                  value -> Process.put(:sm_flow_policy_snapshots, value)
+                end
+              end
+            end
+          end
+        end
+      end
+
+      defp flow_policy_snapshots(attrs) do
+        with {:ok, snapshots} <- collect_flow_policy_snapshots(attrs, %{}),
+             :ok <-
+               snapshots
+               |> Map.values()
+               |> Enum.map(& &1.policy)
+               |> RetryPolicy.validate_flow_policy_snapshots_size(),
+             {:ok, captured?} <- flow_policy_snapshot_captured?(attrs, snapshots) do
+          {:ok, {captured?, snapshots}}
+        end
+      end
+
+      defp flow_policy_snapshot_captured?(attrs, snapshots) when is_list(attrs),
+        do: {:ok, map_size(snapshots) > 0}
+
+      defp flow_policy_snapshot_captured?(attrs, snapshots) when is_map(attrs) do
+        case Map.fetch(attrs, :policy_snapshot_captured) do
+          :error -> {:ok, map_size(snapshots) > 0}
+          {:ok, true} -> {:ok, true}
+          {:ok, _invalid} -> {:error, "ERR invalid flow policy snapshot"}
+        end
+      end
+
+      defp collect_flow_policy_snapshots(attrs, snapshots) when is_map(attrs) do
+        with {:ok, snapshots} <- collect_flow_policy_snapshot(attrs, snapshots),
+             {:ok, snapshots} <- collect_flow_policy_snapshot_map(attrs, snapshots) do
+          Enum.reduce_while([:records, :children], {:ok, snapshots}, fn key, {:ok, acc} ->
+            case Map.get(attrs, key) do
+              entries when is_list(entries) ->
+                case collect_flow_policy_snapshots(entries, acc) do
+                  {:ok, next} -> {:cont, {:ok, next}}
+                  {:error, _reason} = error -> {:halt, error}
+                end
+
+              _other ->
+                {:cont, {:ok, acc}}
+            end
+          end)
+        end
+      end
+
+      defp collect_flow_policy_snapshot_map(attrs, snapshots) do
+        case Map.fetch(attrs, :policy_snapshots) do
+          :error ->
+            {:ok, snapshots}
+
+          {:ok, entries} when is_map(entries) ->
+            Enum.reduce_while(entries, {:ok, snapshots}, fn
+              {type, %{generation: generation, policy: policy}}, {:ok, acc}
+              when is_binary(type) and type != "" ->
+                snapshot_attrs = %{
+                  type: type,
+                  policy_generation: generation,
+                  policy_snapshot: policy
+                }
+
+                case collect_flow_policy_snapshot(snapshot_attrs, acc) do
+                  {:ok, next} -> {:cont, {:ok, next}}
+                  {:error, _reason} = error -> {:halt, error}
+                end
+
+              _invalid, _acc ->
+                {:halt, {:error, "ERR invalid flow policy snapshot"}}
+            end)
+
+          {:ok, _invalid} ->
+            {:error, "ERR invalid flow policy snapshot"}
+        end
+      end
+
+      defp collect_flow_policy_snapshots(entries, snapshots) when is_list(entries) do
+        Enum.reduce_while(entries, {:ok, snapshots}, fn entry, {:ok, acc} ->
+          case collect_flow_policy_snapshots(entry, acc) do
+            {:ok, next} -> {:cont, {:ok, next}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp collect_flow_policy_snapshots(_other, snapshots), do: {:ok, snapshots}
+
+      defp collect_flow_policy_snapshot(attrs, snapshots) do
+        case {Map.fetch(attrs, :policy_generation), Map.fetch(attrs, :policy_snapshot)} do
+          {:error, :error} ->
+            {:ok, snapshots}
+
+          {{:ok, generation}, {:ok, %{type: type} = policy}}
+          when is_integer(generation) and generation >= 0 and is_binary(type) and type != "" ->
+            if generation <= RetryPolicy.max_policy_generation() and
+                 flow_policy_snapshot_matches_attrs?(attrs, type) do
+              snapshot = %{generation: generation, policy: policy}
+
+              case Map.fetch(snapshots, type) do
+                :error -> {:ok, Map.put(snapshots, type, snapshot)}
+                {:ok, ^snapshot} -> {:ok, snapshots}
+                {:ok, _conflict} -> {:error, "ERR conflicting flow policy snapshots"}
+              end
+            else
+              {:error, "ERR invalid flow policy snapshot"}
+            end
+
+          _invalid ->
+            {:error, "ERR invalid flow policy snapshot"}
+        end
+      end
+
+      defp flow_policy_snapshot_matches_attrs?(%{type: attrs_type}, snapshot_type)
+           when is_binary(attrs_type) and attrs_type != "",
+           do: attrs_type == snapshot_type
+
+      defp flow_policy_snapshot_matches_attrs?(_attrs, _snapshot_type), do: true
+
+      defp merge_flow_policy_snapshots(snapshots) do
+        current = Process.get(:sm_flow_policy_snapshots, %{})
+
+        Enum.reduce_while(snapshots, {:ok, current}, fn {type, snapshot}, {:ok, acc} ->
+          case Map.fetch(acc, type) do
+            :error -> {:cont, {:ok, Map.put(acc, type, snapshot)}}
+            {:ok, ^snapshot} -> {:cont, {:ok, acc}}
+            {:ok, _conflict} -> {:halt, {:error, "ERR conflicting flow policy snapshots"}}
+          end
+        end)
       end
 
       defp emit_flow_apply_telemetry(state, command_shape, started_at, item_count, result) do
@@ -248,6 +398,225 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         end)
       end
 
+      defp prepare_cross_shard_policy_entries(entries, state) do
+        with {:ok, policy_targets} <- cross_shard_policy_target_indices(entries, state) do
+          entries
+          |> Enum.reduce_while({:ok, [], %{}}, fn entry, {:ok, prepared, policies} ->
+            case prepare_cross_shard_policy_entry(entry, state, policies, policy_targets) do
+              {:ok, next_entry, next_policies} ->
+                {:cont, {:ok, [next_entry | prepared], next_policies}}
+
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
+          end)
+          |> case do
+            {:ok, prepared, _policies} -> {:ok, Enum.reverse(prepared)}
+            {:error, _reason} = error -> error
+          end
+        end
+      end
+
+      defp cross_shard_policy_target_indices(entries, state) do
+        entries
+        |> Enum.reduce_while({:ok, %{}}, fn
+          {_orig_idx, shard_idx, _pos,
+           {:flow_cross_policy_put, target_idx, key, _value, _expire_at_ms}, _namespace},
+          {:ok, targets}
+          when is_integer(target_idx) and target_idx >= 0 and shard_idx == target_idx and
+                 is_binary(key) ->
+            case Map.fetch(targets, key) do
+              {:ok, indices} ->
+                if MapSet.member?(indices, target_idx) do
+                  {:halt, {:error, "ERR invalid flow policy target set"}}
+                else
+                  {:cont, {:ok, Map.put(targets, key, MapSet.put(indices, target_idx))}}
+                end
+
+              :error ->
+                {:cont, {:ok, Map.put(targets, key, MapSet.new([target_idx]))}}
+            end
+
+          {_orig_idx, _shard_idx, _pos,
+           {:flow_cross_policy_put, _target_idx, _key, _value, _expire_at_ms}, _namespace},
+          _acc ->
+            {:halt, {:error, "ERR invalid flow policy target shard"}}
+
+          _entry, {:ok, targets} ->
+            {:cont, {:ok, targets}}
+        end)
+        |> case do
+          {:ok, targets} ->
+            with :ok <- validate_cross_shard_policy_target_sets(state, targets) do
+              {:ok,
+               Map.new(targets, fn {key, indices} ->
+                 {key, indices |> Enum.to_list() |> Enum.sort()}
+               end)}
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp validate_cross_shard_policy_target_sets(state, targets) do
+        case cross_shard_instance_ctx(state) do
+          %{shard_count: shard_count} when is_integer(shard_count) and shard_count > 0 ->
+            expected = MapSet.new(0..(shard_count - 1))
+
+            if Enum.all?(targets, fn {_key, indices} -> MapSet.equal?(indices, expected) end) do
+              :ok
+            else
+              {:error, "ERR invalid flow policy target set"}
+            end
+
+          _unknown_instance ->
+            :ok
+        end
+      end
+
+      defp prepare_cross_shard_policy_entry(
+             {orig_idx, shard_idx, pos,
+              {:flow_cross_policy_put, target_idx, key, value, expire_at_ms}, namespace},
+             state,
+             policies,
+             policy_targets
+           ) do
+        case Map.fetch(policies, key) do
+          {:ok, {^value, versioned_value}} ->
+            entry =
+              {orig_idx, shard_idx, pos,
+               {:flow_cross_policy_put, target_idx, key, versioned_value, expire_at_ms},
+               namespace}
+
+            {:ok, entry, policies}
+
+          {:ok, {_other_value, _versioned_value}} ->
+            {:error, "ERR conflicting flow policy values in transaction"}
+
+          :error ->
+            with {:ok, target_indices} <- Map.fetch(policy_targets, key),
+                 {:ok, versioned_value} <-
+                   next_flow_policy_value(state, key, value, target_indices) do
+              entry =
+                {orig_idx, shard_idx, pos,
+                 {:flow_cross_policy_put, target_idx, key, versioned_value, expire_at_ms},
+                 namespace}
+
+              {:ok, entry, Map.put(policies, key, {value, versioned_value})}
+            end
+        end
+      end
+
+      defp prepare_cross_shard_policy_entry(entry, _state, policies, _policy_targets),
+        do: {:ok, entry, policies}
+
+      defp next_flow_policy_value(state, key, value, target_indices) do
+        case FlowKeys.policy_type(key) do
+          {:ok, type} ->
+            case RetryPolicy.decode_flow_policy_entry(value) do
+              {:ok, {_input_generation, %{type: ^type} = policy}} ->
+                with {:ok, high_water} <-
+                       current_flow_policy_generation(state, key, target_indices),
+                     {:ok, generation} <-
+                       Ferricstore.Flow.PolicyMigration.next_generation(high_water) do
+                  {:ok, RetryPolicy.encode_flow_policy(policy, generation)}
+                end
+
+              _invalid ->
+                {:error, "ERR invalid flow policy value"}
+            end
+
+          :error ->
+            {:error, "ERR invalid flow policy key"}
+        end
+      end
+
+      defp current_flow_policy_generation(state, key, target_indices) do
+        with {:ok, type} <- FlowKeys.policy_type(key) do
+          Enum.reduce_while(target_indices, {:ok, 0}, fn target_idx, {:ok, high_water} ->
+            case flow_policy_target_state(state, target_idx) do
+              {:ok, target_state} ->
+                {stored_generation, _stored_value} =
+                  flow_stored_policy_generation(target_state, key)
+
+                case flow_policy_strict_migration_high_water(target_state, type) do
+                  {:ok, migration_generation} ->
+                    target_high_water = max(stored_generation, migration_generation)
+                    {:cont, {:ok, max(high_water, target_high_water)}}
+
+                  {:error, _reason} = error ->
+                    {:halt, error}
+                end
+
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
+          end)
+        else
+          :error -> {:error, "ERR invalid flow policy key"}
+        end
+      end
+
+      defp flow_policy_strict_migration_high_water(state, type) do
+        [
+          {FlowKeys.policy_migration_job_key(type), :active},
+          {FlowKeys.policy_migration_marker_key(type), :done}
+        ]
+        |> Enum.reduce_while({:ok, 0}, fn {key, expected_status}, {:ok, high_water} ->
+          case do_get(state, key) do
+            nil ->
+              {:cont, {:ok, high_water}}
+
+            value when is_binary(value) ->
+              case Ferricstore.Flow.PolicyMigration.decode_job(value) do
+                {:ok,
+                 %{
+                   type: ^type,
+                   status: ^expected_status,
+                   migration_generation: generation
+                 }} ->
+                  {:cont, {:ok, max(high_water, generation)}}
+
+                _invalid ->
+                  {:halt, {:error, "ERR corrupt flow policy migration high-water"}}
+              end
+
+            _invalid ->
+              {:halt, {:error, "ERR corrupt flow policy migration high-water"}}
+          end
+        end)
+      end
+
+      defp flow_policy_target_state(state, target_idx) do
+        instance_ctx = cross_shard_instance_ctx(state)
+
+        target_in_range? =
+          target_idx == state.shard_index or
+            (is_map(instance_ctx) and is_integer(Map.get(instance_ctx, :shard_count)) and
+               target_idx < Map.fetch!(instance_ctx, :shard_count) and
+               is_tuple(Map.get(instance_ctx, :keydir_refs)) and
+               target_idx < tuple_size(Map.fetch!(instance_ctx, :keydir_refs)))
+
+        if target_in_range? do
+          try do
+            target_state = cross_shard_state_for_index(state, target_idx)
+
+            if :ets.info(target_state.ets, :type) == :undefined do
+              {:error, "ERR flow policy target shard not available"}
+            else
+              {:ok, target_state}
+            end
+          rescue
+            _error -> {:error, "ERR flow policy target shard not available"}
+          catch
+            _kind, _reason -> {:error, "ERR flow policy target shard not available"}
+          end
+        else
+          {:error, "ERR flow policy target shard not available"}
+        end
+      end
+
       defp transaction_watches_clean?(watched_keys, _state) when map_size(watched_keys) == 0,
         do: true
 
@@ -271,7 +640,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              _store,
              state
            ) do
-        do_flow_cross_spawn_children(state, attrs)
+        with_flow_policy_snapshots(attrs, fn -> do_flow_cross_spawn_children(state, attrs) end)
       end
 
       defp dispatch_cross_shard_entry(
@@ -318,7 +687,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              state
            ) do
         if op in [:complete, :retry, :fail, :cancel] do
-          do_flow_cross_terminal(state, op, attrs)
+          with_flow_policy_snapshots(attrs, fn -> do_flow_cross_terminal(state, op, attrs) end)
         else
           {:error, "ERR invalid flow cross-shard terminal op"}
         end
@@ -331,7 +700,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              state
            ) do
         if op in [:complete, :retry, :fail, :cancel] do
-          do_flow_cross_terminal_many(state, op, attrs_list)
+          with_flow_policy_snapshots(attrs_list, fn ->
+            do_flow_cross_terminal_many(state, op, attrs_list)
+          end)
         else
           {:error, "ERR invalid flow cross-shard terminal op"}
         end
@@ -343,24 +714,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              _store,
              state
            ) do
-        do_flow_cross_retention_cleanup(state, attrs)
+        with_flow_policy_snapshots(attrs, fn -> do_flow_cross_retention_cleanup(state, attrs) end)
       end
 
       defp dispatch_cross_shard_entry(entry, sandbox_namespace, store, _state) do
-        ast =
-          entry
-          |> TxAst.command_ast()
-          |> TxAst.namespace_first_key(sandbox_namespace)
+        with {:ok, ast} <- normalize_cross_shard_entry_ast(entry, sandbox_namespace) do
+          try do
+            Dispatcher.dispatch_ast(ast, store)
+          catch
+            :exit, {:noproc, _} ->
+              {:error, "ERR server not ready, shard process unavailable"}
 
-        try do
-          Dispatcher.dispatch_ast(ast, store)
-        catch
-          :exit, {:noproc, _} ->
-            {:error, "ERR server not ready, shard process unavailable"}
-
-          :exit, {reason, _} ->
-            {:error, "ERR internal error: #{inspect(reason)}"}
+            :exit, {reason, _} ->
+              {:error, "ERR internal error: #{inspect(reason)}"}
+          end
         end
+      end
+
+      defp normalize_cross_shard_entry_ast(entry, sandbox_namespace) do
+        {:ok,
+         entry
+         |> TxAst.command_ast()
+         |> TxAst.namespace_first_key(sandbox_namespace)}
+      rescue
+        _error in [ArgumentError, FunctionClauseError] ->
+          {:error, "ERR invalid cross-shard transaction entry"}
       end
 
       defp cross_shard_fatal_entry_error({orig_idx, entry}, result)

@@ -977,7 +977,12 @@ defmodule FerricStore.API.Flow do
   def flow_limit_lease(_scope, _opts),
     do: {:error, "ERR flow limit opts must be a keyword list"}
 
-  @doc "Spends credits from a durable Flow governance limit lease."
+  @doc """
+  Spends credits from a durable Flow governance limit lease.
+
+  An unknown write outcome returns `FLOW_LIMIT_SPEND_UNKNOWN_OUTCOME` with the
+  exact reservation IDs. Release those IDs before retrying the spend.
+  """
   @spec flow_limit_spend(binary(), keyword()) :: {:ok, map()} | {:error, binary() | map()}
   def flow_limit_spend(scope, opts \\ [])
 
@@ -988,7 +993,7 @@ defmodule FerricStore.API.Flow do
   def flow_limit_spend(_scope, _opts),
     do: {:error, "ERR flow limit opts must be a keyword list"}
 
-  @doc "Releases in-use credits back to a durable Flow governance limit lease."
+  @doc "Releases the exact reservation IDs from a durable Flow governance limit lease."
   @spec flow_limit_release(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_limit_release(scope, opts \\ [])
 

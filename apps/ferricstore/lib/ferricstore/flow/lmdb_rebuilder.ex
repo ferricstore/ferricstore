@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   alias Ferricstore.Flow.LMDBRebuilder.TerminalProjection
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+  alias Ferricstore.Flow.PolicyMigration
   alias Ferricstore.Flow.SharedRefBackfill
 
   @batch_size 512
@@ -145,7 +146,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         %{shard_index: shard_index}
       )
 
-      :ok
+      if Keyword.get(opts, :rotate_policy_source?, false),
+        do: PolicyMigration.rotate_source_token(lmdb_path),
+        else: :ok
     after
       Process.delete(:flow_lmdb_rebuild_cold_read_errors)
     end
@@ -190,7 +193,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
               zset_score_index,
               zset_score_lookup,
               flow_index,
-              flow_lookup
+              flow_lookup,
+              rotate_policy_source?: true
             )
 
           if flush_marker? do
@@ -222,7 +226,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
               zset_score_index,
               zset_score_lookup,
               flow_index,
-              flow_lookup
+              flow_lookup,
+              rotate_policy_source?: true
             )
 
           # A crash can leave the marker behind after LMDB has only part of one
@@ -252,7 +257,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
               zset_score_index,
               zset_score_lookup,
               flow_index,
-              flow_lookup
+              flow_lookup,
+              rotate_policy_source?: true
             )
 
           :telemetry.execute(

@@ -8,6 +8,9 @@ defmodule Ferricstore.Store.Shard.Reads do
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
   @cold_read_timeout_ms 10_000
+  @max_get_many_keys 512
+  @max_key_size 65_535
+  @max_get_many_key_bytes 1_048_576
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -53,6 +56,134 @@ defmodule Ferricstore.Store.Shard.Reads do
         else
           {:reply, nil, state}
         end
+    end
+  end
+
+  @spec handle_get_many([binary()], GenServer.from(), map()) ::
+          {:noreply, map()} | {:reply, {:error, binary()}, map()}
+  @doc false
+  def handle_get_many(keys, from, state) when is_list(keys) do
+    if length(keys) <= @max_get_many_keys and
+         Enum.all?(keys, fn key -> is_binary(key) and byte_size(key) <= @max_key_size end) and
+         Enum.reduce(keys, 0, fn key, total -> total + byte_size(key) end) <=
+           @max_get_many_key_bytes do
+      state = flush_pending_get_many_keys(state, keys)
+
+      spawn(fn ->
+        result =
+          try do
+            get_many_values(keys, state)
+          rescue
+            _read_error -> {:error, "ERR shard batch read failed"}
+          catch
+            _kind, _reason -> {:error, "ERR shard batch read failed"}
+          end
+
+        GenServer.reply(from, result)
+      end)
+
+      {:noreply, state}
+    else
+      {:reply, {:error, "ERR invalid shard batch read request"}, state}
+    end
+  end
+
+  defp flush_pending_get_many_keys(state, keys) do
+    if Enum.any?(keys, &ShardETS.pending_cold?(state, &1)) do
+      ShardFlush.flush_pending_for_read(state)
+    else
+      state
+    end
+  end
+
+  defp get_many_values([], _state), do: []
+
+  defp get_many_values(keys, state) do
+    {results, file_reads, segment_reads} =
+      keys
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, [], []}, fn {key, index}, {results, file_reads, segment_reads} ->
+        case ShardETS.ets_lookup(state, key) do
+          {:hit, value, _expire_at_ms} ->
+            {Map.put(results, index, value), file_reads, segment_reads}
+
+          :expired ->
+            {Map.put(results, index, nil), file_reads, segment_reads}
+
+          :miss ->
+            {Map.put(results, index, nil), file_reads, segment_reads}
+
+          {:cold, fid, off, vsize, exp}
+          when valid_waraft_segment_location(fid, off, vsize) ->
+            read = {index, key, exp, fid, off, vsize}
+            {results, file_reads, [read | segment_reads]}
+
+          {:cold, fid, off, vsize, exp} ->
+            path = ShardETS.file_path(state.shard_data_path, fid)
+            read = {index, key, exp, fid, off, vsize, path}
+            {results, [read | file_reads], segment_reads}
+        end
+      end)
+
+    results = read_get_many_files(state, results, Enum.reverse(file_reads))
+    results = read_get_many_segments(state, results, Enum.reverse(segment_reads))
+
+    Enum.map(0..(length(keys) - 1), &Map.get(results, &1))
+  end
+
+  defp read_get_many_files(_state, results, []), do: results
+
+  defp read_get_many_files(state, results, reads) do
+    locations =
+      Enum.map(reads, fn {_index, key, _exp, _fid, off, _vsize, path} ->
+        {path, off, key}
+      end)
+
+    values =
+      case get_many_pread_batch(state, locations) do
+        {:ok, values} when is_list(values) and length(values) == length(reads) -> values
+        _error -> List.duplicate(:unavailable, length(reads))
+      end
+
+    reads
+    |> Enum.zip(values)
+    |> Enum.reduce(results, fn
+      {{index, key, exp, fid, off, vsize, _path}, value}, acc when is_binary(value) ->
+        Map.put(acc, index, materialize_get_many_value(state, key, exp, fid, off, vsize, value))
+
+      {{index, _key, _exp, _fid, _off, _vsize, _path}, _error}, acc ->
+        Map.put(acc, index, :unavailable)
+    end)
+  end
+
+  defp read_get_many_segments(_state, results, []), do: results
+
+  defp read_get_many_segments(state, results, reads) do
+    Enum.reduce(reads, results, fn {index, key, exp, fid, off, vsize}, acc ->
+      value =
+        case read_cold_raw(state, fid, off, key) do
+          {:ok, value} when is_binary(value) ->
+            materialize_get_many_value(state, key, exp, fid, off, vsize, value)
+
+          _error ->
+            :unavailable
+        end
+
+      Map.put(acc, index, value)
+    end)
+  end
+
+  defp materialize_get_many_value(state, key, exp, fid, off, vsize, value) do
+    case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
+      nil -> :unavailable
+      materialized -> materialized
+    end
+  end
+
+  defp get_many_pread_batch(state, locations) do
+    case Map.get(state, :get_many_pread_batch) do
+      fun when is_function(fun, 2) -> fun.(locations, @cold_read_timeout_ms)
+      _default -> ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms)
     end
   end
 

@@ -552,6 +552,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
                 safe_ets_insert(state.ets, entries)
                 flow_track_state_retention_metadata_batch(state, key_records)
+                flow_enqueue_governance_release_intents(state, key_records)
 
               {:error, _reason} = error ->
                 error
@@ -638,6 +639,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
                 safe_ets_insert(state.ets, entries)
                 flow_track_state_retention_metadata_batch(state, key_records)
+                flow_enqueue_governance_release_intents(state, key_records)
 
               {:error, _reason} = error ->
                 error

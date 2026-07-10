@@ -83,6 +83,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
 
         instance_ctx = Map.get(config, :instance_ctx)
 
+        apply_context =
+          case Map.get(config, :apply_context) do
+            %Ferricstore.Raft.ApplyContext{} = context ->
+              context
+
+            _missing ->
+              case instance_ctx do
+                %{apply_context: %Ferricstore.Raft.ApplyContext{} = context} ->
+                  context
+
+                _legacy ->
+                  Ferricstore.Raft.ApplyContext.from_runtime()
+              end
+          end
+
         %{
           shard_index: config.shard_index,
           shard_data_path: config.shard_data_path,
@@ -93,6 +108,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
           data_dir: data_dir,
           data_dir_expanded: Path.expand(data_dir),
           instance_ctx: instance_ctx,
+          apply_context: apply_context,
+          apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(apply_context),
           instance_name: Map.get(config, :instance_name, :default),
           blob_side_channel_threshold_bytes:
             Map.get(config, :blob_side_channel_threshold_bytes, BlobValue.threshold(instance_ctx)),

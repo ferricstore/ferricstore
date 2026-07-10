@@ -12,7 +12,9 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.WriteVersion
   alias Ferricstore.Transaction.Coordinator
   alias Ferricstore.Test.ShardHelpers
 
@@ -172,6 +174,53 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   end
 
   describe "cross-shard succeeds atomically" do
+    @tag :prepared_multi_routing
+    test "prepared MSET tracks every write shard while returning one result", %{k0: k0, k1: k1} do
+      ctx = FerricStore.Instance.get(:default)
+      idx0 = Router.shard_for(ctx, k0)
+      idx1 = Router.shard_for(ctx, k1)
+      before0 = WriteVersion.get(idx0)
+      before1 = WriteVersion.get(idx1)
+
+      assert {:ok, prepared} = PreparedCommand.prepare("MSET", [k0, "v0", k1, "v1"])
+      assert Coordinator.execute([prepared], %{}, nil) == [:ok]
+
+      assert Router.get(ctx, k0) == "v0"
+      assert Router.get(ctx, k1) == "v1"
+      assert WriteVersion.get(idx0) == before0 + 1
+      assert WriteVersion.get(idx1) == before1 + 1
+    end
+
+    @tag :prepared_multi_routing
+    test "prepared RENAME spanning shards executes exactly once", %{k0: source, k1: destination} do
+      ctx = FerricStore.Instance.get(:default)
+      :ok = Router.put(ctx, source, "move-once", 0)
+
+      assert {:ok, prepared} = PreparedCommand.prepare("RENAME", [source, destination])
+      assert Coordinator.execute([prepared], %{}, nil) == [:ok]
+
+      assert Router.get(ctx, source) == nil
+      assert Router.get(ctx, destination) == "move-once"
+    end
+
+    @tag :prepared_multi_routing
+    test "prepared COPY bumps only its destination write shard", %{k0: source, k1: destination} do
+      ctx = FerricStore.Instance.get(:default)
+      source_idx = Router.shard_for(ctx, source)
+      destination_idx = Router.shard_for(ctx, destination)
+      :ok = Router.put(ctx, source, "copy-me", 0)
+      source_before = WriteVersion.get(source_idx)
+      destination_before = WriteVersion.get(destination_idx)
+
+      assert {:ok, prepared} = PreparedCommand.prepare("COPY", [source, destination])
+      assert Coordinator.execute([prepared], %{}, nil) == [1]
+
+      assert Router.get(ctx, source) == "copy-me"
+      assert Router.get(ctx, destination) == "copy-me"
+      assert WriteVersion.get(source_idx) == source_before
+      assert WriteVersion.get(destination_idx) == destination_before + 1
+    end
+
     test "two shards succeeds", %{k0: k0, k1: k1} do
       queue = [{"SET", [k0, "val_k0"]}, {"SET", [k1, "val_k1"]}]
 
@@ -421,6 +470,34 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   end
 
   describe "sandbox namespace support" do
+    @tag :prepared_multi_routing
+    test "prepared routing namespaces metadata keys before shard classification" do
+      ctx = FerricStore.Instance.get(:default)
+      namespace = "prepared-routing-namespace:"
+
+      key =
+        Enum.find_value(1..10_000, fn suffix ->
+          candidate = "key-#{suffix}"
+          raw_idx = Router.shard_for(ctx, candidate)
+          namespaced_idx = Router.shard_for(ctx, namespace <> candidate)
+          if raw_idx != namespaced_idx, do: candidate
+        end)
+
+      assert is_binary(key)
+      raw_idx = Router.shard_for(ctx, key)
+      namespaced_idx = Router.shard_for(ctx, namespace <> key)
+      raw_before = WriteVersion.get(raw_idx)
+      namespaced_before = WriteVersion.get(namespaced_idx)
+
+      assert {:ok, prepared} = PreparedCommand.prepare("SET", [key, "namespaced"])
+      assert Coordinator.execute([prepared], %{}, namespace) == [:ok]
+
+      assert Router.get(ctx, key) == nil
+      assert Router.get(ctx, namespace <> key) == "namespaced"
+      assert WriteVersion.get(raw_idx) == raw_before
+      assert WriteVersion.get(namespaced_idx) == namespaced_before + 1
+    end
+
     test "respects sandbox namespace for key routing", %{same1: s1} do
       ns = "test_ns:"
 

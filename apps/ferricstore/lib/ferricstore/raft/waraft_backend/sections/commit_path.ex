@@ -549,8 +549,15 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
                 emit_blob_prepare_failed(shard_index, command, reason)
                 error
 
-              other ->
-                other
+              {:ok, prepared_command, blob_protection} ->
+                apply_context =
+                  case Map.get(ctx, :apply_context) do
+                    %Ferricstore.Raft.ApplyContext{} = context -> context
+                    _legacy -> Ferricstore.Raft.ApplyContext.from_runtime()
+                  end
+
+                {:ok, Ferricstore.Raft.ApplyContext.wrap_command(prepared_command, apply_context),
+                 blob_protection}
             end
 
           :error ->
@@ -689,6 +696,10 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       defp barrier_redirected_commit(_node_name, _shard_index, {:error, _reason} = error),
         do: error
 
+      @doc false
+      def __barrier_redirected_commit_for_test__(node_name, shard_index, result),
+        do: barrier_redirected_commit(node_name, shard_index, result)
+
       defp barrier_redirected_commit(node_name, shard_index, result) do
         case remote_storage_position(node_name, shard_index) do
           {:ok, {:raft_log_pos, applied_index, _term}}
@@ -699,7 +710,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
             end
 
           _other ->
-            result
+            ErrorReasons.write_timeout_unknown()
         end
       end
 

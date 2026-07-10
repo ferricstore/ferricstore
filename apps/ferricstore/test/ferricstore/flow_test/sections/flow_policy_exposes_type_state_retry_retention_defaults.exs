@@ -53,6 +53,69 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
         assert state_policy.retention.history_max_events == 256
       end
 
+      @tag :flow_policy_generation
+      test "flow policy writes use one monotonic internal generation on every shard" do
+        ctx = FerricStore.Instance.get(:default)
+        type = uid("flow-policy-generation")
+        policy_key = Ferricstore.Flow.Keys.policy_key(type)
+
+        assert {:ok, %{version: "customer-v1"}} =
+                 FerricStore.flow_policy_set(type,
+                   version: "customer-v1",
+                   max_active_ms: 1_000
+                 )
+
+        assert_policy_generation_on_all_shards(ctx, policy_key, 1, "customer-v1")
+
+        assert {:ok, %{version: "customer-v2"}} =
+                 FerricStore.flow_policy_set(type,
+                   version: "customer-v2",
+                   max_active_ms: 2_000
+                 )
+
+        assert_policy_generation_on_all_shards(ctx, policy_key, 2, "customer-v2")
+
+        attrs = %{
+          id: uid("flow-policy-stamped-create"),
+          type: type,
+          state: "queued",
+          partition_key: uid("flow-policy-stamped-tenant"),
+          policy_generation: 999,
+          policy_snapshot: %{type: type, version: "spoofed"}
+        }
+
+        key = Ferricstore.Flow.Keys.state_key(attrs.id, attrs.partition_key)
+
+        assert {:ok, {:flow_create, ^key, stamped}} =
+                 Ferricstore.Flow.PolicyCommand.stamp(ctx, {:flow_create, key, attrs})
+
+        assert stamped.policy_generation == 2
+        assert stamped.policy_snapshot.version == "customer-v2"
+        assert stamped.policy_snapshot.max_active_ms == 2_000
+
+        assert {:ok, _flow} =
+                 flow_create_and_get(attrs.id,
+                   type: type,
+                   state: "queued",
+                   partition_key: attrs.partition_key,
+                   now_ms: 1_000
+                 )
+
+        transition =
+          {:flow_transition, key,
+           %{
+             id: attrs.id,
+             to: "processing",
+             partition_key: attrs.partition_key
+           }}
+
+        assert {:ok, {:flow_transition, ^key, stamped_transition}} =
+                 Ferricstore.Flow.PolicyCommand.stamp(ctx, transition)
+
+        assert stamped_transition.policy_generation == 2
+        assert stamped_transition.policy_snapshot.type == type
+      end
+
       test "flow policy rejects hot history cap because it is internal" do
         type = uid("flow-policy-hot-internal")
 
@@ -107,6 +170,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
         assert policy.retry.max_retries == 7
       end
 
+      @tag :flow_policy_generation
       test "standalone restart rebuilds stored policy and retry uses it" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -130,13 +194,17 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
 
         type = uid("policy-restart")
         id = uid("flow-policy-restart")
+        policy_key = Ferricstore.Flow.Keys.policy_key(type)
 
         assert {:ok, _policy} =
                  FerricStore.Impl.flow_policy_set(ctx, type,
+                   version: "restart-v1",
                    states: %{
                      "charge_card" => [retry: [max_retries: 0, exhausted_to: "payment_failed"]]
                    }
                  )
+
+        assert_policy_generation_on_all_shards(ctx, policy_key, 1, "restart-v1")
 
         assert {:ok, _flow} =
                  impl_flow_create_and_get(ctx, id,
@@ -154,7 +222,19 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
         assert {:ok, state_policy} =
                  FerricStore.Impl.flow_policy_get(restarted, type, state: "charge_card")
 
+        assert state_policy.version == "restart-v1"
         assert state_policy.retry.max_retries == 0
+        assert_policy_generation_on_all_shards(restarted, policy_key, 1, "restart-v1")
+
+        assert {:ok, %{version: "restart-v2"}} =
+                 FerricStore.Impl.flow_policy_set(restarted, type,
+                   version: "restart-v2",
+                   states: %{
+                     "charge_card" => [retry: [max_retries: 0, exhausted_to: "payment_failed"]]
+                   }
+                 )
+
+        assert_policy_generation_on_all_shards(restarted, policy_key, 2, "restart-v2")
 
         assert {:ok, [claimed]} =
                  FerricStore.Impl.flow_claim_due(restarted, type,
@@ -502,6 +582,18 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
           )
 
         assert :error = Ferricstore.Flow.RetryPolicy.decode_flow_policy(blob)
+      end
+
+      defp assert_policy_generation_on_all_shards(ctx, key, generation, public_version) do
+        Enum.each(0..(ctx.shard_count - 1), fn shard_index ->
+          keydir = elem(ctx.keydir_refs, shard_index)
+
+          assert [{^key, value, 0, _lfu, _file_id, _offset, _value_size}] =
+                   :ets.lookup(keydir, key)
+
+          assert {:ok, {^generation, %{version: ^public_version}}} =
+                   Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(value)
+        end)
       end
 
       test "flow_retry_many atomically reschedules one-partition batch" do

@@ -36,6 +36,13 @@ defmodule Ferricstore.Store.Shard.Calls do
       @impl true
       def handle_call({:get, key}, from, state), do: ShardReads.handle_get(key, from, state)
 
+      def handle_call({:get_many, keys}, from, state)
+          when is_list(keys) and length(keys) <= 512,
+          do: ShardReads.handle_get_many(keys, from, state)
+
+      def handle_call({:get_many, _invalid}, _from, state),
+        do: {:reply, {:error, "ERR invalid shard batch read request"}, state}
+
       def handle_call({:get_file_ref, key}, _from, state),
         do: ShardReads.handle_get_file_ref(key, state)
 

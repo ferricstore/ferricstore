@@ -63,6 +63,17 @@ config :ferricstore,
   flow_retention_sweeper_pressure_limit: 10_000,
   flow_retention_sweeper_pressure_compaction_interval_ms: 60_000
 
+config :ferricstore,
+  flow_governance_limit_storage_cleanup_interval_ms: 1_000,
+  flow_governance_limit_storage_cleanup_pages_per_tick: 16,
+  flow_policy_migration_worker_enabled: true,
+  flow_policy_migration_worker_initial_delay_ms: 1_000,
+  flow_policy_migration_worker_interval_ms: 1_000,
+  flow_policy_migration_worker_catchup_delay_ms: 10,
+  flow_policy_migration_worker_batch_size: 32,
+  flow_policy_migration_worker_backfill_batch_size: 256,
+  flow_policy_migration_worker_backfill_max_bytes: 2 * 1_024 * 1_024
+
 # Operational guardrails are derived from the actual node/container memory and
 # the filesystem backing `:data_dir`. These ratios control when cleanup becomes
 # aggressive and when new writes are rejected cleanly instead of allowing RSS or

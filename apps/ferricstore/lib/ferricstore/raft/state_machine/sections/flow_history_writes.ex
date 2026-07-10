@@ -729,15 +729,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       defp flow_read_policy(_state, type) when not is_binary(type), do: nil
 
       defp flow_read_policy(state, type) do
-        case ets_lookup(state, FlowKeys.policy_key(type)) do
-          {:hit, value, _expire_at_ms} when is_binary(value) ->
-            case RetryPolicy.decode_flow_policy(value) do
-              {:ok, policy} -> policy
-              :error -> nil
-            end
+        case Process.get(:sm_flow_policy_snapshots, :legacy) do
+          %{^type => %{policy: policy}} when is_map(policy) ->
+            policy
 
-          _ ->
+          snapshots when is_map(snapshots) ->
             nil
+
+          :legacy ->
+            case ets_lookup(state, FlowKeys.policy_key(type)) do
+              {:hit, value, _expire_at_ms} when is_binary(value) ->
+                case RetryPolicy.decode_flow_policy(value) do
+                  {:ok, policy} -> policy
+                  :error -> nil
+                end
+
+              _ ->
+                nil
+            end
         end
       end
 

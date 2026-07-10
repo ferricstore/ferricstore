@@ -46,7 +46,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Transaction.Ast, as: TxAst
 
       @flow_state_enter_seq_offset_span 4_294_967_296
-      @flow_policy_reindex_max_keydir_entries 10_000
 
       defp flow_create_existing_state(state, %{idempotent: true}, state_key) do
         flow_read_record_by_key(state, state_key)
@@ -578,7 +577,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           )
 
         %{
-          retention: RetryPolicy.resolve_retention(flow_policy, Map.get(attrs, :state), override),
+          retention:
+            RetryPolicy.resolve_retention(
+              flow_policy,
+              Map.get(attrs, :state),
+              override,
+              raft_apply_context(state)
+            ),
           max_active_ms:
             RetryPolicy.resolve_max_active_ms(flow_policy, Map.get(attrs, :max_active_ms))
         }
@@ -746,11 +751,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_put_record_indexed_state_meta(record, key),
         do: StateMeta.put_indexed_key(record, key)
 
-      defp flow_refresh_indexed_attributes(state, record),
-        do:
-          record
-          |> flow_put_record_indexed_attributes(flow_indexed_attributes_for_record(state, record))
-          |> flow_put_record_indexed_state_meta(flow_indexed_state_meta_for_record(state, record))
+      defp flow_refresh_indexed_attributes(state, record) do
+        record =
+          flow_put_record_indexed_attributes(
+            record,
+            flow_indexed_attributes_for_record(state, record)
+          )
+
+        if flow_catalog_projection_newer?(state, record),
+          do: record,
+          else:
+            flow_put_record_indexed_state_meta(
+              record,
+              flow_indexed_state_meta_for_record(state, record)
+            )
+      end
 
       defp flow_indexed_attributes_for_record(state, record) do
         case Map.get(record, :attributes) do
@@ -777,110 +792,85 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       end
 
       defp do_flow_policy_put(state, key, value, expire_at_ms) do
-        with {:ok, type} <- FlowKeys.policy_type(key),
-             {:ok, new_policy} <- RetryPolicy.decode_flow_policy(value) do
-          old_policy = flow_read_policy(state, type)
-          old_indexed_key = RetryPolicy.indexed_state_meta(old_policy)
-          new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
+        case FlowKeys.policy_type(key) do
+          {:ok, type} ->
+            case RetryPolicy.decode_flow_policy_entry(value) do
+              {:ok, {policy_generation, %{type: ^type} = new_policy}} ->
+                flow_apply_versioned_policy_put(
+                  state,
+                  key,
+                  value,
+                  expire_at_ms,
+                  type,
+                  policy_generation,
+                  new_policy
+                )
 
-          with :ok <- do_put(state, key, value, expire_at_ms) do
-            if old_indexed_key == new_indexed_key do
-              :ok
-            else
-              flow_reindex_state_meta_policy_records(state, type, new_indexed_key)
+              _invalid ->
+                {:error, "ERR invalid flow policy value"}
             end
-          end
-        else
-          _other -> do_put(state, key, value, expire_at_ms)
+
+          :error ->
+            {:error, "ERR invalid flow policy key"}
         end
       end
 
-      defp flow_reindex_state_meta_policy_records(state, type, indexed_key) do
-        with {:ok, state_keys} <- flow_state_keys_for_policy_reindex(state) do
-          Enum.reduce_while(state_keys, :ok, fn state_key, :ok ->
-            case flow_read_record_by_key(state, state_key) do
-              %{type: ^type} = record ->
-                case flow_reindex_state_meta_policy_record(state, state_key, record, indexed_key) do
-                  :ok -> {:cont, :ok}
-                  {:error, _reason} = error -> {:halt, error}
-                end
+      defp flow_apply_versioned_policy_put(
+             state,
+             key,
+             value,
+             expire_at_ms,
+             type,
+             policy_generation,
+             new_policy
+           ) do
+        {stored_generation, stored_value} = flow_stored_policy_generation(state, key)
 
-              _other ->
-                {:cont, :ok}
+        high_water =
+          max(stored_generation, flow_policy_migration_marker_generation(state, type))
+
+        cond do
+          policy_generation == 0 and stored_generation > 0 ->
+            {:error, "ERR stale flow policy generation"}
+
+          policy_generation > 0 and high_water > policy_generation ->
+            :ok
+
+          policy_generation > 0 and stored_generation == policy_generation and
+            is_binary(stored_value) and stored_value != value ->
+            {:error, "ERR conflicting flow policy generation"}
+
+          true ->
+            old_policy = flow_read_policy(state, type)
+            old_indexed_key = RetryPolicy.indexed_state_meta(old_policy)
+            new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
+
+            with :ok <- do_put(state, key, value, expire_at_ms) do
+              if old_indexed_key == new_indexed_key do
+                :ok
+              else
+                flow_enqueue_policy_migration(
+                  state,
+                  type,
+                  policy_generation,
+                  new_indexed_key
+                )
+              end
             end
-          end)
         end
       end
 
-      defp flow_state_keys_for_policy_reindex(%{ets: ets}) do
-        case :ets.info(ets, :size) do
-          size when is_integer(size) and size <= @flow_policy_reindex_max_keydir_entries ->
-            keys =
-              :ets.select(ets, [
-                {{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}
-              ])
+      defp flow_stored_policy_generation(state, key) do
+        case ets_lookup(state, key) do
+          {:hit, value, _expire_at_ms} when is_binary(value) ->
+            case RetryPolicy.decode_flow_policy_entry(value) do
+              {:ok, {generation, _policy}} -> {generation, value}
+              :error -> {0, value}
+            end
 
-            state_keys =
-              Enum.reduce(keys, MapSet.new(), fn key, acc ->
-                cond do
-                  FlowKeys.state_key?(key) ->
-                    MapSet.put(acc, key)
-
-                  FlowKeys.registry_key?(key) ->
-                    case FlowKeys.state_key_from_registry_key(key) do
-                      {:ok, state_key} -> MapSet.put(acc, state_key)
-                      :error -> acc
-                    end
-
-                  true ->
-                    acc
-                end
-              end)
-
-            {:ok, state_keys |> MapSet.to_list() |> Enum.sort()}
-
-          size when is_integer(size) ->
-            {:error,
-             "ERR flow policy reindex exceeds #{@flow_policy_reindex_max_keydir_entries} shard keys"}
-
-          _other ->
-            {:error, "ERR flow policy reindex keydir unavailable"}
+          _missing ->
+            {0, nil}
         end
-      rescue
-        ArgumentError -> {:error, "ERR flow policy reindex keydir unavailable"}
-      end
-
-      defp flow_reindex_state_meta_policy_record(state, state_key, record, indexed_key) do
-        target_key = flow_state_meta_policy_target_indexed_key(record, indexed_key)
-
-        if StateMeta.indexed_key(record) == target_key do
-          :ok
-        else
-          next = StateMeta.put_indexed_key(record, target_key)
-
-          with :ok <- flow_put_state_record(state, state_key, next) do
-            flow_queue_state_meta_policy_projection(state, state_key, next)
-          end
-        end
-      end
-
-      defp flow_state_meta_policy_target_indexed_key(record, indexed_key) do
-        case StateMeta.record(record) do
-          meta when is_map(meta) and map_size(meta) > 0 -> indexed_key
-          _other -> nil
-        end
-      end
-
-      defp flow_queue_state_meta_policy_projection(state, state_key, record) do
-        with_lmdb_mirror_shard(state, fn ->
-          queue_pending_lmdb_flow_state_projection(
-            state_key,
-            flow_encode(record),
-            flow_state_record_expire_at(record)
-          )
-        end)
-
-        :ok
       end
 
       defp flow_normalize_value_refs(refs) when is_map(refs) do

@@ -1,5 +1,8 @@
 import Config
 
+config :ferricstore, :flow_governance_limit_reconcile_interval_ms, 60_000
+config :ferricstore, :flow_governance_limit_storage_cleanup_interval_ms, 86_400_000
+
 # Keep test runs quiet by default. A warning floor prevents debug/info/notice
 # floods from dominating CI time and hiding real failures; tests that need to
 # assert logs should use ExUnit.CaptureLog or set Logger locally.
@@ -32,6 +35,7 @@ config :ferricstore, :eviction_policy, :volatile_lru
 config :ferricstore, :memory_guard_interval_ms, 5_000
 config :ferricstore, :operational_guard_enabled, false
 config :ferricstore, :flow_scheduler_enabled, false
+config :ferricstore, :flow_policy_migration_worker_enabled, false
 
 # Merge: use a very long check interval to prevent periodic merge timers
 # from firing during tests. Tests that need to trigger merges use

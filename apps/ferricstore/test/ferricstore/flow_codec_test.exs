@@ -34,6 +34,24 @@ defmodule Ferricstore.FlowCodecTest do
     assert decoded == record
   end
 
+  test "record codec round trips private governance reservation identity" do
+    record =
+      base_record()
+      |> Map.merge(%{
+        state: "running",
+        governance_limit: %{
+          scope: "flow-running:test",
+          shard_id: 7,
+          enforcement: :strict_global,
+          reservation_id: "reservation-123"
+        }
+      })
+
+    assert Flow.encode_record(record) == Flow.encode_record_elixir(record)
+    assert record == record |> Flow.encode_record() |> Flow.decode_record()
+    refute Map.has_key?(RecordProjection.public(record), :governance_limit)
+  end
+
   test "record codec omits redundant immutable defaults from every state version" do
     record =
       base_record()

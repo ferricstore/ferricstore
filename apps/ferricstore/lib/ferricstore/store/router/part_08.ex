@@ -981,7 +981,7 @@ defmodule Ferricstore.Store.Router.Part08 do
       end
 
       defp flow_retention_cleanup_planned(ctx, attrs) do
-        attrs = flow_retention_planning_attrs(attrs)
+        attrs = flow_retention_planning_attrs(ctx, attrs)
         active_attrs = Map.put(attrs, :plan_kind, :active)
         terminal_plan_attrs = Map.put(attrs, :plan_kind, :terminal)
 
@@ -1157,6 +1157,8 @@ defmodule Ferricstore.Store.Router.Part08 do
           data_dir: ctx.data_dir,
           data_dir_expanded: Path.expand(ctx.data_dir),
           instance_ctx: ctx,
+          apply_context:
+            Map.get_lazy(ctx, :apply_context, &Ferricstore.Raft.ApplyContext.default/0),
           instance_name: ctx.name,
           flow_index_name: flow_index_name,
           flow_lookup_name: flow_lookup_name,
@@ -1297,28 +1299,35 @@ defmodule Ferricstore.Store.Router.Part08 do
         if actual_bytes <= byte_budget, do: selected, else: []
       end
 
-      defp flow_retention_planning_attrs(attrs) do
+      defp flow_retention_planning_attrs(ctx, attrs) do
+        context =
+          case Map.get(ctx, :apply_context) do
+            %Ferricstore.Raft.ApplyContext{} = apply_context -> apply_context
+            _missing -> Ferricstore.Raft.ApplyContext.default()
+          end
+
         attrs
-        |> Map.put_new(
+        |> Map.put(
           :cleanup_key_budget,
-          flow_retention_positive_config(:flow_retention_cleanup_key_budget, 1_024, 8)
+          flow_retention_planning_budget(
+            Map.get(attrs, :cleanup_key_budget),
+            context.flow_retention_cleanup_key_budget
+          )
         )
-        |> Map.put_new(
+        |> Map.put(
           :cleanup_byte_budget,
-          flow_retention_positive_config(
-            :flow_retention_cleanup_byte_budget,
-            8 * 1_024 * 1_024,
-            4_096
+          flow_retention_planning_budget(
+            Map.get(attrs, :cleanup_byte_budget),
+            context.flow_retention_cleanup_byte_budget
           )
         )
       end
 
-      defp flow_retention_positive_config(key, default, minimum) do
-        case Application.get_env(:ferricstore, key, default) do
-          value when is_integer(value) and value > 0 -> max(value, minimum)
-          _invalid -> default
-        end
-      end
+      defp flow_retention_planning_budget(value, maximum)
+           when is_integer(value) and value > 0,
+           do: min(value, maximum)
+
+      defp flow_retention_planning_budget(_invalid, maximum), do: maximum
 
       defp flow_retention_run_after_plan_hook(kind, candidates) do
         case Application.get_env(:ferricstore, :flow_retention_after_plan_hook) do

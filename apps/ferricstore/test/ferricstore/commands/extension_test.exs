@@ -71,6 +71,31 @@ defmodule Ferricstore.Commands.ExtensionTest do
     def handle("GET", _args, _store), do: {:ok, "shadowed"}
   end
 
+  defmodule InvalidKeysExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "EXT.INVALID_KEYS",
+          arity: 2,
+          flags: ["write"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :write
+        }
+      ]
+    end
+
+    @impl true
+    def handle("EXT.INVALID_KEYS", _args, _store), do: {:ok, "must not execute"}
+
+    @impl true
+    def keys("EXT.INVALID_KEYS", [_key]), do: {:ok, [:not_a_binary_key]}
+  end
+
   setup do
     previous = Application.get_env(:ferricstore, :command_extensions)
     Application.delete_env(:ferricstore, :command_extensions)
@@ -101,6 +126,16 @@ defmodule Ferricstore.Commands.ExtensionTest do
     assert {:ok, "EXT.PUT", ["k", "v"], {:extension_command, "EXT.PUT", ["k", "v"]},
             ["dynamic:v"]} =
              Dispatcher.parse_raw("ext.put", ["k", "v"])
+  end
+
+  test "invalid extension key metadata fails closed before dispatch" do
+    Application.put_env(:ferricstore, :command_extensions, [InvalidKeysExtension])
+
+    assert {:error, message} = Dispatcher.prepare_raw("EXT.INVALID_KEYS", ["tenant:key"])
+    assert message =~ "invalid key metadata"
+
+    assert {:error, ^message} =
+             Dispatcher.dispatch_raw("EXT.INVALID_KEYS", ["tenant:key"], MockStore.make())
   end
 
   test "extension command handlers receive the provided store" do

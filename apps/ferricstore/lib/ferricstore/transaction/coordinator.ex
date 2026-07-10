@@ -16,11 +16,14 @@ defmodule Ferricstore.Transaction.Coordinator do
   materialized just to enter or check WATCH.
   """
 
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Raft.Backend
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{Router, WriteVersion}
   alias Ferricstore.Transaction.Ast, as: TxAst
 
-  @spec execute([TxAst.queue_entry()], %{binary() => term()}, binary() | nil) ::
+  @type queue_entry :: TxAst.queue_entry() | PreparedCommand.t()
+
+  @spec execute([queue_entry()], %{binary() => term()}, binary() | nil) ::
           [term()] | nil | {:error, binary()}
   def execute([], _watched_keys, _sandbox_namespace), do: []
 
@@ -29,16 +32,17 @@ defmodule Ferricstore.Transaction.Coordinator do
       maybe_run_after_watch_preflight_hook()
 
       case classify_shards(queue, sandbox_namespace) do
-        {:single_shard, shard_idx} ->
-          execute_single_shard_raft(queue, shard_idx, sandbox_namespace, watched_keys)
-
-        {:multi_shard, shard_groups} ->
+        {:ok, shard_groups, write_shards} ->
           execute_cross_shard(
             shard_groups,
             length(queue),
             sandbox_namespace,
-            watched_keys
+            watched_keys,
+            write_shards
           )
+
+        {:error, _reason} = error ->
+          error
       end
     else
       nil
@@ -46,30 +50,16 @@ defmodule Ferricstore.Transaction.Coordinator do
   end
 
   # ---------------------------------------------------------------------------
-  # Single-shard path
-  # ---------------------------------------------------------------------------
-
-  defp execute_single_shard_raft(queue, shard_idx, sandbox_namespace, watched_keys) do
-    shard_groups = %{
-      shard_idx =>
-        queue
-        |> Enum.with_index()
-        |> Enum.map(fn {entry, orig_idx} -> {orig_idx, entry} end)
-    }
-
-    execute_cross_shard(
-      shard_groups,
-      length(queue),
-      sandbox_namespace,
-      watched_keys
-    )
-  end
-
-  # ---------------------------------------------------------------------------
   # Cross-shard path: anchor shard Raft entry or sequential GenServer fallback
   # ---------------------------------------------------------------------------
 
-  defp execute_cross_shard(shard_groups, total, sandbox_namespace, watched_keys) do
+  defp execute_cross_shard(
+         shard_groups,
+         total,
+         sandbox_namespace,
+         watched_keys,
+         write_shards
+       ) do
     anchor_idx = shard_groups |> Map.keys() |> Enum.min()
 
     shard_batches =
@@ -101,9 +91,7 @@ defmodule Ferricstore.Transaction.Coordinator do
           nil
 
         shard_results ->
-          Enum.each(Map.keys(shard_groups), fn idx ->
-            Ferricstore.Store.WriteVersion.increment(idx)
-          end)
+          Enum.each(write_shards, &WriteVersion.increment/1)
 
           reassemble_results(shard_results, shard_groups, total)
       end
@@ -157,72 +145,170 @@ defmodule Ferricstore.Transaction.Coordinator do
   # whichever shard the keyed commands target, so they never cause CROSSSLOT.
   @keyless_commands MapSet.new(~w(PING ECHO DBSIZE TIME RANDOMKEY))
 
-  @spec classify_shards([TxAst.queue_entry()], binary() | nil) ::
-          {:single_shard, non_neg_integer()}
-          | {:multi_shard, %{non_neg_integer() => list()}}
+  @spec classify_shards([queue_entry()], binary() | nil) ::
+          {:ok, %{non_neg_integer() => list()}, [non_neg_integer()]}
+          | {:error, binary()}
   defp classify_shards(queue, sandbox_namespace) do
-    indexed =
-      queue
-      |> Enum.with_index()
-      |> Enum.map(fn {entry, idx} ->
-        cmd = TxAst.command_name(entry)
-        args = TxAst.command_args(entry)
+    ctx = FerricStore.Instance.get(:default)
 
-        shard_idx =
-          if MapSet.member?(@keyless_commands, cmd) do
-            :keyless
-          else
-            command_shard(args, sandbox_namespace)
-          end
+    with {:ok, classified} <- classify_entries(queue, ctx, sandbox_namespace) do
+      default_shard =
+        Enum.find_value(classified, 0, fn
+          %{routing_shards: [first | _rest]} -> first
+          _entry -> nil
+        end)
 
-        {idx, entry, shard_idx}
-      end)
+      classified =
+        Enum.map(classified, fn entry ->
+          execution_shard = List.first(entry.routing_shards) || default_shard
 
-    # Find the first keyed shard to assign keyless commands to.
-    # If all commands are keyless, they all go to shard 0.
-    default_shard =
-      Enum.find_value(indexed, 0, fn
-        {_, _, :keyless} -> nil
-        {_, _, shard} -> shard
-      end)
+          write_shards =
+            case entry.write_shards do
+              :execution -> [execution_shard]
+              shards -> shards
+            end
 
-    # Replace :keyless with the default shard
-    indexed =
-      Enum.map(indexed, fn
-        {idx, entry, :keyless} -> {idx, entry, default_shard}
-        entry -> entry
-      end)
+          entry
+          |> Map.put(:execution_shard, execution_shard)
+          |> Map.put(:write_shards, write_shards)
+        end)
 
-    shard_indices = indexed |> Enum.map(fn {_, _, s} -> s end) |> Enum.uniq()
+      touched_shards =
+        classified
+        |> Enum.flat_map(fn entry -> [entry.execution_shard | entry.routing_shards] end)
+        |> Enum.uniq()
+        |> Enum.sort()
 
-    case shard_indices do
-      [single] ->
-        {:single_shard, single}
+      shard_groups =
+        touched_shards
+        |> Map.new(&{&1, []})
+        |> then(fn groups ->
+          Enum.reduce(classified, groups, fn entry, acc ->
+            Map.update!(acc, entry.execution_shard, &[{entry.index, entry.entry} | &1])
+          end)
+        end)
+        |> Map.new(fn {shard_idx, entries} -> {shard_idx, Enum.reverse(entries)} end)
 
-      _multiple ->
-        shard_groups =
-          Enum.group_by(
-            indexed,
-            fn {_idx, _entry, shard_idx} -> shard_idx end,
-            fn {idx, entry, _shard_idx} -> {idx, entry} end
-          )
+      write_shards =
+        classified
+        |> Enum.flat_map(& &1.write_shards)
+        |> Enum.uniq()
+        |> Enum.sort()
 
-        {:multi_shard, shard_groups}
+      {:ok, shard_groups, write_shards}
     end
   end
 
-  defp command_shard(args, sandbox_namespace) do
-    key = extract_key(args)
+  defp classify_entries(queue, ctx, sandbox_namespace) do
+    queue
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {entry, index}, {:ok, acc} ->
+      case classify_entry(entry, index, ctx, sandbox_namespace) do
+        {:ok, classified} -> {:cont, {:ok, [classified | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, classified} -> {:ok, Enum.reverse(classified)}
+      {:error, _reason} = error -> error
+    end
+  end
 
-    full_key =
-      case sandbox_namespace do
-        nil -> key
-        ns -> ns <> key
+  defp classify_entry(
+         %PreparedCommand{routing_scope: :coordinated},
+         _index,
+         _ctx,
+         _sandbox_namespace
+       ) do
+    {:error, "ERR coordinated commands are not supported inside transactions"}
+  end
+
+  defp classify_entry(
+         %PreparedCommand{routing_scope: :none, routing_keys: [], write_keys: []} = prepared,
+         index,
+         _ctx,
+         _sandbox_namespace
+       ) do
+    {:ok,
+     %{
+       index: index,
+       entry: prepared_entry(prepared),
+       routing_shards: [],
+       write_shards: []
+     }}
+  end
+
+  defp classify_entry(
+         %PreparedCommand{routing_scope: :keys, routing_keys: [_first | _rest] = routing_keys} =
+           prepared,
+         index,
+         ctx,
+         sandbox_namespace
+       ) do
+    if valid_prepared_keys?(routing_keys) and valid_prepared_keys?(prepared.write_keys) do
+      routing_shards = command_shards(routing_keys, sandbox_namespace, ctx)
+      write_shards = command_shards(prepared.write_keys, sandbox_namespace, ctx)
+
+      {:ok,
+       %{
+         index: index,
+         entry: prepared_entry(prepared),
+         routing_shards: Enum.uniq(routing_shards ++ write_shards),
+         write_shards: write_shards
+       }}
+    else
+      invalid_prepared_routing()
+    end
+  end
+
+  defp classify_entry(%PreparedCommand{}, _index, _ctx, _sandbox_namespace),
+    do: invalid_prepared_routing()
+
+  defp classify_entry(entry, index, ctx, sandbox_namespace) do
+    {cmd, args, ast} = TxAst.normalize_entry(entry)
+
+    routing_shards =
+      if MapSet.member?(@keyless_commands, cmd) do
+        []
+      else
+        [command_shard(args, sandbox_namespace, ctx)]
       end
 
-    ctx = FerricStore.Instance.get(:default)
-    Router.shard_for(ctx, full_key)
+    {:ok,
+     %{
+       index: index,
+       entry: {cmd, args, ast},
+       routing_shards: routing_shards,
+       write_shards: :execution
+     }}
   end
+
+  defp prepared_entry(%PreparedCommand{command: command, args: args, ast: ast}),
+    do: {command, args, ast}
+
+  defp valid_prepared_keys?(keys) when is_list(keys), do: Enum.all?(keys, &is_binary/1)
+  defp valid_prepared_keys?(_keys), do: false
+
+  defp invalid_prepared_routing,
+    do: {:error, "ERR invalid prepared command routing metadata"}
+
+  defp command_shards(keys, sandbox_namespace, ctx) do
+    Enum.map(keys, fn key ->
+      key
+      |> namespace_key(sandbox_namespace)
+      |> then(&Router.shard_for(ctx, &1))
+    end)
+  end
+
+  defp command_shard(args, sandbox_namespace, ctx) do
+    key = args |> extract_key() |> namespace_key(sandbox_namespace)
+
+    Router.shard_for(ctx, key)
+  end
+
+  defp namespace_key(key, nil), do: key
+  defp namespace_key(key, ""), do: key
+  defp namespace_key(key, namespace) when is_binary(namespace), do: namespace <> key
 
   @spec extract_key([binary()]) :: binary()
   defp extract_key([key | _]) when is_binary(key), do: key

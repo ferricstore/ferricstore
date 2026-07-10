@@ -814,6 +814,20 @@ These environment variables are read from `config/runtime.exs` in production (`M
 |----------|---------|-------------|
 | `FERRICSTORE_SOCKET_ACTIVE_MODE` | `true` | TCP active mode: `true`, `once`, or integer N |
 
+### Flow Policy Migration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_ENABLED` | `true` | Runs durable exact-type catalog backfill and policy migration work. |
+| `FERRICSTORE_FLOW_LIMIT_STORAGE_CLEANUP_INTERVAL_MS` | `1000` | Idle delay between detached limit-reservation cleanup passes. |
+| `FERRICSTORE_FLOW_LIMIT_STORAGE_CLEANUP_PAGES_PER_TICK` | `16` | Maximum one-page cleanup Raft commands per scheduler turn; capped at 64, with 256 reservation IDs per command. |
+| `FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_INITIAL_DELAY_MS` | `1000` | Delay before the first migration pass. |
+| `FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_INTERVAL_MS` | `1000` | Poll interval when no immediate work remains. |
+| `FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_CATCHUP_DELAY_MS` | `10` | Delay between bounded passes while work remains. |
+| `FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_BATCH_SIZE` | `32` | Maximum catalog members in one policy migration command; capped at 256. |
+| `FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_BACKFILL_BATCH_SIZE` | `256` | Maximum staged keys in one catalog backfill command; capped at 256. |
+| `FERRICSTORE_FLOW_POLICY_MIGRATION_WORKER_BACKFILL_MAX_BYTES` | `2097152` | Maximum hydrated candidate bytes in a backfill pass; capped at 64 MiB. |
+
 ### WARaft Internals
 
 | Variable | Default | Description |

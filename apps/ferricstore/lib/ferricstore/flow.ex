@@ -618,7 +618,9 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, attrs} <-
-             Ferricstore.Flow.MutationAttrs.extend_lease_attrs(id, lease_token, opts) do
+             Ferricstore.Flow.MutationAttrs.extend_lease_attrs(id, lease_token, opts),
+           attrs = flow_stamp_governance_command_time(attrs),
+           :ok <- maybe_renew_governance_limit(ctx, attrs) do
         Router.flow_extend_lease(ctx, attrs)
       end
 
@@ -1007,9 +1009,9 @@ defmodule Ferricstore.Flow do
       with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.retry_attrs(id, lease_token, opts) do
         ctx
         |> Router.flow_retry(attrs)
+        |> maybe_release_governance_limit(ctx, opts)
         |> maybe_notify_retry_claim_waiters(ctx, attrs)
       end
-      |> maybe_release_governance_limit(ctx, opts)
 
     FlowTelemetry.observe(:retry, started, result, %{flow_id: id, _count: 1})
   end
@@ -1049,15 +1051,14 @@ defmodule Ferricstore.Flow do
           if independent? do
             ctx
             |> flow_terminal_many_independent(:retry, attrs_list)
-            |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
           else
             ctx
             |> Router.flow_retry_many(partition_key, attrs_list)
-            |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
           end
 
         retry_result
         |> maybe_release_many_governance_limit(ctx, opts, length(attrs_list))
+        |> maybe_notify_retry_claim_waiters(ctx, attrs_list)
         |> maybe_return_many_ok_on_success(return_mode)
       end
 
@@ -1279,54 +1280,140 @@ defmodule Ferricstore.Flow do
   end
 
   defp maybe_release_governance_limit(result, ctx, opts) do
-    if terminal_success?(result) do
-      case {Keyword.get(opts, :governance_limit_scope), Keyword.get(opts, :governance_shard_id)} do
-        {scope, shard_id} when is_binary(scope) and scope != "" and is_integer(shard_id) ->
-          Ferricstore.Flow.Governance.LimitCache.release(ctx, scope,
-            shard_id: shard_id,
-            amount: 1,
-            now_ms: Keyword.get(opts, :now_ms)
-          )
-
-          result
-
-        _other ->
-          result
-      end
-    else
-      result
-    end
+    release_governance_result(result, ctx, governance_release_now_ms(opts))
   end
 
   defp maybe_release_many_governance_limit(result, ctx, opts, expected_count) do
-    case {governance_limit_release_count(result, expected_count),
-          Keyword.get(opts, :governance_limit_scope), Keyword.get(opts, :governance_shard_id)} do
-      {amount, scope, shard_id}
-      when amount > 0 and is_binary(scope) and scope != "" and is_integer(shard_id) ->
-        Ferricstore.Flow.Governance.LimitCache.release(ctx, scope,
+    _expected_count = expected_count
+    release_governance_result(result, ctx, governance_release_now_ms(opts))
+  end
+
+  defp release_governance_result({:flow_governance_release, reservation}, ctx, now_ms) do
+    release_governance_reservations(ctx, [reservation], now_ms)
+    :ok
+  end
+
+  defp release_governance_result({:flow_governance_releases, reservations}, ctx, now_ms)
+       when is_list(reservations) do
+    release_governance_reservations(ctx, reservations, now_ms)
+    :ok
+  end
+
+  defp release_governance_result({:ok, results}, ctx, now_ms) when is_list(results) do
+    {normalized, releases} =
+      Enum.map_reduce(results, [], fn
+        {:flow_governance_release, reservation}, acc ->
+          {:ok, [reservation | acc]}
+
+        {:flow_governance_releases, reservations}, acc when is_list(reservations) ->
+          {:ok, Enum.reverse(reservations, acc)}
+
+        result, acc ->
+          {result, acc}
+      end)
+
+    release_governance_reservations(ctx, Enum.reverse(releases), now_ms)
+    {:ok, normalized}
+  end
+
+  defp release_governance_result(result, _ctx, _now_ms), do: result
+
+  defp release_governance_reservations(ctx, reservations, now_ms) do
+    reservations
+    |> Enum.reduce(%{}, fn
+      %{scope: scope, shard_id: shard_id} = reservation, acc
+      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
+        enforcement = Map.get(reservation, :enforcement, :approximate_global)
+        reservation_id = Map.get(reservation, :reservation_id)
+
+        if is_binary(reservation_id) and reservation_id != "" do
+          Map.update(
+            acc,
+            {scope, shard_id, enforcement, :identified},
+            [reservation_id],
+            &[
+              reservation_id | &1
+            ]
+          )
+        else
+          acc
+        end
+
+      _invalid, acc ->
+        acc
+    end)
+    |> Enum.each(fn
+      {{scope, shard_id, enforcement, :identified}, reservation_ids} ->
+        release_opts = [
           shard_id: shard_id,
-          amount: amount,
-          now_ms: Keyword.get(opts, :now_ms)
-        )
+          amount: length(reservation_ids),
+          reservation_ids: reservation_ids
+        ]
 
-        result
+        release_opts =
+          if is_integer(now_ms),
+            do: Keyword.put(release_opts, :now_ms, now_ms),
+            else: release_opts
 
-      _other ->
-        result
+        governance_limit_backend(enforcement).release(ctx, scope, release_opts)
+    end)
+
+    :ok
+  end
+
+  defp governance_release_now_ms(opts) when is_list(opts) do
+    case Keyword.get(opts, :now_ms) do
+      now_ms when is_integer(now_ms) and now_ms >= 0 -> now_ms
+      _missing_or_invalid -> nil
     end
   end
 
-  defp governance_limit_release_count(:ok, expected_count), do: expected_count
+  defp governance_release_now_ms(_opts), do: nil
 
-  defp governance_limit_release_count({:ok, results}, _expected_count) when is_list(results) do
-    Enum.count(results, &many_item_success?/1)
+  defp flow_stamp_governance_command_time(%{now_ms: now_ms} = attrs)
+       when is_integer(now_ms) and now_ms >= 0,
+       do: attrs
+
+  defp flow_stamp_governance_command_time(attrs),
+    do: Map.put(attrs, :now_ms, Ferricstore.CommandTime.now_ms())
+
+  defp maybe_renew_governance_limit(ctx, %{id: id, partition_key: partition_key} = attrs) do
+    case Router.flow_get(ctx, id, partition_key) do
+      value when is_binary(value) ->
+        case Ferricstore.Flow.decode_record(value) do
+          %{
+            lease_token: lease_token,
+            fencing_token: fencing_token,
+            governance_limit: %{scope: scope, shard_id: shard_id} = reservation
+          }
+          when lease_token == attrs.lease_token and fencing_token == attrs.fencing_token ->
+            case governance_limit_backend(Map.get(reservation, :enforcement, :approximate_global)).renew(
+                   ctx,
+                   scope,
+                   shard_id: shard_id,
+                   ttl_ms: attrs.lease_ms,
+                   now_ms: attrs.now_ms
+                 ) do
+              {:ok, _renewed} -> :ok
+              {:error, _reason} = error -> error
+            end
+
+          _ungoverned_or_stale ->
+            :ok
+        end
+
+      _missing_or_unavailable ->
+        :ok
+    end
+  rescue
+    _decode_error -> {:error, "ERR invalid flow record"}
   end
 
-  defp governance_limit_release_count(_result, _expected_count), do: 0
+  defp governance_limit_backend(:strict_global),
+    do: Ferricstore.Flow.Governance.LimitStore
 
-  defp terminal_success?(:ok), do: true
-  defp terminal_success?({:ok, _value}), do: true
-  defp terminal_success?(_result), do: false
+  defp governance_limit_backend(_approximate_or_legacy),
+    do: Ferricstore.Flow.Governance.LimitCache
 
   defp many_return_mode(opts) do
     case Keyword.get(opts, :return, :items) do

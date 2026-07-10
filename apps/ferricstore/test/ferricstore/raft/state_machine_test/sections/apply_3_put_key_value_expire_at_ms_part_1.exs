@@ -4,7 +4,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
-      alias Ferricstore.Raft.{BlobCommand, StateMachine}
+      alias Ferricstore.Raft.{ApplyContext, BlobCommand, StateMachine}
       alias Ferricstore.Store.BitcaskWriter
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
@@ -85,6 +85,35 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
 
           assert [{"stamped_setex", "value", ^expected_expire_at_ms, _, _, _, _}] =
                    :ets.lookup(ets, "stamped_setex")
+        end
+
+        @tag :malformed_cross_shard
+        test "malformed reserved wrappers inside cross-shard queues fail closed", %{
+          state: state,
+          shard_index: shard_index
+        } do
+          trusted = ApplyContext.new(flow_default_history_max_events: 23)
+          injected = ApplyContext.new(flow_default_history_max_events: 99)
+          flow_command = {:flow_create, "state-key", %{id: "id", type: "email"}}
+
+          malformed_entry =
+            {:ferricstore_apply_context, ApplyContext.encode(injected), flow_command}
+
+          cross_shard_command =
+            {:cross_shard_tx, [{shard_index, [malformed_entry], nil}]}
+
+          wrapped = ApplyContext.wrap_command(cross_shard_command, trusted)
+
+          assert {next_state,
+                  %{^shard_index => [{:error, "ERR invalid cross-shard transaction entry"}]}} =
+                   StateMachine.apply(
+                     %{system_time: Ferricstore.HLC.now_ms()},
+                     wrapped,
+                     state
+                   )
+
+          assert next_state.applied_count == state.applied_count + 1
+          assert next_state.apply_context == trusted
         end
 
         test "cross-shard dispatched RMW commands preserve existing TTL", %{
@@ -316,11 +345,12 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
         end
 
         @tag :flow_policy_atomicity
-        test "cross-shard Flow policy put rolls back every shard when reindex is rejected", %{
-          state: state,
-          ets: ets,
-          active_file_path: shard0_file
-        } do
+        test "cross-shard Flow policy put ignores unrelated keydir size and commits every shard",
+             %{
+               state: state,
+               ets: ets,
+               active_file_path: shard0_file
+             } do
           root =
             Path.join(
               System.tmp_dir!(),
@@ -354,7 +384,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             checkpoint_flags: :atomics.new(2, signed: false),
             checkpoint_in_flight: :atomics.new(2, signed: false),
             disk_pressure: :atomics.new(2, signed: false),
-            hot_cache_max_value_size: 64
+            hot_cache_max_value_size: 1_000_000
           }
 
           Ferricstore.Store.ActiveFile.init(2)
@@ -377,6 +407,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
 
           type = "atomic-policy"
           policy_key = Ferricstore.Flow.Keys.policy_key(type)
+          job_key = Ferricstore.Flow.Keys.policy_migration_job_key(type)
 
           {:ok, policy} =
             Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type,
@@ -396,12 +427,169 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           try do
             state = %{state | shard_index: shard0, instance_ctx: instance_ctx}
 
-            {_new_state, {:error, error}} =
+            {_new_state, %{^shard0 => [:ok], ^shard1 => [:ok]}} =
               StateMachine.apply(%{system_time: Ferricstore.HLC.now_ms()}, command, state)
 
-            assert error =~ "flow policy reindex exceeds"
-            assert [] = :ets.lookup(ets, policy_key)
-            assert [] = :ets.lookup(ets1, policy_key)
+            Enum.each([ets, ets1], fn table ->
+              assert [{^policy_key, stored_value, 0, _, _, _, _}] =
+                       :ets.lookup(table, policy_key)
+
+              assert {:ok, {1, ^policy}} =
+                       Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(stored_value)
+
+              assert [{^job_key, job_value, 0, _, _, _, _}] = :ets.lookup(table, job_key)
+
+              assert {:ok,
+                      %{
+                        type: ^type,
+                        migration_generation: 1,
+                        indexed_state_meta: "version",
+                        status: :active
+                      }} = Ferricstore.Flow.PolicyMigration.decode_job(job_value)
+            end)
+          after
+            :ets.delete(ets1)
+            Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+            File.rm_rf!(root)
+          end
+        end
+
+        @tag :flow_policy_generation
+        test "cross-shard policy allocation requires every target once and advances high-water",
+             %{
+               state: state,
+               ets: ets,
+               active_file_path: shard0_file
+             } do
+          root =
+            Path.join(
+              System.tmp_dir!(),
+              "sm_cross_policy_generation_#{System.unique_integer([:positive])}"
+            )
+
+          shard0 = 0
+          shard1 = 1
+          shard1_path = Ferricstore.DataDir.shard_data_path(root, shard1)
+          shard1_file = Path.join(shard1_path, "00000.log")
+          File.mkdir_p!(shard1_path)
+          File.touch!(shard1_file)
+
+          ets1 =
+            :ets.new(:"sm_cross_policy_generation_#{System.unique_integer([:positive])}", [
+              :set,
+              :public
+            ])
+
+          instance_ctx = %{
+            name: :"sm_cross_policy_generation_#{System.unique_integer([:positive])}",
+            data_dir: root,
+            shard_count: 2,
+            keydir_refs: List.to_tuple([ets, ets1]),
+            keydir_binary_bytes: :atomics.new(2, signed: false),
+            checkpoint_flags: :atomics.new(2, signed: false),
+            checkpoint_in_flight: :atomics.new(2, signed: false),
+            disk_pressure: :atomics.new(2, signed: false),
+            hot_cache_max_value_size: 1_000_000
+          }
+
+          Ferricstore.Store.ActiveFile.init(2)
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            shard0,
+            0,
+            shard0_file,
+            state.shard_data_path
+          )
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            shard1,
+            0,
+            shard1_file,
+            shard1_path
+          )
+
+          type = "target-high-water-policy"
+          policy_key = Ferricstore.Flow.Keys.policy_key(type)
+
+          {:ok, old_policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 1_000)
+
+          {:ok, new_policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 2_000)
+
+          shard0_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(old_policy, 1)
+          shard1_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(old_policy, 3)
+          input_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(new_policy)
+
+          Enum.each([{ets, shard0_value}, {ets1, shard1_value}], fn {table, value} ->
+            :ets.insert(
+              table,
+              {policy_key, value, 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size(value)}
+            )
+          end)
+
+          command =
+            {:cross_shard_tx,
+             [
+               {shard0, [{0, {:flow_cross_policy_put, shard0, policy_key, input_value, 0}}], nil},
+               {shard1, [{1, {:flow_cross_policy_put, shard1, policy_key, input_value, 0}}], nil}
+             ]}
+
+          try do
+            state = %{state | shard_index: shard0, instance_ctx: instance_ctx}
+
+            {_new_state, %{^shard0 => [:ok], ^shard1 => [:ok]}} =
+              StateMachine.apply(%{system_time: Ferricstore.HLC.now_ms()}, command, state)
+
+            Enum.each([ets, ets1], fn table ->
+              assert [{^policy_key, value, 0, _, _, _, _}] = :ets.lookup(table, policy_key)
+
+              assert {:ok, {4, ^new_policy}} =
+                       Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(value)
+            end)
+
+            shard0_before = :ets.lookup(ets, policy_key)
+            shard1_before = :ets.lookup(ets1, policy_key)
+
+            invalid_target_commands = [
+              {:cross_shard_tx,
+               [
+                 {shard0, [{0, {:flow_cross_policy_put, shard0, policy_key, input_value, 0}}],
+                  nil}
+               ]},
+              {:cross_shard_tx,
+               [
+                 {shard0,
+                  [
+                    {0, {:flow_cross_policy_put, shard0, policy_key, input_value, 0}},
+                    {1, {:flow_cross_policy_put, shard0, policy_key, input_value, 0}}
+                  ], nil},
+                 {shard1, [{2, {:flow_cross_policy_put, shard1, policy_key, input_value, 0}}],
+                  nil}
+               ]},
+              {:cross_shard_tx,
+               [
+                 {shard0, [{0, {:flow_cross_policy_put, shard0, policy_key, input_value, 0}}],
+                  nil},
+                 {shard1, [{1, {:flow_cross_policy_put, shard1, policy_key, input_value, 0}}],
+                  nil},
+                 {2, [{2, {:flow_cross_policy_put, 2, policy_key, input_value, 0}}], nil}
+               ]}
+            ]
+
+            Enum.each(invalid_target_commands, fn invalid_command ->
+              {_new_state, {:error, "ERR invalid flow policy target set"}} =
+                StateMachine.apply(
+                  %{system_time: Ferricstore.HLC.now_ms()},
+                  invalid_command,
+                  state
+                )
+
+              assert :ets.lookup(ets, policy_key) == shard0_before
+              assert :ets.lookup(ets1, policy_key) == shard1_before
+            end)
           after
             :ets.delete(ets1)
             Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)

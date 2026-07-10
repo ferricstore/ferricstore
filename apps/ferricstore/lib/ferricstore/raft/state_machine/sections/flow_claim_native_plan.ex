@@ -508,7 +508,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
 
                 {:ok, record, next} ->
                   next = flow_refresh_indexed_attributes(state, next)
-                  flow_apply_complete(state, record, next, partition_key, now_ms, attrs)
+
+                  case flow_apply_complete(state, record, next, partition_key, now_ms, attrs) do
+                    :ok -> flow_governance_release_result(record)
+                    {:error, _reason} = error -> error
+                  end
 
                 {:error, _reason} = error ->
                   error
@@ -531,7 +535,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
                flow_complete_many_prepare(state, attrs_list),
              :ok <-
                flow_complete_many_apply(state, plans, has_record_values?, has_after_terminal?) do
-          :ok
+          flow_governance_release_results(plans)
         end
       end
 
@@ -759,7 +763,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
               op,
               rest_attrs,
               rest_records,
-              [:ok | results],
+              [flow_governance_release_result(record) | results],
               [plan | plans],
               has_record_values? or flow_attrs_have_record_values?(attrs),
               has_after_terminal? or flow_terminal_after_required?(op, next)
@@ -871,7 +875,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
               op,
               rest,
               Map.put(virtual_records, state_key, next),
-              [:ok | results],
+              [flow_governance_release_result(record) | results],
               [plan | plans],
               has_record_values? or flow_attrs_have_record_values?(attrs),
               has_after_terminal? or flow_terminal_after_required?(op, next)

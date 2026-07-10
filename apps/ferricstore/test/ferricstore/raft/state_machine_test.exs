@@ -5,6 +5,14 @@ Code.require_file(
 
 Code.require_file("state_machine_test/sections/flow_blob_side_channel_apply.exs", __DIR__)
 Code.require_file("state_machine_test/sections/flow_command_time.exs", __DIR__)
+
+Code.require_file(
+  "state_machine_test/sections/flow_governance_release_outbox.exs",
+  __DIR__
+)
+
+Code.require_file("state_machine_test/sections/flow_governance_limit.exs", __DIR__)
+
 Code.require_file("state_machine_test/sections/flow_index_rollback.exs", __DIR__)
 Code.require_file("state_machine_test/sections/state_machine_compound_reads.exs", __DIR__)
 
@@ -124,6 +132,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
   end
 
   use Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNativeIndexOpsCrossingOrderingBarriers
+
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowGovernanceReleaseOutbox
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowGovernanceLimit
 
   defp safe_delete_ets(table) do
     :ets.delete(table)

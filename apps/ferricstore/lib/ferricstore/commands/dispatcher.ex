@@ -37,7 +37,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     Memory,
     Namespace,
     Native,
-    NativeAstParser,
+    PreparedCommand,
     PubSub,
     Server,
     Set,
@@ -755,6 +755,12 @@ defmodule Ferricstore.Commands.Dispatcher do
     do: {:error, "ERR wrong number of arguments for 'memory' command"}
 
   @doc """
+  Prepares a raw command once for parsing, key authorization, and routing.
+  """
+  @spec prepare_raw(binary(), [term()]) :: {:ok, PreparedCommand.t()} | {:error, binary()}
+  def prepare_raw(name, args), do: PreparedCommand.prepare(name, args)
+
+  @doc """
   Parses a raw command name and argument list into the same AST used by the
   native command path.
 
@@ -765,15 +771,9 @@ defmodule Ferricstore.Commands.Dispatcher do
   @spec parse_raw(binary(), [term()]) ::
           {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
   def parse_raw(name, args) do
-    case NativeAstParser.parse(name, args) do
-      {:ok, cmd, parsed_args, {:unknown, _cmd, _args}, _keys} ->
-        case Extension.keys(cmd, parsed_args) do
-          {:ok, keys} -> {:ok, cmd, parsed_args, Extension.ast(cmd, parsed_args), keys}
-          :error -> {:ok, cmd, parsed_args, {:unknown, cmd, parsed_args}, []}
-        end
-
-      other ->
-        other
+    case prepare_raw(name, args) do
+      {:ok, prepared} -> PreparedCommand.legacy_result(prepared)
+      {:error, _reason} = error -> error
     end
   end
 
@@ -785,31 +785,46 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_raw(name, args, store) do
     start = System.monotonic_time(:microsecond)
 
-    case parse_raw(name, args) do
-      {:ok, cmd, parsed_args, ast, keys} ->
-        result =
-          case authorize_public_keys(cmd, keys) do
-            :ok ->
-              case check_raw_resource_limits(cmd, parsed_args, keys, store) do
-                :ok ->
-                  result = dispatch_ast(ast, store)
-                  record_raw_activity(result, cmd, keys, store)
-                  result
-
-                {:error, reason} ->
-                  {:error, FerricStore.ResourceLimits.error_message(reason)}
-              end
-
-            {:error, reason} ->
-              {:error, reason}
-          end
-
-        log_raw_dispatch(cmd, parsed_args, start)
-        result
+    case prepare_raw(name, args) do
+      {:ok, prepared} ->
+        dispatch_prepared(prepared, store, started_at_us: start)
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Dispatches an already prepared command without repeating parsing or key discovery.
+  """
+  @spec dispatch_prepared(PreparedCommand.t(), map(), keyword()) :: term()
+  def dispatch_prepared(%PreparedCommand{} = prepared, store, opts \\ []) do
+    start = Keyword.get_lazy(opts, :started_at_us, fn -> System.monotonic_time(:microsecond) end)
+
+    result =
+      case authorize_public_keys(prepared.command, prepared.acl_keys) do
+        :ok ->
+          case check_raw_resource_limits(
+                 prepared.command,
+                 prepared.args,
+                 prepared.acl_keys,
+                 store
+               ) do
+            :ok ->
+              result = dispatch_ast(prepared.ast, store)
+              record_raw_activity(result, prepared.command, prepared.acl_keys, store)
+              result
+
+            {:error, reason} ->
+              {:error, FerricStore.ResourceLimits.error_message(reason)}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+
+    log_raw_dispatch(prepared.command, prepared.args, start)
+    result
   end
 
   if Mix.env() == :test do

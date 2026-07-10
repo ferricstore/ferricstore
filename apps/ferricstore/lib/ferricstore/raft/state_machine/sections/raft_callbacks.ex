@@ -51,55 +51,58 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
           write_result =
             if transaction_watches_clean?(watched_keys, state) do
               with_cross_shard_pending_writes(state, fn ->
-                ordered_entries = cross_shard_ordered_entries(shard_batches)
+                with {:ok, ordered_entries} <-
+                       shard_batches
+                       |> cross_shard_ordered_entries()
+                       |> prepare_cross_shard_policy_entries(state) do
+                  Process.put(:tx_deleted_keys, MapSet.new())
+                  Process.put(:tx_pending_values, %{})
 
-                Process.put(:tx_deleted_keys, MapSet.new())
-                Process.put(:tx_pending_values, %{})
+                  try do
+                    case Enum.reduce_while(ordered_entries, {:ok, %{}, %{}}, fn
+                           {_orig_idx, shard_idx, pos, entry, sandbox_namespace},
+                           {:ok, results, stores} ->
+                             {store, stores} =
+                               case Map.fetch(stores, shard_idx) do
+                                 {:ok, cached} ->
+                                   {cached, stores}
 
-                try do
-                  case Enum.reduce_while(ordered_entries, {:ok, %{}, %{}}, fn
-                         {_orig_idx, shard_idx, pos, entry, sandbox_namespace},
-                         {:ok, results, stores} ->
-                           {store, stores} =
-                             case Map.fetch(stores, shard_idx) do
-                               {:ok, cached} ->
-                                 {cached, stores}
+                                 :error ->
+                                   store = build_cross_shard_store(shard_idx, state)
+                                   {store, Map.put(stores, shard_idx, store)}
+                               end
 
-                               :error ->
-                                 store = build_cross_shard_store(shard_idx, state)
-                                 {store, Map.put(stores, shard_idx, store)}
+                             result =
+                               dispatch_cross_shard_entry(entry, sandbox_namespace, store, state)
+
+                             case cross_shard_fatal_entry_error(entry, result) do
+                               {:error, _reason} = error ->
+                                 {:halt, error}
+
+                               nil ->
+                                 results =
+                                   Map.update(
+                                     results,
+                                     shard_idx,
+                                     %{pos => result},
+                                     fn shard_results ->
+                                       Map.put(shard_results, pos, result)
+                                     end
+                                   )
+
+                                 {:cont, {:ok, results, stores}}
                              end
+                         end) do
+                      {:ok, results_by_position, _stores} ->
+                        cross_shard_results_by_batch_position(shard_batches, results_by_position)
 
-                           result =
-                             dispatch_cross_shard_entry(entry, sandbox_namespace, store, state)
-
-                           case cross_shard_fatal_entry_error(entry, result) do
-                             {:error, _reason} = error ->
-                               {:halt, error}
-
-                             nil ->
-                               results =
-                                 Map.update(
-                                   results,
-                                   shard_idx,
-                                   %{pos => result},
-                                   fn shard_results ->
-                                     Map.put(shard_results, pos, result)
-                                   end
-                                 )
-
-                               {:cont, {:ok, results, stores}}
-                           end
-                       end) do
-                    {:ok, results_by_position, _stores} ->
-                      cross_shard_results_by_batch_position(shard_batches, results_by_position)
-
-                    {:error, _reason} = error ->
-                      error
+                      {:error, _reason} = error ->
+                        error
+                    end
+                  after
+                    Process.delete(:tx_deleted_keys)
+                    Process.delete(:tx_pending_values)
                   end
-                after
-                  Process.delete(:tx_deleted_keys)
-                  Process.delete(:tx_pending_values)
                 end
               end)
             else
@@ -917,6 +920,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       defp apply_now_ms do
         CommandTime.now_ms()
       end
+
+      defp raft_apply_context(%{apply_context: %Ferricstore.Raft.ApplyContext{} = context}),
+        do: context
+
+      defp raft_apply_context(_legacy_state), do: Ferricstore.Raft.ApplyContext.default()
     end
   end
 end

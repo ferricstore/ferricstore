@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.Router.Part05 do
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+      alias Ferricstore.Flow.PolicyCommand
       alias Ferricstore.Raft.ReplyAwaiter
       alias Ferricstore.Stats
       alias Ferricstore.Store.BlobRef
@@ -404,6 +405,21 @@ defmodule Ferricstore.Store.Router.Part05 do
       defp batch_quorum_commands(_ctx, [], _origin_node), do: []
 
       defp batch_quorum_commands(ctx, keyed_commands, origin_node) do
+        with {:ok, keyed_commands} <- maybe_stamp_flow_commands(ctx, keyed_commands, origin_node) do
+          do_batch_quorum_commands_dispatch(ctx, keyed_commands, origin_node)
+        else
+          {:error, _reason} = error -> List.duplicate(error, length(keyed_commands))
+        end
+      end
+
+      defp maybe_stamp_flow_commands(_ctx, keyed_commands, origin_node)
+           when not is_nil(origin_node),
+           do: {:ok, keyed_commands}
+
+      defp maybe_stamp_flow_commands(ctx, keyed_commands, nil),
+        do: PolicyCommand.stamp_many(ctx, keyed_commands)
+
+      defp do_batch_quorum_commands_dispatch(ctx, keyed_commands, origin_node) do
         if Enum.any?(keyed_commands, fn {_key, command} ->
              flow_shared_ref_acquisition_command?(command)
            end) do

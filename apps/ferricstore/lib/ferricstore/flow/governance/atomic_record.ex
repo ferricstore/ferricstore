@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
   @moduledoc false
 
   alias Ferricstore.Flow.Governance.Decision
+  alias Ferricstore.Flow.Governance.Catalog
   alias Ferricstore.Store.Router
 
   @default_max_retries 16
@@ -10,11 +11,16 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
       when is_binary(key) and is_function(decode, 1) and is_function(encode, 1) and
              is_function(init, 0) and is_function(mutate, 1) and is_list(opts) do
     max_retries = Keyword.get(opts, :max_retries, @default_max_retries)
-    retention_owner = Keyword.get(opts, :flow_retention_owner)
-    do_mutate(ctx, key, decode, encode, init, mutate, max_retries, retention_owner)
+
+    write_opts = %{
+      retention_owner: Keyword.get(opts, :flow_retention_owner),
+      catalog_kind: Keyword.get(opts, :catalog_kind)
+    }
+
+    do_mutate(ctx, key, decode, encode, init, mutate, max_retries, write_opts)
   end
 
-  defp do_mutate(_ctx, _key, _decode, _encode, _init, _mutate, retries_left, _retention_owner)
+  defp do_mutate(_ctx, _key, _decode, _encode, _init, _mutate, retries_left, _write_opts)
        when retries_left <= 0 do
     {:error,
      Decision.conflict(%{
@@ -23,7 +29,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
      })}
   end
 
-  defp do_mutate(ctx, key, decode, encode, init, mutate, retries_left, retention_owner) do
+  defp do_mutate(ctx, key, decode, encode, init, mutate, retries_left, write_opts) do
     case Router.get(ctx, key) do
       nil ->
         case init.() do
@@ -40,7 +46,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
               mutate,
               record,
               retries_left,
-              retention_owner
+              write_opts
             )
 
           {:error, _reason} = error ->
@@ -59,7 +65,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
             value,
             record,
             retries_left,
-            retention_owner
+            write_opts
           )
         end
 
@@ -77,7 +83,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
          mutate,
          record,
          retries_left,
-         retention_owner
+         write_opts
        ) do
     case mutation_result(mutate.(record)) do
       {:return, reply} ->
@@ -90,27 +96,29 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
           xx: false,
           get: false,
           keepttl: false,
-          flow_retention_owner: retention_owner
+          flow_retention_owner: write_opts.retention_owner
         }
 
-        case Router.set(ctx, key, encode.(updated), set_opts) do
-          :ok ->
-            reply
+        with :ok <- Catalog.register(ctx, write_opts.catalog_kind, key) do
+          case Router.set(ctx, key, encode.(updated), set_opts) do
+            :ok ->
+              reply
 
-          nil ->
-            do_mutate(
-              ctx,
-              key,
-              decode,
-              encode,
-              init,
-              mutate,
-              retries_left - 1,
-              retention_owner
-            )
+            nil ->
+              do_mutate(
+                ctx,
+                key,
+                decode,
+                encode,
+                init,
+                mutate,
+                retries_left - 1,
+                write_opts
+              )
 
-          {:error, _reason} = error ->
-            error
+            {:error, _reason} = error ->
+              error
+          end
         end
     end
   end
@@ -125,7 +133,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
          expected,
          record,
          retries_left,
-         retention_owner
+         write_opts
        ) do
     case mutation_result(mutate.(record)) do
       {:return, reply} ->
@@ -145,7 +153,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
               init,
               mutate,
               retries_left - 1,
-              retention_owner
+              write_opts
             )
 
           nil ->
@@ -157,7 +165,7 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
               init,
               mutate,
               retries_left - 1,
-              retention_owner
+              write_opts
             )
 
           {:error, _reason} = error ->

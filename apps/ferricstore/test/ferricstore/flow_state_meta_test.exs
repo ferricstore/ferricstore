@@ -2,8 +2,35 @@ defmodule Ferricstore.FlowStateMetaTest do
   use Ferricstore.Test.FlowCase
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.PolicyMigrationWorker
 
   @partition "tenant-state-meta"
+
+  setup do
+    ctx = FerricStore.Instance.get(:default)
+
+    {:ok, worker} =
+      PolicyMigrationWorker.start_link(
+        instance_ctx: ctx,
+        name: :"state_meta_policy_worker_#{System.unique_integer([:positive])}",
+        enabled: true,
+        initial_delay_ms: 0,
+        interval_ms: 10,
+        catchup_delay_ms: 1
+      )
+
+    on_exit(fn ->
+      if Process.alive?(worker) do
+        try do
+          GenServer.stop(worker)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    :ok
+  end
 
   test "state_meta stores durable per-state metadata and survives later states" do
     type = unique_flow_id("state-meta-type")
@@ -286,6 +313,13 @@ defmodule Ferricstore.FlowStateMetaTest do
                now_ms: now
              )
 
+    state_key = Ferricstore.Flow.Keys.state_key(id, @partition)
+    catalog_key = Ferricstore.Flow.Keys.type_catalog_member_key(type, state_key)
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, state_key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+    assert [_entry] = :ets.lookup(keydir, catalog_key)
+
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(type,
                states: ["accept"],
@@ -310,6 +344,22 @@ defmodule Ferricstore.FlowStateMetaTest do
 
     assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 2_000)
     assert cleaned.flows >= 1
+    assert [] = :ets.lookup(keydir, catalog_key)
+
+    assert_eventually(fn ->
+      flush_lmdb!()
+
+      path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.LMDB.path()
+
+      assert {:ok, 0} =
+               Ferricstore.Flow.LMDB.prefix_count(
+                 path,
+                 Ferricstore.Flow.Keys.policy_catalog_projection_prefix(type)
+               )
+    end)
 
     assert_eventually(fn ->
       flush_lmdb!()

@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   alias FerricstoreServer.Native.Connection.{FrameBuffer, Responses}
 
   @ping_opcode 0x0003
+  @command_exec_opcode 0x0100
   @frame_count 129
   @socket_chunk_bytes 64 * 1024
   @large_frame_body_bytes 4 * 1024 * 1024
@@ -37,6 +38,27 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert {:error, :timeout} = :gen_tcp.recv(socket, 0, 25)
     assert :ok = :gen_tcp.send(socket, final_bytes)
     assert receive_response_ids(socket, 1) == [42]
+  end
+
+  test "blocking commands inside MULTI are rejected by the session path" do
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    requests =
+      [
+        command_exec_frame(201, "MULTI", []),
+        command_exec_frame(202, "BLPOP", ["transaction:blocking:key", "0.01"]),
+        command_exec_frame(203, "EXEC", [])
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+
+    assert socket |> receive_response_statuses(3) |> Map.new() == %{
+             201 => 0,
+             202 => 1,
+             203 => 1
+           }
   end
 
   test "keeps fragmented multi-megabyte frames chunked until the frame is complete" do
@@ -244,6 +266,11 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     Codec.encode_frame(@ping_opcode, 0, request_id, body)
   end
 
+  defp command_exec_frame(request_id, command, args) do
+    body = Codec.encode_value(%{"command" => command, "args" => args})
+    Codec.encode_frame(@command_exec_opcode, 0, request_id, body)
+  end
+
   defp binary_chunks(binary, chunk_bytes) do
     full_chunks = for <<chunk::binary-size(chunk_bytes) <- binary>>, do: chunk
     consumed = length(full_chunks) * chunk_bytes
@@ -288,4 +315,40 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   end
 
   defp decode_response_ids(buffer, ids), do: {ids, buffer}
+
+  defp receive_response_statuses(socket, expected_count) do
+    receive_response_statuses(socket, expected_count, "", [])
+  end
+
+  defp receive_response_statuses(_socket, expected_count, _buffer, responses)
+       when length(responses) >= expected_count,
+       do: Enum.reverse(responses)
+
+  defp receive_response_statuses(socket, expected_count, buffer, responses) do
+    {decoded, rest} = decode_response_statuses(buffer, [])
+    responses = decoded ++ responses
+
+    if length(responses) >= expected_count do
+      Enum.reverse(responses)
+    else
+      assert {:ok, data} = :gen_tcp.recv(socket, 0, @receive_timeout)
+      receive_response_statuses(socket, expected_count, rest <> data, responses)
+    end
+  end
+
+  defp decode_response_statuses(
+         <<"FSNP", 0x81, _flags, 0::unsigned-32, @command_exec_opcode::unsigned-16,
+           request_id::unsigned-64, body_len::unsigned-32, body_and_rest::binary>> = buffer,
+         responses
+       ) do
+    if byte_size(body_and_rest) >= body_len do
+      <<body::binary-size(body_len), rest::binary>> = body_and_rest
+      <<status::unsigned-16, _value::binary>> = body
+      decode_response_statuses(rest, [{request_id, status} | responses])
+    else
+      {responses, buffer}
+    end
+  end
+
+  defp decode_response_statuses(buffer, responses), do: {responses, buffer}
 end

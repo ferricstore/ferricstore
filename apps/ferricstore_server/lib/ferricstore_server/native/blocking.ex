@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Native.Blocking do
 
   alias Ferricstore.Commands.Blocking, as: BlockingCmd
   alias Ferricstore.Commands.Dispatcher
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Commands.List, as: ListCmd
   alias Ferricstore.Commands.Stream, as: StreamCmd
   alias Ferricstore.Waiters
@@ -17,16 +18,28 @@ defmodule FerricstoreServer.Native.Blocking do
   @spec start_request(map(), map(), map()) ::
           {:ok, pid()} | {:error, atom(), binary()}
   def start_request(payload, state, meta) do
-    with {:ok, cmd, args, ast, keys} <- Session.parse_command(payload),
-         true <-
-           blocking_command?(cmd) || {:error, :bad_request, "ERR native command is not blocking"},
-         :ok <- Session.authorize_command(cmd, args, ast, keys, state) do
+    with {:ok, prepared} <- Session.prepare_command(payload) do
+      start_prepared(prepared, state, meta)
+    else
+      {:error, reason} -> {:error, :bad_request, reason}
+    end
+  end
+
+  @spec start_prepared(PreparedCommand.t(), map(), map()) ::
+          {:ok, pid()} | {:error, atom(), binary()}
+  def start_prepared(%PreparedCommand{} = prepared, state, meta) do
+    with true <-
+           blocking_command?(prepared.command) ||
+             {:error, :bad_request, "ERR native command is not blocking"},
+         :ok <- Session.authorize_command(prepared, state) do
       parent = self()
       ctx = state.instance_ctx
 
       pid =
         spawn(fn ->
-          {status, value} = run_blocking(cmd, args, ast, ctx)
+          {status, value} =
+            run_blocking(prepared.command, prepared.args, prepared.ast, ctx)
+
           send(parent, {:native_blocking_response, meta, self(), status, value})
         end)
 

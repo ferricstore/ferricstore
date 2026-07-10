@@ -13,6 +13,7 @@ defmodule FerricstoreServer.Native.Commands do
   """
 
   alias Ferricstore.{AuditLog, Stats}
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Flow.{ClaimDueAPI, ClaimWaiters}
   alias Ferricstore.Flow.Codec, as: FlowCodec
   alias Ferricstore.Flow.InternalKey
@@ -356,6 +357,7 @@ defmodule FerricstoreServer.Native.Commands do
     "children" => :children,
     "consistent_projection" => :consistent_projection,
     "correlation_id" => :correlation_id,
+    "config_version" => :config_version,
     "count" => :count,
     "cron" => :cron,
     "delay_ms" => :delay_ms,
@@ -447,6 +449,7 @@ defmodule FerricstoreServer.Native.Commands do
     "reason" => :reason,
     "reason_ref" => :reason_ref,
     "reservation_id" => :reservation_id,
+    "reservation_ids" => :reservation_ids,
     "requested_by" => :requested_by,
     "reclaim_expired" => :reclaim_expired,
     "reclaim_ratio" => :reclaim_ratio,
@@ -824,10 +827,9 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, command} <- require_binary(payload, "command"),
          {:ok, args} <- raw_command_args(payload),
          {:ok, request_context} <- request_context(payload, state) do
-      with {:ok, cmd, parsed_args, ast, keys} <-
-             Ferricstore.Commands.Dispatcher.parse_raw(command, args),
-           :ok <- authorize_raw_command(cmd, parsed_args, ast, keys, state) do
-        dispatch_command_exec(cmd, command, parsed_args, state, request_context)
+      with {:ok, prepared} <- prepared_raw_command(payload, command, args),
+           :ok <- authorize_raw_command(prepared, state) do
+        dispatch_command_exec(prepared, state, request_context)
       else
         {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
         {:error, status, reason} -> {status, reason, state}
@@ -1818,29 +1820,35 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
-  defp dispatch_command_exec("CLIENT", _command, [subcmd | rest], state, _request_context) do
+  defp dispatch_command_exec(
+         %PreparedCommand{command: "CLIENT", args: [subcmd | rest]},
+         state,
+         _request_context
+       ) do
     subcmd
     |> String.upcase()
     |> FerricstoreServer.Commands.Client.handle(rest, state, state.instance_ctx)
     |> client_command_result_to_reply(state)
   end
 
-  defp dispatch_command_exec("CLIENT", _command, [], state, _request_context),
-    do: {:bad_request, "ERR wrong number of arguments for 'client' command", state}
+  defp dispatch_command_exec(
+         %PreparedCommand{command: "CLIENT", args: []},
+         state,
+         _request_context
+       ),
+       do: {:bad_request, "ERR wrong number of arguments for 'client' command", state}
 
   defp dispatch_command_exec(
-         "FERRICSTORE.METRICS",
-         _command,
-         parsed_args,
+         %PreparedCommand{command: "FERRICSTORE.METRICS", args: parsed_args},
          state,
          _request_context
        ) do
     ferricstore_metrics_result(parsed_args, state)
   end
 
-  defp dispatch_command_exec(_cmd, command, parsed_args, state, request_context) do
+  defp dispatch_command_exec(%PreparedCommand{} = prepared, state, request_context) do
     store = attach_request_context(state.instance_ctx, request_context)
-    result = Ferricstore.Commands.Dispatcher.dispatch_raw(command, parsed_args, store)
+    result = Ferricstore.Commands.Dispatcher.dispatch_prepared(prepared, store)
     result |> raw_result_to_native() |> result_to_reply(state)
   end
 
@@ -2128,19 +2136,20 @@ defmodule FerricstoreServer.Native.Commands do
   defp check_key_acl_cached(%{keys: :all}, _opcode, _payload), do: :ok
 
   defp check_key_acl_cached(cache, opcode, payload) do
-    ConnAuth.check_keys_cached(cache, key_acl_command(opcode), keys(opcode, payload))
+    ConnAuth.check_keys_cached(cache, key_acl_command(opcode, payload), keys(opcode, payload))
   end
 
-  defp authorize_raw_command(command, args, ast, keys, state) do
+  defp authorize_raw_command(%PreparedCommand{} = prepared, state) do
     cond do
       state.require_auth and not state.authenticated ->
         {:error, :auth, "NOAUTH Authentication required."}
 
       true ->
-        acl_command = ConnAuth.acl_command_name(command, args, ast)
+        acl_command =
+          ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
 
         with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_command),
-             :ok <- ConnAuth.check_keys_cached(state.acl_cache, acl_command, keys) do
+             :ok <- ConnAuth.check_keys_cached(state.acl_cache, prepared) do
           :ok
         else
           {:error, reason} ->
@@ -2153,6 +2162,20 @@ defmodule FerricstoreServer.Native.Commands do
 
             {:error, :noperm, reason}
         end
+    end
+  end
+
+  defp prepared_raw_command(payload, command, args) do
+    case Map.get(payload, :__prepared_command__) do
+      %PreparedCommand{args: ^args} = prepared ->
+        if prepared.command == String.upcase(command) do
+          {:ok, prepared}
+        else
+          Ferricstore.Commands.Dispatcher.prepare_raw(command, args)
+        end
+
+      _not_prepared ->
+        Ferricstore.Commands.Dispatcher.prepare_raw(command, args)
     end
   end
 
@@ -2597,53 +2620,11 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
-  defp key_acl_command(opcode)
-       when opcode in [
-              @op_get,
-              @op_mget,
-              @op_route,
-              @op_hget,
-              @op_hmget,
-              @op_hgetall,
-              @op_lrange,
-              @op_smembers,
-              @op_sismember,
-              @op_zrange,
-              @op_zscore,
-              @op_flow_get,
-              @op_flow_history,
-              @op_flow_list,
-              @op_flow_terminals,
-              @op_flow_failures,
-              @op_flow_by_parent,
-              @op_flow_by_root,
-              @op_flow_by_correlation,
-              @op_flow_info,
-              @op_flow_stuck,
-              @op_flow_stats,
-              @op_flow_attributes,
-              @op_flow_attribute_values,
-              @op_flow_search,
-              @op_flow_value_mget,
-              @op_flow_policy_get,
-              @op_flow_effect_get,
-              @op_flow_governance_ledger,
-              @op_flow_approval_get,
-              @op_flow_approval_list,
-              @op_flow_governance_overview,
-              @op_flow_circuit_get,
-              @op_flow_budget_get,
-              @op_flow_budget_list,
-              @op_flow_limit_get,
-              @op_flow_limit_list,
-              @op_flow_schedule_get,
-              @op_flow_schedule_list,
-              @op_cluster_keyslot,
-              @op_ferricstore_key_info
-            ],
-       do: "GET"
+  defp key_acl_command(@op_set, payload) when is_map(payload) do
+    if Map.get(payload, "get") == true, do: "GETSET", else: "SET"
+  end
 
-  defp key_acl_command(_opcode), do: "SET"
+  defp key_acl_command(opcode, _payload), do: Map.get(@commands, opcode, "SET")
 
   defp pair_key(%{"key" => key}), do: key
   defp pair_key([key, _value]) when is_binary(key), do: key
@@ -3824,6 +3805,7 @@ defmodule FerricstoreServer.Native.Commands do
           when is_integer(opcode) and is_map(body) ->
             lane_id = Map.get(command, "lane_id", 0)
             request_id = Map.get(command, "request_id", 0)
+            body = maybe_prepare_pipeline_command(opcode, body)
 
             if control_opcode?(opcode) do
               {:halt, {:error, "ERR native pipeline cannot contain control commands"}}
@@ -3845,6 +3827,18 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp pipeline_commands(_payload), do: {:error, "ERR native pipeline requires commands list"}
 
+  defp maybe_prepare_pipeline_command(@op_command_exec, body) do
+    with {:ok, command} <- require_binary(body, "command"),
+         {:ok, args} <- raw_command_args(body),
+         {:ok, prepared} <- Ferricstore.Commands.Dispatcher.prepare_raw(command, args) do
+      Map.put(body, :__prepared_command__, prepared)
+    else
+      _invalid_command -> body
+    end
+  end
+
+  defp maybe_prepare_pipeline_command(_opcode, body), do: body
+
   defp authorize_pipeline_public_keys(commands) do
     Enum.reduce_while(commands, :ok, fn command, :ok ->
       case authorize_pipeline_public_command(command) do
@@ -3855,13 +3849,18 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp authorize_pipeline_public_command(%{opcode: @op_command_exec, body: body}) do
-    with {:ok, command} <- require_binary(body, "command"),
-         {:ok, args} <- raw_command_args(body),
-         {:ok, cmd, _parsed_args, _ast, keys} <-
-           Ferricstore.Commands.Dispatcher.parse_raw(command, args) do
-      InternalKey.authorize_command(cmd, keys)
-    else
-      _parse_or_validation_error -> :ok
+    case Map.get(body, :__prepared_command__) do
+      %PreparedCommand{} = prepared ->
+        InternalKey.authorize_command(prepared.command, prepared.acl_keys)
+
+      _not_prepared ->
+        with {:ok, command} <- require_binary(body, "command"),
+             {:ok, args} <- raw_command_args(body),
+             {:ok, prepared} <- Ferricstore.Commands.Dispatcher.prepare_raw(command, args) do
+          InternalKey.authorize_command(prepared.command, prepared.acl_keys)
+        else
+          _parse_or_validation_error -> :ok
+        end
     end
   end
 
@@ -4648,18 +4647,41 @@ defmodule FerricstoreServer.Native.Commands do
        do: :ok
 
   defp validate_pipeline_atomicity(commands, "same_shard", state) do
-    shards =
-      commands
-      |> Enum.flat_map(fn command -> keys(command.opcode, command.body) end)
-      |> Enum.map(&Router.shard_for(state.instance_ctx, &1))
-      |> Enum.uniq()
+    if Enum.any?(commands, &coordinated_pipeline_command?/1) do
+      {:error, "ERR native same_shard pipeline contains coordinated command"}
+    else
+      shards =
+        commands
+        |> Enum.flat_map(&pipeline_routing_keys/1)
+        |> Enum.map(&Router.shard_for(state.instance_ctx, &1))
+        |> Enum.uniq()
 
-    case shards do
-      [] -> :ok
-      [_one] -> :ok
-      _ -> {:error, "ERR native same_shard pipeline contains multiple shards"}
+      case shards do
+        [] -> :ok
+        [_one] -> :ok
+        _ -> {:error, "ERR native same_shard pipeline contains multiple shards"}
+      end
     end
   end
+
+  defp coordinated_pipeline_command?(%{
+         opcode: @op_command_exec,
+         body: %{__prepared_command__: %PreparedCommand{routing_scope: :coordinated}}
+       }),
+       do: true
+
+  defp coordinated_pipeline_command?(%{opcode: opcode}) when is_integer(opcode),
+    do: Map.has_key?(@flow_commands, opcode)
+
+  defp coordinated_pipeline_command?(_command), do: false
+
+  defp pipeline_routing_keys(%{
+         opcode: @op_command_exec,
+         body: %{__prepared_command__: %PreparedCommand{routing_keys: keys}}
+       }),
+       do: keys
+
+  defp pipeline_routing_keys(command), do: keys(command.opcode, command.body)
 
   defp execute_pipeline_fast_path(
          commands,

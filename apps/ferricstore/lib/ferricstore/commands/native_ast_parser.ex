@@ -8,7 +8,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   command catalog.
   """
 
-  alias Ferricstore.Commands.{Catalog, Extension, KeyDiscovery}
+  alias Ferricstore.Commands.{Catalog, Extension}
 
   @max_flow_ref_size 4096
   @extra_command_names ~w(
@@ -970,15 +970,9 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   defp command_keys(cmd, args) do
-    case KeyDiscovery.extract(cmd, args) do
-      {:ok, keys} ->
-        keys
-
-      :not_dynamic ->
-        case Catalog.get_keys_upper(cmd, args) do
-          {:ok, keys} -> keys
-          {:error, _} -> static_or_extension_keys(cmd, args)
-        end
+    case Catalog.get_keys_upper(cmd, args) do
+      {:ok, keys} -> keys
+      {:error, _} -> static_or_extension_keys(cmd, args)
     end
   end
 

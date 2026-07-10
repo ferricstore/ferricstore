@@ -899,11 +899,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
       defp flow_lmdb_record_path(state), do: Map.fetch!(state, :flow_lmdb_path)
 
-      defp flow_hibernation_enabled?, do: Hibernation.enabled?()
+      defp flow_hibernation_enabled?(state),
+        do: Hibernation.enabled?(raft_apply_context(state))
 
-      defp maybe_queue_flow_hibernation_candidate(_state, key, record, state_value)
+      defp maybe_queue_flow_hibernation_candidate(state, key, record, state_value)
            when is_binary(key) and is_map(record) do
-        if flow_hibernation_enabled?() and Hibernation.demotable?(record, apply_now_ms()) do
+        context = raft_apply_context(state)
+
+        if flow_hibernation_enabled?(state) and
+             Hibernation.demotable?(record, apply_now_ms(),
+               hot_window_ms: Hibernation.hot_window_ms(context),
+               safety_margin_ms: Hibernation.safety_margin_ms(context)
+             ) do
           pending = Process.get(:sm_pending_flow_hibernation_candidates, [])
 
           Process.put(:sm_pending_flow_hibernation_candidates, [

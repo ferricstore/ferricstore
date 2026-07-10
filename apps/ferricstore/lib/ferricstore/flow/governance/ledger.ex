@@ -68,11 +68,9 @@ defmodule Ferricstore.Flow.Governance.Ledger do
          {:ok, from_ms} <- optional_non_negative_integer(opts, :from_ms, 0),
          {:ok, to_ms} <- optional_non_negative_integer(opts, :to_ms, :infinity),
          index_key = Keys.governance_ledger_index_key(id, partition_key),
-         {:ok, index_events} <- load_index(ctx, index_key),
-         {:ok, event_key_events} <- load_event_keys(ctx, id, partition_key) do
+         {:ok, index_events} <- load_index(ctx, index_key) do
       events =
         index_events
-        |> merge_events(event_key_events)
         |> Enum.filter(&in_window?(&1, from_ms, to_ms))
         |> maybe_reverse(rev?)
         |> Enum.take(limit)
@@ -90,37 +88,6 @@ defmodule Ferricstore.Flow.Governance.Ledger do
       value when is_binary(value) -> decode_index(value)
       _other -> {:error, "ERR flow governance ledger index is corrupt"}
     end
-  end
-
-  defp load_event_keys(ctx, id, partition_key) do
-    prefix = Keys.governance_ledger_key_prefix(id, partition_key)
-
-    events =
-      ctx
-      |> Router.keys()
-      |> Enum.filter(&String.starts_with?(&1, prefix))
-      |> Enum.reduce([], fn key, acc ->
-        case Router.get(ctx, key) do
-          value when is_binary(value) ->
-            case decode_event(value) do
-              {:ok, event} -> [event | acc]
-              {:error, _reason} -> acc
-            end
-
-          _other ->
-            acc
-        end
-      end)
-
-    {:ok, events}
-  end
-
-  defp merge_events(left, right) do
-    (left ++ right)
-    |> Enum.reduce(%{}, fn event, acc -> Map.put(acc, Map.get(event, :id), event) end)
-    |> Map.values()
-    |> Enum.sort_by(&Map.get(&1, :at_ms, 0))
-    |> trim(@default_max_events)
   end
 
   defp put_event(events, event, max_events) do
@@ -168,15 +135,6 @@ defmodule Ferricstore.Flow.Governance.Ledger do
     end
   rescue
     _ -> {:error, "ERR flow governance ledger index is corrupt"}
-  end
-
-  defp decode_event(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_governance_ledger_v1, event} when is_map(event) -> {:ok, event}
-      _other -> {:error, "ERR flow governance ledger event is corrupt"}
-    end
-  rescue
-    _ -> {:error, "ERR flow governance ledger event is corrupt"}
   end
 
   defp event_id(now_ms) do

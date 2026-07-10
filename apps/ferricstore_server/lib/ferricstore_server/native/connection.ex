@@ -603,17 +603,21 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp dispatch_native_session_payload(frame, payload, state) do
-    case Session.parse_command(payload) do
-      {:ok, cmd, _args, _ast, _keys} ->
+    case Session.prepare_command(payload) do
+      {:ok, prepared} ->
         cond do
-          Blocking.blocking_command?(cmd) ->
+          state.multi_state == :queuing ->
+            {status, value, state} = Session.execute_prepared(prepared, state)
+            {:reply, status, value, state}
+
+          Blocking.blocking_command?(prepared.command) ->
             meta = %{
               opcode: opcode(frame),
               lane_id: lane_id(frame),
               request_id: request_id(frame)
             }
 
-            case Blocking.start_request(payload, state, meta) do
+            case Blocking.start_prepared(prepared, state, meta) do
               {:ok, pid} ->
                 {:blocked, put_blocked_request(state, pid, meta)}
 
@@ -621,8 +625,8 @@ defmodule FerricstoreServer.Native.Connection do
                 {:reply, status, reason, state}
             end
 
-          Session.session_command?(cmd) or state.multi_state == :queuing ->
-            {status, value, state} = Session.execute(payload, state)
+          Session.session_command?(prepared.command) ->
+            {status, value, state} = Session.execute_prepared(prepared, state)
             {:reply, status, value, state}
 
           true ->
@@ -638,20 +642,18 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp native_session_frame?(frame, state) do
     opcode(frame) == @op_command_exec and
-      case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
-        {:ok, payload} ->
-          case Session.parse_command(payload) do
-            {:ok, cmd, _args, _ast, _keys} ->
-              Blocking.blocking_command?(cmd) or Session.session_command?(cmd) or
-                state.multi_state == :queuing
+      (state.multi_state == :queuing or native_session_payload?(frame))
+  end
 
-            {:error, _reason} ->
-              false
-          end
+  defp native_session_payload?(frame) do
+    case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
+      {:ok, %{"command" => command}} when is_binary(command) ->
+        command = String.upcase(command)
+        Blocking.blocking_command?(command) or Session.session_command?(command)
 
-        {:error, _reason} ->
-          false
-      end
+      _invalid_or_non_session ->
+        false
+    end
   end
 
   defp dispatch_data_frame(frame, rest, state, responses, decode_us, lane_batches) do

@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Native.Session do
   @moduledoc false
 
   alias Ferricstore.PubSub, as: PS
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Coordinator, as: TxCoordinator
@@ -29,38 +30,62 @@ defmodule FerricstoreServer.Native.Session do
   @spec parse_command(map()) ::
           {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
   def parse_command(payload) when is_map(payload) do
+    case prepare_command(payload) do
+      {:ok, prepared} -> PreparedCommand.legacy_result(prepared)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec prepare_command(map()) :: {:ok, PreparedCommand.t()} | {:error, binary()}
+  def prepare_command(payload) when is_map(payload) do
     with {:ok, command} <- require_binary(payload, "command"),
          {:ok, args} <- raw_command_args(payload) do
-      Ferricstore.Commands.Dispatcher.parse_raw(command, args)
+      Ferricstore.Commands.Dispatcher.prepare_raw(command, args)
     end
   end
 
   @spec execute(map(), map()) :: {:ok | :error | :bad_request | :auth | :noperm, term(), map()}
   def execute(payload, state) do
-    with {:ok, cmd, args, ast, keys} <- parse_command(payload),
-         :ok <- authorize_command(cmd, args, ast, keys, state) do
-      execute_parsed(cmd, args, ast, keys, state)
+    with {:ok, prepared} <- prepare_command(payload) do
+      execute_prepared(prepared, state)
     else
       {:error, status, reason} -> {status, reason, state}
       {:error, reason} -> {:bad_request, reason, state}
     end
   end
 
+  @spec execute_prepared(PreparedCommand.t(), map()) ::
+          {:ok | :error | :bad_request | :auth | :noperm, term(), map()}
+  def execute_prepared(%PreparedCommand{} = prepared, state) do
+    case authorize_command(prepared, state) do
+      :ok -> execute_prepared_command(prepared, state)
+      {:error, status, reason} -> {status, reason, state}
+    end
+  end
+
   @spec authorize_command(binary(), [binary()], term(), [binary()], map()) ::
           :ok | {:error, atom(), binary()}
   def authorize_command(cmd, args, ast, keys, state) do
+    cmd
+    |> PreparedCommand.from_parsed(args, ast, keys)
+    |> authorize_command(state)
+  end
+
+  @spec authorize_command(PreparedCommand.t(), map()) :: :ok | {:error, atom(), binary()}
+  def authorize_command(%PreparedCommand{} = prepared, state) do
     cond do
       Map.get(state, :require_auth) and not Map.get(state, :authenticated) ->
         {:error, :auth, "NOAUTH Authentication required."}
 
       true ->
-        acl_cmd = ConnAuth.acl_command_name(cmd, args, ast)
+        acl_cmd =
+          ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
 
-        case InternalKey.authorize_command(cmd, keys) do
+        case InternalKey.authorize_command(prepared.command, prepared.acl_keys) do
           :ok ->
             with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
-                 :ok <- authorize_channels(cmd, args, state),
-                 :ok <- ConnAuth.check_keys_cached(state.acl_cache, acl_cmd, keys) do
+                 :ok <- authorize_channels(prepared.command, prepared.args, state),
+                 :ok <- ConnAuth.check_keys_cached(state.acl_cache, prepared) do
               :ok
             else
               {:error, reason} ->
@@ -101,17 +126,29 @@ defmodule FerricstoreServer.Native.Session do
     %{"kind" => "pmessage", "pattern" => pattern, "channel" => channel, "message" => message}
   end
 
-  defp execute_parsed(cmd, args, ast, keys, %{multi_state: :queuing} = state)
-       when not is_nil(cmd) do
-    if MapSet.member?(@transaction_passthrough, cmd) do
-      execute_session_command(cmd, args, ast, keys, state)
+  defp execute_prepared_command(%PreparedCommand{} = prepared, %{multi_state: :queuing} = state) do
+    if MapSet.member?(@transaction_passthrough, prepared.command) do
+      execute_session_command(
+        prepared.command,
+        prepared.args,
+        prepared.ast,
+        prepared.acl_keys,
+        state
+      )
     else
-      queue_transaction_command(cmd, args, ast, keys, state)
+      queue_transaction_command(prepared, state)
     end
   end
 
-  defp execute_parsed(cmd, args, ast, keys, state),
-    do: execute_session_command(cmd, args, ast, keys, state)
+  defp execute_prepared_command(%PreparedCommand{} = prepared, state),
+    do:
+      execute_session_command(
+        prepared.command,
+        prepared.args,
+        prepared.ast,
+        prepared.acl_keys,
+        state
+      )
 
   defp execute_session_command("SUBSCRIBE", [], _ast, _keys, state),
     do: {:bad_request, "ERR wrong number of arguments for 'subscribe' command", state}
@@ -152,7 +189,7 @@ defmodule FerricstoreServer.Native.Session do
     ordered = Enum.reverse(state.multi_queue)
 
     with :ok <- reauthorize_transaction(ordered, state) do
-      entries = Enum.map(ordered, fn {cmd, args, ast, _keys} -> {cmd, args, ast} end)
+      entries = Enum.map(ordered, &transaction_entry/1)
 
       result =
         TxCoordinator.execute(entries, state.watched_keys, Map.get(state, :sandbox_namespace))
@@ -194,24 +231,28 @@ defmodule FerricstoreServer.Native.Session do
   defp execute_session_command(_cmd, _args, _ast, _keys, state),
     do: {:bad_request, "ERR native command is not a session command", state}
 
-  defp queue_transaction_command(cmd, args, ast, keys, state) do
+  defp queue_transaction_command(%PreparedCommand{} = prepared, state) do
     cond do
       state.multi_queue_count >= @max_multi_queue_size ->
         {:error,
          "ERR MULTI queue overflow (max #{@max_multi_queue_size} commands), transaction discarded",
          clear_transaction(state)}
 
-      MapSet.member?(@blocked_in_transaction, cmd) ->
+      MapSet.member?(@blocked_in_transaction, prepared.command) ->
         {:error, "ERR Command not allowed inside a transaction", %{state | multi_error: true}}
 
-      transaction_ast_error(ast) != nil ->
-        {:error, transaction_ast_error(ast), %{state | multi_error: true}}
+      prepared.routing_scope == :coordinated ->
+        {:error, "ERR coordinated command is not supported inside a transaction",
+         %{state | multi_error: true}}
+
+      transaction_ast_error(prepared.ast) != nil ->
+        {:error, transaction_ast_error(prepared.ast), %{state | multi_error: true}}
 
       true ->
         {:ok, "QUEUED",
          %{
            state
-           | multi_queue: [{cmd, args, ast, keys} | state.multi_queue],
+           | multi_queue: [prepared | state.multi_queue],
              multi_queue_count: state.multi_queue_count + 1
          }}
     end
@@ -229,17 +270,29 @@ defmodule FerricstoreServer.Native.Session do
   end
 
   defp reauthorize_transaction(queue, state) do
-    Enum.reduce_while(queue, :ok, fn {cmd, args, ast, keys}, :ok ->
-      acl_cmd = ConnAuth.acl_command_name(cmd, args, ast)
+    Enum.reduce_while(queue, :ok, fn entry, :ok ->
+      prepared = transaction_prepared(entry)
+
+      acl_cmd =
+        ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
 
       case {ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
-            ConnAuth.check_keys_cached(state.acl_cache, acl_cmd, keys)} do
+            ConnAuth.check_keys_cached(state.acl_cache, prepared)} do
         {:ok, :ok} -> {:cont, :ok}
         {{:error, reason}, _} -> {:halt, {:error, reason}}
         {_, {:error, reason}} -> {:halt, {:error, reason}}
       end
     end)
   end
+
+  defp transaction_entry(%PreparedCommand{} = prepared), do: prepared
+
+  defp transaction_entry({cmd, args, ast, _keys}), do: {cmd, args, ast}
+
+  defp transaction_prepared(%PreparedCommand{} = prepared), do: prepared
+
+  defp transaction_prepared({cmd, args, ast, keys}),
+    do: PreparedCommand.from_parsed(cmd, args, ast, keys)
 
   defp subscribe_channels(channels, state) do
     state = ensure_pubsub_sets(state)

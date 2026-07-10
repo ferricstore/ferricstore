@@ -1267,7 +1267,7 @@ defmodule Ferricstore.FlowGovernanceTest do
     assert owner.free == 4
     assert lease.available == 6
 
-    assert {:ok, %{owner: owner, lease: lease}} =
+    assert {:ok, %{owner: owner, lease: lease, reservation_ids: reservation_ids}} =
              FerricStore.flow_limit_spend(scope, shard_id: 1, amount: 4, now_ms: 1_001)
 
     assert owner.free == 4
@@ -1295,7 +1295,12 @@ defmodule Ferricstore.FlowGovernanceTest do
 
     assert denial.code == "GOVERNANCE_LIMIT_EXCEEDED"
 
-    assert {:ok, owner} = FerricStore.flow_limit_release(scope, shard_id: 1, amount: 4)
+    assert {:ok, owner} =
+             FerricStore.flow_limit_release(scope,
+               shard_id: 1,
+               reservation_ids: reservation_ids
+             )
+
     assert owner.leases[1].available == 6
     assert owner.leases[1].in_use == 0
 
@@ -1433,7 +1438,7 @@ defmodule Ferricstore.FlowGovernanceTest do
     assert owner_after_second.leases[0].in_use == 4
   end
 
-  test "terminal release recycles pre-spent limit credits locally" do
+  test "terminal release returns its named pre-spent credit durably" do
     type = unique_flow_id("gov-release-cache-type")
     limit_scope = unique_flow_id("gov-release-cache-limit")
 
@@ -1485,8 +1490,8 @@ defmodule Ferricstore.FlowGovernanceTest do
              )
 
     assert {:ok, owner_after_complete} = FerricStore.flow_limit_get(limit_scope, now_ms: 1_003)
-    assert owner_after_complete.leases[0].available == 0
-    assert owner_after_complete.leases[0].in_use == 4
+    assert owner_after_complete.leases[0].available == 1
+    assert owner_after_complete.leases[0].in_use == 3
 
     assert {:ok, [second]} =
              FerricStore.flow_claim_due(type, Keyword.put(claim_opts, :now_ms, 1_004))
@@ -1568,7 +1573,7 @@ defmodule Ferricstore.FlowGovernanceTest do
              )
   end
 
-  test "ledger list repairs from durable event keys when compact index is missing" do
+  test "ledger list treats its exact durable index as the source of truth" do
     type = unique_flow_id("gov-ledger-repair-type")
     id = unique_flow_id("gov-ledger-repair")
     claimed = create_and_claim!(id, type)
@@ -1583,11 +1588,15 @@ defmodule Ferricstore.FlowGovernanceTest do
                now_ms: 1_002
              )
 
-    assert {:ok, 1} =
-             FerricStore.del(Ferricstore.Flow.Keys.governance_ledger_index_key(id, @partition))
+    ctx = FerricStore.Instance.get(:default)
 
-    assert {:ok, [event]} = FerricStore.flow_governance_ledger(id, partition_key: @partition)
-    assert event.kind == :effect_reserved
+    assert :ok =
+             Ferricstore.Store.Router.delete(
+               ctx,
+               Ferricstore.Flow.Keys.governance_ledger_index_key(id, @partition)
+             )
+
+    assert {:ok, []} = FerricStore.flow_governance_ledger(id, partition_key: @partition)
   end
 
   test "terminal retention removes effect and ledger governance records" do
@@ -1670,7 +1679,7 @@ defmodule Ferricstore.FlowGovernanceTest do
                  partition_key: @partition,
                  run_at_ms: now,
                  now_ms: now,
-                 retention_ttl_ms: 10
+                 retention_ttl_ms: 500
                )
 
       assert {:ok, [claimed]} =

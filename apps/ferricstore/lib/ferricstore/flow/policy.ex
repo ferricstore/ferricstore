@@ -44,16 +44,28 @@ defmodule Ferricstore.Flow.Policy do
   def raw(ctx, type) when is_binary(type), do: read(ctx, type)
   def raw(_ctx, _type), do: {:error, "ERR flow type must be a non-empty string"}
 
+  @doc false
+  def raw_entry(ctx, type) when is_binary(type), do: read_entry(ctx, type)
+
+  def raw_entry(_ctx, _type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
   defp read(ctx, type) do
+    with {:ok, {_generation, policy}} <- read_entry(ctx, type) do
+      {:ok, policy}
+    end
+  end
+
+  defp read_entry(ctx, type) do
     case Stats.with_cache_tracking_disabled(fn ->
            Router.get(ctx, Keys.policy_key(type))
          end) do
       nil ->
-        {:ok, nil}
+        {:ok, {0, nil}}
 
       value when is_binary(value) ->
-        case RetryPolicy.decode_flow_policy(value) do
-          {:ok, policy} -> {:ok, policy}
+        case RetryPolicy.decode_flow_policy_entry(value) do
+          {:ok, entry} -> {:ok, entry}
           :error -> {:error, "ERR flow policy is corrupt"}
         end
 

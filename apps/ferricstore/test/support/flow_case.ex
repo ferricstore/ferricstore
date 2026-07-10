@@ -18,9 +18,15 @@ defmodule Ferricstore.Test.FlowCase do
       end
 
       setup do
+        ctx = FerricStore.Instance.get(:default)
+
+        case Ferricstore.Flow.Governance.LimitCache.clear(ctx) do
+          {:ok, %{errors: 0}} -> :ok
+          {:error, reason} -> raise "failed to flush governance limit cache: #{inspect(reason)}"
+        end
+
         ShardHelpers.flush_all_keys()
         ShardHelpers.reset_memory_guard_pressure()
-        Ferricstore.Flow.Governance.LimitCache.clear()
         :ok
       end
 

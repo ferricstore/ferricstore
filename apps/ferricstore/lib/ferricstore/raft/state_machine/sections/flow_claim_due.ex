@@ -53,6 +53,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
         with :ok <- flow_create_put_record_values(state, plans),
              :ok <- flow_create_put_state_records(state, records),
+             :ok <- flow_create_put_type_catalog_members(state, records),
              :ok <- flow_create_put_registry_markers(state, records),
              :ok <- flow_due_put_many_new(state, records),
              :ok <- flow_index_put_many_new(state, records),
@@ -68,6 +69,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
         with :ok <- flow_create_fast_put_record_values(state, plans),
              :ok <- flow_create_put_fast_state_records(state, plans),
+             :ok <-
+               flow_create_put_type_catalog_members(
+                 state,
+                 Enum.map(plans, &Map.fetch!(&1, :record))
+               ),
              :ok <- flow_create_put_fast_registry_markers(state, plans),
              :ok <- flow_create_put_fast_indexes(state, plans),
              :ok <- flow_create_put_fast_history(state, plans) do
@@ -87,6 +93,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       defp flow_create_put_registry_markers(state, records) do
         Enum.reduce_while(records, :ok, fn record, :ok ->
           case flow_create_put_registry_marker(state, record) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp flow_create_put_type_catalog_members(state, records) do
+        Enum.reduce_while(records, :ok, fn record, :ok ->
+          case flow_put_type_catalog_member(state, record) do
             :ok -> {:cont, :ok}
             {:error, _reason} = error -> {:halt, error}
           end
@@ -181,34 +196,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
                priority: priority
              } = attrs
            ) do
-        now_ms = flow_attrs_now_ms(attrs)
-        partition_key = Map.get(attrs, :partition_keys) || Map.get(attrs, :partition_key)
+        with_flow_governance_limit(attrs, fn ->
+          now_ms = flow_attrs_now_ms(attrs)
+          partition_key = Map.get(attrs, :partition_keys) || Map.get(attrs, :partition_key)
 
-        flow_claim_due_phase(
-          :total,
-          flow_claim_due_phase_meta(state, partition_key, priority, limit),
-          fn ->
-            state_filter =
-              flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
+          flow_claim_due_phase(
+            :total,
+            flow_claim_due_phase_meta(state, partition_key, priority, limit),
+            fn ->
+              state_filter =
+                flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
 
-            case flow_claim_due_priorities(
-                   state,
-                   attrs,
-                   type,
-                   state_filter,
-                   worker,
-                   lease_ms,
-                   now_ms,
-                   partition_key,
-                   flow_claim_priorities(priority),
-                   limit,
-                   []
-                 ) do
-              {:error, _reason} = error -> error
-              claimed -> {:ok, claimed}
+              case flow_claim_due_priorities(
+                     state,
+                     attrs,
+                     type,
+                     state_filter,
+                     worker,
+                     lease_ms,
+                     now_ms,
+                     partition_key,
+                     flow_claim_priorities(priority),
+                     limit,
+                     []
+                   ) do
+                {:error, _reason} = error -> error
+                claimed -> {:ok, claimed}
+              end
             end
-          end
-        )
+          )
+        end)
+      end
+
+      defp with_flow_governance_limit(attrs, fun) when is_map(attrs) and is_function(fun, 0) do
+        case Map.get(attrs, :governance_limit) do
+          %{scope: scope, shard_id: shard_id} = reservation
+          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
+            previous = Process.get(:sm_flow_governance_limit, :undefined)
+            Process.put(:sm_flow_governance_limit, reservation)
+
+            try do
+              fun.()
+            after
+              case previous do
+                :undefined -> Process.delete(:sm_flow_governance_limit)
+                value -> Process.put(:sm_flow_governance_limit, value)
+              end
+            end
+
+          nil ->
+            fun.()
+
+          _invalid ->
+            {:error, "ERR invalid flow governance limit reservation"}
+        end
       end
 
       defp flow_claim_priorities(nil), do: [2, 1, 0]
@@ -437,7 +478,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
            ) do
         remaining = max(limit - length(next_claimed), 0)
 
-        if flow_should_promote_cold_due_for_claim?(attrs, claimed, next_claimed, remaining) do
+        if flow_should_promote_cold_due_for_claim?(
+             state,
+             attrs,
+             claimed,
+             next_claimed,
+             remaining
+           ) do
           promoted =
             maybe_promote_cold_due_for_claim(
               state,
@@ -470,11 +517,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
         end
       end
 
-      defp flow_should_promote_cold_due_for_claim?(attrs, claimed, next_claimed, remaining) do
+      defp flow_should_promote_cold_due_for_claim?(
+             state,
+             attrs,
+             claimed,
+             next_claimed,
+             remaining
+           ) do
         mode = Map.get(attrs, :cold_due_mode, :skip)
         hot_miss? = length(next_claimed) == length(claimed)
 
-        flow_hibernation_enabled?() and remaining > 0 and hot_miss? and mode in [:allow, :block]
+        flow_hibernation_enabled?(state) and remaining > 0 and hot_miss? and
+          mode in [:allow, :block]
       end
 
       defp maybe_promote_cold_due_for_claim(
@@ -486,12 +540,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
              now_ms,
              remaining
            ) do
-        if flow_hibernation_enabled?() and remaining > 0 do
+        if flow_hibernation_enabled?(state) and remaining > 0 do
           promote_limit = flow_hibernation_promote_limit(remaining)
           path = flow_lmdb_record_path(state)
 
           now_ms
-          |> flow_hibernation_promote_prefixes()
+          |> flow_hibernation_promote_prefixes(state)
           |> Enum.reduce_while(0, fn prefix, promoted ->
             if promoted >= promote_limit do
               {:halt, promoted}
@@ -538,9 +592,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
         max(remaining * 4, min(remaining + 16, 128))
       end
 
-      defp flow_hibernation_promote_prefixes(now_ms) do
-        start_ms = max(now_ms - Hibernation.late_promote_window_ms(), 0)
-        horizon_ms = now_ms + Hibernation.promote_window_ms()
+      defp flow_hibernation_promote_prefixes(now_ms, state) do
+        context = raft_apply_context(state)
+        start_ms = max(now_ms - Hibernation.late_promote_window_ms(context), 0)
+        horizon_ms = now_ms + Hibernation.promote_window_ms(context)
         Hibernation.promotion_bucket_prefixes(start_ms, horizon_ms, 60_000)
       end
 
@@ -891,6 +946,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
         cond do
           remaining <= 0 ->
             {:ok, claimed}
+
+          flow_governance_limit_active?() ->
+            :fallback
 
           flow_native_index(state) == nil ->
             :fallback

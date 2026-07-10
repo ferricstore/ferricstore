@@ -54,6 +54,28 @@ defmodule Ferricstore.FlowGovernanceModelsTest do
     assert policy.approvals.states == ["payment_review"]
   end
 
+  test "policy normalization rejects unenforced limit modes without crashing" do
+    for enforcement <- [:strict_local, :shard_local, :async_audit, "strict_local"] do
+      assert {:error, "ERR invalid flow governance enforcement mode"} =
+               Policy.normalize(%{
+                 limits: %{
+                   "running" => %{limit: 10, enforcement: enforcement}
+                 }
+               })
+    end
+  end
+
+  test "policy normalization returns errors for every malformed enum value" do
+    for mode <- [:unknown, 42, %{}] do
+      assert {:error, "ERR invalid flow governance mode"} = Policy.normalize(%{mode: mode})
+    end
+
+    for denials <- [:unknown, 42, %{}] do
+      assert {:error, "ERR invalid flow governance denials audit mode"} =
+               Policy.normalize(%{audit: %{denials: denials}})
+    end
+  end
+
   test "policy normalization rejects circuit windows larger than tracked samples" do
     assert {:error, reason} =
              Policy.normalize(%{
@@ -155,6 +177,109 @@ defmodule Ferricstore.FlowGovernanceModelsTest do
 
     assert owner.free == 10
     refute Map.has_key?(owner.leases, 1)
+  end
+
+  test "credit release by reservation id is idempotent and cannot free a sibling" do
+    owner = CreditLease.owner("global", 2)
+    assert {:ok, owner, _lease} = CreditLease.grant(owner, 1, 2, now_ms: 1_000, ttl_ms: 1_000)
+
+    assert {:ok, owner, _lease} =
+             CreditLease.spend(owner, 1, 2,
+               now_ms: 1_001,
+               reservation_ids: ["reservation-a", "reservation-b"]
+             )
+
+    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["reservation-a"])
+    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["reservation-a"])
+
+    assert owner.leases[1].in_use == 1
+    assert owner.leases[1].available == 1
+
+    assert owner.leases[1].reservations == %{"reservation-b" => 1}
+  end
+
+  test "credit release accepts legacy reservation maps after upgrade" do
+    owner = CreditLease.owner("global", 1)
+
+    lease = %CreditLease.Lease{
+      shard_id: 1,
+      epoch: 1,
+      expires_at_ms: 2_000,
+      in_use: 1,
+      reservations: %{
+        "legacy-reservation" => %{reservation_id: "legacy-reservation", amount: 1}
+      }
+    }
+
+    owner = %{owner | free: 0, epoch: 1, leases: %{1 => lease}}
+    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["legacy-reservation"])
+
+    assert owner.leases[1].in_use == 0
+    assert owner.leases[1].available == 1
+    assert owner.leases[1].reservations == %{}
+  end
+
+  test "credit owner applies monotonic config versions and drains capacity on decreases" do
+    owner =
+      CreditLease.owner("global", 10,
+        config_version: 1,
+        policy_version: "policy-v1"
+      )
+
+    assert {:ok, owner, _lease} =
+             CreditLease.grant(owner, 2, 5, now_ms: 1_000, ttl_ms: 10_000)
+
+    assert {:ok, owner, _lease} =
+             CreditLease.spend(owner, 2, 4,
+               now_ms: 1_001,
+               reservation_ids: ["shard-2-a", "shard-2-b", "shard-2-c", "shard-2-d"]
+             )
+
+    assert {:ok, owner, _lease} =
+             CreditLease.grant(owner, 1, 5, now_ms: 1_002, ttl_ms: 10_000)
+
+    assert {:ok, owner, _lease} =
+             CreditLease.spend(owner, 1, 4,
+               now_ms: 1_003,
+               reservation_ids: ["shard-1-a", "shard-1-b", "shard-1-c", "shard-1-d"]
+             )
+
+    assert {:ok, owner} = CreditLease.reconfigure(owner, 6, 2, "policy-v2")
+    assert owner.limit == 6
+    assert owner.config_version == 2
+    assert owner.policy_version == CreditLease.policy_version_fingerprint("policy-v2")
+    assert owner.free == 0
+    assert owner.leases[1].available == 0
+    assert owner.leases[2].available == 0
+    assert owner.leases[1].in_use + owner.leases[2].in_use == 8
+
+    reclaimed = CreditLease.reclaim_expired(owner, 11_001)
+    assert reclaimed.free == 2
+    assert reclaimed.leases[1].in_use == 4
+    refute Map.has_key?(reclaimed.leases, 2)
+
+    assert {:ok, ^owner} = CreditLease.reconfigure(owner, 20, 1, "stale-policy")
+
+    assert {:error, "ERR flow limit config_version conflict", ^owner} =
+             CreditLease.reconfigure(owner, 7, 2, "conflicting-policy")
+
+    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["shard-1-a"])
+    assert owner.leases[1].in_use == 3
+    assert owner.leases[1].available == 0
+
+    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["shard-1-b"])
+    assert owner.leases[1].in_use == 2
+    assert owner.leases[1].available == 0
+
+    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["shard-1-c"])
+    assert owner.leases[1].in_use == 1
+    assert owner.leases[1].available == 1
+
+    assert {:ok, owner} = CreditLease.reconfigure(owner, 12, 3, "policy-v3")
+    assert owner.limit == 12
+    assert owner.config_version == 3
+    assert owner.policy_version == CreditLease.policy_version_fingerprint("policy-v3")
+    assert owner.free == 6
   end
 
   test "credit owner marks reclaim when global credits exist on another shard" do

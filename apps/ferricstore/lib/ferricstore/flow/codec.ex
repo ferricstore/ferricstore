@@ -705,7 +705,7 @@ defmodule Ferricstore.Flow.Codec do
            decode_flagged_bin(flags, @record_flag_rewound_to_event_id, rest, nil),
          {:ok, child_groups, ""} <- decode_record_sidecar(flags, rest) do
       {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
-       state_enter_seq} = Support.split_record_sidecar(child_groups)
+       state_enter_seq, governance_limit} = Support.split_record_sidecar(child_groups)
 
       record =
         %{
@@ -744,6 +744,7 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_state_meta(state_meta)
         |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
         |> maybe_put_decoded_state_enter_seq(state_enter_seq)
+        |> maybe_put_decoded_governance_limit(governance_limit)
         |> maybe_put_decoded_max_active_ms(max_active_ms)
 
       if is_nil(rewound_to_event_id) do
@@ -830,7 +831,7 @@ defmodule Ferricstore.Flow.Codec do
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
       {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
-       state_enter_seq} = Support.split_record_sidecar(child_groups)
+       state_enter_seq, governance_limit} = Support.split_record_sidecar(child_groups)
 
       record =
         %{
@@ -869,6 +870,7 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_state_meta(state_meta)
         |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
         |> maybe_put_decoded_state_enter_seq(state_enter_seq)
+        |> maybe_put_decoded_governance_limit(governance_limit)
         |> maybe_put_decoded_max_active_ms(max_active_ms)
 
       if is_nil(rewound_to_event_id) do
@@ -908,7 +910,7 @@ defmodule Ferricstore.Flow.Codec do
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
       {_child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
-       _state_enter_seq} = Support.split_record_sidecar(child_groups)
+       _state_enter_seq, _governance_limit} = Support.split_record_sidecar(child_groups)
 
       %{
         id: id,
@@ -947,6 +949,11 @@ defmodule Ferricstore.Flow.Codec do
     do: Map.put(record, :value_refs, refs)
 
   defp maybe_put_decoded_value_refs(record, _refs), do: record
+
+  defp maybe_put_decoded_governance_limit(record, limit) when is_map(limit),
+    do: Map.put(record, :governance_limit, limit)
+
+  defp maybe_put_decoded_governance_limit(record, _limit), do: record
 
   defp maybe_put_decoded_attributes(record, attrs) when is_map(attrs) and map_size(attrs) > 0,
     do: Map.put(record, :attributes, attrs)

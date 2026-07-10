@@ -63,6 +63,7 @@ defmodule FerricStore.Instance do
           blob_side_channel_threshold_bytes: non_neg_integer(),
           sync_flush_timeout_ms: non_neg_integer(),
           max_active_file_size: non_neg_integer(),
+          apply_context: Ferricstore.Raft.ApplyContext.t(),
           read_sample_rate: non_neg_integer(),
           eviction_policy: atom(),
           max_memory_bytes: non_neg_integer(),
@@ -122,6 +123,7 @@ defmodule FerricStore.Instance do
     :blob_side_channel_threshold_bytes,
     :sync_flush_timeout_ms,
     :max_active_file_size,
+    :apply_context,
     :read_sample_rate,
     :eviction_policy,
     :max_memory_bytes,
@@ -149,6 +151,7 @@ defmodule FerricStore.Instance do
     shard_count = Keyword.get(opts, :shard_count, 4)
     data_dir = Keyword.get(opts, :data_dir, "data")
     data_dir_expanded = Path.expand(data_dir)
+    apply_context = Ferricstore.Raft.ApplyContext.from_runtime(opts)
 
     # Slot map: 1024 slots -> shard indices. Use the shared builder so
     # Router.shard_for/2 and CLUSTER.SLOTS expose the same ownership.
@@ -539,6 +542,7 @@ defmodule FerricStore.Instance do
           Application.get_env(:ferricstore, :sync_flush_timeout_ms, 5_000)
         ),
       max_active_file_size: Keyword.get(opts, :max_active_file_size, 8 * 1024 * 1024 * 1024),
+      apply_context: apply_context,
       read_sample_rate: Keyword.get(opts, :read_sample_rate, 100),
       eviction_policy: Keyword.get(opts, :eviction_policy, :volatile_lfu),
       max_memory_bytes: max_memory_bytes,

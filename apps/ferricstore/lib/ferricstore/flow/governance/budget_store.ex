@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Governance.AtomicRecord
   alias Ferricstore.Flow.Governance.Budget
+  alias Ferricstore.Flow.Governance.Catalog
   alias Ferricstore.Flow.Governance.Telemetry
   alias Ferricstore.Flow.Governance.View
   alias Ferricstore.Flow.Keys
@@ -33,7 +34,8 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
               {:error, denial, updated} ->
                 {:error, denial, updated}
             end
-          end
+          end,
+          catalog_kind: :budget
         )
       end
 
@@ -128,32 +130,46 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
 
   def list(ctx, opts) when is_list(opts) do
     with {:ok, limit} <- optional_limit(opts),
-         {:ok, scopes} <- optional_scope_filters(opts) do
-      budgets =
-        ctx
-        |> Router.keys()
-        |> Enum.filter(&Keys.governance_budget_key?/1)
-        |> Enum.reduce([], fn key, acc ->
-          case Router.get(ctx, key) do
-            value when is_binary(value) ->
-              case decode(value) do
-                {:ok, budget} -> [View.public(budget) | acc]
-                {:error, _reason} -> acc
-              end
-
-            _other ->
-              acc
-          end
-        end)
-        |> Enum.filter(&matches_scope?(&1, scopes))
-        |> Enum.sort_by(&Map.get(&1, :scope))
-        |> Enum.take(limit)
-
+         {:ok, scopes} <- optional_scope_filters(opts),
+         {:ok, budgets} <-
+           collect_list_budgets(ctx, scopes, limit) do
       {:ok, budgets}
     end
   end
 
   def list(_ctx, _opts), do: {:error, "ERR flow budget opts must be a keyword list"}
+
+  defp collect_list_budgets(ctx, nil, limit) do
+    Catalog.collect(
+      ctx,
+      :budget,
+      limit,
+      &load_list_budget(ctx, &1, nil),
+      &Map.get(&1, :scope)
+    )
+  end
+
+  defp collect_list_budgets(ctx, scopes, limit) when is_list(scopes) do
+    keys = Enum.map(scopes, &Keys.governance_budget_key/1)
+
+    Catalog.collect_keys(
+      keys,
+      limit,
+      &load_list_budget(ctx, &1, scopes),
+      &Map.get(&1, :scope)
+    )
+  end
+
+  defp load_list_budget(ctx, key, scopes) do
+    with value when is_binary(value) <- Router.get(ctx, key),
+         {:ok, budget} <- decode(value),
+         budget = View.public(budget),
+         true <- matches_scope?(budget, scopes) do
+      {:ok, budget}
+    else
+      _missing_corrupt_or_filtered -> :skip
+    end
+  end
 
   defp new_budget(scope, opts, now_ms) do
     with {:ok, limit} <- required_positive_integer(opts, :limit),

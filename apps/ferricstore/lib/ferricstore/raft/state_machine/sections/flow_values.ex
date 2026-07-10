@@ -130,7 +130,44 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
 
       defp flow_state_record_expire_at(_record), do: 0
 
-      defp flow_encode(record), do: Flow.encode_record(record)
+      defp flow_encode(record) when is_map(record) do
+        record
+        |> flow_record_for_storage()
+        |> Flow.encode_record()
+      end
+
+      defp flow_record_for_storage(%{state: "running"} = record), do: record
+      defp flow_record_for_storage(record), do: Map.delete(record, :governance_limit)
+
+      defp flow_governance_release_result(record) when is_map(record) do
+        case Map.get(record, :governance_limit) do
+          %{scope: scope, shard_id: shard_id} = reservation
+          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
+            {:flow_governance_release, reservation}
+
+          _none ->
+            :ok
+        end
+      end
+
+      defp flow_governance_release_results(plans) when is_list(plans) do
+        releases =
+          plans
+          |> Enum.reduce([], fn plan, acc ->
+            {record, _next} = flow_claim_plan_pair(plan)
+
+            case flow_governance_release_result(record) do
+              {:flow_governance_release, reservation} -> [reservation | acc]
+              :ok -> acc
+            end
+          end)
+          |> Enum.reverse()
+
+        case releases do
+          [] -> :ok
+          [_ | _] -> {:flow_governance_releases, releases}
+        end
+      end
 
       defp do_put(state, key, value, expire_at_ms) do
         maybe_clear_compound_data_structure_for_string_put(state, key)
@@ -464,23 +501,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_finalize_record_value_mode(mode), do: mode
 
       defp flow_put_state_record(state, key, record) when is_map(record) do
-        flow_put_state_record_encoded(
-          state,
-          key,
-          flow_encode(record),
-          flow_state_record_expire_at(record),
-          record
-        )
+        with :ok <-
+               flow_put_state_record_encoded(
+                 state,
+                 key,
+                 flow_encode(record),
+                 flow_state_record_expire_at(record),
+                 record
+               ) do
+          flow_enqueue_governance_release_intents(state, [{key, record}])
+        end
       end
 
       defp flow_put_new_state_record(state, key, record) when is_map(record) do
-        flow_put_state_record_encoded(
-          state,
-          key,
-          flow_encode(record),
-          flow_state_record_expire_at(record),
-          record
-        )
+        with :ok <-
+               flow_put_state_record_encoded(
+                 state,
+                 key,
+                 flow_encode(record),
+                 flow_state_record_expire_at(record),
+                 record
+               ) do
+          flow_enqueue_governance_release_intents(state, [{key, record}])
+        end
       end
 
       defp flow_put_state_record_encoded(state, key, value, expire_at_ms, record) do
@@ -510,6 +553,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           end
 
         with :ok <- result,
+             :ok <- flow_put_type_catalog_member(state, key, record),
              :ok <- flow_put_retention_guard(state, record),
              :ok <- flow_track_retention_cleanup_keys(state, record) do
           flow_track_shared_value_refs(state, record)
@@ -571,8 +615,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       end
 
       defp flow_track_state_retention_metadata_batch(state, key_records) do
-        Enum.reduce_while(key_records, :ok, fn {_key, record}, :ok ->
-          with :ok <- flow_put_retention_guard(state, record),
+        Enum.reduce_while(key_records, :ok, fn {key, record}, :ok ->
+          with :ok <- flow_put_type_catalog_member(state, key, record),
+               :ok <- flow_put_retention_guard(state, record),
                :ok <- flow_track_retention_cleanup_keys(state, record),
                :ok <- flow_track_shared_value_refs(state, record) do
             {:cont, :ok}

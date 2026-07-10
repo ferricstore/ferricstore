@@ -92,7 +92,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
            when is_map(metadata) do
         with :ok <- validate_raft_position(position),
              :ok <- validate_storage_config(config),
-             :ok <- validate_storage_snapshot_boundary(metadata) do
+             :ok <- validate_storage_snapshot_boundary(metadata),
+             :ok <- validate_apply_context_metadata(metadata) do
           {:ok, metadata}
         else
           {:error, reason} -> {:error, {:bad_storage_metadata, reason}}
@@ -101,7 +102,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
 
       defp validate_storage_metadata(%{position: position} = metadata) when is_map(metadata) do
         with :ok <- validate_raft_position(position),
-             :ok <- validate_storage_snapshot_boundary(metadata) do
+             :ok <- validate_storage_snapshot_boundary(metadata),
+             :ok <- validate_apply_context_metadata(metadata) do
           {:ok, metadata}
         else
           {:error, reason} -> {:error, {:bad_storage_metadata, reason}}
@@ -126,6 +128,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       end
 
       defp validate_storage_snapshot_boundary(_metadata), do: :ok
+
+      defp validate_apply_context_metadata(%{apply_context: context}) do
+        if Ferricstore.Raft.ApplyContext.valid?(context) do
+          :ok
+        else
+          {:error, :invalid_apply_context}
+        end
+      end
+
+      defp validate_apply_context_metadata(_legacy_metadata), do: :ok
 
       defp validate_raft_position({:raft_log_pos, index, term})
            when is_integer(index) and index >= 0 and is_integer(term) and term >= 0,

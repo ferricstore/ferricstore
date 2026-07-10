@@ -54,7 +54,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             root_dir
             |> metadata_path()
             |> read_metadata!(ctx, shard_index)
-            |> ensure_initial_storage_metadata!(root_dir)
+            |> ensure_initial_storage_metadata!(root_dir, storage_apply_context(%{ctx: ctx}))
           end)
 
         profile_startup_phase(shard_index, root_dir, :ensure_apply_projection_log, fn ->
@@ -65,7 +65,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
         sm_state =
           profile_startup_phase(shard_index, root_dir, :build_state, fn ->
-            build_sm_state(ctx, shard_index)
+            build_sm_state(ctx, shard_index, Map.get(metadata, :apply_context))
           end)
 
         {sm_state, recovered_position, replay_dependencies} =
@@ -459,8 +459,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
             segment_projection_apply_source(handle.root_dir, position, segment_projection_entries)
 
           sm_state =
-            handle.ctx
-            |> build_sm_state(handle.shard_index)
+            build_sm_state(
+              handle.ctx,
+              handle.shard_index,
+              Map.get(metadata, :apply_context)
+            )
             |> apply_segment_projection_entries(projection_source, segment_projection_entries)
 
           new_handle =
@@ -532,27 +535,43 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
       @spec make_empty_snapshot(map(), charlist() | binary(), tuple(), term(), term()) ::
               :ok | {:error, term()}
-      def make_empty_snapshot(_options, snapshot_path, position, config, _data) do
+      def make_empty_snapshot(options, snapshot_path, position, config, _data) do
         snapshot_path = to_path(snapshot_path)
 
-        metadata = %{
-          version: @version,
-          position: position,
-          label: nil,
-          config: {position, config},
-          payload_dirs: snapshot_payload_kinds(),
-          empty_payload_dirs: snapshot_payload_kinds(),
-          storage_payload_dirs: snapshot_storage_payload_kinds(),
-          empty_storage_payload_dirs: snapshot_storage_payload_kinds()
-        }
-
-        with :ok <- reset_dir(snapshot_path),
+        with {:ok, apply_context} <- empty_snapshot_apply_context(options),
+             metadata = %{
+               version: @version,
+               position: position,
+               label: nil,
+               config: {position, config},
+               apply_context: apply_context,
+               payload_dirs: snapshot_payload_kinds(),
+               empty_payload_dirs: snapshot_payload_kinds(),
+               storage_payload_dirs: snapshot_storage_payload_kinds(),
+               empty_storage_payload_dirs: snapshot_storage_payload_kinds()
+             },
+             :ok <- reset_dir(snapshot_path),
              :ok <- create_empty_snapshot_payload_dirs(snapshot_path),
              :ok <- create_empty_snapshot_storage_payload_dirs(snapshot_path),
              :ok <- atomic_write_snapshot_metadata(snapshot_path, metadata),
              :ok <- fsync_dir(snapshot_path) do
           :ok
         end
+      end
+
+      defp empty_snapshot_apply_context(options) do
+        with {:ok, table} <- Map.fetch(options, :table),
+             ctx when is_map(ctx) <- Ferricstore.Raft.WARaftBackend.context!(table),
+             %Ferricstore.Raft.ApplyContext{} = context <- Map.get(ctx, :apply_context),
+             true <- Ferricstore.Raft.ApplyContext.valid?(context) do
+          {:ok, context}
+        else
+          _missing_or_invalid -> {:error, :missing_empty_snapshot_apply_context}
+        end
+      rescue
+        ArgumentError -> {:error, :missing_empty_snapshot_apply_context}
+      catch
+        :error, :badarg -> {:error, :missing_empty_snapshot_apply_context}
       end
 
       defp apply_command(_command, position, %{blocked_error: reason} = handle, _label_update) do
