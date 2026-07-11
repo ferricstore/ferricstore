@@ -367,7 +367,7 @@ defmodule Ferricstore.InstanceTest do
                  state: "accept",
                  partition_key: partition,
                  state_meta: %{"version" => 1},
-                 retention_ttl_ms: 100,
+                 retention_ttl_ms: 60_000,
                  run_at_ms: now,
                  now_ms: now
                )
@@ -388,6 +388,9 @@ defmodule Ferricstore.InstanceTest do
                  state_meta: %{"version" => 3},
                  now_ms: now + 2
                )
+
+      assert {:ok, completed} = EmbeddedFlow.flow_get(id, partition_key: partition)
+      cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
       assert eventually(fn ->
                case EmbeddedFlow.flow_search(
@@ -415,7 +418,9 @@ defmodule Ferricstore.InstanceTest do
                end
              end)
 
-      assert {:ok, cleaned} = EmbeddedFlow.flow_retention_cleanup(limit: 10, now_ms: now + 200)
+      assert {:ok, cleaned} =
+               EmbeddedFlow.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
       assert cleaned.flows >= 1
 
       assert eventually(fn ->

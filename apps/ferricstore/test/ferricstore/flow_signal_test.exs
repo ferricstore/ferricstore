@@ -385,7 +385,7 @@ defmodule Ferricstore.FlowSignalTest do
              FerricStore.flow_create(id,
                type: "signal-retention",
                partition_key: "tenant-retention",
-               retention_ttl_ms: 100,
+               retention_ttl_ms: 60_000,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -420,10 +420,14 @@ defmodule Ferricstore.FlowSignalTest do
                now_ms: 1_100
              )
 
-    Process.sleep(150)
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.values >= 1
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     assert is_nil(Router.get(ctx, artifact_ref))

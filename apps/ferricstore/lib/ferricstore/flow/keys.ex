@@ -176,6 +176,10 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> @global_tag <> ":policy:" <> type
   end
 
+  def policy_indexed_attribute_count_key(name) when is_binary(name) and name != "" do
+    "f:" <> @global_tag <> ":policy-attribute:1:" <> digest(name)
+  end
+
   def type_catalog_member_key(type, state_key)
       when is_binary(type) and type != "" and is_binary(state_key) do
     case flow_key_tag_prefix(state_key, "}:s:") do

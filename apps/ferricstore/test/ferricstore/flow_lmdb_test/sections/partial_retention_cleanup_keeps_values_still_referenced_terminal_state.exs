@@ -36,7 +36,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    partition_key: partition_key,
                    payload: payload,
                    history_hot_max_events: 0,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -59,12 +59,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    now_ms: now + 2
                  )
 
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
-        Process.sleep(5)
 
         assert {:ok, first} =
-                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
         assert first.flows == 0
         assert first.history == 1
@@ -100,7 +102,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                  Ferricstore.Flow.create(ctx, owner_id,
                    type: owner_type,
                    partition_key: partition_key,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -146,6 +148,11 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    now_ms: now + 4
                  )
 
+        assert {:ok, completed} =
+                 Ferricstore.Flow.get(ctx, owner_id, partition_key: partition_key)
+
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
@@ -154,7 +161,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
         totals =
           Enum.reduce_while(1..10, %{flows: 0, history: 0, values: 0}, fn _, acc ->
             {:ok, cleaned} =
-              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
             assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
@@ -195,7 +202,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    type: owner_type,
                    partition_key: owner_partition,
                    values: %{"doc" => doc},
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -220,6 +227,11 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    fencing_token: claimed.fencing_token,
                    now_ms: now + 2
                  )
+
+        assert {:ok, completed} =
+                 Ferricstore.Flow.get(ctx, owner_id, partition_key: owner_partition)
+
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
         owner_shard =
           Ferricstore.Store.Router.shard_for(
@@ -260,7 +272,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
         )
 
         assert {:ok, cleaned} =
-                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
         assert cleaned.flows == 1
         assert cleaned.values == 1
@@ -301,7 +313,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    type: flow_type,
                    partition_key: partition_key,
                    history_hot_max_events: 0,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -321,6 +333,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
                    fencing_token: claimed.fencing_token,
                    now_ms: now + 2
                  )
+
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
         extra_refs =
           for version <- 10..12 do
@@ -357,7 +372,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
         end)
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
-        Process.sleep(5)
 
         state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
@@ -365,7 +379,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
           Ferricstore.Flow.LMDB.path(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0))
 
         assert {:ok, first} =
-                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
         assert first.flows == 0
         assert first.values == 1
@@ -377,7 +391,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
         totals =
           Enum.reduce_while(1..10, %{flows: first.flows, values: first.values}, fn _, acc ->
             {:ok, cleaned} =
-              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
             next = %{flows: acc.flows + cleaned.flows, values: acc.values + cleaned.values}
 

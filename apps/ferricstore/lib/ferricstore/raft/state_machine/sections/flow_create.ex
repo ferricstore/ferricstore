@@ -843,8 +843,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           true ->
             old_indexed_key = flow_stored_policy_indexed_state_meta(stored_value)
             new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
+            old_indexed_attributes = flow_stored_policy_indexed_attributes(stored_value)
+            new_indexed_attributes = RetryPolicy.indexed_attributes(new_policy)
 
-            with :ok <- do_put(state, key, value, expire_at_ms) do
+            with :ok <- do_put(state, key, value, expire_at_ms),
+                 :ok <-
+                   flow_update_policy_indexed_attribute_counts(
+                     state,
+                     old_indexed_attributes,
+                     new_indexed_attributes
+                   ) do
               if old_indexed_key == new_indexed_key do
                 :ok
               else
@@ -858,6 +866,55 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             end
         end
       end
+
+      defp flow_stored_policy_indexed_attributes(value) when is_binary(value) do
+        case RetryPolicy.decode_flow_policy_entry(value) do
+          {:ok, {_generation, policy}} -> RetryPolicy.indexed_attributes(policy)
+          :error -> []
+        end
+      end
+
+      defp flow_stored_policy_indexed_attributes(_missing), do: []
+
+      defp flow_update_policy_indexed_attribute_counts(state, old_names, new_names)
+           when is_list(old_names) and is_list(new_names) do
+        old_names = MapSet.new(old_names)
+        new_names = MapSet.new(new_names)
+
+        changes =
+          Enum.map(MapSet.difference(old_names, new_names), &{&1, -1}) ++
+            Enum.map(MapSet.difference(new_names, old_names), &{&1, 1})
+
+        Enum.reduce_while(changes, :ok, fn {name, delta}, :ok ->
+          case flow_update_policy_indexed_attribute_count(state, name, delta) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp flow_update_policy_indexed_attribute_count(state, name, delta)
+           when is_binary(name) and name != "" and delta in [-1, 1] do
+        key = FlowKeys.policy_indexed_attribute_count_key(name)
+
+        with {:ok, count} <- flow_policy_indexed_attribute_count(do_get(state, key)),
+             next when next >= 0 and next <= 0xFFFFFFFFFFFFFFFF <- count + delta do
+          case next do
+            0 -> do_delete(state, key)
+            value -> do_put(state, key, <<value::unsigned-big-64>>, 0)
+          end
+        else
+          _invalid -> {:error, "ERR flow policy attribute catalog is corrupt"}
+        end
+      end
+
+      defp flow_policy_indexed_attribute_count(nil), do: {:ok, 0}
+
+      defp flow_policy_indexed_attribute_count(<<count::unsigned-big-64>>) when count > 0,
+        do: {:ok, count}
+
+      defp flow_policy_indexed_attribute_count(_invalid),
+        do: {:error, "ERR flow policy attribute catalog is corrupt"}
 
       defp flow_stored_policy_indexed_state_meta(value) when is_binary(value) do
         case RetryPolicy.decode_flow_policy_entry(value) do

@@ -1611,7 +1611,7 @@ defmodule Ferricstore.FlowGovernanceTest do
                partition_key: @partition,
                run_at_ms: now,
                now_ms: now,
-               retention_ttl_ms: 10
+               retention_ttl_ms: 60_000
              )
 
     assert {:ok, [claimed]} =
@@ -1640,9 +1640,12 @@ defmodule Ferricstore.FlowGovernanceTest do
                now_ms: now + 3
              )
 
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
     Ferricstore.Test.ShardHelpers.eventually(
       fn ->
-        case FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 1_000) do
+        case FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms) do
           {:ok, cleaned} -> cleaned.flows >= 1
           _other -> false
         end

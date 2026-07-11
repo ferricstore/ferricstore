@@ -519,7 +519,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
                    type: flow_type,
                    partition_key: partition_key,
                    run_at_ms: 1_000,
-                   retention_ttl_ms: 40,
+                   retention_ttl_ms: 60_000,
                    now_ms: 1_000
                  )
 
@@ -537,6 +537,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
                    now_ms: 2_000
                  )
 
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
         state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
@@ -548,9 +551,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
           10
         )
 
-        Process.sleep(60)
+        assert {:ok, cleaned} =
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
-        assert {:ok, cleaned} = Ferricstore.Flow.retention_cleanup(ctx, limit: 10)
         assert cleaned.flows == 1
         assert cleaned.history >= 1
 
@@ -594,7 +597,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
                    root_flow_id: root,
                    correlation_id: correlation,
                    run_at_ms: now,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    now_ms: now
                  )
 
@@ -611,6 +614,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
                    fencing_token: claimed.fencing_token,
                    now_ms: now + 1
                  )
+
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
@@ -635,12 +641,15 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
         state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
         assert {:ok, [^state_key]} =
-                 Ferricstore.Flow.LMDB.expired_terminal_state_keys(lmdb_path, now + 100, 10)
+                 Ferricstore.Flow.LMDB.expired_terminal_state_keys(lmdb_path, cleanup_now_ms, 10)
 
         totals =
           Enum.reduce_while(1..10, %{flows: 0, history: 0, values: 0}, fn _, acc ->
             assert {:ok, cleaned} =
-                     Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 100)
+                     Ferricstore.Flow.retention_cleanup(ctx,
+                       limit: 10,
+                       now_ms: cleanup_now_ms
+                     )
 
             assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 

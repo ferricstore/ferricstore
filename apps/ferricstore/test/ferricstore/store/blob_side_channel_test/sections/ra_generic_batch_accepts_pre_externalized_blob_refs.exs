@@ -442,12 +442,15 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
 
         assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, state_key)
         assert {:ok, encoded_state} = BlobStore.get(ctx.data_dir, 0, ref)
-        assert %{id: ^id, state: "completed"} = Ferricstore.Flow.decode_record(encoded_state)
+
+        assert %{id: ^id, state: "completed"} =
+                 completed =
+                 Ferricstore.Flow.decode_record(encoded_state)
 
         assert {:ok, %{deleted_files: 0}} = Router.sweep_blob_garbage(ctx)
         assert {:ok, _encoded_state} = BlobStore.get(ctx.data_dir, 0, ref)
 
-        cleanup_now = System.system_time(:millisecond) + 10_000
+        cleanup_now = completed.terminal_retention_until_ms + 1
 
         assert {:ok, cleaned} =
                  Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now)

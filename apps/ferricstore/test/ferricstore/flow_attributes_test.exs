@@ -475,7 +475,7 @@ defmodule Ferricstore.FlowAttributesTest do
                state: "queued",
                partition_key: @partition,
                attributes: %{"tenant" => "acme", "phase" => "terminal"},
-               retention_ttl_ms: 1_000,
+               retention_ttl_ms: 60_000,
                run_at_ms: now,
                now_ms: now
              )
@@ -488,6 +488,9 @@ defmodule Ferricstore.FlowAttributesTest do
                partition_key: @partition,
                now_ms: now + 2
              )
+
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
     assert_eventually(fn ->
       assert {:ok, records} =
@@ -535,7 +538,9 @@ defmodule Ferricstore.FlowAttributesTest do
       assert Enum.map(broad_records, & &1.id) == [id]
     end)
 
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 2_000)
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.flows >= 1
 
     assert_eventually(fn ->
@@ -768,6 +773,42 @@ defmodule Ferricstore.FlowAttributesTest do
              FerricStore.flow_search(
                partition_key: @partition,
                attributes: %{"customer" => "c1"},
+               consistent_projection: true,
+               count: 10
+             )
+  end
+
+  test "broad search retains indexed policy knowledge when no rows exist" do
+    type_a = unique_flow_id("attrs-empty-policy-a")
+    type_b = unique_flow_id("attrs-empty-policy-b")
+
+    assert {:ok, _} = FerricStore.flow_policy_set(type_a, indexed_attributes: ["tenant"])
+    assert {:ok, _} = FerricStore.flow_policy_set(type_b, indexed_attributes: ["tenant"])
+
+    assert {:ok, []} =
+             FerricStore.flow_search(
+               partition_key: @partition,
+               attributes: %{"tenant" => "missing"},
+               consistent_projection: true,
+               count: 10
+             )
+
+    assert {:ok, _} = FerricStore.flow_policy_set(type_a, indexed_attributes: [])
+
+    assert {:ok, []} =
+             FerricStore.flow_search(
+               partition_key: @partition,
+               attributes: %{"tenant" => "missing"},
+               consistent_projection: true,
+               count: 10
+             )
+
+    assert {:ok, _} = FerricStore.flow_policy_set(type_b, indexed_attributes: [])
+
+    assert {:error, "ERR flow attribute tenant is not indexed for broad search"} =
+             FerricStore.flow_search(
+               partition_key: @partition,
+               attributes: %{"tenant" => "missing"},
                consistent_projection: true,
                count: 10
              )
@@ -1145,7 +1186,7 @@ defmodule Ferricstore.FlowAttributesTest do
                state: "queued",
                partition_key: @partition,
                attributes: %{"tenant" => "acme"},
-               retention_ttl_ms: 1_000,
+               retention_ttl_ms: 60_000,
                run_at_ms: now,
                now_ms: now
              )
@@ -1159,6 +1200,9 @@ defmodule Ferricstore.FlowAttributesTest do
                now_ms: now + 2
              )
 
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
     assert_eventually(fn ->
       assert {:ok, [%{name: "tenant", count: 1}]} =
                FerricStore.flow_attributes(type,
@@ -1168,7 +1212,9 @@ defmodule Ferricstore.FlowAttributesTest do
                )
     end)
 
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 2_000)
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.flows >= 1
 
     assert_eventually(fn ->

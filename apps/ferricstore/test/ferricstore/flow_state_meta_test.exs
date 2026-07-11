@@ -310,7 +310,7 @@ defmodule Ferricstore.FlowStateMetaTest do
                state: "accept",
                partition_key: @partition,
                state_meta: %{"version" => 1},
-               retention_ttl_ms: 1_000,
+               retention_ttl_ms: 60_000,
                run_at_ms: now,
                now_ms: now
              )
@@ -339,12 +339,17 @@ defmodule Ferricstore.FlowStateMetaTest do
                now_ms: now + 2
              )
 
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
     assert_eventually(fn ->
       flush_lmdb!()
       assert {:ok, 1} = lmdb_state_meta_query_count(type, "completed", "version", 3)
     end)
 
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 2_000)
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.flows >= 1
     assert [] = :ets.lookup(keydir, catalog_key)
 

@@ -456,7 +456,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    partition_key: partition_key,
                    payload: initial_payload,
                    history_hot_max_events: 0,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -501,6 +501,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    now_ms: now + 4
                  )
 
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
@@ -509,10 +512,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
         assert {:ok, [^initial_payload, ^next_payload]} =
                  Ferricstore.Flow.value_mget(ctx, [created.payload_ref, transitioned.payload_ref])
 
-        Process.sleep(5)
-
         assert {:ok, cleaned} =
-                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
         assert cleaned.flows == 1
         assert cleaned.history >= 1
@@ -552,7 +553,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    partition_key: partition_key,
                    payload: payload,
                    history_hot_max_events: 0,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -575,6 +576,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    now_ms: now + 2
                  )
 
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
@@ -591,13 +595,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
         )
 
         assert {:ok, 1} =
-                 Ferricstore.Flow.LMDB.sweep_expired_terminal(lmdb_path, now + 10_000, 100)
+                 Ferricstore.Flow.LMDB.sweep_expired_terminal(lmdb_path, cleanup_now_ms, 100)
 
         assert {:ok, [state_key]} ==
-                 Ferricstore.Flow.LMDB.expired_terminal_state_keys(lmdb_path, now + 10_000, 100)
+                 Ferricstore.Flow.LMDB.expired_terminal_state_keys(lmdb_path, cleanup_now_ms, 100)
 
         assert {:ok, cleaned} =
-                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
         assert cleaned.flows == 1
         assert cleaned.values >= 1
@@ -635,7 +639,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    type: flow_type,
                    partition_key: partition_key,
                    history_hot_max_events: 0,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -656,6 +660,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    now_ms: now + 2
                  )
 
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
@@ -673,10 +680,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
 
         assert history_count > 1
 
-        Process.sleep(5)
-
         assert {:ok, first} =
-                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
         assert first.flows == 0
         assert first.history == 1
@@ -687,7 +692,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
         totals =
           Enum.reduce_while(1..10, %{flows: first.flows, history: first.history}, fn _, acc ->
             {:ok, cleaned} =
-              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
             assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
 
@@ -752,7 +757,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    type: flow_type,
                    partition_key: partition_key,
                    history_hot_max_events: 0,
-                   retention_ttl_ms: 1,
+                   retention_ttl_ms: 60_000,
                    run_at_ms: now,
                    now_ms: now
                  )
@@ -773,6 +778,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
                    now_ms: now + 2
                  )
 
+        assert {:ok, completed} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        cleanup_now_ms = completed.terminal_retention_until_ms + 1
+
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
 
@@ -790,10 +798,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
 
         assert history_count > 1
 
-        Process.sleep(5)
-
         assert {:ok, first} =
-                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+                 Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
         assert first.flows == 0
         assert first.history == 1
@@ -811,7 +817,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.AsyncTerminalHistoryColdOnlyAfterLm
         totals =
           Enum.reduce_while(1..10, %{flows: first.flows, history: first.history}, fn _, acc ->
             {:ok, cleaned} =
-              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: now + 10_000)
+              Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now_ms)
 
             next = %{flows: acc.flows + cleaned.flows, history: acc.history + cleaned.history}
 

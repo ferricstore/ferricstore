@@ -156,6 +156,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
               Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
             end)
 
+          attribute_query_keys =
+            record
+            |> Ferricstore.Flow.Attributes.index_entries()
+            |> Enum.map(fn {index_key, id, score} ->
+              Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
+            end)
+
           state_meta_query_keys =
             record
             |> Ferricstore.Flow.StateMeta.index_entries()
@@ -163,7 +170,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
               Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
             end)
 
-          (metadata_query_keys ++ state_meta_query_keys)
+          (metadata_query_keys ++ attribute_query_keys ++ state_meta_query_keys)
           |> Enum.each(fn query_key ->
             queue_pending_lmdb_mirror_query_delete(query_key)
           end)

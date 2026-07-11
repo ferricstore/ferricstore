@@ -947,7 +947,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     ctx = FerricStore.Instance.get(:default)
     type = unique_flow_id("deleted-after-plan")
     id = unique_flow_id("deleted-after-plan-flow")
-    now_ms = System.system_time(:millisecond)
+    requested_now_ms = 1_000
     state_key = Keys.state_key(id, @partition)
     registry_key = Keys.registry_key(id, @partition)
     guard_key = Keys.retention_guard_key(id, @partition)
@@ -960,9 +960,9 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
                type: type,
                state: "queued",
                partition_key: @partition,
-               retention_ttl_ms: 1,
-               run_at_ms: now_ms,
-               now_ms: now_ms
+               retention_ttl_ms: 60_000,
+               run_at_ms: requested_now_ms,
+               now_ms: requested_now_ms
              )
 
     assert {:ok, [claim]} =
@@ -970,15 +970,19 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
                partition_key: @partition,
                worker: "deleted-after-plan-worker",
                limit: 1,
-               now_ms: now_ms
+               now_ms: requested_now_ms
              )
 
     assert :ok =
              FerricStore.flow_complete(id, claim.lease_token,
                fencing_token: claim.fencing_token,
                partition_key: @partition,
-               now_ms: now_ms + 1
+               now_ms: requested_now_ms + 1
              )
+
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+    assert completed.terminal_retention_until_ms > requested_now_ms + 100
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
     {:ok, source_token} = PolicyMigration.source_token(ctx, shard_index)
     run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
@@ -1020,7 +1024,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert Enum.any?(page.candidates, &match?(%{kind: :state, state_key: ^state_key}, &1))
 
     assert {:ok, %{flows: flows}} =
-             FerricStore.flow_retention_cleanup(limit: 10, now_ms: now_ms + 100)
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
 
     assert flows >= 1
     assert [] = :ets.lookup(keydir, registry_key)

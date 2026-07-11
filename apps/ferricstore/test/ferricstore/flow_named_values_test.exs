@@ -276,7 +276,7 @@ defmodule Ferricstore.FlowNamedValuesTest do
                type: "named-retention",
                partition_key: "tenant-retention",
                values: %{"order" => "order-v1"},
-               retention_ttl_ms: 100,
+               retention_ttl_ms: 60_000,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -307,11 +307,14 @@ defmodule Ferricstore.FlowNamedValuesTest do
     receipt_ref = get_in(completed.value_refs, ["receipt", :ref])
     assert is_binary(receipt_ref)
 
-    Process.sleep(150)
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.flows >= 1
     assert cleaned.values >= 2
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     assert is_nil(Router.get(ctx, order_ref))
@@ -327,7 +330,7 @@ defmodule Ferricstore.FlowNamedValuesTest do
                type: "named-retention-override",
                partition_key: "tenant-retention",
                values: %{"order" => "order-v1"},
-               retention_ttl_ms: 100,
+               retention_ttl_ms: 60_000,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -364,9 +367,12 @@ defmodule Ferricstore.FlowNamedValuesTest do
                now_ms: 1_100
              )
 
-    Process.sleep(150)
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.values >= 2
 
     assert is_nil(Router.get(ctx, old_ref))

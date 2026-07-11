@@ -891,14 +891,26 @@ defmodule Ferricstore.Flow.ReadAPI do
   end
 
   defp projected_indexed_attribute?(ctx, state, partition_key, name, values, consistent?) do
-    values
-    |> attribute_filter_values()
-    |> Enum.any?(fn value ->
-      case attribute_candidate_count(ctx, nil, state, partition_key, name, value, consistent?) do
-        {:ok, count} -> count > 0
-        {:error, _reason} -> false
-      end
-    end)
+    policy_indexed_attribute?(ctx, name) or
+      values
+      |> attribute_filter_values()
+      |> Enum.any?(fn value ->
+        case attribute_candidate_count(ctx, nil, state, partition_key, name, value, consistent?) do
+          {:ok, count} -> count > 0
+          {:error, _reason} -> false
+        end
+      end)
+  end
+
+  defp policy_indexed_attribute?(ctx, name) do
+    key = Keys.policy_indexed_attribute_count_key(name)
+
+    case Ferricstore.Stats.with_cache_tracking_disabled(fn ->
+           Ferricstore.Store.Router.get(ctx, key)
+         end) do
+      <<count::unsigned-big-64>> when count > 0 -> true
+      _missing_or_invalid -> false
+    end
   end
 
   defp validate_optional_type(nil), do: :ok

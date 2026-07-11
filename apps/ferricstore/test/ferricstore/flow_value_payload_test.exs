@@ -350,7 +350,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
                type: "value-retention-cleanup",
                partition_key: "tenant-retention",
                payload: %{large: String.duplicate("p", 256)},
-               retention_ttl_ms: 100,
+               retention_ttl_ms: 60_000,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -375,9 +375,11 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
-    Process.sleep(150)
+    cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.flows >= 1
     assert cleaned.history >= 1
     assert cleaned.values >= 2
@@ -445,7 +447,12 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
-    Process.sleep(150)
+    ShardHelpers.eventually(
+      fn -> Ferricstore.HLC.now_ms() > completed.terminal_retention_until_ms end,
+      "retention deadline did not elapse",
+      1_000,
+      10
+    )
 
     assert pid = Process.whereis(Ferricstore.Flow.RetentionSweeper)
     send(pid, :sweep)
@@ -675,8 +682,27 @@ defmodule Ferricstore.FlowValuePayloadTest do
   end
 
   defp wait_terminal_removed!(id, partition_key) do
-    Process.sleep(150)
-    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
+    cleanup_now_ms =
+      case FerricStore.flow_get(id, partition_key: partition_key) do
+        {:ok, %{terminal_retention_until_ms: deadline}} when is_integer(deadline) ->
+          cleanup_now_ms = deadline + 1
+
+          Ferricstore.Test.ShardHelpers.eventually(
+            fn -> Ferricstore.HLC.now_ms() >= cleanup_now_ms end,
+            "terminal retention deadline should elapse",
+            1_000,
+            5
+          )
+
+          cleanup_now_ms
+
+        {:ok, nil} ->
+          Ferricstore.HLC.now_ms()
+      end
+
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+
     assert cleaned.flows >= 0
 
     Ferricstore.Test.ShardHelpers.eventually(
