@@ -37,6 +37,11 @@ config :ferricstore, :operational_guard_enabled, false
 config :ferricstore, :flow_scheduler_enabled, false
 config :ferricstore, :flow_policy_migration_worker_enabled, false
 
+# Core CI shards can run longer than the production sweeper's 10-minute interval.
+# Keep the application sweeper idle; sweeper tests trigger it explicitly.
+config :ferricstore, :flow_retention_sweeper_initial_delay_ms, 86_400_000
+config :ferricstore, :flow_retention_sweeper_interval_ms, 86_400_000
+
 # Merge: use a very long check interval to prevent periodic merge timers
 # from firing during tests. Tests that need to trigger merges use
 # Scheduler.trigger_check/1 explicitly.

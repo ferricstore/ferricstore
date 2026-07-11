@@ -4,6 +4,14 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
 
   alias Ferricstore.Flow.RetentionSweeper
 
+  test "test runtime keeps the application sweeper out of explicit cleanup tests" do
+    assert Application.fetch_env!(:ferricstore, :flow_retention_sweeper_initial_delay_ms) ==
+             86_400_000
+
+    assert Application.fetch_env!(:ferricstore, :flow_retention_sweeper_interval_ms) ==
+             86_400_000
+  end
+
   test "catch-up scheduling treats history-only cleanup at limit as backlog" do
     name = :"flow_retention_sweeper_test_#{System.unique_integer([:positive])}"
     parent = self()
