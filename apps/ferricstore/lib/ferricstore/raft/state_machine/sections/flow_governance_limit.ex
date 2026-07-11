@@ -14,11 +14,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowGovernanceLimit do
 
       defp do_flow_governance_limit_mutate(state, key, attrs) do
         with :ok <- flow_limit_validate_request(state, key, attrs),
-             {:ok, owner} <- flow_limit_load_owner(state, key, attrs),
+             {:ok, owner, new_owner?} <- flow_limit_load_owner(state, key, attrs),
              {:ok, owner} <-
                flow_limit_apply_configuration(owner, Map.get(attrs, :configuration)),
              {:ok, owner} <-
-               flow_limit_prepare_owner(state, owner, attrs) do
+               flow_limit_prepare_owner(state, owner, attrs),
+             :ok <- flow_limit_maybe_enqueue_catalog_publication(state, key, new_owner?) do
           flow_limit_dispatch(state, key, owner, attrs)
         end
       end
@@ -634,14 +635,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowGovernanceLimit do
                  CreditLease.owner(attrs.scope, limit,
                    config_version: config_version || 0,
                    policy_version: policy_version
-                 )}
+                 ), true}
 
               _invalid ->
                 {:error, "ERR flow limit limit must be a non-negative integer"}
             end
 
           value when is_binary(value) ->
-            flow_limit_decode_owner(state, value, attrs.scope)
+            with {:ok, owner} <- flow_limit_decode_owner(state, value, attrs.scope) do
+              {:ok, owner, false}
+            end
 
           _invalid ->
             {:error, "ERR flow limit record is corrupt"}
@@ -650,10 +653,190 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowGovernanceLimit do
 
       defp flow_limit_load_owner(state, key, attrs) do
         case do_get(state, key) do
-          nil -> {:error, "ERR flow limit not found"}
-          value when is_binary(value) -> flow_limit_decode_owner(state, value, attrs.scope)
-          _invalid -> {:error, "ERR flow limit record is corrupt"}
+          nil ->
+            {:error, "ERR flow limit not found"}
+
+          value when is_binary(value) ->
+            with {:ok, owner} <- flow_limit_decode_owner(state, value, attrs.scope) do
+              {:ok, owner, false}
+            end
+
+          _invalid ->
+            {:error, "ERR flow limit record is corrupt"}
         end
+      end
+
+      defp flow_limit_maybe_enqueue_catalog_publication(_state, _key, false), do: :ok
+
+      defp flow_limit_maybe_enqueue_catalog_publication(state, owner_key, true) do
+        shard_index = state.shard_index
+        meta_key = FlowKeys.governance_limit_catalog_outbox_meta_key(shard_index)
+
+        with {:ok, meta} <-
+               Ferricstore.Flow.Governance.LimitCatalogOutbox.decode_meta(do_get(state, meta_key)),
+             {:ok, pending?} <-
+               flow_limit_catalog_publication_pending?(state, shard_index, meta, owner_key) do
+          if pending? do
+            :ok
+          else
+            flow_limit_append_catalog_publication(
+              state,
+              shard_index,
+              meta_key,
+              meta,
+              owner_key
+            )
+          end
+        end
+      end
+
+      defp flow_limit_catalog_publication_pending?(
+             _state,
+             _shard_index,
+             %{head: head, tail: tail},
+             _owner_key
+           )
+           when head > tail,
+           do: {:ok, false}
+
+      defp flow_limit_catalog_publication_pending?(
+             state,
+             shard_index,
+             %{tail: tail},
+             owner_key
+           ) do
+        intent_key = FlowKeys.governance_limit_catalog_outbox_intent_key(shard_index, tail)
+
+        case do_get(state, intent_key) do
+          value when is_binary(value) ->
+            with {:ok, pending_owner_key} <-
+                   Ferricstore.Flow.Governance.LimitCatalogOutbox.decode_intent(value) do
+              {:ok, pending_owner_key == owner_key}
+            end
+
+          _missing_or_invalid ->
+            {:error, "ERR flow limit catalog publication entry is missing or corrupt"}
+        end
+      end
+
+      defp flow_limit_append_catalog_publication(
+             state,
+             shard_index,
+             meta_key,
+             meta,
+             owner_key
+           ) do
+        with {:ok, next_meta, sequence} <-
+               Ferricstore.Flow.Governance.LimitCatalogOutbox.append(meta, owner_key),
+             intent_key <-
+               FlowKeys.governance_limit_catalog_outbox_intent_key(shard_index, sequence) do
+          case do_get(state, intent_key) do
+            nil ->
+              with :ok <- flow_limit_put_catalog_publication_intent(state, intent_key, owner_key) do
+                flow_limit_put_catalog_publication_meta(state, meta_key, next_meta)
+              end
+
+            value when is_binary(value) ->
+              with {:ok, pending_owner_key} <-
+                     Ferricstore.Flow.Governance.LimitCatalogOutbox.decode_intent(value) do
+                cond do
+                  pending_owner_key == owner_key ->
+                    flow_limit_put_catalog_publication_meta(state, meta_key, next_meta)
+
+                  is_nil(do_get(state, pending_owner_key)) ->
+                    with :ok <-
+                           flow_limit_put_catalog_publication_intent(
+                             state,
+                             intent_key,
+                             owner_key
+                           ) do
+                      flow_limit_put_catalog_publication_meta(state, meta_key, next_meta)
+                    end
+
+                  true ->
+                    {:error, "ERR flow limit catalog publication entry already exists"}
+                end
+              else
+                {:error, _reason} = error -> error
+              end
+
+            _invalid ->
+              {:error, "ERR flow limit catalog publication entry is corrupt"}
+          end
+        end
+      end
+
+      defp flow_limit_put_catalog_publication_intent(state, intent_key, owner_key) do
+        do_put(
+          state,
+          intent_key,
+          Ferricstore.Flow.Governance.LimitCatalogOutbox.encode_intent(owner_key),
+          0
+        )
+      end
+
+      defp flow_limit_put_catalog_publication_meta(state, meta_key, meta) do
+        do_put(
+          state,
+          meta_key,
+          Ferricstore.Flow.Governance.LimitCatalogOutbox.encode_meta(meta),
+          0
+        )
+      end
+
+      defp do_flow_governance_limit_catalog_outbox_ack(
+             state,
+             shard_index,
+             expected_head,
+             up_to
+           )
+           when is_integer(shard_index) and shard_index >= 0 and is_integer(expected_head) and
+                  expected_head > 0 and is_integer(up_to) and up_to >= expected_head and
+                  up_to - expected_head < 256 do
+        if shard_index == state.shard_index do
+          meta_key = FlowKeys.governance_limit_catalog_outbox_meta_key(shard_index)
+
+          with {:ok, meta} <-
+                 Ferricstore.Flow.Governance.LimitCatalogOutbox.decode_meta(
+                   do_get(state, meta_key)
+                 ),
+               {:ok, next_meta, acknowledged} <-
+                 Ferricstore.Flow.Governance.LimitCatalogOutbox.acknowledge(
+                   meta,
+                   expected_head,
+                   up_to
+                 ),
+               :ok <-
+                 flow_limit_delete_catalog_publications(state, shard_index, acknowledged) do
+            do_put(
+              state,
+              meta_key,
+              Ferricstore.Flow.Governance.LimitCatalogOutbox.encode_meta(next_meta),
+              0
+            )
+          end
+        else
+          {:error, "ERR flow limit catalog publication shard mismatch"}
+        end
+      end
+
+      defp do_flow_governance_limit_catalog_outbox_ack(
+             _state,
+             _shard_index,
+             _expected_head,
+             _up_to
+           ),
+           do: {:error, "ERR invalid flow limit catalog publication acknowledgement"}
+
+      defp flow_limit_delete_catalog_publications(state, shard_index, sequences) do
+        Enum.reduce_while(sequences, :ok, fn sequence, :ok ->
+          key = FlowKeys.governance_limit_catalog_outbox_intent_key(shard_index, sequence)
+
+          case do_delete(state, key) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
       end
 
       defp flow_limit_decode_owner(state, value, scope) do

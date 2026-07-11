@@ -180,6 +180,27 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert :ets.info(table, :owner) == Process.whereis(Ferricstore.Flow.Governance.LimitCache)
   end
 
+  test "limit cache rejects invalid entry shapes instead of granting credits" do
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+
+    ctx = FerricStore.Instance.get(:default)
+    scope = unique_flow_id("invalid-cache-entry")
+    key = {ctx.name, scope, 0}
+    table = :ferricstore_flow_governance_limit_cache
+
+    true = :ets.insert(table, {key, 1, 2_000, 1, ["unbacked-reservation"]})
+
+    assert {:error, "ERR flow limit not found"} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert [] == :ets.lookup(table, key)
+  end
+
   test "strict global running policy enforces claims without caller limit options" do
     type = unique_flow_id("policy-limit-type")
     _ids = create_due_flows(type, 2)
@@ -436,15 +457,15 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert second_id != first_id
   end
 
-  test "legacy terminal metadata without an id cannot release an identified reservation" do
-    type = unique_flow_id("legacy-terminal-limit-type")
-    scope = unique_flow_id("legacy-terminal-limit")
+  test "terminal transition rejects governance metadata without a reservation id" do
+    type = unique_flow_id("invalid-terminal-limit-type")
+    scope = unique_flow_id("invalid-terminal-limit")
     create_due_flows(type, 1)
     lease_limit!(scope, 1)
     claimed = claim_one!(type, scope, 0, 1_001)
     record = raw_record(claimed.id)
-    legacy_limit = Map.delete(record.governance_limit, :reservation_id)
-    legacy_record = Map.put(record, :governance_limit, legacy_limit)
+    invalid_limit = Map.delete(record.governance_limit, :reservation_id)
+    invalid_record = Map.put(record, :governance_limit, invalid_limit)
     ctx = FerricStore.Instance.get(:default)
     state_key = Ferricstore.Flow.Keys.state_key(claimed.id, @partition)
     shard = Ferricstore.Store.Router.shard_for(ctx, state_key)
@@ -452,10 +473,10 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert :ok =
              Ferricstore.Raft.WARaftBackend.write(
                shard,
-               {:put, state_key, Ferricstore.Flow.encode_record(legacy_record), 0}
+               {:put, state_key, Ferricstore.Flow.encode_record(invalid_record), 0}
              )
 
-    assert :ok =
+    assert {:error, "ERR invalid flow governance limit reservation"} =
              FerricStore.flow_complete(claimed.id, claimed.lease_token,
                partition_key: @partition,
                fencing_token: claimed.fencing_token,
@@ -464,6 +485,7 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
 
     assert {:ok, owner} = FerricStore.flow_limit_get(scope, now_ms: 1_003)
     assert owner.leases[0].in_use == 1
+    assert raw_record(claimed.id).state == "running"
   end
 
   test "existing limit owner applies only monotonic capacity configurations" do

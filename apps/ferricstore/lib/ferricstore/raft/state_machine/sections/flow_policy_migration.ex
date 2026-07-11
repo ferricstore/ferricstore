@@ -725,7 +725,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
 
           case do_get(state, guard_key) do
             ^expected_guard -> {:ok, record}
-            nil -> flow_policy_planned_legacy_record(state, state_key, record)
+            nil -> flow_policy_planned_unguarded_record(state, state_key, record)
             _changed -> {:error, "ERR stale flow policy catalog record plan"}
           end
         else
@@ -737,7 +737,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
         _error -> {:error, "ERR invalid flow policy catalog state record"}
       end
 
-      defp flow_policy_planned_legacy_record(state, state_key, record) do
+      defp flow_policy_planned_unguarded_record(state, state_key, record) do
         case FlowKeys.registry_key_from_state_key(state_key) do
           {:ok, registry_key} ->
             if is_nil(do_get(state, registry_key)), do: :missing, else: {:ok, record}
@@ -987,18 +987,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
         end
       end
 
-      defp flow_policy_catalog_generation(state, type) do
-        case Process.get(:sm_flow_policy_snapshots, :legacy) do
-          snapshots when is_map(snapshots) ->
-            flow_read_policy_generation(state, type)
-
-          :legacy ->
-            max(
-              flow_read_policy_generation(state, type),
-              flow_policy_migration_marker_generation(state, type)
-            )
-        end
-      end
+      defp flow_policy_catalog_generation(state, type),
+        do: flow_read_policy_generation(state, type)
 
       defp flow_reopen_stale_policy_migration(state, type, catalog_generation) do
         active_key = FlowKeys.policy_migration_job_key(type)
@@ -1047,26 +1037,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
 
       defp flow_read_policy_generation(_state, type) when not is_binary(type), do: 0
 
-      defp flow_read_policy_generation(state, type) do
-        case Process.get(:sm_flow_policy_snapshots, :legacy) do
+      defp flow_read_policy_generation(_state, type) do
+        case Process.get(:sm_flow_policy_snapshots, %{}) do
           %{^type => %{generation: generation}}
           when is_integer(generation) and generation >= 0 ->
             generation
 
-          snapshots when is_map(snapshots) ->
+          _missing ->
             0
-
-          :legacy ->
-            case ets_lookup(state, FlowKeys.policy_key(type)) do
-              {:hit, value, _expire_at_ms} when is_binary(value) ->
-                case RetryPolicy.decode_flow_policy_entry(value) do
-                  {:ok, {generation, _policy}} -> generation
-                  :error -> 0
-                end
-
-              _missing ->
-                0
-            end
         end
       end
 

@@ -211,9 +211,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       defp resolve_persisted_apply_context(%Ferricstore.Raft.ApplyContext{} = context, _ctx),
         do: context
 
-      defp resolve_persisted_apply_context(_legacy, ctx),
-        do: storage_apply_context(%{ctx: ctx})
-
       defp storage_apply_context(%{
              sm_state: %{apply_context: %Ferricstore.Raft.ApplyContext{} = context}
            }),
@@ -223,8 +220,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
              ctx: %{apply_context: %Ferricstore.Raft.ApplyContext{} = context}
            }),
            do: context
-
-      defp storage_apply_context(_legacy), do: Ferricstore.Raft.ApplyContext.from_runtime()
 
       defp maybe_recover_segment_projected!(sm_state, root_dir, metadata) do
         metadata_position = Map.get(metadata, :position, @zero_pos)

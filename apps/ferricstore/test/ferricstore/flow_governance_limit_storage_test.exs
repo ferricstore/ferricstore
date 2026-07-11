@@ -5,11 +5,27 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
   alias Ferricstore.Flow.Governance.Catalog
   alias Ferricstore.Flow.Governance.LimitRecord
   alias Ferricstore.Flow.Governance.LimitCache
+  alias Ferricstore.Flow.Governance.LimitCatalogOutbox
   alias Ferricstore.Flow.Governance.LimitStorageCleaner
   alias Ferricstore.Flow.Governance.LimitStore
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
+
+  test "reservation records require the current explicit status field" do
+    reservation_id = "reservation-1"
+
+    assert {:ok, :active} =
+             reservation_id
+             |> LimitRecord.encode_reservation(:active)
+             |> LimitRecord.decode_reservation(reservation_id)
+
+    statusless =
+      :erlang.term_to_binary({:flow_governance_limit_reservation, reservation_id})
+
+    assert {:error, "ERR flow limit reservation record is corrupt"} =
+             LimitRecord.decode_reservation(statusless, reservation_id)
+  end
 
   test "limit owner bytes stay bounded as detached reservations grow" do
     ctx = FerricStore.Instance.get(:default)
@@ -343,8 +359,8 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
     bad_lease = %{bad_owner.leases[0] | reservations: %{bad_id => 1}}
     bad_owner = %{bad_owner | leases: %{0 => bad_lease}}
     bad_shard = Router.shard_for(ctx, bad_key)
-    legacy = :erlang.term_to_binary({:flow_governance_limit_v1, bad_owner})
-    assert :ok = WARaftBackend.write(bad_shard, {:put, bad_key, legacy, 0})
+    malformed = :erlang.term_to_binary({:flow_governance_limit_v1, bad_owner})
+    assert :ok = WARaftBackend.write(bad_shard, {:put, bad_key, malformed, 0})
     assert {:ok, true} = Catalog.member?(ctx, Keys.governance_catalog_key(:limit), bad_key)
 
     assert {:error, _reason} = LimitStorageCleaner.run_once(ctx, now_ms: 1_006)
@@ -599,7 +615,7 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
              )
   end
 
-  test "legacy embedded reservations fail with an explicit beta migration error" do
+  test "current owner records reject embedded reservations as corruption" do
     ctx = FerricStore.Instance.get(:default)
     scope = unique_flow_id("embedded-limit-record")
     key = Keys.governance_limit_key(scope)
@@ -610,7 +626,7 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
       epoch: 1,
       expires_at_ms: 2_000,
       in_use: 1,
-      reservations: %{"legacy-id" => 1}
+      reservations: %{"embedded-id" => 1}
     }
 
     owner = %CreditLease.Owner{
@@ -621,17 +637,16 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
       leases: %{0 => lease}
     }
 
-    old_value = :erlang.term_to_binary({:flow_governance_limit_v1, owner})
-    assert :ok = WARaftBackend.write(shard, {:put, key, old_value, 0})
+    invalid_value = :erlang.term_to_binary({:flow_governance_limit_v1, owner})
+    assert :ok = WARaftBackend.write(shard, {:put, key, invalid_value, 0})
 
-    assert {:error,
-            "ERR flow limit record uses obsolete embedded reservations; recreate the limit"} =
+    assert {:error, "ERR flow limit record is corrupt"} =
              LimitStore.get(ctx, scope, now_ms: 1_001)
   end
 
-  test "a pre-catalog owner is registered before it creates detached storage" do
+  test "an uncataloged current owner is repaired before it creates detached storage" do
     ctx = FerricStore.Instance.get(:default)
-    scope = unique_flow_id("detached-limit-catalog-upgrade")
+    scope = unique_flow_id("detached-limit-catalog-repair")
     key = Keys.governance_limit_key(scope)
     shard = Router.shard_for(ctx, key)
     catalog_key = Keys.governance_catalog_key(:limit)
@@ -730,6 +745,88 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
     assert {:ok, true} = Catalog.member?(ctx, catalog_key, key)
     send(task.pid, :continue)
     assert {:ok, _lease} = Task.await(task, 3_000)
+  end
+
+  test "durable owner publication repairs a catalog member after caller-side loss" do
+    ctx = FerricStore.Instance.get(:default)
+    scope = unique_flow_id("detached-limit-durable-catalog")
+    key = Keys.governance_limit_key(scope)
+    catalog_key = Keys.governance_catalog_key(:limit)
+
+    assert {:ok, _lease} =
+             LimitStore.lease(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               limit: 2,
+               ttl_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    shard_index = Router.shard_for(ctx, key)
+
+    assert {:ok, %{entries: [{_sequence, ^key}]}} =
+             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+
+    assert {:ok, 1} = FerricStore.Impl.zrem(ctx, catalog_key, [key])
+    assert {:ok, false} = Catalog.member?(ctx, catalog_key, key)
+
+    assert {:ok, %{errors: 0}} =
+             Ferricstore.Flow.Governance.LimitReconciler.run_once(ctx,
+               now_ms: 1_001,
+               reservation_limit: 256
+             )
+
+    assert {:ok, true} = Catalog.member?(ctx, catalog_key, key)
+
+    assert {:ok, %{entries: []}} =
+             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+
+    assert {:ok, _lease} =
+             LimitStore.lease(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               limit: 2,
+               ttl_ms: 1_000,
+               now_ms: 1_002
+             )
+
+    assert {:ok, %{entries: []}} =
+             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+  end
+
+  test "catalog publication discards a torn intent whose owner never committed" do
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = 0
+    owner_key = Keys.governance_limit_key(unique_flow_id("missing-catalog-owner"))
+    meta_key = Keys.governance_limit_catalog_outbox_meta_key(shard_index)
+    intent_key = Keys.governance_limit_catalog_outbox_intent_key(shard_index, 1)
+
+    assert {:ok, meta, 1} = LimitCatalogOutbox.append(LimitCatalogOutbox.empty_meta(), owner_key)
+
+    assert [:ok, :ok] =
+             WARaftBackend.write_many([
+               {shard_index, {:put, meta_key, LimitCatalogOutbox.encode_meta(meta), 0}},
+               {shard_index, {:put, intent_key, LimitCatalogOutbox.encode_intent(owner_key), 0}}
+             ])
+
+    assert {:ok, _result} =
+             Ferricstore.Flow.Governance.LimitReconciler.run_once(ctx,
+               now_ms: 1_001,
+               reservation_limit: 256
+             )
+
+    assert {:ok, %{entries: []}} =
+             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+  end
+
+  test "catalog publication backlog is strictly bounded" do
+    full = %{head: 1, tail: 65_536}
+
+    assert {:error, "ERR flow limit catalog publication backlog is full"} =
+             LimitCatalogOutbox.append(full, "owner")
+
+    assert {:ok, %{head: 2, tail: 65_537}, 65_537} =
+             LimitCatalogOutbox.append(%{head: 2, tail: 65_536}, "owner")
   end
 
   test "removed metadata binding and reservation scan APIs stay unavailable" do

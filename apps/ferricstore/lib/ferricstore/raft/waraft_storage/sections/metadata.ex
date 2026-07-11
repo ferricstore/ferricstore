@@ -137,7 +137,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       end
 
-      defp validate_apply_context_metadata(_legacy_metadata), do: :ok
+      defp validate_apply_context_metadata(_metadata), do: {:error, :missing_apply_context}
 
       defp validate_raft_position({:raft_log_pos, index, term})
            when is_integer(index) and index >= 0 and is_integer(term) and term >= 0,
@@ -169,58 +169,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       defp decode_persisted_metadata_term(other), do: other
 
       defp encode_persisted_storage_config({position, config}) when is_map(config),
-        do: {position, encode_persisted_waraft_config(config)}
+        do: {position, Ferricstore.Raft.WARaftStorage.PersistedConfig.encode!(config)}
 
       defp encode_persisted_storage_config(other), do: other
 
       defp decode_persisted_storage_config({position, config}) when is_map(config),
-        do: {position, decode_persisted_waraft_config(config)}
+        do: {position, Ferricstore.Raft.WARaftStorage.PersistedConfig.decode!(config)}
 
       defp decode_persisted_storage_config(other), do: other
 
-      defp encode_persisted_waraft_config(config) do
-        Enum.reduce([:membership, :participants, :witness, :witnesses], config, fn key, acc ->
-          if Map.has_key?(acc, key) do
-            Map.update!(acc, key, &encode_persisted_waraft_peers/1)
-          else
-            acc
-          end
-        end)
+      @doc false
+      def __decode_persisted_waraft_config_for_test__(config) do
+        Ferricstore.Raft.WARaftStorage.PersistedConfig.decode(config)
       end
-
-      defp decode_persisted_waraft_config(config) do
-        Enum.reduce([:membership, :participants, :witness, :witnesses], config, fn key, acc ->
-          if Map.has_key?(acc, key) do
-            Map.update!(acc, key, &decode_persisted_waraft_peers/1)
-          else
-            acc
-          end
-        end)
-      end
-
-      defp encode_persisted_waraft_peers(peers) when is_list(peers),
-        do: Enum.map(peers, &encode_persisted_waraft_peer/1)
-
-      defp encode_persisted_waraft_peers(other), do: other
-
-      defp decode_persisted_waraft_peers(peers) when is_list(peers),
-        do: Enum.map(peers, &decode_persisted_waraft_peer/1)
-
-      defp decode_persisted_waraft_peers(other), do: other
-
-      defp encode_persisted_waraft_peer({server, node_name})
-           when is_atom(server) and is_atom(node_name) do
-        {@encoded_peer_tag, Atom.to_string(server), Atom.to_string(node_name)}
-      end
-
-      defp encode_persisted_waraft_peer(other), do: other
-
-      defp decode_persisted_waraft_peer({@encoded_peer_tag, server, node_name})
-           when is_binary(server) and is_binary(node_name) do
-        {String.to_atom(server), String.to_atom(node_name)}
-      end
-
-      defp decode_persisted_waraft_peer(other), do: other
 
       defp metadata_path(root_dir), do: Path.join(root_dir, @metadata_file)
 

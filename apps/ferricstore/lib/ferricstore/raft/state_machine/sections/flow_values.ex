@@ -141,31 +141,40 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
 
       defp flow_governance_release_result(record) when is_map(record) do
         case Map.get(record, :governance_limit) do
-          %{scope: scope, shard_id: shard_id} = reservation
-          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
+          %{
+            scope: scope,
+            shard_id: shard_id,
+            reservation_id: reservation_id,
+            enforcement: enforcement
+          } = reservation
+          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+                 is_binary(reservation_id) and reservation_id != "" and
+                 enforcement in [:strict_global, :approximate_global] ->
             {:flow_governance_release, reservation}
 
-          _none ->
+          nil ->
             :ok
+
+          _invalid ->
+            {:error, "ERR invalid flow governance limit reservation"}
         end
       end
 
       defp flow_governance_release_results(plans) when is_list(plans) do
-        releases =
-          plans
-          |> Enum.reduce([], fn plan, acc ->
-            {record, _next} = flow_claim_plan_pair(plan)
+        plans
+        |> Enum.reduce_while({:ok, []}, fn plan, {:ok, acc} ->
+          {record, _next} = flow_claim_plan_pair(plan)
 
-            case flow_governance_release_result(record) do
-              {:flow_governance_release, reservation} -> [reservation | acc]
-              :ok -> acc
-            end
-          end)
-          |> Enum.reverse()
-
-        case releases do
-          [] -> :ok
-          [_ | _] -> {:flow_governance_releases, releases}
+          case flow_governance_release_result(record) do
+            {:flow_governance_release, reservation} -> {:cont, {:ok, [reservation | acc]}}
+            :ok -> {:cont, {:ok, acc}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, []} -> :ok
+          {:ok, releases} -> {:flow_governance_releases, Enum.reverse(releases)}
+          {:error, _reason} = error -> error
         end
       end
 

@@ -195,7 +195,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
         {:ok, token}
 
       :not_found ->
-        {:ok, "legacy"}
+        {:ok, "uninitialized"}
 
       {:error, _reason} = error ->
         error

@@ -1052,12 +1052,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       when is_integer(version) and version >= 0 and is_integer(sequence) and sequence >= 0 ->
         {version, {:state_enter_seq, sequence}}
 
-      {version, {:legacy_record, created_at_ms, digest}}
-      when is_integer(version) and version >= 0 and
-             (is_integer(created_at_ms) or is_nil(created_at_ms)) and is_binary(digest) and
-             byte_size(digest) == 32 ->
-        {version, {:legacy_record, created_at_ms, digest}}
-
       _invalid ->
         raise "shared-ref backfill found corrupt retention guard #{inspect(key)}"
     end

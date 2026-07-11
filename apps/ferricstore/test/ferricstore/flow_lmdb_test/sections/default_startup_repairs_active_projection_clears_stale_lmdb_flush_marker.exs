@@ -286,7 +286,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
                  Ferricstore.Flow.LMDB.get_many(path, ["a", "b", "c"])
       end
 
-      test "query index values carry state keys and decode legacy values" do
+      test "query index values require the current state-key encoding" do
         state_key = Ferricstore.Flow.Keys.state_key("flow-query-value", "tenant-query-value")
 
         value =
@@ -295,14 +295,22 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
         assert {:ok, {"flow-query-value", 42, 1_000, ^state_key}} =
                  Ferricstore.Flow.LMDB.decode_query_index_value(value)
 
-        legacy_expiring = :erlang.term_to_binary({"flow-query-value", 43, 2_000})
-        legacy_permanent = :erlang.term_to_binary({"flow-query-value", 44})
+        obsolete_expiring = :erlang.term_to_binary({"flow-query-value", 43, 2_000})
+        obsolete_permanent = :erlang.term_to_binary({"flow-query-value", 44})
 
-        assert {:ok, {"flow-query-value", 43, 2_000, nil}} =
-                 Ferricstore.Flow.LMDB.decode_query_index_value(legacy_expiring)
+        assert :error = Ferricstore.Flow.LMDB.decode_query_index_value(obsolete_expiring)
+        assert :error = Ferricstore.Flow.LMDB.decode_query_index_value(obsolete_permanent)
+      end
 
-        assert {:ok, {"flow-query-value", 44, 0, nil}} =
-                 Ferricstore.Flow.LMDB.decode_query_index_value(legacy_permanent)
+      test "terminal and history indexes reject shortened obsolete encodings" do
+        terminal = :erlang.term_to_binary({"flow-terminal-value", 42, 1_000})
+        history = :erlang.term_to_binary({"event", 42, "compound-key"})
+        history_expiry = :erlang.term_to_binary("history-key")
+
+        assert :error = Ferricstore.Flow.LMDB.decode_terminal_index_value(terminal)
+        assert :error = Ferricstore.Flow.LMDB.decode_history_index_value(history)
+        assert :error = Ferricstore.Flow.LMDB.decode_history_index_location(history)
+        assert :error = Ferricstore.Flow.LMDB.decode_history_flow_expire_value(history_expiry)
       end
 
       test "terminal_counts batches count reads without caching missing counts" do

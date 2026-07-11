@@ -198,7 +198,7 @@ defmodule Ferricstore.FlowGovernanceModelsTest do
     assert owner.leases[1].reservations == %{"reservation-b" => 1}
   end
 
-  test "credit release accepts legacy reservation maps after upgrade" do
+  test "credit release rejects invalid reservation value shapes" do
     owner = CreditLease.owner("global", 1)
 
     lease = %CreditLease.Lease{
@@ -207,16 +207,19 @@ defmodule Ferricstore.FlowGovernanceModelsTest do
       expires_at_ms: 2_000,
       in_use: 1,
       reservations: %{
-        "legacy-reservation" => %{reservation_id: "legacy-reservation", amount: 1}
+        "invalid-reservation" => %{reservation_id: "invalid-reservation", amount: 1}
       }
     }
 
     owner = %{owner | free: 0, epoch: 1, leases: %{1 => lease}}
-    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["legacy-reservation"])
+    owner = CreditLease.release(owner, 1, 1, reservation_ids: ["invalid-reservation"])
 
-    assert owner.leases[1].in_use == 0
-    assert owner.leases[1].available == 1
-    assert owner.leases[1].reservations == %{}
+    assert owner.leases[1].in_use == 1
+    assert owner.leases[1].available == 0
+
+    assert owner.leases[1].reservations == %{
+             "invalid-reservation" => %{reservation_id: "invalid-reservation", amount: 1}
+           }
   end
 
   test "credit owner applies monotonic config versions and drains capacity on decreases" do

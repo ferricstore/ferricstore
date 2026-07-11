@@ -4,7 +4,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
-      alias Ferricstore.Raft.{BlobCommand, StateMachine}
+      alias Ferricstore.Raft.BlobCommand
+      alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
       alias Ferricstore.Store.BitcaskWriter
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
@@ -85,15 +86,15 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "legacy Flow commands still use the local policy during log replay", %{
+        test "unstamped Flow commands are rejected instead of reading replica-local policy", %{
           state: state,
           ets: ets
         } do
           setup_flow_indexes(state)
 
-          type = "legacy-policy-create"
-          partition_key = "legacy-policy-tenant"
-          state_key = Ferricstore.Flow.Keys.state_key("legacy-policy-flow", partition_key)
+          type = "unstamped-policy-create"
+          partition_key = "unstamped-policy-tenant"
+          state_key = Ferricstore.Flow.Keys.state_key("unstamped-policy-flow", partition_key)
           policy_key = Ferricstore.Flow.Keys.policy_key(type)
 
           {:ok, local_policy} =
@@ -107,12 +108,12 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
              byte_size(local_value)}
           )
 
-          {_state, :ok} =
-            StateMachine.apply(
+          {_state, {:error, "ERR flow policy snapshot is required"}} =
+            Ferricstore.Raft.StateMachine.apply(
               %{system_time: 1_000},
               {:flow_create, state_key,
                %{
-                 id: "legacy-policy-flow",
+                 id: "unstamped-policy-flow",
                  type: type,
                  state: "queued",
                  partition_key: partition_key
@@ -120,7 +121,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               state
             )
 
-          assert flow_record!(state, state_key).max_active_ms == 9_000
+          assert :ets.lookup(ets, state_key) == []
         end
 
         @tag :flow_policy_generation
@@ -469,29 +470,35 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "legacy list-shaped cross-shard terminal batches replay without snapshot metadata",
+        test "list-shaped cross-shard terminal batches are rejected without canonical metadata",
              %{
                state: state,
                shard_index: shard_index
              } do
           setup_flow_indexes(state)
 
-          id = "legacy-cross-terminal-many"
-          type = "legacy-cross-terminal-many"
-          partition_key = "legacy-cross-terminal-many-tenant"
+          id = "unstamped-cross-terminal-many"
+          type = "unstamped-cross-terminal-many"
+          partition_key = "unstamped-cross-terminal-many-tenant"
           state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
           {state, :ok} =
             StateMachine.apply(
               %{system_time: 1_000},
               {:flow_create, state_key,
-               %{id: id, type: type, state: "queued", partition_key: partition_key}},
+               %{
+                 id: id,
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 policy_snapshot_captured: true
+               }},
               state
             )
 
           created = flow_record!(state, state_key)
 
-          legacy_attrs = [
+          unstamped_attrs = [
             %{
               id: id,
               fencing_token: created.fencing_token,
@@ -499,17 +506,17 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
             }
           ]
 
-          {_state, %{^shard_index => [:ok]}} =
-            StateMachine.apply(
+          {_state, {:error, "ERR flow policy snapshot is required"}} =
+            Ferricstore.Raft.StateMachine.apply(
               %{system_time: 2_000},
               {:cross_shard_tx,
                [
-                 {shard_index, [{:flow_cross_terminal_many, :cancel, legacy_attrs}], nil}
+                 {shard_index, [{:flow_cross_terminal_many, :cancel, unstamped_attrs}], nil}
                ]},
               state
             )
 
-          assert flow_record!(state, state_key).state == "cancelled"
+          assert flow_record!(state, state_key).state == "queued"
         end
 
         @tag :flow_policy_generation

@@ -63,6 +63,34 @@ defmodule Ferricstore.Store.Router.Part07 do
           do: {:error, "ERR invalid flow governance release outbox acknowledgement"}
 
       @doc false
+      def flow_governance_limit_catalog_outbox_ack(
+            ctx,
+            shard_index,
+            expected_head,
+            up_to
+          )
+          when is_integer(shard_index) and shard_index >= 0 and shard_index < ctx.shard_count and
+                 is_integer(expected_head) and expected_head > 0 and is_integer(up_to) and
+                 up_to >= expected_head and up_to - expected_head < 256 do
+        key = Ferricstore.Flow.Keys.governance_limit_catalog_outbox_meta_key(shard_index)
+
+        raft_write(
+          ctx,
+          shard_index,
+          key,
+          {:flow_governance_limit_catalog_outbox_ack, key, shard_index, expected_head, up_to}
+        )
+      end
+
+      def flow_governance_limit_catalog_outbox_ack(
+            _ctx,
+            _shard_index,
+            _expected_head,
+            _up_to
+          ),
+          do: {:error, "ERR invalid flow limit catalog publication acknowledgement"}
+
+      @doc false
       def flow_governance_release_outbox_mark_completed(ctx, shard_index, sequences)
           when is_integer(shard_index) and shard_index >= 0 and shard_index < ctx.shard_count and
                  is_list(sequences) and sequences != [] and length(sequences) <= 256 do

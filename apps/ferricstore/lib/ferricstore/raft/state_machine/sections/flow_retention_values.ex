@@ -629,10 +629,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
             Map.put(record, :governance_limit, reservation)
 
-          %{scope: scope, shard_id: shard_id} = reservation
-          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
-            Map.put(record, :governance_limit, Map.delete(reservation, :reservation_ids))
-
           _none ->
             Map.delete(record, :governance_limit)
         end
@@ -640,7 +636,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
 
       defp flow_governance_limit_active? do
         match?(
-          %{scope: scope, shard_id: shard_id} when is_binary(scope) and is_integer(shard_id),
+          %{
+            scope: scope,
+            shard_id: shard_id,
+            enforcement: enforcement,
+            reservation_ids: [_ | _]
+          }
+          when is_binary(scope) and is_integer(shard_id) and
+                 enforcement in [:strict_global, :approximate_global],
           Process.get(:sm_flow_governance_limit)
         )
       end

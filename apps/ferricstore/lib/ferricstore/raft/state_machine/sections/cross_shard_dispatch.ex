@@ -132,7 +132,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             started_at = System.monotonic_time()
 
             result =
-              with_flow_policy_snapshots(attrs, fn ->
+              with_flow_policy_snapshots(command_shape, attrs, fn ->
                 with_pending_writes(state, fun)
               end)
 
@@ -152,7 +152,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       defp apply_flow_single_with_telemetry(state, command_shape, attrs, fun) do
         item_count = flow_apply_item_count(attrs)
         started_at = System.monotonic_time()
-        result = with_flow_policy_snapshots(attrs, fun)
+        result = with_flow_policy_snapshots(command_shape, attrs, fun)
 
         emit_flow_apply_telemetry(
           state,
@@ -165,25 +165,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         result
       end
 
-      defp with_flow_policy_snapshots(attrs, fun) when is_function(fun, 0) do
-        with {:ok, {captured?, snapshots}} <- flow_policy_snapshots(attrs) do
-          if not captured? do
-            fun.()
-          else
-            with {:ok, merged} <- merge_flow_policy_snapshots(snapshots) do
-              previous = Process.get(:sm_flow_policy_snapshots, :undefined)
-              Process.put(:sm_flow_policy_snapshots, merged)
+      defp with_flow_policy_snapshots(command_shape, attrs, fun) when is_function(fun, 0) do
+        if Ferricstore.Flow.PolicyCommand.policy_sensitive_op?(command_shape) do
+          with {:ok, snapshots} <- flow_policy_snapshots(attrs),
+               {:ok, merged} <- merge_flow_policy_snapshots(snapshots) do
+            previous = Process.get(:sm_flow_policy_snapshots, :undefined)
+            Process.put(:sm_flow_policy_snapshots, merged)
 
-              try do
-                fun.()
-              after
-                case previous do
-                  :undefined -> Process.delete(:sm_flow_policy_snapshots)
-                  value -> Process.put(:sm_flow_policy_snapshots, value)
-                end
+            try do
+              fun.()
+            after
+              case previous do
+                :undefined -> Process.delete(:sm_flow_policy_snapshots)
+                value -> Process.put(:sm_flow_policy_snapshots, value)
               end
             end
           end
+        else
+          fun.()
         end
       end
 
@@ -194,21 +193,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                |> Map.values()
                |> Enum.map(& &1.policy)
                |> RetryPolicy.validate_flow_policy_snapshots_size(),
-             {:ok, captured?} <- flow_policy_snapshot_captured?(attrs, snapshots) do
-          {:ok, {captured?, snapshots}}
+             :ok <- require_flow_policy_snapshot_marker(attrs) do
+          {:ok, snapshots}
         end
       end
 
-      defp flow_policy_snapshot_captured?(attrs, snapshots) when is_list(attrs),
-        do: {:ok, map_size(snapshots) > 0}
-
-      defp flow_policy_snapshot_captured?(attrs, snapshots) when is_map(attrs) do
+      defp require_flow_policy_snapshot_marker(attrs) when is_map(attrs) do
         case Map.fetch(attrs, :policy_snapshot_captured) do
-          :error -> {:ok, map_size(snapshots) > 0}
-          {:ok, true} -> {:ok, true}
+          {:ok, true} -> :ok
+          :error -> {:error, "ERR flow policy snapshot is required"}
           {:ok, _invalid} -> {:error, "ERR invalid flow policy snapshot"}
         end
       end
+
+      defp require_flow_policy_snapshot_marker(_attrs),
+        do: {:error, "ERR flow policy snapshot is required"}
 
       defp collect_flow_policy_snapshots(attrs, snapshots) when is_map(attrs) do
         with {:ok, snapshots} <- collect_flow_policy_snapshot(attrs, snapshots),
@@ -375,13 +374,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp cross_shard_ordered_entries(shard_batches) do
-        {_next_legacy_index, entries} =
+        {_next_generated_index, entries} =
           Enum.reduce(shard_batches, {0, []}, fn {shard_idx, queue, sandbox_namespace},
-                                                 {next_legacy_index, acc} ->
-            {next_legacy_index, batch_entries} =
+                                                 {next_generated_index, acc} ->
+            {next_generated_index, batch_entries} =
               queue
               |> Enum.with_index()
-              |> Enum.reduce({next_legacy_index, []}, fn
+              |> Enum.reduce({next_generated_index, []}, fn
                 {{orig_idx, entry}, pos}, {next, inner} when is_integer(orig_idx) ->
                   {max(next, orig_idx + 1),
                    [{orig_idx, shard_idx, pos, entry, sandbox_namespace} | inner]}
@@ -390,7 +389,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                   {next + 1, [{next, shard_idx, pos, entry, sandbox_namespace} | inner]}
               end)
 
-            {next_legacy_index, batch_entries ++ acc}
+            {next_generated_index, batch_entries ++ acc}
           end)
 
         Enum.sort_by(entries, fn {orig_idx, _shard_idx, _pos, _entry, _sandbox_namespace} ->
@@ -640,7 +639,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              _store,
              state
            ) do
-        with_flow_policy_snapshots(attrs, fn -> do_flow_cross_spawn_children(state, attrs) end)
+        with_flow_policy_snapshots(:flow_cross_spawn_children, attrs, fn ->
+          do_flow_cross_spawn_children(state, attrs)
+        end)
       end
 
       defp dispatch_cross_shard_entry(
@@ -687,7 +688,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              state
            ) do
         if op in [:complete, :retry, :fail, :cancel] do
-          with_flow_policy_snapshots(attrs, fn -> do_flow_cross_terminal(state, op, attrs) end)
+          with_flow_policy_snapshots(:flow_cross_terminal, attrs, fn ->
+            do_flow_cross_terminal(state, op, attrs)
+          end)
         else
           {:error, "ERR invalid flow cross-shard terminal op"}
         end
@@ -700,7 +703,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              state
            ) do
         if op in [:complete, :retry, :fail, :cancel] do
-          with_flow_policy_snapshots(attrs_list, fn ->
+          with_flow_policy_snapshots(:flow_cross_terminal_many, attrs_list, fn ->
             do_flow_cross_terminal_many(state, op, attrs_list)
           end)
         else
@@ -714,7 +717,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              _store,
              state
            ) do
-        with_flow_policy_snapshots(attrs, fn -> do_flow_cross_retention_cleanup(state, attrs) end)
+        with_flow_policy_snapshots(:flow_cross_retention_cleanup, attrs, fn ->
+          do_flow_cross_retention_cleanup(state, attrs)
+        end)
       end
 
       defp dispatch_cross_shard_entry(entry, sandbox_namespace, store, _state) do

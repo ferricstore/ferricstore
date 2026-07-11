@@ -798,11 +798,6 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
         :ets.delete_object(table, current)
         :miss
 
-      [current = {^key, _available, expires_at_ms, _capacity, _reservation_ids}]
-      when is_integer(expires_at_ms) and expires_at_ms <= now_ms ->
-        :ets.delete_object(table, current)
-        :miss
-
       [
         current =
             {^key, available, expires_at_ms, capacity, reservation_ids, config_version,
@@ -833,28 +828,8 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           detach_stale_entry(table, current, key, amount, now_ms, requested_configuration)
         end
 
-      [current = {^key, available, expires_at_ms, capacity, reservation_ids}]
-      when is_integer(available) and available >= amount and is_list(reservation_ids) ->
-        if cache_configuration_matches?(0, nil, requested_configuration) do
-          {taken, remaining} = Enum.split(reservation_ids, amount)
-
-          if length(taken) == amount do
-            updated = {key, available - amount, expires_at_ms, capacity, remaining, 0, nil}
-
-            if replace_exact(table, current, updated) do
-              {:ok, taken}
-            else
-              take_cached(key, amount, now_ms, requested_configuration)
-            end
-          else
-            :miss
-          end
-        else
-          detach_stale_entry(table, current, key, amount, now_ms, requested_configuration)
-        end
-
-      [legacy = {^key, _available, _expires_at_ms, _capacity}] ->
-        :ets.delete_object(table, legacy)
+      [invalid_entry] ->
+        :ets.delete_object(table, invalid_entry)
         :miss
 
       _missing_or_insufficient ->
@@ -1118,23 +1093,6 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           acc
         )
 
-      {{_instance, scope, shard_id}, _available, expires_at_ms, capacity, reservation_ids} =
-          entry,
-      acc
-      when is_binary(scope) and is_integer(shard_id) and is_integer(expires_at_ms) and
-             is_integer(capacity) and capacity >= 0 and is_list(reservation_ids) ->
-        release_detached_entry(
-          table,
-          ctx,
-          entry,
-          scope,
-          shard_id,
-          reservation_ids,
-          now_ms,
-          release_fun,
-          acc
-        )
-
       invalid_entry, acc ->
         restore_invalid_entry(table, invalid_entry)
         Map.update!(acc, :errors, &(&1 + 1))
@@ -1309,17 +1267,13 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     []
   end
 
-  defp restore_fenced_entry(entry) do
+  defp restore_fenced_entry(
+         {key, available, expires_at_ms, capacity, reservation_ids, config_version,
+          effective_limit}
+       ) do
     fenced_entry =
-      case entry do
-        {key, available, expires_at_ms, capacity, reservation_ids, config_version,
-         effective_limit} ->
-          {key, available, expires_at_ms, capacity, reservation_ids, {:fenced, config_version},
-           effective_limit}
-
-        {key, available, expires_at_ms, capacity, reservation_ids} ->
-          {key, available, expires_at_ms, capacity, reservation_ids, {:fenced, 0}, nil}
-      end
+      {key, available, expires_at_ms, capacity, reservation_ids, {:fenced, config_version},
+       effective_limit}
 
     :ets.insert_new(table(), fenced_entry)
     :ok
@@ -1329,8 +1283,6 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
          {_key, _available, _expires_at_ms, _capacity, _ids, config_version, effective_limit}
        ),
        do: {config_version, effective_limit}
-
-  defp entry_cache_configuration(_legacy), do: {0, nil}
 
   defp merge_flush_counts(left, right) do
     %{
@@ -1365,18 +1317,9 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     )
   end
 
-  defp restore_cached_entry(
-         table,
-         {key, _available, expires_at_ms, capacity, reservation_ids}
-       ),
-       do: do_add_cached(table, key, reservation_ids, capacity, expires_at_ms, 0, nil)
-
   defp restore_invalid_entry(table, entry) do
     case entry do
       {key, _field_2, _field_3, _field_4, _field_5, _field_6, _field_7} ->
-        if :ets.lookup(table, key) == [], do: :ets.insert_new(table, entry), else: true
-
-      {key, _field_2, _field_3, _field_4, _field_5} ->
         if :ets.lookup(table, key) == [], do: :ets.insert_new(table, entry), else: true
 
       _other ->
@@ -1386,8 +1329,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
 
   defp cache_entry_match_spec(instance_name) do
     [
-      {{{instance_name, :"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6", :"$7", :"$8"}, [], [:"$_"]},
-      {{{instance_name, :"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"}, [], [:"$_"]}
+      {{{instance_name, :"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6", :"$7", :"$8"}, [], [:"$_"]}
     ]
   end
 
@@ -1398,11 +1340,6 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
          {^key, _available, expires_at_ms, _capacity, _reservation_ids, _config_version,
           _effective_limit}
        ]}
-      when is_integer(ttl_ms) and ttl_ms > 0 and expires_at_ms > now_ms and
-             expires_at_ms < now_ms + ttl_ms ->
-        renew_cached_lease_deadline(ctx, scope, opts)
-
-      {ttl_ms, [{^key, _available, expires_at_ms, _capacity, _reservation_ids}]}
       when is_integer(ttl_ms) and ttl_ms > 0 and expires_at_ms > now_ms and
              expires_at_ms < now_ms + ttl_ms ->
         renew_cached_lease_deadline(ctx, scope, opts)
@@ -1435,10 +1372,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
         ] ->
           :ets.update_element(table(), key, {3, expires_at_ms})
 
-        [{^key, _available, _old_expiry, _capacity, _reservation_ids}] ->
-          :ets.update_element(table(), key, {3, expires_at_ms})
-
-        [] ->
+        _missing_or_invalid ->
           false
       end
     else
@@ -1448,8 +1382,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
 
   defp cached_entries?(table) do
     match_spec = [
-      {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6", :"$7", :"$8", :"$9"}, [], [true]},
-      {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6", :"$7"}, [], [true]}
+      {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6", :"$7", :"$8", :"$9"}, [], [true]}
     ]
 
     :ets.select_count(table, match_spec) > 0

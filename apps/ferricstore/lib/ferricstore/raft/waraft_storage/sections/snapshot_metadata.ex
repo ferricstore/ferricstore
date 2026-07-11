@@ -762,7 +762,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
       defp rebuild_runtime_after_snapshot_rollback(_handle), do: :ok
 
       defp rollback_rebuild_metadata(nil, handle),
-        do: %{position: Map.get(handle, :position, @zero_pos)}
+        do: %{
+          position: Map.get(handle, :position, @zero_pos),
+          apply_context: storage_apply_context(handle)
+        }
 
       defp rollback_rebuild_metadata(root_dir, handle) do
         case read_metadata_if_present(metadata_path(root_dir)) do
@@ -772,7 +775,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
           _missing_or_bad ->
             %{
               position:
-                latest_segment_log_position(root_dir, Map.get(handle, :position, @zero_pos))
+                latest_segment_log_position(root_dir, Map.get(handle, :position, @zero_pos)),
+              apply_context: storage_apply_context(handle)
             }
         end
       end

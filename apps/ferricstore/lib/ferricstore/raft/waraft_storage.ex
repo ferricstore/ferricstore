@@ -39,7 +39,6 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @default_snapshot_compaction_drain_timeout_ms 30_000
   @cold_read_timeout_ms 10_000
   @zero_pos {:raft_log_pos, 0, 0}
-  @encoded_peer_tag :ferricstore_waraft_peer
   @segment_projection_registry :ferricstore_waraft_segment_projection_registry
   @storage_root "ferricstore_waraft_backend"
   @segment_value_pin_scan_limit 100_000

@@ -179,7 +179,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
          prefix,
          id,
          current_state_key,
-         legacy_only?
+         nil_state_key_only?
        ) do
     case LMDB.prefix_entries(lmdb_path, prefix, terminal_projection_scan_limit()) do
       {:ok, entries} ->
@@ -189,7 +189,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
               LMDB.terminal_index_delete_ops(lmdb_path, terminal_key, nil)
 
             {:ok, {^id, _updated_at_ms, _expire_at_ms, ^current_state_key}}
-            when is_binary(current_state_key) and not legacy_only? ->
+            when is_binary(current_state_key) and not nil_state_key_only? ->
               LMDB.terminal_index_delete_ops(lmdb_path, terminal_key, current_state_key)
 
             _ ->

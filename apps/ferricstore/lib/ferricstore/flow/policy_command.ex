@@ -54,12 +54,14 @@ defmodule Ferricstore.Flow.PolicyCommand do
   def requires_stamp?({:flow_shared_ref_write, _shard_index, command}) when is_tuple(command),
     do: requires_stamp?(command)
 
-  def requires_stamp?(command)
-      when is_tuple(command) and tuple_size(command) > 0 and
-             elem(command, 0) in @flow_commands,
-      do: true
+  def requires_stamp?(command) when is_tuple(command) and tuple_size(command) > 0,
+    do: policy_sensitive_op?(elem(command, 0))
 
   def requires_stamp?(_command), do: false
+
+  @spec policy_sensitive_op?(term()) :: boolean()
+  def policy_sensitive_op?(op) when op in @flow_commands, do: true
+  def policy_sensitive_op?(_op), do: false
 
   defp shard_batches_require_stamp?(shard_batches) do
     Enum.any?(shard_batches, fn
@@ -159,7 +161,7 @@ defmodule Ferricstore.Flow.PolicyCommand do
     op = elem(command, 0)
     attrs = elem(command, tuple_size(command) - 1)
 
-    if flow_command?(op) and is_map(attrs) do
+    if policy_sensitive_op?(op) and is_map(attrs) do
       with {:ok, attrs, cache} <- stamp_attrs(ctx, attrs, cache) do
         attrs =
           attrs
@@ -375,10 +377,6 @@ defmodule Ferricstore.Flow.PolicyCommand do
         {:error, "ERR flow policy shard not available"}
     end
   end
-
-  defp flow_command?(op) when op in @flow_commands, do: true
-
-  defp flow_command?(_op), do: false
 
   defp validate_stamped_snapshot_size(command) do
     command

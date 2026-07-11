@@ -93,7 +93,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
                 %{apply_context: %Ferricstore.Raft.ApplyContext{} = context} ->
                   context
 
-                _legacy ->
+                _missing ->
                   Ferricstore.Raft.ApplyContext.from_runtime()
               end
           end

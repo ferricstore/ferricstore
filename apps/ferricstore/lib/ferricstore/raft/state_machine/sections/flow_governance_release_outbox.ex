@@ -29,24 +29,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowGovernanceReleaseOutbox do
              %{
                id: flow_id,
                state: flow_state,
-               governance_limit:
-                 %{
-                   scope: scope,
-                   shard_id: shard_id,
-                   reservation_id: reservation_id
-                 } = reservation
+               governance_limit: %{
+                 scope: scope,
+                 shard_id: shard_id,
+                 reservation_id: reservation_id,
+                 enforcement: enforcement
+               }
              } = record
            )
            when flow_state != "running" and is_binary(flow_id) and flow_id != "" and
                   is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
-                  is_binary(reservation_id) and reservation_id != "" do
+                  is_binary(reservation_id) and reservation_id != "" and
+                  enforcement in [:strict_global, :approximate_global] do
         %{
           flow_id: flow_id,
           partition_key: Map.get(record, :partition_key),
           scope: scope,
           shard_id: shard_id,
           reservation_id: reservation_id,
-          enforcement: Map.get(reservation, :enforcement, :approximate_global),
+          enforcement: enforcement,
           created_at_ms: Map.get(record, :updated_at_ms, 0)
         }
       end

@@ -34,6 +34,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
             position: position,
             label: nil,
             config: nil,
+            apply_context: ctx.apply_context,
             payload_dirs: [:data, :blob, :prob],
             empty_payload_dirs: []
           })
@@ -156,6 +157,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
           position: position,
           label: :binary.copy("x", 1_048_576),
           config: nil,
+          apply_context: ctx.apply_context,
           payload_dirs: [:data, :blob, :prob],
           empty_payload_dirs: [:data, :blob, :prob]
         }
@@ -361,6 +363,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
             version: 1,
             position: position,
             config: nil,
+            apply_context: ctx.apply_context,
             payload_dirs: [:data, :blob, :prob],
             empty_payload_dirs: :all
           })
@@ -654,6 +657,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
         assert File.regular?(data_dest)
       end
 
+      @tag :snapshot_metadata_rollback
       test "snapshot install metadata failure rolls live ETS back with disk", %{root: root} do
         source_root = Path.join(root, "metadata-fail-source")
         target_root = Path.join(root, "metadata-fail-target")
@@ -709,10 +713,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
           config: nil
         }
 
-        assert {:error, _reason} =
+        assert {:error, reason} =
                  Ferricstore.Raft.WARaftStorage.open_snapshot(snapshot_path, position, handle)
 
-        assert "old-value-longer" == Router.get(target_ctx, "snapshot:metadata-fail")
+        assert "old-value-longer" == Router.get(target_ctx, "snapshot:metadata-fail"),
+               inspect(reason)
       end
 
       test "snapshot install journal cleanup failure restores previous storage metadata", %{

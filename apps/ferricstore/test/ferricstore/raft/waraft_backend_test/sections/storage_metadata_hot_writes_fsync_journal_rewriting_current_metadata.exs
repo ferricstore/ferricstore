@@ -766,7 +766,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
           version: 1,
           position: {:raft_log_pos, 1, 1},
           label: nil,
-          config: nil
+          config: nil,
+          apply_context: ctx.apply_context
         })
 
         context_key = {{WARaftBackend, :context}, :ferricstore_waraft_backend}
@@ -877,7 +878,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
           version: 1,
           position: {:raft_log_pos, 50, 7},
           label: nil,
-          config: nil
+          config: nil,
+          apply_context: ctx.apply_context
         })
 
         FerricStore.Instance.cleanup(ctx.name)

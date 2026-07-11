@@ -3,9 +3,13 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
 
   use GenServer
 
+  alias Ferricstore.Flow.Governance.Catalog
+  alias Ferricstore.Flow.Governance.LimitCatalogOutbox
+  alias Ferricstore.Flow.Governance.LimitRecord
   alias Ferricstore.Flow.Governance.LimitStore
   alias Ferricstore.Flow.Governance.ReleaseOutbox
   alias Ferricstore.Flow.Governance.Telemetry
+  alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
 
   @default_interval_ms 1_000
@@ -19,7 +23,7 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
 
   @impl true
   def init(ctx) do
-    state = %{ctx: ctx, cursor: nil, timer: nil}
+    state = %{ctx: ctx, cursor: nil, catalog_shard: 0, timer: nil}
     {:ok, schedule(state)}
   end
 
@@ -27,13 +31,20 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
   def handle_info(:reconcile, state) do
     state = %{state | timer: nil}
 
+    {catalog_shard, _catalog_result} =
+      reconcile_catalog_publications(
+        state.ctx,
+        state.catalog_shard,
+        reconcile_reservation_limit()
+      )
+
     cursor =
       case reconcile_page(state.ctx, state.cursor, reconcile_reservation_limit(), now_ms()) do
         {:ok, %{next_cursor: next_cursor}} -> next_cursor
         {:error, _reason} -> nil
       end
 
-    {:noreply, schedule(%{state | cursor: cursor})}
+    {:noreply, schedule(%{state | cursor: cursor, catalog_shard: catalog_shard})}
   end
 
   @impl true
@@ -50,7 +61,87 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
       Keyword.get(opts, :reservation_limit, Keyword.get(opts, :scope_limit, 256))
 
     cursor = Keyword.get(opts, :cursor)
+    _catalog_result = reconcile_catalog_publications(ctx, 0, reservation_limit)
     reconcile_page(ctx, cursor, reservation_limit, now_ms)
+  end
+
+  defp reconcile_catalog_publications(ctx, start_shard, limit)
+       when is_integer(start_shard) and start_shard >= 0 and is_integer(limit) and limit > 0 and
+              limit <= 256 do
+    shard_count = Map.fetch!(ctx, :shard_count)
+    shard_order = Enum.map(0..(shard_count - 1), &rem(start_shard + &1, shard_count))
+    scan_catalog_publication_shards(ctx, shard_order, limit, shard_count)
+  end
+
+  defp reconcile_catalog_publications(ctx, start_shard, _invalid_limit) do
+    shard_count = Map.fetch!(ctx, :shard_count)
+    {rem(start_shard + 1, shard_count), %{published: 0, errors: 1}}
+  end
+
+  defp scan_catalog_publication_shards(_ctx, [], _limit, _shard_count),
+    do: {0, %{published: 0, errors: 0}}
+
+  defp scan_catalog_publication_shards(ctx, [shard_index | rest], limit, shard_count) do
+    case LimitCatalogOutbox.read_page(ctx, shard_index, limit) do
+      {:ok, %{entries: []}} ->
+        scan_catalog_publication_shards(ctx, rest, limit, shard_count)
+
+      {:ok, page} ->
+        result = publish_catalog_page(ctx, page)
+        {rem(shard_index + 1, shard_count), result}
+
+      {:error, _reason} ->
+        {rem(shard_index + 1, shard_count), %{published: 0, errors: 1}}
+    end
+  end
+
+  defp publish_catalog_page(ctx, %{entries: entries, head: head, shard_index: shard_index}) do
+    {published, last_sequence, errors} =
+      Enum.reduce_while(entries, {0, nil, 0}, fn {sequence, owner_key},
+                                                 {published, last, _errors} ->
+        case publish_catalog_owner(ctx, shard_index, owner_key) do
+          :ok -> {:cont, {published + 1, sequence, 0}}
+          {:error, _reason} -> {:halt, {published, last, 1}}
+        end
+      end)
+
+    case last_sequence do
+      nil ->
+        %{published: published, errors: errors}
+
+      sequence ->
+        case Router.flow_governance_limit_catalog_outbox_ack(
+               ctx,
+               shard_index,
+               head,
+               sequence
+             ) do
+          :ok -> %{published: published, errors: errors}
+          {:ok, _result} -> %{published: published, errors: errors}
+          {:error, _reason} -> %{published: published, errors: errors + 1}
+        end
+    end
+  end
+
+  defp publish_catalog_owner(ctx, shard_index, owner_key) do
+    case Router.read_shard_value(ctx, shard_index, owner_key) do
+      {:ok, value} when is_binary(value) ->
+        with {:ok, owner} <- LimitRecord.decode_owner(value),
+             true <- Keys.governance_limit_key(owner.scope) == owner_key do
+          Catalog.register_key(ctx, Keys.governance_catalog_key(:limit), owner_key)
+        else
+          _invalid -> {:error, :limit_catalog_owner_corrupt}
+        end
+
+      {:ok, nil} ->
+        :ok
+
+      :unavailable ->
+        {:error, :limit_catalog_owner_unavailable}
+
+      _invalid ->
+        {:error, :limit_catalog_owner_corrupt}
+    end
   end
 
   defp reconcile_page(ctx, cursor, reservation_limit, now_ms) do

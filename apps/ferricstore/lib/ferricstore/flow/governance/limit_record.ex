@@ -61,12 +61,6 @@ defmodule Ferricstore.Flow.Governance.LimitRecord do
       {@reservation_tag, _other_id, status} when status in [:active, :released] ->
         {:error, "ERR flow limit reservation key collision"}
 
-      {@reservation_tag, ^expected_id} ->
-        {:ok, :active}
-
-      {@reservation_tag, _other_id} ->
-        {:error, "ERR flow limit reservation key collision"}
-
       _invalid ->
         {:error, "ERR flow limit reservation record is corrupt"}
     end
@@ -144,17 +138,17 @@ defmodule Ferricstore.Flow.Governance.LimitRecord do
   defp decode_current_owner(owner) do
     owner = CreditLease.normalize_owner(owner)
 
-    with :ok <- reject_embedded_reservations(owner),
+    with :ok <- validate_detached_reservations(owner),
          :ok <- validate_owner(owner) do
       {:ok, owner}
     end
   end
 
-  defp reject_embedded_reservations(owner) do
+  defp validate_detached_reservations(owner) do
     if Enum.all?(owner.leases, fn {_shard_id, lease} -> lease.reservations == %{} end) do
       :ok
     else
-      {:error, "ERR flow limit record uses obsolete embedded reservations; recreate the limit"}
+      {:error, "ERR flow limit record is corrupt"}
     end
   end
 

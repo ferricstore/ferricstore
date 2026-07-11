@@ -163,9 +163,6 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
       {history_key, expire_at_ms} when is_binary(history_key) and is_integer(expire_at_ms) ->
         {:ok, {history_key, expire_at_ms}}
 
-      history_key when is_binary(history_key) ->
-        {:ok, {history_key, :infinity}}
-
       _ ->
         :error
     end
@@ -278,13 +275,6 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
              (is_binary(state_key) or is_nil(state_key)) ->
         {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
 
-      {id, updated_at_ms, expire_at_ms}
-      when is_binary(id) and is_integer(updated_at_ms) and is_integer(expire_at_ms) ->
-        {:ok, {id, updated_at_ms, expire_at_ms, nil}}
-
-      {id, updated_at_ms} when is_binary(id) and is_integer(updated_at_ms) ->
-        {:ok, {id, updated_at_ms, 0, nil}}
-
       _ ->
         :error
     end
@@ -298,14 +288,6 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
       when is_binary(id) and is_integer(updated_at_ms) and is_integer(expire_at_ms) and
              (is_binary(state_key) or is_nil(state_key)) ->
         {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
-
-      {id, updated_at_ms, expire_at_ms}
-      when is_binary(id) and is_integer(updated_at_ms) and is_integer(expire_at_ms) ->
-        {:ok, {id, updated_at_ms, expire_at_ms, nil}}
-
-      {id, updated_at_ms}
-      when is_binary(id) and is_integer(updated_at_ms) ->
-        {:ok, {id, updated_at_ms, 0, nil}}
 
       _ ->
         :error
@@ -327,10 +309,6 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
       when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
              is_binary(compound_key) ->
         {:ok, {event_id, event_ms, expire_at_ms, compound_key}}
-
-      {event_id, event_ms, compound_key}
-      when is_binary(event_id) and is_integer(event_ms) and is_binary(compound_key) ->
-        {:ok, {event_id, event_ms, 0, compound_key}}
 
       _ ->
         :error
@@ -354,10 +332,6 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
       when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
              is_binary(compound_key) ->
         {:ok, {event_id, event_ms, expire_at_ms, compound_key, nil, nil, nil}}
-
-      {event_id, event_ms, compound_key}
-      when is_binary(event_id) and is_integer(event_ms) and is_binary(compound_key) ->
-        {:ok, {event_id, event_ms, 0, compound_key, nil, nil, nil}}
 
       _ ->
         :error

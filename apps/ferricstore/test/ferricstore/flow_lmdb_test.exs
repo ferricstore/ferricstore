@@ -203,6 +203,7 @@ defmodule Ferricstore.Flow.LMDBTest do
       type: type,
       state: state,
       version: Keyword.get(opts, :version, 1),
+      state_enter_seq: Keyword.get(opts, :state_enter_seq, 1),
       attempts: 0,
       fencing_token: 0,
       created_at_ms: 1,

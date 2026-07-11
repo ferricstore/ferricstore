@@ -209,6 +209,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterrupte
             position: position,
             label: nil,
             config: nil,
+            apply_context: ctx.apply_context,
             payload_dirs: [:data, :blob, :prob],
             empty_payload_dirs: [:data, :blob, :prob]
           })
@@ -496,7 +497,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterrupte
           version: 1,
           position: current_position,
           label: nil,
-          config: nil
+          config: nil,
+          apply_context: ctx.apply_context
         }
 
         File.write!(Path.join(root_dir, "snapshot_install.term"), :erlang.term_to_binary(marker))

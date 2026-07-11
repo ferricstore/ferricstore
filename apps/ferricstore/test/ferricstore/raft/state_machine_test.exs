@@ -45,6 +45,88 @@ Code.require_file(
   __DIR__
 )
 
+defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
+  @moduledoc false
+
+  alias Ferricstore.Flow.PolicyCommand
+  alias Ferricstore.Raft.StateMachine
+
+  def apply(meta, command, state), do: StateMachine.apply(meta, canonical(command), state)
+
+  defdelegate init(config), to: StateMachine
+  defdelegate init_aux(config), to: StateMachine
+  defdelegate handle_aux(meta, command, from, state, aux), to: StateMachine
+  defdelegate overview(state), to: StateMachine
+  defdelegate state_enter(role, state), to: StateMachine
+  defdelegate tick(time, state), to: StateMachine
+  defdelegate apply_waraft_segment_command(command, meta, state, writer), to: StateMachine
+  defdelegate apply_standalone_command(command, state), to: StateMachine
+  defdelegate apply_standalone_command(command, meta, state), to: StateMachine
+
+  defdelegate __apply_pending_locations_for_test__(state, file_id, batch, locations),
+    to: StateMachine
+
+  defdelegate __validate_pending_locations__(batch, locations), to: StateMachine
+  defdelegate __coalesce_flow_native_ops_for_test__(ops), to: StateMachine
+
+  defdelegate __flow_history_projection_same_shard_for_test__(ctx, state, ops),
+    to: StateMachine
+
+  defdelegate __flow_history_projection_shards_for_test__(ctx, state, ops), to: StateMachine
+  defdelegate __flow_history_projection_value_refs_for_test__(op), to: StateMachine
+  defdelegate __observe_tagged_lmdb_enqueue_failure_for_test__(state, reason), to: StateMachine
+  defdelegate __safe_ets_select_page_for_test__(table, spec, limit), to: StateMachine
+  defdelegate __append_pending_batch_sync_for_test__(path, batch), to: StateMachine
+
+  defdelegate __flow_read_claim_hot_values_for_test__(state, keys, priority, partition_key),
+    to: StateMachine
+
+  defp canonical({:cross_shard_tx, shard_batches}) when is_list(shard_batches),
+    do: {:cross_shard_tx, canonical_batches(shard_batches)}
+
+  defp canonical({:cross_shard_tx, shard_batches, watched_keys}) when is_list(shard_batches),
+    do: {:cross_shard_tx, canonical_batches(shard_batches), watched_keys}
+
+  defp canonical({:flow_shared_ref_write, shard_index, command}),
+    do: {:flow_shared_ref_write, shard_index, canonical(command)}
+
+  defp canonical(command) when is_tuple(command) do
+    if PolicyCommand.requires_stamp?(command) do
+      attrs = elem(command, tuple_size(command) - 1)
+
+      if is_map(attrs) do
+        put_elem(
+          command,
+          tuple_size(command) - 1,
+          Map.put_new(attrs, :policy_snapshot_captured, true)
+        )
+      else
+        command
+      end
+    else
+      command
+    end
+  end
+
+  defp canonical(command), do: command
+
+  defp canonical_batches(shard_batches) do
+    Enum.map(shard_batches, fn
+      {shard_index, queue, namespace} when is_list(queue) ->
+        {shard_index, Enum.map(queue, &canonical_entry/1), namespace}
+
+      other ->
+        other
+    end)
+  end
+
+  defp canonical_entry({index, command}) when is_integer(index) and is_tuple(command),
+    do: {index, canonical(command)}
+
+  defp canonical_entry(command) when is_tuple(command), do: canonical(command)
+  defp canonical_entry(other), do: other
+end
+
 defmodule Ferricstore.Raft.StateMachineTest do
   @moduledoc """
   Unit tests for `Ferricstore.Raft.StateMachine`.
@@ -59,7 +141,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
   @moduletag :global_state
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Raft.{BlobCommand, StateMachine}
+  alias Ferricstore.Raft.BlobCommand
+  alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 

@@ -162,6 +162,45 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(
+            meta,
+            {:flow_governance_limit_catalog_outbox_ack, _key, shard_index, expected_head, up_to},
+            state
+          )
+          when is_integer(shard_index) and shard_index >= 0 and is_integer(expected_head) and
+                 expected_head > 0 and is_integer(up_to) and up_to >= expected_head and
+                 up_to - expected_head < 256 do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_governance_limit_catalog_outbox_ack,
+          %{items: up_to - expected_head + 1},
+          fn ->
+            do_flow_governance_limit_catalog_outbox_ack(
+              state,
+              shard_index,
+              expected_head,
+              up_to
+            )
+          end
+        )
+      end
+
+      def apply(
+            meta,
+            {:flow_governance_limit_catalog_outbox_ack, _key, _shard_index, _expected_head,
+             _up_to},
+            state
+          ) do
+        with_apply_time(meta, fn ->
+          bump_applied(
+            meta,
+            state,
+            {:error, "ERR invalid flow limit catalog publication acknowledgement"}
+          )
+        end)
+      end
+
       def apply(meta, {:flow_policy_catalog_backfill_step, request}, state)
           when is_map(request) do
         item_count = request |> Map.get(:candidates, []) |> length()

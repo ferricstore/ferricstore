@@ -366,6 +366,17 @@ defmodule Ferricstore.Flow.Keys do
     "f:{flow-governance}:gov:limit-storage-cleanup:progress"
   end
 
+  def governance_limit_catalog_outbox_meta_key(shard_index)
+      when is_integer(shard_index) and shard_index >= 0 do
+    "f:{flow-governance}:gov:limit-catalog-outbox:" <> Integer.to_string(shard_index) <> ":meta"
+  end
+
+  def governance_limit_catalog_outbox_intent_key(shard_index, sequence)
+      when is_integer(shard_index) and shard_index >= 0 and is_integer(sequence) and sequence > 0 do
+    "f:{flow-governance}:gov:limit-catalog-outbox:" <>
+      Integer.to_string(shard_index) <> ":intent:" <> Integer.to_string(sequence)
+  end
+
   def governance_limit_cache_session_head_key(node_id, instance_name)
       when is_binary(node_id) and node_id != "" and is_binary(instance_name) and
              instance_name != "" do

@@ -308,11 +308,11 @@ defmodule Ferricstore.Flow.Governance.CreditLease do
     reservation_ids
     |> Enum.uniq()
     |> Enum.reduce({reservations, 0}, fn reservation_id, {reservations, released} ->
-      case Map.pop(reservations, reservation_id) do
-        {reservation, reservations} when not is_nil(reservation) ->
-          {reservations, released + reservation_amount(reservation)}
+      case Map.fetch(reservations, reservation_id) do
+        {:ok, amount} when is_integer(amount) and amount > 0 ->
+          {Map.delete(reservations, reservation_id), released + amount}
 
-        {nil, reservations} ->
+        _missing_or_invalid ->
           {reservations, released}
       end
     end)
@@ -340,10 +340,6 @@ defmodule Ferricstore.Flow.Governance.CreditLease do
         owner
     end
   end
-
-  defp reservation_amount(%{amount: amount}) when is_integer(amount) and amount > 0, do: amount
-  defp reservation_amount(amount) when is_integer(amount) and amount > 0, do: amount
-  defp reservation_amount(_reservation), do: 1
 
   defp spend_expires_at_ms(lease, now_ms, opts) do
     case Keyword.get(opts, :ttl_ms) do

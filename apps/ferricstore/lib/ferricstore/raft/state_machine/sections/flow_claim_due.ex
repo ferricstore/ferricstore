@@ -230,18 +230,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
       defp with_flow_governance_limit(attrs, fun) when is_map(attrs) and is_function(fun, 0) do
         case Map.get(attrs, :governance_limit) do
-          %{scope: scope, shard_id: shard_id} = reservation
-          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
-            previous = Process.get(:sm_flow_governance_limit, :undefined)
-            Process.put(:sm_flow_governance_limit, reservation)
-
-            try do
-              fun.()
-            after
-              case previous do
-                :undefined -> Process.delete(:sm_flow_governance_limit)
-                value -> Process.put(:sm_flow_governance_limit, value)
-              end
+          %{
+            scope: scope,
+            shard_id: shard_id,
+            enforcement: enforcement,
+            reservation_ids: [_ | _] = reservation_ids
+          } = reservation
+          when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+                 enforcement in [:strict_global, :approximate_global] ->
+            if length(Enum.uniq(reservation_ids)) == length(reservation_ids) and
+                 Enum.all?(reservation_ids, &(is_binary(&1) and &1 != "")) do
+              with_valid_flow_governance_limit(reservation, fun)
+            else
+              {:error, "ERR invalid flow governance limit reservation"}
             end
 
           nil ->
@@ -249,6 +250,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
           _invalid ->
             {:error, "ERR invalid flow governance limit reservation"}
+        end
+      end
+
+      defp with_valid_flow_governance_limit(reservation, fun) do
+        previous = Process.get(:sm_flow_governance_limit, :undefined)
+        Process.put(:sm_flow_governance_limit, reservation)
+
+        try do
+          fun.()
+        after
+          case previous do
+            :undefined -> Process.delete(:sm_flow_governance_limit)
+            value -> Process.put(:sm_flow_governance_limit, value)
+          end
         end
       end
 

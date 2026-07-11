@@ -71,7 +71,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
             version: 1,
             position: {:raft_log_pos, 0, 0},
             label: nil,
-            config: nil
+            config: nil,
+            apply_context: ctx.apply_context
           })
         )
 
@@ -316,6 +317,34 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
                    log_module: :ferricstore_waraft_spike_segment_log
                  )
 
+        assert shard_payload_present?(restarted_ctx, 0)
+      end
+
+      @tag :strict_apply_context_metadata
+      test "restart fails closed on storage metadata missing replicated apply context", %{
+        root: root,
+        ctx: ctx
+      } do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        assert :ok = WARaftBackend.write(0, {:put, "metadata:missing-context", "value", 0})
+        assert "value" == Router.get(ctx, "metadata:missing-context")
+        assert :ok = WARaftBackend.stop()
+
+        root
+        |> waraft_storage_metadata(0)
+        |> Map.delete(:apply_context)
+        |> then(&:erlang.term_to_binary/1)
+        |> then(&File.write!(waraft_storage_metadata_path(root, 0), &1))
+
+        FerricStore.Instance.cleanup(ctx.name)
+        restarted_ctx = build_ctx(root)
+
+        assert {:error, reason} =
+                 WARaftBackend.start(restarted_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert inspect(reason) =~ "missing_apply_context"
         assert shard_payload_present?(restarted_ctx, 0)
       end
 
@@ -828,7 +857,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
             version: 1,
             position: position,
             label: nil,
-            config: nil
+            config: nil,
+            apply_context: ctx.apply_context
           })
         )
 
@@ -872,6 +902,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
             position: position,
             label: nil,
             config: nil,
+            apply_context: ctx.apply_context,
             payload_dirs: [:data, :blob, :prob],
             empty_payload_dirs: [:data, :blob, :prob]
           })

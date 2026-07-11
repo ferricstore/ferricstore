@@ -4,7 +4,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
-      alias Ferricstore.Raft.{BlobCommand, StateMachine}
+      alias Ferricstore.Raft.BlobCommand
+      alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
       alias Ferricstore.Store.BitcaskWriter
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 

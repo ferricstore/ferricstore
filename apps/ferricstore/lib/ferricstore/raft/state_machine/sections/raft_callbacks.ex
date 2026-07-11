@@ -866,7 +866,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
         end
       end
 
-      # Only legacy/default state-machine callers may release without an Instance.
+      # Only isolated/default state-machine callers may release without an Instance.
       # Any unresolved custom or malformed state fails closed because checkpoint
       # atomics are instance-owned and releasing Ra early can discard the only
       # durable copy of un-fsynced Bitcask writes.
@@ -923,8 +923,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
 
       defp raft_apply_context(%{apply_context: %Ferricstore.Raft.ApplyContext{} = context}),
         do: context
-
-      defp raft_apply_context(_legacy_state), do: Ferricstore.Raft.ApplyContext.default()
     end
   end
 end
