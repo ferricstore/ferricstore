@@ -4,6 +4,12 @@ defmodule Ferricstore.Stats.HotnessTest do
 
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
+
+  setup_all do
+    ShardHelpers.flush_all_keys()
+    :ok
+  end
 
   # Reset hotness state before each test to isolate counters.
   setup do
@@ -253,9 +259,11 @@ defmodule Ferricstore.Stats.HotnessTest do
       Stats.reset_hotness()
       before_hot = Stats.total_hot_reads()
 
-      Router.put(FerricStore.Instance.get(:default), "hottest:alpha", "value", 0)
+      ctx = FerricStore.Instance.get(:default)
+
+      assert :ok = Router.put(ctx, "hottest:alpha", "value", 0)
       # Key is now in ETS from the put. Reading should be a hot read.
-      _val = Router.get(FerricStore.Instance.get(:default), "hottest:alpha")
+      assert "value" == Router.get(ctx, "hottest:alpha")
 
       assert Stats.total_hot_reads() >= before_hot + 1
 
@@ -269,10 +277,12 @@ defmodule Ferricstore.Stats.HotnessTest do
     test "repeated reads of same key are all hot" do
       Stats.reset_hotness()
 
-      Router.put(FerricStore.Instance.get(:default), "hottest:beta", "value", 0)
+      ctx = FerricStore.Instance.get(:default)
+
+      assert :ok = Router.put(ctx, "hottest:beta", "value", 0)
 
       for _ <- 1..5 do
-        Router.get(FerricStore.Instance.get(:default), "hottest:beta")
+        assert "value" == Router.get(ctx, "hottest:beta")
       end
 
       entries = Stats.hotness_top(10)
