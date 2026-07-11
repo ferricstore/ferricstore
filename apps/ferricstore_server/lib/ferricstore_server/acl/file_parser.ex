@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Acl.FileParser do
   @moduledoc false
 
   alias FerricstoreServer.Acl.CommandCategories
+  alias FerricstoreServer.Acl.Password
   alias FerricstoreServer.Acl.Rules
 
   @max_line_length 1_048_576
@@ -100,10 +101,18 @@ defmodule FerricstoreServer.Acl.FileParser do
   defp parse_file_token(user, "resetpass"), do: {:ok, %{user | password: nil}}
 
   defp parse_file_token(user, "#" <> hash) do
-    case Base.decode64(hash) do
-      {:ok, decoded} when byte_size(decoded) == 48 -> {:ok, %{user | password: hash}}
-      {:ok, _} -> {:error, "invalid password hash length"}
-      :error -> {:error, "invalid password hash encoding"}
+    cond do
+      Password.valid_stored_hash_format?(hash) ->
+        {:ok, %{user | password: hash}}
+
+      String.starts_with?(hash, "pbkdf2-sha256$") ->
+        {:error, "invalid password hash"}
+
+      true ->
+        case Base.decode64(hash) do
+          {:ok, _decoded} -> {:error, "invalid password hash length"}
+          :error -> {:error, "invalid password hash encoding"}
+        end
     end
   end
 

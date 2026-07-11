@@ -20,12 +20,19 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
   def authenticate_session(username, password)
       when is_binary(username) and is_binary(password) do
     case Acl.get_user(username) do
-      %{enabled: true, password: stored_hash, auth_epoch: auth_epoch}
-      when is_binary(stored_hash) ->
-        if Password.verify(password, stored_hash) do
-          {:ok, username, auth_epoch}
-        else
-          authentication_error()
+      %{enabled: true, password: stored_hash} when is_binary(stored_hash) ->
+        case Acl.authenticate(username, password) do
+          {:ok, ^username} ->
+            auth_epoch =
+              case Acl.get_user(username) do
+                %{auth_epoch: epoch} when is_integer(epoch) and epoch >= 0 -> epoch
+                _missing_or_invalid -> 0
+              end
+
+            {:ok, username, auth_epoch}
+
+          {:error, _reason} ->
+            authentication_error()
         end
 
       _missing_disabled_or_passwordless ->

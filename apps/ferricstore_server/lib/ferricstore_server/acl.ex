@@ -325,7 +325,27 @@ defmodule FerricstoreServer.Acl do
   """
   @spec authenticate(binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def authenticate(username, password) do
-    authenticate(username, password, &Password.verify/2)
+    case get_user(username) do
+      nil ->
+        verify_dummy_password(password, &Password.verify/2)
+        authentication_error()
+
+      %{enabled: false} ->
+        verify_dummy_password(password, &Password.verify/2)
+        authentication_error()
+
+      %{password: nil} ->
+        verify_dummy_password(password, &Password.verify/2)
+        {:ok, username}
+
+      %{password: stored_hash} ->
+        if Password.verify(password, stored_hash) do
+          maybe_upgrade_password_hash(username, password, stored_hash)
+          {:ok, username}
+        else
+          authentication_error()
+        end
+    end
   end
 
   @doc false
@@ -356,6 +376,24 @@ defmodule FerricstoreServer.Acl do
 
   defp verify_dummy_password(password, verifier) do
     _verified = verifier.(password, Password.dummy_hash())
+    :ok
+  end
+
+  defp maybe_upgrade_password_hash(username, password, stored_hash) do
+    if Password.needs_rehash?(stored_hash) do
+      table = Tables.active_table()
+
+      case :ets.lookup(table, username) do
+        [{^username, %{password: ^stored_hash} = user}] ->
+          updated = %{user | password: Password.hash(password)}
+          :ets.insert(table, {username, updated})
+          Tables.update_configured_user_witness(username, updated)
+
+        _stale_or_missing ->
+          :ok
+      end
+    end
+
     :ok
   end
 

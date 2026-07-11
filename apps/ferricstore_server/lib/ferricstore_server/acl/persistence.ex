@@ -72,7 +72,7 @@ defmodule FerricstoreServer.Acl.Persistence do
       {:error, _} = err -> throw(err)
     end
 
-    case File.read(path) do
+    case Ferricstore.FS.read_nofollow(path) do
       {:ok, contents} ->
         if byte_size(contents) > @max_file_size do
           {:error, "ERR ACL file too large (#{byte_size(contents)} bytes, max #{@max_file_size})"}
@@ -80,14 +80,17 @@ defmodule FerricstoreServer.Acl.Persistence do
           {:ok, contents}
         end
 
-      {:error, :enoent} ->
+      {:error, {:not_found, _}} ->
         {:error, "ERR There is no ACL file to load"}
 
-      {:error, :eacces} ->
+      {:error, {:permission_denied, _}} ->
         {:error, "ERR Permission denied reading ACL file"}
 
-      {:error, reason} ->
-        {:error, "ERR Cannot read ACL file: #{inspect(reason)}"}
+      {:error, {:symlink, _}} ->
+        {:error, "ERR ACL file path is a symlink, refusing for security"}
+
+      {:error, {kind, reason}} ->
+        {:error, "ERR Cannot read ACL file: #{inspect({kind, reason})}"}
     end
   catch
     {:error, _} = err -> err
@@ -136,35 +139,29 @@ defmodule FerricstoreServer.Acl.Persistence do
   @spec auto_load_from_file(binary(), non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:error, :enoent} | {:error, binary()}
   def auto_load_from_file(data_dir, live_epoch) do
-    path = acl_file_path(data_dir)
-
-    case File.read(path) do
+    case read_file_contents(data_dir) do
       {:ok, contents} ->
-        if byte_size(contents) > @max_file_size do
-          {:error, "ACL file too large"}
-        else
-          case FileParser.parse(contents) do
-            {:ok, users} ->
-              if Enum.any?(users, fn {name, _} -> name == "default" end) do
-                with :ok <- validate_user_limit(users),
-                     {:ok, users, auth_epoch} <- AuthEpoch.restore(contents, users, live_epoch) do
-                  :ok = Tables.replace_acl_snapshot(users)
-                  {:ok, auth_epoch}
-                end
-              else
-                {:error, "ACL file missing 'default' user"}
+        case FileParser.parse(contents) do
+          {:ok, users} ->
+            if Enum.any?(users, fn {name, _} -> name == "default" end) do
+              with :ok <- validate_user_limit(users),
+                   {:ok, users, auth_epoch} <- AuthEpoch.restore(contents, users, live_epoch) do
+                :ok = Tables.replace_acl_snapshot(users)
+                {:ok, auth_epoch}
               end
+            else
+              {:error, "ACL file missing 'default' user"}
+            end
 
-            {:error, reason} ->
-              {:error, reason}
-          end
+          {:error, reason} ->
+            {:error, reason}
         end
 
-      {:error, :enoent} ->
+      {:error, "ERR There is no ACL file to load"} ->
         {:error, :enoent}
 
       {:error, reason} ->
-        {:error, "Cannot read ACL file: #{inspect(reason)}"}
+        {:error, reason}
     end
   end
 

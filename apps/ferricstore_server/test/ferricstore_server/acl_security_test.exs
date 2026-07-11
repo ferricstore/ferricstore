@@ -18,7 +18,9 @@ defmodule FerricstoreServer.AclSecurityTest do
   @moduletag :global_state
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.Password
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
+  alias FerricstoreServer.Native.Commands
   alias FerricstoreServer.Native.Session
   alias Ferricstore.AuditLog
 
@@ -48,9 +50,44 @@ defmodule FerricstoreServer.AclSecurityTest do
 
       # Password field should NOT be the plaintext string
       refute user.password == "s3cret"
-      # It should be a non-nil binary (the base64-encoded salt+hash)
+      # It should be a non-nil encoded hash string
       assert is_binary(user.password)
       assert byte_size(user.password) > 0
+    end
+
+    test "new password hashes are versioned" do
+      assert :ok = Acl.set_user("alice", ["on", ">s3cret"])
+      user = Acl.get_user("alice")
+
+      assert String.starts_with?(user.password, "pbkdf2-sha256$")
+    end
+
+    test "legacy SHA-256 password hashes are rejected" do
+      password = "s3cret"
+      stored_hash = legacy_sha256_hash(password)
+
+      refute Password.verify(password, stored_hash)
+    end
+
+    test "unversioned PBKDF2 password hashes still verify for migration" do
+      password = "s3cret"
+      stored_hash = unversioned_pbkdf2_hash(password)
+
+      assert Password.verify(password, stored_hash)
+    end
+
+    test "successful auth upgrades unversioned PBKDF2 hashes to versioned storage" do
+      password = "s3cret"
+      stored_hash = unversioned_pbkdf2_hash(password)
+
+      contents = "user default on nopass ~* &* +@all\nuser alice on ##{stored_hash} ~* &* +@all\n"
+
+      assert :ok = Acl.load_contents(contents)
+      assert {:ok, "alice"} = Acl.authenticate("alice", password)
+
+      user = Acl.get_user("alice")
+      assert String.starts_with?(user.password, "pbkdf2-sha256$")
+      assert Password.verify(password, user.password)
     end
 
     test "auth with correct password succeeds" do
@@ -150,6 +187,18 @@ defmodule FerricstoreServer.AclSecurityTest do
       # Should be a 64-char lowercase hex string (SHA-256 digest display)
       assert byte_size(hash) == 64
       assert String.match?(hash, ~r/^[0-9a-f]{64}$/)
+    end
+
+    defp unversioned_pbkdf2_hash(password) do
+      salt = String.duplicate("s", 16)
+      hash = :crypto.pbkdf2_hmac(:sha256, password, salt, 100_000, 32)
+      Base.encode64(salt <> hash)
+    end
+
+    defp legacy_sha256_hash(password) do
+      salt = String.duplicate("s", 16)
+      hash = :crypto.hash(:sha256, salt <> password)
+      Base.encode64(salt <> hash)
     end
   end
 
@@ -272,6 +321,15 @@ defmodule FerricstoreServer.AclSecurityTest do
   # ---------------------------------------------------------------------------
 
   describe "protected mode" do
+    test "named passworded users force native default sessions to authenticate" do
+      refute Commands.default_requires_auth?()
+
+      assert :ok = Acl.set_user("app", ["on", ">secret", "~app:*", "+GET"])
+
+      assert Commands.default_requires_auth?()
+      assert :ok = Acl.check_protected_mode({{192, 0, 2, 10}, 12_345})
+    end
+
     test "protected_mode? returns true when config is true" do
       Application.put_env(:ferricstore, :protected_mode, true)
 

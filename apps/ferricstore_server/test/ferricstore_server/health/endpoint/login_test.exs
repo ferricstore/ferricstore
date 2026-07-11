@@ -44,4 +44,20 @@ defmodule FerricstoreServer.Health.Endpoint.LoginTest do
     assert {:error, _reason} = Login.authenticate("missing", "wrong")
     assert {:ok, "known"} = Login.authenticate("known", "secret")
   end
+
+  test "successful dashboard authentication upgrades unversioned PBKDF2 hashes" do
+    stored_hash = unversioned_pbkdf2_hash("secret")
+
+    contents = "user default on nopass ~* &* +@all\nuser known on ##{stored_hash} ~* &* +@all\n"
+    assert :ok = Acl.load_contents(contents)
+
+    assert {:ok, "known", _auth_epoch} = Login.authenticate_session("known", "secret")
+    assert String.starts_with?(Acl.get_user("known").password, "pbkdf2-sha256$")
+  end
+
+  defp unversioned_pbkdf2_hash(password) do
+    salt = String.duplicate("s", 16)
+    hash = :crypto.pbkdf2_hmac(:sha256, password, salt, 100_000, 32)
+    Base.encode64(salt <> hash)
+  end
 end

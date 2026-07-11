@@ -1,15 +1,24 @@
 # ============================================================
-# Stage 1: Build
+# Stage 1: Rust toolchain
 # ============================================================
-FROM hexpm/elixir:1.19.5-erlang-28.4.1-ubuntu-noble-20260217 AS builder
+ARG RUST_VERSION=1.94.0
+FROM rust:${RUST_VERSION}-slim-bookworm@sha256:a86cada82e36ebd7a9bffed7548792c55a952fdb20718eea9278a936bcb76e62 AS rust-toolchain
+
+# ============================================================
+# Stage 2: Build
+# ============================================================
+FROM hexpm/elixir:1.19.5-erlang-28.4.1-ubuntu-noble-20260217@sha256:a0ee05779f7231b1f679ce540b63741e0ec56b181947ff00556b13370ad080f8 AS builder
 
 # Install system deps + Rust
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates build-essential git \
+    ca-certificates build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-ENV PATH="/root/.cargo/bin:$PATH"
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH="/usr/local/cargo/bin:$PATH"
 
 WORKDIR /app
 
@@ -43,20 +52,23 @@ RUN mix compile
 RUN mix release ferricstore
 
 # ============================================================
-# Stage 2: Runtime
+# Stage 3: Runtime
 # ============================================================
-FROM ubuntu:noble-20260217
+FROM ubuntu:noble-20260217@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 libncurses6 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
+RUN groupadd --system --gid 10001 ferricstore \
+    && useradd --system --uid 10001 --gid ferricstore --home-dir /app --shell /usr/sbin/nologin ferricstore
+
 WORKDIR /app
 
-COPY --from=builder /app/_build/prod/rel/ferricstore ./
+COPY --from=builder --chown=ferricstore:ferricstore /app/_build/prod/rel/ferricstore ./
 
 # Create data directory
-RUN mkdir -p /data
+RUN mkdir -p /data && chown ferricstore:ferricstore /app /data
 
 ENV FERRICSTORE_DATA_DIR=/data
 ENV FERRICSTORE_NATIVE_PORT=6388
@@ -67,5 +79,7 @@ ENV LC_ALL=C.UTF-8
 ENV ELIXIR_ERL_OPTIONS="+fnu"
 
 EXPOSE 6388 6380 6381
+
+USER ferricstore
 
 CMD ["bin/ferricstore", "start"]

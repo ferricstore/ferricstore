@@ -100,5 +100,7 @@ defmodule FerricstoreServer.Native.TlsListener do
   end
 
   defp ca_opt(nil), do: []
-  defp ca_opt(path), do: [cacertfile: path, verify: :verify_peer]
+
+  defp ca_opt(path),
+    do: [cacertfile: path, verify: :verify_peer, fail_if_no_peer_cert: true]
 end

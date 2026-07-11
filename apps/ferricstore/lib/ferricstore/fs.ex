@@ -29,6 +29,7 @@ defmodule Ferricstore.FS do
           | :is_a_directory
           | :directory_not_empty
           | :invalid_path
+          | :symlink
           | :other
 
   @type fs_error :: {:error, {err_kind(), binary()}}
@@ -57,6 +58,9 @@ defmodule Ferricstore.FS do
 
   @spec ls(binary()) :: {:ok, [binary()]} | fs_error()
   def ls(path), do: NIF.fs_ls(path)
+
+  @spec read_nofollow(binary()) :: {:ok, binary()} | fs_error()
+  def read_nofollow(path), do: NIF.fs_read_nofollow(path)
 
   # -------------------------------------------------------------------
   # Bang variants: raise on error, matching File.*!/n
@@ -160,6 +164,7 @@ defmodule Ferricstore.FS do
   defp fmt_reason({:is_a_directory, _}), do: :eisdir
   defp fmt_reason({:directory_not_empty, _}), do: :enotempty
   defp fmt_reason({:invalid_path, msg}), do: msg
+  defp fmt_reason({:symlink, _}), do: :eloop
   defp fmt_reason({:other, msg}), do: msg
   defp fmt_reason(other), do: inspect(other)
 end

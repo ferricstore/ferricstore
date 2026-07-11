@@ -109,7 +109,7 @@ Passwords are never stored in plaintext. FerricStore uses PBKDF2-SHA256 with:
 - Random salt per password
 - `:crypto` module for cryptographic operations
 
-When you set a password with `>password`, the plaintext is immediately hashed and only the hash is stored in the ACL ETS table. `ACL LOAD` rejects files containing plaintext passwords.
+When you set a password with `>password`, the plaintext is immediately hashed and only the hash is stored in the ACL ETS table. New hashes use a versioned `pbkdf2-sha256$...` format. Existing unversioned PBKDF2 hashes remain accepted for migration and are upgraded in memory after a successful authentication; the legacy fast SHA-256 fallback is not accepted. `ACL LOAD` rejects files containing plaintext passwords.
 
 ## Protected Mode
 

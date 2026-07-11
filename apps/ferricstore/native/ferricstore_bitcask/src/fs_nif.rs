@@ -7,8 +7,9 @@
 //! All ops here run on the **Normal** BEAM scheduler:
 //!
 //! - **Sync metadata ops** (`fs_touch`, `fs_mkdir_p`, `fs_rename`, `fs_rm`,
-//!   `fs_exists`, `fs_is_dir`, `fs_ls`): single syscall, typically <100µs.
-//!   End with `consume_timeslice` so BEAM scheduling stays accurate.
+//!   `fs_exists`, `fs_is_dir`, `fs_ls`, `fs_read_nofollow`): single syscall
+//!   or bounded short file read. End with `consume_timeslice` so BEAM
+//!   scheduling stays accurate.
 //!
 //! - **Async long I/O** (`fs_rm_rf_async`): spawns on Tokio, sends
 //!   `{:tokio_complete, corr_id, :ok | :error, reason}` to the caller.
@@ -16,18 +17,26 @@
 //! Error atoms are stable for pattern-matching in Elixir:
 //!   `:not_found`, `:already_exists`, `:permission_denied`,
 //!   `:not_a_directory`, `:is_a_directory`, `:directory_not_empty`,
-//!   `:invalid_path`. Anything else comes through as `:other` with a
+//!   `:invalid_path`, `:symlink`. Anything else comes through as `:other` with a
 //!   message.
 //!
 //! **Design rule:** NEVER use `schedule = "DirtyIo"` or `"DirtyCpu"` here.
 //! The whole point of this module is to keep disk I/O off the dirty pool so
 //! BEAM scheduler accounting stays correct; long I/O goes through Tokio async.
 
+#[cfg(unix)]
+use std::ffi::CString;
 use std::io;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use rustler::schedule::consume_timeslice;
-use rustler::{Encoder, Env, LocalPid, NifResult, OwnedEnv, Term};
+use rustler::{Encoder, Env, LocalPid, NifResult, OwnedBinary, OwnedEnv, Term};
 
 use crate::async_io;
 use crate::atoms;
@@ -44,6 +53,7 @@ rustler::atoms! {
     is_a_directory,
     directory_not_empty,
     invalid_path,
+    symlink,
     other,
 }
 
@@ -63,6 +73,7 @@ fn encode_error<'a>(env: Env<'a>, err: &io::Error) -> Term<'a> {
             Some(libc::EISDIR) => is_a_directory(),
             Some(libc::ENOTEMPTY) => directory_not_empty(),
             Some(libc::EINVAL) => invalid_path(),
+            Some(libc::ELOOP) => symlink(),
             _ => other(),
         },
     };
@@ -246,6 +257,61 @@ fn fs_ls(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     Ok((atoms::ok(), names).encode(env))
 }
 
+/// Read a regular file while refusing a symlink at the final path component.
+///
+/// This exists for security-sensitive configuration reads where a prior
+/// `lstat` check is not enough: another process can swap the file for a
+/// symlink between check and open. On Unix, `O_NOFOLLOW` makes the kernel
+/// reject that final-component symlink atomically.
+#[rustler::nif(schedule = "Normal")]
+fn fs_read_nofollow(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
+    if let Err(t) = validate_path(env, &path) {
+        return Ok(t);
+    }
+
+    let result = read_file_nofollow(&path);
+    let _ = consume_timeslice(env, 1);
+
+    match result {
+        Ok(bytes) => Ok((atoms::ok(), binary_term(env, &bytes)?).encode(env)),
+        Err(e) => Ok(encode_error(env, &e)),
+    }
+}
+
+#[cfg(unix)]
+fn read_file_nofollow(path: &str) -> io::Result<Vec<u8>> {
+    let c_path = CString::new(Path::new(path).as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
+
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_file_nofollow(path: &str) -> io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
+fn binary_term<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
+    let mut binary =
+        OwnedBinary::new(bytes.len()).ok_or_else(|| rustler::Error::Term(Box::new("oom")))?;
+    binary.as_mut_slice().copy_from_slice(bytes);
+    Ok(binary.release(env).encode(env))
+}
+
 // ---------------------------------------------------------------------------
 // Async I/O NIFs (Tokio-backed, Normal scheduler)
 // ---------------------------------------------------------------------------
@@ -308,6 +374,7 @@ fn encode_error_owned<'a>(env: Env<'a>, err: &io::Error) -> Term<'a> {
             Some(libc::EISDIR) => is_a_directory(),
             Some(libc::ENOTEMPTY) => directory_not_empty(),
             Some(libc::EINVAL) => invalid_path(),
+            Some(libc::ELOOP) => symlink(),
             _ => other(),
         },
     };
@@ -360,6 +427,7 @@ mod tests {
                 "directory_not_empty",
             ),
             (io::ErrorKind::Other, Some(libc::EINVAL), "invalid_path"),
+            (io::ErrorKind::Other, Some(libc::ELOOP), "symlink"),
             (io::ErrorKind::Other, Some(libc::EIO), "other"),
         ];
 
@@ -374,6 +442,7 @@ mod tests {
                     Some(libc::EISDIR) => "is_a_directory",
                     Some(libc::ENOTEMPTY) => "directory_not_empty",
                     Some(libc::EINVAL) => "invalid_path",
+                    Some(libc::ELOOP) => "symlink",
                     _ => "other",
                 },
             };

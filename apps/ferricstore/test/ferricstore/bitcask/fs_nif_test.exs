@@ -199,6 +199,24 @@ defmodule Ferricstore.Bitcask.FsNifTest do
   # fs_ls
   # ---------------------------------------------------------------------------
 
+  describe "fs_read_nofollow/1" do
+    test "reads a regular file", %{tmp: tmp} do
+      path = Path.join(tmp, "acl.conf")
+      File.write!(path, "user default on nopass ~* &* +@all\n")
+
+      assert {:ok, "user default on nopass ~* &* +@all\n"} = NIF.fs_read_nofollow(path)
+    end
+
+    test "rejects symlink targets", %{tmp: tmp} do
+      target = Path.join(tmp, "real_acl.conf")
+      link = Path.join(tmp, "acl.conf")
+      File.write!(target, "user default on nopass ~* &* +@all\n")
+      File.ln_s!(target, link)
+
+      assert {:error, {:symlink, _}} = NIF.fs_read_nofollow(link)
+    end
+  end
+
   describe "fs_ls/1" do
     test "lists entries (names only)", %{tmp: tmp} do
       File.write!(Path.join(tmp, "one"), "")

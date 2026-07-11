@@ -193,9 +193,8 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     refute function_exported?(PreparedCommand, :legacy_result, 1)
   end
 
-  test "transaction queue entries require their prepared AST" do
-    assert_raise FunctionClauseError, fn ->
-      apply(TransactionAst, :normalize_entry, [{"GET", ["key"]}])
-    end
+  test "legacy transaction queue entries derive their prepared AST" do
+    assert {"HGETALL", ["hash"], {:hgetall, "hash"}} =
+             TransactionAst.normalize_entry({"HGETALL", ["hash"]})
   end
 end

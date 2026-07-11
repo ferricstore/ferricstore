@@ -71,9 +71,9 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           assert :ok = Acl.save(dir)
 
           contents = File.read!(Acl.acl_file_path(dir))
-          # Should contain #<base64hash>, not >mypass
+          # Should contain #<hash>, not >mypass
           refute contents =~ ">mypass"
-          assert contents =~ ~r/user alice on #[A-Za-z0-9+\/=]+/
+          assert contents =~ ~r/user alice on #\S+/
         end
 
         test "nopass users show nopass in file", %{tmp_dir: dir} do
@@ -590,6 +590,19 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           File.ln_s!(real_file, acl_path)
 
           assert {:error, msg} = Acl.load(dir)
+          assert msg =~ "symlink"
+        end
+
+        test "auto-load rejects symlink ACL file", %{tmp_dir: dir} do
+          real_file = Path.join(dir, "real_acl.conf")
+          File.write!(real_file, "user default on nopass ~* &* +@all\n")
+
+          acl_path = Acl.acl_file_path(dir)
+          File.ln_s!(real_file, acl_path)
+
+          assert {:error, msg} =
+                   FerricstoreServer.Acl.Persistence.auto_load_from_file(dir, 0)
+
           assert msg =~ "symlink"
         end
 

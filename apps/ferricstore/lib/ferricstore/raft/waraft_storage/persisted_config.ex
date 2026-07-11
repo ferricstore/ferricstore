@@ -1,7 +1,7 @@
 defmodule Ferricstore.Raft.WARaftStorage.PersistedConfig do
   @moduledoc false
 
-  @peer_tag :ferricstore_waraft_peer
+  @peer_tag "ferricstore_waraft_peer"
   @peer_keys [:membership, :participants, :witness, :witnesses]
   @max_peers 64
   @max_atom_bytes 255

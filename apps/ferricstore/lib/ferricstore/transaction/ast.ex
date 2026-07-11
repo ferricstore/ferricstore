@@ -1,7 +1,9 @@
 defmodule Ferricstore.Transaction.Ast do
   @moduledoc false
 
-  @type queue_entry :: {binary(), [term()], term()}
+  alias Ferricstore.Commands.PreparedCommand
+
+  @type queue_entry :: {binary(), [term()]} | {binary(), [term()], term()}
 
   @non_key_list_tags ~w(
     acl auth client cluster_demote cluster_failover cluster_join cluster_leave cluster_promote command
@@ -11,6 +13,11 @@ defmodule Ferricstore.Transaction.Ast do
   @spec normalize_entry(queue_entry()) :: {binary(), [term()], term()}
   def normalize_entry({cmd, args, ast}) when is_binary(cmd) and is_list(args),
     do: {cmd, args, ast}
+
+  def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
+    {:ok, prepared} = PreparedCommand.prepare(cmd, args)
+    {prepared.command, prepared.args, prepared.ast}
+  end
 
   @spec command_name(queue_entry()) :: binary()
   def command_name(entry) do

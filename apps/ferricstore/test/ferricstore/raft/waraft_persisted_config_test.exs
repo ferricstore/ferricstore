@@ -3,7 +3,7 @@ defmodule Ferricstore.Raft.WARaftPersistedConfigTest do
 
   alias Ferricstore.Raft.WARaftStorage
 
-  @peer_tag :ferricstore_waraft_peer
+  @peer_tag "ferricstore_waraft_peer"
 
   test "canonical persisted peers round trip bounded dynamic node names" do
     node_name = unique_node_name("valid")

@@ -799,6 +799,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp apply_projection_entries(batch) do
         Enum.flat_map(batch, fn
+          {:put, key, value, expire_at_ms}
+          when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
+            if generated_flow_value_ref?(key), do: [{key, value, expire_at_ms}], else: []
+
           {:put_cold, key, value, expire_at_ms, _lfu}
           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
             [{key, value, expire_at_ms}]

@@ -67,14 +67,11 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
     assert many_owner.leases[0].reservations == %{}
     assert byte_size(many_raw) <= byte_size(one_raw) + 64
 
-    prefix = Keys.governance_limit_reservation_prefix(scope, 0, many_owner.leases[0].epoch)
-
     reservation_keys =
-      ctx
-      |> Router.keys()
-      |> Enum.filter(&String.starts_with?(&1, prefix))
+      [first_id | many_ids]
+      |> Enum.map(&Keys.governance_limit_reservation_key(scope, 0, many_owner.leases[0].epoch, &1))
 
-    assert length(reservation_keys) == 1_001
+    assert Enum.count(reservation_keys, &(Router.get(ctx, &1) != nil)) == 1_001
     assert Router.get(ctx, Keys.governance_limit_reservation_key(scope, 0, 1, first_id)) != nil
   end
 

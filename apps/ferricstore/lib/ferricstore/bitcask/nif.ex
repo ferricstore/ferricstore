@@ -800,7 +800,7 @@ defmodule Ferricstore.Bitcask.NIF do
   # Error shape: `{:error, {atom_kind, message_binary}}` where `kind` is
   # one of: `:not_found`, `:already_exists`, `:permission_denied`,
   # `:not_a_directory`, `:is_a_directory`, `:directory_not_empty`,
-  # `:invalid_path`, `:other`.
+  # `:invalid_path`, `:symlink`, `:other`.
   # -------------------------------------------------------------------
 
   @type fs_error :: {:error, {atom(), binary()}}
@@ -855,6 +855,12 @@ defmodule Ferricstore.Bitcask.NIF do
   """
   @spec fs_ls(binary()) :: {:ok, [binary()]} | fs_error()
   def fs_ls(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Read a regular file while refusing a symlink at the final path component.
+  """
+  @spec fs_read_nofollow(binary()) :: {:ok, binary()} | fs_error()
+  def fs_read_nofollow(_path), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   Async recursive remove. Runs on the Tokio blocking pool; sends

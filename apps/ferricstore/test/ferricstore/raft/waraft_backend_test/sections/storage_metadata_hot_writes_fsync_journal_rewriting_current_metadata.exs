@@ -634,6 +634,26 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
 
         assert persisted.apply_context ==
                  Ferricstore.Raft.ApplyContext.encode(ctx.apply_context)
+
+        metadata_path = waraft_storage_metadata_path(root, 0)
+        ebin = Application.app_dir(:ferricstore, "ebin")
+
+        script = """
+        Code.ensure_loaded!(Ferricstore.Raft.WARaftStorage)
+
+        if :code.is_loaded(Ferricstore.Raft.WARaftStorage.PersistedConfig) != false do
+          System.halt(2)
+        end
+
+        #{inspect(metadata_path)}
+        |> File.read!()
+        |> :erlang.binary_to_term([:safe])
+        """
+
+        assert {_output, 0} =
+                 System.cmd(System.find_executable("elixir"), ["-pa", ebin, "-e", script],
+                   stderr_to_stdout: true
+                 )
       end
 
       test "restart fails closed on oversized storage metadata journal record", %{

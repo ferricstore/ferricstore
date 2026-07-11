@@ -702,7 +702,7 @@ defmodule FerricstoreServer.Native.Commands do
 
   @spec default_requires_auth?() :: boolean()
   def default_requires_auth? do
-    ConnAuth.user_requires_auth?("default") or requirepass_configured?()
+    FerricstoreServer.Acl.has_configured_users?()
   end
 
   defp do_execute(@op_hello, payload, state) do
@@ -3388,14 +3388,6 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp constant_time_equal?(_left, _right), do: false
-
-  defp requirepass_configured? do
-    case requirepass() do
-      nil -> false
-      "" -> false
-      _ -> true
-    end
-  end
 
   defp requirepass do
     Ferricstore.Config.get_value("requirepass") || Application.get_env(:ferricstore, :requirepass)

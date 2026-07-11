@@ -117,6 +117,30 @@ defmodule Ferricstore.ProductionDefaultsTest do
     end
   end
 
+  test "Docker build pins Rust and runtime runs as non-root" do
+    dockerfile = File.read!(Path.join(@repo_root, "Dockerfile"))
+
+    assert dockerfile =~ "ARG RUST_VERSION="
+
+    assert dockerfile =~
+             ~r/FROM rust:\$\{RUST_VERSION\}-slim-bookworm@sha256:[0-9a-f]{64} AS rust-toolchain/
+
+    assert dockerfile =~
+             ~r/FROM hexpm\/elixir:1\.19\.5-erlang-28\.4\.1-ubuntu-noble-20260217@sha256:[0-9a-f]{64} AS builder/
+
+    assert dockerfile =~ ~r/FROM ubuntu:noble-20260217@sha256:[0-9a-f]{64}/
+
+    assert dockerfile =~ "COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo"
+    assert dockerfile =~ "COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup"
+    refute dockerfile =~ "sh.rustup.rs"
+    refute dockerfile =~ "--default-toolchain stable"
+
+    assert dockerfile =~ "groupadd --system"
+    assert dockerfile =~ "useradd --system"
+    assert dockerfile =~ "COPY --from=builder --chown=ferricstore:ferricstore"
+    assert dockerfile =~ "USER ferricstore"
+  end
+
   test "Raft hot-path optimizations are not exposed as runtime mode flags" do
     runtime_exs = File.read!(Path.join(@repo_root, "config/runtime.exs"))
     configuration_guide = File.read!(Path.join(@repo_root, "guides/configuration.md"))
@@ -428,9 +452,14 @@ defmodule Ferricstore.ProductionDefaultsTest do
     routing_ex =
       File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/store/shard/routing.ex"))
 
+    startup_ex =
+      File.read!(Path.join(@repo_root, "apps/ferricstore/lib/ferricstore/store/shard/startup.ex"))
+
     assert runtime_exs =~ ~s(FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")
     assert state_machine_ex =~ "@default_release_cursor_interval 200_000"
-    assert routing_ex =~ "Application.get_env(:ferricstore, :release_cursor_interval, 200_000)"
+    assert startup_ex =~ "Application.get_env(:ferricstore, :release_cursor_interval, 200_000)"
+    assert routing_ex =~ "release_cursor_interval: state.release_cursor_interval"
+    refute routing_ex =~ "Application.get_env(:ferricstore, :release_cursor_interval"
     refute runtime_exs =~ ~s(FERRICSTORE_RELEASE_CURSOR_INTERVAL", "500")
   end
 end
