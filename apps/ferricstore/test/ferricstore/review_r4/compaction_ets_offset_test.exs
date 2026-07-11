@@ -31,11 +31,15 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       assert :ok = GenServer.call(shard, {:delete, "c2_key_2"})
 
       force_rotate_active_file(shard)
+      active_file_id = :sys.get_state(shard).active_file_id
 
       [{_, nil, _, _, 0, offset_1_before, _}] = :ets.lookup(keydir, "c2_key_1")
       [{_, nil, _, _, 0, offset_3_before, _}] = :ets.lookup(keydir, "c2_key_3")
 
-      assert {:ok, {2, 0, reclaimed}} = GenServer.call(shard, {:run_compaction, [0]})
+      assert {:ok, {compacted_file_id, 0, reclaimed}} =
+               GenServer.call(shard, {:run_compaction, [0]})
+
+      assert compacted_file_id > active_file_id
       assert reclaimed > 0
 
       assert "value_1" == GenServer.call(shard, {:get, "c2_key_1"})

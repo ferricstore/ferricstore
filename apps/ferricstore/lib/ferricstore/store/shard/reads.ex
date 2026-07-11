@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   @moduledoc "Shard read-path handlers: ETS hot lookup, cold-key pread from Bitcask, exists check, and key enumeration."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.InternalKey
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BlobValue, ColdRead}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -588,6 +589,6 @@ defmodule Ferricstore.Store.Shard.Reads do
       )
 
     Enum.each(expired_keys, &ShardETS.ets_delete_key(state, &1))
-    live_keys
+    Enum.reject(live_keys, &InternalKey.internal?/1)
   end
 end

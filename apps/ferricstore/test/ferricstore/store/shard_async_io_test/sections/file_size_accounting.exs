@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.FileSizeAccounting do
           value = "value"
 
           try do
+            baseline_size = :sys.get_state(pid).active_file_size
             assert :ok == GenServer.call(pid, {:put, key, value, 0})
             assert :ok == GenServer.call(pid, :flush)
 
@@ -28,7 +29,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.FileSizeAccounting do
             state = :sys.get_state(pid)
 
             assert state.active_file_size == File.stat!(active_path).size
-            assert state.active_file_size == 26 + byte_size(key) + byte_size(value)
+
+            assert state.active_file_size ==
+                     baseline_size + 26 + byte_size(key) + byte_size(value)
           after
             cleanup_shard(pid, ctx, dir)
           end

@@ -6,6 +6,7 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
   alias Ferricstore.Flow.Governance.LimitRecord
   alias Ferricstore.Flow.Governance.LimitCache
   alias Ferricstore.Flow.Governance.LimitCatalogOutbox
+  alias Ferricstore.Flow.Governance.LimitReconciler
   alias Ferricstore.Flow.Governance.LimitStorageCleaner
   alias Ferricstore.Flow.Governance.LimitStore
   alias Ferricstore.Flow.Keys
@@ -752,46 +753,54 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
     scope = unique_flow_id("detached-limit-durable-catalog")
     key = Keys.governance_limit_key(scope)
     catalog_key = Keys.governance_catalog_key(:limit)
+    reconciler = Process.whereis(LimitReconciler)
+    assert is_pid(reconciler)
+    :ok = :sys.suspend(reconciler)
 
-    assert {:ok, _lease} =
-             LimitStore.lease(ctx, scope,
-               shard_id: 0,
-               amount: 1,
-               limit: 2,
-               ttl_ms: 1_000,
-               now_ms: 1_000
-             )
+    try do
+      assert {:ok, _lease} =
+               LimitStore.lease(ctx, scope,
+                 shard_id: 0,
+                 amount: 1,
+                 limit: 2,
+                 ttl_ms: 1_000,
+                 now_ms: 1_000
+               )
 
-    shard_index = Router.shard_for(ctx, key)
+      shard_index = Router.shard_for(ctx, key)
 
-    assert {:ok, %{entries: [{_sequence, ^key}]}} =
-             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+      assert {:ok, %{entries: [{_sequence, ^key}]}} =
+               LimitCatalogOutbox.read_page(ctx, shard_index, 256)
 
-    assert {:ok, 1} = FerricStore.Impl.zrem(ctx, catalog_key, [key])
-    assert {:ok, false} = Catalog.member?(ctx, catalog_key, key)
+      assert {:ok, 1} = FerricStore.Impl.zrem(ctx, catalog_key, [key])
+      assert {:ok, false} = Catalog.member?(ctx, catalog_key, key)
 
-    assert {:ok, %{errors: 0}} =
-             Ferricstore.Flow.Governance.LimitReconciler.run_once(ctx,
-               now_ms: 1_001,
-               reservation_limit: 256
-             )
+      assert {:ok, %{errors: 0}} =
+               LimitReconciler.run_once(ctx,
+                 now_ms: 1_001,
+                 reservation_limit: 256,
+                 catalog_shard: shard_index
+               )
 
-    assert {:ok, true} = Catalog.member?(ctx, catalog_key, key)
+      assert {:ok, true} = Catalog.member?(ctx, catalog_key, key)
 
-    assert {:ok, %{entries: []}} =
-             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+      assert {:ok, %{entries: []}} =
+               LimitCatalogOutbox.read_page(ctx, shard_index, 256)
 
-    assert {:ok, _lease} =
-             LimitStore.lease(ctx, scope,
-               shard_id: 0,
-               amount: 1,
-               limit: 2,
-               ttl_ms: 1_000,
-               now_ms: 1_002
-             )
+      assert {:ok, _lease} =
+               LimitStore.lease(ctx, scope,
+                 shard_id: 0,
+                 amount: 1,
+                 limit: 2,
+                 ttl_ms: 1_000,
+                 now_ms: 1_002
+               )
 
-    assert {:ok, %{entries: []}} =
-             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+      assert {:ok, %{entries: []}} =
+               LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+    after
+      if Process.alive?(reconciler), do: :sys.resume(reconciler)
+    end
   end
 
   test "catalog publication batches owner reads and the idempotent catalog write" do

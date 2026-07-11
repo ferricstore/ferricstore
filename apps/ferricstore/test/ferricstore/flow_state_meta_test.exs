@@ -242,6 +242,8 @@ defmodule Ferricstore.FlowStateMetaTest do
     assert policy.indexed_state_meta == nil
 
     assert_eventually(fn ->
+      assert {:ok, migrated} = FerricStore.flow_get(id, partition_key: @partition)
+      assert Map.get(migrated, :indexed_state_meta) == nil
       flush_lmdb!()
       assert {:ok, 0} = lmdb_state_meta_query_count(type, "accept", "version", 1)
       assert {:ok, 0} = lmdb_state_meta_query_count(type, "accept", "owner", "risk")

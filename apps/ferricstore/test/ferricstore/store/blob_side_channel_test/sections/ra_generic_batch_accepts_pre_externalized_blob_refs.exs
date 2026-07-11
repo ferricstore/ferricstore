@@ -292,6 +292,9 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
         active_file_path = ShardETS.file_path(shard_path, 0)
 
+        {:ok, policy_snapshot} =
+          Ferricstore.Flow.RetryPolicy.normalize_flow_policy("blob-flow", [])
+
         state =
           StateMachine.init(%{
             shard_index: 0,
@@ -315,7 +318,10 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
                state: "queued",
                partition_key: partition_key,
                payload: payload,
-               now_ms: 1_000
+               now_ms: 1_000,
+               policy_generation: 0,
+               policy_snapshot: policy_snapshot,
+               policy_snapshot_captured: true
              }},
             state
           )
@@ -576,7 +582,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
           %{0 => [:ok]},
           StateMachine.apply(
             %{index: 1, system_time: 1_000},
-            {:cross_shard_tx, [{0, [{"SET", [key, payload]}], nil}]},
+            {:cross_shard_tx, [{0, [prepared_tx_entry("SET", [key, payload])], nil}]},
             state
           )
         )
@@ -588,7 +594,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
           %{0 => [payload]},
           StateMachine.apply(
             %{index: 2, system_time: 1_001},
-            {:cross_shard_tx, [{0, [{"GET", [key]}], nil}]},
+            {:cross_shard_tx, [{0, [prepared_tx_entry("GET", [key])], nil}]},
             state
           )
         )
@@ -626,7 +632,13 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
             StateMachine.apply(
               %{index: 1, system_time: 1_000},
               {:cross_shard_tx,
-               [{0, [{"SET", [small_key, "small"]}, {"SET", [large_key, payload]}], nil}]},
+               [
+                 {0,
+                  [
+                    prepared_tx_entry("SET", [small_key, "small"]),
+                    prepared_tx_entry("SET", [large_key, payload])
+                  ], nil}
+               ]},
               state
             )
           )
@@ -647,22 +659,28 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         field_b = CompoundKey.hash_field(redis_key, "b")
         payload_a = :binary.copy("A", 1024)
         payload_b = :binary.copy("B", 1536)
+        previous_threshold = :persistent_term.get(:ferricstore_promotion_threshold)
+        :persistent_term.put(:ferricstore_promotion_threshold, 1_000_000)
 
-        assert :ok = Router.compound_put(ctx, redis_key, field_a, payload_a, 0)
-        assert :ok = Router.compound_put(ctx, redis_key, field_b, payload_b, 0)
+        try do
+          assert :ok = Router.compound_put(ctx, redis_key, field_a, payload_a, 0)
+          assert :ok = Router.compound_put(ctx, redis_key, field_b, payload_b, 0)
 
-        assert {:ok, _encoded_ref_a, ref_a} = raw_disk_blob_ref(ctx, keydir, field_a)
-        assert {:ok, _encoded_ref_b, ref_b} = raw_disk_blob_ref(ctx, keydir, field_b)
-        assert {:ok, ^payload_a} = BlobStore.get(ctx.data_dir, 0, ref_a)
-        assert {:ok, ^payload_b} = BlobStore.get(ctx.data_dir, 0, ref_b)
+          assert {:ok, _encoded_ref_a, ref_a} = raw_disk_blob_ref(ctx, keydir, field_a)
+          assert {:ok, _encoded_ref_b, ref_b} = raw_disk_blob_ref(ctx, keydir, field_b)
+          assert {:ok, ^payload_a} = BlobStore.get(ctx.data_dir, 0, ref_a)
+          assert {:ok, ^payload_b} = BlobStore.get(ctx.data_dir, 0, ref_b)
 
-        assert payload_a == Router.compound_get(ctx, redis_key, field_a)
+          assert payload_a == Router.compound_get(ctx, redis_key, field_a)
 
-        assert [payload_a, payload_b] ==
-                 Router.compound_batch_get(ctx, redis_key, [field_a, field_b])
+          assert [payload_a, payload_b] ==
+                   Router.compound_batch_get(ctx, redis_key, [field_a, field_b])
 
-        assert [{^payload_a, 0}, {^payload_b, 0}] =
-                 Router.compound_batch_get_meta(ctx, redis_key, [field_a, field_b])
+          assert [{^payload_a, 0}, {^payload_b, 0}] =
+                   Router.compound_batch_get_meta(ctx, redis_key, [field_a, field_b])
+        after
+          :persistent_term.put(:ferricstore_promotion_threshold, previous_threshold)
+        end
       end
 
       test "direct native list writes persist large elements as blob refs", %{

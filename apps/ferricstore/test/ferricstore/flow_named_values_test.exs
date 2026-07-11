@@ -4,6 +4,7 @@ defmodule Ferricstore.FlowNamedValuesTest do
   @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.Store.Router
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -267,6 +268,7 @@ defmodule Ferricstore.FlowNamedValuesTest do
   end
 
   test "retention cleanup removes owned named value blobs" do
+    ctx = FerricStore.Instance.get(:default)
     id = uid("named-retention")
 
     assert :ok =
@@ -282,7 +284,7 @@ defmodule Ferricstore.FlowNamedValuesTest do
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     order_ref = get_in(created.value_refs, ["order", :ref])
     assert is_binary(order_ref)
-    assert {:ok, _blob} = FerricStore.get(order_ref)
+    assert is_binary(Router.get(ctx, order_ref))
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("named-retention",
@@ -312,11 +314,12 @@ defmodule Ferricstore.FlowNamedValuesTest do
     assert cleaned.values >= 2
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert {:ok, nil} = FerricStore.get(order_ref)
-    assert {:ok, nil} = FerricStore.get(receipt_ref)
+    assert is_nil(Router.get(ctx, order_ref))
+    assert is_nil(Router.get(ctx, receipt_ref))
   end
 
   test "retention cleanup removes overridden named value versions from history" do
+    ctx = FerricStore.Instance.get(:default)
     id = uid("named-retention-override")
 
     assert :ok =
@@ -342,8 +345,8 @@ defmodule Ferricstore.FlowNamedValuesTest do
              )
 
     assert override.ref != old_ref
-    assert {:ok, _old_blob} = FerricStore.get(old_ref)
-    assert {:ok, _new_blob} = FerricStore.get(override.ref)
+    assert is_binary(Router.get(ctx, old_ref))
+    assert is_binary(Router.get(ctx, override.ref))
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("named-retention-override",
@@ -366,8 +369,8 @@ defmodule Ferricstore.FlowNamedValuesTest do
     assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
     assert cleaned.values >= 2
 
-    assert {:ok, nil} = FerricStore.get(old_ref)
-    assert {:ok, nil} = FerricStore.get(override.ref)
+    assert is_nil(Router.get(ctx, old_ref))
+    assert is_nil(Router.get(ctx, override.ref))
   end
 
   test "transition_many stores named value blobs for every transitioned flow" do

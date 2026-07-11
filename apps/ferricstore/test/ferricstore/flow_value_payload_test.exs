@@ -4,6 +4,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
   @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.Store.Router
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -192,7 +193,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
-    assert {:ok, value_blob} = FerricStore.get(created.payload_ref)
+    assert {:ok, value_blob} = internal_get(created.payload_ref)
     assert is_binary(value_blob)
 
     assert {:ok, [claimed]} =
@@ -257,7 +258,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
-    assert {:ok, value_blob} = FerricStore.get(created.payload_ref)
+    assert {:ok, value_blob} = internal_get(created.payload_ref)
     assert is_binary(value_blob)
 
     assert :ok =
@@ -338,7 +339,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert fetched.error == reason
 
     wait_terminal_removed!(id, "tenant-retention")
-    assert {:ok, nil} = FerricStore.get(cancelled.error_ref)
+    assert {:ok, nil} = internal_get(cancelled.error_ref)
   end
 
   test "retention cleanup removes expired terminal state, history, and owned values" do
@@ -394,8 +395,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
                count: 10
              )
 
-    assert {:ok, nil} = FerricStore.get(created.payload_ref)
-    assert {:ok, nil} = FerricStore.get(completed.result_ref)
+    assert {:ok, nil} = internal_get(created.payload_ref)
+    assert {:ok, nil} = internal_get(completed.result_ref)
   end
 
   test "retention sweeper runs cleanup through Flow command path" do
@@ -457,8 +458,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert history >= 1
     assert values >= 2
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert {:ok, nil} = FerricStore.get(created.payload_ref)
-    assert {:ok, nil} = FerricStore.get(completed.result_ref)
+    assert {:ok, nil} = internal_get(created.payload_ref)
+    assert {:ok, nil} = internal_get(completed.result_ref)
   end
 
   test "rewind from terminal back to active clears value ref expiration" do
@@ -685,6 +686,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
       10
     )
   end
+
+  defp internal_get(key), do: {:ok, Router.get(FerricStore.Instance.get(:default), key)}
 
   defp unique_id(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 end

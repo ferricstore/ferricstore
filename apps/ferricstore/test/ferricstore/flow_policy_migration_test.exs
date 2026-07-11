@@ -1420,7 +1420,8 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
       run_at_ms: 2_000,
       now_ms: 1_100,
       policy_generation: 1,
-      policy_snapshot: policy_v1
+      policy_snapshot: policy_v1,
+      policy_snapshot_captured: true
     }
 
     assert :ok =

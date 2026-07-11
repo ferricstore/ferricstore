@@ -269,10 +269,16 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowBlobSideChannelApply do
                      single_member?: true
                    )
 
-          {_state, {:applied_at, 1, :ok}, _effects} =
+          {state, {:applied_at, 1, :ok}, _effects} =
             StateMachine.apply(%{index: 1, system_time: 1_000}, prepared, state)
 
-          refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
+          assert_receive {:flow_lmdb_backlog, %{pending_ops: 3}, %{shard_index: ^shard_index}},
+                         500
+
+          assert :ok = Ferricstore.Flow.LMDBWriter.flush(state.instance_name, shard_index)
+          record = flow_record!(state, state_key)
+          assert :not_found = Ferricstore.Flow.LMDB.get(state.flow_lmdb_path, state_key)
+          assert :not_found = Ferricstore.Flow.LMDB.get(state.flow_lmdb_path, record.payload_ref)
         end
 
         test "prepared Flow create payload does not reopen the blob during apply", %{state: state} do

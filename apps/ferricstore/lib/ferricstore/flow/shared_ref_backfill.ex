@@ -1779,9 +1779,17 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
   defp lookup_primary_value!(ctx, key) do
     case :ets.lookup(ctx.keydir, key) do
-      [entry] -> {:ok, read_entry_value!(ctx, entry)}
-      [] -> :not_found
-      _invalid -> raise "shared-ref backfill keydir contains duplicate rows"
+      [entry] ->
+        case read_entry_value!(ctx, entry) do
+          :__missing_shared_ref_primary_value__ -> :not_found
+          value -> {:ok, value}
+        end
+
+      [] ->
+        :not_found
+
+      _invalid ->
+        raise "shared-ref backfill keydir contains duplicate rows"
     end
   rescue
     error in ArgumentError ->
@@ -1822,6 +1830,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
            key
          ) do
       {:ok, value} when is_binary(value) -> materialize!(ctx, value)
+      :not_found -> :__missing_shared_ref_primary_value__
       other -> raise "shared-ref backfill WARaft read failed: #{inspect(other)}"
     end
   end

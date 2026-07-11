@@ -88,8 +88,14 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defp canonical({:cross_shard_tx, shard_batches, watched_keys}) when is_list(shard_batches),
     do: {:cross_shard_tx, canonical_batches(shard_batches), watched_keys}
 
+  defp canonical({:batch, commands}) when is_list(commands),
+    do: {:batch, Enum.map(commands, &canonical/1)}
+
   defp canonical({:flow_shared_ref_write, shard_index, command}),
     do: {:flow_shared_ref_write, shard_index, canonical(command)}
+
+  defp canonical({command, metadata}) when is_tuple(command) and is_map(metadata),
+    do: {canonical(command), metadata}
 
   defp canonical(command) when is_tuple(command) do
     if PolicyCommand.requires_stamp?(command) do

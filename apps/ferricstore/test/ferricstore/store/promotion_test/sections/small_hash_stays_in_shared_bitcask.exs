@@ -264,7 +264,10 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
 
           assert ["value_1"] ==
-                   GenServer.call(shard, {:tx_execute, [{"HGET", [key, "field_1"]}], nil})
+                   GenServer.call(
+                     shard,
+                     {:tx_execute, [prepared_tx_entry("HGET", [key, "field_1"])], nil}
+                   )
         end
 
         test "transaction HGET releases tracked key bytes for expired cold promoted field" do
@@ -285,7 +288,12 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           :ets.insert(keydir, {compound_key, nil, expired_at, 0, 0, 0, 0})
           :atomics.add(ctx.keydir_binary_bytes, idx + 1, byte_size(compound_key))
 
-          assert [nil] == GenServer.call(shard, {:tx_execute, [{"HGET", [key, field]}], nil})
+          assert [nil] ==
+                   GenServer.call(
+                     shard,
+                     {:tx_execute, [prepared_tx_entry("HGET", [key, field])], nil}
+                   )
+
           assert :ets.lookup(keydir, compound_key) == []
           assert :atomics.get(ctx.keydir_binary_bytes, idx + 1) == before_bytes
         end
@@ -305,7 +313,11 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
           :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
 
-          [fields_and_values] = GenServer.call(shard, {:tx_execute, [{"HGETALL", [key]}], nil})
+          [fields_and_values] =
+            GenServer.call(
+              shard,
+              {:tx_execute, [prepared_tx_entry("HGETALL", [key])], nil}
+            )
 
           assert "value_1" ==
                    fields_and_values

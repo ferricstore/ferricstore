@@ -112,6 +112,10 @@ defmodule Ferricstore.Store.Shard do
     # slot_map, keydir_refs, atomics, config) needed to route operations without
     # global state. Passed to Router.* calls instead of persistent_term lookups.
     :instance_ctx,
+    :apply_context,
+    :apply_context_encoded,
+    :release_cursor_interval,
+    :flow_async_history,
     :active_file_id,
     :active_file_path,
     :active_file_size,

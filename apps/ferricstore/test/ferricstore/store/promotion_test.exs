@@ -14,7 +14,7 @@ defmodule Ferricstore.Store.PromotionTest do
   @moduletag :global_state
   import ExUnit.CaptureLog
 
-  alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Strings}
+  alias Ferricstore.Commands.{Hash, List, PreparedCommand, Set, SortedSet, Strings}
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, Promotion, Router}
@@ -142,6 +142,11 @@ defmodule Ferricstore.Store.PromotionTest do
   end
 
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
+
+  defp prepared_tx_entry(command, args) do
+    {:ok, prepared} = PreparedCommand.prepare(command, args)
+    {prepared.command, prepared.args, prepared.ast}
+  end
 
   # Inserts `n` fields into a hash and returns the key.
   defp populate_hash(store, key, n) do

@@ -88,6 +88,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         index: 0,
         data_dir: dir,
         flush_interval_ms: flush_ms,
+        flow_shared_ref_backfill?: false,
         instance_ctx: ctx
       )
 
@@ -107,6 +108,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         index: 0,
         data_dir: dir,
         flush_interval_ms: flush_ms,
+        flow_shared_ref_backfill?: false,
         instance_ctx: ctx
       )
 

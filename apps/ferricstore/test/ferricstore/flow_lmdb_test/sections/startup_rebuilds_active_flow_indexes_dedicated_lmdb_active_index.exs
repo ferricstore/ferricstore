@@ -199,7 +199,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         {flow_index, flow_lookup} =
           Ferricstore.Flow.NativeOrderedIndex.table_names(instance_name, shard_index)
 
-        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+        flow_index_resource =
+          Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
         write_calls = :atomics.new(1, signed: false)
 
         Application.put_env(:ferricstore, :flow_shared_ref_backfill_write_hook, fn path, rows ->
@@ -262,7 +264,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
 
         assert [{cleanup_member_key, +0.0}] =
                  Ferricstore.Flow.NativeOrderedIndex.range_slice(
-                   flow_index,
+                   flow_index_resource,
                    cleanup_index_key,
                    :neg_inf,
                    :inf,

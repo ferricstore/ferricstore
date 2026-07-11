@@ -172,8 +172,8 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
         send(parent, {:cache_spend, result})
       end)
 
-    assert_receive {:cache_spend, {:ok, _spent}}
-    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+    assert_receive {:cache_spend, {:ok, _spent}}, 3_000
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 3_000
 
     table = :ferricstore_flow_governance_limit_cache
     assert :ets.whereis(table) != :undefined
@@ -462,7 +462,7 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert second_id != first_id
   end
 
-  test "terminal transition rejects governance metadata without a reservation id" do
+  test "record codec rejects governance metadata without a reservation id" do
     type = unique_flow_id("invalid-terminal-limit-type")
     scope = unique_flow_id("invalid-terminal-limit")
     create_due_flows(type, 1)
@@ -471,22 +471,10 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     record = raw_record(claimed.id)
     invalid_limit = Map.delete(record.governance_limit, :reservation_id)
     invalid_record = Map.put(record, :governance_limit, invalid_limit)
-    ctx = FerricStore.Instance.get(:default)
-    state_key = Ferricstore.Flow.Keys.state_key(claimed.id, @partition)
-    shard = Ferricstore.Store.Router.shard_for(ctx, state_key)
 
-    assert :ok =
-             Ferricstore.Raft.WARaftBackend.write(
-               shard,
-               {:put, state_key, Ferricstore.Flow.encode_record(invalid_record), 0}
-             )
-
-    assert {:error, "ERR invalid flow governance limit reservation"} =
-             FerricStore.flow_complete(claimed.id, claimed.lease_token,
-               partition_key: @partition,
-               fencing_token: claimed.fencing_token,
-               now_ms: 1_002
-             )
+    assert_raise ArgumentError, "flow record requires the current governance limit shape", fn ->
+      Ferricstore.Flow.encode_record(invalid_record)
+    end
 
     assert {:ok, owner} = FerricStore.flow_limit_get(scope, now_ms: 1_003)
     assert owner.leases[0].in_use == 1

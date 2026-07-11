@@ -570,7 +570,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
 
         refute_receive {:retention_reference_scan, ^id, _refs}, 50
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
-        assert {:ok, nil} = FerricStore.get(created.payload_ref)
+        assert nil == Ferricstore.Store.Router.get(ctx, created.payload_ref)
       end
 
       test "retention cleanup reclaims unreferenced owner named shared values without scanning" do

@@ -55,6 +55,16 @@ defmodule FerricstoreServer.ShutdownTest do
     end
   end
 
+  defp evict_hot_value(ctx, key) do
+    shard_idx = Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, shard_idx)
+
+    assert :ets.update_element(keydir, key, {2, nil}),
+           "expected keydir entry for #{inspect(key)}"
+
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # After stopping a shard, it is no longer alive
   # ---------------------------------------------------------------------------
@@ -100,84 +110,43 @@ defmodule FerricstoreServer.ShutdownTest do
   # ---------------------------------------------------------------------------
 
   describe "pending writes flushed before shutdown" do
-    test "data written to shard is persisted to Bitcask files on disk" do
-      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
+    test "data written to shard is recoverable from its durable backend" do
+      ctx = FerricStore.Instance.get(:default)
       key = "shutdown_flush_test_#{:rand.uniform(9_999_999)}"
       value = "must_be_on_disk"
 
-      Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      Router.put(ctx, key, value, 0)
 
       # Explicitly flush to ensure pending async writes hit disk.
-      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      shard_idx = Router.shard_for(ctx, key)
+      shard_name = Router.shard_name(ctx, shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 
-      # Verify the shard's data directory exists and has files.
-      shard_dir = DataDir.shard_data_path(data_dir, shard_idx)
-      assert File.dir?(shard_dir), "Shard data directory should exist: #{shard_dir}"
-
-      files = File.ls!(shard_dir)
-      assert files != [], "Shard directory should contain Bitcask data files"
-
-      # Verify the data is recoverable from disk using v2 stateless NIFs.
-      {:ok, recovered_value} = read_key_from_disk(shard_dir, key)
-      assert recovered_value == value, "Value should be recoverable from Bitcask on disk"
+      # Force the next read through the keydir's direct-log or WARaft segment location.
+      assert :ok = evict_hot_value(ctx, key)
+      assert Router.get(ctx, key) == value
     end
 
-    test "multiple keys are persisted and recoverable from Bitcask" do
-      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
+    test "multiple keys are persisted and recoverable from the durable backend" do
+      ctx = FerricStore.Instance.get(:default)
       prefix = "shutdown_multi_#{:rand.uniform(9_999_999)}"
 
       keys_and_values =
         for i <- 1..20 do
           k = "#{prefix}_#{i}"
           v = "value_#{i}"
-          Router.put(FerricStore.Instance.get(:default), k, v, 0)
+          Router.put(ctx, k, v, 0)
           {k, v}
         end
 
       # Flush all shards to guarantee writes are on disk.
       ShardHelpers.flush_all_shards()
 
-      # Verify each key is recoverable by scanning the v2 data files directly.
+      # Evict hot copies so each read must use its backend-specific durable location.
       for {k, v} <- keys_and_values do
-        shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k)
-        shard_dir = DataDir.shard_data_path(data_dir, shard_idx)
-
-        # Scan all log files in the shard directory to find the key
-        {:ok, files} = File.ls(shard_dir)
-        log_files = Enum.filter(files, &String.ends_with?(&1, ".log")) |> Enum.sort()
-
-        found =
-          Enum.any?(log_files, fn log_name ->
-            log_path = Path.join(shard_dir, log_name)
-
-            case NIF.v2_scan_file(log_path) do
-              {:ok, records} ->
-                # Find the last non-tombstone entry for this key
-                last =
-                  records
-                  |> Enum.filter(fn {rk, _, _, _, _} -> rk == k end)
-                  |> List.last()
-
-                case last do
-                  {^k, offset, _, _, false} ->
-                    case NIF.v2_pread_at(log_path, offset) do
-                      {:ok, ^v} -> true
-                      _ -> false
-                    end
-
-                  _ ->
-                    false
-                end
-
-              _ ->
-                false
-            end
-          end)
-
-        assert found, "Key #{k} should be recoverable from Bitcask"
+        assert :ok = evict_hot_value(ctx, k)
+        assert Router.get(ctx, k) == v
       end
     end
 

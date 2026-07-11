@@ -30,6 +30,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Raft.StateMachine
   alias Ferricstore.Test.IsolatedInstance
 
@@ -101,6 +102,11 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
           file_stats: Map.put(state.file_stats, new_id, {0, 0})
       }
     end)
+  end
+
+  defp prepared_tx_entry(command, args) do
+    {:ok, prepared} = PreparedCommand.prepare(command, args)
+    {prepared.command, prepared.args, prepared.ast}
   end
 
   defp raw_disk_blob_ref(ctx, keydir, key) do

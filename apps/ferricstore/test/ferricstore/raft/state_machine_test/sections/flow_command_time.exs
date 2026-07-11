@@ -1058,7 +1058,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                             %{shard_index: ^shard_index, status: :ok}},
                            500
 
-            assert measurements.batch_size == 6
+            assert measurements.batch_size == 15
             assert measurements.delete_count == 0
             assert measurements.batch_bytes > 0
 
@@ -1151,7 +1151,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                             %{shard_index: ^shard_index, status: :ok}},
                            500
 
-            assert measurements.batch_size == 4
+            assert measurements.batch_size == 10
             assert measurements.delete_count == 0
             assert measurements.batch_bytes > 0
 
@@ -1271,7 +1271,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           [_, body] =
             Regex.run(
-              ~r/defp flow_apply_claim_batch\(state, due_key, plans, stale_due_ids, now_ms\) do(.*?)(?=^\s*defp flow_claim_move_indexes)/ms,
+              ~r/defp flow_apply_claim_batch\(\s*state,\s*due_key,\s*plans,\s*stale_due_ids,\s*deferred_timeout_records,\s*now_ms\s*\) do(.*?)(?=^\s*defp flow_deferred_timeout_due_index_deletes)/ms,
               source
             )
 
@@ -1647,7 +1647,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               state
             )
 
-          refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
+          assert_receive {:flow_lmdb_backlog, %{pending_ops: 3}, %{shard_index: ^shard_index}},
+                         500
+
+          assert :ok = Ferricstore.Flow.LMDBWriter.flush(state.instance_name, shard_index)
+          assert :not_found = Ferricstore.Flow.LMDB.get(state.flow_lmdb_path, state_key)
 
           due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
 
@@ -1767,6 +1771,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
             )
 
           assert flow_record!(state, state_key).state == "queued"
+
+          assert_receive {:flow_lmdb_degraded, %{count: 1},
+                          %{shard_index: ^shard_index, reason: :writer_not_started}},
+                         500
 
           due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
 

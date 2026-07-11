@@ -157,13 +157,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       end
 
       defp encode_persisted_metadata_term(%{} = metadata) do
-        Map.update(metadata, :config, nil, &encode_persisted_storage_config/1)
+        metadata
+        |> Map.update(:config, nil, &encode_persisted_storage_config/1)
+        |> Map.update(:apply_context, nil, &encode_persisted_apply_context/1)
       end
 
       defp encode_persisted_metadata_term(other), do: other
 
       defp decode_persisted_metadata_term(%{} = metadata) do
-        Map.update(metadata, :config, nil, &decode_persisted_storage_config/1)
+        metadata
+        |> Map.update(:config, nil, &decode_persisted_storage_config/1)
+        |> Map.update(:apply_context, nil, &decode_persisted_apply_context/1)
       end
 
       defp decode_persisted_metadata_term(other), do: other
@@ -177,6 +181,25 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         do: {position, Ferricstore.Raft.WARaftStorage.PersistedConfig.decode!(config)}
 
       defp decode_persisted_storage_config(other), do: other
+
+      defp encode_persisted_apply_context(%Ferricstore.Raft.ApplyContext{} = context),
+        do: Ferricstore.Raft.ApplyContext.encode(context)
+
+      defp encode_persisted_apply_context(other), do: other
+
+      defp decode_persisted_apply_context(
+             {:flow_apply_context_v1, _retention_ttl_ms, _history_hot, _history_max,
+              _max_history_hot, _max_history, _cleanup_keys, _cleanup_bytes, _history_scan,
+              _value_scan, _hibernation_enabled, _hot_window_ms, _safety_margin_ms,
+              _promote_window_ms, _late_promote_window_ms} = encoded
+           ) do
+        case Ferricstore.Raft.ApplyContext.decode(encoded) do
+          {:ok, context} -> context
+          {:error, :invalid_apply_context} -> encoded
+        end
+      end
+
+      defp decode_persisted_apply_context(other), do: other
 
       @doc false
       def __decode_persisted_waraft_config_for_test__(config) do

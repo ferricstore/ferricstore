@@ -587,7 +587,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
           assert extract_body(response) =~ "read"
         end
 
-        test "flow query pages enforce ACL type keys when no partition filter exists" do
+        test "flow query pages require wildcard ACL access when no partition filter exists" do
           Application.put_env(:ferricstore, :protected_mode, true)
 
           :ok =
@@ -618,7 +618,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
 
           assert extract_status_code(response) == 403
           assert extract_body(response) =~ "FLOW.FAILURES"
-          assert extract_body(response) =~ "%R~checkout"
+          assert extract_body(response) =~ "%R~*"
           assert extract_body(response) =~ "read"
         end
 

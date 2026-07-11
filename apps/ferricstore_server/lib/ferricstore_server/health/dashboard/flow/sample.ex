@@ -56,12 +56,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   end
 
   def collect_records_sample(limit) when is_integer(limit) and limit > 0 do
-    sc = max(shard_count(), 1)
-    per_shard = max(1, div(limit + sc - 1, sc))
+    case FerricStore.Instance.get(:default) do
+      %{shard_count: sc, keydir_refs: keydir_refs} = ctx
+      when is_integer(sc) and sc > 0 and is_tuple(keydir_refs) and tuple_size(keydir_refs) >= sc ->
+        per_shard = max(1, div(limit + sc - 1, sc))
 
-    0..(sc - 1)
-    |> Enum.flat_map(&collect_records_from_keydir(&1, per_shard))
-    |> Enum.take(limit)
+        0..(sc - 1)
+        |> Enum.flat_map(&collect_records_from_keydir(ctx, &1, per_shard))
+        |> Enum.take(limit)
+
+      _missing_instance ->
+        []
+    end
   end
 
   def collect_records_sample(_limit), do: []
@@ -373,11 +379,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     end
   end
 
-  defp collect_records_from_keydir(index, per_shard) do
-    keydir = :"keydir_#{index}"
+  defp collect_records_from_keydir(ctx, index, per_shard) do
+    keydir = elem(ctx.keydir_refs, index)
 
     try do
       collect_records_from_keydir_select(
+        ctx,
         keydir,
         per_shard,
         max(@flow_dashboard_keydir_scan_floor, per_shard * @flow_dashboard_keydir_scan_multiplier)
@@ -389,7 +396,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     end
   end
 
-  defp collect_records_from_keydir_select(keydir, wanted, scan_limit) do
+  defp collect_records_from_keydir_select(ctx, keydir, wanted, scan_limit) do
     match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
 
     case :ets.select(keydir, match_spec, @flow_dashboard_keydir_select_batch) do
@@ -397,11 +404,21 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
         []
 
       {keys, continuation} ->
-        collect_records_from_keydir_continue(keys, continuation, wanted, scan_limit, [], 0, 0)
+        collect_records_from_keydir_continue(
+          ctx,
+          keys,
+          continuation,
+          wanted,
+          scan_limit,
+          [],
+          0,
+          0
+        )
     end
   end
 
   defp collect_records_from_keydir_continue(
+         ctx,
          keys,
          continuation,
          wanted,
@@ -414,7 +431,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
       Enum.reduce_while(keys, {records, record_count}, fn key, {acc, count} ->
         cond do
           count >= wanted -> {:halt, {acc, count}}
-          record = record_from_state_key(key) -> {:cont, {[record | acc], count + 1}}
+          record = record_from_state_key(ctx, key) -> {:cont, {[record | acc], count + 1}}
           true -> {:cont, {acc, count}}
         end
       end)
@@ -435,6 +452,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
 
           {next_keys, next_continuation} ->
             collect_records_from_keydir_continue(
+              ctx,
               next_keys,
               next_continuation,
               wanted,
@@ -447,10 +465,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     end
   end
 
-  defp record_from_state_key(key) when is_binary(key) do
+  defp record_from_state_key(ctx, key) when is_binary(key) do
     if Ferricstore.Flow.Keys.state_key?(key) do
-      case FerricStore.get(key) do
-        {:ok, value} when is_binary(value) ->
+      case Ferricstore.Store.Router.get(ctx, key) do
+        value when is_binary(value) ->
           value
           |> safe_decode_record()
           |> case do
@@ -468,7 +486,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     :exit, _ -> nil
   end
 
-  defp record_from_state_key(_key), do: nil
+  defp record_from_state_key(_ctx, _key), do: nil
 
   defp safe_decode_record(value) do
     case Ferricstore.Flow.decode_record(value) do
@@ -638,6 +656,4 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   defp normalize_datetime_local(value) do
     if String.match?(value, ~r/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/), do: value <> ":00", else: value
   end
-
-  defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 end

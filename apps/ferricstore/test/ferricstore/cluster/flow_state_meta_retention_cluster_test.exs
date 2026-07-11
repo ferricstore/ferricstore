@@ -77,12 +77,7 @@ defmodule Ferricstore.Cluster.FlowStateMetaRetentionClusterTest do
 
       cleaner = hd(remaining)
 
-      assert {:ok, cleaned} =
-               remote_flow(cleaner.name, :flow_retention_cleanup, [
-                 [limit: 20, now_ms: now + 2_000]
-               ])
-
-      assert cleaned.flows >= length(specs)
+      assert cleanup_after_failover(cleaner.name, now + 2_000, length(specs)) >= length(specs)
 
       Enum.each(specs, fn spec ->
         eventually(fn ->
@@ -189,6 +184,31 @@ defmodule Ferricstore.Cluster.FlowStateMetaRetentionClusterTest do
   defp flow_absent?({:ok, nil}), do: true
   defp flow_absent?({:error, _reason}), do: true
   defp flow_absent?(_other), do: false
+
+  defp cleanup_after_failover(node_name, now_ms, expected, attempts \\ 120, cleaned \\ 0)
+
+  defp cleanup_after_failover(_node_name, _now_ms, expected, _attempts, cleaned)
+       when cleaned >= expected,
+       do: cleaned
+
+  defp cleanup_after_failover(node_name, now_ms, expected, attempts, cleaned)
+       when attempts > 0 do
+    assert {:ok, result} =
+             remote_flow(node_name, :flow_retention_cleanup, [[limit: 20, now_ms: now_ms]])
+
+    cleaned = cleaned + result.flows
+
+    if cleaned >= expected do
+      cleaned
+    else
+      Process.sleep(250)
+      cleanup_after_failover(node_name, now_ms, expected, attempts - 1, cleaned)
+    end
+  end
+
+  defp cleanup_after_failover(_node_name, _now_ms, expected, 0, cleaned) do
+    flunk("retention cleanup removed #{cleaned} of #{expected} flows after failover")
+  end
 
   defp eventually(fun, attempts \\ 120, interval_ms \\ 250)
 

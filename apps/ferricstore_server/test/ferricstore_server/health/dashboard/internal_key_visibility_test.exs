@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.InternalKeyVisibilityTest do
 
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Health.Dashboard.Data.KV
+  alias FerricstoreServer.Health.Dashboard.Flow.Sample
 
   setup do
     ctx = FerricStore.Instance.get(:default)
@@ -54,6 +55,33 @@ defmodule FerricstoreServer.Health.Dashboard.InternalKeyVisibilityTest do
     after_count = prefix_count(KV.collect_prefixes_page(), "f")
 
     assert after_count == before_count
+  end
+
+  test "Flow sampling reads reserved state through the internal store path", context do
+    suffix = System.unique_integer([:positive, :monotonic])
+    id = "dashboard-flow-sample-#{suffix}"
+    partition_key = "dashboard-flow-partition-#{suffix}"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    record = %{
+      id: id,
+      type: "dashboard-flow-sample",
+      state: "queued",
+      version: 1,
+      attempts: 0,
+      created_at_ms: 1_000,
+      updated_at_ms: 1_000,
+      next_run_at_ms: 1_000,
+      priority: 0,
+      partition_key: partition_key
+    }
+
+    assert :ok = Router.put(context.ctx, state_key, Ferricstore.Flow.encode_record(record), 0)
+    on_exit(fn -> Router.delete(context.ctx, state_key) end)
+
+    assert Enum.any?(Sample.collect_flow_records_sample(1_000), fn sampled ->
+             Map.get(sampled, :id) == id and Map.get(sampled, :partition_key) == partition_key
+           end)
   end
 
   test "sampled dashboard traversal has a global scan cap" do

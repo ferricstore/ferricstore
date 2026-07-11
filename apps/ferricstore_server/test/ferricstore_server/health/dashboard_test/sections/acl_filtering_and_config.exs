@@ -442,7 +442,13 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               run_state: "terminal"
             }
 
-            assert :ok = FerricStore.set(key, Ferricstore.Flow.encode_record(record))
+            assert :ok =
+                     Ferricstore.Store.Router.put(
+                       FerricStore.Instance.get(:default),
+                       key,
+                       Ferricstore.Flow.encode_record(record),
+                       0
+                     )
           end
 
           ShardHelpers.eventually(

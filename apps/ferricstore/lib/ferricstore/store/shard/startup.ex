@@ -38,6 +38,27 @@ defmodule Ferricstore.Store.Shard.Startup do
           ctx = Keyword.get(opts, :instance_ctx)
           fsync_dir_fun = Keyword.get(opts, :fsync_dir_fun, &NIF.v2_fsync_dir/1)
 
+          apply_context =
+            case ctx do
+              %{apply_context: %Ferricstore.Raft.ApplyContext{} = context} ->
+                context
+
+              _missing_context ->
+                Ferricstore.Raft.ApplyContext.from_runtime()
+            end
+
+          apply_context_encoded = Ferricstore.Raft.ApplyContext.encode(apply_context)
+
+          release_cursor_interval =
+            Keyword.get_lazy(opts, :release_cursor_interval, fn ->
+              Application.get_env(:ferricstore, :release_cursor_interval, 200_000)
+            end)
+
+          flow_async_history =
+            Keyword.get_lazy(opts, :flow_async_history, &flow_async_history_enabled?/0)
+
+          flow_shared_ref_backfill? = Keyword.get(opts, :flow_shared_ref_backfill?, true)
+
           if ctx && !Ferricstore.ReplicationMode.raft?() do
             :ok = Ferricstore.Store.StandaloneTxLog.recover_once(data_dir)
           end
@@ -115,7 +136,8 @@ defmodule Ferricstore.Store.Shard.Startup do
                 flow_index,
                 flow_lookup,
                 active_file_id: active_file_id,
-                active_file_path: active_file_path
+                active_file_path: active_file_path,
+                shared_ref_backfill?: flow_shared_ref_backfill?
               )
             end
 
@@ -185,6 +207,10 @@ defmodule Ferricstore.Store.Shard.Startup do
              data_dir: data_dir,
              shard_data_path: path,
              instance_ctx: ctx,
+             apply_context: apply_context,
+             apply_context_encoded: apply_context_encoded,
+             release_cursor_interval: release_cursor_interval,
+             flow_async_history: flow_async_history,
              active_file_id: active_file_id,
              active_file_path: active_file_path,
              active_file_size: active_file_size,

@@ -8,6 +8,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       alias Ferricstore.ErrorReasons
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
+      alias Ferricstore.Flow.InternalKey
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Raft.ReplyAwaiter
@@ -502,7 +503,7 @@ defmodule Ferricstore.Store.Router.Part09 do
           :ets.delete(keydir, key)
         end)
 
-        live_keys
+        Enum.reject(live_keys, &InternalKey.internal?/1)
       rescue
         ArgumentError ->
           keydir_unavailable(ctx, idx, :keys, [])
@@ -523,12 +524,16 @@ defmodule Ferricstore.Store.Router.Part09 do
         {count, expired_keys} =
           :ets.foldl(
             fn
-              {_key, _value, 0, _lfu, _fid, _off, _vsize}, {count, expired_keys} ->
-                {count + 1, expired_keys}
+              {key, _value, 0, _lfu, _fid, _off, _vsize}, {count, expired_keys} ->
+                if InternalKey.internal?(key),
+                  do: {count, expired_keys},
+                  else: {count + 1, expired_keys}
 
-              {_key, _value, exp, _lfu, _fid, _off, _vsize}, {count, expired_keys}
+              {key, _value, exp, _lfu, _fid, _off, _vsize}, {count, expired_keys}
               when exp > now ->
-                {count + 1, expired_keys}
+                if InternalKey.internal?(key),
+                  do: {count, expired_keys},
+                  else: {count + 1, expired_keys}
 
               {key, _value, _exp, _lfu, _fid, _off, _vsize}, {count, expired_keys} ->
                 {count, [key | expired_keys]}

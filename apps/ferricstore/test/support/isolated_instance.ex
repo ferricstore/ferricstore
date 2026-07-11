@@ -68,44 +68,46 @@ defmodule Ferricstore.Test.IsolatedInstance do
         )
     end
 
-    # Custom instance shards are local/direct; only the default application
-    # instance owns Raft.
-    for i <- 0..(shard_count - 1) do
-      {:ok, _pid} =
-        Ferricstore.Store.Shard.start_link(
-          index: i,
-          data_dir: tmp_dir,
-          instance_ctx: ctx
+    if Keyword.get(opts, :start_shards, true) do
+      # Custom instance shards are local/direct; only the default application
+      # instance owns Raft.
+      for i <- 0..(shard_count - 1) do
+        {:ok, _pid} =
+          Ferricstore.Store.Shard.start_link(
+            index: i,
+            data_dir: tmp_dir,
+            instance_ctx: ctx
+          )
+      end
+
+      # Wait for all shards to be alive AND ready to accept calls.
+      # Process.alive? alone isn't enough — the shard's init (keydir recovery,
+      # ETS table creation) must complete before GenServer.call works.
+      Enum.each(0..(shard_count - 1), fn i ->
+        shard = elem(ctx.shard_names, i)
+
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn ->
+            pid = Process.whereis(shard)
+
+            is_pid(pid) and Process.alive?(pid) and
+              match?(
+                {:ok, _},
+                try do
+                  {:ok, GenServer.call(shard, :shard_stats, 500)}
+                rescue
+                  _ -> :error
+                catch
+                  :exit, _ -> :error
+                end
+              )
+          end,
+          "shard #{i} not ready",
+          50,
+          20
         )
+      end)
     end
-
-    # Wait for all shards to be alive AND ready to accept calls.
-    # Process.alive? alone isn't enough — the shard's init (keydir recovery,
-    # ETS table creation) must complete before GenServer.call works.
-    Enum.each(0..(shard_count - 1), fn i ->
-      shard = elem(ctx.shard_names, i)
-
-      Ferricstore.Test.ShardHelpers.eventually(
-        fn ->
-          pid = Process.whereis(shard)
-
-          is_pid(pid) and Process.alive?(pid) and
-            match?(
-              {:ok, _},
-              try do
-                {:ok, GenServer.call(shard, :shard_stats, 500)}
-              rescue
-                _ -> :error
-              catch
-                :exit, _ -> :error
-              end
-            )
-        end,
-        "shard #{i} not ready",
-        50,
-        20
-      )
-    end)
 
     ctx
   end

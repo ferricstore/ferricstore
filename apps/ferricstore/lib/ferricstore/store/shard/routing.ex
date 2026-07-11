@@ -61,7 +61,10 @@ defmodule Ferricstore.Store.Shard.Routing do
           | active_file_id: Map.get(sm_state, :active_file_id, state.active_file_id),
             active_file_path: Map.get(sm_state, :active_file_path, state.active_file_path),
             active_file_size: Map.get(sm_state, :active_file_size, state.active_file_size),
-            file_stats: Map.get(sm_state, :file_stats, state.file_stats)
+            file_stats: Map.get(sm_state, :file_stats, state.file_stats),
+            apply_context: Map.get(sm_state, :apply_context, state.apply_context),
+            apply_context_encoded:
+              Map.get(sm_state, :apply_context_encoded, state.apply_context_encoded)
         }
       end
 
@@ -79,9 +82,10 @@ defmodule Ferricstore.Store.Shard.Routing do
           merge_config: state.merge_config,
           max_active_file_size: state.max_active_file_size,
           ets: state.ets,
+          apply_context: state.apply_context,
+          apply_context_encoded: state.apply_context_encoded,
           applied_count: 0,
-          release_cursor_interval:
-            Application.get_env(:ferricstore, :release_cursor_interval, 200_000),
+          release_cursor_interval: state.release_cursor_interval,
           cross_shard_locks: %{},
           cross_shard_intents: %{},
           instance_ctx: state.instance_ctx,
@@ -92,7 +96,7 @@ defmodule Ferricstore.Store.Shard.Routing do
           flow_index_name: state.flow_index,
           flow_lookup_name: state.flow_lookup,
           flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path),
-          flow_async_history: flow_async_history_enabled?()
+          flow_async_history: state.flow_async_history
         }
       end
 

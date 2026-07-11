@@ -293,7 +293,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       end
 
     with :ok <- result do
-      SharedRefBackfill.run!(
+      maybe_run_shared_ref_backfill(
         shard_path,
         keydir,
         shard_index,
@@ -327,7 +327,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
              flow_index,
              flow_lookup
            ) do
-      SharedRefBackfill.run!(
+      maybe_run_shared_ref_backfill(
         shard_path,
         keydir,
         shard_index,
@@ -337,6 +337,61 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         opts
       )
     end
+  end
+
+  defp maybe_run_shared_ref_backfill(
+         shard_path,
+         keydir,
+         shard_index,
+         instance_ctx,
+         flow_index,
+         flow_lookup,
+         opts
+       ) do
+    cond do
+      Keyword.get(opts, :shared_ref_backfill?, true) == false ->
+        :ok
+
+      shared_ref_backfill_empty_keydir?(keydir, shard_index) ->
+        SharedRefBackfill.finalize_empty_shard!(
+          shard_path,
+          keydir,
+          shard_index,
+          instance_ctx,
+          opts
+        )
+
+      true ->
+        SharedRefBackfill.run!(
+          shard_path,
+          keydir,
+          shard_index,
+          instance_ctx,
+          flow_index,
+          flow_lookup,
+          opts
+        )
+    end
+  end
+
+  defp shared_ref_backfill_empty_keydir?(keydir, shard_index) do
+    case :ets.info(keydir, :size) do
+      0 ->
+        true
+
+      size when is_integer(size) and size <= 2 ->
+        allowed = [
+          Flow.Keys.shared_value_ref_backfill_key(shard_index),
+          SharedRefBackfill.progress_key(shard_index)
+        ]
+
+        Enum.count(allowed, &:ets.member(keydir, &1)) == size
+
+      _nonempty_or_missing ->
+        false
+    end
+  rescue
+    ArgumentError -> false
   end
 
   defp reconcile_batch(

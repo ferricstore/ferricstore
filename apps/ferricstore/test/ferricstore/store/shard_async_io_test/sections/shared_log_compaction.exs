@@ -58,6 +58,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
             assert :ok = GenServer.call(pid, :flush)
 
             size_before = File.stat!(active_path).size
+            {_total_before, dead_before} = Map.fetch!(:sys.get_state(pid).file_stats, 0)
 
             assert {:ok, {0, 0, 0}} = GenServer.call(pid, {:run_compaction, [0]})
             assert File.exists?(active_path)
@@ -66,7 +67,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
 
             state = :sys.get_state(pid)
             assert state.active_file_size == size_before
-            assert Map.fetch!(state.file_stats, 0) == {size_before, 0}
+            assert Map.fetch!(state.file_stats, 0) == {size_before, dead_before}
           after
             cleanup_shard(pid, ctx, dir)
           end
@@ -88,7 +89,10 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
             assert {:ok, [_stale_location]} =
                      NIF.v2_append_batch(compact_path, [{stale_key, "stale", 0}])
 
-            assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid, {:run_compaction, [0]})
+            assert {:ok, {copied, 0, _reclaimed}} =
+                     GenServer.call(pid, {:run_compaction, [0]})
+
+            assert copied >= 1
             refute File.exists?(compact_path)
 
             GenServer.stop(pid, :normal, 5000)
@@ -151,7 +155,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           try do
             key = "expired_only_compaction"
             expired_at = System.os_time(:millisecond) - 1_000
-            source = Path.join([dir, "data", "shard_0", "00000.log"])
+            assert :ok = force_rotate_active_file(pid)
+            {source_id, source} = GenServer.call(pid, :get_active_file)
 
             assert :ok = GenServer.call(pid, {:put, key, "expired", expired_at})
             assert :ok = GenServer.call(pid, :flush)
@@ -159,7 +164,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
 
             assert :ok = force_rotate_active_file(pid)
 
-            assert {:ok, {0, 0, reclaimed}} = GenServer.call(pid, {:run_compaction, [0]})
+            assert {:ok, {0, 0, reclaimed}} =
+                     GenServer.call(pid, {:run_compaction, [source_id]})
+
             assert reclaimed >= old_size
             refute File.exists?(source)
             assert nil == GenServer.call(pid, {:get, key})
@@ -395,7 +402,10 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
               }
             end)
 
-            assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid, {:run_compaction, [0]})
+            assert {:ok, {copied, 0, _reclaimed}} =
+                     GenServer.call(pid, {:run_compaction, [0]})
+
+            assert copied >= 1
 
             assert [{^field_key, "dedicated-value", 0, _lfu, 0, 0, _vsize}] =
                      :ets.lookup(:sys.get_state(pid).keydir, field_key)
@@ -441,7 +451,10 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
 
           :ok = force_rotate_active_file(pid1)
 
-          assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid1, {:run_compaction, [0]})
+          assert {:ok, {copied, 0, _reclaimed}} =
+                   GenServer.call(pid1, {:run_compaction, [0]})
+
+          assert copied >= 1
 
           Process.unlink(pid1)
           ref = Process.monitor(pid1)

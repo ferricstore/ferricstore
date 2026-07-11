@@ -52,6 +52,32 @@ defmodule Ferricstore.Raft.ApplyContextTest do
            }
   end
 
+  test "standalone shards carry their startup apply context into Flow commands" do
+    Application.put_env(:ferricstore, :flow_default_retention_ttl_ms, 111_000)
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+    shard = elem(ctx.shard_names, 0)
+    captured = :sys.get_state(shard).apply_context
+
+    on_exit(fn -> Ferricstore.Test.IsolatedInstance.checkin(ctx) end)
+
+    assert captured.flow_default_retention_ttl_ms == 111_000
+    Application.put_env(:ferricstore, :flow_default_retention_ttl_ms, 999_000)
+
+    id = "standalone-apply-context-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: id,
+               type: "standalone-apply-context",
+               state: "queued",
+               partition_key: "standalone-apply-context",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             })
+
+    assert :sys.get_state(shard).apply_context == captured
+  end
+
   test "captured cleanup and hibernation limits are flat immutable data" do
     context =
       ApplyContext.new(

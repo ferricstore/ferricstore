@@ -3,6 +3,7 @@ defmodule Ferricstore.FlowSignalTest do
   @moduletag :flow
   @moduletag :global_state
 
+  alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
@@ -399,8 +400,9 @@ defmodule Ferricstore.FlowSignalTest do
 
     assert {:ok, signaled} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     artifact_ref = get_in(signaled.value_refs, ["artifact", :ref])
+    ctx = FerricStore.Instance.get(:default)
     assert is_binary(artifact_ref)
-    assert {:ok, _blob} = FerricStore.get(artifact_ref)
+    assert is_binary(Router.get(ctx, artifact_ref))
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("signal-retention",
@@ -424,6 +426,6 @@ defmodule Ferricstore.FlowSignalTest do
     assert cleaned.values >= 1
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
-    assert {:ok, nil} = FerricStore.get(artifact_ref)
+    assert is_nil(Router.get(ctx, artifact_ref))
   end
 end

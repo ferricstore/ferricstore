@@ -623,6 +623,19 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
         assert source =~ "read_metadata_journal_record"
       end
 
+      @tag :persisted_apply_context_encoding
+      test "storage metadata persists apply context without an Elixir struct", %{
+        root: root,
+        ctx: ctx
+      } do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        persisted = waraft_storage_metadata(root, 0)
+
+        assert persisted.apply_context ==
+                 Ferricstore.Raft.ApplyContext.encode(ctx.apply_context)
+      end
+
       test "restart fails closed on oversized storage metadata journal record", %{
         root: root,
         ctx: ctx

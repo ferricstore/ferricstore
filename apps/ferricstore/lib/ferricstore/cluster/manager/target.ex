@@ -6,9 +6,11 @@ defmodule Ferricstore.Cluster.Manager.Target do
   alias Ferricstore.Cluster.DataSync
   alias Ferricstore.Cluster.JoinIdentity
   alias Ferricstore.Cluster.TargetMarker
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @membership_operation_timeout_ms 5_000
+  @target_log_probe_page_size 1_024
 
   def target_membership_by_shard(target_node, state) do
     case Process.get(:ferricstore_cluster_manager_target_membership_hook) do
@@ -219,25 +221,80 @@ defmodule Ferricstore.Cluster.Manager.Target do
   def probe_target_log_files(target_node, shard_path, files) do
     Enum.reduce_while(files, {:ok, false}, fn file, {:ok, false} ->
       if String.ends_with?(file, ".log") do
-        case :erpc.call(target_node, File, :stat, [Path.join(shard_path, file)], 5_000) do
-          {:ok, %{size: size}} when size > 0 ->
+        path = Path.join(shard_path, file)
+
+        case :erpc.call(target_node, __MODULE__, :bitcask_log_has_user_data, [path], 5_000) do
+          {:ok, true} ->
             {:halt, {:ok, true}}
 
-          {:ok, %{size: _size}} ->
+          {:ok, false} ->
             {:cont, {:ok, false}}
 
           {:error, reason} ->
-            {:halt,
-             {:error, {:target_data_probe_failed, target_node, {:stat, shard_path, reason}}}}
+            {:halt, {:error, {:target_data_probe_failed, target_node, {:scan, path, reason}}}}
 
           other ->
-            {:halt,
-             {:error, {:target_data_probe_failed, target_node, {:stat, shard_path, other}}}}
+            {:halt, {:error, {:target_data_probe_failed, target_node, {:scan, path, other}}}}
         end
       else
         {:cont, {:ok, false}}
       end
     end)
+  end
+
+  @doc false
+  def bitcask_log_has_user_data(path) when is_binary(path) do
+    bitcask_log_has_user_data(path, 0)
+  end
+
+  defp bitcask_log_has_user_data(path, offset) do
+    case NIF.v2_scan_file_page(path, offset, @target_log_probe_page_size) do
+      {:ok, records, next_offset, done?} ->
+        if Enum.any?(records, &target_user_record?/1) do
+          {:ok, true}
+        else
+          continue_target_log_probe(path, offset, next_offset, done?)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:unexpected_scan_result, other}}
+    end
+  end
+
+  defp continue_target_log_probe(_path, _offset, _next_offset, true), do: {:ok, false}
+
+  defp continue_target_log_probe(path, offset, next_offset, false)
+       when is_integer(next_offset) and next_offset > offset,
+       do: bitcask_log_has_user_data(path, next_offset)
+
+  defp continue_target_log_probe(_path, offset, next_offset, false),
+    do: {:error, {:non_advancing_scan, offset, next_offset}}
+
+  defp target_user_record?({key, _offset, _value_size, _expire_at_ms, false})
+       when is_binary(key),
+       do: not target_bootstrap_control_key?(key)
+
+  defp target_user_record?(_record), do: false
+
+  defp target_bootstrap_control_key?("f:{f}:svb:1:" <> shard_index),
+    do: canonical_shard_index?(shard_index)
+
+  defp target_bootstrap_control_key?("f:{f}:svbp:2:" <> shard_index),
+    do: canonical_shard_index?(shard_index)
+
+  defp target_bootstrap_control_key?("f:{f}:pcb:1:" <> shard_index),
+    do: canonical_shard_index?(shard_index)
+
+  defp target_bootstrap_control_key?(_key), do: false
+
+  defp canonical_shard_index?(value) do
+    case Integer.parse(value) do
+      {shard_index, ""} when shard_index >= 0 -> Integer.to_string(shard_index) == value
+      _invalid -> false
+    end
   end
 
   def probe_target_file_tree(target_node, path) do

@@ -1791,6 +1791,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
     state = state_as("platform_other_abcd")
     assert_native_get_ok("tenant:other:key", state)
 
+    assert_receive {:acl_invalidate, "platform_other_abcd"}
+
     assert {:error, "ERR User 'platform_missing_abcd' does not exist"} =
              apply_raft_acl({:acl_deluser, "platform_missing_abcd"})
 

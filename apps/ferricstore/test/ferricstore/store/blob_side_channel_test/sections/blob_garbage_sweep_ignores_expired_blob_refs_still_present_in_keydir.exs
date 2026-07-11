@@ -53,7 +53,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
           IsolatedInstance.checkout(
             shard_count: 1,
             hot_cache_max_value_size: 0,
-            blob_side_channel_threshold_bytes: 128
+            blob_side_channel_threshold_bytes: 128,
+            start_shards: false
           )
 
         key = "blob:gc:waraft-segment-live"
@@ -61,6 +62,14 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
 
         try do
           Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+          assert {:ok, _shard} =
+                   Ferricstore.Store.Shard.start_link(
+                     index: 0,
+                     data_dir: ctx.data_dir,
+                     instance_ctx: ctx,
+                     flow_shared_ref_backfill?: false
+                   )
 
           assert :ok =
                    Ferricstore.Raft.WARaftBackend.start(ctx,

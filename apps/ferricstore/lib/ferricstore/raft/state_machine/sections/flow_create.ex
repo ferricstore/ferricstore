@@ -841,8 +841,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             {:error, "ERR conflicting flow policy generation"}
 
           true ->
-            old_policy = flow_read_policy(state, type)
-            old_indexed_key = RetryPolicy.indexed_state_meta(old_policy)
+            old_indexed_key = flow_stored_policy_indexed_state_meta(stored_value)
             new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
 
             with :ok <- do_put(state, key, value, expire_at_ms) do
@@ -859,6 +858,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
             end
         end
       end
+
+      defp flow_stored_policy_indexed_state_meta(value) when is_binary(value) do
+        case RetryPolicy.decode_flow_policy_entry(value) do
+          {:ok, {_generation, policy}} -> RetryPolicy.indexed_state_meta(policy)
+          :error -> nil
+        end
+      end
+
+      defp flow_stored_policy_indexed_state_meta(_missing), do: nil
 
       defp flow_stored_policy_generation(state, key) do
         case ets_lookup(state, key) do

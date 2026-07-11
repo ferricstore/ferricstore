@@ -28,7 +28,7 @@ defmodule Ferricstore.FlowCrashMatrixTest do
       ShardHelpers.teardown_isolated_data_dir(isolated)
     end)
 
-    :ok
+    {:ok, isolated: isolated}
   end
 
   test "unknown outcome after WARaft commit recovers committed Flow state and hot due index" do
@@ -65,7 +65,9 @@ defmodule Ferricstore.FlowCrashMatrixTest do
     assert claim.payload == "commit-payload"
   end
 
-  test "crash after WARaft apply projection write rebuilds visible Flow state" do
+  test "crash after WARaft apply projection write rebuilds visible Flow state", %{
+    isolated: isolated
+  } do
     type = unique("matrix-apply-type")
     partition = unique("matrix-apply-partition")
     id = unique("matrix-apply-flow")
@@ -88,6 +90,7 @@ defmodule Ferricstore.FlowCrashMatrixTest do
     Ferricstore.FaultInjection.clear_hook()
     kill_process(pid)
     shutdown_op(op)
+    ShardHelpers.restart_current_data_dir(isolated)
     ShardHelpers.wait_default_quorum_writable(60_000)
 
     ensure_created_or_retry(type, partition, id, "apply-payload")
