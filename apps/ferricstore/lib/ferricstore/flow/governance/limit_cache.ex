@@ -95,22 +95,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   @impl true
   def handle_call({:reset_session, instance_name}, _from, state) do
     :ets.delete(create_table!(), session_coord_key(instance_name))
-
-    pending_pages =
-      Map.reject(state.pending_pages, fn
-        {{^instance_name, _scope, _shard_id}, _pages} -> true
-        _other -> false
-      end)
-
-    updated_state = %{
-      state
-      | sessions: Map.delete(state.sessions, instance_name),
-        session_contexts: Map.delete(state.session_contexts, instance_name),
-        pending_pages: pending_pages,
-        recovery_cursors: Map.delete(state.recovery_cursors, instance_name)
-    }
-
-    {:reply, :ok, updated_state}
+    {:reply, :ok, drop_state_session(state, instance_name)}
   end
 
   @impl true
@@ -158,31 +143,47 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
         scope = elem(key, 1)
         shard_id = elem(key, 2)
 
-        case CacheSessionStore.persist_prefetch(
+        case persist_cache_plan(
                ctx,
                session,
+               key,
                scope,
                shard_id,
                reservation_ids,
-               page_size: session_page_size(),
-               expires_at_ms: expires_at_ms,
-               config_version: config_version,
-               effective_limit: effective_limit
+               capacity,
+               generation,
+               expires_at_ms,
+               config_version,
+               effective_limit
              ) do
-          {:ok, pages} ->
-            plan = %{
-              key: key,
-              generation: generation,
-              capacity: capacity,
-              reservation_ids: reservation_ids,
-              pages: pages,
-              session: session
-            }
+          {:error, :stale_cache_session} ->
+            state = drop_state_session(state, instance_name)
 
-            {:reply, {:ok, plan}, state}
+            case ensure_state_session(ctx, state) do
+              {:ok, refreshed_session, state} ->
+                :ok = cache_session_coord(ctx, refreshed_session)
 
-          {:error, _reason} = error ->
-            {:reply, error, state}
+                {:reply,
+                 persist_cache_plan(
+                   ctx,
+                   refreshed_session,
+                   key,
+                   scope,
+                   shard_id,
+                   reservation_ids,
+                   capacity,
+                   generation,
+                   expires_at_ms,
+                   config_version,
+                   effective_limit
+                 ), state}
+
+              {:error, _reason} = error ->
+                {:reply, error, state}
+            end
+
+          result ->
+            {:reply, result, state}
         end
 
       {{^generation, nil}, {:error, _reason} = error} ->
@@ -728,7 +729,14 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           plan
         )
       else
-        {:error, _reason} -> LimitStore.spend(ctx, scope, opts)
+        {:error, _reason} = error ->
+          Telemetry.emit(:limit_cache_fill, error, %{
+            scope: scope,
+            shard_id: Keyword.get(opts, :shard_id),
+            amount: chunk - amount
+          })
+
+          LimitStore.spend(ctx, scope, opts)
       end
     end
   end
@@ -750,13 +758,22 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
         run_after_reserved_spend_hook(opts, result)
         {config_version, effective_limit} = result_cache_configuration(result, opts)
 
-        case finalize_cached(
-               ctx,
-               plan,
-               lease_expires_at_ms(result),
-               config_version,
-               effective_limit
-             ) do
+        finalize_result =
+          finalize_cached(
+            ctx,
+            plan,
+            lease_expires_at_ms(result),
+            config_version,
+            effective_limit
+          )
+
+        Telemetry.emit(:limit_cache_fill, finalize_result, %{
+          scope: scope,
+          shard_id: Keyword.get(opts, :shard_id),
+          amount: length(cached_ids)
+        })
+
+        case finalize_result do
           :ok ->
             :ok
 
@@ -1443,6 +1460,62 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           {:error, _reason} = error ->
             error
         end
+    end
+  end
+
+  defp drop_state_session(state, instance_name) do
+    pending_pages =
+      Map.reject(state.pending_pages, fn
+        {{^instance_name, _scope, _shard_id}, _pages} -> true
+        _other -> false
+      end)
+
+    %{
+      state
+      | sessions: Map.delete(state.sessions, instance_name),
+        session_contexts: Map.delete(state.session_contexts, instance_name),
+        pending_pages: pending_pages,
+        recovery_cursors: Map.delete(state.recovery_cursors, instance_name)
+    }
+  end
+
+  defp persist_cache_plan(
+         ctx,
+         session,
+         key,
+         scope,
+         shard_id,
+         reservation_ids,
+         capacity,
+         generation,
+         expires_at_ms,
+         config_version,
+         effective_limit
+       ) do
+    case CacheSessionStore.persist_prefetch(
+           ctx,
+           session,
+           scope,
+           shard_id,
+           reservation_ids,
+           page_size: session_page_size(),
+           expires_at_ms: expires_at_ms,
+           config_version: config_version,
+           effective_limit: effective_limit
+         ) do
+      {:ok, pages} ->
+        {:ok,
+         %{
+           key: key,
+           generation: generation,
+           capacity: capacity,
+           reservation_ids: reservation_ids,
+           pages: pages,
+           session: session
+         }}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

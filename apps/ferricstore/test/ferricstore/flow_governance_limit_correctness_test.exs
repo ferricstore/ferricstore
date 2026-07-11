@@ -829,6 +829,59 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert owner.leases[0].available == 3
   end
 
+  test "cache refills after a durable clear resets its session" do
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+
+    ctx = FerricStore.Instance.get(:default)
+    opts = [shard_id: 0, amount: 1, ttl_ms: 1_000, now_ms: 1_001]
+    first_scope = unique_flow_id("cache-clear-first")
+    second_scope = unique_flow_id("cache-clear-second")
+    table = :ferricstore_flow_governance_limit_cache
+
+    lease_limit!(first_scope, 4)
+
+    parent = self()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        send(
+          parent,
+          {:first_cache_spend,
+           Ferricstore.Flow.Governance.LimitCache.spend(ctx, first_scope, opts)}
+        )
+      end)
+
+    assert_receive {:first_cache_spend, {:ok, %{reservation_ids: [_active_id]}}}, 3_000
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 3_000
+
+    assert [_entry] = :ets.lookup(table, {ctx.name, first_scope, 0})
+
+    assert {:ok, %{released: 3, errors: 0}} =
+             Ferricstore.Flow.Governance.LimitCache.clear(ctx)
+
+    ShardHelpers.flush_all_keys()
+    lease_limit!(second_scope, 4)
+
+    handler_id = {__MODULE__, :cache_refill_after_clear, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :governance, :limit_cache_fill],
+      fn _event, _measurements, metadata, test_pid ->
+        send(test_pid, {:limit_cache_fill, metadata})
+      end,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, second_scope, opts)
+
+    assert_receive {:limit_cache_fill, %{status: :ok, scope: ^second_scope}}, 1_000
+    assert [_entry] = :ets.lookup(table, {ctx.name, second_scope, 0})
+  end
+
   test "flush never releases a cached reservation taken before atomic detach" do
     Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
 
