@@ -498,6 +498,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
 
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
+          bitcask_file = Path.join([root, "data", "shard_0", "00000.log"])
+          bitcask_size = File.stat!(bitcask_file).size
           key1 = "segment-keydir:batch-large:1"
           key2 = "segment-keydir:batch-large:2"
           value1 = :binary.copy("a", ctx.hot_cache_max_value_size + 1)
@@ -519,7 +521,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
           assert value2_size == byte_size(value2)
           assert value1 == Router.get(ctx, key1)
           assert value2 == Router.get(ctx, key2)
-          assert File.stat!(Path.join([root, "data", "shard_0", "00000.log"])).size == 0
+          assert File.stat!(bitcask_file).size == bitcask_size
 
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
@@ -549,6 +551,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
 
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
+          bitcask_file = Path.join([root, "data", "shard_0", "00000.log"])
+          bitcask_size = File.stat!(bitcask_file).size
           key1 = "segment-keydir:delete-batch:1"
           key2 = "segment-keydir:delete-batch:2"
 
@@ -560,7 +564,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
           assert nil == Router.get(ctx, key2)
           assert [] == :ets.lookup(elem(ctx.keydir_refs, 0), key1)
           assert [] == :ets.lookup(elem(ctx.keydir_refs, 0), key2)
-          assert File.stat!(Path.join([root, "data", "shard_0", "00000.log"])).size == 0
+          assert File.stat!(bitcask_file).size == bitcask_size
 
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)

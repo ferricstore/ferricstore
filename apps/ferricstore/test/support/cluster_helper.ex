@@ -126,6 +126,8 @@ defmodule Ferricstore.Test.ClusterHelper do
 
       # Set cluster_nodes so Raft.Cluster.start_shard_server uses all
       # nodes as initial_members for each shard's Raft group.
+      # Static peers are already initial members. Dynamic join is exercised by
+      # start_node/1 and must not race destructive target preparation here.
       :ok =
         :rpc.call(node.name, Application, :put_env, [
           :ferricstore,
@@ -137,7 +139,7 @@ defmodule Ferricstore.Test.ClusterHelper do
         :rpc.call(node.name, Application, :put_env, [
           :ferricstore,
           :cluster_auto_join,
-          true
+          false
         ])
     end)
 

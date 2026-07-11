@@ -505,6 +505,40 @@ defmodule Ferricstore.FlowTest do
   use Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfiguredMaximum
   use Ferricstore.FlowTest.Sections.FlushdbClearsFlowLmdbTerminalProjections
 
+  defp configure_default_apply_context(overrides) do
+    instance_key = {FerricStore.Instance, :default}
+    backend_key = {{Ferricstore.Raft.WARaftBackend, :context}, :ferricstore_waraft_backend}
+    original_instance = FerricStore.Instance.get(:default)
+    original_backend = :persistent_term.get(backend_key)
+
+    apply_context =
+      original_instance.apply_context
+      |> Map.from_struct()
+      |> Map.merge(Map.new(overrides))
+      |> Ferricstore.Raft.ApplyContext.new()
+
+    updated_instance = %{original_instance | apply_context: apply_context}
+    updated_backend = Map.put(original_backend, :apply_context, apply_context)
+
+    :persistent_term.put(instance_key, updated_instance)
+    :persistent_term.put(backend_key, updated_backend)
+
+    on_exit(fn ->
+      :persistent_term.put(instance_key, original_instance)
+      :persistent_term.put(backend_key, original_backend)
+    end)
+
+    updated_instance
+  end
+
+  defp internal_get(key), do: FerricStore.Impl.get(FerricStore.Instance.get(:default), key)
+
+  defp internal_del(key),
+    do: FerricStore.Impl.del(FerricStore.Instance.get(:default), [key])
+
+  defp internal_zrange(key, start, stop),
+    do: FerricStore.Impl.zrange(FerricStore.Instance.get(:default), key, start, stop, [])
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 

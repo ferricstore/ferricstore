@@ -4,6 +4,20 @@ defmodule Ferricstore.Raft.ApplyContextTest do
   alias Ferricstore.Flow.{Hibernation, RetryPolicy}
   alias Ferricstore.Raft.{ApplyContext, StateMachine}
 
+  test "history hot limits cannot exceed the total history maximum" do
+    context =
+      ApplyContext.new(
+        flow_default_history_hot_max_events: 10,
+        flow_default_history_max_events: 100,
+        flow_max_history_hot_max_events: 50,
+        flow_max_history_max_events: 5
+      )
+
+    assert context.flow_max_history_hot_max_events == 5
+    assert context.flow_default_history_hot_max_events == 5
+    assert context.flow_default_history_max_events == 5
+  end
+
   @runtime_keys [
     :flow_default_retention_ttl_ms,
     :flow_default_history_hot_max_events,

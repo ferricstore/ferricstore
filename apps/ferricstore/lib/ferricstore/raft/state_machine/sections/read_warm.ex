@@ -39,7 +39,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -741,6 +741,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                 {compound_key, ets_val, expire_at_ms, LFU.initial(), fid, offset, value_size}
               )
 
+              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), compound_key)
               sm_tx_put_pending(compound_key, value, expire_at_ms)
 
               deleted = Process.get(:tx_deleted_keys, MapSet.new())
@@ -856,6 +857,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                   compound_key, acc ->
                     track_keydir_binary_remove(state, compound_key)
                     :ets.delete(state.ets, compound_key)
+
+                    CompoundMemberIndex.delete(
+                      Map.get(state, :compound_member_index_name),
+                      compound_key
+                    )
+
                     sm_tx_drop_pending(compound_key)
                     zset_index_delete(state, redis_key, compound_key)
                     MapSet.put(acc, compound_key)
@@ -963,6 +970,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, value_size}
             )
 
+            CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), compound_key)
             sm_tx_put_pending(compound_key, value, expire_at_ms)
             deleted = Process.get(:tx_deleted_keys, MapSet.new())
 

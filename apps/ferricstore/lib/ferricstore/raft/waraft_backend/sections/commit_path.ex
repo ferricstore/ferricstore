@@ -85,19 +85,25 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
            do: invalid_shard_index_error(shard_index)
 
       defp commit_or_redirect(shard_index, command, redirects_left) do
+        shard_index
+        |> commit_or_redirect_with_position(command, redirects_left)
+        |> normalize_commit_result()
+      end
+
+      defp commit_or_redirect_with_position(shard_index, _command, _redirects_left)
+           when invalid_shard_index_shape(shard_index),
+           do: invalid_shard_index_error(shard_index)
+
+      defp commit_or_redirect_with_position(shard_index, command, redirects_left) do
         Ferricstore.LatencyTrace.maybe_span "server_waraft_commit_or_redirect_us" do
           case cached_pre_submit_redirect_node(shard_index, redirects_left) do
             leader_node when is_atom(leader_node) and leader_node not in [nil, node()] ->
-              leader_node
-              |> redirect_commit(shard_index, command, redirects_left)
-              |> normalize_commit_result()
+              redirect_commit(leader_node, shard_index, command, redirects_left)
 
             _other ->
               case commit(shard_index, command) do
                 {:error, _reason} = error ->
-                  error
-                  |> maybe_redirect_commit(shard_index, command, redirects_left)
-                  |> normalize_commit_result()
+                  maybe_redirect_commit(error, shard_index, command, redirects_left)
 
                 result ->
                   result
@@ -697,52 +703,74 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       def __barrier_redirected_commit_for_test__(node_name, shard_index, result),
         do: barrier_redirected_commit(node_name, shard_index, result)
 
-      defp barrier_redirected_commit(node_name, shard_index, result) do
-        case remote_storage_position(node_name, shard_index) do
-          {:ok, {:raft_log_pos, applied_index, _term}}
-          when is_integer(applied_index) and applied_index > 0 ->
-            case await_local_storage_applied(shard_index, applied_index, @timeout) do
-              :ok -> result
-              {:error, :timeout} -> ErrorReasons.write_timeout_unknown()
-            end
-
-          _other ->
-            ErrorReasons.write_timeout_unknown()
+      defp barrier_redirected_commit(
+             _node_name,
+             shard_index,
+             {:waraft_applied_at, target_position, _command_result} = applied_result
+           ) do
+        case await_local_storage_applied(shard_index, target_position, @timeout) do
+          :ok -> applied_result
+          {:error, :timeout} -> ErrorReasons.write_timeout_unknown()
         end
       end
 
-      defp remote_storage_position(node_name, shard_index) do
-        :erpc.call(node_name, __MODULE__, :storage_position, [shard_index], 5_000)
-      catch
-        _kind, _reason -> {:error, :leader_unavailable}
-      end
+      defp barrier_redirected_commit(_node_name, _shard_index, _result),
+        do: ErrorReasons.write_timeout_unknown()
 
-      defp await_local_storage_applied(_shard_index, target_index, _timeout_ms)
-           when not is_integer(target_index) or target_index <= 0,
-           do: :ok
-
-      defp await_local_storage_applied(shard_index, target_index, timeout_ms) do
+      defp await_local_storage_applied(
+             shard_index,
+             {:raft_log_pos, target_index, target_term} = target_position,
+             timeout_ms
+           )
+           when is_integer(target_index) and target_index > 0 and is_integer(target_term) and
+                  target_term > 0 and is_integer(timeout_ms) do
         Ferricstore.LatencyTrace.maybe_span "server_waraft_local_apply_wait_us" do
           deadline = System.monotonic_time(:millisecond) + max(timeout_ms, 0)
-          do_await_local_storage_applied(shard_index, target_index, deadline)
+          do_await_local_storage_applied(shard_index, target_position, deadline)
         end
       end
 
-      defp do_await_local_storage_applied(shard_index, target_index, deadline) do
+      defp await_local_storage_applied(_shard_index, _target_position, _timeout_ms),
+        do: {:error, :timeout}
+
+      defp do_await_local_storage_applied(shard_index, target_position, deadline) do
         case storage_position(shard_index) do
-          {:ok, {:raft_log_pos, applied_index, _term}}
-          when is_integer(applied_index) and applied_index >= target_index ->
-            :ok
+          {:ok, local_position} ->
+            if storage_position_satisfies(local_position, target_position) do
+              :ok
+            else
+              await_local_storage_retry(shard_index, target_position, deadline)
+            end
 
           _other ->
-            if System.monotonic_time(:millisecond) >= deadline do
-              {:error, :timeout}
-            else
-              Process.sleep(1)
-              do_await_local_storage_applied(shard_index, target_index, deadline)
-            end
+            await_local_storage_retry(shard_index, target_position, deadline)
         end
       end
+
+      defp await_local_storage_retry(shard_index, target_position, deadline) do
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(1)
+          do_await_local_storage_applied(shard_index, target_position, deadline)
+        end
+      end
+
+      defp storage_position_satisfies(
+             {:raft_log_pos, local_index, local_term},
+             {:raft_log_pos, target_index, target_term}
+           )
+           when is_integer(local_index) and is_integer(local_term) and is_integer(target_index) and
+                  is_integer(target_term) do
+        (local_index == target_index and local_term == target_term) or
+          (local_index > target_index and local_term >= target_term)
+      end
+
+      defp storage_position_satisfies(_local_position, _target_position), do: false
+
+      @doc false
+      def __storage_position_satisfies_for_test__(local_position, target_position),
+        do: storage_position_satisfies(local_position, target_position)
 
       defp redirect_write_failure(_kind, {:erpc, :timeout}), do: {:error, :timeout}
 
@@ -857,6 +885,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       defp normalize_commit_result({:error, reason})
            when reason in [:commit_queue_full, :apply_queue_full, :commit_bytes_full],
            do: {:error, :overloaded}
+
+      defp normalize_commit_result({:waraft_applied_at, _position, result}), do: result
 
       defp normalize_commit_result({:error, reason})
            when is_storage_unknown_outcome_reason(reason),

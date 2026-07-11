@@ -56,8 +56,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
   end
 
   def collect_records_sample(limit) when is_integer(limit) and limit > 0 do
-    case FerricStore.Instance.get(:default) do
-      %{shard_count: sc, keydir_refs: keydir_refs} = ctx
+    case FerricStore.Instance.fetch(:default) do
+      {:ok, %{shard_count: sc, keydir_refs: keydir_refs} = ctx}
       when is_integer(sc) and sc > 0 and is_tuple(keydir_refs) and tuple_size(keydir_refs) >= sc ->
         per_shard = max(1, div(limit + sc - 1, sc))
 
@@ -65,7 +65,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
         |> Enum.flat_map(&collect_records_from_keydir(ctx, &1, per_shard))
         |> Enum.take(limit)
 
-      _missing_instance ->
+      :error ->
+        []
+
+      _invalid_instance ->
         []
     end
   end

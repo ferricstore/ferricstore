@@ -289,6 +289,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defdelegate discard_all(shard_count), to: Control
   defdelegate discard_all(instance_name, shard_count), to: Control
   defdelegate discard(instance_name, shard_index), to: Control
+  defdelegate prepare_snapshot_install(instance_name, shard_index), to: Control
+  defdelegate resume_after_snapshot_install(instance_name, shard_index), to: Control
 
   def name(shard_index), do: Ferricstore.Flow.LMDBWriter.Registry.name(shard_index)
 
@@ -435,6 +437,34 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  def handle_call(:prepare_snapshot_install, _from, state) do
+    if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+    {state, reply} = flush_pending_with_reply(%{state | timer_ref: nil})
+
+    case reply do
+      :ok -> {:reply, :ok, reset_for_snapshot_install(state, true)}
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call(:resume_after_snapshot_install, _from, state) do
+    durable_index = LMDBReplaySafeIndex.read(state.shard_data_path)
+
+    Ferricstore.Flow.LMDBWriter.Telemetry.reset_replay_safe(
+      state.instance_ctx,
+      state.shard_index,
+      durable_index
+    )
+
+    state =
+      state
+      |> reset_for_snapshot_install(false)
+      |> Map.put(:durable_index, durable_index)
+      |> Map.put(:requested_index, durable_index)
+
+    {:reply, :ok, state}
+  end
+
   def handle_call(:suspend, _from, state) do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
     {state, _reply} = flush_pending_with_reply(%{state | timer_ref: nil})
@@ -466,6 +496,36 @@ defmodule Ferricstore.Flow.LMDBWriter do
     publish_backlog(state, 0)
 
     {:reply, :ok, state}
+  end
+
+  defp reset_for_snapshot_install(state, suspended?) do
+    if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+    Outbox.clear_projection_outbox(state)
+
+    processed = EnqueueControl.enqueue_seq_target(state)
+    EnqueueControl.publish_processed_enqueue_seq(state.enqueue_seq, processed)
+    Enum.each(state.flush_waiters, fn {from, _target} -> GenServer.reply(from, :ok) end)
+
+    state = %{
+      state
+      | pending: [],
+        pending_after_flush: [],
+        count: 0,
+        first_pending_at: nil,
+        last_enqueue_at: nil,
+        timer_ref: nil,
+        terminal_count_inits: MapSet.new(),
+        terminal_count_cache: ProjectionOps.empty_terminal_count_cache(),
+        lmdb_ready: false,
+        suspended?: suspended?,
+        projection_dirty?: false,
+        processed_enqueue_seq: processed,
+        processed_enqueue_gaps: MapSet.new(),
+        flush_waiters: []
+    }
+
+    publish_backlog(state, 0)
+    state
   end
 
   defp handle_enqueue(ops, after_flush, state) do

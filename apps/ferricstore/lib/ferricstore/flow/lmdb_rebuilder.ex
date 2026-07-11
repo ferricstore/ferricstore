@@ -12,6 +12,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   @batch_size 512
 
+  def init_startup_active_rebuild_limiter,
+    do: ActiveIndexes.init_startup_active_rebuild_limiter()
+
   @doc false
   def __startup_active_rebuild_concurrency_for_test__,
     do: ActiveIndexes.startup_active_rebuild_concurrency()

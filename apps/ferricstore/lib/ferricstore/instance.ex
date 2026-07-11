@@ -573,6 +573,16 @@ defmodule FerricStore.Instance do
   end
 
   @doc """
+  Retrieves the cached instance context without raising while startup is incomplete.
+  """
+  @spec fetch(atom()) :: {:ok, t()} | :error
+  def fetch(name) do
+    {:ok, :persistent_term.get({FerricStore.Instance, name})}
+  rescue
+    ArgumentError -> :error
+  end
+
+  @doc """
   Injects optional callbacks into an existing instance.
 
   Used by server apps (e.g., ferricstore_server) to provide server-specific
@@ -593,7 +603,7 @@ defmodule FerricStore.Instance do
   """
   @spec cleanup(atom()) :: :ok
   def cleanup(name) do
-    cleanup_instance_tables(fetch_cached(name))
+    cleanup_instance_tables(fetch(name))
     :persistent_term.erase({FerricStore.Instance, name})
     :ok
   rescue
@@ -603,12 +613,6 @@ defmodule FerricStore.Instance do
   # ---------------------------------------------------------------------------
   # Private: build helpers
   # ---------------------------------------------------------------------------
-
-  defp fetch_cached(name) do
-    {:ok, :persistent_term.get({FerricStore.Instance, name})}
-  rescue
-    ArgumentError -> :error
-  end
 
   defp cleanup_instance_tables({:ok, %__MODULE__{name: :default}}), do: :ok
   defp cleanup_instance_tables(:error), do: :ok

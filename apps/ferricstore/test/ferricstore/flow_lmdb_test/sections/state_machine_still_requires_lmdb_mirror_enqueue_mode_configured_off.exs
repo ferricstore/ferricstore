@@ -46,7 +46,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StateMachineStillRequiresLmdbMirror
                    now_ms: 3
                  )
 
-        assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 1
+        assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 2
         assert :atomics.get(ctx.flow_lmdb_mirror_degraded, 1) == 1
       end
 
@@ -458,6 +458,69 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StateMachineStillRequiresLmdbMirror
         assert_receive {:suspend_finished, :ok}, 500
         assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
         assert :atomics.get(degraded, 1) == 0
+      end
+
+      test "snapshot preparation flushes queued projection writes before suspending" do
+        old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+        old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+        Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+        Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_snapshot_prepare_#{System.unique_integer([:positive])}"
+          )
+
+        shard_index = 0
+        instance_name = :"flow_lmdb_snapshot_prepare_#{System.unique_integer([:positive])}"
+        shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        key = "flow:{flow:test}:state:snapshot-prepare"
+
+        on_exit(fn ->
+          restore_env(:flow_lmdb_mode, old_mode)
+          restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+          File.rm_rf!(data_dir)
+        end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+        start_supervised!(
+          {Ferricstore.Flow.LMDBWriter,
+           shard_index: shard_index,
+           data_dir: data_dir,
+           instance_ctx: %{name: instance_name},
+           instance_name: instance_name}
+        )
+
+        path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+                   {:put, key, "v1"}
+                 ])
+
+        assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.prepare_snapshot_install(
+                   instance_name,
+                   shard_index
+                 )
+
+        assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
+
+        assert {:error, :writer_suspended} =
+                 Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+                   {:put, key, "v2"}
+                 ])
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.resume_after_snapshot_install(
+                   instance_name,
+                   shard_index
+                 )
       end
 
       test "mirror writer persists replay-safe marker with no pending ops" do

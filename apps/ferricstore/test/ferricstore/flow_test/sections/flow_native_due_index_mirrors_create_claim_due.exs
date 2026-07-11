@@ -766,7 +766,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowNativeDueIndexMirrorsCreateClaimDue 
         assert {:ok, _} =
                  flow_create_and_get(live_id, type: "stale-scan", run_at_ms: 1_000)
 
-        assert {:ok, 1} = FerricStore.del(Ferricstore.Flow.Keys.state_key(stale_id))
+        assert {:ok, 1} = internal_del(Ferricstore.Flow.Keys.state_key(stale_id))
 
         assert {:ok, [claimed]} =
                  FerricStore.flow_claim_due("stale-scan",

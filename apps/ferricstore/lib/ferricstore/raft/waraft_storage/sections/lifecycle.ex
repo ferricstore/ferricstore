@@ -441,6 +441,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       def open_snapshot(snapshot_path, expected_position, handle) do
         snapshot_path = to_path(snapshot_path)
 
+        with_flow_lmdb_snapshot_install(handle, fn ->
+          do_open_snapshot(snapshot_path, expected_position, handle)
+        end)
+      end
+
+      defp do_open_snapshot(snapshot_path, expected_position, handle) do
         with {:ok, metadata} <- read_snapshot_metadata(snapshot_path),
              :ok <- verify_snapshot_position(metadata, expected_position),
              :ok <- verify_snapshot_payload_dirs(metadata, snapshot_path, handle),

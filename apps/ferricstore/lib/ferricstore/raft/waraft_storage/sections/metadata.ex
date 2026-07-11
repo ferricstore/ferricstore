@@ -165,9 +165,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       defp encode_persisted_metadata_term(other), do: other
 
       defp decode_persisted_metadata_term(%{} = metadata) do
-        metadata
-        |> Map.update(:config, nil, &decode_persisted_storage_config/1)
-        |> Map.update(:apply_context, nil, &decode_persisted_apply_context/1)
+        metadata = Map.update(metadata, :config, nil, &decode_persisted_storage_config/1)
+
+        case Map.fetch(metadata, :apply_context) do
+          {:ok, context} ->
+            Map.put(metadata, :apply_context, decode_persisted_apply_context(context))
+
+          :error ->
+            metadata
+        end
       end
 
       defp decode_persisted_metadata_term(other), do: other

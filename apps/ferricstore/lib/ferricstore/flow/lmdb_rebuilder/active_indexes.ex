@@ -7,7 +7,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
   alias Ferricstore.Store.Shard.ZSetIndex
 
   @active_index_rebuild_batch_size 4096
-  @startup_active_rebuild_slots :ferricstore_flow_lmdb_startup_active_rebuild_slots
+  @startup_active_rebuild_slots_key {__MODULE__, :startup_active_rebuild_slots}
+
+  def init_startup_active_rebuild_limiter do
+    ref = :atomics.new(1, signed: false)
+    :persistent_term.put(@startup_active_rebuild_slots_key, ref)
+    :ok
+  end
 
   def rebuild_score_indexes(zset_score_index, zset_score_lookup, record) do
     do_rebuild_score_indexes(
@@ -50,13 +56,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
   end
 
   def with_startup_active_rebuild_slot(fun) when is_function(fun, 0) do
-    table = ensure_startup_active_rebuild_slots!()
-    acquire_startup_active_rebuild_slot(table, startup_active_rebuild_concurrency())
+    ref = :persistent_term.get(@startup_active_rebuild_slots_key)
+    acquire_startup_active_rebuild_slot(ref, startup_active_rebuild_concurrency())
 
     try do
       fun.()
     after
-      release_startup_active_rebuild_slot(table)
+      release_startup_active_rebuild_slot(ref)
     end
   end
 
@@ -113,52 +119,35 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     end)
   end
 
-  defp ensure_startup_active_rebuild_slots! do
-    case :ets.whereis(@startup_active_rebuild_slots) do
-      :undefined ->
-        try do
-          table =
-            :ets.new(@startup_active_rebuild_slots, [
-              :set,
-              :public,
-              :named_table,
-              {:read_concurrency, true},
-              {:write_concurrency, true}
-            ])
+  defp acquire_startup_active_rebuild_slot(ref, limit) do
+    count = :atomics.get(ref, 1)
 
-          :ets.insert_new(table, {:active, 0})
-          table
-        rescue
-          ArgumentError ->
-            @startup_active_rebuild_slots
-        end
+    cond do
+      count >= limit ->
+        Process.sleep(10)
+        acquire_startup_active_rebuild_slot(ref, limit)
 
-      table ->
-        table
+      :atomics.compare_exchange(ref, 1, count, count + 1) == :ok ->
+        :ok
+
+      true ->
+        acquire_startup_active_rebuild_slot(ref, limit)
     end
   end
 
-  defp acquire_startup_active_rebuild_slot(table, limit) do
-    count = :ets.update_counter(table, :active, {2, 1}, {:active, 0})
+  defp release_startup_active_rebuild_slot(ref) do
+    case :atomics.sub_get(ref, 1, 1) do
+      count when count >= 0 ->
+        :ok
 
-    if count <= limit do
-      :ok
-    else
-      _ = :ets.update_counter(table, :active, {2, -1}, {:active, 0})
-      Process.sleep(10)
-      acquire_startup_active_rebuild_slot(table, limit)
+      _negative ->
+        _ = :atomics.add_get(ref, 1, 1)
+        raise "startup active LMDB rebuild slot released without a matching acquire"
     end
   rescue
     ArgumentError ->
-      Process.sleep(10)
-      acquire_startup_active_rebuild_slot(ensure_startup_active_rebuild_slots!(), limit)
-  end
-
-  defp release_startup_active_rebuild_slot(table) do
-    _ = :ets.update_counter(table, :active, {2, -1}, {:active, 0})
-    :ok
-  rescue
-    ArgumentError -> :ok
+      # An unsigned counter can only underflow after a mismatched release.
+      raise "startup active LMDB rebuild slot released without a matching acquire"
   end
 
   defp rebuild_flow_indexes_from_lmdb_page(

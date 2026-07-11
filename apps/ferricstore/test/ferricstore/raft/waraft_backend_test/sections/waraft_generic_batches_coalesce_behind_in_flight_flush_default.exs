@@ -242,7 +242,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
           task =
             Task.async(fn ->
               WARaftBackend.write_batch(0, [
-                {:flow_create_pipeline_batch, "flow-window-bypass", %{records: []}}
+                {:flow_create_pipeline_batch, "flow-window-bypass",
+                 %{records: [], policy_snapshot_captured: true}}
               ])
             end)
 

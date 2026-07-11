@@ -31,7 +31,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  FerricStore.flow_by_parent(parent, partition_key: partition, count: 10)
 
         assert {:ok, []} =
-                 FerricStore.zrange(
+                 internal_zrange(
                    Ferricstore.Flow.Keys.parent_index_key(parent, partition),
                    0,
                    10
@@ -41,13 +41,13 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  FerricStore.flow_by_root(root, partition_key: partition, count: 10)
 
         assert {:ok, []} =
-                 FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
+                 internal_zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
 
         assert {:ok, [%{id: ^id}]} =
                  FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 10)
 
         assert {:ok, []} =
-                 FerricStore.zrange(
+                 internal_zrange(
                    Ferricstore.Flow.Keys.correlation_index_key(correlation, partition),
                    0,
                    10
@@ -76,7 +76,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
         assert flow.root_flow_id == id
 
         assert {:ok, []} =
-                 FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(id, partition), 0, 10)
+                 internal_zrange(Ferricstore.Flow.Keys.root_index_key(id, partition), 0, 10)
       end
 
       test "flow_by_parent root and correlation query lineage indexes" do
@@ -149,7 +149,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  )
 
         assert {:ok, []} =
-                 FerricStore.zrange(
+                 internal_zrange(
                    Ferricstore.Flow.Keys.parent_index_key(root, partition),
                    0,
                    10
@@ -168,7 +168,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  )
 
         assert {:ok, []} =
-                 FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
+                 internal_zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
 
         assert {:ok, [%{id: ^root}, %{id: ^child_a}]} =
                  FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 2)
@@ -190,7 +190,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  )
 
         assert {:ok, []} =
-                 FerricStore.zrange(
+                 internal_zrange(
                    Ferricstore.Flow.Keys.correlation_index_key(correlation, partition),
                    0,
                    10

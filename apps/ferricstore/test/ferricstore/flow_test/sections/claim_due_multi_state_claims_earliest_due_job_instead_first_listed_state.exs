@@ -816,8 +816,8 @@ defmodule Ferricstore.FlowTest.Sections.ClaimDueMultiStateClaimsEarliestDueJobIn
         member_key = Ferricstore.Store.CompoundKey.zset_member(due_key, id)
         type_key = Ferricstore.Store.CompoundKey.type_key(due_key)
 
-        assert {:ok, nil} = FerricStore.get(member_key)
-        assert {:ok, nil} = FerricStore.get(type_key)
+        assert {:ok, nil} = internal_get(member_key)
+        assert {:ok, nil} = internal_get(type_key)
 
         assert {:ok, [%{id: ^id}]} =
                  FerricStore.flow_claim_due("checkout",

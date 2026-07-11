@@ -251,7 +251,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def write_redirected(shard_index, command, redirects_left)
           when is_integer(redirects_left) and redirects_left >= 0 do
         with_sync_write(shard_index, fn ->
-          commit_or_redirect(shard_index, command, redirects_left)
+          commit_or_redirect_with_position(shard_index, command, redirects_left)
         end)
       end
 

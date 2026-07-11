@@ -160,9 +160,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
       with {:ok, shard_id} <- required_shard_id(ctx, opts),
            {:ok, ttl_ms} <- required_positive_integer(opts, :ttl_ms),
            {:ok, now_ms} <- optional_now_ms(opts),
-           :ok <- validate_deadline(now_ms, ttl_ms) do
-        key = Keys.governance_limit_key(scope)
-
+           :ok <- validate_deadline(now_ms, ttl_ms),
+           key = Keys.governance_limit_key(scope),
+           :ok <- ensure_existing_limit_registered(ctx, key) do
         Router.flow_governance_limit_mutate(ctx, key, %{
           op: :renew,
           scope: scope,
@@ -185,9 +185,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
       with {:ok, shard_id} <- required_shard_id(ctx, opts),
            {:ok, reservation_ids} <- release_reservation_ids(opts),
            {:ok, amount} <- release_amount(opts, reservation_ids),
-           {:ok, now_ms} <- optional_now_ms(opts) do
-        key = Keys.governance_limit_key(scope)
-
+           {:ok, now_ms} <- optional_now_ms(opts),
+           key = Keys.governance_limit_key(scope),
+           :ok <- ensure_existing_limit_registered(ctx, key) do
         Router.flow_governance_limit_mutate(ctx, key, %{
           op: :release,
           scope: scope,
@@ -216,11 +216,13 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
             {:ok, nil}
 
           _existing ->
-            Router.flow_governance_limit_mutate(ctx, key, %{
-              op: :get,
-              scope: scope,
-              now_ms: now_ms
-            })
+            with :ok <- ensure_limit_registered(ctx, key) do
+              Router.flow_governance_limit_mutate(ctx, key, %{
+                op: :get,
+                scope: scope,
+                now_ms: now_ms
+              })
+            end
         end
       end
 
@@ -569,6 +571,10 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   defp register_existing_limit(ctx, key, true), do: ensure_limit_registered(ctx, key)
   defp register_existing_limit(_ctx, _key, false), do: :ok
+
+  defp ensure_existing_limit_registered(ctx, key) do
+    register_existing_limit(ctx, key, not is_nil(Router.get(ctx, key)))
+  end
 
   defp register_committed_limit(ctx, key, result, opts) do
     case Router.get(ctx, key) do

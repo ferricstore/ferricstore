@@ -298,7 +298,15 @@ defmodule Ferricstore.Store.ConcurrencyTest do
       assert Enum.all?(results, &(&1 == :ok))
 
       # Shard uses single-table format: {key, value, expire_at_ms, lfu_counter} in keydir
-      entries = :ets.tab2list(keydir)
+      entries =
+        Enum.filter(:ets.tab2list(keydir), fn
+          {<<"ets_key_", _rest::binary>>, _value, _expire_at_ms, _lfu, _fid, _off, _vsize} ->
+            true
+
+          _other ->
+            false
+        end)
+
       assert length(entries) == 30
 
       for i <- 0..29 do

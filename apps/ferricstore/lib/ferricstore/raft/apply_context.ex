@@ -147,17 +147,18 @@ defmodule Ferricstore.Raft.ApplyContext do
   def new(values) when is_map(values), do: values |> Map.to_list() |> new()
 
   def new(values) when is_list(values) do
-    max_history_hot =
-      values
-      |> Keyword.get(:flow_max_history_hot_max_events, @default_max_history_hot_max_events)
-      |> positive(@default_max_history_hot_max_events)
-      |> min(@max_history_hot_max_events)
-
     max_history =
       values
       |> Keyword.get(:flow_max_history_max_events, @default_max_history_max_events)
       |> positive(@default_max_history_max_events)
       |> min(@max_history_max_events)
+
+    max_history_hot =
+      values
+      |> Keyword.get(:flow_max_history_hot_max_events, @default_max_history_hot_max_events)
+      |> positive(@default_max_history_hot_max_events)
+      |> min(@max_history_hot_max_events)
+      |> min(max_history)
 
     default_hot =
       values

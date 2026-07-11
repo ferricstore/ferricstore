@@ -7,15 +7,11 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
   because set membership is unambiguous: a member is either present or it
   is not.
 
-  In single-node Raft mode (current architecture), each node is independent.
-  Set operations are local. The test verifies:
+  The test verifies:
 
     1. ACKed SADD members survive sibling node crashes.
     2. No phantom members appear (members that were never ACKed).
     3. After multiple rounds of node kills, all ACKed members are still present.
-
-  When multi-node Raft is implemented, these tests will validate that SADD
-  is durable across the cluster and survives leader failover.
 
   ## Running
 
@@ -44,6 +40,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
   describe "19.5 set members never disappear" do
     @tag :jepsen
+    @tag :set_sibling_kill
     @tag timeout: 300_000
     test "set: no ACKed member missing after sibling node kills", %{nodes: nodes} do
       [n1, _n2, n3] = nodes
@@ -53,25 +50,21 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
       on_exit(fn -> if Process.alive?(history), do: HistoryRecorder.stop(history) end)
 
-      # SADD 200 members on n1, killing one sibling at the midpoint
-      # to test disruption while maintaining Raft quorum (need 2 of 3).
-      for i <- 1..200 do
+      # Establish committed state before the fault.
+      for i <- 1..100 do
         member = "member:#{i}"
+        result = :rpc.call(n1.name, FerricStore, :sadd, [key, [member]])
 
-        case :rpc.call(n1.name, FerricStore, :sadd, [key, [member]]) do
-          {:ok, count} when is_integer(count) ->
-            HistoryRecorder.record_ok(history, key, member, n1.name)
-
-          _other ->
-            :ok
-        end
-
-        # Kill one sibling at the midpoint to introduce disruption
-        if i == 100 do
-          ClusterHelper.kill_node(nodes, n3)
-          Process.sleep(500)
-        end
+        assert {:ok, 1} = result
+        HistoryRecorder.record_ok(history, key, member, n1.name)
       end
+
+      # Remove the current sibling leader, preserving a two-voter quorum. The
+      # immediate write may succeed or fail while leadership is unavailable.
+      ClusterHelper.kill_node(nodes, n3)
+      Process.sleep(500)
+
+      maybe_record_set_write(history, n1, key, 101)
 
       alive =
         Enum.filter(nodes, fn n ->
@@ -83,20 +76,21 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
       :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 30_000)
 
+      # Continue through the surviving cluster after election. These writes are
+      # the regression for redirected ACKs outrunning apply on n1.
+      for i <- 102..200 do
+        member = "member:#{i}"
+        assert {:ok, 1} = :rpc.call(n1.name, FerricStore, :sadd, [key, [member]])
+        HistoryRecorder.record_ok(history, key, member, n1.name)
+      end
+
       # In multi-node Raft, writes forwarded to the leader replicate back
       # to followers asynchronously. Poll until all ACKed members appear.
-      Ferricstore.Test.ShardHelpers.eventually(
-        fn ->
-          violations = HistoryRecorder.verify_set_durability(history, [n1], key)
+      violations = wait_for_set_durability(history, [n1], key, 50, 100)
 
-          assert violations == [],
-                 "Set durability violated:\n" <>
-                   HistoryRecorder.format_violations(violations)
-        end,
-        "set durability on n1",
-        50,
-        100
-      )
+      assert violations == [],
+             "Set durability violated:\n" <>
+               HistoryRecorder.format_violations(violations)
 
       {:ok, members} = :rpc.call(n1.name, FerricStore, :smembers, [key])
 
@@ -241,6 +235,31 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
         "  #{ok_count} concurrent SADD operations; " <>
           "#{length(members)} members present; 0 missing"
       )
+    end
+  end
+
+  defp wait_for_set_durability(history, nodes, key, attempts, interval_ms) do
+    Enum.reduce_while(1..attempts, [], fn attempt, _previous ->
+      case HistoryRecorder.verify_set_durability(history, nodes, key) do
+        [] ->
+          {:halt, []}
+
+        violations when attempt < attempts ->
+          Process.sleep(interval_ms)
+          {:cont, violations}
+
+        violations ->
+          {:halt, violations}
+      end
+    end)
+  end
+
+  defp maybe_record_set_write(history, node, key, member_number) do
+    member = "member:#{member_number}"
+
+    case :rpc.call(node.name, FerricStore, :sadd, [key, [member]]) do
+      {:ok, 1} -> HistoryRecorder.record_ok(history, key, member, node.name)
+      {:error, _reason} -> :ok
     end
   end
 end

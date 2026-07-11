@@ -105,6 +105,10 @@ defmodule Ferricstore.Application do
       # on file rotation — critical for embedded mode with many host processes.
       Ferricstore.Store.ActiveFile.init(shard_count)
 
+      # This VM-lifetime atomic is initialized before shard recovery can launch
+      # concurrent LMDB active-index rebuilds.
+      Ferricstore.Flow.LMDBRebuilder.init_startup_active_rebuild_limiter()
+
       # Publish max_active_file_size once at startup. Shards read this via
       # persistent_term.get (~5ns) at init. Never written again at runtime.
       :persistent_term.put(

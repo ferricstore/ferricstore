@@ -170,6 +170,35 @@ defmodule Ferricstore.Flow.LMDBWriter.Control do
     :exit, _reason -> :ok
   end
 
+  def prepare_snapshot_install(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
+    case Process.whereis(name(instance_name, shard_index)) do
+      pid when is_pid(pid) ->
+        with :ok <- GenServer.call(pid, :flush, 30_000) do
+          GenServer.call(pid, :prepare_snapshot_install, 30_000)
+        end
+
+      nil ->
+        :ok
+    end
+  catch
+    :exit, reason -> {:error, {:lmdb_writer_snapshot_handoff_failed, reason}}
+  end
+
+  def resume_after_snapshot_install(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
+    snapshot_call(instance_name, shard_index, :resume_after_snapshot_install)
+  end
+
+  defp snapshot_call(instance_name, shard_index, request) do
+    case Process.whereis(name(instance_name, shard_index)) do
+      pid when is_pid(pid) -> GenServer.call(pid, request, 30_000)
+      nil -> :ok
+    end
+  catch
+    :exit, reason -> {:error, {:lmdb_writer_snapshot_handoff_failed, reason}}
+  end
+
   defp name(instance_name, shard_index), do: Registry.name(instance_name, shard_index)
 
   defp mark_instance_suspended(instance_name) when is_atom(instance_name),

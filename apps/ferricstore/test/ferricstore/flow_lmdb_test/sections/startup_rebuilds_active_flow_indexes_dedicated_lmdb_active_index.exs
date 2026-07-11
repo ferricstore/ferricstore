@@ -809,6 +809,62 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         assert max_seen <= limit
       end
 
+      test "startup active LMDB rebuild limit survives the limiter creator exiting" do
+        parent = self()
+
+        owner =
+          Task.async(fn ->
+            :ok = Ferricstore.Flow.LMDBRebuilder.init_startup_active_rebuild_limiter()
+            send(parent, :startup_rebuild_limiter_owner_ready)
+
+            receive do
+              :stop_startup_rebuild_limiter_owner -> :ok
+            end
+          end)
+
+        assert_receive :startup_rebuild_limiter_owner_ready, 1_000
+        limit = Ferricstore.Flow.LMDBRebuilder.__startup_active_rebuild_concurrency_for_test__()
+
+        holders =
+          for index <- 1..limit do
+            Task.async(fn ->
+              Ferricstore.Flow.LMDBRebuilder.__with_startup_active_rebuild_slot_for_test__(fn ->
+                send(parent, {:startup_rebuild_slot_held, index})
+
+                receive do
+                  :release_startup_rebuild_slot -> :ok
+                end
+              end)
+            end)
+          end
+
+        for index <- 1..limit do
+          assert_receive {:startup_rebuild_slot_held, ^index}, 1_000
+        end
+
+        send(owner.pid, :stop_startup_rebuild_limiter_owner)
+        assert :ok = Task.await(owner, 1_000)
+
+        waiter =
+          Task.async(fn ->
+            Ferricstore.Flow.LMDBRebuilder.__with_startup_active_rebuild_slot_for_test__(fn ->
+              send(parent, :startup_rebuild_waiter_entered)
+
+              receive do
+                :release_startup_rebuild_waiter -> :ok
+              end
+            end)
+          end)
+
+        refute_receive :startup_rebuild_waiter_entered, 100
+
+        Enum.each(holders, &send(&1.pid, :release_startup_rebuild_slot))
+        assert Enum.map(holders, &Task.await(&1, 1_000)) == List.duplicate(:ok, limit)
+        assert_receive :startup_rebuild_waiter_entered, 1_000
+        send(waiter.pid, :release_startup_rebuild_waiter)
+        assert :ok = Task.await(waiter, 1_000)
+      end
+
       test "LMDB active projection replaces stale indexes when state changes" do
         fixture = start_active_lmdb_projection_fixture!("replace-active")
 

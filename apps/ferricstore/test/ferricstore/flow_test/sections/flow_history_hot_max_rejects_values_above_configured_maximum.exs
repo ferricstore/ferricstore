@@ -448,6 +448,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert {:ok, %{state: "completed"}} = FerricStore.flow_get(id)
 
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
         assert {:ok, %{flows: 1}} =
                  Ferricstore.Store.Router.flow_retention_cleanup(ctx, %{
@@ -455,6 +456,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
                    now_ms: cleanup_now
                  })
 
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
         assert {:ok, nil} = FerricStore.flow_get(id)
       end
 
@@ -958,17 +960,13 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
       end
 
       test "bounded partial and full cleanup preserve a shared value with a live consumer" do
-        ctx = FerricStore.Instance.get(:default)
+        ctx = configure_default_apply_context(flow_retention_cleanup_key_budget: 8)
         owner_id = uid("flow-retention-partial-shared-owner")
         consumer_id = uid("flow-retention-partial-shared-consumer")
         {owner_partition, _same_partition, consumer_partition} = mixed_partition_keys()
         create_now = System.system_time(:millisecond) + 60_000
         complete_now = create_now + 1_000
         cleanup_now = complete_now + 1_000
-        old_budget = Application.get_env(:ferricstore, :flow_retention_cleanup_key_budget)
-        Application.put_env(:ferricstore, :flow_retention_cleanup_key_budget, 8)
-
-        on_exit(fn -> restore_env(:flow_retention_cleanup_key_budget, old_budget) end)
 
         assert {:ok, _owner} =
                  flow_create_and_get(owner_id,

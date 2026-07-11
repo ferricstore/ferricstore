@@ -203,11 +203,16 @@ defmodule Ferricstore.Flow.LMDB do
     if env_present?(path) do
       :ok
     else
-      case NIF.lmdb_release(path) do
-        {:ok, _released} -> :ok
-        {:busy, count} -> {:error, {:lmdb_env_busy, count}}
-        {:error, _reason} = error -> error
-      end
+      release(path)
+    end
+  end
+
+  @spec release(binary()) :: :ok | {:error, term()}
+  def release(path) when is_binary(path) do
+    case NIF.lmdb_release(path) do
+      {:ok, _released} -> :ok
+      {:busy, count} -> {:error, {:lmdb_env_busy, count}}
+      {:error, _reason} = error -> error
     end
   end
 

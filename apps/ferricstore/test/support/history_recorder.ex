@@ -77,6 +77,32 @@ defmodule Ferricstore.Test.HistoryRecorder do
     Agent.get(agent, & &1)
   end
 
+  @doc """
+  Classifies one-shot counter write results for an exact final-value oracle.
+
+  A lost RPC reply or an explicit unknown-outcome timeout may have committed,
+  so those writes contribute to the upper bound rather than the failure count.
+  """
+  @spec counter_outcome_counts([term()]) :: %{
+          acknowledged: non_neg_integer(),
+          unknown: non_neg_integer(),
+          failed: non_neg_integer()
+        }
+  def counter_outcome_counts(results) when is_list(results) do
+    Enum.reduce(
+      results,
+      %{acknowledged: 0, unknown: 0, failed: 0},
+      fn result, counts ->
+        Map.update!(counts, counter_outcome(result), &(&1 + 1))
+      end
+    )
+  end
+
+  defp counter_outcome({:ok, _value}), do: :acknowledged
+  defp counter_outcome({:error, {:timeout, :unknown_outcome}}), do: :unknown
+  defp counter_outcome({:badrpc, _reason}), do: :unknown
+  defp counter_outcome(_result), do: :failed
+
   # ---------------------------------------------------------------------------
   # Verification
   # ---------------------------------------------------------------------------

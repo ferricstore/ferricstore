@@ -138,10 +138,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
                        persist_metadata_for_hot_position(old_handle, projected_handle)
                      end) do
                   {:ok, persisted_handle} ->
-                    {result, maybe_start_segment_projection_checkpoint(persisted_handle)}
+                    {tag_applied_result(position, result),
+                     maybe_start_segment_projection_checkpoint(persisted_handle)}
 
                   :skipped ->
-                    {result,
+                    {tag_applied_result(position, result),
                      projected_handle
                      |> maybe_mark_clean_position()
                      |> maybe_start_segment_projection_checkpoint()}
@@ -161,6 +162,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
              block_storage(old_handle, reason, position, :apply_projection_cache_compaction)}
         end
       end
+
+      defp tag_applied_result(
+             {:raft_log_pos, index, term} = position,
+             result
+           )
+           when is_integer(index) and index > 0 and is_integer(term) and term > 0,
+           do: {:waraft_applied_at, position, result}
+
+      defp tag_applied_result(_position, result), do: result
 
       defp maybe_compact_apply_projection_cache(handle) do
         limit = apply_projection_cache_max_entries()

@@ -11,6 +11,11 @@ Code.require_file(
   __DIR__
 )
 
+Code.require_file(
+  "state_machine_test/sections/promoted_compound_member_index.exs",
+  __DIR__
+)
+
 Code.require_file("state_machine_test/sections/flow_governance_limit.exs", __DIR__)
 
 Code.require_file("state_machine_test/sections/flow_index_rollback.exs", __DIR__)
@@ -239,6 +244,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowGovernanceReleaseOutbox
   use Ferricstore.Raft.StateMachineTest.Sections.FlowGovernanceLimit
+  use Ferricstore.Raft.StateMachineTest.Sections.PromotedCompoundMemberIndex
 
   defp safe_delete_ets(table) do
     :ets.delete(table)

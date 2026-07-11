@@ -668,26 +668,20 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest.Sections.NewNodeJoinContinuousWri
         end
       end
 
-      describe "disk snapshot: new node boots from copied disk while writes continue" do
+      describe "disk clone safety" do
         @tag timeout: 180_000
-        test "node with cloned disk joins cluster and gets all data" do
-          # 1. Start 3-node cluster, write data
-          nodes = ClusterHelper.start_cluster(3, shards: @shards)
-          on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+        @tag :disk_clone
+        test "copied shard data without consensus metadata fails closed" do
+          [source] = source_nodes = ClusterHelper.start_cluster(1, shards: @shards)
+          on_exit(fn -> ClusterHelper.stop_cluster(source_nodes) end)
+          on_exit(fn -> cleanup_orphan_peers() end)
 
-          [node_a, _node_b, _node_c] = nodes
-          n_a = node_name(node_a)
+          keys = write_keys(source, "pre_clone", 1..30)
+          assert Enum.all?(keys, &(read_key(source, &1) != nil))
 
-          keys = write_keys(node_a, "pre_clone", 1..30)
+          source_ctx =
+            :erpc.call(node_name(source), FerricStore.Instance, :get, [:default], 10_000)
 
-          # 2. Start continuous writer
-          writer_pid = start_continuous_writer(node_a, "during_clone")
-
-          # 3. Simulate EBS snapshot: copy data dir WHILE server is running.
-          #    No pausing — EBS does block-level atomic snapshot.
-          #    The copy may have partially written files, but recover_keydir
-          #    handles this (skips corrupt records at end of log files).
-          source_ctx = :erpc.call(n_a, FerricStore.Instance, :get, [:default], 10_000)
           source_data_dir = source_ctx.data_dir
 
           clone_dir =
@@ -699,74 +693,14 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest.Sections.NewNodeJoinContinuousWri
           File.cp_r!(source_data_dir, clone_dir)
           on_exit(fn -> File.rm_rf(clone_dir) end)
 
-          # Read last applied Raft index from cloned ra state BEFORE deleting.
-          for i <- 0..(source_ctx.shard_count - 1) do
-            idx = Ferricstore.Cluster.DataSync.read_last_applied_from_disk(clone_dir, i)
-            IO.puts("Shard #{i}: cloned data at raft index #{idx}")
-          end
-
-          # Delete Raft dirs — they contain source node server IDs and cannot be reused.
-          # Keep Bitcask data so the cloned node still boots with snapshot data.
+          # A new node identity cannot reuse the source consensus directories,
+          # but deleting them also removes the only authoritative replay position.
           File.rm_rf!(Path.join(clone_dir, "ra"))
           File.rm_rf!(Path.join(clone_dir, "waraft"))
 
-          # Stop the writer before join. The test still covers writes during the
-          # live disk copy, but add_node/1 should sync a finite backlog instead of
-          # chasing an unbounded moving target in CI.
-          {during_keys, during_count} = stop_continuous_writer(writer_pid)
-          IO.puts("Writes during clone copy: #{during_count}")
-
-          all_cluster_nodes = Enum.map(nodes, &node_name/1)
-
-          node_d =
-            ClusterHelper.start_node(
-              shards: @shards,
-              data_dir: clone_dir,
-              cluster_nodes: all_cluster_nodes
-            )
-
-          on_exit(fn -> ClusterHelper.stop_node(node_d) end)
-
-          # 5. Connect is automatic via cluster_nodes in start_node.
-          #    Existing nodes detect pre-existing Bitcask data and add the node.
-
-          # 6. Wait briefly for post-join replication and dump diagnostics.
-          Process.sleep(5_000)
-          dump_raft_diagnostics(node_a, node_d, @shards, "disk clone after join wait")
-
-          # 7. Write post-join data
-          post_keys = write_keys(node_a, "post_clone", 1..10)
-          all_keys = keys ++ during_keys ++ post_keys
-
-          # 8. Verify all keys on node_d
-          eventually(
-            fn ->
-              missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
-
-              if missing > 0 do
-                IO.puts("  poll: clone missing=#{missing}")
-              end
-
-              assert missing == 0, "#{missing} keys missing on node_d"
-            end,
-            "keys not replicated to cloned node",
-            120,
-            500
-          )
-
-          IO.puts("Total keys: #{length(all_keys)}, all present on cloned node")
-
-          # 9. Keydirs identical
-          eventually(
-            fn ->
-              assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "keydir mismatch"
-            end,
-            "keydirs not converged",
-            60,
-            500
-          )
-
-          IO.puts("SUCCESS: #{length(all_keys)} keys identical after disk clone join")
+          assert_raise RuntimeError, ~r/missing_current_storage_metadata/, fn ->
+            ClusterHelper.start_node(shards: @shards, data_dir: clone_dir)
+          end
         end
       end
 

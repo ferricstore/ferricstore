@@ -71,9 +71,16 @@ defmodule Ferricstore.Cluster.FlowStateMetaRetentionClusterTest do
         end)
       end)
 
+      Enum.each(nodes, fn node ->
+        assert :ok = remote_flush_lmdb(node.name)
+        assert_lmdb_envs_present(node.name)
+      end)
+
       target_shard = hd(specs).shard
       {_killed, remaining} = ClusterHelper.kill_leader(nodes, target_shard)
       assert :ok = ClusterHelper.wait_for_leaders(remaining, @shards, timeout: 60_000)
+
+      Enum.each(remaining, &assert_lmdb_envs_present(&1.name))
 
       cleaner = hd(remaining)
 
@@ -165,6 +172,27 @@ defmodule Ferricstore.Cluster.FlowStateMetaRetentionClusterTest do
       [ctx.name, ctx.shard_count, 30_000],
       30_000
     )
+  end
+
+  defp assert_lmdb_envs_present(node_name) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default], 5_000)
+
+    Enum.each(0..(ctx.shard_count - 1), fn shard_index ->
+      path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.LMDB.path()
+
+      assert :erpc.call(
+               node_name,
+               Ferricstore.Flow.LMDB,
+               :env_present?,
+               [path],
+               5_000
+             ),
+             "LMDB environment is detached on #{node_name} shard #{shard_index}: " <>
+               inspect(:erpc.call(node_name, File, :ls, [path], 5_000))
+    end)
   end
 
   defp remote_flow_state_shard(node_name, id, partition_key) do

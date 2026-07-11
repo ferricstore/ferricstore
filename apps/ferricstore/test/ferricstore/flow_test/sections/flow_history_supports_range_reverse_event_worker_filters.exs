@@ -718,7 +718,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistorySupportsRangeReverseEventWork
         {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
         assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 0
-        assert {:ok, nil} = FerricStore.get(history_entry_key)
+        assert {:ok, nil} = internal_get(history_entry_key)
       end
 
       test "flow history max events defaults to 100k and rejects invalid caps" do
@@ -752,19 +752,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistorySupportsRangeReverseEventWork
       end
 
       test "flow history hard default is clamped by configured maximum" do
-        original_hot = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
-        original_hard = Application.get_env(:ferricstore, :flow_default_history_max_events)
-        original_max = Application.get_env(:ferricstore, :flow_max_history_max_events)
-
-        Application.put_env(:ferricstore, :flow_default_history_hot_max_events, 10)
-        Application.put_env(:ferricstore, :flow_default_history_max_events, 100)
-        Application.put_env(:ferricstore, :flow_max_history_max_events, 5)
-
-        on_exit(fn ->
-          restore_env(:flow_default_history_hot_max_events, original_hot)
-          restore_env(:flow_default_history_max_events, original_hard)
-          restore_env(:flow_max_history_max_events, original_max)
-        end)
+        configure_default_apply_context(
+          flow_default_history_hot_max_events: 10,
+          flow_default_history_max_events: 100,
+          flow_max_history_max_events: 5
+        )
 
         assert {:ok, created} =
                  flow_create_and_get(uid("flow-history-default-hard-clamp"),
@@ -777,10 +769,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistorySupportsRangeReverseEventWork
       end
 
       test "flow history configured maximum cannot exceed hard cap" do
-        original_max = Application.get_env(:ferricstore, :flow_max_history_max_events)
-        Application.put_env(:ferricstore, :flow_max_history_max_events, 2_000_000)
-
-        on_exit(fn -> restore_env(:flow_max_history_max_events, original_max) end)
+        configure_default_apply_context(flow_max_history_max_events: 2_000_000)
 
         assert {:error, "ERR flow history_max_events exceeds maximum 1000000"} =
                  flow_create_and_get(uid("flow-history-hard-cap-env"),
@@ -790,16 +779,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistorySupportsRangeReverseEventWork
       end
 
       test "flow history uses configured default hot max when omitted" do
-        original = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
-        Application.put_env(:ferricstore, :flow_default_history_hot_max_events, 2)
-
-        on_exit(fn ->
-          if is_nil(original) do
-            Application.delete_env(:ferricstore, :flow_default_history_hot_max_events)
-          else
-            Application.put_env(:ferricstore, :flow_default_history_hot_max_events, original)
-          end
-        end)
+        configure_default_apply_context(flow_default_history_hot_max_events: 2)
 
         id = uid("flow-history-default-retention")
 

@@ -8,6 +8,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
+      alias Ferricstore.Flow.LMDBWriter
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.WARaftSegmentReader
       alias Ferricstore.Store.BlobRef
@@ -89,6 +90,50 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
       defp snapshot_payload_kinds, do: [:data, :blob, :dedicated, :prob]
 
       defp snapshot_storage_payload_kinds, do: [:segment_projection_log, :apply_projection_log]
+
+      defp with_flow_lmdb_snapshot_install(handle, fun) when is_function(fun, 0) do
+        with :ok <- prepare_flow_lmdb_snapshot_install(handle) do
+          result =
+            try do
+              fun.()
+            catch
+              kind, reason ->
+                _ = resume_flow_lmdb_after_snapshot_install(handle)
+                :erlang.raise(kind, reason, __STACKTRACE__)
+            end
+
+          case resume_flow_lmdb_after_snapshot_install(handle) do
+            :ok -> result
+            {:error, reason} -> {:error, {:flow_lmdb_snapshot_resume_failed, reason}}
+          end
+        end
+      end
+
+      defp prepare_flow_lmdb_snapshot_install(%{ctx: ctx, shard_index: shard_index} = handle) do
+        instance_name = Map.get(ctx, :name, :default)
+
+        with :ok <- LMDBWriter.prepare_snapshot_install(instance_name, shard_index) do
+          lmdb_path = flow_lmdb_path(ctx, shard_index)
+
+          release_result =
+            with :ok <- Ferricstore.FS.mkdir_p(lmdb_path) do
+              FlowLMDB.release(lmdb_path)
+            end
+
+          case release_result do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              _ = resume_flow_lmdb_after_snapshot_install(handle)
+              {:error, {:flow_lmdb_snapshot_release_failed, reason}}
+          end
+        end
+      end
+
+      defp resume_flow_lmdb_after_snapshot_install(%{ctx: ctx, shard_index: shard_index}) do
+        LMDBWriter.resume_after_snapshot_install(Map.get(ctx, :name, :default), shard_index)
+      end
 
       defp storage_payload_dir_specs(%{root_dir: root_dir}) do
         [

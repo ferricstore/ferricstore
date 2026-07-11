@@ -28,7 +28,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
           partition_key: partition_key,
           run_at_ms: 1,
           now_ms: 1,
-          payload: "payload-v1"
+          payload: "payload-v1",
+          policy_snapshot_captured: true
         }
 
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
@@ -770,7 +771,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
         assert shard_payload_present?(restarted_ctx, 0)
       end
 
-      test "restart fails closed when missing metadata sees special payload files", %{
+      test "missing metadata failure takes precedence over special payload files", %{
         root: root,
         ctx: ctx
       } do
@@ -793,7 +794,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
                    log_module: :ferricstore_waraft_spike_segment_log
                  )
 
-        assert inspect(reason) =~ "unsafe_snapshot_payload_path"
+        assert inspect(reason) =~ "missing_current_storage_metadata"
       end
 
       test "cluster-member start publishes zero storage metadata before payload apply", %{

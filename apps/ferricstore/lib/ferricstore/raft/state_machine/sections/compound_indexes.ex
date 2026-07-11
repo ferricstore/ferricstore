@@ -39,7 +39,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -53,6 +53,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         case NIF.v2_append_tombstone(active, compound_key) do
           {:ok, _offset} ->
             :ets.delete(state.ets, compound_key)
+
+            CompoundMemberIndex.delete(
+              Map.get(state, :compound_member_index_name),
+              compound_key
+            )
+
             sm_tx_drop_pending(compound_key)
             deleted = Process.get(:tx_deleted_keys, MapSet.new())
             Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
@@ -277,6 +283,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         |> Enum.each(fn key ->
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
+          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
           sm_tx_drop_pending(key)
           deleted = Process.get(:tx_deleted_keys, MapSet.new())
           Process.put(:tx_deleted_keys, MapSet.put(deleted, key))

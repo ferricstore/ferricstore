@@ -27,6 +27,20 @@ defmodule Ferricstore.Flow.LMDBWriter.Telemetry do
 
   def publish_requested(_instance_ctx, _shard_index, _index), do: :ok
 
+  def reset_replay_safe(instance_ctx, shard_index, index)
+      when is_integer(shard_index) and shard_index >= 0 and is_integer(index) and index >= 0 do
+    reset_atomic(Map.get(instance_ctx || %{}, :flow_lmdb_replay_safe_index), shard_index, index)
+
+    reset_atomic(
+      Map.get(instance_ctx || %{}, :flow_lmdb_replay_safe_requested_index),
+      shard_index,
+      index
+    )
+
+    reset_atomic(Map.get(instance_ctx || %{}, :flow_lmdb_mirror_degraded), shard_index, 0)
+    :ok
+  end
+
   def record_persist_failure(%{flow_lmdb_replay_safe_persist_failures: failures}, shard_index)
       when is_reference(failures) do
     if shard_index < :atomics.info(failures).size do
@@ -214,6 +228,18 @@ defmodule Ferricstore.Flow.LMDBWriter.Telemetry do
   defp persist_reason({:error, reason}), do: reason
 
   defp replay_safe_lag(state), do: max(state.requested_index - state.durable_index, 0)
+
+  defp reset_atomic(ref, shard_index, value) when is_reference(ref) do
+    if shard_index < :atomics.info(ref).size do
+      :atomics.put(ref, shard_index + 1, value)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp reset_atomic(_ref, _shard_index, _value), do: :ok
 
   defp writer_metadata(state) do
     %{

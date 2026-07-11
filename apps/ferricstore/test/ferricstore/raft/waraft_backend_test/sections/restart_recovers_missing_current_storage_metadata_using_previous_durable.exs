@@ -974,7 +974,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
           |> File.read!()
           |> :erlang.binary_to_term([:safe])
 
-        assert metadata.apply_context == persisted_context
+        assert {:ok, ^persisted_context} =
+                 Ferricstore.Raft.ApplyContext.decode(metadata.apply_context)
 
         handle = %{
           ctx: install_ctx,

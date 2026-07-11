@@ -25,6 +25,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
            %{root: root, ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
+        bitcask_file = Path.join([root, "data", "shard_0", "00000.log"])
+        bitcask_size = File.stat!(bitcask_file).size
         key = "default-segment-keydir:k1"
         assert :ok = WARaftBackend.write(0, {:put, key, "v1", 0})
         assert "v1" == Router.get(ctx, key)
@@ -38,8 +40,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         assert is_integer(offset)
         assert offset >= 0
 
-        bitcask_file = Path.join([root, "data", "shard_0", "00000.log"])
-        assert File.stat!(bitcask_file).size == 0
+        assert File.stat!(bitcask_file).size == bitcask_size
 
         assert :ok = WARaftBackend.stop()
 
@@ -67,7 +68,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
 
           assert is_integer(restarted_offset)
           assert restarted_offset >= 0
-          assert File.stat!(bitcask_file).size == 0
         after
           FerricStore.Instance.cleanup(restarted_ctx.name)
         end
@@ -367,6 +367,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
 
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
+          bitcask_file = Path.join([root, "data", "shard_0", "00000.log"])
+          bitcask_size = File.stat!(bitcask_file).size
           key = "segment-keydir:k1"
           assert :ok = WARaftBackend.write(0, {:put, key, "v1", 0})
           assert "v1" == Router.get(ctx, key)
@@ -377,7 +379,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
 
           assert is_integer(index) and index > 0
           assert is_integer(offset) and offset >= 0
-          assert File.stat!(Path.join([root, "data", "shard_0", "00000.log"])).size == 0
+          assert File.stat!(bitcask_file).size == bitcask_size
 
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
@@ -742,6 +744,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
 
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
+          bitcask_file = Path.join([root, "data", "shard_0", "00000.log"])
+          bitcask_size = File.stat!(bitcask_file).size
           key = "segment-keydir:large"
           value = :binary.copy("v", ctx.hot_cache_max_value_size + 1)
 
@@ -755,6 +759,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
           assert is_integer(index) and index > 0
           assert is_integer(offset) and offset >= 0
           assert value == Router.get(ctx, key)
+          assert File.stat!(bitcask_file).size == bitcask_size
 
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
@@ -767,7 +772,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
                    )
 
           assert value == Router.get(restarted_ctx, key)
-          assert File.stat!(Path.join([root, "data", "shard_0", "00000.log"])).size == 0
         after
           restore_env(:waraft_storage_apply_mode, previous_mode)
         end

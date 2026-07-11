@@ -69,7 +69,9 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
 
     reservation_keys =
       [first_id | many_ids]
-      |> Enum.map(&Keys.governance_limit_reservation_key(scope, 0, many_owner.leases[0].epoch, &1))
+      |> Enum.map(
+        &Keys.governance_limit_reservation_key(scope, 0, many_owner.leases[0].epoch, &1)
+      )
 
     assert Enum.count(reservation_keys, &(Router.get(ctx, &1) != nil)) == 1_001
     assert Router.get(ctx, Keys.governance_limit_reservation_key(scope, 0, 1, first_id)) != nil
@@ -683,6 +685,56 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
     assert_eventually(fn ->
       Router.get(ctx, Keys.governance_limit_reservation_key(scope, 0, 1, reservation_id)) ==
         nil
+    end)
+  end
+
+  test "existing owner reads renewals and releases repair catalog membership" do
+    ctx = FerricStore.Instance.get(:default)
+    catalog_key = Keys.governance_catalog_key(:limit)
+
+    operations = [
+      {:get, fn scope -> LimitStore.get(ctx, scope, now_ms: 1_001) end},
+      {:renew,
+       fn scope ->
+         LimitStore.renew(ctx, scope, shard_id: 0, ttl_ms: 1_000, now_ms: 1_001)
+       end},
+      {:release,
+       fn scope ->
+         LimitStore.release(ctx, scope,
+           shard_id: 0,
+           reservation_ids: ["uncataloged-release"],
+           now_ms: 1_001
+         )
+       end}
+    ]
+
+    Enum.each(operations, fn {operation, invoke} ->
+      scope = unique_flow_id("detached-limit-#{operation}-catalog-repair")
+      key = Keys.governance_limit_key(scope)
+      shard = Router.shard_for(ctx, key)
+
+      owner = %CreditLease.Owner{
+        scope: scope,
+        limit: 1,
+        free: 0,
+        epoch: 1,
+        leases: %{
+          0 => %CreditLease.Lease{
+            shard_id: 0,
+            epoch: 1,
+            expires_at_ms: 2_000,
+            available: 1
+          }
+        }
+      }
+
+      assert {:ok, value} = LimitRecord.encode_owner(owner)
+      assert :ok = WARaftBackend.write(shard, {:put, key, value, 0})
+      assert {:ok, _removed} = FerricStore.Impl.zrem(ctx, catalog_key, [key])
+      assert {:ok, false} = Catalog.member?(ctx, catalog_key, key)
+
+      assert {:ok, _result} = invoke.(scope)
+      assert {:ok, true} = Catalog.member?(ctx, catalog_key, key)
     end)
   end
 

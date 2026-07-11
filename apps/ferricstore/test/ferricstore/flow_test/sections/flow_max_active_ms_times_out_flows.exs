@@ -341,7 +341,6 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
       end
 
       test "retention bounds the exact cross-shard cleanup command globally" do
-        ctx = FerricStore.Instance.get(:default)
         {partition_a, _same_partition, partition_b} = mixed_partition_keys()
         create_now = System.system_time(:millisecond) + 60_000
         complete_now = create_now + 10
@@ -350,14 +349,13 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
         byte_budget = 12_000
         parent = self()
 
-        old_key_budget = Application.get_env(:ferricstore, :flow_retention_cleanup_key_budget)
-
-        old_byte_budget =
-          Application.get_env(:ferricstore, :flow_retention_cleanup_byte_budget)
-
         old_hook = Application.get_env(:ferricstore, :flow_retention_command_hook)
-        Application.put_env(:ferricstore, :flow_retention_cleanup_key_budget, key_budget)
-        Application.put_env(:ferricstore, :flow_retention_cleanup_byte_budget, byte_budget)
+
+        ctx =
+          configure_default_apply_context(
+            flow_retention_cleanup_key_budget: key_budget,
+            flow_retention_cleanup_byte_budget: byte_budget
+          )
 
         Application.put_env(:ferricstore, :flow_retention_command_hook, fn kind, command ->
           send(parent, {:retention_command, kind, command})
@@ -365,8 +363,6 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
         end)
 
         on_exit(fn ->
-          restore_env(:flow_retention_cleanup_key_budget, old_key_budget)
-          restore_env(:flow_retention_cleanup_byte_budget, old_byte_budget)
           restore_env(:flow_retention_command_hook, old_hook)
         end)
 

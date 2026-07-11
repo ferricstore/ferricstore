@@ -94,8 +94,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
       Process.sleep(200)
       :ok = ClusterHelper.wait_for_leaders([n1, n2], 4, timeout: 15_000)
 
-      # Count successful increments
-      ok_count = Enum.count(results, &match?({:ok, _}, &1))
+      outcome_counts = HistoryRecorder.counter_outcome_counts(results)
 
       # Counter on n1 must not have regressed below max ACKed value
       violations = HistoryRecorder.verify_counter_monotonic(history, [n1], key)
@@ -104,17 +103,23 @@ defmodule Ferricstore.Jepsen.CounterTest do
              "Counter monotonicity violated:\n" <>
                HistoryRecorder.format_violations(violations)
 
-      # Final value must equal number of successful increments
+      # Unknown outcomes may have committed even though their replies were lost.
       {:ok, final_val} = :rpc.call(n1.name, FerricStore, :get, [key])
       assert final_val != nil, "counter key should exist"
       final_int = String.to_integer(final_val)
 
-      assert final_int == ok_count,
-             "Counter #{final_int} != successful increments #{ok_count}"
+      assert final_int >= outcome_counts.acknowledged,
+             "Counter #{final_int} lost an acknowledged increment; " <>
+               "acknowledged=#{outcome_counts.acknowledged}"
+
+      assert final_int <= outcome_counts.acknowledged + outcome_counts.unknown,
+             "Counter #{final_int} exceeds all writes that could have committed; " <>
+               "acknowledged=#{outcome_counts.acknowledged}, unknown=#{outcome_counts.unknown}"
 
       IO.puts(
         "  Final counter value: #{final_int} " <>
-          "(#{ok_count} successful increments, 0 lost)"
+          "(#{outcome_counts.acknowledged} acknowledged, " <>
+          "#{outcome_counts.unknown} unknown, 0 acknowledged lost)"
       )
     end
 
@@ -146,20 +151,22 @@ defmodule Ferricstore.Jepsen.CounterTest do
         end
 
       results = Task.await_many(tasks, 30_000)
-      ok_count = Enum.count(results, &match?({:ok, _}, &1))
+      outcome_counts = HistoryRecorder.counter_outcome_counts(results)
 
       # Allow flush
       Process.sleep(100)
 
-      # Final value must equal number of successful increments
       {:ok, final_val} = :rpc.call(node.name, FerricStore, :get, [key])
       assert final_val != nil, "counter key should exist"
       final_int = String.to_integer(final_val)
 
-      assert final_int == ok_count,
-             "Counter #{final_int} != successful increments #{ok_count}"
+      assert final_int >= outcome_counts.acknowledged
+      assert final_int <= outcome_counts.acknowledged + outcome_counts.unknown
 
-      IO.puts("  Counter agreement: final=#{final_int}, ok_increments=#{ok_count}")
+      IO.puts(
+        "  Counter agreement: final=#{final_int}, " <>
+          "acknowledged=#{outcome_counts.acknowledged}, unknown=#{outcome_counts.unknown}"
+      )
     end
 
     @tag :jepsen
