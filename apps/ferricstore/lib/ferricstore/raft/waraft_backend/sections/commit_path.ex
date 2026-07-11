@@ -526,7 +526,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
 
       defp prepare_commit_command(shard_index, command) do
         case fetch_context() do
-          {:ok, ctx} ->
+          {:ok, %{apply_context: %Ferricstore.Raft.ApplyContext{} = apply_context} = ctx} ->
             result =
               try do
                 if BlobCommand.side_channel_candidate?(ctx, command) do
@@ -550,15 +550,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
                 error
 
               {:ok, prepared_command, blob_protection} ->
-                apply_context =
-                  case Map.get(ctx, :apply_context) do
-                    %Ferricstore.Raft.ApplyContext{} = context -> context
-                    _legacy -> Ferricstore.Raft.ApplyContext.from_runtime()
-                  end
-
                 {:ok, Ferricstore.Raft.ApplyContext.wrap_command(prepared_command, apply_context),
                  blob_protection}
             end
+
+          {:ok, _missing_apply_context} ->
+            {:error, :missing_apply_context}
 
           :error ->
             {:error, :unreachable}

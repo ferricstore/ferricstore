@@ -8,7 +8,7 @@ defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
   alias Ferricstore.Commands.Server
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
-  alias Ferricstore.Transaction.Coordinator
+  alias Ferricstore.Test.PreparedTransactionCoordinator, as: Coordinator
 
   setup do
     original_max_active_file_size = Application.get_env(:ferricstore, :max_active_file_size)

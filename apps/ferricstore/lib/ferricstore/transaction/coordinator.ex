@@ -264,7 +264,8 @@ defmodule Ferricstore.Transaction.Coordinator do
   defp classify_entry(%PreparedCommand{}, _index, _ctx, _sandbox_namespace),
     do: invalid_prepared_routing()
 
-  defp classify_entry(entry, index, ctx, sandbox_namespace) do
+  defp classify_entry({cmd, args, _ast} = entry, index, ctx, sandbox_namespace)
+       when is_binary(cmd) and is_list(args) do
     {cmd, args, ast} = TxAst.normalize_entry(entry)
 
     routing_shards =
@@ -282,6 +283,9 @@ defmodule Ferricstore.Transaction.Coordinator do
        write_shards: :execution
      }}
   end
+
+  defp classify_entry(_invalid, _index, _ctx, _sandbox_namespace),
+    do: {:error, "ERR invalid transaction command"}
 
   defp prepared_entry(%PreparedCommand{command: command, args: args, ast: ast}),
     do: {command, args, ast}

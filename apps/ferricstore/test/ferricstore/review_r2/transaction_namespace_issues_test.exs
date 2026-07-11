@@ -24,7 +24,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Store.Router
-  alias Ferricstore.Transaction.Coordinator
+  alias Ferricstore.Test.PreparedTransactionCoordinator, as: Coordinator
   alias Ferricstore.Test.ShardHelpers
 
   setup do

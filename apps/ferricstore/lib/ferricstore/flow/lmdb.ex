@@ -35,10 +35,12 @@ defmodule Ferricstore.Flow.LMDB do
 
   # LMDB stores Flow state as a wrapper around the already-versioned Flow record
   # bytes: {expire_at_ms, encoded_record}. The wrapper owns TTL semantics only.
-  # Do not version Flow metadata here or decode user payload here. If the wrapper
-  # itself changes, add a wrapper version and keep decoding this tuple form so
-  # old LMDB mirrors can survive restart/rebuild after upgrade.
-  def encode_value(value, expire_at_ms), do: :erlang.term_to_binary({expire_at_ms, value})
+  # Do not decode user payload here; the Flow schema gate remains centralized.
+  def encode_value(value, expire_at_ms) when is_integer(expire_at_ms) and expire_at_ms >= 0,
+    do: :erlang.term_to_binary({expire_at_ms, value})
+
+  def encode_value(_value, _expire_at_ms),
+    do: raise(ArgumentError, "LMDB value expiration must be a non-negative integer")
 
   # Returns the wrapped encoded Flow record when it is still live. Callers must
   # pass the returned value through Ferricstore.Flow.decode_record/1 so the Flow
@@ -51,8 +53,8 @@ defmodule Ferricstore.Flow.LMDB do
       {0, value} ->
         {:ok, value}
 
-      {_expire_at_ms, value} ->
-        {:ok, value}
+      _invalid ->
+        :error
     end
   rescue
     _ -> :error
@@ -62,9 +64,14 @@ defmodule Ferricstore.Flow.LMDB do
     if Ferricstore.FS.dir?(path), do: NIF.lmdb_get(path, key, map_size()), else: :not_found
   end
 
-  def encode_value_locator(expire_at_ms, file_id, offset, value_size) do
+  def encode_value_locator(expire_at_ms, file_id, offset, value_size)
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 and is_integer(offset) and offset >= 0 and
+             is_integer(value_size) and value_size >= 0 do
     :erlang.term_to_binary({:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size})
   end
+
+  def encode_value_locator(_expire_at_ms, _file_id, _offset, _value_size),
+    do: raise(ArgumentError, "LMDB value locator metadata is invalid")
 
   def decode_value_locator(blob, now_ms) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
@@ -76,8 +83,11 @@ defmodule Ferricstore.Flow.LMDB do
           decode_live_value_locator(file_id, offset, value_size)
         end
 
-      {:flow_value_locator, 1, _expire_at_ms, file_id, offset, value_size} ->
+      {:flow_value_locator, 1, 0, file_id, offset, value_size} ->
         decode_live_value_locator(file_id, offset, value_size)
+
+      {:flow_value_locator, 1, _expire_at_ms, _file_id, _offset, _value_size} ->
+        :error
 
       _other ->
         :not_locator

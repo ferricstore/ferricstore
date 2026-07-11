@@ -69,6 +69,6 @@ defmodule Ferricstore.Commands.AstPurityAuditTest do
     refute source =~ "parse_set_options"
     refute source =~ "parse_getex_options"
     refute source =~ "defp parse_integer"
-    assert source =~ "Dispatcher.parse_raw"
+    refute source =~ "Dispatcher.parse_raw"
   end
 end

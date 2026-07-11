@@ -46,7 +46,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     * **Wrapped**: `{inner_command, %{hlc_ts: {physical_ms, logical}}}` --
       the metadata map carries the leader's HLC timestamp for merging.
-    * **Unwrapped**: `inner_command` (legacy / test) -- processed as before
+    * **Unwrapped**: ordinary commands that do not consume replicated Flow limits
       without HLC merging.
 
   ## Log compaction (spec 2E.5)

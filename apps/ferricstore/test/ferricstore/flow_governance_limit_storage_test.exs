@@ -794,6 +794,77 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
              LimitCatalogOutbox.read_page(ctx, shard_index, 256)
   end
 
+  test "catalog publication batches owner reads and the idempotent catalog write" do
+    ctx = FerricStore.Instance.get(:default)
+    catalog_key = Keys.governance_catalog_key(:limit)
+    assert ctx.shard_count > 1
+    target_shard = 1
+    reconciler = Process.whereis(Ferricstore.Flow.Governance.LimitReconciler)
+    :ok = :sys.suspend(reconciler)
+
+    on_exit(fn ->
+      if Process.alive?(reconciler), do: :sys.resume(reconciler)
+    end)
+
+    owner_keys =
+      Enum.map(1..3, fn index ->
+        scope = governance_scope_for_shard(ctx, "batched-limit-catalog-#{index}", target_shard)
+        owner_key = Keys.governance_limit_key(scope)
+
+        assert {:ok, _lease} =
+                 LimitStore.lease(ctx, scope,
+                   shard_id: 0,
+                   amount: 1,
+                   limit: 1,
+                   ttl_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        owner_key
+      end)
+
+    assert {:ok, 3} = FerricStore.Impl.zrem(ctx, catalog_key, owner_keys)
+
+    assert {:ok, %{entries: entries}} =
+             LimitCatalogOutbox.read_page(ctx, target_shard, 256)
+
+    assert length(entries) == 3
+
+    assert {:ok,
+            %{
+              catalog_published: 0,
+              catalog_shards_scanned: 1,
+              next_catalog_shard: ^target_shard
+            }} =
+             Ferricstore.Flow.Governance.LimitReconciler.run_once(ctx,
+               now_ms: 1_001,
+               reservation_limit: 256,
+               catalog_shard: 0
+             )
+
+    Enum.each(owner_keys, fn owner_key ->
+      assert {:ok, false} = Catalog.member?(ctx, catalog_key, owner_key)
+    end)
+
+    assert {:ok,
+            %{
+              errors: 0,
+              catalog_published: 3,
+              catalog_read_batches: 2,
+              catalog_write_batches: 1,
+              catalog_shards_scanned: 1
+            }} =
+             Ferricstore.Flow.Governance.LimitReconciler.run_once(ctx,
+               now_ms: 1_001,
+               reservation_limit: 256,
+               catalog_shard: target_shard
+             )
+
+    Enum.each(owner_keys, fn owner_key ->
+      assert {:ok, true} = Catalog.member?(ctx, catalog_key, owner_key)
+    end)
+  end
+
   test "catalog publication discards a torn intent whose owner never committed" do
     ctx = FerricStore.Instance.get(:default)
     shard_index = 0
@@ -819,6 +890,71 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
              LimitCatalogOutbox.read_page(ctx, shard_index, 256)
   end
 
+  test "catalog publication acknowledges only the valid prefix before a corrupt owner" do
+    ctx = FerricStore.Instance.get(:default)
+    catalog_key = Keys.governance_catalog_key(:limit)
+    shard_index = 0
+    reconciler = Process.whereis(Ferricstore.Flow.Governance.LimitReconciler)
+    :ok = :sys.suspend(reconciler)
+
+    on_exit(fn ->
+      if Process.alive?(reconciler), do: :sys.resume(reconciler)
+    end)
+
+    owner_keys =
+      Enum.map(1..3, fn index ->
+        scope = governance_scope_for_shard(ctx, "catalog-prefix-#{index}", shard_index)
+        owner_key = Keys.governance_limit_key(scope)
+
+        assert {:ok, _lease} =
+                 LimitStore.lease(ctx, scope,
+                   shard_id: 0,
+                   amount: 1,
+                   limit: 1,
+                   ttl_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        owner_key
+      end)
+
+    [first_key, corrupt_key, last_key] = owner_keys
+    assert {:ok, 3} = FerricStore.Impl.zrem(ctx, catalog_key, owner_keys)
+    assert :ok = WARaftBackend.write(shard_index, {:put, corrupt_key, "corrupt", 0})
+
+    assert {:ok, %{catalog_published: 1, catalog_errors: 1}} =
+             Ferricstore.Flow.Governance.LimitReconciler.run_once(ctx,
+               now_ms: 1_001,
+               reservation_limit: 256,
+               catalog_shard: shard_index
+             )
+
+    assert {:ok, true} = Catalog.member?(ctx, catalog_key, first_key)
+    assert {:ok, false} = Catalog.member?(ctx, catalog_key, corrupt_key)
+    assert {:ok, false} = Catalog.member?(ctx, catalog_key, last_key)
+
+    assert {:ok,
+            %{
+              entries: [
+                {_corrupt_sequence, ^corrupt_key},
+                {_last_sequence, ^last_key}
+              ]
+            }} =
+             LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+
+    assert :ok = WARaftBackend.write(shard_index, {:delete, corrupt_key})
+
+    assert {:ok, %{catalog_published: 2, catalog_errors: 0}} =
+             Ferricstore.Flow.Governance.LimitReconciler.run_once(ctx,
+               now_ms: 1_002,
+               reservation_limit: 256,
+               catalog_shard: shard_index
+             )
+
+    assert {:ok, true} = Catalog.member?(ctx, catalog_key, last_key)
+    assert {:ok, %{entries: []}} = LimitCatalogOutbox.read_page(ctx, shard_index, 256)
+  end
+
   test "catalog publication backlog is strictly bounded" do
     full = %{head: 1, tail: 65_536}
 
@@ -836,5 +972,12 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
     refute function_exported?(LimitStore, :force_release_amount, 3)
     refute function_exported?(CreditLease, :bind, 4)
     refute function_exported?(CreditLease, :reservations, 1)
+  end
+
+  defp governance_scope_for_shard(ctx, prefix, shard_index) do
+    Stream.repeatedly(fn -> unique_flow_id(prefix) end)
+    |> Enum.find(fn scope ->
+      Router.shard_for(ctx, Keys.governance_limit_key(scope)) == shard_index
+    end)
   end
 end

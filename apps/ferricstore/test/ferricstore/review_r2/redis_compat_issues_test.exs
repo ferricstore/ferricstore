@@ -335,7 +335,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       # EXEC should succeed because value hash didn't change
       queue = [{"SET", [key, "should_not_write", "NX"]}]
 
-      result = Ferricstore.Transaction.Coordinator.execute(queue, watched, nil)
+      result = Ferricstore.Test.PreparedTransactionCoordinator.execute(queue, watched, nil)
 
       # Value-hash WATCH: NX skip doesn't change the value, so hash matches.
       assert result == [nil],
@@ -365,7 +365,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
         {"SET", [key_b, "written_by_b"]}
       ]
 
-      Ferricstore.Transaction.Coordinator.execute(client_b_queue, %{}, nil)
+      Ferricstore.Test.PreparedTransactionCoordinator.execute(client_b_queue, %{}, nil)
 
       # Client A: value hash should be unchanged since key_a was not modified.
       # With value-hash WATCH, the cross-shard WriteVersion.increment is
@@ -378,7 +378,9 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       # Client A: EXEC with watched key -- should succeed
       watched_a = %{key_a => hash_a}
       client_a_queue = [{"SET", [key_a, "updated_by_a"]}]
-      result = Ferricstore.Transaction.Coordinator.execute(client_a_queue, watched_a, nil)
+
+      result =
+        Ferricstore.Test.PreparedTransactionCoordinator.execute(client_a_queue, watched_a, nil)
 
       assert result == [:ok],
              "R2-H13: Client A's EXEC should succeed, got: #{inspect(result)}"

@@ -790,10 +790,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         {:batch, Enum.map(commands, &normalize_stamped_command/1)}
       end
 
-      defp normalize_stamped_command({:async, command}) do
-        {:async, normalize_stamped_command(command)}
-      end
-
       defp normalize_stamped_command(command), do: command
 
       defp with_cross_shard_pending_writes(state, fun) do

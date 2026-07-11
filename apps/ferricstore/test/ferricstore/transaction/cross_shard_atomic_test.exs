@@ -15,7 +15,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
   @moduletag :global_state
 
   alias Ferricstore.Store.Router
-  alias Ferricstore.Transaction.Coordinator
+  alias Ferricstore.Test.PreparedTransactionCoordinator, as: Coordinator
   alias Ferricstore.Test.ShardHelpers
 
   setup do

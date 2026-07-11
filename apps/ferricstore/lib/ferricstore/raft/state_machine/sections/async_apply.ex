@@ -278,28 +278,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         apply_single(state, inner_cmd)
       end
 
-      # 2-tuple async clauses (legacy shape from binaries before origin tagging).
-      # Kept for WAL backward compatibility — replays still work. New writes use
-      # the 3-tuple form. Falls back to the ETS-presence heuristic which is
-      # imperfect for repeated RMW on the same key but correct for the common
-      # case (single put/delete/incr per key per batch).
-      defp apply_single(state, {:async, {:put, key, value, expire_at_ms} = _inner}) do
-        if async_key_present?(state, {:put, key, value, expire_at_ms}) do
-          maybe_queue_origin_pending_put(state, key, value, expire_at_ms)
-          :ok
-        else
-          apply_single(state, {:put, key, value, expire_at_ms})
-        end
-      end
-
-      defp apply_single(state, {:async, inner_cmd}) do
-        if async_key_present?(state, inner_cmd) do
-          :ok
-        else
-          apply_single(state, inner_cmd)
-        end
-      end
-
       defp apply_single(state, {:put, key, value, expire_at_ms}) do
         redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 

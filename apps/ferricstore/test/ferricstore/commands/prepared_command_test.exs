@@ -2,6 +2,7 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Dispatcher, KeyDiscovery, PreparedCommand}
+  alias Ferricstore.Transaction.Ast, as: TransactionAst
 
   test "dynamic merge keys share one ACL, routing, and mutation footprint" do
     assert {:ok, prepared} =
@@ -103,7 +104,7 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     end
   end
 
-  test "key access normalization preserves legacy lowercase and pipeline classifications" do
+  test "key access normalization accepts lowercase names and classifies pipelines" do
     assert KeyDiscovery.access_keys("copy", ["source", "destination"]) ==
              {["source"], ["destination"]}
 
@@ -187,10 +188,14 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     end
   end
 
-  test "legacy parse_raw output is a compatibility view of the prepared command" do
-    assert {:ok, prepared} = Dispatcher.prepare_raw("MGET", ["one", "two"])
+  test "tuple projection APIs are not part of the prepared-command contract" do
+    refute function_exported?(Dispatcher, :parse_raw, 2)
+    refute function_exported?(PreparedCommand, :legacy_result, 1)
+  end
 
-    assert Dispatcher.parse_raw("MGET", ["one", "two"]) ==
-             {:ok, prepared.command, prepared.args, prepared.ast, prepared.acl_keys}
+  test "transaction queue entries require their prepared AST" do
+    assert_raise FunctionClauseError, fn ->
+      apply(TransactionAst, :normalize_entry, [{"GET", ["key"]}])
+    end
   end
 end

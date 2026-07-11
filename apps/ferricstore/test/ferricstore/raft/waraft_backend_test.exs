@@ -194,6 +194,23 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
     %{root: root, ctx: ctx}
   end
 
+  @tag :strict_commit_apply_context
+  test "commit rejects a backend context without replicated apply limits", %{ctx: ctx} do
+    assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+    context_key = {{WARaftBackend, :context}, :ferricstore_waraft_backend}
+    :persistent_term.put(context_key, Map.delete(ctx, :apply_context))
+
+    try do
+      assert {:error, :missing_apply_context} =
+               WARaftBackend.write(0, {:put, "commit:missing-apply-context", "value", 0})
+    after
+      :persistent_term.put(context_key, ctx)
+    end
+
+    assert Router.get(ctx, "commit:missing-apply-context") == nil
+  end
+
   use Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLogModule
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFlowApplyProjectionValueCache

@@ -86,11 +86,6 @@ defmodule Ferricstore.Commands.PreparedCommand do
     }
   end
 
-  @spec legacy_result(t()) :: {:ok, binary(), [binary()], term(), [binary()]}
-  def legacy_result(%__MODULE__{} = prepared) do
-    {:ok, prepared.command, prepared.args, prepared.ast, prepared.acl_keys}
-  end
-
   @spec mutation_footprint(t()) :: %{read: [binary()], write: [binary()]}
   def mutation_footprint(%__MODULE__{} = prepared) do
     %{read: prepared.read_keys, write: prepared.write_keys}

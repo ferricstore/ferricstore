@@ -12,7 +12,7 @@ defmodule Ferricstore.Cluster.JoinIdentity do
         :ok
 
       {{:error, :enoent}, {:error, :enoent}} ->
-        :ok
+        {:error, {:local_cluster_state_missing, target_node}}
 
       {{:error, :enoent}, {:ok, _}} ->
         {:error, {:local_cluster_state_missing, target_node}}

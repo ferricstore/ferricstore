@@ -61,87 +61,181 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
       Keyword.get(opts, :reservation_limit, Keyword.get(opts, :scope_limit, 256))
 
     cursor = Keyword.get(opts, :cursor)
-    _catalog_result = reconcile_catalog_publications(ctx, 0, reservation_limit)
-    reconcile_page(ctx, cursor, reservation_limit, now_ms)
+    catalog_shard = Keyword.get(opts, :catalog_shard, 0)
+
+    {next_catalog_shard, catalog_result} =
+      reconcile_catalog_publications(ctx, catalog_shard, reservation_limit)
+
+    case reconcile_page(ctx, cursor, reservation_limit, now_ms) do
+      {:ok, result} ->
+        {:ok, attach_catalog_result(result, catalog_result, next_catalog_shard)}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp reconcile_catalog_publications(ctx, start_shard, limit)
        when is_integer(start_shard) and start_shard >= 0 and is_integer(limit) and limit > 0 and
               limit <= 256 do
     shard_count = Map.fetch!(ctx, :shard_count)
-    shard_order = Enum.map(0..(shard_count - 1), &rem(start_shard + &1, shard_count))
-    scan_catalog_publication_shards(ctx, shard_order, limit, shard_count)
+    shard_index = rem(start_shard, shard_count)
+
+    result =
+      case LimitCatalogOutbox.read_page(ctx, shard_index, limit) do
+        {:ok, %{entries: []}} ->
+          catalog_result(0, 0, 0, 0)
+
+        {:ok, page} ->
+          page_result = publish_catalog_page(ctx, page)
+          Map.update!(page_result, :read_batches, &(&1 + 1))
+
+        {:error, _reason} ->
+          catalog_result(0, 1, 0, 0)
+      end
+
+    {rem(shard_index + 1, shard_count), Map.put(result, :shards_scanned, 1)}
   end
 
   defp reconcile_catalog_publications(ctx, start_shard, _invalid_limit) do
     shard_count = Map.fetch!(ctx, :shard_count)
-    {rem(start_shard + 1, shard_count), %{published: 0, errors: 1}}
-  end
 
-  defp scan_catalog_publication_shards(_ctx, [], _limit, _shard_count),
-    do: {0, %{published: 0, errors: 0}}
+    shard_index =
+      if is_integer(start_shard) and start_shard >= 0, do: rem(start_shard, shard_count), else: 0
 
-  defp scan_catalog_publication_shards(ctx, [shard_index | rest], limit, shard_count) do
-    case LimitCatalogOutbox.read_page(ctx, shard_index, limit) do
-      {:ok, %{entries: []}} ->
-        scan_catalog_publication_shards(ctx, rest, limit, shard_count)
-
-      {:ok, page} ->
-        result = publish_catalog_page(ctx, page)
-        {rem(shard_index + 1, shard_count), result}
-
-      {:error, _reason} ->
-        {rem(shard_index + 1, shard_count), %{published: 0, errors: 1}}
-    end
+    {rem(shard_index + 1, shard_count), Map.put(catalog_result(0, 1, 0, 0), :shards_scanned, 1)}
   end
 
   defp publish_catalog_page(ctx, %{entries: entries, head: head, shard_index: shard_index}) do
-    {published, last_sequence, errors} =
-      Enum.reduce_while(entries, {0, nil, 0}, fn {sequence, owner_key},
-                                                 {published, last, _errors} ->
-        case publish_catalog_owner(ctx, shard_index, owner_key) do
-          :ok -> {:cont, {published + 1, sequence, 0}}
-          {:error, _reason} -> {:halt, {published, last, 1}}
-        end
-      end)
+    owner_keys = Enum.map(entries, &elem(&1, 1))
 
-    case last_sequence do
-      nil ->
-        %{published: published, errors: errors}
+    case Router.read_shard_values(ctx, shard_index, owner_keys) do
+      {:ok, values} when is_list(values) and length(values) == length(entries) ->
+        {catalog_keys, published, last_sequence, errors} =
+          catalog_prefix(entries, values)
 
-      sequence ->
-        case Router.flow_governance_limit_catalog_outbox_ack(
-               ctx,
-               shard_index,
-               head,
-               sequence
-             ) do
-          :ok -> %{published: published, errors: errors}
-          {:ok, _result} -> %{published: published, errors: errors}
-          {:error, _reason} -> %{published: published, errors: errors + 1}
-        end
+        publish_catalog_prefix(
+          ctx,
+          shard_index,
+          head,
+          catalog_keys,
+          published,
+          last_sequence,
+          errors
+        )
+
+      _unavailable_or_invalid ->
+        catalog_result(0, 1, 1, 0)
     end
   end
 
-  defp publish_catalog_owner(ctx, shard_index, owner_key) do
-    case Router.read_shard_value(ctx, shard_index, owner_key) do
-      {:ok, value} when is_binary(value) ->
-        with {:ok, owner} <- LimitRecord.decode_owner(value),
-             true <- Keys.governance_limit_key(owner.scope) == owner_key do
-          Catalog.register_key(ctx, Keys.governance_catalog_key(:limit), owner_key)
+  defp catalog_prefix(entries, values) do
+    entries
+    |> Enum.zip(values)
+    |> Enum.reduce_while({[], 0, nil, 0}, fn {{sequence, owner_key}, value},
+                                             {keys, published, last, _errors} ->
+      case catalog_owner(value, owner_key) do
+        {:ok, nil} ->
+          {:cont, {keys, published + 1, sequence, 0}}
+
+        {:ok, catalog_key} ->
+          {:cont, {[catalog_key | keys], published + 1, sequence, 0}}
+
+        {:error, _reason} ->
+          {:halt, {keys, published, last, 1}}
+      end
+    end)
+    |> then(fn {keys, published, last_sequence, errors} ->
+      {Enum.reverse(keys), published, last_sequence, errors}
+    end)
+  end
+
+  defp catalog_owner(nil, _owner_key), do: {:ok, nil}
+
+  defp catalog_owner(value, owner_key) when is_binary(value) do
+    case LimitRecord.decode_owner(value) do
+      {:ok, owner} ->
+        if Keys.governance_limit_key(owner.scope) == owner_key do
+          {:ok, owner_key}
         else
-          _invalid -> {:error, :limit_catalog_owner_corrupt}
+          {:error, :limit_catalog_owner_corrupt}
         end
 
-      {:ok, nil} ->
-        :ok
-
-      :unavailable ->
-        {:error, :limit_catalog_owner_unavailable}
-
-      _invalid ->
+      {:error, _reason} ->
         {:error, :limit_catalog_owner_corrupt}
     end
+  end
+
+  defp catalog_owner(_value, _owner_key), do: {:error, :limit_catalog_owner_corrupt}
+
+  defp publish_catalog_prefix(
+         _ctx,
+         _shard_index,
+         _head,
+         _catalog_keys,
+         0,
+         nil,
+         errors
+       ),
+       do: catalog_result(0, errors, 1, 0)
+
+  defp publish_catalog_prefix(
+         ctx,
+         shard_index,
+         head,
+         catalog_keys,
+         published,
+         last_sequence,
+         errors
+       ) do
+    write_batches = if catalog_keys == [], do: 0, else: 1
+
+    with :ok <-
+           Catalog.register_keys(
+             ctx,
+             Keys.governance_catalog_key(:limit),
+             catalog_keys
+           ),
+         :ok <- ack_catalog_prefix(ctx, shard_index, head, last_sequence) do
+      catalog_result(published, errors, 1, write_batches)
+    else
+      {:error, _reason} -> catalog_result(0, errors + 1, 1, write_batches)
+    end
+  end
+
+  defp ack_catalog_prefix(ctx, shard_index, head, last_sequence) do
+    case Router.flow_governance_limit_catalog_outbox_ack(
+           ctx,
+           shard_index,
+           head,
+           last_sequence
+         ) do
+      :ok -> :ok
+      {:ok, _result} -> :ok
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :limit_catalog_ack_failed}
+    end
+  end
+
+  defp catalog_result(published, errors, read_batches, write_batches) do
+    %{
+      published: published,
+      errors: errors,
+      read_batches: read_batches,
+      write_batches: write_batches,
+      shards_scanned: 0
+    }
+  end
+
+  defp attach_catalog_result(result, catalog_result, next_catalog_shard) do
+    Map.merge(result, %{
+      catalog_published: catalog_result.published,
+      catalog_errors: catalog_result.errors,
+      catalog_read_batches: catalog_result.read_batches,
+      catalog_write_batches: catalog_result.write_batches,
+      catalog_shards_scanned: catalog_result.shards_scanned,
+      next_catalog_shard: next_catalog_shard
+    })
   end
 
   defp reconcile_page(ctx, cursor, reservation_limit, now_ms) do

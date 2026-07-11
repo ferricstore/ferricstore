@@ -27,15 +27,6 @@ defmodule FerricstoreServer.Native.Session do
   def session_command?(cmd) when is_binary(cmd), do: MapSet.member?(@session_commands, cmd)
   def session_command?(_cmd), do: false
 
-  @spec parse_command(map()) ::
-          {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
-  def parse_command(payload) when is_map(payload) do
-    case prepare_command(payload) do
-      {:ok, prepared} -> PreparedCommand.legacy_result(prepared)
-      {:error, _reason} = error -> error
-    end
-  end
-
   @spec prepare_command(map()) :: {:ok, PreparedCommand.t()} | {:error, binary()}
   def prepare_command(payload) when is_map(payload) do
     with {:ok, command} <- require_binary(payload, "command"),
@@ -287,12 +278,7 @@ defmodule FerricstoreServer.Native.Session do
 
   defp transaction_entry(%PreparedCommand{} = prepared), do: prepared
 
-  defp transaction_entry({cmd, args, ast, _keys}), do: {cmd, args, ast}
-
   defp transaction_prepared(%PreparedCommand{} = prepared), do: prepared
-
-  defp transaction_prepared({cmd, args, ast, keys}),
-    do: PreparedCommand.from_parsed(cmd, args, ast, keys)
 
   defp subscribe_channels(channels, state) do
     state = ensure_pubsub_sets(state)

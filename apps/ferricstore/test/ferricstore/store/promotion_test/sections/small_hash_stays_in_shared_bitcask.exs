@@ -392,7 +392,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           assert promoted?(key)
 
           assert [1, :ok] ==
-                   Ferricstore.Transaction.Coordinator.execute(
+                   Ferricstore.Test.PreparedTransactionCoordinator.execute(
                      [{"HDEL", [key, field]}, {"SET", [other_key, "touch"]}],
                      %{},
                      nil

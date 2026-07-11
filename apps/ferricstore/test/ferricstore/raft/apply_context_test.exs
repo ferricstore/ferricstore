@@ -218,7 +218,6 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     commands =
       [
         {:batch, [inner]},
-        {:async, inner},
         {:async, self(), inner},
         {:ferricstore_latency_trace, inner},
         {:flow_shared_ref_write, 0, inner},
@@ -237,6 +236,13 @@ defmodule Ferricstore.Raft.ApplyContextTest do
 
       assert {:ok, ^context} = ApplyContext.decode(encoded)
     end)
+  end
+
+  test "two-field async envelopes are not current context carriers" do
+    context = ApplyContext.new(flow_default_history_max_events: 23)
+    inner = {:flow_create, "state-key", %{id: "id", type: "email"}}
+
+    assert {:async, ^inner} = ApplyContext.wrap_command({:async, inner}, context)
   end
 
   test "reserved wrappers cannot inject context or pessimize ordinary KV commands" do

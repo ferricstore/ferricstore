@@ -23,8 +23,8 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
              )
   end
 
-  test "allows legacy local data with no marker" do
-    assert :ok =
+  test "rejects a join when both cluster identity markers are missing" do
+    assert {:error, {:local_cluster_state_missing, @target}} =
              JoinIdentity.validate(
                {:error, :enoent},
                {:error, :enoent},

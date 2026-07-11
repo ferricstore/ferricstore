@@ -180,7 +180,7 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert :ets.info(table, :owner) == Process.whereis(Ferricstore.Flow.Governance.LimitCache)
   end
 
-  test "limit cache rejects invalid entry shapes instead of granting credits" do
+  test "limit cache rejects every untagged entry shape instead of granting credits" do
     Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
 
     ctx = FerricStore.Instance.get(:default)
@@ -188,17 +188,22 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     key = {ctx.name, scope, 0}
     table = :ferricstore_flow_governance_limit_cache
 
-    true = :ets.insert(table, {key, 1, 2_000, 1, ["unbacked-reservation"]})
+    for entry <- [
+          {key, 1, 2_000, 1, ["unbacked-reservation"]},
+          {key, 1, 2_000, 1, ["unbacked-reservation"], 0, nil}
+        ] do
+      true = :ets.insert(table, entry)
 
-    assert {:error, "ERR flow limit not found"} =
-             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
-               shard_id: 0,
-               amount: 1,
-               ttl_ms: 1_000,
-               now_ms: 1_000
-             )
+      assert {:error, "ERR flow limit not found"} =
+               Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+                 shard_id: 0,
+                 amount: 1,
+                 ttl_ms: 1_000,
+                 now_ms: 1_000
+               )
 
-    assert [] == :ets.lookup(table, key)
+      assert [] == :ets.lookup(table, key)
+    end
   end
 
   test "strict global running policy enforces claims without caller limit options" do
@@ -918,12 +923,20 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     table = :ferricstore_flow_governance_limit_cache
     key = {ctx.name, scope, 0}
     concurrent_id = "concurrent-refill"
-    assert :ets.insert_new(table, {key, 1, 2_001, 1, [concurrent_id]})
+
+    assert :ets.insert_new(
+             table,
+             {key, 1, 2_001, 1, [concurrent_id], 0, 4, :flow_governance_limit_cache_entry}
+           )
+
     send(release_pid, :fail_limit_cache_release)
 
     assert {:ok, %{released: 0, errors: 1}} = Task.await(flush_task, 2_000)
 
-    assert [{^key, 4, _expiry, 5, restored_ids, 0, 4}] = :ets.lookup(table, key)
+    assert [
+             {^key, 4, _expiry, 5, restored_ids, 0, 4, :flow_governance_limit_cache_entry}
+           ] = :ets.lookup(table, key)
+
     assert Enum.sort(restored_ids) == Enum.sort([concurrent_id | detached_ids])
   end
 

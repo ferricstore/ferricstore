@@ -15,7 +15,27 @@ defmodule Ferricstore.Flow.Governance.Catalog do
 
   def register_key(ctx, catalog_key, record_key)
       when is_binary(catalog_key) and is_binary(record_key) do
-    case FerricStore.Impl.zadd(ctx, catalog_key, [{0, record_key}]) do
+    register_keys(ctx, catalog_key, [record_key])
+  end
+
+  def register_keys(ctx, catalog_key, record_keys)
+      when is_binary(catalog_key) and is_list(record_keys) and length(record_keys) <= @page_size do
+    if Enum.all?(record_keys, &(is_binary(&1) and &1 != "")) do
+      do_register_keys(ctx, catalog_key, Enum.uniq(record_keys))
+    else
+      {:error, "ERR invalid flow governance catalog registration"}
+    end
+  end
+
+  def register_keys(_ctx, _catalog_key, _record_keys),
+    do: {:error, "ERR invalid flow governance catalog registration"}
+
+  defp do_register_keys(_ctx, _catalog_key, []), do: :ok
+
+  defp do_register_keys(ctx, catalog_key, record_keys) do
+    entries = Enum.map(record_keys, &{0, &1})
+
+    case FerricStore.Impl.zadd(ctx, catalog_key, entries) do
       {:ok, _added} -> :ok
       {:error, _reason} = error -> error
     end

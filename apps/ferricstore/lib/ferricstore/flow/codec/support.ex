@@ -351,50 +351,49 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def maybe_put_record_governance_limit(groups, _limit), do: groups
 
-  def encode_governance_limit(%{scope: scope, shard_id: shard_id} = limit)
-      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 do
-    encoded = %{"scope" => scope, "shard_id" => shard_id}
+  def encode_governance_limit(nil), do: nil
 
-    case Map.get(limit, :enforcement) do
-      enforcement when enforcement in [:strict_global, :approximate_global] ->
-        encoded
-        |> Map.put("enforcement", Atom.to_string(enforcement))
-        |> maybe_put_governance_reservation_id(Map.get(limit, :reservation_id))
-
-      _none ->
-        maybe_put_governance_reservation_id(encoded, Map.get(limit, :reservation_id))
-    end
+  def encode_governance_limit(%{
+        scope: scope,
+        shard_id: shard_id,
+        enforcement: enforcement,
+        reservation_id: reservation_id
+      })
+      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+             enforcement in [:strict_global, :approximate_global] and
+             is_binary(reservation_id) and reservation_id != "" do
+    %{
+      "scope" => scope,
+      "shard_id" => shard_id,
+      "enforcement" => Atom.to_string(enforcement),
+      "reservation_id" => reservation_id
+    }
   end
 
-  def encode_governance_limit(_limit), do: nil
+  def encode_governance_limit(_limit),
+    do: raise(ArgumentError, "flow record requires the current governance limit shape")
 
-  def decode_governance_limit(%{"scope" => scope, "shard_id" => shard_id} = limit)
-      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 do
-    decoded = %{scope: scope, shard_id: shard_id}
+  def decode_governance_limit(nil), do: nil
 
-    decoded =
-      case Map.get(limit, "enforcement") do
-        "strict_global" -> Map.put(decoded, :enforcement, :strict_global)
-        "approximate_global" -> Map.put(decoded, :enforcement, :approximate_global)
-        _none -> decoded
-      end
-
-    case Map.get(limit, "reservation_id") do
-      reservation_id when is_binary(reservation_id) and reservation_id != "" ->
-        Map.put(decoded, :reservation_id, reservation_id)
-
-      _none ->
-        decoded
-    end
+  def decode_governance_limit(%{
+        "scope" => scope,
+        "shard_id" => shard_id,
+        "enforcement" => enforcement,
+        "reservation_id" => reservation_id
+      })
+      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+             enforcement in ["strict_global", "approximate_global"] and
+             is_binary(reservation_id) and reservation_id != "" do
+    %{
+      scope: scope,
+      shard_id: shard_id,
+      enforcement: String.to_existing_atom(enforcement),
+      reservation_id: reservation_id
+    }
   end
 
-  def decode_governance_limit(_limit), do: nil
-
-  defp maybe_put_governance_reservation_id(encoded, reservation_id)
-       when is_binary(reservation_id) and reservation_id != "",
-       do: Map.put(encoded, "reservation_id", reservation_id)
-
-  defp maybe_put_governance_reservation_id(encoded, _reservation_id), do: encoded
+  def decode_governance_limit(_limit),
+    do: raise(ArgumentError, "flow record requires the current governance limit shape")
 
   def decode_record_indexed_attributes(names) do
     case Ferricstore.Flow.Attributes.normalize_indexed_names(names) do

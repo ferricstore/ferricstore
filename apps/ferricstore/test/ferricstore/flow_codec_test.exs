@@ -3,6 +3,7 @@ defmodule Ferricstore.FlowCodecTest do
   @moduletag :flow
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.Codec.Support
   alias Ferricstore.Flow.RecordProjection
 
   test "record codec round trips small and nil fields" do
@@ -50,6 +51,38 @@ defmodule Ferricstore.FlowCodecTest do
     assert Flow.encode_record(record) == Flow.encode_record_elixir(record)
     assert record == record |> Flow.encode_record() |> Flow.decode_record()
     refute Map.has_key?(RecordProjection.public(record), :governance_limit)
+  end
+
+  test "record codec rejects governance metadata outside the current exact shape" do
+    invalid_limits = [
+      %{scope: "flow-running:test", shard_id: 7, reservation_id: "reservation-123"},
+      %{
+        scope: "flow-running:test",
+        shard_id: 7,
+        enforcement: :unknown,
+        reservation_id: "reservation-123"
+      },
+      %{scope: "flow-running:test", shard_id: 7, enforcement: :strict_global}
+    ]
+
+    Enum.each(invalid_limits, fn governance_limit ->
+      record =
+        base_record()
+        |> Map.put(:state, "running")
+        |> Map.put(:governance_limit, governance_limit)
+
+      assert_raise ArgumentError, ~r/current governance limit/, fn ->
+        Flow.encode_record(record)
+      end
+    end)
+
+    assert_raise ArgumentError, ~r/current governance limit/, fn ->
+      Support.decode_governance_limit(%{
+        "scope" => "flow-running:test",
+        "shard_id" => 7,
+        "reservation_id" => "reservation-123"
+      })
+    end
   end
 
   test "record codec omits redundant immutable defaults from every state version" do

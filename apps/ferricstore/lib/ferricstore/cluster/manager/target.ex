@@ -296,19 +296,7 @@ defmodule Ferricstore.Cluster.Manager.Target do
     local_state = Ferricstore.ReplicationMode.read(ctx.data_dir)
     target_state = read_target_cluster_state(target_node)
 
-    case JoinIdentity.validate(local_state, target_state, target_node) do
-      :ok ->
-        if match?({:error, :enoent}, local_state) do
-          Logger.warning(
-            "ClusterManager: local cluster_state marker missing; allowing legacy pre-marker join for #{target_node}"
-          )
-        end
-
-        :ok
-
-      {:error, _reason} = error ->
-        error
-    end
+    JoinIdentity.validate(local_state, target_state, target_node)
   end
 
   def read_target_cluster_state(target_node) do

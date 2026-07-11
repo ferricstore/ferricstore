@@ -382,10 +382,6 @@ defmodule Ferricstore.Store.Shard.Routing do
         standalone_command_keys(command)
       end
 
-      defp standalone_command_keys({:async, command}) when is_tuple(command) do
-        standalone_command_keys(command)
-      end
-
       defp standalone_command_keys({command, %{hlc_ts: _remote_ts}}) when is_tuple(command) do
         standalone_command_keys(command)
       end

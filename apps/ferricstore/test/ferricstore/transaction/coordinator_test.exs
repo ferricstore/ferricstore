@@ -15,7 +15,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.WriteVersion
-  alias Ferricstore.Transaction.Coordinator
+  alias Ferricstore.Test.PreparedTransactionCoordinator, as: Coordinator
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -63,6 +63,11 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   end
 
   describe "single-shard transactions" do
+    test "production coordinator rejects queue entries without a prepared AST", %{same1: key} do
+      assert {:error, "ERR invalid transaction command"} =
+               Ferricstore.Transaction.Coordinator.execute([{"GET", [key]}], %{}, nil)
+    end
+
     test "executes when all commands target the same shard", %{same1: s1, same2: s2} do
       queue = [{"SET", [s1, "100"]}, {"SET", [s2, "200"]}, {"GET", [s1]}]
 
@@ -131,7 +136,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert result == ["existing", :ok, "updated"]
     end
 
-    test "two-tuple SET NX options execute through Rust AST normalization", %{same1: s1} do
+    test "prepared SET NX options execute through Rust AST normalization", %{same1: s1} do
       Router.put(FerricStore.Instance.get(:default), s1, "existing", 0)
 
       result = Coordinator.execute([{"SET", [s1, "skipped", "NX"]}], %{}, nil)
@@ -140,7 +145,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert Router.get(FerricStore.Instance.get(:default), s1) == "existing"
     end
 
-    test "two-tuple SET rejects conflicting NX and XX through Rust AST normalization", %{
+    test "prepared SET rejects conflicting NX and XX through Rust AST normalization", %{
       same1: s1
     } do
       result = Coordinator.execute([{"SET", [s1, "value", "NX", "XX"]}], %{}, nil)

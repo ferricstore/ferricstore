@@ -761,23 +761,6 @@ defmodule Ferricstore.Commands.Dispatcher do
   def prepare_raw(name, args), do: PreparedCommand.prepare(name, args)
 
   @doc """
-  Parses a raw command name and argument list into the same AST used by the
-  native command path.
-
-  Native protocol uses this as a compatibility fallback for commands that do
-  not yet have a specialized native opcode. Hot commands should keep using
-  dedicated native opcodes.
-  """
-  @spec parse_raw(binary(), [term()]) ::
-          {:ok, binary(), [binary()], term(), [binary()]} | {:error, binary()}
-  def parse_raw(name, args) do
-    case prepare_raw(name, args) do
-      {:ok, prepared} -> PreparedCommand.legacy_result(prepared)
-      {:error, _reason} = error -> error
-    end
-  end
-
-  @doc """
   Dispatches a raw command name and argument list through the canonical command
   AST dispatcher.
   """

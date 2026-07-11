@@ -48,6 +48,7 @@ Code.require_file(
 defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   @moduledoc false
 
+  alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Flow.PolicyCommand
   alias Ferricstore.Raft.StateMachine
 
@@ -122,6 +123,11 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
 
   defp canonical_entry({index, command}) when is_integer(index) and is_tuple(command),
     do: {index, canonical(command)}
+
+  defp canonical_entry({command, args}) when is_binary(command) and is_list(args) do
+    {:ok, prepared} = PreparedCommand.prepare(command, args)
+    {prepared.command, prepared.args, prepared.ast}
+  end
 
   defp canonical_entry(command) when is_tuple(command), do: canonical(command)
   defp canonical_entry(other), do: other
@@ -212,6 +218,15 @@ defmodule Ferricstore.Raft.StateMachineTest do
       shard_index: shard_index,
       writer_pid: writer_pid
     }
+  end
+
+  test "two-field async envelopes are rejected without mutation", %{state: state, ets: ets} do
+    command = {:async, {:put, "old-async", "value", 0}}
+
+    assert {^state, {:error, {:unknown_command, ^command}}} =
+             StateMachine.apply(%{}, command, state)
+
+    assert [] = :ets.lookup(ets, "old-async")
   end
 
   use Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNativeIndexOpsCrossingOrderingBarriers

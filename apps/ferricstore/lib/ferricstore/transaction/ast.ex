@@ -1,7 +1,7 @@
 defmodule Ferricstore.Transaction.Ast do
   @moduledoc false
 
-  @type queue_entry :: {binary(), [term()], term()} | {binary(), [term()]}
+  @type queue_entry :: {binary(), [term()], term()}
 
   @non_key_list_tags ~w(
     acl auth client cluster_demote cluster_failover cluster_join cluster_leave cluster_promote command
@@ -11,24 +11,6 @@ defmodule Ferricstore.Transaction.Ast do
   @spec normalize_entry(queue_entry()) :: {binary(), [term()], term()}
   def normalize_entry({cmd, args, ast}) when is_binary(cmd) and is_list(args),
     do: {cmd, args, ast}
-
-  # Pre-AST Ra logs can contain transaction queue entries as `{cmd, args}`.
-  # Keep this replay shim compiled in every environment; otherwise a production
-  # node upgraded after the AST migration can fail while replaying old entries.
-  def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
-    normalized_args = Enum.map(args, &to_command_binary/1)
-
-    case Ferricstore.Commands.Dispatcher.parse_raw(cmd, normalized_args) do
-      {:ok, parsed_cmd, parsed_args, ast, _keys} ->
-        {parsed_cmd, parsed_args, ast}
-
-      {:error, reason} ->
-        raise ArgumentError, "invalid legacy transaction command #{inspect(cmd)}: #{reason}"
-    end
-  end
-
-  defp to_command_binary(value) when is_binary(value), do: value
-  defp to_command_binary(value), do: to_string(value)
 
   @spec command_name(queue_entry()) :: binary()
   def command_name(entry) do

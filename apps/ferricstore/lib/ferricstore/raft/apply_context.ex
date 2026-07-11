@@ -400,14 +400,6 @@ defmodule Ferricstore.Raft.ApplyContext do
     end
   end
 
-  defp sanitize_reserved_wrappers({:async, inner} = command, context)
-       when is_tuple(inner) do
-    case sanitize_reserved_wrappers(inner, context) do
-      ^inner -> command
-      sanitized -> {:async, sanitized}
-    end
-  end
-
   defp sanitize_reserved_wrappers({:async, origin, inner} = command, context)
        when is_tuple(inner) do
     case sanitize_reserved_wrappers(inner, context) do
@@ -474,7 +466,6 @@ defmodule Ferricstore.Raft.ApplyContext do
     do: nested_flow_command?(shard_batches)
 
   defp flow_command?({:ferricstore_latency_trace, inner}), do: flow_command?(inner)
-  defp flow_command?({:async, inner}), do: flow_command?(inner)
   defp flow_command?({:async, _origin, inner}), do: flow_command?(inner)
 
   defp flow_command?({inner, %{hlc_ts: {physical_ms, logical}}})

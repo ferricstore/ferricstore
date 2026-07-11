@@ -90,14 +90,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_pending_with_time(meta, state, fn -> apply_single(state, cmd) end)
       end
 
-      # Backward-compat for 2-tuple async commands written by older binaries.
-      # Treat as origin-unknown — apply unconditionally. Idempotent for put/delete,
-      # may over-count repeated RMW on the same key (acceptable for one-time WAL
-      # recovery; new writes use the 3-tuple form below).
-      def apply(meta, {:async, _inner_cmd} = cmd, state) do
-        apply_pending_with_time(meta, state, fn -> apply_single(state, cmd) end)
-      end
-
       def apply(meta, {:put, key, value, expire_at_ms}, state) do
         with_apply_time(meta, fn ->
           redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)

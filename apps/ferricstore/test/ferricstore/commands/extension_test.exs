@@ -120,12 +120,16 @@ defmodule Ferricstore.Commands.ExtensionTest do
              Dispatcher.dispatch("ext.ping", ["a", "b"], MockStore.make())
   end
 
-  test "extension metadata supplies keys for parsed raw commands" do
+  test "extension metadata supplies keys for prepared raw commands" do
     Application.put_env(:ferricstore, :command_extensions, [TestExtension])
 
-    assert {:ok, "EXT.PUT", ["k", "v"], {:extension_command, "EXT.PUT", ["k", "v"]},
-            ["dynamic:v"]} =
-             Dispatcher.parse_raw("ext.put", ["k", "v"])
+    assert {:ok,
+            %Ferricstore.Commands.PreparedCommand{
+              command: "EXT.PUT",
+              args: ["k", "v"],
+              ast: {:extension_command, "EXT.PUT", ["k", "v"]},
+              acl_keys: ["dynamic:v"]
+            }} = Dispatcher.prepare_raw("ext.put", ["k", "v"])
   end
 
   test "invalid extension key metadata fails closed before dispatch" do
@@ -161,7 +165,15 @@ defmodule Ferricstore.Commands.ExtensionTest do
     store = MockStore.make(%{"k" => {"v", 0}})
 
     assert "v" == Dispatcher.dispatch("GET", ["k"], store)
-    assert {:ok, "GET", ["k"], {:get, "k"}, ["k"]} = Dispatcher.parse_raw("GET", ["k"])
+
+    assert {:ok,
+            %Ferricstore.Commands.PreparedCommand{
+              command: "GET",
+              args: ["k"],
+              ast: {:get, "k"},
+              acl_keys: ["k"]
+            }} = Dispatcher.prepare_raw("GET", ["k"])
+
     assert Enum.count(Catalog.names(), &(&1 == "get")) == 1
   end
 end

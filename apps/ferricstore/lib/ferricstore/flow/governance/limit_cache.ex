@@ -8,6 +8,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   alias Ferricstore.Flow.Governance.Telemetry
 
   @table :ferricstore_flow_governance_limit_cache
+  @entry_tag :flow_governance_limit_cache_entry
   @coord_tag :"$ferricstore_flow_governance_limit_cache_coord"
   @session_coord_tag :"$ferricstore_flow_governance_limit_cache_session"
   @flush_batch_size 128
@@ -792,7 +793,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       [
         current =
             {^key, _available, expires_at_ms, _capacity, _reservation_ids, _config_version,
-             _effective_limit}
+             _effective_limit, @entry_tag}
       ]
       when is_integer(expires_at_ms) and expires_at_ms <= now_ms ->
         :ets.delete_object(table, current)
@@ -801,7 +802,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       [
         current =
             {^key, available, expires_at_ms, capacity, reservation_ids, config_version,
-             effective_limit}
+             effective_limit, @entry_tag}
       ]
       when is_integer(available) and available >= amount and is_list(reservation_ids) ->
         if cache_configuration_matches?(
@@ -814,7 +815,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           if length(taken) == amount do
             updated =
               {key, available - amount, expires_at_ms, capacity, remaining, config_version,
-               effective_limit}
+               effective_limit, @entry_tag}
 
             if replace_exact(table, current, updated) do
               {:ok, taken}
@@ -894,7 +895,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
        ) do
     new_entry =
       {key, length(reservation_ids), expires_at_ms, capacity, reservation_ids, config_version,
-       effective_limit}
+       effective_limit, @entry_tag}
 
     case :ets.lookup(table, key) do
       [] ->
@@ -915,12 +916,13 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       [
         current =
             {^key, available, old_expiry, old_capacity, old_ids, ^config_version,
-             ^effective_limit}
+             ^effective_limit, @entry_tag}
       ]
       when is_integer(available) and is_integer(old_capacity) and is_list(old_ids) ->
         updated =
           {key, available + length(reservation_ids), max(old_expiry, expires_at_ms),
-           old_capacity + capacity, reservation_ids ++ old_ids, config_version, effective_limit}
+           old_capacity + capacity, reservation_ids ++ old_ids, config_version, effective_limit,
+           @entry_tag}
 
         if replace_exact(table, current, updated) do
           :ok
@@ -936,29 +938,33 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           )
         end
 
-      [current = {^key, available, old_expiry, old_capacity, old_ids}]
-      when config_version == 0 and is_integer(available) and is_integer(old_capacity) and
-             is_list(old_ids) ->
-        updated =
-          {key, available + length(reservation_ids), max(old_expiry, expires_at_ms),
-           old_capacity + capacity, reservation_ids ++ old_ids, config_version, effective_limit}
-
-        if replace_exact(table, current, updated) do
-          :ok
-        else
-          do_add_cached(
-            table,
-            key,
-            reservation_ids,
-            capacity,
-            expires_at_ms,
-            config_version,
-            effective_limit
-          )
-        end
-
-      [_different_configuration_or_corrupt_entry] ->
+      [current]
+      when is_tuple(current) and tuple_size(current) == 8 and
+             elem(current, 7) == @entry_tag ->
         {:error, :cache_configuration_changed}
+
+      [invalid_entry] ->
+        if delete_exact(table, invalid_entry) do
+          do_add_cached(
+            table,
+            key,
+            reservation_ids,
+            capacity,
+            expires_at_ms,
+            config_version,
+            effective_limit
+          )
+        else
+          do_add_cached(
+            table,
+            key,
+            reservation_ids,
+            capacity,
+            expires_at_ms,
+            config_version,
+            effective_limit
+          )
+        end
     end
   end
 
@@ -1077,7 +1083,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   defp release_detached(table, ctx, entries, now_ms, release_fun) do
     Enum.reduce(entries, %{released: 0, errors: 0}, fn
       {{_instance, scope, shard_id}, _available, expires_at_ms, capacity, reservation_ids,
-       _config_version, _effective_limit} = entry,
+       _config_version, _effective_limit, @entry_tag} = entry,
       acc
       when is_binary(scope) and is_integer(shard_id) and is_integer(expires_at_ms) and
              is_integer(capacity) and capacity >= 0 and is_list(reservation_ids) ->
@@ -1269,18 +1275,19 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
 
   defp restore_fenced_entry(
          {key, available, expires_at_ms, capacity, reservation_ids, config_version,
-          effective_limit}
+          effective_limit, @entry_tag}
        ) do
     fenced_entry =
       {key, available, expires_at_ms, capacity, reservation_ids, {:fenced, config_version},
-       effective_limit}
+       effective_limit, @entry_tag}
 
     :ets.insert_new(table(), fenced_entry)
     :ok
   end
 
   defp entry_cache_configuration(
-         {_key, _available, _expires_at_ms, _capacity, _ids, config_version, effective_limit}
+         {_key, _available, _expires_at_ms, _capacity, _ids, config_version, effective_limit,
+          @entry_tag}
        ),
        do: {config_version, effective_limit}
 
@@ -1304,7 +1311,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   defp restore_cached_entry(
          table,
          {key, _available, expires_at_ms, capacity, reservation_ids, config_version,
-          effective_limit}
+          effective_limit, @entry_tag}
        ) do
     do_add_cached(
       table,
@@ -1319,7 +1326,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
 
   defp restore_invalid_entry(table, entry) do
     case entry do
-      {key, _field_2, _field_3, _field_4, _field_5, _field_6, _field_7} ->
+      {key, _field_2, _field_3, _field_4, _field_5, _field_6, _field_7, @entry_tag} ->
         if :ets.lookup(table, key) == [], do: :ets.insert_new(table, entry), else: true
 
       _other ->
@@ -1329,7 +1336,8 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
 
   defp cache_entry_match_spec(instance_name) do
     [
-      {{{instance_name, :"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6", :"$7", :"$8"}, [], [:"$_"]}
+      {{{instance_name, :"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6", :"$7", :"$8", @entry_tag}, [],
+       [:"$_"]}
     ]
   end
 
@@ -1338,7 +1346,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       {ttl_ms,
        [
          {^key, _available, expires_at_ms, _capacity, _reservation_ids, _config_version,
-          _effective_limit}
+          _effective_limit, @entry_tag}
        ]}
       when is_integer(ttl_ms) and ttl_ms > 0 and expires_at_ms > now_ms and
              expires_at_ms < now_ms + ttl_ms ->
@@ -1368,7 +1376,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       case :ets.lookup(table(), key) do
         [
           {^key, _available, _old_expiry, _capacity, _reservation_ids, _config_version,
-           _effective_limit}
+           _effective_limit, @entry_tag}
         ] ->
           :ets.update_element(table(), key, {3, expires_at_ms})
 
@@ -1382,7 +1390,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
 
   defp cached_entries?(table) do
     match_spec = [
-      {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6", :"$7", :"$8", :"$9"}, [], [true]}
+      {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6", :"$7", :"$8", :"$9", @entry_tag}, [], [true]}
     ]
 
     :ets.select_count(table, match_spec) > 0

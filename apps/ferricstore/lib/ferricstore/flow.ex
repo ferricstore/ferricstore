@@ -1321,23 +1321,22 @@ defmodule Ferricstore.Flow do
   defp release_governance_reservations(ctx, reservations, now_ms) do
     reservations
     |> Enum.reduce(%{}, fn
-      %{scope: scope, shard_id: shard_id} = reservation, acc
-      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 ->
-        enforcement = Map.get(reservation, :enforcement, :approximate_global)
-        reservation_id = Map.get(reservation, :reservation_id)
-
-        if is_binary(reservation_id) and reservation_id != "" do
-          Map.update(
-            acc,
-            {scope, shard_id, enforcement, :identified},
-            [reservation_id],
-            &[
-              reservation_id | &1
-            ]
-          )
-        else
-          acc
-        end
+      %{
+        scope: scope,
+        shard_id: shard_id,
+        enforcement: enforcement,
+        reservation_id: reservation_id
+      },
+      acc
+      when is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+             enforcement in [:strict_global, :approximate_global] and
+             is_binary(reservation_id) and reservation_id != "" ->
+        Map.update(
+          acc,
+          {scope, shard_id, enforcement, :identified},
+          [reservation_id],
+          &[reservation_id | &1]
+        )
 
       _invalid, acc ->
         acc
@@ -1384,10 +1383,18 @@ defmodule Ferricstore.Flow do
           %{
             lease_token: lease_token,
             fencing_token: fencing_token,
-            governance_limit: %{scope: scope, shard_id: shard_id} = reservation
+            governance_limit: %{
+              scope: scope,
+              shard_id: shard_id,
+              enforcement: enforcement,
+              reservation_id: reservation_id
+            }
           }
-          when lease_token == attrs.lease_token and fencing_token == attrs.fencing_token ->
-            case governance_limit_backend(Map.get(reservation, :enforcement, :approximate_global)).renew(
+          when lease_token == attrs.lease_token and fencing_token == attrs.fencing_token and
+                 is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+                 enforcement in [:strict_global, :approximate_global] and
+                 is_binary(reservation_id) and reservation_id != "" ->
+            case governance_limit_backend(enforcement).renew(
                    ctx,
                    scope,
                    shard_id: shard_id,
@@ -1397,6 +1404,15 @@ defmodule Ferricstore.Flow do
               {:ok, _renewed} -> :ok
               {:error, _reason} = error -> error
             end
+
+          %{
+            lease_token: lease_token,
+            fencing_token: fencing_token,
+            governance_limit: governance_limit
+          }
+          when lease_token == attrs.lease_token and fencing_token == attrs.fencing_token and
+                 is_map(governance_limit) ->
+            {:error, "ERR invalid flow governance limit reservation"}
 
           _ungoverned_or_stale ->
             :ok
@@ -1412,7 +1428,7 @@ defmodule Ferricstore.Flow do
   defp governance_limit_backend(:strict_global),
     do: Ferricstore.Flow.Governance.LimitStore
 
-  defp governance_limit_backend(_approximate_or_legacy),
+  defp governance_limit_backend(:approximate_global),
     do: Ferricstore.Flow.Governance.LimitCache
 
   defp many_return_mode(opts) do
