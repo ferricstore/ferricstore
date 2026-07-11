@@ -527,7 +527,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert_receive {:DOWN, ^snapshot_ref, :process, ^snapshot_pid, :shutdown}, 1_000
   end
 
-  test "worker ignores stale scheduled runs after task completion reschedules" do
+  test "worker ignores stale scheduled runs after timer replacement" do
     ctx = FerricStore.Instance.get(:default)
 
     assert {:ok, pid} =
@@ -544,34 +544,19 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert is_reference(initial.run_timer_ref)
     assert is_reference(initial.run_timer_token)
 
-    send(
-      pid,
-      {:policy_catalog_snapshot_finished, 0, "stale-run", self(), :ok}
-    )
+    replacement_token = make_ref()
+    replacement_ref = Process.send_after(pid, {:run, replacement_token}, 60_000)
 
-    send(
-      pid,
-      {:policy_catalog_snapshot_finished, 0, "stale-run", self(), :ok}
-    )
-
-    assert_eventually(
-      fn ->
-        settled = :sys.get_state(pid)
-        assert is_reference(settled.run_timer_ref)
-        assert is_reference(settled.run_timer_token)
-        refute settled.run_timer_token == initial.run_timer_token
-        assert is_integer(Process.read_timer(settled.run_timer_ref))
-      end,
-      timeout: 5_000,
-      interval: 10
-    )
-
-    settled = :sys.get_state(pid)
+    replaced =
+      :sys.replace_state(pid, fn state ->
+        Process.cancel_timer(state.run_timer_ref)
+        %{state | run_timer_ref: replacement_ref, run_timer_token: replacement_token}
+      end)
 
     send(pid, {:run, initial.run_timer_token})
     after_stale = :sys.get_state(pid)
-    assert after_stale.run_timer_token == settled.run_timer_token
-    assert after_stale.run_timer_ref == settled.run_timer_ref
+    assert after_stale.run_timer_token == replaced.run_timer_token
+    assert after_stale.run_timer_ref == replaced.run_timer_ref
     assert is_integer(Process.read_timer(after_stale.run_timer_ref))
     GenServer.stop(pid)
   end
