@@ -554,14 +554,24 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
       {:policy_catalog_snapshot_finished, 0, "stale-run", self(), :ok}
     )
 
-    current = :sys.get_state(pid)
-    assert is_reference(current.run_timer_ref)
-    assert is_reference(current.run_timer_token)
-    refute current.run_timer_token == initial.run_timer_token
+    assert_eventually(
+      fn ->
+        settled = :sys.get_state(pid)
+        assert is_reference(settled.run_timer_ref)
+        assert is_reference(settled.run_timer_token)
+        refute settled.run_timer_token == initial.run_timer_token
+        assert is_integer(Process.read_timer(settled.run_timer_ref))
+      end,
+      timeout: 5_000,
+      interval: 10
+    )
+
+    settled = :sys.get_state(pid)
 
     send(pid, {:run, initial.run_timer_token})
     after_stale = :sys.get_state(pid)
-    assert after_stale.run_timer_token == current.run_timer_token
+    assert after_stale.run_timer_token == settled.run_timer_token
+    assert after_stale.run_timer_ref == settled.run_timer_ref
     assert is_integer(Process.read_timer(after_stale.run_timer_ref))
     GenServer.stop(pid)
   end
