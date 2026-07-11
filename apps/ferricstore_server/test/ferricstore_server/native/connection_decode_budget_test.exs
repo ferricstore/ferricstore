@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
 
   alias FerricstoreServer.Native.{Codec, Listener}
   alias FerricstoreServer.Native.Connection.{FrameBuffer, Responses}
+  alias FerricstoreServer.Acl
 
   @ping_opcode 0x0003
   @command_exec_opcode 0x0100
@@ -12,6 +13,12 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   @max_frame_bytes 16 * 1024 * 1024
   @max_buffer_bytes 128 * 1024 * 1024
   @receive_timeout 5_000
+
+  setup do
+    Acl.reset!()
+    on_exit(fn -> Acl.reset!() end)
+    :ok
+  end
 
   test "drains budgeted frame continuations without waiting for more socket data" do
     socket = connect()

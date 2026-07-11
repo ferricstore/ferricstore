@@ -19,6 +19,12 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
   alias FerricstoreServer.Acl
   alias Ferricstore.Test.ShardHelpers
 
+  setup do
+    Acl.reset!()
+    on_exit(fn -> Acl.reset!() end)
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # R2-C1: Deleted user ACL cache must fail closed
   #

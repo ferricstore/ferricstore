@@ -34,6 +34,7 @@ defmodule FerricstoreServer.AclSecurityTest do
       Application.delete_env(:ferricstore, :max_acl_users)
       Application.delete_env(:ferricstore, :protected_mode)
       Ferricstore.Config.set("requirepass", "")
+      Acl.reset!()
     end)
 
     :ok
