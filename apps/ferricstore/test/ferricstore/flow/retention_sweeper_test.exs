@@ -23,6 +23,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         interval_ms: 60_000,
         catchup_delay_ms: 1,
         limit: 5,
+        pressure_detector_fun: fn -> false end,
         cleanup_fun: fn opts ->
           send(parent, {:cleanup_called, opts})
           {:ok, %{flows: 0, history: 5, values: 0}}
@@ -55,6 +56,7 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
         interval_ms: 60_000,
         catchup_delay_ms: 1,
         limit: 100,
+        pressure_detector_fun: fn -> false end,
         cleanup_fun: fn opts ->
           call = :atomics.add_get(calls, 1, 1)
           send(parent, {:cleanup_called, call, opts})
