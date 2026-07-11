@@ -10,8 +10,15 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
   @startup_active_rebuild_slots_key {__MODULE__, :startup_active_rebuild_slots}
 
   def init_startup_active_rebuild_limiter do
-    ref = :atomics.new(1, signed: false)
-    :persistent_term.put(@startup_active_rebuild_slots_key, ref)
+    case :persistent_term.get(@startup_active_rebuild_slots_key, nil) do
+      ref when is_reference(ref) ->
+        :ok
+
+      _missing_or_invalid ->
+        ref = :atomics.new(1, signed: false)
+        :persistent_term.put(@startup_active_rebuild_slots_key, ref)
+    end
+
     :ok
   end
 

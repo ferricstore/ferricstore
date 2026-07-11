@@ -98,6 +98,9 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Telemetry do
         _ -> :ok
       end
 
+      defp commit_stage_result({:waraft_applied_at, _position, result}),
+        do: commit_stage_result(result)
+
       defp commit_stage_result(:ok), do: :ok
       defp commit_stage_result({:ok, _value}), do: :ok
       defp commit_stage_result(result) when is_list(result), do: :ok

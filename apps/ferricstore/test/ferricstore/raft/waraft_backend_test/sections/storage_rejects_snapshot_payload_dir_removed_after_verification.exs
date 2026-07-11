@@ -631,12 +631,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
 
         specs = shard_dir_specs(target_ctx, 0)
         data_dest = Keyword.fetch!(specs, :data)
+        blob_dest = Keyword.fetch!(specs, :blob)
         prob_dest = Keyword.fetch!(specs, :prob)
         prob_sentinel = Path.join(prob_dest, "sentinel")
 
-        File.rm_rf!(data_dest)
-        File.mkdir_p!(Path.dirname(data_dest))
-        File.write!(data_dest, "not-a-directory")
+        File.rm_rf!(blob_dest)
+        File.mkdir_p!(Path.dirname(blob_dest))
+        File.write!(blob_dest, "not-a-directory")
         File.mkdir_p!(prob_dest)
         File.write!(prob_sentinel, "must-survive")
 
@@ -650,11 +651,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
           config: nil
         }
 
-        assert {:error, {:backup_live_dir, :data, :not_directory}} =
+        assert {:error, {:backup_live_dir, :blob, :not_directory}} =
                  Ferricstore.Raft.WARaftStorage.open_snapshot(snapshot_path, position, handle)
 
         assert File.exists?(prob_sentinel)
-        assert File.regular?(data_dest)
+        assert File.dir?(data_dest)
+        assert File.regular?(blob_dest)
       end
 
       @tag :snapshot_metadata_rollback

@@ -842,6 +842,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
           assert_receive {:startup_rebuild_slot_held, ^index}, 1_000
         end
 
+        assert :ok = Ferricstore.Flow.LMDBRebuilder.init_startup_active_rebuild_limiter()
+
         send(owner.pid, :stop_startup_rebuild_limiter_owner)
         assert :ok = Task.await(owner, 1_000)
 

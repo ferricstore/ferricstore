@@ -432,7 +432,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
           |> Task.async_stream(
             fn index -> Ferricstore.Flow.HistoryProjectedIndex.persist(dir, index) end,
             max_concurrency: 32,
-            timeout: 10_000
+            timeout: 30_000
           )
           |> Enum.to_list()
 

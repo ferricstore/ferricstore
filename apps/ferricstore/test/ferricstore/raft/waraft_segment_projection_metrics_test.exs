@@ -5,6 +5,8 @@ defmodule Ferricstore.Raft.WARaftSegmentProjectionMetricsTest do
   alias Ferricstore.Raft.WARaftBackend
 
   test "hot put batches emit segment projection apply telemetry" do
+    default_ctx = FerricStore.Instance.get(:default)
+
     root =
       Path.join(
         System.tmp_dir!(),
@@ -53,7 +55,16 @@ defmodule Ferricstore.Raft.WARaftSegmentProjectionMetricsTest do
     )
 
     try do
+      :persistent_term.erase(
+        {Ferricstore.Flow.LMDBRebuilder.ActiveIndexes, :startup_active_rebuild_slots}
+      )
+
       assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+      assert :ok =
+               Ferricstore.Flow.LMDBRebuilder.__with_startup_active_rebuild_slot_for_test__(fn ->
+                 :ok
+               end)
 
       assert {:ok, [:ok, :ok, :ok]} =
                WARaftBackend.write_put_batch(0, [
@@ -92,6 +103,7 @@ defmodule Ferricstore.Raft.WARaftSegmentProjectionMetricsTest do
       WARaftBackend.stop()
       FerricStore.Instance.cleanup(ctx.name)
       File.rm_rf!(root)
+      :ok = WARaftBackend.start(default_ctx)
     end
   end
 end

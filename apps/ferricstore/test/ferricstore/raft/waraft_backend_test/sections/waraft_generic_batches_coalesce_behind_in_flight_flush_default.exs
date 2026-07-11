@@ -677,7 +677,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
             end
           end)
 
-        assert_receive {^first_ref, :ok}, 120
+        assert_receive {^first_ref,
+                        {:waraft_applied_at, {:raft_log_pos, applied_index, applied_term}, :ok}},
+                       120
+
+        assert applied_index > 0
+        assert applied_term > 0
         assert System.monotonic_time(:millisecond) - started_ms < 120
         assert List.duplicate(:ok, 80) == Task.await(producer, 5_000)
         assert_eventually(fn -> Router.get(ctx, "batch-timer:first") end, "v0")

@@ -82,6 +82,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       @spec start(FerricStore.Instance.t(), keyword()) :: :ok | {:error, term()}
       def start(%FerricStore.Instance{} = ctx, opts \\ []) do
         Ferricstore.Raft.WARaftStorage.validate_supported_apply_mode!()
+        :ok = Ferricstore.Flow.LMDBRebuilder.init_startup_active_rebuild_limiter()
 
         config = backend_config!(opts)
 
