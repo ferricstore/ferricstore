@@ -526,6 +526,13 @@ defmodule Ferricstore.FlowTest do
     on_exit(fn ->
       :persistent_term.put(instance_key, original_instance)
       :persistent_term.put(backend_key, original_backend)
+
+      restore_type = "apply-context-restore:#{System.unique_integer([:positive])}"
+
+      case FerricStore.flow_policy_set(restore_type, []) do
+        {:ok, _policy} -> :ok
+        other -> raise "failed to restore replicated apply context: #{inspect(other)}"
+      end
     end)
 
     updated_instance

@@ -347,8 +347,7 @@ defmodule Ferricstore.FlowStateMetaTest do
       assert {:ok, 1} = lmdb_state_meta_query_count(type, "completed", "version", 3)
     end)
 
-    assert {:ok, cleaned} =
-             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+    cleaned = cleanup_until_flow_removed!(id, cleanup_now_ms)
 
     assert cleaned.flows >= 1
     assert [] = :ets.lookup(keydir, catalog_key)
@@ -432,6 +431,38 @@ defmodule Ferricstore.FlowStateMetaTest do
   defp flush_lmdb! do
     ctx = FerricStore.Instance.get(:default)
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
+  end
+
+  defp cleanup_until_flow_removed!(id, now_ms) do
+    do_cleanup_until_flow_removed!(
+      id,
+      now_ms,
+      %{flows: 0, history: 0, values: 0, active_timeouts: 0},
+      100
+    )
+  end
+
+  defp do_cleanup_until_flow_removed!(id, now_ms, totals, attempts) do
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: now_ms)
+
+    totals =
+      Map.new([:flows, :history, :values, :active_timeouts], fn key ->
+        {key, Map.get(totals, key, 0) + Map.get(cleaned, key, 0)}
+      end)
+
+    flush_lmdb!()
+
+    case FerricStore.flow_get(id, partition_key: @partition) do
+      {:ok, nil} ->
+        totals
+
+      {:ok, _record} when attempts > 1 ->
+        do_cleanup_until_flow_removed!(id, now_ms, totals, attempts - 1)
+
+      {:ok, _record} ->
+        flunk("retention cleanup did not remove flow #{inspect(id)}")
+    end
   end
 
   defp lmdb_state_meta_query_count(type, state, name, value) do

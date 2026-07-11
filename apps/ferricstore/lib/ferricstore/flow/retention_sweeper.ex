@@ -194,6 +194,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     duration_us = duration_us(started)
     {status, counts, reason} = normalize_result(result)
     limit_hit? = status == :ok and cleanup_limit_hit?(counts, limit)
+    catchup? = status == :ok and cleanup_work_done?(counts)
 
     {state, compaction_triggered?} =
       maybe_trigger_compaction(status, counts, pressure?, limit_hit?, state)
@@ -233,7 +234,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
           }
       }
 
-    schedule(next_delay_ms(limit_hit?, pressure?, state))
+    schedule(next_delay_ms(catchup?, pressure?, state))
     {:noreply, next_state}
   end
 
@@ -306,6 +307,10 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     Map.get(counts, :flows, 0) + Map.get(counts, :active_timeouts, 0) >= limit or
       Map.get(counts, :history, 0) >= limit or
       Map.get(counts, :values, 0) >= limit
+  end
+
+  defp cleanup_work_done?(counts) do
+    Enum.any?([:flows, :history, :values, :active_timeouts], &(Map.get(counts, &1, 0) > 0))
   end
 
   defp emit_sweep(

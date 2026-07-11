@@ -43,6 +43,40 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     assert info.last_sweep.history == 5
   end
 
+  test "catch-up scheduling continues after an underfilled cleanup pass does work" do
+    name = :"flow_retention_sweeper_test_#{System.unique_integer([:positive])}"
+    parent = self()
+    calls = :atomics.new(1, [])
+
+    {:ok, pid} =
+      RetentionSweeper.start_link(
+        name: name,
+        initial_delay_ms: 60_000,
+        interval_ms: 60_000,
+        catchup_delay_ms: 1,
+        limit: 100,
+        cleanup_fun: fn opts ->
+          call = :atomics.add_get(calls, 1, 1)
+          send(parent, {:cleanup_called, call, opts})
+
+          if call == 1 do
+            {:ok, %{flows: 0, history: 1, values: 0}}
+          else
+            {:ok, %{flows: 0, history: 0, values: 0}}
+          end
+        end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    send(pid, :sweep)
+
+    assert_receive {:cleanup_called, 1, [limit: 100]}, 500
+    assert_receive {:cleanup_called, 2, [limit: 100]}, 500
+  end
+
   test "catch-up scheduling treats active timeouts and terminal cleanup as one budget" do
     name = :"flow_retention_sweeper_test_#{System.unique_integer([:positive])}"
     parent = self()

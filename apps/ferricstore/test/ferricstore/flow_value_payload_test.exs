@@ -377,15 +377,12 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     cleanup_now_ms = completed.terminal_retention_until_ms + 1
 
-    assert {:ok, cleaned} =
-             FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now_ms)
+    cleaned =
+      cleanup_until_flow_removed!(id, "tenant-retention", cleanup_now_ms)
 
     assert cleaned.flows >= 1
     assert cleaned.history >= 1
     assert cleaned.values >= 2
-
-    assert :ok =
-             Ferricstore.Flow.LMDBWriter.flush_all(FerricStore.Instance.get(:default).shard_count)
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
@@ -457,13 +454,11 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert pid = Process.whereis(Ferricstore.Flow.RetentionSweeper)
     send(pid, :sweep)
 
-    assert_receive {:retention_sweeper_event, [:ferricstore, :flow, :retention_sweeper, :sweep],
-                    %{flows: flows, history: history, values: values}, %{status: :ok}},
-                   5_000
+    cleaned = await_retention_sweeper_cleanup!(5_000)
 
-    assert flows >= 1
-    assert history >= 1
-    assert values >= 2
+    assert cleaned.flows >= 1
+    assert cleaned.history >= 1
+    assert cleaned.values >= 2
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     assert {:ok, nil} = internal_get(created.payload_ref)
     assert {:ok, nil} = internal_get(completed.result_ref)
@@ -711,6 +706,72 @@ defmodule Ferricstore.FlowValuePayloadTest do
       1_000,
       10
     )
+  end
+
+  defp cleanup_until_flow_removed!(id, partition_key, now_ms) do
+    do_cleanup_until_flow_removed!(
+      id,
+      partition_key,
+      now_ms,
+      %{flows: 0, history: 0, values: 0, active_timeouts: 0},
+      100
+    )
+  end
+
+  defp do_cleanup_until_flow_removed!(id, partition_key, now_ms, totals, attempts) do
+    assert {:ok, cleaned} =
+             FerricStore.flow_retention_cleanup(limit: 10, now_ms: now_ms)
+
+    totals = merge_cleanup_counts(totals, cleaned)
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    case FerricStore.flow_get(id, partition_key: partition_key) do
+      {:ok, nil} ->
+        totals
+
+      {:ok, _record} when attempts > 1 ->
+        do_cleanup_until_flow_removed!(id, partition_key, now_ms, totals, attempts - 1)
+
+      {:ok, _record} ->
+        flunk("retention cleanup did not remove flow #{inspect(id)}")
+    end
+  end
+
+  defp await_retention_sweeper_cleanup!(timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    do_await_retention_sweeper_cleanup!(
+      deadline,
+      %{flows: 0, history: 0, values: 0, active_timeouts: 0}
+    )
+  end
+
+  defp do_await_retention_sweeper_cleanup!(deadline, totals) do
+    timeout_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:retention_sweeper_event, [:ferricstore, :flow, :retention_sweeper, :sweep], cleaned,
+       %{status: :ok}} ->
+        totals = merge_cleanup_counts(totals, cleaned)
+
+        work_done? =
+          Enum.any?([:flows, :history, :values, :active_timeouts], &(Map.get(cleaned, &1, 0) > 0))
+
+        if totals.flows >= 1 and totals.history >= 1 and totals.values >= 2 and not work_done? do
+          totals
+        else
+          do_await_retention_sweeper_cleanup!(deadline, totals)
+        end
+    after
+      timeout_ms -> flunk("retention sweeper did not finish bounded cleanup passes")
+    end
+  end
+
+  defp merge_cleanup_counts(left, right) do
+    Map.new([:flows, :history, :values, :active_timeouts], fn key ->
+      {key, Map.get(left, key, 0) + Map.get(right, key, 0)}
+    end)
   end
 
   defp internal_get(key), do: {:ok, Router.get(FerricStore.Instance.get(:default), key)}
