@@ -69,7 +69,7 @@ jobs:
 
       - name: Install cargo-audit
         run: |
-          if ! cargo audit --version 2>/dev/null | grep -Eq '^cargo-audit v?0\.22\.2$'; then
+          if [ ! -x "$HOME/.cargo/bin/cargo-audit" ]; then
             cargo install cargo-audit --version 0.22.2 --locked --force
           fi
 

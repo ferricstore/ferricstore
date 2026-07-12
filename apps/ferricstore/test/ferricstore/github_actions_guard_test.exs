@@ -135,7 +135,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "mix hex.audit"
     assert workflow =~ "mix deps.compile --include-children mix_audit"
     assert workflow =~ "mix deps.audit"
-    assert workflow =~ "grep -Eq '^cargo-audit v?0\\.22\\.2$'"
+    assert workflow =~ ~s(if [ ! -x "$HOME/.cargo/bin/cargo-audit" ]; then)
     assert workflow =~ "cargo install cargo-audit --version 0.22.2 --locked --force"
 
     for lockfile <- [
