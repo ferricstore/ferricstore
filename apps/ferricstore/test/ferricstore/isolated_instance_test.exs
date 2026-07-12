@@ -23,6 +23,13 @@ defmodule Ferricstore.IsolatedInstanceTest do
     assert {:ok, 0} = Ferricstore.Flow.LMDB.release_all()
   end
 
+  test "checkin tolerates an instance data directory removed by a failure test" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    File.rm_rf!(ctx.data_dir)
+
+    assert :ok = IsolatedInstance.checkin(ctx)
+  end
+
   describe "instance isolation" do
     test "two instances don't see each other's keys" do
       ctx_a = IsolatedInstance.checkout()

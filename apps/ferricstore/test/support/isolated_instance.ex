@@ -173,7 +173,9 @@ defmodule Ferricstore.Test.IsolatedInstance do
         |> Ferricstore.DataDir.shard_data_path(i)
         |> Ferricstore.Flow.LMDB.path()
 
-      :ok = Ferricstore.Flow.LMDB.release(lmdb_path, @lmdb_release_timeout_ms)
+      if File.dir?(lmdb_path) do
+        :ok = Ferricstore.Flow.LMDB.release(lmdb_path, @lmdb_release_timeout_ms)
+      end
     end
 
     # Delete ETS tables
