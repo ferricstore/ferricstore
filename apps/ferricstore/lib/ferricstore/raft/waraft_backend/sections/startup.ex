@@ -92,6 +92,17 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
         end)
       end
 
+      defp rollout_apply_context_shard(shard_index) do
+        %{apply_context: %Ferricstore.Raft.ApplyContext{} = context} = context!(@table)
+
+        profile_startup_phase(:rollout_apply_context, %{shard_index: shard_index}, fn ->
+          Ferricstore.Raft.ApplyContext.rollout_shards(context, [shard_index], fn
+            ^shard_index, command ->
+              commit_or_redirect(shard_index, command, @config_redirects)
+          end)
+        end)
+      end
+
       defp finish_start_partitions(shard_count, opts) when shard_count > 0 do
         max_concurrency = startup_partition_concurrency(shard_count)
 

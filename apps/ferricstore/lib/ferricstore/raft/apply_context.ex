@@ -339,12 +339,28 @@ defmodule Ferricstore.Raft.ApplyContext do
           :ok | {:error, {:apply_context_rollout_failed, map()}}
   def rollout(%__MODULE__{} = context, shard_count, write_fun)
       when is_integer(shard_count) and shard_count > 0 and is_function(write_fun, 2) do
+    do_rollout(context, 0..(shard_count - 1), shard_count, write_fun)
+  end
+
+  @doc false
+  @spec rollout_shards(t(), [non_neg_integer()], (non_neg_integer(), tuple() -> term())) ::
+          :ok | {:error, {:apply_context_rollout_failed, map()}}
+  def rollout_shards(%__MODULE__{} = context, shard_indices, write_fun)
+      when is_list(shard_indices) and shard_indices != [] and is_function(write_fun, 2) do
+    if valid_rollout_shards?(shard_indices) do
+      do_rollout(context, shard_indices, length(shard_indices), write_fun)
+    else
+      raise ArgumentError, "shard indices must be unique non-negative integers"
+    end
+  end
+
+  defp do_rollout(context, shard_indices, shard_count, write_fun) do
     encoded = encode(context)
     command = barrier_command(context)
     max_concurrency = min(shard_count, max(1, System.schedulers_online()))
 
     failures =
-      0..(shard_count - 1)
+      shard_indices
       |> Task.async_stream(
         fn shard_index ->
           result = safe_rollout_write(write_fun, shard_index, command)
@@ -370,6 +386,11 @@ defmodule Ferricstore.Raft.ApplyContext do
     else
       {:error, {:apply_context_rollout_failed, failures}}
     end
+  end
+
+  defp valid_rollout_shards?(shard_indices) do
+    Enum.all?(shard_indices, &(is_integer(&1) and &1 >= 0)) and
+      MapSet.size(MapSet.new(shard_indices)) == length(shard_indices)
   end
 
   defp safe_rollout_write(write_fun, shard_index, command) do

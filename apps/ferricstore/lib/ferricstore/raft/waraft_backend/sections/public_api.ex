@@ -535,11 +535,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       @spec bootstrap_cluster([node()]) :: :ok | {:error, term()}
       def bootstrap_cluster(nodes) when is_list(nodes) do
         with :ok <- validate_bootstrap_nodes(nodes),
-             {:ok, ctx} <- context(@table),
-             :ok <- bootstrap_cluster_partitions(ctx.shard_count, nodes),
-             :ok <- finish_start_partitions(ctx.shard_count, bootstrap: true),
-             :ok <- rollout_apply_context(ctx.shard_count) do
-          :ok
+             {:ok, ctx} <- context(@table) do
+          bootstrap_cluster_partitions(ctx.shard_count, nodes)
         end
       end
 
@@ -565,7 +562,15 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
           |> partition()
           |> server_name()
 
-        backend_call(fn -> :wa_raft_server.trigger_election(server) end)
+        case backend_call(fn -> :wa_raft_server.trigger_election(server) end) do
+          :ok ->
+            with :ok <- wait_known_leader(shard_index, server, startup_wait_attempts()) do
+              rollout_apply_context_shard(shard_index)
+            end
+
+          other ->
+            other
+        end
       end
 
       @spec transfer_leadership(non_neg_integer(), node()) :: :ok | {:error, term()}

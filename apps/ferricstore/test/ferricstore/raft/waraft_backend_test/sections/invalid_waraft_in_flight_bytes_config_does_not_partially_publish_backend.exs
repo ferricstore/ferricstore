@@ -315,6 +315,45 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytes
         assert {:ok, {:raft_log_pos, 0, 0}} = WARaftBackend.storage_position(0)
       end
 
+      test "bootstrap_cluster stages multi-peer config before leader election", %{ctx: ctx} do
+        previous_wait_timeout =
+          Application.get_env(:ferricstore, :waraft_start_wait_timeout_ms)
+
+        try do
+          Application.put_env(:ferricstore, :waraft_start_wait_timeout_ms, 100)
+
+          assert :ok =
+                   WARaftBackend.start(ctx,
+                     bootstrap: false,
+                     log_module: :ferricstore_waraft_spike_segment_log
+                   )
+
+          assert :ok =
+                   WARaftBackend.bootstrap_cluster([
+                     node(),
+                     :waraft_staged_peer_1@nohost,
+                     :waraft_staged_peer_2@nohost
+                   ])
+        after
+          restore_env(:waraft_start_wait_timeout_ms, previous_wait_timeout)
+        end
+      end
+
+      test "manual bootstrap replicates apply context after election", %{ctx: ctx} do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   bootstrap: false,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert :ok = WARaftBackend.bootstrap_cluster([node()])
+        assert {:ok, {:raft_log_pos, 1, 1}} = WARaftBackend.storage_position(0)
+
+        assert :ok = WARaftBackend.trigger_election(0)
+        assert {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(0)
+        assert index >= 2
+      end
+
       test "add_member rejects invalid timeouts before membership mutation", %{ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
         original_membership = WARaftBackend.membership(0)

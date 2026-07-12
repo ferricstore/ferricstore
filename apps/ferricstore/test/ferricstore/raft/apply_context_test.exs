@@ -432,6 +432,22 @@ defmodule Ferricstore.Raft.ApplyContextTest do
              end)
   end
 
+  test "targeted rollout only writes the elected raft group" do
+    context = ApplyContext.new(flow_default_history_max_events: 20)
+    encoded = ApplyContext.encode(context)
+    parent = self()
+
+    assert :ok =
+             ApplyContext.rollout_shards(context, [3], fn shard_index, command ->
+               send(parent, {:targeted_rollout, shard_index, command})
+               {:ok, encoded}
+             end)
+
+    assert_receive {:targeted_rollout, 3, command}, 500
+    assert command == ApplyContext.barrier_command(context)
+    refute_receive {:targeted_rollout, _shard_index, _command}
+  end
+
   test "barrier adopts and acknowledges the exact replicated context" do
     local = ApplyContext.new(flow_default_history_max_events: 10)
     leader = ApplyContext.new(flow_default_history_max_events: 20)
