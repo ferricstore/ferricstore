@@ -264,6 +264,18 @@ if config_env() == :prod do
       String.to_integer(
         System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_INTERVAL_MS", "600000")
       ),
+    flow_retention_sweeper_catchup_delay_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_CATCHUP_DELAY_MS", "100")
+      ),
+    flow_retention_sweeper_catchup_burst_limit:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_CATCHUP_BURST_LIMIT", "8")
+      ),
+    flow_retention_sweeper_catchup_pause_ms:
+      String.to_integer(
+        System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_CATCHUP_PAUSE_MS", "1000")
+      ),
     flow_retention_sweeper_limit:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_RETENTION_SWEEPER_LIMIT", "1000")),
     flow_retention_sweeper_pressure_interval_ms:

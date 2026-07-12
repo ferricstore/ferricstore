@@ -53,19 +53,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         lmdb_pending? = flow_retention_lmdb_projection_pending?(state)
         backfill_pending? = not flow_retention_backfill_complete?(state)
 
-        active_candidates =
+        {active_candidates, active_more?} =
           if plan_kind in [:active, :all] do
-            state
-            |> flow_active_timeout_expired_state_entries(now_ms, limit)
-            |> Enum.flat_map(&flow_retention_plan_active_candidate(state, &1, now_ms))
+            candidates =
+              state
+              |> flow_active_timeout_expired_state_entries(now_ms, limit + 1)
+              |> Enum.flat_map(&flow_retention_plan_active_candidate(state, &1, now_ms))
+
+            {Enum.take(candidates, limit), length(candidates) > limit}
           else
-            []
+            {[], false}
           end
 
-        terminal_candidates =
+        {terminal_candidates, terminal_more?} =
           if plan_kind not in [:terminal, :all] or projection_pending? or lmdb_pending? or
                backfill_pending? do
-            []
+            {[], false}
           else
             flow_retention_plan_terminal_candidates(state, now_ms, limit, attrs)
           end
@@ -74,7 +77,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
          %{
            shard_index: state.shard_index,
            active_candidates: active_candidates,
+           active_more?: active_more?,
            terminal_candidates: terminal_candidates,
+           terminal_more?: terminal_more?,
            projection_pending?: projection_pending?,
            lmdb_pending?: lmdb_pending?,
            backfill_pending?: backfill_pending?
@@ -126,8 +131,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
       end
 
       defp flow_retention_plan_terminal_candidates(state, now_ms, limit, attrs) do
-        hot_state_keys = flow_retention_plan_hot_terminal_state_keys(state, now_ms, limit)
-        lmdb_limit = limit + length(hot_state_keys)
+        source_limit = limit + 1
+        hot_state_keys = flow_retention_plan_hot_terminal_state_keys(state, now_ms, source_limit)
+        lmdb_limit = source_limit + length(hot_state_keys)
 
         lmdb_state_keys =
           case Ferricstore.Flow.LMDB.expired_terminal_state_keys(
@@ -152,50 +158,101 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         key_budget = flow_retention_cleanup_key_budget(state, attrs)
         byte_budget = flow_retention_cleanup_byte_budget(state, attrs)
 
-        {candidates, _remaining_limit, _remaining_keys, _remaining_bytes} =
-          state_keys
-          |> Enum.reverse()
-          |> Enum.reduce_while({[], limit, key_budget, byte_budget}, fn
-            _state_key, {acc, remaining_limit, remaining_keys, remaining_bytes}
-            when remaining_limit <= 0 or remaining_keys <= 0 or remaining_bytes <= 0 ->
-              {:halt, {acc, remaining_limit, remaining_keys, remaining_bytes}}
+        source_truncated? =
+          length(hot_state_keys) >= source_limit or length(lmdb_state_keys) >= lmdb_limit
 
-            state_key, {acc, remaining_limit, remaining_keys, remaining_bytes} ->
-              candidates =
-                case flow_active_timeout_current_record(state, state_key) do
-                  record when is_map(record) ->
-                    flow_retention_plan_terminal_candidate(
-                      state,
-                      state_key,
-                      record,
-                      now_ms,
-                      remaining_keys,
-                      remaining_bytes
-                    )
+        state_keys
+        |> Enum.reverse()
+        |> flow_retention_plan_terminal_state_keys(
+          state,
+          now_ms,
+          limit,
+          key_budget,
+          byte_budget,
+          [],
+          source_truncated?
+        )
+      end
 
-                  nil ->
-                    []
-                end
+      defp flow_retention_plan_terminal_state_keys(
+             [],
+             _state,
+             _now_ms,
+             _remaining_limit,
+             _remaining_keys,
+             _remaining_bytes,
+             candidates,
+             source_truncated?
+           ),
+           do: {Enum.reverse(candidates), source_truncated?}
 
-              case candidates do
-                [candidate] ->
-                  candidate_keys = Map.fetch!(candidate, :planned_key_count)
-                  candidate_bytes = :erlang.external_size(candidate)
+      defp flow_retention_plan_terminal_state_keys(
+             remaining_state_keys,
+             _state,
+             _now_ms,
+             remaining_limit,
+             remaining_keys,
+             remaining_bytes,
+             candidates,
+             _source_truncated?
+           )
+           when remaining_limit <= 0 or remaining_keys <= 0 or remaining_bytes <= 0,
+           do: {Enum.reverse(candidates), remaining_state_keys != []}
 
-                  {:cont,
-                   {
-                     [candidate | acc],
-                     remaining_limit - 1,
-                     remaining_keys - candidate_keys,
-                     remaining_bytes - candidate_bytes
-                   }}
+      defp flow_retention_plan_terminal_state_keys(
+             [state_key | rest],
+             state,
+             now_ms,
+             remaining_limit,
+             remaining_keys,
+             remaining_bytes,
+             candidates,
+             source_truncated?
+           ) do
+        planned =
+          case flow_active_timeout_current_record(state, state_key) do
+            record when is_map(record) ->
+              flow_retention_plan_terminal_candidate(
+                state,
+                state_key,
+                record,
+                now_ms,
+                remaining_keys,
+                remaining_bytes
+              )
 
-                [] ->
-                  {:cont, {acc, remaining_limit, remaining_keys, remaining_bytes}}
-              end
-          end)
+            nil ->
+              []
+          end
 
-        Enum.reverse(candidates)
+        case planned do
+          [candidate] ->
+            candidate_keys = Map.fetch!(candidate, :planned_key_count)
+            candidate_bytes = :erlang.external_size(candidate)
+
+            flow_retention_plan_terminal_state_keys(
+              rest,
+              state,
+              now_ms,
+              remaining_limit - 1,
+              remaining_keys - candidate_keys,
+              remaining_bytes - candidate_bytes,
+              [candidate | candidates],
+              source_truncated?
+            )
+
+          [] ->
+            flow_retention_plan_terminal_state_keys(
+              rest,
+              state,
+              now_ms,
+              remaining_limit,
+              remaining_keys,
+              remaining_bytes,
+              candidates,
+              source_truncated?
+            )
+        end
       end
 
       defp flow_retention_plan_hot_terminal_state_keys(state, now_ms, limit) do

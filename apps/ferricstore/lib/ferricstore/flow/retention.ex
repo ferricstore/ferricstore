@@ -15,10 +15,15 @@ defmodule Ferricstore.Flow.Retention do
       with :ok <- validate_opts(opts),
            {:ok, limit} <- optional_pos_integer(opts, :limit, 100),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, continuation} <- optional_continuation(opts),
            :ok <- flush_lmdb_before_cleanup(ctx),
            :ok <- flush_history_before_cleanup(ctx),
            :ok <- flush_lmdb_before_cleanup(ctx) do
-        Router.flow_retention_cleanup(ctx, %{limit: limit, now_ms: now})
+        Router.flow_retention_cleanup(ctx, %{
+          limit: limit,
+          now_ms: now,
+          continuation: continuation
+        })
       end
 
     FlowTelemetry.observe(:retention_cleanup, started, result, %{flow_id: nil})
@@ -70,6 +75,14 @@ defmodule Ferricstore.Flow.Retention do
       :error when is_integer(default) and default >= 0 -> {:ok, default}
       :error when is_nil(default) -> {:ok, nil}
       :error -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_continuation(opts) do
+    case Keyword.get(opts, :continuation) do
+      nil -> {:ok, nil}
+      continuation when is_binary(continuation) -> {:ok, continuation}
+      _invalid -> {:error, "ERR flow continuation must be a binary token"}
     end
   end
 

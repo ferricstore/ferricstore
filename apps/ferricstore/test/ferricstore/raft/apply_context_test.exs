@@ -558,6 +558,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     refute router_source =~ "defp flow_retention_positive_config"
     assert budget_source =~ "min(value, maximum)"
     refute budget_source =~ "max("
+    assert router_source =~ "min(acc.remaining_limit, acc.remaining_keys)"
   end
 
   test "Raft apply limit readers do not consult application configuration" do

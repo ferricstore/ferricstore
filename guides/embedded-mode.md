@@ -850,8 +850,9 @@ MyApp.PageCache.set("page:/home", html, ttl: :timer.hours(1))
 ```
 
 Each named instance starts its own Flow retention sweeper. Configure it with
-`:flow_retention_sweeper` when the default interval or batch limit is not
-appropriate. The sweeper enforces `max_active_ms` and terminal retention only
+`:flow_retention_sweeper` when the default interval, batch limit, or bounded
+catch-up burst and pause settings are not appropriate. The sweeper enforces
+`max_active_ms` and terminal retention only
 against that instance's shards.
 
 ### When to Use Multiple Instances

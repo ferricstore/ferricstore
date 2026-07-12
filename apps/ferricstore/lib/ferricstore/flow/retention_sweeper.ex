@@ -15,6 +15,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
   @default_initial_delay_ms 600_000
   @default_interval_ms 600_000
   @default_catchup_delay_ms 100
+  @default_catchup_burst_limit 8
+  @default_catchup_pause_ms 1_000
   @default_limit 100
   @default_pressure_interval_ms 1_000
   @default_pressure_limit 10_000
@@ -48,6 +50,16 @@ defmodule Ferricstore.Flow.RetentionSweeper do
               :flow_retention_sweeper_catchup_delay_ms,
               @default_catchup_delay_ms
             ),
+          catchup_burst_limit:
+            config_pos_int(
+              :flow_retention_sweeper_catchup_burst_limit,
+              @default_catchup_burst_limit
+            ),
+          catchup_pause_ms:
+            config_pos_int(
+              :flow_retention_sweeper_catchup_pause_ms,
+              @default_catchup_pause_ms
+            ),
           limit: config_pos_int(:flow_retention_sweeper_limit, @default_limit),
           pressure_interval_ms:
             config_pos_int(
@@ -62,6 +74,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
               @default_pressure_compaction_interval_ms
             ),
           compaction_running?: false,
+          catchup_burst_count: 0,
           consecutive_limit_hits: 0,
           last_sweep: nil
         }
@@ -77,6 +90,16 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         interval_ms: config_pos_int(:flow_retention_sweeper_interval_ms, @default_interval_ms),
         catchup_delay_ms:
           config_non_neg_int(:flow_retention_sweeper_catchup_delay_ms, @default_catchup_delay_ms),
+        catchup_burst_limit:
+          config_pos_int(
+            :flow_retention_sweeper_catchup_burst_limit,
+            @default_catchup_burst_limit
+          ),
+        catchup_pause_ms:
+          config_pos_int(
+            :flow_retention_sweeper_catchup_pause_ms,
+            @default_catchup_pause_ms
+          ),
         limit: config_pos_int(:flow_retention_sweeper_limit, @default_limit),
         pressure_interval_ms:
           config_pos_int(
@@ -91,6 +114,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
             @default_pressure_compaction_interval_ms
           ),
         compaction_running?: false,
+        catchup_burst_count: 0,
         consecutive_limit_hits: 0,
         last_sweep: nil
       }
@@ -109,6 +133,20 @@ defmodule Ferricstore.Flow.RetentionSweeper do
           :catchup_delay_ms,
           :flow_retention_sweeper_catchup_delay_ms,
           @default_catchup_delay_ms
+        ),
+      catchup_burst_limit:
+        opt_pos_int(
+          opts,
+          :catchup_burst_limit,
+          :flow_retention_sweeper_catchup_burst_limit,
+          @default_catchup_burst_limit
+        ),
+      catchup_pause_ms:
+        opt_pos_int(
+          opts,
+          :catchup_pause_ms,
+          :flow_retention_sweeper_catchup_pause_ms,
+          @default_catchup_pause_ms
         ),
       limit: opt_pos_int(opts, :limit, :flow_retention_sweeper_limit, @default_limit),
       pressure_interval_ms:
@@ -142,6 +180,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         Keyword.get(opts, :compaction_fun, fn -> trigger_merge_checks(instance_ctx) end),
       compaction_ref: nil,
       last_compaction_mono_ms: nil,
+      continuation: nil,
+      catchup_burst_count: 0,
       consecutive_limit_hits: 0,
       last_sweep: nil
     }
@@ -166,6 +206,9 @@ defmodule Ferricstore.Flow.RetentionSweeper do
        running: true,
        interval_ms: state.interval_ms,
        catchup_delay_ms: state.catchup_delay_ms,
+       catchup_burst_limit: state.catchup_burst_limit,
+       catchup_pause_ms: state.catchup_pause_ms,
+       catchup_burst_count: state.catchup_burst_count,
        limit: state.limit,
        pressure_interval_ms: state.pressure_interval_ms,
        pressure_limit: state.pressure_limit,
@@ -184,7 +227,7 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
     result =
       try do
-        state.cleanup_fun.(limit: limit)
+        state.cleanup_fun.(cleanup_opts(limit, state.continuation))
       rescue
         error ->
           Logger.warning("Flow retention sweeper failed: #{Exception.message(error)}")
@@ -193,8 +236,11 @@ defmodule Ferricstore.Flow.RetentionSweeper do
 
     duration_us = duration_us(started)
     {status, counts, reason} = normalize_result(result)
-    limit_hit? = status == :ok and cleanup_limit_hit?(counts, limit)
-    catchup? = status == :ok and cleanup_work_done?(counts)
+    continuation = Map.get(counts, :continuation)
+    more? = status == :ok and is_binary(continuation)
+    limit_hit? = more?
+    next_burst_count = if(more?, do: state.catchup_burst_count + 1, else: 0)
+    catchup_paused? = more? and next_burst_count >= state.catchup_burst_limit
 
     {state, compaction_triggered?} =
       maybe_trigger_compaction(status, counts, pressure?, limit_hit?, state)
@@ -208,6 +254,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
       compaction_triggered?,
       duration_us,
       limit,
+      more?,
+      catchup_paused?,
       state
     )
 
@@ -217,7 +265,9 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     next_state =
       %{
         state
-        | consecutive_limit_hits: if(limit_hit?, do: state.consecutive_limit_hits + 1, else: 0),
+        | continuation: if(status == :ok, do: continuation, else: state.continuation),
+          catchup_burst_count: if(catchup_paused?, do: 0, else: next_burst_count),
+          consecutive_limit_hits: if(limit_hit?, do: state.consecutive_limit_hits + 1, else: 0),
           last_sweep: %{
             status: status,
             reason: reason,
@@ -229,12 +279,14 @@ defmodule Ferricstore.Flow.RetentionSweeper do
             duration_us: duration_us,
             limit: limit,
             limit_hit?: limit_hit?,
+            more?: more?,
+            catchup_paused?: catchup_paused?,
             compaction_triggered?: compaction_triggered?,
             finished_at_ms: System.system_time(:millisecond)
           }
       }
 
-    schedule(next_delay_ms(catchup?, pressure?, state))
+    schedule(next_delay_ms(more?, catchup_paused?, pressure?, state))
     {:noreply, next_state}
   end
 
@@ -299,19 +351,19 @@ defmodule Ferricstore.Flow.RetentionSweeper do
   defp effective_limit(state, true), do: max(state.limit, state.pressure_limit)
   defp effective_limit(state, false), do: state.limit
 
-  defp normalize_result({:ok, counts}) when is_map(counts), do: {:ok, counts, :none}
+  defp normalize_result({:ok, counts}) when is_map(counts) do
+    case Map.get(counts, :continuation) do
+      nil -> {:ok, counts, :none}
+      continuation when is_binary(continuation) -> {:ok, counts, :none}
+      invalid -> {:error, %{}, {:invalid_cleanup_continuation, invalid}}
+    end
+  end
+
   defp normalize_result({:error, reason}), do: {:error, %{}, reason}
   defp normalize_result(other), do: {:error, %{}, other}
 
-  defp cleanup_limit_hit?(counts, limit) do
-    Map.get(counts, :flows, 0) + Map.get(counts, :active_timeouts, 0) >= limit or
-      Map.get(counts, :history, 0) >= limit or
-      Map.get(counts, :values, 0) >= limit
-  end
-
-  defp cleanup_work_done?(counts) do
-    Enum.any?([:flows, :history, :values, :active_timeouts], &(Map.get(counts, &1, 0) > 0))
-  end
+  defp cleanup_opts(limit, nil), do: [limit: limit]
+  defp cleanup_opts(limit, continuation), do: [limit: limit, continuation: continuation]
 
   defp emit_sweep(
          status,
@@ -322,6 +374,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
          compaction_triggered?,
          duration_us,
          limit,
+         more?,
+         catchup_paused?,
          state
        ) do
     :telemetry.execute(
@@ -340,6 +394,8 @@ defmodule Ferricstore.Flow.RetentionSweeper do
         pressure?: pressure?,
         compaction_triggered?: compaction_triggered?,
         limit_hit?: limit_hit?,
+        more?: more?,
+        catchup_paused?: catchup_paused?,
         consecutive_limit_hits: if(limit_hit?, do: state.consecutive_limit_hits + 1, else: 0)
       }
     )
@@ -375,12 +431,18 @@ defmodule Ferricstore.Flow.RetentionSweeper do
     )
   end
 
-  defp next_delay_ms(true, true, state),
+  defp next_delay_ms(true, true, true, state),
+    do: max(state.catchup_pause_ms, state.pressure_interval_ms)
+
+  defp next_delay_ms(true, true, false, state),
+    do: max(state.catchup_pause_ms, state.catchup_delay_ms)
+
+  defp next_delay_ms(true, false, true, state),
     do: min(state.catchup_delay_ms, state.pressure_interval_ms)
 
-  defp next_delay_ms(true, false, state), do: state.catchup_delay_ms
-  defp next_delay_ms(false, true, state), do: state.pressure_interval_ms
-  defp next_delay_ms(false, false, state), do: state.interval_ms
+  defp next_delay_ms(true, false, false, state), do: state.catchup_delay_ms
+  defp next_delay_ms(false, _paused?, true, state), do: state.pressure_interval_ms
+  defp next_delay_ms(false, _paused?, false, state), do: state.interval_ms
 
   defp pressure?(state) do
     state.pressure_detector_fun.()

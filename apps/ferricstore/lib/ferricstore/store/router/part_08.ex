@@ -977,76 +977,90 @@ defmodule Ferricstore.Store.Router.Part08 do
 
       @doc false
       def flow_retention_cleanup(ctx, attrs) when is_map(attrs) do
-        flow_retention_cleanup_planned(ctx, attrs)
+        with {:ok, attrs} <- flow_retention_decode_continuation(ctx, attrs) do
+          flow_retention_cleanup_planned(ctx, attrs)
+        end
       end
 
       defp flow_retention_cleanup_planned(ctx, attrs) do
         attrs = flow_retention_planning_attrs(ctx, attrs)
         active_attrs = Map.put(attrs, :plan_kind, :active)
-        terminal_plan_attrs = Map.put(attrs, :plan_kind, :terminal)
 
-        with {:ok, active_plans} <- flow_retention_plan_shards(ctx, active_attrs),
-             {:ok, terminal_plans} <- flow_retention_plan_shards(ctx, terminal_plan_attrs),
+        with {:ok, active_plan} <- flow_retention_plan_shards(ctx, active_attrs),
              {:ok, active_result} <-
-               flow_retention_cleanup_active(ctx, active_attrs, active_plans) do
+               flow_retention_cleanup_active(ctx, active_attrs, active_plan.plans) do
           remaining_limit = max(attrs.limit - Map.get(active_result, :active_timeouts, 0), 0)
 
-          if remaining_limit == 0 do
-            {:ok, Map.take(active_result, [:flows, :history, :values, :active_timeouts])}
+          if active_plan.continuation do
+            {:ok, flow_retention_result(active_result, active_plan.continuation)}
           else
             terminal_attrs =
               attrs
               |> Map.put(:plan_kind, :terminal)
               |> Map.put(:limit, remaining_limit)
 
-            flow_retention_cleanup_terminal_shards(
-              ctx,
-              terminal_attrs,
-              terminal_plans,
-              active_result
-            )
+            with {:ok, terminal_plan} <- flow_retention_plan_shards(ctx, terminal_attrs) do
+              if remaining_limit == 0 do
+                {:ok, flow_retention_result(active_result, terminal_plan.continuation)}
+              else
+                with {:ok, result} <-
+                       flow_retention_cleanup_terminal_shards(
+                         ctx,
+                         terminal_attrs,
+                         terminal_plan.plans,
+                         active_result
+                       ) do
+                  {:ok, flow_retention_result(result, terminal_plan.continuation)}
+                end
+              end
+            end
           end
         end
       end
 
       defp flow_retention_plan_shards(ctx, attrs) do
+        plan_kind = Map.fetch!(attrs, :plan_kind)
+        key_budget = Map.fetch!(attrs, :cleanup_key_budget)
+        byte_budget = Map.fetch!(attrs, :cleanup_byte_budget)
+
         initial = %{
           plans: [],
           remaining_limit: Map.get(attrs, :limit, 100),
-          remaining_keys: Map.fetch!(attrs, :cleanup_key_budget),
-          remaining_bytes: Map.fetch!(attrs, :cleanup_byte_budget)
+          remaining_keys: key_budget,
+          remaining_bytes: byte_budget,
+          key_budget: key_budget,
+          byte_budget: byte_budget,
+          continuation: nil
         }
 
-        0..(ctx.shard_count - 1)
-        |> Enum.reduce_while({:ok, initial}, fn
-          _idx, {:ok, %{remaining_limit: remaining_limit} = acc}
-          when remaining_limit <= 0 ->
-            {:halt, {:ok, acc}}
+        ctx.shard_count
+        |> flow_retention_shard_order(flow_retention_start_shard(attrs, plan_kind))
+        |> Enum.reduce_while({:ok, initial}, fn idx, {:ok, acc} ->
+          selecting? =
+            acc.remaining_limit > 0 and acc.remaining_keys > 0 and acc.remaining_bytes > 0
 
-          idx, {:ok, acc} ->
-            shard_attrs =
-              attrs
-              |> Map.put(:limit, acc.remaining_limit)
-              |> Map.put(:cleanup_key_budget, acc.remaining_keys)
-              |> Map.put(:cleanup_byte_budget, acc.remaining_bytes)
+          {limit, remaining_keys, remaining_bytes} =
+            if selecting? do
+              {min(acc.remaining_limit, acc.remaining_keys), acc.remaining_keys,
+               acc.remaining_bytes}
+            else
+              {1, acc.key_budget, acc.byte_budget}
+            end
 
-            case flow_retention_plan_shard(ctx, idx, shard_attrs) do
-              {:ok, {:ok, plan}} ->
-                candidates = flow_retention_plan_kind_candidates(plan, attrs.plan_kind)
+          shard_attrs =
+            attrs
+            |> Map.put(:limit, limit)
+            |> Map.put(:cleanup_key_budget, remaining_keys)
+            |> Map.put(:cleanup_byte_budget, remaining_bytes)
 
-                if Enum.all?(candidates, fn
-                     %{
-                       expected_version: version,
-                       expected_guard: guard,
-                       planned_key_count: key_count
-                     }
-                     when is_integer(version) and is_binary(guard) and is_integer(key_count) and
-                            key_count > 0 ->
-                       true
+          case flow_retention_plan_shard(ctx, idx, shard_attrs) do
+            {:ok, {:ok, plan}} ->
+              candidates = flow_retention_plan_kind_candidates(plan, attrs.plan_kind)
 
-                     _invalid ->
-                       false
-                   end) do
+              if flow_retention_valid_candidates?(candidates) do
+                plan_more? = flow_retention_plan_more?(plan, plan_kind)
+
+                if selecting? do
                   {selected, remaining_limit, remaining_keys, remaining_bytes} =
                     flow_retention_take_planned_candidates(
                       candidates,
@@ -1057,31 +1071,116 @@ defmodule Ferricstore.Store.Router.Part08 do
                     )
 
                   plan = flow_retention_put_plan_kind_candidates(plan, attrs.plan_kind, selected)
+                  known_more? = plan_more? or length(selected) < length(candidates)
 
-                  {:cont,
-                   {:ok,
-                    %{
-                      acc
-                      | plans: [plan | acc.plans],
-                        remaining_limit: remaining_limit,
-                        remaining_keys: remaining_keys,
-                        remaining_bytes: remaining_bytes
-                    }}}
+                  next = %{
+                    acc
+                    | plans: [plan | acc.plans],
+                      remaining_limit: remaining_limit,
+                      remaining_keys: remaining_keys,
+                      remaining_bytes: remaining_bytes,
+                      continuation:
+                        if(known_more?,
+                          do:
+                            flow_retention_continuation(
+                              plan_kind,
+                              flow_retention_next_shard(ctx.shard_count, idx)
+                            ),
+                          else: nil
+                        )
+                  }
+
+                  if known_more?, do: {:halt, {:ok, next}}, else: {:cont, {:ok, next}}
                 else
-                  {:halt, {:error, "ERR invalid flow retention candidate"}}
+                  if candidates != [] or plan_more? do
+                    {:halt,
+                     {:ok,
+                      %{
+                        acc
+                        | continuation: flow_retention_continuation(plan_kind, idx)
+                      }}}
+                  else
+                    {:cont, {:ok, acc}}
+                  end
                 end
+              else
+                {:halt, {:error, "ERR invalid flow retention candidate"}}
+              end
 
-              :unavailable ->
-                {:halt, {:error, "ERR flow retention cleanup planning unavailable"}}
+            :unavailable ->
+              {:halt, {:error, "ERR flow retention cleanup planning unavailable"}}
 
-              _other ->
-                {:halt, {:error, "ERR flow retention cleanup planning failed"}}
-            end
+            _other ->
+              {:halt, {:error, "ERR flow retention cleanup planning failed"}}
+          end
         end)
         |> case do
-          {:ok, %{plans: plans}} -> {:ok, Enum.reverse(plans)}
+          {:ok, %{plans: plans} = result} -> {:ok, %{result | plans: Enum.reverse(plans)}}
           {:error, _reason} = error -> error
         end
+      end
+
+      defp flow_retention_valid_candidates?(candidates) do
+        Enum.all?(candidates, fn
+          %{
+            expected_version: version,
+            expected_guard: guard,
+            planned_key_count: key_count
+          }
+          when is_integer(version) and is_binary(guard) and is_integer(key_count) and
+                 key_count > 0 ->
+            true
+
+          _invalid ->
+            false
+        end)
+      end
+
+      defp flow_retention_plan_more?(plan, :active), do: Map.get(plan, :active_more?, false)
+      defp flow_retention_plan_more?(plan, :terminal), do: Map.get(plan, :terminal_more?, false)
+
+      defp flow_retention_start_shard(%{continuation: %{phase: phase, shard_index: idx}}, phase),
+        do: idx
+
+      defp flow_retention_start_shard(_attrs, _phase), do: 0
+
+      defp flow_retention_shard_order(shard_count, start_shard) do
+        Enum.map(0..(shard_count - 1), &rem(start_shard + &1, shard_count))
+      end
+
+      defp flow_retention_next_shard(shard_count, shard_index),
+        do: rem(shard_index + 1, shard_count)
+
+      defp flow_retention_continuation(:active, shard_index),
+        do: <<1, 0, shard_index::unsigned-big-32>>
+
+      defp flow_retention_continuation(:terminal, shard_index),
+        do: <<1, 1, shard_index::unsigned-big-32>>
+
+      defp flow_retention_decode_continuation(_ctx, %{continuation: nil} = attrs),
+        do: {:ok, attrs}
+
+      defp flow_retention_decode_continuation(
+             ctx,
+             %{continuation: <<1, phase, shard_index::unsigned-big-32>>} = attrs
+           )
+           when phase in [0, 1] and shard_index < ctx.shard_count do
+        decoded_phase = if(phase == 0, do: :active, else: :terminal)
+
+        {:ok, Map.put(attrs, :continuation, %{phase: decoded_phase, shard_index: shard_index})}
+      end
+
+      defp flow_retention_decode_continuation(_ctx, %{continuation: _invalid}),
+        do: {:error, "ERR invalid flow retention continuation"}
+
+      defp flow_retention_decode_continuation(_ctx, attrs),
+        do: {:ok, Map.put(attrs, :continuation, nil)}
+
+      defp flow_retention_result(result, continuation) do
+        result
+        |> Map.take([:flows, :history, :values, :active_timeouts])
+        |> Map.put(:continuation, continuation)
+        |> Map.put(:more?, not is_nil(continuation))
       end
 
       defp flow_retention_plan_kind_candidates(plan, :active), do: plan.active_candidates

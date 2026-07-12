@@ -398,6 +398,88 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert {:ok, nil} = internal_get(completed.result_ref)
   end
 
+  test "retention cleanup returns an exact continuation without a final empty pass" do
+    partition = "tenant-retention-continuation"
+    ids = [unique_id("retention-continuation-a"), unique_id("retention-continuation-b")]
+
+    Enum.each(ids, fn id ->
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: "retention-continuation",
+                 partition_key: partition,
+                 retention_ttl_ms: 60_000,
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+    end)
+
+    assert {:ok, claims} =
+             FerricStore.flow_claim_due("retention-continuation",
+               partition_key: partition,
+               worker: "retention-continuation-worker",
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    assert length(claims) == 2
+
+    Enum.each(claims, fn claim ->
+      assert :ok =
+               FerricStore.flow_complete(claim.id, claim.lease_token,
+                 partition_key: partition,
+                 fencing_token: claim.fencing_token,
+                 now_ms: 1_100
+               )
+    end)
+
+    cleanup_now_ms =
+      ids
+      |> Enum.map(fn id ->
+        assert {:ok, completed} = FerricStore.flow_get(id, partition_key: partition)
+        completed.terminal_retention_until_ms + 1
+      end)
+      |> Enum.max()
+
+    assert {:ok, first} =
+             FerricStore.flow_retention_cleanup(limit: 1, now_ms: cleanup_now_ms)
+
+    assert first.flows == 1
+    assert first.more? == true
+    assert is_binary(first.continuation)
+
+    assert {:ok, second} =
+             FerricStore.flow_retention_cleanup(
+               limit: 1,
+               now_ms: cleanup_now_ms,
+               continuation: first.continuation
+             )
+
+    assert second.flows == 1
+    assert second.more? == false
+    assert second.continuation == nil
+
+    ctx = FerricStore.Instance.get(:default)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    assert Enum.all?(ids, fn id ->
+             FerricStore.flow_get(id, partition_key: partition) == {:ok, nil}
+           end)
+
+    assert {:error, "ERR invalid flow retention continuation"} =
+             FerricStore.flow_retention_cleanup(
+               limit: 1,
+               now_ms: cleanup_now_ms,
+               continuation: <<1, 9, 0::unsigned-big-32>>
+             )
+
+    assert {:error, "ERR flow continuation must be a binary token"} =
+             FerricStore.flow_retention_cleanup(
+               limit: 1,
+               now_ms: cleanup_now_ms,
+               continuation: %{shard: 0}
+             )
+  end
+
   test "retention sweeper runs cleanup through Flow command path" do
     id = unique_id("flow-value-retention-sweeper")
     parent = self()
@@ -752,13 +834,10 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     receive do
       {:retention_sweeper_event, [:ferricstore, :flow, :retention_sweeper, :sweep], cleaned,
-       %{status: :ok}} ->
+       %{status: :ok, more?: more?}} ->
         totals = merge_cleanup_counts(totals, cleaned)
 
-        work_done? =
-          Enum.any?([:flows, :history, :values, :active_timeouts], &(Map.get(cleaned, &1, 0) > 0))
-
-        if totals.flows >= 1 and totals.history >= 1 and totals.values >= 2 and not work_done? do
+        if totals.flows >= 1 and totals.history >= 1 and totals.values >= 2 and not more? do
           totals
         else
           do_await_retention_sweeper_cleanup!(deadline, totals)

@@ -635,7 +635,8 @@ defmodule FerricStore.API.Flow do
 
   This is a bounded cleanup pass; pass `limit: n` to share a per-shard work
   budget between active timeouts and expired terminal cleanup. The result's
-  `:active_timeouts` count reports Flows transitioned to `failed`.
+  `:active_timeouts` count reports Flows transitioned to `failed`. When
+  `:more?` is true, pass the opaque `:continuation` token to the next call.
   """
   @spec flow_retention_cleanup(keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_retention_cleanup(opts \\ [])
