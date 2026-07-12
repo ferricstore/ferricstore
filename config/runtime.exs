@@ -549,7 +549,8 @@ if config_env() == :prod do
 
     # Node discovery strategy — auto-configured from env vars.
     # Set FERRICSTORE_DISCOVERY to choose strategy:
-    #   "gossip"  — multicast UDP (default, good for Docker Compose / LAN)
+    #   "gossip"  — multicast UDP (default; loopback-bound unless
+    #               FERRICSTORE_GOSSIP_IF_ADDR is set explicitly)
     #   "dns"     — DNS A-record polling (good for Kubernetes headless services)
     #   "epmd"    — static node list from FERRICSTORE_CLUSTER_NODES
     #   "consul"  — Consul service discovery (requires libcluster_consul dep)
@@ -559,11 +560,21 @@ if config_env() == :prod do
 
     case discovery do
       "gossip" ->
+        gossip_if_addr = System.get_env("FERRICSTORE_GOSSIP_IF_ADDR", "127.0.0.1")
+        gossip_multicast_if = System.get_env("FERRICSTORE_GOSSIP_MULTICAST_IF", gossip_if_addr)
+
         config :libcluster,
           topologies: [
             ferricstore: [
               strategy: Cluster.Strategy.Gossip,
               config: [
+                port: String.to_integer(System.get_env("FERRICSTORE_GOSSIP_PORT", "45892")),
+                if_addr: gossip_if_addr,
+                multicast_if: gossip_multicast_if,
+                multicast_addr:
+                  System.get_env("FERRICSTORE_GOSSIP_MULTICAST_ADDR", "230.1.1.251"),
+                multicast_ttl:
+                  String.to_integer(System.get_env("FERRICSTORE_GOSSIP_MULTICAST_TTL", "1")),
                 secret: cookie
               ]
             ]

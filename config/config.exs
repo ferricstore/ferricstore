@@ -112,20 +112,9 @@ config :ferricstore,
   blob_gc_sweeper_interval_ms: 600_000
 
 # Node discovery via libcluster.
-# Default: Gossip strategy for local/dev multi-node clusters.
-# Override in prod.exs or runtime.exs for Kubernetes DNS or other strategies.
-config :libcluster,
-  topologies: [
-    ferricstore: [
-      strategy: Cluster.Strategy.Gossip,
-      config: [
-        port: 45892,
-        if_addr: "0.0.0.0",
-        multicast_if: "0.0.0.0",
-        multicast_addr: "230.1.1.251",
-        multicast_ttl: 1
-      ]
-    ]
-  ]
+# Disabled in the base config so standalone/default deployments do not open
+# a UDP gossip listener on all interfaces. Runtime clustering config enables
+# discovery only when FERRICSTORE_NODE_NAME is set.
+config :libcluster, topologies: :disabled
 
 import_config "#{config_env()}.exs"

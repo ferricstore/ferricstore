@@ -629,18 +629,20 @@ config :ferricstore, :embedded_large_value_warning_bytes, 512 * 1024
 
 ## Node Discovery (libcluster)
 
-FerricStore uses [libcluster](https://hexdocs.pm/libcluster/) for automatic node discovery in multi-node deployments.
+FerricStore uses [libcluster](https://hexdocs.pm/libcluster/) for automatic node discovery in multi-node deployments. The base config disables libcluster so standalone nodes do not open a gossip listener. Runtime config enables discovery only when `FERRICSTORE_NODE_NAME` is set.
 
 ```elixir
-# Local development: Gossip (multicast)
+# Local single-host development: Gossip (multicast, loopback-bound)
 config :libcluster,
   topologies: [
     ferricstore: [
       strategy: Cluster.Strategy.Gossip,
       config: [
         port: 45892,
-        if_addr: "0.0.0.0",
-        multicast_addr: "230.1.1.251"
+        if_addr: "127.0.0.1",
+        multicast_if: "127.0.0.1",
+        multicast_addr: "230.1.1.251",
+        secret: System.fetch_env!("FERRICSTORE_COOKIE")
       ]
     ]
   ]
@@ -673,7 +675,12 @@ config :ferricstore, :eviction_policy, :volatile_lru
 config :libcluster,
   topologies: [
     ferricstore: [
-      strategy: Cluster.Strategy.Gossip
+      strategy: Cluster.Strategy.Gossip,
+      config: [
+        if_addr: "127.0.0.1",
+        multicast_if: "127.0.0.1",
+        secret: System.fetch_env!("FERRICSTORE_COOKIE")
+      ]
     ]
   ]
 ```
@@ -848,6 +855,12 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_NODE_NAME` | unset | Erlang node name. Setting this enables clustering |
 | `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
 | `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated peer node names |
+| `FERRICSTORE_DISCOVERY` | `gossip` | Discovery strategy when `FERRICSTORE_NODE_NAME` is set (`gossip`, `dns`, `epmd`, `consul`, `etcd`, `none`) |
+| `FERRICSTORE_GOSSIP_IF_ADDR` | `127.0.0.1` | Local interface used by gossip discovery. Set explicitly for LAN/container gossip. |
+| `FERRICSTORE_GOSSIP_MULTICAST_IF` | `FERRICSTORE_GOSSIP_IF_ADDR` | Multicast interface used by gossip discovery |
+| `FERRICSTORE_GOSSIP_PORT` | `45892` | UDP port used by gossip discovery |
+| `FERRICSTORE_GOSSIP_MULTICAST_ADDR` | `230.1.1.251` | Multicast address used by gossip discovery |
+| `FERRICSTORE_GOSSIP_MULTICAST_TTL` | `1` | Gossip multicast TTL |
 
 ### Supervisor (advanced)
 
