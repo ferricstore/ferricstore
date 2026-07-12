@@ -87,9 +87,224 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
 
         profile_startup_phase(:rollout_apply_context, %{shard_count: shard_count}, fn ->
           Ferricstore.Raft.ApplyContext.rollout(context, shard_count, fn shard_index, command ->
-            commit_or_redirect(shard_index, command, @config_redirects)
+            commit_apply_context_control_or_redirect(
+              shard_index,
+              command,
+              @config_redirects
+            )
           end)
         end)
+      end
+
+      defp commit_apply_context_control_or_redirect(shard_index, command, redirects_left) do
+        shard_index
+        |> commit_apply_context_control_or_redirect_with_position(command, redirects_left)
+        |> normalize_commit_result()
+      end
+
+      defp commit_apply_context_control_or_redirect_with_position(
+             shard_index,
+             command,
+             redirects_left
+           ) do
+        case {redirects_left, local_leader_node(shard_index)} do
+          {redirects_left, leader_node}
+          when redirects_left > 0 and is_atom(leader_node) and
+                 leader_node not in [nil, node()] ->
+            redirect_apply_context_control(
+              leader_node,
+              shard_index,
+              command,
+              redirects_left
+            )
+
+          _local_unknown_or_redirects_exhausted ->
+            shard_index
+            |> commit_apply_context_control_local(command)
+            |> maybe_redirect_apply_context_control(shard_index, command, redirects_left)
+        end
+      end
+
+      defp commit_apply_context_control_local(shard_index, command) do
+        with :ok <- ensure_local_leader_connected_quorum(shard_index),
+             :ok <- apply_context_control_apply_capacity(),
+             {:ok, priorities} <- apply_context_control_priorities(),
+             {:ok, prepared_command, nil} <- prepare_commit_command(shard_index, command) do
+          acceptor = :wa_raft_acceptor.registered_name(@table, partition(shard_index))
+          acceptor_pid = Process.whereis(acceptor)
+          stamped = CommandStamp.to_ttb(prepared_command)
+
+          acceptor
+          |> commit_control_safely(acceptor_pid, {make_ref(), stamped}, priorities)
+          |> normalize_commit_transport_result(acceptor_pid)
+        end
+      end
+
+      defp commit_control_safely(_acceptor, nil, _command, _priorities),
+        do: {:error, :unreachable}
+
+      defp commit_control_safely(acceptor, acceptor_pid, command, [priority | rest]) do
+        case commit_control_once_safely(acceptor, command, priority) do
+          {:error, :commit_queue_full} when rest != [] ->
+            commit_control_safely(acceptor, acceptor_pid, command, rest)
+
+          result ->
+            result
+        end
+      end
+
+      defp commit_control_once_safely(acceptor, command, priority) do
+        :wa_raft_acceptor.commit(acceptor, command, @timeout, priority)
+      catch
+        kind, reason -> {:error, {:commit_call_failed_after_submit, {kind, reason}}}
+      end
+
+      defp apply_context_control_priorities do
+        preferred = if waraft_commit_priority() == :high, do: :low, else: :high
+        fallback = if preferred == :low, do: :high, else: :low
+
+        case Enum.filter([preferred, fallback], &apply_context_control_lane_enabled?/1) do
+          [] -> {:error, :apply_context_control_commit_lanes_disabled}
+          priorities -> {:ok, priorities}
+        end
+      end
+
+      defp apply_context_control_lane_enabled?(:low) do
+        Application.get_env(@app, :raft_max_pending_low_priority_commits, 0) > 0
+      end
+
+      defp apply_context_control_lane_enabled?(:high) do
+        Application.get_env(@app, :raft_max_pending_high_priority_commits, 0) > 0
+      end
+
+      defp apply_context_control_apply_capacity do
+        if Application.get_env(@app, :raft_max_pending_applies, 0) > 0 do
+          :ok
+        else
+          {:error, {:apply_context_control_admission_disabled, :max_pending_applies}}
+        end
+      end
+
+      defp maybe_redirect_apply_context_control(
+             error,
+             _shard_index,
+             _command,
+             redirects_left
+           )
+           when redirects_left <= 0,
+           do: error
+
+      defp maybe_redirect_apply_context_control(
+             {:error, :not_leader} = error,
+             shard_index,
+             command,
+             redirects_left
+           ) do
+        case local_leader_node(shard_index) do
+          leader_node when is_atom(leader_node) and leader_node not in [nil, node()] ->
+            redirect_apply_context_control(
+              leader_node,
+              shard_index,
+              command,
+              redirects_left
+            )
+
+          _unknown_or_local ->
+            error
+        end
+      end
+
+      defp maybe_redirect_apply_context_control(
+             {:error, {:notify_redirect, peer}} = error,
+             shard_index,
+             command,
+             redirects_left
+           ) do
+        case peer_node(peer) do
+          leader_node when is_atom(leader_node) and leader_node not in [nil, node()] ->
+            redirect_apply_context_control(
+              leader_node,
+              shard_index,
+              command,
+              redirects_left
+            )
+
+          _invalid_or_local ->
+            error
+        end
+      end
+
+      defp maybe_redirect_apply_context_control(
+             result,
+             _shard_index,
+             _command,
+             _redirects_left
+           ),
+           do: result
+
+      defp redirect_apply_context_control(
+             leader_node,
+             shard_index,
+             command,
+             redirects_left
+           ) do
+        try do
+          result =
+            :erpc.call(
+              leader_node,
+              __MODULE__,
+              :apply_context_control_redirected,
+              [shard_index, command, redirects_left - 1],
+              @timeout
+            )
+
+          barrier_redirected_commit(leader_node, shard_index, result)
+        catch
+          kind, reason -> redirect_write_failure(kind, reason)
+        end
+      end
+
+      @doc false
+      @spec apply_context_control_redirected(non_neg_integer(), tuple(), non_neg_integer()) ::
+              term()
+      def apply_context_control_redirected(shard_index, _command, _redirects_left)
+          when invalid_shard_index_shape(shard_index),
+          do: invalid_shard_index_error(shard_index)
+
+      def apply_context_control_redirected(_shard_index, _command, redirects_left)
+          when invalid_redirects_left_shape(redirects_left),
+          do: invalid_redirects_left_error(redirects_left)
+
+      def apply_context_control_redirected(shard_index, command, redirects_left)
+          when is_integer(redirects_left) and redirects_left >= 0 do
+        case command do
+          {:ferricstore_apply_context_barrier, encoded} ->
+            with {:ok, _context} <- Ferricstore.Raft.ApplyContext.decode(encoded),
+                 {:ok, %{apply_context: %Ferricstore.Raft.ApplyContext{} = local_context}} <-
+                   context(@table),
+                 true <- Ferricstore.Raft.ApplyContext.encode(local_context) == encoded do
+              commit_apply_context_control_or_redirect_with_position(
+                shard_index,
+                command,
+                redirects_left
+              )
+            else
+              false ->
+                {:error, :apply_context_mismatch}
+
+              {:ok, _missing_apply_context} ->
+                {:error, :missing_apply_context}
+
+              {:error, :invalid_apply_context} ->
+                {:error, :invalid_apply_context}
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          _invalid ->
+            {:error, :invalid_apply_context_barrier}
+        end
       end
 
       defp rollout_apply_context_shard(shard_index) do
@@ -98,7 +313,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
         profile_startup_phase(:rollout_apply_context, %{shard_index: shard_index}, fn ->
           Ferricstore.Raft.ApplyContext.rollout_shards(context, [shard_index], fn
             ^shard_index, command ->
-              commit_or_redirect(shard_index, command, @config_redirects)
+              commit_apply_context_control_or_redirect(
+                shard_index,
+                command,
+                @config_redirects
+              )
           end)
         end)
       end
@@ -676,7 +895,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
         do: {:error, :storage_apply_timeout}
 
       defp wait_storage_durable_position(shard_index, target_position, timeout_ms) do
-        case storage_status(shard_index) do
+        case internal_storage_status(shard_index) do
           status when is_list(status) ->
             cond do
               reason = Keyword.get(status, :blocked_error) ->
@@ -715,7 +934,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
           )
       end
 
-      defp storage_status(shard_index) do
+      defp internal_storage_status(shard_index) do
         storage =
           shard_index
           |> partition()

@@ -427,6 +427,27 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.LeaderWait do
         |> Map.merge(commit_options!(opts))
         |> Map.merge(module_options!(opts))
         |> Map.put(:max_inflight_commit_bytes, max_inflight_commit_bytes_option!(opts))
+        |> validate_apply_context_control_capacity!(opts)
+      end
+
+      defp validate_apply_context_control_capacity!(config, opts) do
+        if Keyword.get(opts, :bootstrap, true) do
+          cond do
+            config.max_pending_low_priority_commits == 0 and
+                config.max_pending_high_priority_commits == 0 ->
+              raise ArgumentError,
+                    "at least one WARaft commit lane must have positive capacity for apply-context control traffic"
+
+            config.max_pending_applies == 0 ->
+              raise ArgumentError,
+                    ":max_pending_applies must be positive for apply-context control traffic"
+
+            true ->
+              config
+          end
+        else
+          config
+        end
       end
 
       defp module_options!(opts) do

@@ -290,7 +290,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
           Application.get_env(:ferricstore, :waraft_segment_projection_checkpoint_min_interval_ms)
 
         try do
-          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 3)
+          Application.put_env(:ferricstore, :waraft_segment_projection_checkpoint_every, 4)
 
           Application.put_env(
             :ferricstore,
@@ -313,7 +313,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
                           }},
                          2_000
 
-          assert checkpoint_index >= 4
+          assert checkpoint_index >= 5
           assert entries >= 2
 
           log = waraft_segment_log_record(0)

@@ -29,11 +29,19 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentLogRejectsRecordsSt
           WARaftBackend.stop()
 
           segment_dir = waraft_segment_log_dir(root, 0)
-          segment_one = Path.join(segment_dir, "1.seg")
-          wrong_segment = Path.join(segment_dir, "9.seg")
 
-          assert File.exists?(segment_one)
-          File.rename!(segment_one, wrong_segment)
+          {last_ordinal, last_segment} =
+            segment_dir
+            |> File.ls!()
+            |> Enum.filter(&String.ends_with?(&1, ".seg"))
+            |> Enum.map(fn filename ->
+              ordinal = filename |> Path.rootname(".seg") |> String.to_integer()
+              {ordinal, Path.join(segment_dir, filename)}
+            end)
+            |> Enum.max_by(&elem(&1, 0))
+
+          wrong_segment = Path.join(segment_dir, "#{last_ordinal + 1}.seg")
+          File.rename!(last_segment, wrong_segment)
 
           assert {:error, reason} =
                    WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
@@ -650,12 +658,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SegmentLogRejectsRecordsSt
           end
 
           log_table = waraft_log_table(0)
+          max_idle_tail_entries = 2 + 2 + 1
 
           assert_eventually(
             fn ->
               case :ets.info(log_table, :size) do
-                size when is_integer(size) and size <= 4 -> :trimmed
-                size -> {:not_trimmed, size}
+                # Batched rotation may retain one idle async-completion entry in
+                # addition to the configured keep and rotation intervals.
+                size when is_integer(size) and size <= max_idle_tail_entries ->
+                  :trimmed
+
+                size ->
+                  {:not_trimmed, size}
               end
             end,
             :trimmed,

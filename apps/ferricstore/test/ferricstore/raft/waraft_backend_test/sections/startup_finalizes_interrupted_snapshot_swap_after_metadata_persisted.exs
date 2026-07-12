@@ -659,6 +659,113 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StartupFinalizesInterrupte
         assert nil == Router.get(ctx, "blocked:k")
       end
 
+      test "startup apply-context rollout uses control admission", %{ctx: ctx} do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   max_pending_high_priority_commits: 0,
+                   max_pending_reads: 0,
+                   max_inflight_commit_bytes: 0
+                 )
+
+        assert {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(0)
+        assert index >= 3
+        assert {:error, :overloaded} = WARaftBackend.write(0, {:put, "blocked:control", "v", 0})
+        assert nil == Router.get(ctx, "blocked:control")
+      end
+
+      test "startup apply-context rollout falls back to the remaining commit lane", %{ctx: ctx} do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   max_pending_low_priority_commits: 0,
+                   max_inflight_commit_bytes: 0
+                 )
+
+        assert {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(0)
+        assert index >= 3
+        assert {:error, :overloaded} = WARaftBackend.write(0, {:put, "blocked:fallback", "v", 0})
+      end
+
+      test "redirected apply-context control accepts only the local immutable context", %{
+        ctx: ctx
+      } do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert {:ok, position_before} = WARaftBackend.storage_position(0)
+
+        current_max = ctx.apply_context.flow_default_history_max_events
+
+        different_context =
+          Ferricstore.Raft.ApplyContext.new(
+            flow_default_history_max_events: if(current_max == 7, do: 8, else: 7)
+          )
+
+        command = Ferricstore.Raft.ApplyContext.barrier_command(different_context)
+
+        assert {:error, :apply_context_mismatch} =
+                 WARaftBackend.apply_context_control_redirected(0, command, 0)
+
+        assert {:ok, ^position_before} = WARaftBackend.storage_position(0)
+
+        encoded = Ferricstore.Raft.ApplyContext.encode(ctx.apply_context)
+        local_command = Ferricstore.Raft.ApplyContext.barrier_command(ctx.apply_context)
+
+        assert {:waraft_applied_at, position_after, {:ok, ^encoded}} =
+                 WARaftBackend.apply_context_control_redirected(0, local_command, 0)
+
+        assert {:ok, ^position_after} = WARaftBackend.storage_position(0)
+        assert elem(position_after, 1) > elem(position_before, 1)
+      end
+
+      test "startup rejects disabled apply-context control capacity before partition start", %{
+        ctx: ctx
+      } do
+        assert_raise ArgumentError, ~r/at least one WARaft commit lane/, fn ->
+          WARaftBackend.start(ctx,
+            log_module: :ferricstore_waraft_spike_segment_log,
+            max_pending_low_priority_commits: 0,
+            max_pending_high_priority_commits: 0
+          )
+        end
+
+        assert_raise ArgumentError, ~r/max_pending_applies must be positive/, fn ->
+          WARaftBackend.start(ctx,
+            log_module: :ferricstore_waraft_spike_segment_log,
+            max_pending_applies: 0
+          )
+        end
+
+        refute Process.whereis(:raft_sup_ferricstore_waraft_backend_1)
+      end
+
+      test "non-bootstrapping start permits disabled control admission", %{ctx: ctx} do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   bootstrap: false,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   max_pending_low_priority_commits: 0,
+                   max_pending_high_priority_commits: 0,
+                   max_pending_applies: 0
+                 )
+
+        assert {:ok, {:raft_log_pos, 0, 0}} = WARaftBackend.storage_position(0)
+      end
+
+      test "apply queue size setting does not override primary apply capacity", %{ctx: ctx} do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   apply_queue_max_size: 0
+                 )
+
+        assert {:ok, {:raft_log_pos, index, _term}} = WARaftBackend.storage_position(0)
+        assert index >= 3
+      end
+
       test "backend maps async WARaft commit backpressure to Ra-compatible overload", %{ctx: ctx} do
         assert :ok =
                  WARaftBackend.start(ctx,

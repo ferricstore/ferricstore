@@ -611,7 +611,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
         end
       end
 
-      test "storage label persists across restart when WARaft labels are enabled", %{
+      test "storage label chain advances across restart apply-context rollout", %{
         root: root,
         ctx: ctx
       } do
@@ -638,11 +638,50 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
                  )
 
         assert_eventually(fn -> Router.get(restarted_ctx, "label:k1") end, "v1")
-        assert {:ok, ^label_before_stop} = waraft_storage_label(0)
+        assert {:ok, label_after_restart} = waraft_storage_label(0)
+        assert label_after_restart > label_before_stop
 
         assert :ok = WARaftBackend.write(0, {:put, "label:k2", "v2", 0})
         assert {:ok, label_after} = waraft_storage_label(0)
-        assert label_after > label_before_stop
+        assert label_after > label_after_restart
+      end
+
+      test "storage label advances when rollout changes the replicated apply context", %{
+        root: root,
+        ctx: ctx
+      } do
+        assert :ok =
+                 WARaftBackend.start(ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   label_module: LabelCounter
+                 )
+
+        assert :ok = WARaftBackend.write(0, {:put, "label:context-change", "v", 0})
+        assert {:ok, label_before_restart} = waraft_storage_label(0)
+        assert :ok = WARaftBackend.stop()
+        FerricStore.Instance.cleanup(ctx.name)
+
+        current_max = ctx.apply_context.flow_default_history_max_events
+
+        changed_context =
+          Ferricstore.Raft.ApplyContext.new(
+            flow_default_history_max_events: if(current_max == 7, do: 8, else: 7)
+          )
+
+        restarted_ctx = %{build_ctx(root) | apply_context: changed_context}
+
+        assert :ok =
+                 WARaftBackend.start(restarted_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log,
+                   label_module: LabelCounter
+                 )
+
+        assert {:ok, label_after_restart} = waraft_storage_label(0)
+        assert label_after_restart > label_before_restart
+        assert :ok = WARaftBackend.stop()
+
+        assert waraft_storage_metadata(root, 0).apply_context ==
+                 Ferricstore.Raft.ApplyContext.encode(changed_context)
       end
 
       test "storage label is persisted with the applied position before graceful close", %{
@@ -687,13 +726,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
           Application.put_env(:ferricstore, :waraft_storage_metadata_persist_every, 1)
           Application.put_env(:ferricstore, :waraft_bitcask_payload_fsync_every, 1)
 
-          assert :ok =
+          assert {:error, {:apply_context_rollout_failed, %{0 => {:error, reason}}}} =
                    WARaftBackend.start(ctx,
                      log_module: :ferricstore_waraft_spike_segment_log,
                      label_module: OversizedLabel
                    )
 
-          assert {:error, reason} = WARaftBackend.write(0, {:put, "label:too-large", "v", 0})
           assert inspect(reason) =~ "storage_metadata_term_too_large"
 
           metadata = waraft_latest_storage_metadata(root, 0)
