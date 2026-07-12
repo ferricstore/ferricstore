@@ -396,6 +396,66 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     assert next_state.apply_context_encoded == ApplyContext.encode(leader)
   end
 
+  test "rollout requires an exact acknowledgement from every raft group" do
+    context = ApplyContext.new(flow_default_history_max_events: 20)
+    encoded = ApplyContext.encode(context)
+    parent = self()
+
+    assert :ok =
+             ApplyContext.rollout(context, 4, fn shard_index, command ->
+               send(parent, {:rollout, shard_index, command})
+               {:ok, encoded}
+             end)
+
+    assert Enum.sort(
+             for _ <- 1..4 do
+               assert_receive {:rollout, shard_index, command}, 500
+               {shard_index, command}
+             end
+           ) ==
+             Enum.map(0..3, &{&1, ApplyContext.barrier_command(context)})
+  end
+
+  test "rollout fails closed when any raft group does not acknowledge the context" do
+    context = ApplyContext.new(flow_default_history_max_events: 20)
+    encoded = ApplyContext.encode(context)
+
+    assert {:error,
+            {:apply_context_rollout_failed,
+             %{1 => {:error, :not_leader}, 2 => {:unexpected_ack, {:ok, :stale}}}}} =
+             ApplyContext.rollout(context, 3, fn
+               1, _command -> {:error, :not_leader}
+               2, _command -> {:ok, :stale}
+               _shard_index, _command -> {:ok, encoded}
+             end)
+  end
+
+  test "barrier adopts and acknowledges the exact replicated context" do
+    local = ApplyContext.new(flow_default_history_max_events: 10)
+    leader = ApplyContext.new(flow_default_history_max_events: 20)
+    encoded = ApplyContext.encode(leader)
+
+    state = %{
+      applied_count: 0,
+      release_cursor_interval: 1_000,
+      apply_context: local,
+      apply_context_encoded: ApplyContext.encode(local)
+    }
+
+    assert {:ferricstore_apply_context, ^encoded, {:ferricstore_apply_context_barrier, ^encoded}} =
+             ApplyContext.wrap_command(ApplyContext.barrier_command(leader), leader)
+
+    assert {next_state, {:ok, ^encoded}} =
+             StateMachine.apply(
+               %{},
+               ApplyContext.wrap_command(ApplyContext.barrier_command(leader), leader),
+               state
+             )
+
+    assert next_state.apply_context == leader
+    assert next_state.apply_context_encoded == encoded
+  end
+
   test "malformed replicated contexts fail closed without running the command" do
     context = ApplyContext.default()
 

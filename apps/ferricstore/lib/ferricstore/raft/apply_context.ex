@@ -27,6 +27,7 @@ defmodule Ferricstore.Raft.ApplyContext do
   @default_lmdb_cleanup_scan_limit 100_000
 
   @flow_command_tags [
+    :ferricstore_apply_context_barrier,
     :flow_cancel,
     :flow_cancel_many,
     :flow_claim_due,
@@ -324,6 +325,66 @@ defmodule Ferricstore.Raft.ApplyContext do
   @spec valid?(term()) :: boolean()
   def valid?(%__MODULE__{} = context), do: decode(encode(context)) == {:ok, context}
   def valid?(_other), do: false
+
+  @doc false
+  @spec barrier_command(t()) :: {:ferricstore_apply_context_barrier, encoded()}
+  def barrier_command(%__MODULE__{} = context) do
+    {:ferricstore_apply_context_barrier, encode(context)}
+  end
+
+  @doc false
+  @spec rollout(t(), pos_integer(), (non_neg_integer(), tuple() -> term())) ::
+          :ok | {:error, {:apply_context_rollout_failed, map()}}
+  def rollout(%__MODULE__{} = context, shard_count, write_fun)
+      when is_integer(shard_count) and shard_count > 0 and is_function(write_fun, 2) do
+    encoded = encode(context)
+    command = barrier_command(context)
+    max_concurrency = min(shard_count, max(1, System.schedulers_online()))
+
+    failures =
+      0..(shard_count - 1)
+      |> Task.async_stream(
+        fn shard_index ->
+          result = safe_rollout_write(write_fun, shard_index, command)
+          {shard_index, rollout_failure(result, encoded)}
+        end,
+        max_concurrency: max_concurrency,
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Enum.reduce(%{}, fn
+        {:ok, {_shard_index, nil}}, acc ->
+          acc
+
+        {:ok, {shard_index, reason}}, acc ->
+          Map.put(acc, shard_index, reason)
+
+        {:exit, reason}, acc ->
+          Map.put(acc, :unknown_shard, {:task_exit, reason})
+      end)
+
+    if map_size(failures) == 0 do
+      :ok
+    else
+      {:error, {:apply_context_rollout_failed, failures}}
+    end
+  end
+
+  defp safe_rollout_write(write_fun, shard_index, command) do
+    write_fun.(shard_index, command)
+  rescue
+    error -> {:rollout_exception, {error.__struct__, Exception.message(error)}}
+  catch
+    kind, reason -> {:rollout_exception, {kind, reason}}
+  end
+
+  defp rollout_failure({:ok, encoded}, encoded), do: nil
+  defp rollout_failure({:error, _reason} = error, _encoded), do: error
+
+  defp rollout_failure({:rollout_exception, reason}, _encoded),
+    do: {:rollout_exception, reason}
+
+  defp rollout_failure(other, _encoded), do: {:unexpected_ack, other}
 
   @spec wrap_command(tuple(), t()) :: tuple()
   def wrap_command(command, %__MODULE__{} = context) when is_tuple(command) do

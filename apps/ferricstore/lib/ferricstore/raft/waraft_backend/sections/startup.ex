@@ -66,12 +66,30 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       end
 
       defp finish_start(shard_count, opts) do
-        with :ok <-
-               finish_start_partitions(shard_count, opts) do
+        with :ok <- finish_start_partitions(shard_count, opts),
+             :ok <- maybe_rollout_apply_context(shard_count, opts) do
           profile_startup_phase(:start_namespace_batchers, %{shard_count: shard_count}, fn ->
             start_namespace_batchers(shard_count, opts)
           end)
         end
+      end
+
+      defp maybe_rollout_apply_context(shard_count, opts) do
+        if Keyword.get(opts, :bootstrap, true) do
+          rollout_apply_context(shard_count)
+        else
+          :ok
+        end
+      end
+
+      defp rollout_apply_context(shard_count) do
+        %{apply_context: %Ferricstore.Raft.ApplyContext{} = context} = context!(@table)
+
+        profile_startup_phase(:rollout_apply_context, %{shard_count: shard_count}, fn ->
+          Ferricstore.Raft.ApplyContext.rollout(context, shard_count, fn shard_index, command ->
+            commit_or_redirect(shard_index, command, @config_redirects)
+          end)
+        end)
       end
 
       defp finish_start_partitions(shard_count, opts) when shard_count > 0 do

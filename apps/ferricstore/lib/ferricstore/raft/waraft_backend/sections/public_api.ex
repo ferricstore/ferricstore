@@ -535,18 +535,25 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       @spec bootstrap_cluster([node()]) :: :ok | {:error, term()}
       def bootstrap_cluster(nodes) when is_list(nodes) do
         with :ok <- validate_bootstrap_nodes(nodes),
-             {:ok, ctx} <- context(@table) do
-          0..(ctx.shard_count - 1)
-          |> Enum.reduce_while(:ok, fn shard_index, :ok ->
-            case bootstrap_cluster_partition(shard_index, nodes) do
-              :ok -> {:cont, :ok}
-              {:error, _reason} = error -> {:halt, error}
-            end
-          end)
+             {:ok, ctx} <- context(@table),
+             :ok <- bootstrap_cluster_partitions(ctx.shard_count, nodes),
+             :ok <- finish_start_partitions(ctx.shard_count, bootstrap: true),
+             :ok <- rollout_apply_context(ctx.shard_count) do
+          :ok
         end
       end
 
       def bootstrap_cluster(_nodes), do: {:error, :invalid_cluster_nodes}
+
+      defp bootstrap_cluster_partitions(shard_count, nodes) do
+        0..(shard_count - 1)
+        |> Enum.reduce_while(:ok, fn shard_index, :ok ->
+          case bootstrap_cluster_partition(shard_index, nodes) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
 
       @spec trigger_election(non_neg_integer()) :: :ok | term()
       def trigger_election(shard_index) when invalid_shard_index_shape(shard_index),

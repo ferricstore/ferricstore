@@ -1222,6 +1222,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # Generic server command hook — allows server apps to replicate their own
       # commands through Raft without the library knowing what they are.
       # The server registers a raft_apply_hook callback on the Instance struct.
+      def apply(meta, {:ferricstore_apply_context_barrier, expected_encoded}, state) do
+        with_apply_time(meta, fn ->
+          if Map.get(state, :apply_context_encoded) == expected_encoded do
+            bump_applied(meta, state, {:ok, expected_encoded})
+          else
+            bump_applied(meta, state, {:error, "ERR replicated apply context mismatch"})
+          end
+        end)
+      end
+
       def apply(meta, {:ferricstore_apply_context, encoded, inner_command}, state)
           when is_tuple(inner_command) do
         if Map.get(state, :apply_context_encoded) == encoded do
