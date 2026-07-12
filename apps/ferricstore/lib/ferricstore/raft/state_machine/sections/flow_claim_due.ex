@@ -512,9 +512,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
             )
 
           if promoted > 0 do
+            promoted_due_keys =
+              flow_claim_due_keys(state, type, state_filter, partition_key, priority)
+
             flow_claim_due_scan_keys(
               state,
-              due_keys,
+              promoted_due_keys,
               type,
               state_filter,
               worker,

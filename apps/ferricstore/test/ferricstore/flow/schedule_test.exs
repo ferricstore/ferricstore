@@ -1013,6 +1013,87 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert after_first.next_run_at_ms == second_due_ms
   end
 
+  test "due schedule is not missed after hibernation removes its hot due key" do
+    ctx = FerricStore.Instance.get(:default)
+    schedule_id = unique_flow_id("schedule-hibernation-precheck-race")
+    partition_key = schedule_partition_key(schedule_id)
+
+    state_key =
+      Ferricstore.Flow.Keys.state_key(
+        Ferricstore.Flow.Schedule.flow_id(schedule_id),
+        partition_key
+      )
+
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, state_key)
+    writer_name = Ferricstore.Flow.LMDBWriter.name(ctx.name, shard_index)
+    writer = Process.whereis(writer_name)
+    assert is_pid(writer)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+
+    original_flush_interval_ms = :sys.get_state(writer).flush_interval_ms
+
+    :sys.replace_state(writer, fn state ->
+      if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+      %{state | flush_interval_ms: 60_000, timer_ref: nil}
+    end)
+
+    acceptor =
+      :wa_raft_acceptor.registered_name(:ferricstore_waraft_backend, shard_index + 1)
+
+    try do
+      now_ms = DateTime.to_unix(~U[2026-11-01 05:00:00Z], :millisecond)
+      due_ms = now_ms + 30 * 60_000
+
+      assert {:ok, schedule} =
+               FerricStore.flow_schedule_create(schedule_id,
+                 kind: :one_shot,
+                 at_ms: due_ms,
+                 now_ms: now_ms,
+                 target: [
+                   id: unique_flow_id("schedule-hibernation-precheck-target"),
+                   type: unique_flow_id("schedule-hibernation-precheck-type")
+                 ]
+               )
+
+      assert schedule.next_run_at_ms == due_ms
+      :ok = :sys.suspend(acceptor)
+
+      task =
+        Task.async(fn ->
+          FerricStore.flow_schedule_fire_due(now_ms: due_ms, worker: "schedule-test")
+        end)
+
+      try do
+        acceptor_pid = Process.whereis(acceptor)
+
+        assert eventually(fn ->
+                 match?(
+                   {:message_queue_len, count} when count > 0,
+                   Process.info(acceptor_pid, :message_queue_len)
+                 )
+               end)
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+        :ok = :sys.resume(acceptor)
+
+        assert {:ok, %{fired: 1, claimed: 1, errors: []}} = Task.await(task, 10_000)
+      after
+        resume_process(acceptor)
+
+        if Process.alive?(task.pid) do
+          Task.shutdown(task, :brutal_kill)
+        end
+      end
+    after
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+
+      :sys.replace_state(writer, fn state ->
+        if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+        %{state | flush_interval_ms: original_flush_interval_ms, timer_ref: nil}
+      end)
+    end
+  end
+
   test "cron schedule rejects invalid timezone" do
     assert {:error, "ERR flow schedule timezone is invalid or unavailable"} =
              FerricStore.flow_schedule_create(unique_flow_id("schedule-cron-invalid-timezone"),
@@ -1084,5 +1165,11 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
   defp schedule_partition_key(id) do
     "__ferricstore_schedule__:" <> Integer.to_string(:erlang.phash2(id, 256))
+  end
+
+  defp resume_process(name) do
+    :sys.resume(name)
+  catch
+    :exit, _reason -> :ok
   end
 end

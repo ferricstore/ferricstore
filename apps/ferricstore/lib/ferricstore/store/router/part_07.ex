@@ -424,10 +424,10 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       defp flow_claim_due_group_cold_mode(modes, attrs) do
-        cond do
-          Enum.any?(modes, &(&1 == :skip)) -> :skip
-          Enum.any?(modes, &(&1 == :allow)) -> :allow
-          true -> Map.get(attrs, :cold_due_mode, :skip)
+        if Enum.any?(modes, &(&1 in [:allow, :block])) do
+          flow_claim_due_cold_fallback_mode(attrs)
+        else
+          :skip
         end
       end
 
@@ -450,13 +450,13 @@ defmodule Ferricstore.Store.Router.Part07 do
                    now_ms,
                    Map.get(attrs, :cold_due_mode)
                  ) do
-                {:non_empty, :allow}
+                {:non_empty, flow_claim_due_cold_fallback_mode(attrs)}
               else
                 :empty
               end
 
             [_ | _] ->
-              {:non_empty, :skip}
+              {:non_empty, flow_claim_due_cold_fallback_mode(attrs)}
           end
         else
           _other -> :unknown
@@ -490,13 +490,13 @@ defmodule Ferricstore.Store.Router.Part07 do
                    now_ms,
                    Map.get(attrs, :cold_due_mode)
                  ) do
-                {:non_empty, :allow}
+                {:non_empty, flow_claim_due_cold_fallback_mode(attrs)}
               else
                 :empty
               end
 
             [_ | _] ->
-              {:non_empty, :skip}
+              {:non_empty, flow_claim_due_cold_fallback_mode(attrs)}
           end
         else
           _other -> :unknown
@@ -508,6 +508,13 @@ defmodule Ferricstore.Store.Router.Part07 do
       end
 
       defp flow_claim_due_precheck_now_ms(%{now_ms: now_ms}) when is_integer(now_ms), do: now_ms
+
+      defp flow_claim_due_cold_fallback_mode(attrs) do
+        case Map.get(attrs, :cold_due_mode) do
+          mode when mode in [:allow, :block] -> mode
+          _other -> :skip
+        end
+      end
 
       defp flow_claim_due_precheck_now_ms(_attrs),
         do: CommandTime.now_ms() + @flow_claim_due_precheck_slack_ms
