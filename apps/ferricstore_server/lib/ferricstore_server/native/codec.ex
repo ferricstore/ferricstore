@@ -1781,10 +1781,7 @@ defmodule FerricstoreServer.Native.Codec do
 
   defp take_compact_partitions(0, rest), do: {:ok, nil, rest}
 
-  defp take_compact_partitions(1, rest) do
-    with {:ok, partition_key, rest} <- take_compact_binary(rest),
-         do: {:ok, partition_key, rest}
-  end
+  defp take_compact_partitions(1, rest), do: take_compact_binary(rest)
 
   defp take_compact_partitions(2, <<count::unsigned-32, rest::binary>>),
     do: take_compact_partition_list(count, rest, [])

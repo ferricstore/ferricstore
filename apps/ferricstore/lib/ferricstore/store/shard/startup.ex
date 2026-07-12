@@ -271,18 +271,17 @@ defmodule Ferricstore.Store.Shard.Startup do
           fsync_dir_fun
         )
 
-        # v2: scan data_dir for existing .log files, find highest file_id
+        # Scan the shard directory and resume from the highest log file id.
         {active_file_id, active_file_size} = ShardLifecycle.discover_active_file(path)
         active_file_path = file_path(path, active_file_id)
 
         # Ensure the active file exists (touch it)
-        # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
         file_created? =
-          unless Ferricstore.FS.exists?(active_file_path) do
+          if Ferricstore.FS.exists?(active_file_path) do
+            false
+          else
             Ferricstore.FS.touch!(active_file_path)
             true
-          else
-            false
           end
 
         maybe_fsync_startup_dir!(

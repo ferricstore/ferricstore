@@ -8,7 +8,7 @@ defmodule Ferricstore.Flow.HistoryProjector.KeyCodecTest do
     key = KeyCodec.history_entry_key("flow-history:1", "12345-7")
 
     assert key == "X:flow-history:1" <> <<0>> <> "12345-7"
-    assert KeyCodec.parse_history_entry_key(key) == {:ok, "flow-history:1", "12345-7", 12345}
+    assert KeyCodec.parse_history_entry_key(key) == {:ok, "flow-history:1", "12345-7", 12_345}
   end
 
   test "parse_history_entry_key rejects malformed keys" do

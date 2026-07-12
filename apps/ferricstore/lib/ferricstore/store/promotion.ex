@@ -128,13 +128,12 @@ defmodule Ferricstore.Store.Promotion do
     with :ok <- maybe_fsync_dir(created_dir?, Path.dirname(path), :create_dedicated_dir) do
       active_file = Path.join(path, "00000.log")
 
-      # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
       created_file? =
-        unless Ferricstore.FS.exists?(active_file) do
+        if Ferricstore.FS.exists?(active_file) do
+          false
+        else
           Ferricstore.FS.touch!(active_file)
           true
-        else
-          false
         end
 
       with :ok <- maybe_fsync_dir(created_dir? or created_file?, path, :create_active_file) do

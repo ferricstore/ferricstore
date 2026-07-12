@@ -3911,9 +3911,8 @@ defmodule FerricstoreServer.Native.Commands do
 
       true ->
         with :ok <- authorize_compact_pipeline_public_keys(mode, items),
-             {:ok, atomicity} <- pipeline_atomicity(payload),
-             :ok <- validate_compact_pipeline_atomicity(mode, items, atomicity, state) do
-          :ok
+             {:ok, atomicity} <- pipeline_atomicity(payload) do
+          validate_compact_pipeline_atomicity(mode, items, atomicity, state)
         end
     end
   end

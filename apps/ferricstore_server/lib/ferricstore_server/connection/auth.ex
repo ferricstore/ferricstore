@@ -112,9 +112,8 @@ defmodule FerricstoreServer.Connection.Auth do
   def check_keys_cached(%{keys: patterns}, cmd, keys) when is_list(keys) do
     {read_keys, write_keys} = KeyDiscovery.access_keys(cmd, keys)
 
-    with :ok <- check_all_keys(read_keys, :read, patterns),
-         :ok <- check_all_keys(write_keys, :write, patterns) do
-      :ok
+    with :ok <- check_all_keys(read_keys, :read, patterns) do
+      check_all_keys(write_keys, :write, patterns)
     end
   end
 
@@ -134,9 +133,8 @@ defmodule FerricstoreServer.Connection.Auth do
     if prepared.acl_keys == [] do
       check_keys_cached(cache, prepared.command, [])
     else
-      with :ok <- check_all_keys(prepared.read_keys, :read, patterns),
-           :ok <- check_all_keys(prepared.write_keys, :write, patterns) do
-        :ok
+      with :ok <- check_all_keys(prepared.read_keys, :read, patterns) do
+        check_all_keys(prepared.write_keys, :write, patterns)
       end
     end
   end

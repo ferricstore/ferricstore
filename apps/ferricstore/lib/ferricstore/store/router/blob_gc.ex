@@ -142,9 +142,9 @@ defmodule Ferricstore.Store.Router.BlobGC do
   end
 
   defp blob_gc_reconcile_barrier_timeout_ms() do
-    case Application.get_env(:ferricstore, :blob_protection_reconcile_barrier_timeout_ms, 30000) do
+    case Application.get_env(:ferricstore, :blob_protection_reconcile_barrier_timeout_ms, 30_000) do
       value when :erlang.andalso(:erlang.is_integer(value), :erlang.>=(value, 0)) -> value
-      _other -> 30000
+      _other -> 30_000
     end
   end
 
@@ -373,7 +373,7 @@ defmodule Ferricstore.Store.Router.BlobGC do
             ) do
     path = blob_gc_entry_file_path(ctx, idx, state, key, fid)
 
-    case Ferricstore.Store.ColdRead.pread_keyed(path, off, key, 10000) do
+    case Ferricstore.Store.ColdRead.pread_keyed(path, off, key, 10_000) do
       {:ok, value} -> blob_gc_decode_ref(value)
       {:error, reason} -> {:error, {:blob_gc_live_ref_scan_failed, key, reason}}
     end

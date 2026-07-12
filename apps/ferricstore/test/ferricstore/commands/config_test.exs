@@ -431,7 +431,7 @@ defmodule Ferricstore.Commands.ConfigTest do
       Application.put_env(
         :ferricstore,
         :config_memory_guard_reconfigure_hook,
-        fn %{keydir_max_ram: 12345} ->
+        fn %{keydir_max_ram: 12_345} ->
           raise "memory guard reconfigure exploded"
         end
       )

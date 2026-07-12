@@ -302,42 +302,44 @@ defmodule FerricstoreServer.Health.Endpoint do
          headers,
          body
        ) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(body)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-      case Auth.authorize_command_request(peer, headers, {"FERRICSTORE.DOCTOR", []}, :html) do
-        :ok ->
-          location =
-            case FerricstoreServer.Health.Dashboard.apply_doctor_form(params) do
-              {:ok, message} ->
-                "/dashboard/doctor?" <>
-                  URI.encode_query(%{"status" => "ok", "message" => message})
+      true ->
+        params = FlowPaths.decode_form_body(body)
 
-              {:error, reason} ->
-                "/dashboard/doctor?" <>
-                  URI.encode_query(%{"status" => "error", "message" => reason})
-            end
+        case Auth.authorize_command_request(peer, headers, {"FERRICSTORE.DOCTOR", []}, :html) do
+          :ok ->
+            location =
+              case FerricstoreServer.Health.Dashboard.apply_doctor_form(params) do
+                {:ok, message} ->
+                  "/dashboard/doctor?" <>
+                    URI.encode_query(%{"status" => "ok", "message" => message})
 
-          send_redirect_response(socket, transport, location)
+                {:error, reason} ->
+                  "/dashboard/doctor?" <>
+                    URI.encode_query(%{"status" => "error", "message" => reason})
+              end
 
-        {:redirect_login, location} ->
-          send_redirect_response(socket, transport, location)
+            send_redirect_response(socket, transport, location)
 
-        {:unauthorized, reason} ->
-          send_response(
-            socket,
-            transport,
-            401,
-            "Unauthorized",
-            "application/json",
-            Jason.encode!(%{error: reason})
-          )
+          {:redirect_login, location} ->
+            send_redirect_response(socket, transport, location)
 
-        {:forbidden, requirement, reason} ->
-          send_forbidden_response(socket, transport, "/dashboard/doctor", requirement, reason)
-      end
+          {:unauthorized, reason} ->
+            send_response(
+              socket,
+              transport,
+              401,
+              "Unauthorized",
+              "application/json",
+              Jason.encode!(%{error: reason})
+            )
+
+          {:forbidden, requirement, reason} ->
+            send_forbidden_response(socket, transport, "/dashboard/doctor", requirement, reason)
+        end
     end
   end
 
@@ -350,55 +352,57 @@ defmodule FerricstoreServer.Health.Endpoint do
          headers,
          body
        ) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(body)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-      case Auth.authorize_command_request(
-             peer,
-             headers,
-             RouteRequirements.flow_policy_form_requirement(params),
-             :html
-           ) do
-        :ok ->
-          location =
-            case FerricstoreServer.Health.Dashboard.apply_flow_policy_form(params) do
-              {:ok, type} ->
-                "/dashboard/flow/policies?" <>
-                  URI.encode_query(%{"status" => "ok", "type" => type, "edit" => type})
+      true ->
+        params = FlowPaths.decode_form_body(body)
 
-              {:error, reason} ->
-                type = Map.get(params, "type", "")
+        case Auth.authorize_command_request(
+               peer,
+               headers,
+               RouteRequirements.flow_policy_form_requirement(params),
+               :html
+             ) do
+          :ok ->
+            location =
+              case FerricstoreServer.Health.Dashboard.apply_flow_policy_form(params) do
+                {:ok, type} ->
+                  "/dashboard/flow/policies?" <>
+                    URI.encode_query(%{"status" => "ok", "type" => type, "edit" => type})
 
-                "/dashboard/flow/policies?" <>
-                  URI.encode_query(%{"status" => "error", "message" => reason, "edit" => type})
-            end
+                {:error, reason} ->
+                  type = Map.get(params, "type", "")
 
-          send_redirect_response(socket, transport, location)
+                  "/dashboard/flow/policies?" <>
+                    URI.encode_query(%{"status" => "error", "message" => reason, "edit" => type})
+              end
 
-        {:redirect_login, location} ->
-          send_redirect_response(socket, transport, location)
+            send_redirect_response(socket, transport, location)
 
-        {:unauthorized, reason} ->
-          send_response(
-            socket,
-            transport,
-            401,
-            "Unauthorized",
-            "application/json",
-            Jason.encode!(%{error: reason})
-          )
+          {:redirect_login, location} ->
+            send_redirect_response(socket, transport, location)
 
-        {:forbidden, requirement, reason} ->
-          send_forbidden_response(
-            socket,
-            transport,
-            "/dashboard/flow/policies",
-            requirement,
-            reason
-          )
-      end
+          {:unauthorized, reason} ->
+            send_response(
+              socket,
+              transport,
+              401,
+              "Unauthorized",
+              "application/json",
+              Jason.encode!(%{error: reason})
+            )
+
+          {:forbidden, requirement, reason} ->
+            send_forbidden_response(
+              socket,
+              transport,
+              "/dashboard/flow/policies",
+              requirement,
+              reason
+            )
+        end
     end
   end
 
@@ -411,49 +415,51 @@ defmodule FerricstoreServer.Health.Endpoint do
          headers,
          body
        ) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(body)
-      requirement = RouteRequirements.flow_governance_form_requirement(params)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-      case Auth.authorize_command_request(peer, headers, requirement, :html) do
-        :ok ->
-          location =
-            case FerricstoreServer.Health.Dashboard.apply_flow_governance_form(params) do
-              {:ok, message} ->
-                "/dashboard/flow/governance?" <>
-                  URI.encode_query(%{"status" => "ok", "message" => message})
+      true ->
+        params = FlowPaths.decode_form_body(body)
+        requirement = RouteRequirements.flow_governance_form_requirement(params)
 
-              {:error, reason} ->
-                "/dashboard/flow/governance?" <>
-                  URI.encode_query(%{"status" => "error", "message" => reason})
-            end
+        case Auth.authorize_command_request(peer, headers, requirement, :html) do
+          :ok ->
+            location =
+              case FerricstoreServer.Health.Dashboard.apply_flow_governance_form(params) do
+                {:ok, message} ->
+                  "/dashboard/flow/governance?" <>
+                    URI.encode_query(%{"status" => "ok", "message" => message})
 
-          send_redirect_response(socket, transport, location)
+                {:error, reason} ->
+                  "/dashboard/flow/governance?" <>
+                    URI.encode_query(%{"status" => "error", "message" => reason})
+              end
 
-        {:redirect_login, location} ->
-          send_redirect_response(socket, transport, location)
+            send_redirect_response(socket, transport, location)
 
-        {:unauthorized, reason} ->
-          send_response(
-            socket,
-            transport,
-            401,
-            "Unauthorized",
-            "application/json",
-            Jason.encode!(%{error: reason})
-          )
+          {:redirect_login, location} ->
+            send_redirect_response(socket, transport, location)
 
-        {:forbidden, requirement, reason} ->
-          send_forbidden_response(
-            socket,
-            transport,
-            "/dashboard/flow/governance",
-            requirement,
-            reason
-          )
-      end
+          {:unauthorized, reason} ->
+            send_response(
+              socket,
+              transport,
+              401,
+              "Unauthorized",
+              "application/json",
+              Jason.encode!(%{error: reason})
+            )
+
+          {:forbidden, requirement, reason} ->
+            send_forbidden_response(
+              socket,
+              transport,
+              "/dashboard/flow/governance",
+              requirement,
+              reason
+            )
+        end
     end
   end
 
@@ -466,49 +472,51 @@ defmodule FerricstoreServer.Health.Endpoint do
          headers,
          body
        ) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(body)
-      requirement = RouteRequirements.flow_schedule_form_requirement(params)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-      case Auth.authorize_command_request(peer, headers, requirement, :html) do
-        :ok ->
-          location =
-            case FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params) do
-              {:ok, message} ->
-                "/dashboard/flow/schedules?" <>
-                  URI.encode_query(%{"status" => "ok", "message" => message})
+      true ->
+        params = FlowPaths.decode_form_body(body)
+        requirement = RouteRequirements.flow_schedule_form_requirement(params)
 
-              {:error, reason} ->
-                "/dashboard/flow/schedules?" <>
-                  URI.encode_query(%{"status" => "error", "message" => reason})
-            end
+        case Auth.authorize_command_request(peer, headers, requirement, :html) do
+          :ok ->
+            location =
+              case FerricstoreServer.Health.Dashboard.apply_flow_schedule_form(params) do
+                {:ok, message} ->
+                  "/dashboard/flow/schedules?" <>
+                    URI.encode_query(%{"status" => "ok", "message" => message})
 
-          send_redirect_response(socket, transport, location)
+                {:error, reason} ->
+                  "/dashboard/flow/schedules?" <>
+                    URI.encode_query(%{"status" => "error", "message" => reason})
+              end
 
-        {:redirect_login, location} ->
-          send_redirect_response(socket, transport, location)
+            send_redirect_response(socket, transport, location)
 
-        {:unauthorized, reason} ->
-          send_response(
-            socket,
-            transport,
-            401,
-            "Unauthorized",
-            "application/json",
-            Jason.encode!(%{error: reason})
-          )
+          {:redirect_login, location} ->
+            send_redirect_response(socket, transport, location)
 
-        {:forbidden, requirement, reason} ->
-          send_forbidden_response(
-            socket,
-            transport,
-            "/dashboard/flow/schedules",
-            requirement,
-            reason
-          )
-      end
+          {:unauthorized, reason} ->
+            send_response(
+              socket,
+              transport,
+              401,
+              "Unauthorized",
+              "application/json",
+              Jason.encode!(%{error: reason})
+            )
+
+          {:forbidden, requirement, reason} ->
+            send_forbidden_response(
+              socket,
+              transport,
+              "/dashboard/flow/schedules",
+              requirement,
+              reason
+            )
+        end
     end
   end
 
@@ -521,67 +529,69 @@ defmodule FerricstoreServer.Health.Endpoint do
          headers,
          body
        ) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(body)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-      case Auth.authorize_command_request(
-             peer,
-             headers,
-             RouteRequirements.flow_retention_form_requirement(params),
-             :html
-           ) do
-        :ok ->
-          location =
-            case FerricstoreServer.Health.Dashboard.apply_flow_retention_form(params) do
-              {:ok, :dry_run, result} ->
-                "/dashboard/flow/retention?" <>
-                  URI.encode_query(%{
-                    "status" => "dry_run",
-                    "limit" => Map.get(result, :limit, 100)
-                  })
+      true ->
+        params = FlowPaths.decode_form_body(body)
 
-              {:ok, :cleanup, result} ->
-                "/dashboard/flow/retention?" <>
-                  URI.encode_query(%{
-                    "status" => "ok",
-                    "limit" => Map.get(result, :limit, 100),
-                    "active_timeouts" => Map.get(result, :active_timeouts, 0),
-                    "flows" => Map.get(result, :flows, 0),
-                    "history" => Map.get(result, :history, 0),
-                    "values" => Map.get(result, :values, 0)
-                  })
+        case Auth.authorize_command_request(
+               peer,
+               headers,
+               RouteRequirements.flow_retention_form_requirement(params),
+               :html
+             ) do
+          :ok ->
+            location =
+              case FerricstoreServer.Health.Dashboard.apply_flow_retention_form(params) do
+                {:ok, :dry_run, result} ->
+                  "/dashboard/flow/retention?" <>
+                    URI.encode_query(%{
+                      "status" => "dry_run",
+                      "limit" => Map.get(result, :limit, 100)
+                    })
 
-              {:error, reason} ->
-                "/dashboard/flow/retention?" <>
-                  URI.encode_query(%{"status" => "error", "message" => reason})
-            end
+                {:ok, :cleanup, result} ->
+                  "/dashboard/flow/retention?" <>
+                    URI.encode_query(%{
+                      "status" => "ok",
+                      "limit" => Map.get(result, :limit, 100),
+                      "active_timeouts" => Map.get(result, :active_timeouts, 0),
+                      "flows" => Map.get(result, :flows, 0),
+                      "history" => Map.get(result, :history, 0),
+                      "values" => Map.get(result, :values, 0)
+                    })
 
-          send_redirect_response(socket, transport, location)
+                {:error, reason} ->
+                  "/dashboard/flow/retention?" <>
+                    URI.encode_query(%{"status" => "error", "message" => reason})
+              end
 
-        {:redirect_login, location} ->
-          send_redirect_response(socket, transport, location)
+            send_redirect_response(socket, transport, location)
 
-        {:unauthorized, reason} ->
-          send_response(
-            socket,
-            transport,
-            401,
-            "Unauthorized",
-            "application/json",
-            Jason.encode!(%{error: reason})
-          )
+          {:redirect_login, location} ->
+            send_redirect_response(socket, transport, location)
 
-        {:forbidden, requirement, reason} ->
-          send_forbidden_response(
-            socket,
-            transport,
-            "/dashboard/flow/retention",
-            requirement,
-            reason
-          )
-      end
+          {:unauthorized, reason} ->
+            send_response(
+              socket,
+              transport,
+              401,
+              "Unauthorized",
+              "application/json",
+              Jason.encode!(%{error: reason})
+            )
+
+          {:forbidden, requirement, reason} ->
+            send_forbidden_response(
+              socket,
+              transport,
+              "/dashboard/flow/retention",
+              requirement,
+              reason
+            )
+        end
     end
   end
 
@@ -594,57 +604,59 @@ defmodule FerricstoreServer.Health.Endpoint do
          headers,
          body
        ) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      params = FlowPaths.decode_form_body(body)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-      case Auth.authorize_command_request(
-             peer,
-             headers,
-             RouteRequirements.flow_reclaim_form_requirement(params),
-             :html
-           ) do
-        :ok ->
-          location =
-            case FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params) do
-              {:ok, result} ->
-                "/dashboard/flow/failures?" <>
-                  URI.encode_query(%{
-                    "status" => "reclaimed",
-                    "type" => Map.get(result, :type, ""),
-                    "count" => Map.get(result, :reclaimed, 0)
-                  })
+      true ->
+        params = FlowPaths.decode_form_body(body)
 
-              {:error, reason} ->
-                "/dashboard/flow/failures?" <>
-                  URI.encode_query(%{"status" => "error", "message" => reason})
-            end
+        case Auth.authorize_command_request(
+               peer,
+               headers,
+               RouteRequirements.flow_reclaim_form_requirement(params),
+               :html
+             ) do
+          :ok ->
+            location =
+              case FerricstoreServer.Health.Dashboard.apply_flow_failures_form(params) do
+                {:ok, result} ->
+                  "/dashboard/flow/failures?" <>
+                    URI.encode_query(%{
+                      "status" => "reclaimed",
+                      "type" => Map.get(result, :type, ""),
+                      "count" => Map.get(result, :reclaimed, 0)
+                    })
 
-          send_redirect_response(socket, transport, location)
+                {:error, reason} ->
+                  "/dashboard/flow/failures?" <>
+                    URI.encode_query(%{"status" => "error", "message" => reason})
+              end
 
-        {:redirect_login, location} ->
-          send_redirect_response(socket, transport, location)
+            send_redirect_response(socket, transport, location)
 
-        {:unauthorized, reason} ->
-          send_response(
-            socket,
-            transport,
-            401,
-            "Unauthorized",
-            "application/json",
-            Jason.encode!(%{error: reason})
-          )
+          {:redirect_login, location} ->
+            send_redirect_response(socket, transport, location)
 
-        {:forbidden, requirement, reason} ->
-          send_forbidden_response(
-            socket,
-            transport,
-            "/dashboard/flow/failures",
-            requirement,
-            reason
-          )
-      end
+          {:unauthorized, reason} ->
+            send_response(
+              socket,
+              transport,
+              401,
+              "Unauthorized",
+              "application/json",
+              Jason.encode!(%{error: reason})
+            )
+
+          {:forbidden, requirement, reason} ->
+            send_forbidden_response(
+              socket,
+              transport,
+              "/dashboard/flow/failures",
+              requirement,
+              reason
+            )
+        end
     end
   end
 
@@ -657,121 +669,123 @@ defmodule FerricstoreServer.Health.Endpoint do
          headers,
          body
        ) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      cond do
-        match?({:ok, _id}, FlowPaths.decode_flow_rewind_action(encoded_action)) ->
-          {:ok, id} = FlowPaths.decode_flow_rewind_action(encoded_action)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-          params =
-            body
-            |> FlowPaths.decode_form_body()
-            |> Map.put_new("id", id)
+      true ->
+        cond do
+          match?({:ok, _id}, FlowPaths.decode_flow_rewind_action(encoded_action)) ->
+            {:ok, id} = FlowPaths.decode_flow_rewind_action(encoded_action)
 
-          case Auth.authorize_command_request(
-                 peer,
-                 headers,
-                 RouteRequirements.flow_rewind_form_requirement(id, params),
-                 :html
-               ) do
-            :ok ->
-              location =
-                case FerricstoreServer.Health.Dashboard.apply_flow_rewind_form(params) do
-                  {:ok, id, partition_key} ->
-                    FlowPaths.flow_detail_location(id, partition_key, %{"status" => "rewound"})
+            params =
+              body
+              |> FlowPaths.decode_form_body()
+              |> Map.put_new("id", id)
 
-                  {:error, reason} ->
-                    partition_key = Map.get(params, "partition_key", "")
+            case Auth.authorize_command_request(
+                   peer,
+                   headers,
+                   RouteRequirements.flow_rewind_form_requirement(id, params),
+                   :html
+                 ) do
+              :ok ->
+                location =
+                  case FerricstoreServer.Health.Dashboard.apply_flow_rewind_form(params) do
+                    {:ok, id, partition_key} ->
+                      FlowPaths.flow_detail_location(id, partition_key, %{"status" => "rewound"})
 
-                    FlowPaths.flow_detail_location(id, partition_key, %{
-                      "status" => "error",
-                      "message" => reason
-                    })
-                end
+                    {:error, reason} ->
+                      partition_key = Map.get(params, "partition_key", "")
 
-              send_redirect_response(socket, transport, location)
+                      FlowPaths.flow_detail_location(id, partition_key, %{
+                        "status" => "error",
+                        "message" => reason
+                      })
+                  end
 
-            {:redirect_login, location} ->
-              send_redirect_response(socket, transport, location)
+                send_redirect_response(socket, transport, location)
 
-            {:unauthorized, reason} ->
-              send_response(
-                socket,
-                transport,
-                401,
-                "Unauthorized",
-                "application/json",
-                Jason.encode!(%{error: reason})
-              )
+              {:redirect_login, location} ->
+                send_redirect_response(socket, transport, location)
 
-            {:forbidden, requirement, reason} ->
-              send_forbidden_response(
-                socket,
-                transport,
-                "/dashboard/flow/" <> encoded_action,
-                requirement,
-                reason
-              )
-          end
+              {:unauthorized, reason} ->
+                send_response(
+                  socket,
+                  transport,
+                  401,
+                  "Unauthorized",
+                  "application/json",
+                  Jason.encode!(%{error: reason})
+                )
 
-        match?({:ok, _id}, FlowPaths.decode_flow_signal_action(encoded_action)) ->
-          {:ok, id} = FlowPaths.decode_flow_signal_action(encoded_action)
+              {:forbidden, requirement, reason} ->
+                send_forbidden_response(
+                  socket,
+                  transport,
+                  "/dashboard/flow/" <> encoded_action,
+                  requirement,
+                  reason
+                )
+            end
 
-          params =
-            body
-            |> FlowPaths.decode_form_body()
-            |> Map.put_new("id", id)
+          match?({:ok, _id}, FlowPaths.decode_flow_signal_action(encoded_action)) ->
+            {:ok, id} = FlowPaths.decode_flow_signal_action(encoded_action)
 
-          case Auth.authorize_command_request(
-                 peer,
-                 headers,
-                 RouteRequirements.flow_signal_form_requirement(id, params),
-                 :html
-               ) do
-            :ok ->
-              location =
-                case FerricstoreServer.Health.Dashboard.apply_flow_signal_form(params) do
-                  {:ok, id, partition_key} ->
-                    FlowPaths.flow_detail_location(id, partition_key, %{"status" => "signaled"})
+            params =
+              body
+              |> FlowPaths.decode_form_body()
+              |> Map.put_new("id", id)
 
-                  {:error, reason} ->
-                    partition_key = Map.get(params, "partition_key", "")
+            case Auth.authorize_command_request(
+                   peer,
+                   headers,
+                   RouteRequirements.flow_signal_form_requirement(id, params),
+                   :html
+                 ) do
+              :ok ->
+                location =
+                  case FerricstoreServer.Health.Dashboard.apply_flow_signal_form(params) do
+                    {:ok, id, partition_key} ->
+                      FlowPaths.flow_detail_location(id, partition_key, %{"status" => "signaled"})
 
-                    FlowPaths.flow_detail_location(id, partition_key, %{
-                      "status" => "error",
-                      "message" => reason
-                    })
-                end
+                    {:error, reason} ->
+                      partition_key = Map.get(params, "partition_key", "")
 
-              send_redirect_response(socket, transport, location)
+                      FlowPaths.flow_detail_location(id, partition_key, %{
+                        "status" => "error",
+                        "message" => reason
+                      })
+                  end
 
-            {:redirect_login, location} ->
-              send_redirect_response(socket, transport, location)
+                send_redirect_response(socket, transport, location)
 
-            {:unauthorized, reason} ->
-              send_response(
-                socket,
-                transport,
-                401,
-                "Unauthorized",
-                "application/json",
-                Jason.encode!(%{error: reason})
-              )
+              {:redirect_login, location} ->
+                send_redirect_response(socket, transport, location)
 
-            {:forbidden, requirement, reason} ->
-              send_forbidden_response(
-                socket,
-                transport,
-                "/dashboard/flow/" <> encoded_action,
-                requirement,
-                reason
-              )
-          end
+              {:unauthorized, reason} ->
+                send_response(
+                  socket,
+                  transport,
+                  401,
+                  "Unauthorized",
+                  "application/json",
+                  Jason.encode!(%{error: reason})
+                )
 
-        true ->
-          send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
-      end
+              {:forbidden, requirement, reason} ->
+                send_forbidden_response(
+                  socket,
+                  transport,
+                  "/dashboard/flow/" <> encoded_action,
+                  requirement,
+                  reason
+                )
+            end
+
+          true ->
+            send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
+        end
     end
   end
 
@@ -795,22 +809,26 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect()
-      body = FerricstoreServer.Health.Dashboard.render(data)
-      send_html_response(socket, transport, 200, "OK", body)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        data = FerricstoreServer.Health.Dashboard.collect()
+        body = FerricstoreServer.Health.Dashboard.render(data)
+        send_html_response(socket, transport, 200, "OK", body)
     end
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/api/overview", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      data = FerricstoreServer.Health.Dashboard.collect()
-      payload = FerricstoreServer.Health.Dashboard.live_overview_payload(data)
-      Response.send_live_json_response(socket, transport, payload)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        data = FerricstoreServer.Health.Dashboard.collect()
+        payload = FerricstoreServer.Health.Dashboard.live_overview_payload(data)
+        Response.send_live_json_response(socket, transport, payload)
     end
   end
 
@@ -823,19 +841,21 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/api/" <> api_path, peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      case FerricstoreServer.Health.Dashboard.live_payload(
-             api_path,
-             Auth.dashboard_collect_opts(peer, headers)
-           ) do
-        {:ok, payload} ->
-          Response.send_live_json_response(socket, transport, payload)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
-        :not_found ->
-          send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
-      end
+      true ->
+        case FerricstoreServer.Health.Dashboard.live_payload(
+               api_path,
+               Auth.dashboard_collect_opts(peer, headers)
+             ) do
+          {:ok, payload} ->
+            Response.send_live_json_response(socket, transport, payload)
+
+          :not_found ->
+            send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
+        end
     end
   end
 
@@ -1096,38 +1116,46 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/config", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      send_redirect_response(socket, transport, "/dashboard/config")
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        send_redirect_response(socket, transport, "/dashboard/config")
     end
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/projections", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      send_redirect_response(socket, transport, "/dashboard/flow")
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        send_redirect_response(socket, transport, "/dashboard/flow")
     end
   end
 
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/" <> encoded_id, peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      {id, opts} = FlowPaths.decode_flow_detail_request(encoded_id)
-      data = FerricstoreServer.Health.Dashboard.collect_flow_detail_page(id, opts)
-      body = FerricstoreServer.Health.Dashboard.render_flow_detail_page(data)
-      send_html_response(socket, transport, 200, "OK", body)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        {id, opts} = FlowPaths.decode_flow_detail_request(encoded_id)
+        data = FerricstoreServer.Health.Dashboard.collect_flow_detail_page(id, opts)
+        body = FerricstoreServer.Health.Dashboard.render_flow_detail_page(data)
+        send_html_response(socket, transport, 200, "OK", body)
     end
   end
 
   defp dispatch_request(socket, transport, "GET", "/metrics", peer, headers) do
-    unless Auth.observability_authorized?(peer, headers) do
-      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
-    else
-      body = Ferricstore.Metrics.scrape()
-      send_text_response(socket, transport, 200, "OK", body)
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        body = Ferricstore.Metrics.scrape()
+        send_text_response(socket, transport, 200, "OK", body)
     end
   end
 

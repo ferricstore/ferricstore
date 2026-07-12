@@ -214,9 +214,8 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   defp requirement_allowed?(user, {"*", _opts}), do: Acl.check_permission(user, "*")
 
   defp requirement_allowed?(user, {command, opts}) do
-    with :ok <- Acl.check_command(user, command),
-         :ok <- check_requirement_key(user, opts) do
-      :ok
+    with :ok <- Acl.check_command(user, command) do
+      check_requirement_key(user, opts)
     end
   end
 
