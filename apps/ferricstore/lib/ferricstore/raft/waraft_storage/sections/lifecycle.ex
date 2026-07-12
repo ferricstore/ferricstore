@@ -394,6 +394,31 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
         finish_apply_projection_cache_compaction(ref, result, handle)
       end
 
+      def info(
+            {:ferricstore_waraft_flush_replay_dependencies, reply_to, ref},
+            %{blocked_error: reason} = handle
+          )
+          when is_pid(reply_to) and is_reference(ref) do
+        send(reply_to, {:ferricstore_waraft_flush_replay_dependencies, ref, {:error, reason}})
+        {:ok, handle}
+      end
+
+      def info(
+            {:ferricstore_waraft_flush_replay_dependencies, reply_to, ref},
+            handle
+          )
+          when is_pid(reply_to) and is_reference(ref) do
+        target_position = Map.get(handle, :position, @zero_pos)
+        next_handle = request_replay_dependencies_async(handle)
+
+        send(
+          reply_to,
+          {:ferricstore_waraft_flush_replay_dependencies, ref, {:ok, target_position}}
+        )
+
+        {:ok, next_handle}
+      end
+
       def info(_info, _handle), do: :ignore
 
       @spec create_snapshot(charlist() | binary(), handle()) :: :ok | {:error, term()}

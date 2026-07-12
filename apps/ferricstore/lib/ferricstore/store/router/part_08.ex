@@ -986,36 +986,66 @@ defmodule Ferricstore.Store.Router.Part08 do
         attrs = flow_retention_planning_attrs(ctx, attrs)
         active_attrs = Map.put(attrs, :plan_kind, :active)
 
-        with {:ok, active_plan} <- flow_retention_plan_shards(ctx, active_attrs),
+        with {:ok, active_plan} <- flow_retention_plan_shards(ctx, active_attrs) do
+          if active_plan.continuation do
+            with {:ok, active_result} <-
+                   flow_retention_cleanup_active(ctx, active_attrs, active_plan.plans) do
+              {:ok, flow_retention_result(active_result, active_plan.continuation)}
+            end
+          else
+            flow_retention_cleanup_with_terminal_plan(ctx, attrs, active_attrs, active_plan)
+          end
+        end
+      end
+
+      defp flow_retention_cleanup_with_terminal_plan(ctx, attrs, active_attrs, active_plan) do
+        terminal_plan_attrs = Map.put(attrs, :plan_kind, :terminal)
+
+        with {:ok, terminal_plan} <- flow_retention_plan_shards(ctx, terminal_plan_attrs),
              {:ok, active_result} <-
                flow_retention_cleanup_active(ctx, active_attrs, active_plan.plans) do
           remaining_limit = max(attrs.limit - Map.get(active_result, :active_timeouts, 0), 0)
+          terminal_plan = flow_retention_limit_terminal_plan(terminal_plan, remaining_limit)
 
-          if active_plan.continuation do
-            {:ok, flow_retention_result(active_result, active_plan.continuation)}
+          if remaining_limit == 0 do
+            {:ok, flow_retention_result(active_result, terminal_plan.continuation)}
           else
-            terminal_attrs =
-              attrs
-              |> Map.put(:plan_kind, :terminal)
-              |> Map.put(:limit, remaining_limit)
+            terminal_attrs = Map.put(terminal_plan_attrs, :limit, remaining_limit)
 
-            with {:ok, terminal_plan} <- flow_retention_plan_shards(ctx, terminal_attrs) do
-              if remaining_limit == 0 do
-                {:ok, flow_retention_result(active_result, terminal_plan.continuation)}
-              else
-                with {:ok, result} <-
-                       flow_retention_cleanup_terminal_shards(
-                         ctx,
-                         terminal_attrs,
-                         terminal_plan.plans,
-                         active_result
-                       ) do
-                  {:ok, flow_retention_result(result, terminal_plan.continuation)}
-                end
-              end
+            with {:ok, result} <-
+                   flow_retention_cleanup_terminal_shards(
+                     ctx,
+                     terminal_attrs,
+                     terminal_plan.plans,
+                     active_result
+                   ) do
+              {:ok, flow_retention_result(result, terminal_plan.continuation)}
             end
           end
         end
+      end
+
+      defp flow_retention_limit_terminal_plan(plan, limit) do
+        {plans, {_remaining, first_omitted_shard}} =
+          Enum.map_reduce(plan.plans, {limit, nil}, fn shard_plan, {remaining, omitted_shard} ->
+            candidates = shard_plan.terminal_candidates
+            selected = Enum.take(candidates, remaining)
+
+            omitted_shard =
+              if is_nil(omitted_shard) and length(selected) < length(candidates),
+                do: shard_plan.shard_index,
+                else: omitted_shard
+
+            {%{shard_plan | terminal_candidates: selected},
+             {remaining - length(selected), omitted_shard}}
+          end)
+
+        continuation =
+          if is_integer(first_omitted_shard),
+            do: flow_retention_continuation(:terminal, first_omitted_shard),
+            else: plan.continuation
+
+        %{plan | plans: plans, continuation: continuation}
       end
 
       defp flow_retention_plan_shards(ctx, attrs) do

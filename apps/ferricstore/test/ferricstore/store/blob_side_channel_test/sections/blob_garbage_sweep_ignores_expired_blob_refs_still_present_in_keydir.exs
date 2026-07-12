@@ -96,96 +96,16 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
         end
       end
 
-      test "blob garbage sweep skips deletion while Ra replay cursor still covers possible blob refs",
-           %{ctx: ctx, shard: shard} do
-        payload = "dead-but-possibly-still-in-raft-log"
+      test "blob garbage sweep fails closed without matching WARaft storage", %{
+        ctx: ctx,
+        shard: shard
+      } do
+        payload = "dead-without-waraft-storage"
         ref = BlobRef.from_payload(payload)
         path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+        original_state = :sys.get_state(shard)
 
         :sys.replace_state(shard, fn state -> %{state | raft?: true} end)
-        :atomics.put(ctx.last_applied_index, 1, 10)
-        :atomics.put(ctx.last_released_cursor_index, 1, 9)
-        state = :sys.get_state(shard)
-        assert state.raft?
-        assert :atomics.get(state.instance_ctx.last_applied_index, 1) == 10
-        assert :atomics.get(state.instance_ctx.last_released_cursor_index, 1) == 9
-
-        assert {:ok,
-                %{
-                  deleted_files: 0,
-                  deleted_bytes: 0,
-                  kept_files: 0,
-                  skipped: true,
-                  reason: {:raft_replay_gap, 10, 9}
-                }} = Router.sweep_blob_garbage(ctx)
-
-        assert File.exists?(path)
-      end
-
-      test "blob garbage sweep skips deletion while WARaft replay cursor still covers possible blob refs",
-           %{ctx: ctx, shard: shard} do
-        payload = "dead-but-possibly-still-in-waraft-log"
-        ref = BlobRef.from_payload(payload)
-        path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
-
-        :atomics.put(ctx.last_applied_index, 1, 10)
-        :atomics.put(ctx.last_released_cursor_index, 1, 9)
-        state = :sys.get_state(shard)
-        refute state.raft?
-        assert :atomics.get(state.instance_ctx.last_applied_index, 1) == 10
-        assert :atomics.get(state.instance_ctx.last_released_cursor_index, 1) == 9
-
-        assert {:ok,
-                %{
-                  deleted_files: 0,
-                  deleted_bytes: 0,
-                  kept_files: 0,
-                  skipped: true,
-                  reason: {:raft_replay_gap, 10, 9}
-                }} = Router.sweep_blob_garbage(ctx)
-
-        assert File.exists?(path)
-      end
-
-      test "blob garbage sweep continues safe shards when another shard is replay-unsafe" do
-        ctx =
-          IsolatedInstance.checkout(
-            shard_count: 2,
-            hot_cache_max_value_size: 64,
-            blob_side_channel_threshold_bytes: 128
-          )
-
-        try do
-          safe_payload = "safe-shard-orphan-blob"
-          unsafe_payload = "unsafe-shard-orphan-blob"
-          safe_ref = BlobRef.from_payload(safe_payload)
-          unsafe_ref = BlobRef.from_payload(unsafe_payload)
-          safe_path = write_legacy_blob!(ctx.data_dir, 0, safe_ref, safe_payload)
-          unsafe_path = write_legacy_blob!(ctx.data_dir, 1, unsafe_ref, unsafe_payload)
-
-          :atomics.put(ctx.last_applied_index, 2, 10)
-          :atomics.put(ctx.last_released_cursor_index, 2, 9)
-
-          assert {:ok, %{deleted_files: 1, skipped: true, reason: {:raft_replay_gap, 10, 9}}} =
-                   Router.sweep_blob_garbage(ctx)
-
-          refute File.exists?(safe_path)
-          assert File.exists?(unsafe_path)
-        after
-          IsolatedInstance.checkin(ctx)
-        end
-      end
-
-      test "blob garbage sweep fails closed when Ra replay metrics are unavailable", %{
-        ctx: ctx,
-        shard: shard
-      } do
-        payload = "dead-but-unknown-raft-replay-gap"
-        ref = BlobRef.from_payload(payload)
-        path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
-        original_state = :sys.get_state(shard)
-
-        :sys.replace_state(shard, fn state -> %{state | raft?: true, instance_ctx: nil} end)
 
         try do
           assert {:ok,
@@ -194,44 +114,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
                     deleted_bytes: 0,
                     kept_files: 0,
                     skipped: true,
-                    reason: :missing_raft_replay_metrics
-                  }} = Router.sweep_blob_garbage(ctx)
-
-          assert File.exists?(path)
-        after
-          :sys.replace_state(shard, fn _state -> original_state end)
-        end
-      end
-
-      test "blob garbage sweep fails closed when Ra replay metrics are invalid", %{
-        ctx: ctx,
-        shard: shard
-      } do
-        payload = "dead-but-invalid-raft-replay-metrics"
-        ref = BlobRef.from_payload(payload)
-        path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
-        original_state = :sys.get_state(shard)
-
-        :sys.replace_state(shard, fn state ->
-          %{
-            state
-            | raft?: true,
-              instance_ctx: %{
-                state.instance_ctx
-                | last_applied_index: {:not, :atomics},
-                  last_released_cursor_index: {:not, :atomics}
-              }
-          }
-        end)
-
-        try do
-          assert {:ok,
-                  %{
-                    deleted_files: 0,
-                    deleted_bytes: 0,
-                    kept_files: 0,
-                    skipped: true,
-                    reason: :missing_raft_replay_metrics
+                    reason: :missing_waraft_storage_metrics
                   }} = Router.sweep_blob_garbage(ctx)
 
           assert File.exists?(path)

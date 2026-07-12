@@ -243,8 +243,15 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
-        assert {:ok, %{active_timeouts: 2, flows: 0}} =
-                 FerricStore.flow_retention_cleanup(limit: 2, now_ms: cleanup_now)
+        assert {:ok,
+                %{
+                  active_timeouts: 2,
+                  flows: 0,
+                  more?: true,
+                  continuation: continuation
+                }} = FerricStore.flow_retention_cleanup(limit: 2, now_ms: cleanup_now)
+
+        assert is_binary(continuation)
 
         Enum.each(terminal_flows, fn {id, partition_key} ->
           assert {:ok, %{state: "completed"}} =

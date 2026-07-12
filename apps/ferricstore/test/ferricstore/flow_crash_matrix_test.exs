@@ -8,6 +8,7 @@ defmodule Ferricstore.FlowCrashMatrixTest do
 
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Flow.LMDBWriter
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -220,33 +221,54 @@ defmodule Ferricstore.FlowCrashMatrixTest do
     partition = unique("matrix-gc-partition")
     id = unique("matrix-gc-flow")
     result = :binary.copy("gc-result:", 128)
+    shard = flow_shard(id, partition)
 
     create_and_complete(type, partition, id, result: result)
     ShardHelpers.flush_all_shards()
+    ctx = FerricStore.Instance.get(:default)
 
-    fault = install_blocking_fault(:after_blob_gc_live_refs)
-    op = start_unlinked(fn -> Router.sweep_blob_garbage(FerricStore.Instance.get(:default)) end)
+    old_applied_metric = :atomics.get(ctx.last_applied_index, shard + 1)
+    old_released_metric = :atomics.get(ctx.last_released_cursor_index, shard + 1)
+    :atomics.put(ctx.last_applied_index, shard + 1, 10)
+    :atomics.put(ctx.last_released_cursor_index, shard + 1, 9)
+    assert {:ok, storage_position_before_gc} = WARaftBackend.storage_position(shard)
 
-    {pid, _metadata} = await_fault(fault)
+    on_exit(fn ->
+      :atomics.put(ctx.last_applied_index, shard + 1, old_applied_metric)
+      :atomics.put(ctx.last_released_cursor_index, shard + 1, old_released_metric)
+    end)
+
+    fault =
+      install_blocking_fault(
+        :after_blob_gc_live_refs,
+        &(&1.shard_index == shard)
+      )
+
+    op = start_unlinked(fn -> Router.sweep_blob_garbage(ctx) end)
+
+    {pid, metadata} = await_fault_or_op(fault, op)
+    assert metadata.shard_index == shard
+    assert metadata.live_ref_count > 0
+    assert {:ok, ^storage_position_before_gc} = WARaftBackend.storage_position(shard)
     Ferricstore.FaultInjection.clear_hook()
     kill_process(pid)
     shutdown_op(op)
 
-    assert {:ok, _stats} = Router.sweep_blob_garbage(FerricStore.Instance.get(:default))
+    assert {:ok, _stats} = Router.sweep_blob_garbage(ctx)
 
     assert {:ok, record} = FerricStore.flow_get(id, partition_key: partition, full: true)
     assert record.state == "completed"
     assert record.result == result
   end
 
-  defp install_blocking_fault(point) do
+  defp install_blocking_fault(point, metadata_match_fun \\ fn _metadata -> true end) do
     ref = make_ref()
     owner = self()
     hits = :atomics.new(1, signed: false)
 
     Ferricstore.FaultInjection.put_hook(fn
       ^point, metadata ->
-        if :atomics.add_get(hits, 1, 1) == 1 do
+        if metadata_match_fun.(metadata) and :atomics.add_get(hits, 1, 1) == 1 do
           send(owner, {:flow_crash_matrix_fault, ref, point, self(), metadata})
 
           receive do
@@ -268,6 +290,18 @@ defmodule Ferricstore.FlowCrashMatrixTest do
   defp await_fault(ref) do
     receive do
       {:flow_crash_matrix_fault, ^ref, _point, pid, metadata} -> {pid, metadata}
+    after
+      30_000 -> flunk("fault injection point was not reached")
+    end
+  end
+
+  defp await_fault_or_op(ref, %{ref: op_ref}) do
+    receive do
+      {:flow_crash_matrix_fault, ^ref, _point, pid, metadata} ->
+        {pid, metadata}
+
+      {:flow_crash_matrix_op_result, ^op_ref, result} ->
+        flunk("operation completed before fault injection point: #{inspect(result)}")
     after
       30_000 -> flunk("fault injection point was not reached")
     end

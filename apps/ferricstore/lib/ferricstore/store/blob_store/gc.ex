@@ -63,10 +63,10 @@ defmodule Ferricstore.Store.BlobStore.GC do
 
       The caller owns producing a complete live set. This function is deliberately
       conservative for append segments: a segment is kept while any live v2 ref
-      points into it, prepared refs can register a short protection token until Raft
-      apply finishes, and fresh dead segments are kept for a grace window as a final
-      safety net. The shard must still guard Ra replay safety before calling this,
-      because unreleased Ra log entries can contain older blob refs.
+      points into it, prepared refs can register a short protection token until
+      replicated apply finishes, and fresh dead segments are kept for a grace window
+      as a final safety net. The shard must still establish a durable WARaft replay
+      boundary before calling this because pending projection data can contain blob refs.
       """
       @spec sweep_unreferenced(binary(), non_neg_integer(), Enumerable.t()) ::
               {:ok,

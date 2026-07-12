@@ -37,7 +37,8 @@ defmodule Ferricstore.Store.Router.BlobGC do
     try do
       with {:ok, hardened_ids, hardened_stats} <- blob_gc_reconcile_hardened_protections(ctx, idx),
            state <- :sys.get_state(resolve_shard(ctx, idx)),
-           :ok <- blob_gc_replay_safe?(state, idx),
+           :ok <- blob_gc_prepare_replay_safe(ctx, state, idx),
+           :ok <- blob_gc_replay_safe?(ctx, state, idx),
            :ok <- blob_gc_fsync_active_file(state),
            {:ok, stats} <-
              Ferricstore.Store.BlobStore.sweep_unreferenced_releasing_hardened_with_live_refs(
@@ -107,27 +108,11 @@ defmodule Ferricstore.Store.Router.BlobGC do
   end
 
   defp blob_gc_wait_replay_safe(ctx, idx, timeout_ms) do
-    deadline = :erlang.+(System.monotonic_time(:millisecond), :erlang.max(timeout_ms, 0))
-    blob_gc_wait_replay_safe_until(ctx, idx, deadline)
-  end
-
-  defp blob_gc_wait_replay_safe_until(ctx, idx, deadline_ms) do
     try do
       state = :sys.get_state(resolve_shard(ctx, idx))
 
-      case blob_gc_replay_safe?(state, idx) do
-        :ok ->
-          :ok
-
-        {:ok, %{skipped: true} = skipped} ->
-          case :erlang.>=(System.monotonic_time(:millisecond), deadline_ms) do
-            false ->
-              Process.sleep(10)
-              blob_gc_wait_replay_safe_until(ctx, idx, deadline_ms)
-
-            true ->
-              {:ok, skipped}
-          end
+      with :ok <- blob_gc_prepare_replay_safe(ctx, state, idx, timeout_ms) do
+        blob_gc_replay_safe?(ctx, state, idx)
       end
     catch
       :exit, reason -> {:error, {:blob_gc_replay_wait_shard_unavailable, reason}}
@@ -148,28 +133,101 @@ defmodule Ferricstore.Store.Router.BlobGC do
     end
   end
 
-  defp blob_gc_replay_safe?(%{instance_ctx: instance_ctx}, idx)
-       when :erlang.is_map(instance_ctx) do
-    with %{last_applied_index: applied_ref, last_released_cursor_index: released_ref} <-
-           instance_ctx,
-         {:ok, applied} <- blob_gc_read_replay_index(applied_ref, idx),
-         {:ok, released} <- blob_gc_read_replay_index(released_ref, idx) do
-      case :erlang.>(applied, released) do
-        false -> :ok
-        true -> blob_gc_skipped({:raft_replay_gap, applied, released})
-      end
-    else
-      _ -> blob_gc_skipped(:missing_raft_replay_metrics)
+  defp blob_gc_replay_safe?(ctx, state, idx) do
+    cond do
+      blob_gc_active_waraft_ctx?(ctx) ->
+        blob_gc_waraft_replay_safe?(idx)
+
+      Map.get(ctx, :name) == :default or Map.get(state, :raft?) == true ->
+        blob_gc_skipped(:missing_waraft_storage_metrics)
+
+      true ->
+        :ok
     end
   end
 
-  defp blob_gc_replay_safe?(%{raft?: true}, _idx) do
-    blob_gc_skipped(:missing_raft_replay_metrics)
+  defp blob_gc_prepare_replay_safe(ctx, state, idx) do
+    blob_gc_prepare_replay_safe(ctx, state, idx, blob_gc_reconcile_barrier_timeout_ms())
   end
 
-  defp blob_gc_replay_safe?(_state, _idx) do
-    :ok
+  defp blob_gc_prepare_replay_safe(ctx, state, idx, timeout_ms) do
+    cond do
+      blob_gc_active_waraft_ctx?(ctx) ->
+        case blob_gc_waraft_replay_safe?(idx) do
+          :ok ->
+            :ok
+
+          {:ok, %{reason: {:waraft_storage_replay_gap, _applied, _durable}}} ->
+            case Ferricstore.Raft.WARaftBackend.flush_storage_replay_dependencies(idx, timeout_ms) do
+              :ok -> :ok
+              {:error, reason} -> blob_gc_skipped({:waraft_storage_durability_failed, reason})
+            end
+
+          {:ok, %{skipped: true} = skipped} ->
+            {:ok, skipped}
+        end
+
+      Map.get(ctx, :name) == :default or Map.get(state, :raft?) == true ->
+        blob_gc_skipped(:missing_waraft_storage_metrics)
+
+      true ->
+        :ok
+    end
   end
+
+  defp blob_gc_waraft_replay_safe?(idx) do
+    case Ferricstore.Raft.WARaftBackend.storage_status(idx) do
+      {:ok, status} when is_list(status) ->
+        blob_gc_waraft_status_replay_safe?(status)
+
+      {:error, reason} ->
+        blob_gc_skipped({:waraft_storage_unavailable, reason})
+
+      _invalid ->
+        blob_gc_skipped(:missing_waraft_storage_metrics)
+    end
+  end
+
+  defp blob_gc_waraft_status_replay_safe?(status) do
+    applied = Keyword.get(status, :applied_position)
+    durable = Keyword.get(status, :durable_position)
+
+    cond do
+      Keyword.get(status, :blocked?, true) != false ->
+        blob_gc_skipped({:waraft_storage_blocked, Keyword.get(status, :blocked_error)})
+
+      Keyword.get(status, :payload_dirty?, true) != false ->
+        blob_gc_skipped({:waraft_storage_payload_dirty, applied, durable})
+
+      not blob_gc_valid_waraft_position?(applied) or
+          not blob_gc_valid_waraft_position?(durable) ->
+        blob_gc_skipped(:missing_waraft_storage_metrics)
+
+      applied == durable ->
+        :ok
+
+      true ->
+        blob_gc_skipped({:waraft_storage_replay_gap, applied, durable})
+    end
+  end
+
+  defp blob_gc_valid_waraft_position?({:raft_log_pos, index, term})
+       when is_integer(index) and index >= 0 and is_integer(term) and term >= 0,
+       do: true
+
+  defp blob_gc_valid_waraft_position?(_position), do: false
+
+  defp blob_gc_active_waraft_ctx?(%{name: name, data_dir: data_dir})
+       when is_atom(name) and is_binary(data_dir) do
+    active_ctx = Ferricstore.Raft.WARaftBackend.context!(:ferricstore_waraft_backend)
+
+    active_ctx.name == name and
+      Path.expand(active_ctx.data_dir) == Path.expand(data_dir)
+  catch
+    _kind, _reason -> false
+  end
+
+  defp blob_gc_active_waraft_ctx?(_ctx), do: false
 
   defp blob_gc_skipped(reason) do
     {:ok,
@@ -182,24 +240,6 @@ defmodule Ferricstore.Store.Router.BlobGC do
        skipped: true,
        reason: reason
      }}
-  end
-
-  defp blob_gc_read_replay_index(ref, idx) do
-    try do
-      value = :atomics.get(ref, :erlang.+(idx, 1))
-
-      case (case :erlang.is_integer(value) do
-              false -> false
-              true -> :erlang.>=(value, 0)
-            end) do
-        false -> :error
-        true -> {:ok, value}
-      end
-    rescue
-      _ in [ArgumentError] -> :error
-    catch
-      :exit, _ -> :error
-    end
   end
 
   defp blob_gc_fsync_active_file(%{active_file_path: path}) when :erlang.is_binary(path) do

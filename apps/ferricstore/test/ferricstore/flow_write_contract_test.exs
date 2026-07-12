@@ -1296,6 +1296,12 @@ defmodule Ferricstore.FlowWriteContractTest do
         "flow_retention_plan_shards"
       )
 
+    candidate_validation_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        router_source,
+        "flow_retention_valid_candidates?"
+      )
+
     terminal_planner_source =
       Ferricstore.Test.SourceFiles.private_function_source!(
         state_machine_source,
@@ -1310,7 +1316,8 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     assert cleanup_source =~ "terminal_candidates"
     assert cross_cleanup_source =~ "active_candidates"
-    assert router_cleanup_source =~ "expected_version"
+    assert router_cleanup_source =~ "flow_retention_valid_candidates?"
+    assert candidate_validation_source =~ "expected_version"
     assert terminal_planner_source =~ "cleanup_plan"
     assert terminal_apply_source =~ "cleanup_plan"
 

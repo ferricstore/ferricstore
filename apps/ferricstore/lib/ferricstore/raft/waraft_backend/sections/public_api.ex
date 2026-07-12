@@ -506,6 +506,97 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         end)
       end
 
+      @doc false
+      @spec storage_status(non_neg_integer()) :: {:ok, keyword()} | {:error, term()}
+      def storage_status(shard_index) when invalid_shard_index_shape(shard_index),
+        do: invalid_shard_index_error(shard_index)
+
+      def storage_status(shard_index) do
+        storage = :wa_raft_storage.registered_name(@table, partition(shard_index))
+
+        backend_call(fn ->
+          {:ok, :wa_raft_storage.status(storage)}
+        end)
+      end
+
+      @doc false
+      @spec flush_storage_replay_dependencies(non_neg_integer(), non_neg_integer()) ::
+              :ok | {:error, term()}
+      def flush_storage_replay_dependencies(shard_index, _timeout_ms)
+          when invalid_shard_index_shape(shard_index),
+          do: invalid_shard_index_error(shard_index)
+
+      def flush_storage_replay_dependencies(_shard_index, timeout_ms)
+          when not is_integer(timeout_ms) or timeout_ms < 0,
+          do: {:error, {:invalid_timeout, timeout_ms}}
+
+      def flush_storage_replay_dependencies(shard_index, timeout_ms) do
+        storage = :wa_raft_storage.registered_name(@table, partition(shard_index))
+        deadline = System.monotonic_time(:millisecond) + timeout_ms
+        ref = make_ref()
+
+        case Process.whereis(storage) do
+          pid when is_pid(pid) ->
+            send(pid, {:ferricstore_waraft_flush_replay_dependencies, self(), ref})
+            await_storage_replay_flush_request(shard_index, ref, deadline)
+
+          nil ->
+            backend_unavailable_error()
+        end
+      end
+
+      defp await_storage_replay_flush_request(shard_index, ref, deadline) do
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+        receive do
+          {:ferricstore_waraft_flush_replay_dependencies, ^ref, {:ok, target_position}} ->
+            await_storage_replay_flush_position(shard_index, target_position, deadline)
+
+          {:ferricstore_waraft_flush_replay_dependencies, ^ref, {:error, reason}} ->
+            {:error, {:storage_blocked, reason}}
+        after
+          remaining -> {:error, :storage_durability_timeout}
+        end
+      end
+
+      defp await_storage_replay_flush_position(shard_index, target_position, deadline) do
+        case storage_status(shard_index) do
+          {:ok, status} when is_list(status) ->
+            cond do
+              reason = Keyword.get(status, :blocked_error) ->
+                {:error, {:storage_blocked, reason}}
+
+              storage_replay_position_reached?(
+                Keyword.get(status, :durable_position),
+                target_position
+              ) ->
+                :ok
+
+              System.monotonic_time(:millisecond) >= deadline ->
+                {:error, :storage_durability_timeout}
+
+              true ->
+                Process.sleep(10)
+                await_storage_replay_flush_position(shard_index, target_position, deadline)
+            end
+
+          {:error, _reason} = error ->
+            error
+
+          _invalid ->
+            {:error, :missing_waraft_storage_metrics}
+        end
+      end
+
+      defp storage_replay_position_reached?(
+             {:raft_log_pos, durable_index, _durable_term},
+             {:raft_log_pos, target_index, _target_term}
+           )
+           when is_integer(durable_index) and is_integer(target_index),
+           do: durable_index >= target_index
+
+      defp storage_replay_position_reached?(_durable_position, _target_position), do: false
+
       @spec create_snapshot(non_neg_integer()) :: {:ok, tuple()} | {:error, term()}
       def create_snapshot(shard_index) when invalid_shard_index_shape(shard_index),
         do: invalid_shard_index_error(shard_index)
