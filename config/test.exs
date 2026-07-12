@@ -13,7 +13,12 @@ config :logger, level: :warning
 config :ferricstore, :native_port, 0
 config :ferricstore, :health_port, 0
 config :ferricstore, :health_probe_port, 0
-config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
+
+test_run_id = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+
+config :ferricstore,
+       :data_dir,
+       Path.join(System.tmp_dir!(), "ferricstore_test_#{:os.getpid()}_#{test_run_id}")
 
 # Use a fixed shard count in tests for deterministic behavior.
 # Production defaults to System.schedulers_online().

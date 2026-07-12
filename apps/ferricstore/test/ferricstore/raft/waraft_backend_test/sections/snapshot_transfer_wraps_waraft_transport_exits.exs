@@ -79,7 +79,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
       test "storage durable-position polling wraps WARaft exits" do
         source = Ferricstore.Test.SourceFiles.waraft_backend_source()
 
-        assert [_, storage_source] = String.split(source, "defp storage_status", parts: 2)
+        assert [_, storage_source] =
+                 String.split(source, "defp internal_storage_status", parts: 2)
 
         assert [storage_source, _rest] =
                  String.split(storage_source, "defp position_reached?", parts: 2)

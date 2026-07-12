@@ -278,7 +278,7 @@ jobs:
         run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 45
-        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
+        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --exclude waraft_backend_suite --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
@@ -314,12 +314,78 @@ jobs:
         run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 80
-        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
+        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --exclude waraft_backend_suite --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
           name: test-results-core-macos-${{ matrix.partition }}
+          path: test-results/
+          retention-days: 14
+
+  # WARaft's backend suite is intentionally one async:false test module. ExUnit
+  # partitions by file, so keeping it in the core matrix overloads one partition.
+  test-waraft-ubuntu:
+    name: "WARaft backend tests (ubuntu)"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-Linux
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
+      - name: Run WARaft backend tests
+        timeout-minutes: 55
+        run: mix test apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs --timeout 30000
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: test-results-waraft-ubuntu
+          path: test-results/
+          retention-days: 14
+
+  test-waraft-macos:
+    name: "WARaft backend tests (macos)"
+    needs: build-macos
+    runs-on: macos-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://cdn.jsdelivr.net/hex
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-macOS
+          path: .
+      - name: Ensure dependencies
+        run: mix deps.get
+      - name: Run WARaft backend tests
+        timeout-minutes: 65
+        run: mix test apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs --timeout 30000
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: test-results-waraft-macos
           path: test-results/
           retention-days: 14
 

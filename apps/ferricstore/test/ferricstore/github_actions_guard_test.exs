@@ -35,7 +35,39 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert missing_paths == []
   end
 
+  test "serial WARaft backend tests do not overload a core partition" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    waraft_suite =
+      File.read!(
+        Path.join(
+          @repo_root,
+          "apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs"
+        )
+      )
+
+    assert waraft_suite =~ "@moduletag :waraft_backend_suite"
+    assert count_occurrences(workflow, "--exclude waraft_backend_suite") == 2
+
+    assert count_occurrences(
+             workflow,
+             "mix test apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs"
+           ) == 2
+
+    assert workflow =~ "test-waraft-ubuntu:"
+    assert workflow =~ "test-waraft-macos:"
+    assert workflow =~ "test-results-waraft-ubuntu"
+    assert workflow =~ "test-results-waraft-macos"
+  end
+
   defp workflow_paths, do: Path.wildcard(@workflow_glob)
+
+  defp count_occurrences(source, pattern) do
+    source
+    |> String.split(pattern)
+    |> length()
+    |> Kernel.-(1)
+  end
 
   defp literal_test_paths(path) do
     path

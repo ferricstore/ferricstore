@@ -103,6 +103,7 @@ end
 defmodule Ferricstore.Raft.WARaftBackendTest do
   use ExUnit.Case, async: false
   @moduletag :raft
+  @moduletag :waraft_backend_suite
 
   import ExUnit.CaptureLog
 
