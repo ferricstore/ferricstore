@@ -108,15 +108,13 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
         parent = self()
         ref = make_ref()
 
-        pid =
-          spawn(fn ->
-            assert {:ok, _blob_ref} = BlobStore.put(root, 0, :binary.copy("x", 512))
-            send(parent, {ref, :writer_done})
+        {pid, monitor} =
+          spawn_monitor(fn ->
+            send(parent, {ref, BlobStore.put(root, 0, :binary.copy("x", 512))})
           end)
 
-        monitor = Process.monitor(pid)
-        assert_receive {^ref, :writer_done}
-        assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}
+        assert_receive {^ref, {:ok, _blob_ref}}, 5_000
+        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
 
         refute :ets.whereis(:ferricstore_blob_store_dirs) == :undefined
         refute :ets.whereis(:ferricstore_blob_store_segments) == :undefined
