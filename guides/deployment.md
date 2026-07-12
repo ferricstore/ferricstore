@@ -33,8 +33,12 @@ Environment variables:
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards (0 = CPU count) |
 | `FERRICSTORE_PROTECTED_MODE` | `true` | Reject non-localhost without auth |
 | `FERRICSTORE_NODE_NAME` | none | Erlang node name for clustering |
-| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
+| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie. Override with a strong shared secret for any cluster. |
 | `FERRICSTORE_CLUSTER_NODES` | none | Comma-separated peer node names |
+| `FERRICSTORE_DISCOVERY` | `gossip` | Discovery strategy when `FERRICSTORE_NODE_NAME` is set. Use `dns` for Kubernetes. |
+| `FERRICSTORE_GOSSIP_IF_ADDR` | `127.0.0.1` | Gossip bind interface. Set explicitly only for private LAN/container gossip. |
+| `FERRICSTORE_GOSSIP_MULTICAST_IF` | same as `FERRICSTORE_GOSSIP_IF_ADDR` | Gossip multicast interface |
+| `FERRICSTORE_GOSSIP_PORT` | `45892` | Gossip UDP port; firewall to FerricStore nodes only |
 
 ### BEAM VM Tuning
 
@@ -170,6 +174,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: FERRICSTORE_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: ferricstore-secrets
+                  key: erlang-cookie
+            - name: FERRICSTORE_DISCOVERY
+              value: "dns"
+            - name: FERRICSTORE_DNS_NAME
+              value: "ferricstore-headless"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -185,6 +198,19 @@ spec:
         - name: data
           emptyDir: {}
 ```
+
+For cluster deployments, create the `ferricstore-secrets` Secret with a strong
+shared cookie before starting pods:
+
+```bash
+kubectl create secret generic ferricstore-secrets \
+  --from-literal=erlang-cookie="$(openssl rand -base64 32)"
+```
+
+Use DNS discovery in Kubernetes. Gossip discovery is loopback-bound by default;
+only set `FERRICSTORE_GOSSIP_IF_ADDR`/`FERRICSTORE_GOSSIP_MULTICAST_IF` when
+you intentionally want multicast gossip on a private pod/node network and have
+firewalled `FERRICSTORE_GOSSIP_PORT`.
 
 ### Optimized for Production
 

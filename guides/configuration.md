@@ -710,28 +710,22 @@ config :libcluster, topologies: :disabled
 
 ## Example: Production Configuration
 
-```elixir
-# config/runtime.exs
-config :ferricstore, :native_port, String.to_integer(System.get_env("FERRICSTORE_NATIVE_PORT", "6388"))
-config :ferricstore, :data_dir, System.get_env("FERRICSTORE_DATA_DIR", "/var/lib/ferricstore")
-config :ferricstore, :max_memory_bytes, 8_589_934_592  # 8 GB
-config :ferricstore, :eviction_policy, :allkeys_lru
+```bash
+export FERRICSTORE_NATIVE_PORT=6388
+export FERRICSTORE_DATA_DIR=/var/lib/ferricstore
+export FERRICSTORE_REQUIRE_TLS=true
+export FERRICSTORE_NATIVE_TLS_PORT=6389
+export FERRICSTORE_NATIVE_TLS_CERT_FILE=/etc/ferricstore/tls/tls.crt
+export FERRICSTORE_NATIVE_TLS_KEY_FILE=/etc/ferricstore/tls/tls.key
 
-config :ferricstore, :native_tls_port, 6389
-config :ferricstore, :native_tls_cert_file, System.get_env("TLS_CERT_FILE")
-config :ferricstore, :native_tls_key_file, System.get_env("TLS_KEY_FILE")
-config :ferricstore, :require_tls, true
+# Clustered production nodes must use a strong shared cookie.
+export FERRICSTORE_NODE_NAME=ferricstore-0@ferricstore-0.ferricstore-headless
+export FERRICSTORE_COOKIE="$(cat /etc/ferricstore/erlang-cookie)"
 
-config :libcluster,
-  topologies: [
-    ferricstore: [
-      strategy: Cluster.Strategy.Kubernetes.DNS,
-      config: [
-        service: "ferricstore-headless",
-        application_name: "ferricstore"
-      ]
-    ]
-  ]
+# Prefer DNS discovery in Kubernetes. Gossip remains loopback-bound unless
+# FERRICSTORE_GOSSIP_IF_ADDR is set explicitly.
+export FERRICSTORE_DISCOVERY=dns
+export FERRICSTORE_DNS_NAME=ferricstore-headless
 ```
 
 ## Runtime Environment Variables
@@ -853,7 +847,7 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRICSTORE_NODE_NAME` | unset | Erlang node name. Setting this enables clustering |
-| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
+| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie. Override with a strong shared secret for clustered production. |
 | `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated peer node names |
 | `FERRICSTORE_DISCOVERY` | `gossip` | Discovery strategy when `FERRICSTORE_NODE_NAME` is set (`gossip`, `dns`, `epmd`, `consul`, `etcd`, `none`) |
 | `FERRICSTORE_GOSSIP_IF_ADDR` | `127.0.0.1` | Local interface used by gossip discovery. Set explicitly for LAN/container gossip. |

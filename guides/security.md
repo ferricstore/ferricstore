@@ -356,17 +356,17 @@ openssl rand -base64 32 > /etc/ferricstore/cookie
 chmod 400 /etc/ferricstore/cookie
 ```
 
-In your release config (`rel/env.sh.eex`):
+In the FerricStore process environment:
 
 ```bash
-export RELEASE_COOKIE=$(cat /etc/ferricstore/cookie)
+export FERRICSTORE_COOKIE="$(cat /etc/ferricstore/cookie)"
 ```
 
 Or in Kubernetes, store it as a Secret:
 
 ```yaml
 env:
-  - name: RELEASE_COOKIE
+  - name: FERRICSTORE_COOKIE
     valueFrom:
       secretKeyRef:
         name: ferricstore-secrets
@@ -376,7 +376,33 @@ env:
 > **All nodes in the cluster must share the same cookie.** They cannot
 > communicate without it.
 
-#### Step 2: Restrict distribution to a specific interface
+#### Step 2: Keep discovery scoped to the intended network
+
+FerricStore disables libcluster discovery in the base config. Runtime discovery
+is enabled only when `FERRICSTORE_NODE_NAME` is set. If you use the default
+`gossip` discovery strategy, FerricStore binds gossip to `127.0.0.1` unless
+you explicitly set a different interface.
+
+For production:
+
+- Prefer `FERRICSTORE_DISCOVERY=dns` in Kubernetes or environments with stable
+  service discovery.
+- If you intentionally use gossip across hosts or containers, set
+  `FERRICSTORE_GOSSIP_IF_ADDR` and `FERRICSTORE_GOSSIP_MULTICAST_IF` to the
+  private cluster interface, not a public interface.
+- Firewall the gossip UDP port, `FERRICSTORE_GOSSIP_PORT` (`45892` by
+  default), so only FerricStore nodes can send discovery packets.
+- Always use a strong `FERRICSTORE_COOKIE`; gossip packets use that value as
+  their discovery secret.
+
+```bash
+export FERRICSTORE_NODE_NAME=ferricstore@10.0.0.11
+export FERRICSTORE_COOKIE="$(cat /etc/ferricstore/cookie)"
+export FERRICSTORE_DISCOVERY=dns
+export FERRICSTORE_DNS_NAME=ferricstore-headless
+```
+
+#### Step 3: Restrict distribution to a specific interface
 
 By default, Erlang distribution listens on all interfaces (`0.0.0.0`). Bind it
 to a private interface:
@@ -394,7 +420,7 @@ export ELIXIR_ERL_OPTIONS="-kernel inet_dist_listen_min 9100 -kernel inet_dist_l
 
 Then firewall those ports to only allow traffic from other FerricStore nodes.
 
-#### Step 3: Enable TLS for distribution
+#### Step 4: Enable TLS for distribution
 
 For full encryption and mutual authentication, enable Erlang distribution over
 TLS. This encrypts all node-to-node traffic and requires each node to present
