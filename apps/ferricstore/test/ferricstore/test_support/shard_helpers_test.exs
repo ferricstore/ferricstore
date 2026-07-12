@@ -3,8 +3,50 @@ defmodule Ferricstore.Test.ShardHelpersTest do
   @moduletag :global_state
 
   alias Ferricstore.MemoryGuard
+  alias Ferricstore.Flow.Governance.LimitCache
   alias Ferricstore.Store.{DiskPressure, Router}
   alias Ferricstore.Test.ShardHelpers
+
+  test "flush_all_keys drains cached governance reservations before deleting owners" do
+    ctx = FerricStore.Instance.get(:default)
+    scope = "shard-helper-cache-flush-#{System.unique_integer([:positive])}"
+    old_enabled = Application.get_env(:ferricstore, :flow_governance_limit_cache_enabled)
+
+    on_exit(fn ->
+      if is_nil(old_enabled) do
+        Application.delete_env(:ferricstore, :flow_governance_limit_cache_enabled)
+      else
+        Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, old_enabled)
+      end
+    end)
+
+    assert {:ok, %{errors: 0}} = LimitCache.clear(ctx)
+    assert :ok = ShardHelpers.flush_all_keys()
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+
+    assert {:ok, _lease} =
+             FerricStore.flow_limit_lease(scope,
+               shard_id: 0,
+               amount: 4,
+               limit: 4,
+               ttl_ms: 30_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             LimitCache.spend(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 1_000,
+               now_ms: 1_001
+             )
+
+    assert [_entry] =
+             :ets.lookup(:ferricstore_flow_governance_limit_cache, {ctx.name, scope, 0})
+
+    assert :ok = ShardHelpers.flush_all_keys()
+    assert :ok = LimitCache.clear()
+  end
 
   test "flush_all_keys clears stale keydir memory pressure accounting" do
     ctx = FerricStore.Instance.get(:default)

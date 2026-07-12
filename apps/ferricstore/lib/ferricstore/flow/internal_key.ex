@@ -56,6 +56,7 @@ defmodule Ferricstore.Flow.InternalKey do
   defp split_flow_key(_key), do: :error
 
   defp valid_flow_tag?("f"), do: true
+  defp valid_flow_tag?("flow-governance"), do: true
 
   defp valid_flow_tag?(<<"fa:", bucket::binary>>) do
     case Integer.parse(bucket) do
@@ -64,7 +65,15 @@ defmodule Ferricstore.Flow.InternalKey do
     end
   end
 
-  defp valid_flow_tag?(<<"f:", digest::binary>>) when byte_size(digest) == 43 do
+  defp valid_flow_tag?(<<"f:", digest::binary>>) when byte_size(digest) == 43,
+    do: valid_digest?(digest)
+
+  defp valid_flow_tag?(<<"fgc:", digest::binary>>) when byte_size(digest) == 43,
+    do: valid_digest?(digest)
+
+  defp valid_flow_tag?(_tag), do: false
+
+  defp valid_digest?(digest) do
     case Base.url_decode64(digest, padding: false) do
       {:ok, decoded} when byte_size(decoded) == 32 ->
         Base.url_encode64(decoded, padding: false) == digest
@@ -73,8 +82,6 @@ defmodule Ferricstore.Flow.InternalKey do
         false
     end
   end
-
-  defp valid_flow_tag?(_tag), do: false
 
   defp valid_suffix?(""), do: true
   defp valid_suffix?(<<":", _rest::binary>>), do: true

@@ -3,6 +3,9 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
 
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Governance.CreditLease
+  alias Ferricstore.Flow.Governance.LimitReconciler
+  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Store.Router
 
   @partition "tenant-governance-limit-correctness"
 
@@ -827,6 +830,99 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert {:ok, owner} = FerricStore.flow_limit_get(scope, now_ms: 1_004)
     assert owner.leases[0].in_use == 1
     assert owner.leases[0].available == 3
+  end
+
+  test "flushdb drains cached reservations before deleting governance owners" do
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+
+    ctx = FerricStore.Instance.get(:default)
+    reconciler = Process.whereis(LimitReconciler)
+    :ok = :sys.suspend(reconciler)
+
+    on_exit(fn ->
+      if Process.alive?(reconciler), do: :sys.resume(reconciler)
+    end)
+
+    outbox_route = Router.shard_for(ctx, Keys.governance_limit_catalog_outbox_meta_key(0))
+    scope_prefix = unique_flow_id("cache-flushdb-limit")
+
+    {scope, owner_shard} =
+      Enum.find_value(0..(ctx.shard_count * 4), fn suffix ->
+        candidate = scope_prefix <> ":" <> Integer.to_string(suffix)
+        shard_index = Router.shard_for(ctx, Keys.governance_limit_key(candidate))
+        if shard_index != outbox_route, do: {candidate, shard_index}
+      end)
+
+    lease_limit!(scope, 4)
+
+    outbox_key = Keys.governance_limit_catalog_outbox_meta_key(owner_shard)
+    refute Router.shard_for(ctx, outbox_key) == owner_shard
+    assert :ets.member(elem(ctx.keydir_refs, owner_shard), outbox_key)
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 1_000,
+               now_ms: 1_001
+             )
+
+    assert [_entry] =
+             :ets.lookup(:ferricstore_flow_governance_limit_cache, {ctx.name, scope, 0})
+
+    assert :ok = FerricStore.flushdb()
+    assert :ok = Ferricstore.Flow.Governance.LimitCache.clear()
+  end
+
+  test "destructive cache drain keeps concurrent spends uncached until deletion finishes" do
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+
+    cached_scope = unique_flow_id("cache-drain-cached")
+    concurrent_scope = unique_flow_id("cache-drain-concurrent")
+    lease_limit!(cached_scope, 4)
+    lease_limit!(concurrent_scope, 4)
+    ctx = FerricStore.Instance.get(:default)
+    parent = self()
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, cached_scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 1_000,
+               now_ms: 1_001
+             )
+
+    drain =
+      Task.async(fn ->
+        Ferricstore.Flow.Governance.LimitCache.with_drained_cache(
+          ctx,
+          fn ->
+            send(parent, {:cache_drain_started, self()})
+            receive do: (:finish_cache_drain -> :ok)
+          end,
+          now_ms: 1_002
+        )
+      end)
+
+    assert_receive {:cache_drain_started, drain_pid}, 2_000
+
+    assert {:ok, %{reservation_ids: [_reservation_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, concurrent_scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 1_000,
+               now_ms: 1_002
+             )
+
+    assert [] =
+             :ets.lookup(
+               :ferricstore_flow_governance_limit_cache,
+               {ctx.name, concurrent_scope, 0}
+             )
+
+    send(drain_pid, :finish_cache_drain)
+    assert :ok = Task.await(drain, 2_000)
+    assert :ok = Ferricstore.Flow.Governance.LimitCache.clear()
   end
 
   test "cache refills after a durable clear resets its session" do

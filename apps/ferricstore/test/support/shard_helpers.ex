@@ -9,6 +9,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   specific or different shards, without hardcoding key-to-shard mappings.
   """
 
+  alias Ferricstore.Flow.Governance.LimitCache
   alias Ferricstore.Store.Router
 
   @test_max_memory_bytes 1_073_741_824
@@ -85,6 +86,21 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
   @spec flush_all_keys() :: :ok
   def flush_all_keys do
+    ctx = FerricStore.Instance.get(:default)
+
+    case LimitCache.with_drained_cache(ctx, fn -> do_flush_all_keys(ctx) end) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise "Governance limit cache drain failed during cleanup: #{inspect(reason)}"
+
+      other ->
+        raise "Governance limit cache drain returned an invalid result: #{inspect(other)}"
+    end
+  end
+
+  defp do_flush_all_keys(ctx) do
     alias Ferricstore.Store.Router
 
     reset_server_auth_state()
@@ -99,8 +115,7 @@ defmodule Ferricstore.Test.ShardHelpers do
       Map.new(0..(shard_count - 1), fn shard_index ->
         key = Ferricstore.Flow.Keys.shared_value_ref_backfill_key(shard_index)
 
-        {shard_index,
-         :ets.lookup(elem(FerricStore.Instance.get(:default).keydir_refs, shard_index), key)}
+        {shard_index, :ets.lookup(elem(ctx.keydir_refs, shard_index), key)}
       end)
 
     # Flush background BitcaskWriter so deferred writes are on disk
@@ -118,7 +133,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     wait_default_waraft_ready(ready_timeout)
 
     Enum.each(0..(shard_count - 1), fn i ->
-      shard = Router.shard_name(FerricStore.Instance.get(:default), i)
+      shard = Router.shard_name(ctx, i)
 
       keys =
         try do
@@ -145,8 +160,6 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     # Prove the WARaft write/apply path is usable before handing control back.
     wait_default_waraft_ready(ready_timeout)
-
-    ctx = FerricStore.Instance.get(:default)
 
     # Flow secondary indexes are native-only and rebuilt from durable Flow
     # records. The key delete path above removes the durable records; reset the

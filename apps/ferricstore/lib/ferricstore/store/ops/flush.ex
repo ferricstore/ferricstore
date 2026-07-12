@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Ops.Flush do
   @moduledoc false
 
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+  alias Ferricstore.Flow.Governance.LimitCache
   alias Ferricstore.Flow.{InternalKey, Keys, SharedRefBackfill}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops.Compound, as: CompoundOps
@@ -11,6 +12,10 @@ defmodule Ferricstore.Store.Ops.Flush do
   @internal_delete_batch_size 512
 
   def flush(ctx) do
+    LimitCache.with_drained_cache(ctx, fn -> do_flush(ctx) end)
+  end
+
+  defp do_flush(ctx) do
     with :ok <- SharedRefBackfill.invalidate_verified!(ctx.name, ctx.shard_count),
          :ok <- flush_keys(ctx, Router.keys(ctx)),
          :ok <- flush_internal_keys(ctx),

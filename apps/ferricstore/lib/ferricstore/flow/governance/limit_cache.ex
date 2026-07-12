@@ -525,6 +525,48 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   def clear(_ctx, _opts), do: {:error, "ERR flow limit cache opts must be a keyword list"}
 
   @doc false
+  def with_drained_cache(ctx, fun, opts \\ [])
+
+  def with_drained_cache(ctx, fun, opts) when is_function(fun, 0) and is_list(opts) do
+    now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
+    before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
+    release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
+
+    if is_integer(now_ms) and now_ms >= 0 and is_function(before_detach_fun, 1) and
+         is_function(release_fun, 3) do
+      case :ets.whereis(@table) do
+        :undefined ->
+          fun.()
+
+        table ->
+          with_cache_flush(
+            table,
+            ctx,
+            now_ms,
+            before_detach_fun,
+            release_fun,
+            fn counts ->
+              if counts.errors == 0 do
+                try do
+                  fun.()
+                after
+                  GenServer.call(__MODULE__, {:reset_session, instance_name(ctx)})
+                end
+              else
+                {:error, {:cached_reservation_release_failed, counts}}
+              end
+            end
+          )
+      end
+    else
+      {:error, "ERR invalid flow limit cache drain opts"}
+    end
+  end
+
+  def with_drained_cache(_ctx, _fun, _opts),
+    do: {:error, "ERR invalid flow limit cache drain opts"}
+
+  @doc false
   def flush(ctx, opts \\ []) when is_list(opts) do
     now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
     before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
@@ -1040,6 +1082,19 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   end
 
   defp flush_table(table, ctx, now_ms, before_detach_fun, release_fun) do
+    with_cache_flush(table, ctx, now_ms, before_detach_fun, release_fun, fn counts ->
+      {:ok, counts}
+    end)
+  end
+
+  defp with_cache_flush(
+         table,
+         ctx,
+         now_ms,
+         before_detach_fun,
+         release_fun,
+         after_drain_fun
+       ) do
     instance_name = instance_name(ctx)
     token = make_ref()
 
@@ -1059,7 +1114,9 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
               30_000
             )
 
-          {:ok, merge_flush_counts(detached_counts, pending_counts)}
+          detached_counts
+          |> merge_flush_counts(pending_counts)
+          |> after_drain_fun.()
         after
           GenServer.call(__MODULE__, {:finish_flush, instance_name, token})
         end
