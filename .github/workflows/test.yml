@@ -12,7 +12,6 @@ env:
   RUSTFLAGS: "-D warnings"
   CARGO_HTTP_MULTIPLEXING: "false"
   FERRICSTORE_BUILD_NIF: "1"
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   # ===========================================================================
@@ -22,7 +21,7 @@ jobs:
     name: "Build (ubuntu)"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -35,14 +34,14 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache Mix deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: deps
           key: mix-deps-Linux-1.19-28-${{ hashFiles('mix.lock') }}
           restore-keys: mix-deps-Linux-1.19-28-
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -108,7 +107,7 @@ jobs:
         run: mix credo --min-priority high --mute-exit-status
 
       - name: Upload native artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-Linux
           path: |
@@ -123,7 +122,7 @@ jobs:
     name: "Build (macos)"
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -136,14 +135,14 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache Mix deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: deps
           key: mix-deps-macOS-1.19-28-${{ hashFiles('mix.lock') }}
           restore-keys: mix-deps-macOS-1.19-28-
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -199,7 +198,7 @@ jobs:
         run: mix credo --min-priority high --mute-exit-status
 
       - name: Upload native artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-macOS
           path: |
@@ -216,7 +215,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -225,7 +224,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-Linux
           path: .
@@ -243,7 +242,7 @@ jobs:
       - name: Upload architecture test results
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-architecture
           path: test-results/
@@ -262,7 +261,7 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -271,7 +270,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-Linux
           path: .
@@ -280,7 +279,7 @@ jobs:
       - name: Run ferricstore tests
         timeout-minutes: 45
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -298,7 +297,7 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -307,7 +306,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-macOS
           path: .
@@ -316,7 +315,7 @@ jobs:
       - name: Run ferricstore tests
         timeout-minutes: 80
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --timeout 30000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -337,7 +336,7 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -346,7 +345,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-Linux
           path: .
@@ -355,7 +354,7 @@ jobs:
       - name: Run ferricstore_server tests
         timeout-minutes: 45
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -373,7 +372,7 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -382,7 +381,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-macOS
           path: .
@@ -391,7 +390,7 @@ jobs:
       - name: Run ferricstore_server tests
         timeout-minutes: 45
         run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore_server/test --partitions 3 --timeout 30000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -408,7 +407,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -417,7 +416,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-Linux
           path: .
@@ -426,7 +425,7 @@ jobs:
       - name: Run ferricstore_sdk tests
         timeout-minutes: 15
         run: mix test apps/ferricstore_sdk/test --timeout 30000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -440,7 +439,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -449,7 +448,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-macOS
           path: .
@@ -458,7 +457,7 @@ jobs:
       - name: Run ferricstore_sdk tests
         timeout-minutes: 15
         run: mix test apps/ferricstore_sdk/test --timeout 30000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -474,7 +473,7 @@ jobs:
     needs: build-ubuntu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -483,7 +482,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-Linux
           path: .
@@ -531,7 +530,7 @@ jobs:
       # - Rust-level backend tests via cargo test.
       # - Elixir :linux_io_uring integration tests when the runner supports io_uring.
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -547,7 +546,7 @@ jobs:
     needs: build-ubuntu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -556,7 +555,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-Linux
           path: .
@@ -567,7 +566,7 @@ jobs:
       - name: Run bounded performance guards
         run: mix test apps/ferricstore/test --only perf_guard --timeout 120000
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
@@ -583,7 +582,7 @@ jobs:
     needs: build-ubuntu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
@@ -592,7 +591,7 @@ jobs:
             https://builds.hex.pm
             https://cdn.jsdelivr.net/hex
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-Linux
           path: .
@@ -655,7 +654,7 @@ jobs:
             echo "PASS: $FAILURES failures within threshold of 5"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:

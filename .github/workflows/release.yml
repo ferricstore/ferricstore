@@ -34,7 +34,7 @@ jobs:
             job: { target: x86_64-unknown-linux-musl,   os: ubuntu-22.04, use-cross: true }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract project version
         shell: bash
@@ -71,12 +71,12 @@ jobs:
           project-dir: ${{ env.NIF_DIRECTORY }}
 
       - name: Artifact attestation
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest@v4
         with:
           subject-path: ${{ steps.build.outputs.file-path }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.build.outputs.file-name }}
           path: ${{ steps.build.outputs.file-path }}
@@ -106,7 +106,7 @@ jobs:
         os: [macos-15]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract project version
         shell: bash
@@ -178,12 +178,12 @@ jobs:
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
 
       - name: Artifact attestation
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest@v4
         with:
           subject-path: ${{ env.ARCHIVE_FILE }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |

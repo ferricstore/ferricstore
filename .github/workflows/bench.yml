@@ -14,7 +14,6 @@ on:
 
 env:
   MIX_ENV: bench
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   bench:
@@ -22,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
@@ -37,7 +36,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Mix deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: deps
           key: mix-bench-deps-${{ runner.os }}-1.19-28-${{ hashFiles('mix.lock') }}
@@ -132,7 +131,7 @@ jobs:
           append_section "Commands Results" bench/output/commands_results.txt
 
       - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.sha }}
           path: bench/output/
