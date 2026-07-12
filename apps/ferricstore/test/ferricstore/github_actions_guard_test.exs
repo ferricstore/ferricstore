@@ -111,6 +111,7 @@ defmodule Ferricstore.GitHubActionsGuardTest do
            ) == 2
 
     assert workflow =~ "mix hex.audit"
+    assert workflow =~ "mix deps.compile --include-children mix_audit"
     assert workflow =~ "mix deps.audit"
     assert workflow =~ "cargo install cargo-audit --version 0.22.2 --locked"
 

@@ -64,7 +64,7 @@ jobs:
       - name: Audit Hex dependencies
         run: |
           mix hex.audit
-          mix deps.compile mix_audit
+          mix deps.compile --include-children mix_audit
           mix deps.audit
 
       - name: Install cargo-audit
