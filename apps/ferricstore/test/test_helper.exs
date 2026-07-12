@@ -32,9 +32,7 @@ ExUnit.start(
   formatters: [ExUnit.CLIFormatter, JUnitFormatter, Ferricstore.Test.AuditFormatter]
 )
 
-# NOTE: data directory cleanup is handled by the ferricstore_server app's
-# test_helper.exs which runs last in the umbrella. We must NOT delete the
-# data directory here because in umbrella `mix test`, after_suite callbacks
-# fire between apps while the application supervisor (and its shards) are
-# still running. Deleting the data directory here causes "No such file or
-# directory" errors for all shard writes in the ferricstore_server test suite.
+# ExUnit after_suite callbacks can run between umbrella apps while shards are
+# still active. VM-exit cleanup stops both applications before removing only
+# generated test roots, after every app suite has finished.
+:ok = Ferricstore.Test.DataDirLifecycle.register_generated_cleanup()

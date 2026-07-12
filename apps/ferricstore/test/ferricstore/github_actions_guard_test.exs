@@ -47,7 +47,12 @@ defmodule Ferricstore.GitHubActionsGuardTest do
       )
 
     assert waraft_suite =~ "@moduletag :waraft_backend_suite"
-    assert count_occurrences(workflow, "--exclude waraft_backend_suite") == 2
+    refute workflow =~ "--exclude waraft_backend_suite"
+
+    assert count_occurrences(
+             workflow,
+             "apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs"
+           ) == 4
 
     assert count_occurrences(
              workflow,
@@ -58,6 +63,66 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert workflow =~ "test-waraft-macos:"
     assert workflow =~ "test-results-waraft-ubuntu"
     assert workflow =~ "test-results-waraft-macos"
+  end
+
+  test "destructive suites fail on every non-zero test command" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    refute workflow =~ "max 5 failures allowed"
+    refute workflow =~ "set +e"
+    refute workflow =~ "count_failures"
+    refute workflow =~ "FAILURES="
+    assert count_occurrences(workflow, "set -o pipefail") == 6
+
+    assert workflow =~ "Run ferricstore shard-kill tests"
+    assert workflow =~ "Run SDK shard-kill tests"
+    assert workflow =~ "Run Jepsen tests"
+    assert workflow =~ "Run large-allocation tests"
+    assert workflow =~ "Run ferricstore cluster tests"
+    assert workflow =~ "Run ferricstore_server cluster tests"
+  end
+
+  test "core suites use deterministic duration-aware file partitions" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    assert count_occurrences(workflow, ".github/scripts/core_test_partition.exs") == 2
+    assert workflow =~ ".github/test-timings/ferricstore.tsv"
+    refute workflow =~ "mix test apps/ferricstore/test --partitions 3"
+
+    assert File.exists?(Path.join(@repo_root, ".github/scripts/core_test_partition.ex"))
+    assert File.exists?(Path.join(@repo_root, ".github/scripts/core_test_partition.exs"))
+    assert File.exists?(Path.join(@repo_root, ".github/test-timings/ferricstore.tsv"))
+  end
+
+  test "lint and dependency security checks are gating" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+    root_mix = File.read!(Path.join(@repo_root, "mix.exs"))
+
+    refute workflow =~ "--mute-exit-status"
+
+    assert count_occurrences(
+             workflow,
+             "mix credo suggest --only warning --min-priority high --files-excluded 'apps/*/test/**/*'"
+           ) == 2
+
+    assert count_occurrences(
+             workflow,
+             "mix credo suggest --only warning --min-priority high --ignore-checks UnusedListOperation,ExpensiveEmptyEnumCheck"
+           ) == 2
+
+    assert workflow =~ "mix hex.audit"
+    assert workflow =~ "mix deps.audit"
+    assert workflow =~ "cargo install cargo-audit --version 0.22.2 --locked"
+
+    for lockfile <- [
+          "apps/ferricstore/native/ferricstore_bitcask/Cargo.lock",
+          "apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock",
+          "apps/ferricstore_server/native/native_protocol_nif/Cargo.lock"
+        ] do
+      assert workflow =~ "cargo audit --file #{lockfile}"
+    end
+
+    assert root_mix =~ ~s({:mix_audit, "~> 2.1")
   end
 
   defp workflow_paths, do: Path.wildcard(@workflow_glob)

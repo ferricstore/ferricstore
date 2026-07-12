@@ -1472,7 +1472,7 @@ defmodule Ferricstore.Flow.Schedule do
   defp cron_datetime(ms, timezone) do
     datetime = DateTime.from_unix!(ms, :millisecond)
 
-    case DateTime.shift_zone(datetime, timezone, Tzdata.TimeZoneDatabase) do
+    case DateTime.shift_zone(datetime, timezone, Tz.TimeZoneDatabase) do
       {:ok, shifted} -> {:ok, shifted}
       {:error, _reason} -> {:error, "ERR flow schedule timezone is invalid or unavailable"}
     end

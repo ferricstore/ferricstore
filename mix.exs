@@ -26,6 +26,7 @@ defmodule Ferricstore.Umbrella.MixProject do
   defp deps do
     [
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:junit_formatter, "~> 3.4", only: :test},
       {:benchee, "~> 1.3", only: :bench, runtime: false},
       {:benchee_html, "~> 1.0", only: :bench, runtime: false}

@@ -52,8 +52,32 @@ jobs:
           key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore_server/native/native_protocol_nif/Cargo.lock') }}
           restore-keys: cargo-Linux-
 
+      - name: Cache cargo-audit
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-Linux-0.22.2
+
       - name: Install dependencies
         run: mix deps.get
+
+      - name: Audit Hex dependencies
+        run: |
+          mix hex.audit
+          mix deps.compile mix_audit
+          mix deps.audit
+
+      - name: Install cargo-audit
+        run: |
+          if ! cargo audit --version 2>/dev/null | grep -q 'cargo-audit 0.22.2'; then
+            cargo install cargo-audit --version 0.22.2 --locked
+          fi
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo audit --file apps/ferricstore/native/ferricstore_bitcask/Cargo.lock
+          cargo audit --file apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock
+          cargo audit --file apps/ferricstore_server/native/native_protocol_nif/Cargo.lock
 
       - name: Check Rust formatting
         run: |
@@ -104,7 +128,9 @@ jobs:
           mix test apps/ferricstore/test/ferricstore/store/io_uring_integration_test.exs --only linux_io_uring --timeout 120000
 
       - name: Credo
-        run: mix credo --min-priority high --mute-exit-status
+        run: |
+          mix credo suggest --only warning --min-priority high --files-excluded 'apps/*/test/**/*'
+          mix credo suggest --only warning --min-priority high --ignore-checks UnusedListOperation,ExpensiveEmptyEnumCheck
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v7
@@ -195,7 +221,9 @@ jobs:
         run: mix compile --warnings-as-errors
 
       - name: Credo
-        run: mix credo --min-priority high --mute-exit-status
+        run: |
+          mix credo suggest --only warning --min-priority high --files-excluded 'apps/*/test/**/*'
+          mix credo suggest --only warning --min-priority high --ignore-checks UnusedListOperation,ExpensiveEmptyEnumCheck
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v7
@@ -278,7 +306,28 @@ jobs:
         run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 45
-        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --exclude waraft_backend_suite --timeout 30000
+        run: |
+          selection_file=$(mktemp)
+          trap 'rm -f "$selection_file"' EXIT
+          elixir .github/scripts/core_test_partition.exs \
+            apps/ferricstore/test \
+            .github/test-timings/ferricstore.tsv \
+            3 \
+            ${{ matrix.partition }} \
+            apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs \
+            > "$selection_file"
+
+          files=()
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then files+=("$file"); fi
+          done < "$selection_file"
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No test files assigned to core partition ${{ matrix.partition }}"
+            exit 1
+          fi
+
+          mix test "${files[@]}" --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
@@ -314,7 +363,28 @@ jobs:
         run: mix deps.get
       - name: Run ferricstore tests
         timeout-minutes: 80
-        run: MIX_TEST_PARTITION=${{ matrix.partition }} mix test apps/ferricstore/test --partitions 3 --exclude waraft_backend_suite --timeout 30000
+        run: |
+          selection_file=$(mktemp)
+          trap 'rm -f "$selection_file"' EXIT
+          elixir .github/scripts/core_test_partition.exs \
+            apps/ferricstore/test \
+            .github/test-timings/ferricstore.tsv \
+            3 \
+            ${{ matrix.partition }} \
+            apps/ferricstore/test/ferricstore/raft/waraft_backend_test.exs \
+            > "$selection_file"
+
+          files=()
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then files+=("$file"); fi
+          done < "$selection_file"
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No test files assigned to core partition ${{ matrix.partition }}"
+            exit 1
+          fi
+
+          mix test "${files[@]}" --timeout 30000
       - uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
@@ -556,41 +626,29 @@ jobs:
       - name: Ensure dependencies
         run: mix deps.get
 
-      - name: "Shard-kill + Jepsen + large alloc tests (max 5 failures allowed)"
+      - name: Run ferricstore shard-kill tests
         run: |
-          epmd -daemon
-          set +e
-
-          # Run destructive durability suites explicitly. Server lifecycle tests
-          # stay in the dedicated server jobs to avoid supervised-state leakage
-          # into later umbrella test suites.
+          set -o pipefail
           mix test apps/ferricstore/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
+
+      - name: Run SDK shard-kill tests
+        if: success() || failure()
+        run: |
+          set -o pipefail
           mix test apps/ferricstore_sdk/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_sdk_shard_kill.log
+
+      - name: Run Jepsen tests
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          epmd -daemon
           elixir --sname ci_jepsen --cookie ferricstore_test -S mix test apps/ferricstore/test --only jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
+
+      - name: Run large-allocation tests
+        if: success() || failure()
+        run: |
+          set -o pipefail
           mix test apps/ferricstore/test --only large_alloc --timeout 120000 2>&1 | tee /tmp/durability_large_alloc.log
-
-          count_failures() {
-            line=$(grep -E '^[[:space:]]*[0-9]+ tests?, [0-9]+ failures?' "$1" | tail -n 1 || true)
-            if [ -z "$line" ]; then
-              echo 0
-            else
-              echo "$line" | sed -E 's/.*[0-9]+ tests?, ([0-9]+) failures?.*/\1/'
-            fi
-          }
-
-          FAILURES=0
-          for log in /tmp/durability_*.log; do
-            count=$(count_failures "$log")
-            FAILURES=$((FAILURES + count))
-          done
-          echo "Total durability failures: $FAILURES"
-
-          if [ "$FAILURES" -gt 5 ]; then
-            echo "FAIL: $FAILURES failures exceeds threshold of 5"
-            exit 1
-          else
-            echo "PASS: $FAILURES failures within threshold of 5"
-          fi
 
       # io_uring tests run in build-ubuntu:
       # - Rust-level backend tests via cargo test.
@@ -601,7 +659,9 @@ jobs:
         continue-on-error: true
         with:
           name: test-results-durability
-          path: test-results/
+          path: |
+            test-results/
+            /tmp/durability_*.log
           retention-days: 14
 
   # ===========================================================================
@@ -665,60 +725,24 @@ jobs:
       - name: Ensure dependencies
         run: mix deps.get
 
-      - name: "Cluster tests (max 5 failures allowed)"
+      - name: Run ferricstore cluster tests
         run: |
+          set -o pipefail
           epmd -daemon
-          set +e
+          data_dir=$(mktemp -d "/tmp/ferricstore-cluster-XXXXXX")
+          echo "Running ferricstore cluster tests with data_dir=${data_dir}"
+          FERRICSTORE_DATA_DIR="$data_dir" \
+            elixir --sname ci_cluster_ferricstore --cookie ferricstore_test -S mix test apps/ferricstore/test --only cluster --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster_ferricstore.log
 
-          run_cluster_suite() {
-            name="$1"
-            node="$2"
-            path="$3"
-            log="$4"
-            data_dir=$(mktemp -d "/tmp/ferricstore-${name}-XXXXXX")
-
-            echo "Running ${name} cluster tests with data_dir=${data_dir}"
-            FERRICSTORE_DATA_DIR="$data_dir" \
-              elixir --sname "$node" --cookie ferricstore_test -S mix test "$path" --only cluster --timeout 180000 --seed 0 2>&1 | tee "$log"
-            echo "${PIPESTATUS[0]}" > "${log}.status"
-          }
-
-          run_cluster_suite ferricstore ci_cluster_ferricstore apps/ferricstore/test /tmp/cluster_ferricstore.log
-          run_cluster_suite ferricstore_server ci_cluster_server apps/ferricstore_server/test /tmp/cluster_ferricstore_server.log
-
-          count_failures() {
-            line=$(grep -E '^[[:space:]]*[0-9]+ tests?, [0-9]+ failures?' "$1" | tail -n 1 || true)
-            if [ -z "$line" ]; then
-              echo 0
-            else
-              echo "$line" | sed -E 's/.*[0-9]+ tests?, ([0-9]+) failures?.*/\1/'
-            fi
-          }
-
-          effective_failures() {
-            failures=$(count_failures "$1")
-            status=$(cat "${1}.status")
-
-            if [ "$status" -ne 0 ] && [ "$failures" -eq 0 ]; then
-              echo 999
-            else
-              echo "$failures"
-            fi
-          }
-
-          APP_FAILURES=$(effective_failures /tmp/cluster_ferricstore.log)
-          SERVER_FAILURES=$(effective_failures /tmp/cluster_ferricstore_server.log)
-          FAILURES=$((APP_FAILURES + SERVER_FAILURES))
-          echo "FerricStore cluster failures: $APP_FAILURES"
-          echo "FerricStore server cluster failures: $SERVER_FAILURES"
-          echo "Total cluster failures: $FAILURES"
-
-          if [ "$FAILURES" -gt 5 ]; then
-            echo "FAIL: $FAILURES failures exceeds threshold of 5"
-            exit 1
-          else
-            echo "PASS: $FAILURES failures within threshold of 5"
-          fi
+      - name: Run ferricstore_server cluster tests
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          epmd -daemon
+          data_dir=$(mktemp -d "/tmp/ferricstore-server-cluster-XXXXXX")
+          echo "Running ferricstore_server cluster tests with data_dir=${data_dir}"
+          FERRICSTORE_DATA_DIR="$data_dir" \
+            elixir --sname ci_cluster_server --cookie ferricstore_test -S mix test apps/ferricstore_server/test --only cluster --timeout 180000 --seed 0 2>&1 | tee /tmp/cluster_ferricstore_server.log
 
       - uses: actions/upload-artifact@v7
         if: always()
