@@ -69,9 +69,32 @@ defmodule Ferricstore.Flow.LMDBTest do
   end
 
   defp release_all_lmdb_envs! do
-    case Ferricstore.Flow.LMDB.release_all() do
+    case Ferricstore.Flow.LMDB.release_all(30_000) do
       :ok -> :ok
       {:ok, _released} -> :ok
+    end
+  end
+
+  defp await_lmdb_busy_release(path, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_lmdb_busy_release(path, deadline)
+  end
+
+  defp do_await_lmdb_busy_release(path, deadline) do
+    case Ferricstore.Bitcask.NIF.lmdb_release(path) do
+      {:busy, _count} = busy ->
+        busy
+
+      {:ok, _released} ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(1)
+          do_await_lmdb_busy_release(path, deadline)
+        else
+          flunk("LMDB prefix scan completed before exposing an in-flight environment lease")
+        end
+
+      {:error, reason} ->
+        flunk("LMDB environment release probe failed: #{inspect(reason)}")
     end
   end
 

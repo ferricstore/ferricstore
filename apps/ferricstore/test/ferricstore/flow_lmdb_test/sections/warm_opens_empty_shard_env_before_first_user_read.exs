@@ -28,7 +28,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
           )
 
         on_exit(fn ->
-          Ferricstore.Flow.LMDB.release_all()
+          Ferricstore.Flow.LMDB.release_all(30_000)
           File.rm_rf!(path)
         end)
 
@@ -41,6 +41,37 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
         assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(path, "key")
       end
 
+      test "bounded path release waits for an in-flight LMDB operation" do
+        path =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_busy_release_#{System.unique_integer([:positive])}"
+          )
+
+        on_exit(fn -> File.rm_rf!(path) end)
+
+        entry_count = 200_000
+
+        ops =
+          for index <- 1..entry_count do
+            {:put, <<0, index::unsigned-big-64>>, <<index::unsigned-big-64>>}
+          end
+
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(path, ops)
+        parent = self()
+
+        task =
+          Task.async(fn ->
+            send(parent, :lmdb_prefix_count_started)
+            Ferricstore.Flow.LMDB.prefix_count(path, <<0>>)
+          end)
+
+        assert_receive :lmdb_prefix_count_started
+        assert {:busy, 1} = await_lmdb_busy_release(path, 1_000)
+        assert :ok = Ferricstore.Flow.LMDB.release(path, 5_000)
+        assert {:ok, ^entry_count} = Task.await(task, 5_000)
+      end
+
       test "clear reopens a cached env after its directory was replaced" do
         path =
           Path.join(
@@ -49,7 +80,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
           )
 
         on_exit(fn ->
-          Ferricstore.Flow.LMDB.release_all()
+          Ferricstore.Flow.LMDB.release_all(30_000)
           File.rm_rf!(path)
         end)
 

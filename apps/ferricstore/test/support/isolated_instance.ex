@@ -22,6 +22,8 @@ defmodule Ferricstore.Test.IsolatedInstance do
       end
   """
 
+  @lmdb_release_timeout_ms 30_000
+
   @doc """
   Creates a new isolated instance. Returns the ctx struct.
   """
@@ -163,6 +165,15 @@ defmodule Ferricstore.Test.IsolatedInstance do
             :exit, _ -> :ok
           end
       end
+    end
+
+    for i <- 0..(ctx.shard_count - 1) do
+      lmdb_path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(i)
+        |> Ferricstore.Flow.LMDB.path()
+
+      :ok = Ferricstore.Flow.LMDB.release(lmdb_path, @lmdb_release_timeout_ms)
     end
 
     # Delete ETS tables

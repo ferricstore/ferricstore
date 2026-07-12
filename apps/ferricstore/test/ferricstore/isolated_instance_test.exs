@@ -7,6 +7,22 @@ defmodule Ferricstore.IsolatedInstanceTest do
 
   alias Ferricstore.Test.IsolatedInstance
 
+  test "checkin releases each cached LMDB environment" do
+    assert {:ok, _released} = Ferricstore.Flow.LMDB.release_all()
+
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, "key", "value"}])
+    assert {:ok, "value"} = Ferricstore.Flow.LMDB.get(lmdb_path, "key")
+    assert :ok = IsolatedInstance.checkin(ctx)
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.release_all()
+  end
+
   describe "instance isolation" do
     test "two instances don't see each other's keys" do
       ctx_a = IsolatedInstance.checkout()

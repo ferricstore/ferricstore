@@ -834,7 +834,7 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
   end
 
   defp release_lmdb! do
-    case LMDB.release_all() do
+    case LMDB.release_all(30_000) do
       :ok -> :ok
       {:ok, _released} -> :ok
     end

@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.LMDB do
   alias Ferricstore.Bitcask.NIF
 
   @default_map_size 16 * 1024 * 1024 * 1024
+  @release_retry_interval_ms 5
 
   def enabled?, do: true
   def projection_enabled?, do: true
@@ -216,8 +217,41 @@ defmodule Ferricstore.Flow.LMDB do
     end
   end
 
+  @spec release(binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def release(path, timeout_ms)
+      when is_binary(path) and is_integer(timeout_ms) and timeout_ms >= 0 do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+
+    case release_until(fn -> NIF.lmdb_release(path) end, deadline_ms) do
+      {:ok, _released} -> :ok
+      {:busy, count} -> {:error, {:lmdb_env_busy, count}}
+      {:error, _reason} = error -> error
+    end
+  end
+
   def release_all do
     NIF.lmdb_release_all()
+  end
+
+  def release_all(timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
+    release_until(&NIF.lmdb_release_all/0, System.monotonic_time(:millisecond) + timeout_ms)
+  end
+
+  defp release_until(release_fun, deadline_ms) do
+    case release_fun.() do
+      {:busy, _count} = busy ->
+        now_ms = System.monotonic_time(:millisecond)
+
+        if now_ms < deadline_ms do
+          Process.sleep(min(@release_retry_interval_ms, deadline_ms - now_ms))
+          release_until(release_fun, deadline_ms)
+        else
+          busy
+        end
+
+      result ->
+        result
+    end
   end
 
   def flush_in_progress_key, do: "flow-lmdb-flush-in-progress"
