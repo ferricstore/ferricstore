@@ -75,11 +75,33 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert count_occurrences(workflow, "set -o pipefail") == 6
 
     assert workflow =~ "Run ferricstore shard-kill tests"
-    assert workflow =~ "Run SDK shard-kill tests"
+    assert workflow =~ "Run ferricstore_server shard-kill tests"
     assert workflow =~ "Run Jepsen tests"
     assert workflow =~ "Run large-allocation tests"
     assert workflow =~ "Run ferricstore cluster tests"
     assert workflow =~ "Run ferricstore_server cluster tests"
+
+    assert workflow =~
+             "elixir --sname ci_shard_kill --cookie ferricstore_test -S mix test apps/ferricstore/test --only shard_kill"
+
+    assert workflow =~
+             "mix test apps/ferricstore_server/test --only shard_kill --timeout 120000"
+  end
+
+  test "every app test path in the workflow exists" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    app_test_paths =
+      Regex.scan(~r/mix test (apps\/[a-zA-Z0-9_-]+\/test)\b/, workflow, capture: :all_but_first)
+      |> List.flatten()
+      |> Enum.uniq()
+
+    assert app_test_paths != []
+
+    for relative <- app_test_paths do
+      assert File.dir?(Path.join(@repo_root, relative)),
+             "workflow references missing app test path #{relative}"
+    end
   end
 
   test "core suites use deterministic duration-aware file partitions" do

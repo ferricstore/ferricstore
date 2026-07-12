@@ -535,73 +535,6 @@ jobs:
           retention-days: 14
 
   # ===========================================================================
-  # SDK tests (per OS)
-  # ===========================================================================
-  test-sdk-ubuntu:
-    name: "SDK tests (ubuntu)"
-    needs: build-ubuntu
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.19"
-          otp-version: "28"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-Linux
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
-      - name: Run ferricstore_sdk tests
-        timeout-minutes: 15
-        run: mix test apps/ferricstore_sdk/test --timeout 30000
-      - uses: actions/upload-artifact@v7
-        if: always()
-        continue-on-error: true
-        with:
-          name: test-results-sdk-ubuntu
-          path: test-results/
-          retention-days: 14
-
-  test-sdk-macos:
-    name: "SDK tests (macos)"
-    needs: build-macos
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.19"
-          otp-version: "28"
-          hexpm-mirrors: |
-            https://builds.hex.pm
-            https://cdn.jsdelivr.net/hex
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-macOS
-          path: .
-      - name: Ensure dependencies
-        run: mix deps.get
-      - name: Run ferricstore_sdk tests
-        timeout-minutes: 15
-        run: mix test apps/ferricstore_sdk/test --timeout 30000
-      - uses: actions/upload-artifact@v7
-        if: always()
-        continue-on-error: true
-        with:
-          name: test-results-sdk-macos
-          path: test-results/
-          retention-days: 14
-
-  # ===========================================================================
   # Durability tests (ubuntu only — shard-kill, jepsen, large alloc)
   # ===========================================================================
   test-durability:
@@ -629,13 +562,14 @@ jobs:
       - name: Run ferricstore shard-kill tests
         run: |
           set -o pipefail
-          mix test apps/ferricstore/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
+          epmd -daemon
+          elixir --sname ci_shard_kill --cookie ferricstore_test -S mix test apps/ferricstore/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
 
-      - name: Run SDK shard-kill tests
+      - name: Run ferricstore_server shard-kill tests
         if: success() || failure()
         run: |
           set -o pipefail
-          mix test apps/ferricstore_sdk/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_sdk_shard_kill.log
+          mix test apps/ferricstore_server/test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_server_shard_kill.log
 
       - name: Run Jepsen tests
         if: success() || failure()
