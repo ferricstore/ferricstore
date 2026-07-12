@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
   require Logger
 
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.PolicyAttributeCatalog
   alias Ferricstore.Flow.PolicyMigration
   alias Ferricstore.Store.Router
 
@@ -34,6 +35,16 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       )
     else
       :ignore
+    end
+  end
+
+  @doc false
+  @spec request_attribute_repair(FerricStore.Instance.t(), binary()) :: :ok
+  def request_attribute_repair(%{name: instance_name} = ctx, attribute_name)
+      when is_atom(instance_name) and is_binary(attribute_name) and attribute_name != "" do
+    case Process.whereis(name(ctx)) do
+      pid when is_pid(pid) -> GenServer.cast(pid, {:repair_attribute_catalog, attribute_name})
+      nil -> :ok
     end
   end
 
@@ -86,6 +97,8 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       backfill_page_fun: Keyword.get(opts, :backfill_page_fun, &PolicyMigration.backfill_page/5),
       snapshot_fun: Keyword.get(opts, :snapshot_fun, &PolicyMigration.snapshot_primary_keydir/5),
       cleanup_fun: Keyword.get(opts, :cleanup_fun, &PolicyMigration.cleanup_snapshot/3),
+      attribute_repair_fun:
+        Keyword.get(opts, :attribute_repair_fun, &PolicyAttributeCatalog.repair_next/2),
       backfill_runs: %{},
       run_timer_ref: nil,
       run_timer_token: nil
@@ -143,6 +156,21 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     end
 
     state = clear_task_pid(state, shard_index, run_token, :cleanup_pid, cleanup_pid)
+    {:noreply, schedule_run(state, 0)}
+  end
+
+  @impl true
+  def handle_cast({:repair_attribute_catalog, name}, state) do
+    case Router.flow_policy_attribute_catalog_repair_request(state.instance_ctx, name) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Flow policy attribute catalog repair request failed for #{inspect(name)}: #{inspect(reason)}"
+        )
+    end
+
     {:noreply, schedule_run(state, 0)}
   end
 
@@ -209,12 +237,28 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
         {state, {:retry, :backend_not_ready}}
 
       true ->
-        case run_backfill_step(state, shard_index) do
-          {next_state, {:ok, %{done?: true}}} ->
-            {next_state, run_policy_step(next_state, shard_index)}
+        case state.attribute_repair_fun.(state.instance_ctx, shard_index) do
+          {:ok, :idle} ->
+            case run_backfill_step(state, shard_index) do
+              {next_state, {:ok, %{done?: true}}} ->
+                {next_state, run_policy_step(next_state, shard_index)}
 
-          {next_state, result} ->
-            {next_state, result}
+              {next_state, result} ->
+                {next_state, result}
+            end
+
+          {:ok, %{processed: processed} = result}
+          when is_integer(processed) and processed >= 0 ->
+            {state, {:ok, Map.put_new(result, :idle?, false)}}
+
+          {:retry, _reason} = retry ->
+            {state, retry}
+
+          {:error, _reason} = error ->
+            {state, error}
+
+          other ->
+            {state, {:error, {:invalid_policy_attribute_catalog_repair_result, other}}}
         end
     end
   rescue

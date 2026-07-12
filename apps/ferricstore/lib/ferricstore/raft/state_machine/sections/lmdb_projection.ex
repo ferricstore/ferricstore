@@ -763,7 +763,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
             :ets.insert(state.ets, {key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
             queue_lmdb_state_delete_projection(state, key)
 
-          flow_owned_value_ref?(key) or FlowKeys.policy_key?(key) ->
+          flow_owned_value_ref?(key) or FlowKeys.policy_key?(key) or
+              FlowKeys.policy_indexed_attribute_catalog_key?(key) ->
             with_lmdb_mirror_shard(state, fn ->
               queue_pending_lmdb_mirror_delete(key)
             end)
@@ -782,7 +783,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           flow_state_key?(key) ->
             queue_lmdb_state_delete_projection(state, key)
 
-          flow_owned_value_ref?(key) or FlowKeys.policy_key?(key) ->
+          flow_owned_value_ref?(key) or FlowKeys.policy_key?(key) or
+              FlowKeys.policy_indexed_attribute_catalog_key?(key) ->
             with_lmdb_mirror_shard(state, fn ->
               queue_pending_lmdb_mirror_delete(key)
             end)
@@ -804,7 +806,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       end
 
       defp maybe_queue_lmdb_policy_put(key, value, expire_at_ms) do
-        if FlowKeys.policy_key?(key) do
+        if FlowKeys.policy_key?(key) or FlowKeys.policy_indexed_attribute_catalog_key?(key) do
           queue_pending_lmdb_mirror_put(key, value, expire_at_ms)
         end
 

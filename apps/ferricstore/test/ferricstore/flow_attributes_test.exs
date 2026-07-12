@@ -814,6 +814,133 @@ defmodule Ferricstore.FlowAttributesTest do
              )
   end
 
+  test "broad search repairs missing and corrupt indexed-attribute refcounts" do
+    type = unique_flow_id("attrs-catalog-repair")
+    ctx = FerricStore.Instance.get(:default)
+
+    {:ok, worker} =
+      Ferricstore.Flow.PolicyMigrationWorker.start_link(
+        instance_ctx: ctx,
+        enabled: true,
+        initial_delay_ms: 60_000,
+        interval_ms: 60_000,
+        catchup_delay_ms: 1
+      )
+
+    on_exit(fn ->
+      if Process.alive?(worker) do
+        try do
+          GenServer.stop(worker)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    count_key = Ferricstore.Flow.Keys.policy_indexed_attribute_count_key("tenant")
+    member_key = Ferricstore.Flow.Keys.policy_indexed_attribute_member_key("tenant", type)
+
+    assert {:ok, _} = FerricStore.flow_policy_set(type, indexed_attributes: ["tenant"])
+    assert <<1::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, count_key)
+    assert <<1>> = Ferricstore.Store.Router.get(ctx, member_key)
+
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, member_key)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert {:ok, [_member]} =
+             Ferricstore.Flow.LMDB.prefix_entries(
+               lmdb_path,
+               Ferricstore.Flow.Keys.policy_indexed_attribute_member_prefix("tenant"),
+               1
+             )
+
+    assert :ok = Ferricstore.Store.Router.delete(ctx, count_key)
+
+    assert {:ok, []} =
+             FerricStore.flow_search(
+               partition_key: @partition,
+               attributes: %{"tenant" => "missing"},
+               consistent_projection: true,
+               count: 10
+             )
+
+    assert_eventually(fn ->
+      assert <<1::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, count_key)
+    end)
+
+    assert :ok = Ferricstore.Store.Router.put(ctx, count_key, "corrupt", 0)
+
+    assert {:ok, []} =
+             FerricStore.flow_search(
+               partition_key: @partition,
+               attributes: %{"tenant" => "missing"},
+               consistent_projection: true,
+               count: 10
+             )
+
+    assert_eventually(fn ->
+      assert <<1::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, count_key)
+    end)
+
+    assert {:ok, _} = FerricStore.flow_policy_set(type, indexed_attributes: [])
+    assert <<0::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, count_key)
+
+    assert {:error, "ERR flow attribute tenant is not indexed for broad search"} =
+             FerricStore.flow_search(
+               partition_key: @partition,
+               attributes: %{"tenant" => "missing"},
+               consistent_projection: true,
+               count: 10
+             )
+  end
+
+  test "indexed-attribute repair is fenced by the membership revision" do
+    type = unique_flow_id("attrs-catalog-fence")
+    name = "region"
+    ctx = FerricStore.Instance.get(:default)
+    revision_key = Ferricstore.Flow.Keys.policy_indexed_attribute_revision_key(name)
+    count_key = Ferricstore.Flow.Keys.policy_indexed_attribute_count_key(name)
+    repair_key = Ferricstore.Flow.Keys.policy_indexed_attribute_repair_key(name)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, repair_key)
+
+    assert {:ok, _} = FerricStore.flow_policy_set(type, indexed_attributes: [name])
+    assert <<revision::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, revision_key)
+    assert <<1::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, count_key)
+
+    assert :ok = Ferricstore.Store.Router.flow_policy_attribute_catalog_repair_request(ctx, name)
+    assert {:ok, _} = FerricStore.flow_policy_set(type, indexed_attributes: [])
+
+    assert {:ok, %{processed: 0, repaired?: false, stale?: true}} =
+             Ferricstore.Store.Router.flow_policy_attribute_catalog_repair(
+               ctx,
+               shard_index,
+               %{name: name, expected_revision: revision, count: 1}
+             )
+
+    assert <<0::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, count_key)
+    assert is_binary(Ferricstore.Store.Router.get(ctx, repair_key))
+
+    assert <<next_revision::unsigned-big-64>> =
+             Ferricstore.Store.Router.get(ctx, revision_key)
+
+    assert next_revision > revision
+
+    assert {:ok, %{processed: 1, repaired?: true, stale?: false}} =
+             Ferricstore.Store.Router.flow_policy_attribute_catalog_repair(
+               ctx,
+               shard_index,
+               %{name: name, expected_revision: next_revision, count: 0}
+             )
+
+    assert <<0::unsigned-big-64>> = Ferricstore.Store.Router.get(ctx, count_key)
+    assert nil == Ferricstore.Store.Router.get(ctx, repair_key)
+  end
+
   test "indexed attribute policy changes are future-only for broad indexes" do
     type = unique_flow_id("attrs-policy-future-type")
     before_id = unique_flow_id("attrs-policy-future-before")

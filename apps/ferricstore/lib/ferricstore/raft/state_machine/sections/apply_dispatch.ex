@@ -115,6 +115,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_policy_attribute_catalog_repair_request, key, name}, state) do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_policy_attribute_catalog_repair_request,
+          %{items: 1},
+          fn -> do_flow_policy_attribute_catalog_repair_request(state, key, name) end
+        )
+      end
+
+      def apply(meta, {:flow_policy_attribute_catalog_repair, attrs}, state)
+          when is_map(attrs) do
+        apply_flow_pending_with_time(
+          meta,
+          state,
+          :flow_policy_attribute_catalog_repair,
+          %{items: 1},
+          fn -> do_flow_policy_attribute_catalog_repair(state, attrs) end
+        )
+      end
+
       def apply(meta, {:flow_policy_migration_step, plan}, state) when is_map(plan) do
         item_count = plan |> Map.get(:catalog_entries, []) |> length()
 

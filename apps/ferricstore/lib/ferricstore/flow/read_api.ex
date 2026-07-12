@@ -9,6 +9,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   alias Ferricstore.Flow.IndexQuery
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDBIndexRead
+  alias Ferricstore.Flow.PolicyAttributeCatalog
   alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.RecordQuery
   alias Ferricstore.Flow.RecordRead
@@ -908,8 +909,19 @@ defmodule Ferricstore.Flow.ReadAPI do
     case Ferricstore.Stats.with_cache_tracking_disabled(fn ->
            Ferricstore.Store.Router.get(ctx, key)
          end) do
-      <<count::unsigned-big-64>> when count > 0 -> true
-      _missing_or_invalid -> false
+      <<count::unsigned-big-64>> when count > 0 ->
+        true
+
+      <<0::unsigned-big-64>> ->
+        false
+
+      _missing_or_invalid ->
+        if PolicyAttributeCatalog.indexed_member_exists?(ctx, name) do
+          :ok = PolicyAttributeCatalog.request_repair(ctx, name)
+          true
+        else
+          false
+        end
     end
   end
 

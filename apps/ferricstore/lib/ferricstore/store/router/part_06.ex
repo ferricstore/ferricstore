@@ -224,6 +224,39 @@ defmodule Ferricstore.Store.Router.Part06 do
         do: {:error, "ERR flow policy transaction failed"}
 
       @doc false
+      def flow_policy_attribute_catalog_repair_request(ctx, name)
+          when is_binary(name) and name != "" do
+        key = Ferricstore.Flow.Keys.policy_indexed_attribute_repair_key(name)
+        idx = shard_for(ctx, key)
+
+        raft_write(
+          ctx,
+          idx,
+          key,
+          {:flow_policy_attribute_catalog_repair_request, key, name}
+        )
+      end
+
+      def flow_policy_attribute_catalog_repair_request(_ctx, _name),
+        do: {:error, "ERR invalid flow policy attribute repair request"}
+
+      @doc false
+      def flow_policy_attribute_catalog_repair(
+            ctx,
+            shard_index,
+            %{name: name} = attrs
+          )
+          when is_integer(shard_index) and shard_index >= 0 and
+                 shard_index < ctx.shard_count and is_binary(name) and name != "" do
+        key = Ferricstore.Flow.Keys.policy_indexed_attribute_repair_key(name)
+
+        raft_write(ctx, shard_index, key, {:flow_policy_attribute_catalog_repair, attrs})
+      end
+
+      def flow_policy_attribute_catalog_repair(_ctx, _shard_index, _attrs),
+        do: {:error, "ERR invalid flow policy attribute catalog repair"}
+
+      @doc false
       def flow_policy_migration_step(ctx, shard_index, limit)
           when is_integer(shard_index) and shard_index >= 0 and
                  shard_index < ctx.shard_count and is_integer(limit) and limit > 0 and

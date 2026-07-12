@@ -2,6 +2,11 @@ defmodule Ferricstore.Flow.Keys do
   @moduledoc false
 
   @global_tag "{f}"
+  @policy_prefix "f:" <> @global_tag <> ":policy:"
+  @policy_attribute_count_prefix "f:" <> @global_tag <> ":policy-attribute:1:"
+  @policy_attribute_member_prefix "f:" <> @global_tag <> ":policy-attribute-member:1:"
+  @policy_attribute_revision_prefix "f:" <> @global_tag <> ":policy-attribute-revision:1:"
+  @policy_attribute_repair_prefix "f:" <> @global_tag <> ":policy-attribute-repair:1:"
   @partition_tag_prefix "{f:"
   @auto_partition_prefix "__flow_auto__:"
   @auto_partition_buckets 256
@@ -173,12 +178,55 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def policy_key(type) do
-    "f:" <> @global_tag <> ":policy:" <> type
+    @policy_prefix <> type
   end
 
   def policy_indexed_attribute_count_key(name) when is_binary(name) and name != "" do
-    "f:" <> @global_tag <> ":policy-attribute:1:" <> digest(name)
+    @policy_attribute_count_prefix <> digest(name)
   end
+
+  def policy_indexed_attribute_member_prefix(name) when is_binary(name) and name != "" do
+    @policy_attribute_member_prefix <> digest(name) <> ":"
+  end
+
+  def policy_indexed_attribute_member_key(name, type)
+      when is_binary(name) and name != "" and is_binary(type) and type != "" do
+    policy_indexed_attribute_member_prefix(name) <> digest(type)
+  end
+
+  def policy_indexed_attribute_revision_key(name) when is_binary(name) and name != "" do
+    @policy_attribute_revision_prefix <> digest(name)
+  end
+
+  def policy_indexed_attribute_repair_key(name) when is_binary(name) and name != "" do
+    policy_indexed_attribute_repair_prefix() <> digest(name)
+  end
+
+  def policy_indexed_attribute_repair_prefix do
+    @policy_attribute_repair_prefix
+  end
+
+  def policy_indexed_attribute_catalog_key?(
+        <<@policy_attribute_count_prefix::binary, _::binary>>
+      ),
+      do: true
+
+  def policy_indexed_attribute_catalog_key?(
+        <<@policy_attribute_member_prefix::binary, _::binary>>
+      ),
+      do: true
+
+  def policy_indexed_attribute_catalog_key?(
+        <<@policy_attribute_revision_prefix::binary, _::binary>>
+      ),
+      do: true
+
+  def policy_indexed_attribute_catalog_key?(
+        <<@policy_attribute_repair_prefix::binary, _::binary>>
+      ),
+      do: true
+
+  def policy_indexed_attribute_catalog_key?(_key), do: false
 
   def type_catalog_member_key(type, state_key)
       when is_binary(type) and type != "" and is_binary(state_key) do
@@ -433,8 +481,7 @@ defmodule Ferricstore.Flow.Keys do
     "f:{flow-governance}:gov:catalog:approval:flow:" <> governance_catalog_digest(flow_id)
   end
 
-  def policy_key?(key) when is_binary(key),
-    do: String.starts_with?(key, "f:" <> @global_tag <> ":policy:")
+  def policy_key?(<<@policy_prefix::binary, _::binary>>), do: true
 
   def policy_key?(_key), do: false
 

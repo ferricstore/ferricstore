@@ -21,6 +21,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
+      alias Ferricstore.Flow.PolicyAttributeCatalog
       alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.Flow.StateMeta
       alias Ferricstore.HLC
@@ -850,6 +851,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
                  :ok <-
                    flow_update_policy_indexed_attribute_counts(
                      state,
+                     type,
                      old_indexed_attributes,
                      new_indexed_attributes
                    ) do
@@ -876,45 +878,173 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
       defp flow_stored_policy_indexed_attributes(_missing), do: []
 
-      defp flow_update_policy_indexed_attribute_counts(state, old_names, new_names)
-           when is_list(old_names) and is_list(new_names) do
+      defp flow_update_policy_indexed_attribute_counts(state, type, old_names, new_names)
+           when is_binary(type) and type != "" and is_list(old_names) and is_list(new_names) do
         old_names = MapSet.new(old_names)
         new_names = MapSet.new(new_names)
 
         changes =
-          Enum.map(MapSet.difference(old_names, new_names), &{&1, -1}) ++
-            Enum.map(MapSet.difference(new_names, old_names), &{&1, 1})
+          (old_names
+           |> MapSet.difference(new_names)
+           |> Enum.sort()
+           |> Enum.map(&{&1, -1})) ++
+            (new_names
+             |> MapSet.difference(old_names)
+             |> Enum.sort()
+             |> Enum.map(&{&1, 1}))
 
         Enum.reduce_while(changes, :ok, fn {name, delta}, :ok ->
-          case flow_update_policy_indexed_attribute_count(state, name, delta) do
+          case flow_update_policy_indexed_attribute_membership(state, type, name, delta) do
             :ok -> {:cont, :ok}
             {:error, _reason} = error -> {:halt, error}
           end
         end)
       end
 
-      defp flow_update_policy_indexed_attribute_count(state, name, delta)
-           when is_binary(name) and name != "" and delta in [-1, 1] do
-        key = FlowKeys.policy_indexed_attribute_count_key(name)
+      defp flow_update_policy_indexed_attribute_membership(state, type, name, requested_delta)
+           when is_binary(type) and type != "" and is_binary(name) and name != "" and
+                  requested_delta in [-1, 1] do
+        member_key = FlowKeys.policy_indexed_attribute_member_key(name, type)
+        revision_key = FlowKeys.policy_indexed_attribute_revision_key(name)
+        member? = do_get(state, member_key) == <<1>>
 
-        with {:ok, count} <- flow_policy_indexed_attribute_count(do_get(state, key)),
-             next when next >= 0 and next <= 0xFFFFFFFFFFFFFFFF <- count + delta do
-          case next do
-            0 -> do_delete(state, key)
-            value -> do_put(state, key, <<value::unsigned-big-64>>, 0)
-          end
-        else
-          _invalid -> {:error, "ERR flow policy attribute catalog is corrupt"}
+        member_change? =
+          (requested_delta == 1 and not member?) or (requested_delta == -1 and member?)
+
+        catalog_delta = if(member_change?, do: requested_delta, else: 0)
+        force_repair? = not member_change?
+
+        with {:ok, revision} <-
+               flow_policy_indexed_attribute_revision(do_get(state, revision_key)),
+             {:ok, next_revision} <-
+               flow_policy_indexed_attribute_next_revision(revision, member_change?),
+             :ok <-
+               flow_apply_policy_indexed_attribute_member_change(
+                 state,
+                 member_key,
+                 requested_delta,
+                 member_change?
+               ),
+             :ok <- do_put(state, revision_key, <<next_revision::unsigned-big-64>>, 0) do
+          flow_update_policy_indexed_attribute_count(
+            state,
+            name,
+            revision,
+            catalog_delta,
+            force_repair?
+          )
         end
       end
 
-      defp flow_policy_indexed_attribute_count(nil), do: {:ok, 0}
+      defp flow_apply_policy_indexed_attribute_member_change(
+             _state,
+             _member_key,
+             _requested_delta,
+             false
+           ),
+           do: :ok
 
-      defp flow_policy_indexed_attribute_count(<<count::unsigned-big-64>>) when count > 0,
+      defp flow_apply_policy_indexed_attribute_member_change(state, member_key, 1, true),
+        do: do_put(state, member_key, <<1>>, 0)
+
+      defp flow_apply_policy_indexed_attribute_member_change(state, member_key, -1, true),
+        do: do_delete(state, member_key)
+
+      defp flow_policy_indexed_attribute_next_revision(revision, false), do: {:ok, revision}
+
+      defp flow_policy_indexed_attribute_next_revision(revision, true)
+           when revision < 0xFFFFFFFFFFFFFFFF,
+           do: {:ok, revision + 1}
+
+      defp flow_policy_indexed_attribute_next_revision(_revision, true),
+        do: {:error, "ERR flow policy attribute catalog revision exhausted"}
+
+      defp flow_update_policy_indexed_attribute_count(
+             state,
+             name,
+             revision,
+             catalog_delta,
+             force_repair?
+           ) do
+        count_key = FlowKeys.policy_indexed_attribute_count_key(name)
+
+        with false <- force_repair?,
+             {:ok, count} <-
+               flow_policy_indexed_attribute_count(do_get(state, count_key), revision),
+             next when next >= 0 and next <= 0xFFFFFFFFFFFFFFFF <- count + catalog_delta do
+          do_put(state, count_key, <<next::unsigned-big-64>>, 0)
+        else
+          _corrupt_or_inconsistent -> flow_mark_policy_indexed_attribute_repair(state, name)
+        end
+      end
+
+      defp flow_mark_policy_indexed_attribute_repair(state, name) do
+        key = FlowKeys.policy_indexed_attribute_repair_key(name)
+        value = PolicyAttributeCatalog.encode_repair_request(name)
+        do_put(state, key, value, 0)
+      end
+
+      defp flow_policy_indexed_attribute_revision(nil), do: {:ok, 0}
+
+      defp flow_policy_indexed_attribute_revision(<<revision::unsigned-big-64>>),
+        do: {:ok, revision}
+
+      defp flow_policy_indexed_attribute_revision(_invalid),
+        do: {:error, "ERR flow policy attribute catalog revision is corrupt"}
+
+      defp flow_policy_indexed_attribute_count(nil, 0), do: {:ok, 0}
+
+      defp flow_policy_indexed_attribute_count(<<count::unsigned-big-64>>, _revision),
         do: {:ok, count}
 
-      defp flow_policy_indexed_attribute_count(_invalid),
+      defp flow_policy_indexed_attribute_count(_invalid, _revision),
         do: {:error, "ERR flow policy attribute catalog is corrupt"}
+
+      defp do_flow_policy_attribute_catalog_repair_request(state, key, name)
+           when is_binary(key) and is_binary(name) and name != "" do
+        expected_key = FlowKeys.policy_indexed_attribute_repair_key(name)
+
+        if key == expected_key do
+          flow_mark_policy_indexed_attribute_repair(state, name)
+        else
+          {:error, "ERR invalid flow policy attribute repair key"}
+        end
+      end
+
+      defp do_flow_policy_attribute_catalog_repair_request(_state, _key, _name),
+        do: {:error, "ERR invalid flow policy attribute repair request"}
+
+      defp do_flow_policy_attribute_catalog_repair(
+             state,
+             %{name: name, expected_revision: expected_revision, count: count}
+           )
+           when is_binary(name) and name != "" and is_integer(expected_revision) and
+                  expected_revision >= 0 and expected_revision <= 0xFFFFFFFFFFFFFFFF and
+                  is_integer(count) and count >= 0 and count <= 0xFFFFFFFFFFFFFFFF do
+        repair_key = FlowKeys.policy_indexed_attribute_repair_key(name)
+        revision_key = FlowKeys.policy_indexed_attribute_revision_key(name)
+        count_key = FlowKeys.policy_indexed_attribute_count_key(name)
+
+        with {:ok, ^name} <-
+               do_get(state, repair_key) |> PolicyAttributeCatalog.decode_repair_request(),
+             {:ok, revision} <-
+               do_get(state, revision_key) |> flow_policy_indexed_attribute_revision() do
+          if revision == expected_revision do
+            with :ok <- do_put(state, count_key, <<count::unsigned-big-64>>, 0),
+                 :ok <- do_delete(state, repair_key) do
+              {:ok, %{processed: 1, repaired?: true, stale?: false}}
+            end
+          else
+            {:ok, %{processed: 0, repaired?: false, stale?: true}}
+          end
+        else
+          :error -> {:error, "ERR flow policy attribute repair marker is corrupt"}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp do_flow_policy_attribute_catalog_repair(_state, _attrs),
+        do: {:error, "ERR invalid flow policy attribute catalog repair"}
 
       defp flow_stored_policy_indexed_state_meta(value) when is_binary(value) do
         case RetryPolicy.decode_flow_policy_entry(value) do

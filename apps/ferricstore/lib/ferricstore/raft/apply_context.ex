@@ -48,6 +48,8 @@ defmodule Ferricstore.Raft.ApplyContext do
     :flow_named_value_put,
     :flow_named_value_put_pipeline_batch,
     :flow_policy_catalog_backfill_step,
+    :flow_policy_attribute_catalog_repair,
+    :flow_policy_attribute_catalog_repair_request,
     :flow_policy_migration_step,
     :flow_policy_put,
     :flow_reschedule,
