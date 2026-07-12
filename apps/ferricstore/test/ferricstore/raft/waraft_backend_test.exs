@@ -113,6 +113,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   alias Ferricstore.Store.{BlobRef, BlobStore}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
 
   defmodule LabelCounter do
     @moduledoc false
@@ -170,6 +171,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
 
   def handle_store_unavailable_telemetry(event, measurements, metadata, parent) do
     send(parent, {:store_unavailable, event, measurements, metadata})
+  end
+
+  setup_all do
+    on_exit(fn -> ShardHelpers.restore_default_waraft!() end)
+    :ok
   end
 
   setup do

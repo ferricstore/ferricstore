@@ -14,6 +14,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
   @moduletag timeout: 120_000
 
   alias Ferricstore.Store.Router
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Test.ShardHelpers
 
   # Generous eventually timeout: 200 attempts * 200ms = 40s.
@@ -23,6 +24,12 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
   @eventually_interval 200
 
   setup_all do
+    default_ctx = FerricStore.Instance.get(:default)
+    active_ctx = WARaftBackend.context!(:ferricstore_waraft_backend)
+    identity_fields = [:name, :data_dir_expanded, :shard_count, :keydir_refs]
+
+    assert Map.take(active_ctx, identity_fields) == Map.take(default_ctx, identity_fields)
+
     ShardHelpers.wait_shards_alive(30_000)
     ShardHelpers.compact_wal()
     :ok

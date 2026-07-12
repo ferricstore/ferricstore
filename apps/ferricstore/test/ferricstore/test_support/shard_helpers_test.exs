@@ -4,6 +4,7 @@ defmodule Ferricstore.Test.ShardHelpersTest do
 
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Flow.Governance.LimitCache
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.{DiskPressure, Router}
   alias Ferricstore.Test.ShardHelpers
 
@@ -118,5 +119,35 @@ defmodule Ferricstore.Test.ShardHelpersTest do
 
     assert :ok = Ferricstore.Raft.WARaftBackend.stop()
     assert :ok = ShardHelpers.wait_default_quorum_writable(5_000)
+  end
+
+  test "restore_default_waraft! replaces a stopped foreign backend" do
+    default_ctx = FerricStore.Instance.get(:default)
+    name = :"shard_helpers_foreign_#{System.unique_integer([:positive])}"
+    root = Path.join(System.tmp_dir!(), Atom.to_string(name))
+    File.rm_rf!(root)
+    Ferricstore.DataDir.ensure_layout!(root, 1)
+    foreign_ctx = FerricStore.Instance.build(name, data_dir: root, shard_count: 1)
+
+    on_exit(fn ->
+      WARaftBackend.stop()
+      FerricStore.Instance.cleanup(name)
+      File.rm_rf!(root)
+      :ok = WARaftBackend.start(default_ctx)
+    end)
+
+    assert :ok =
+             WARaftBackend.start(foreign_ctx,
+               log_module: :ferricstore_waraft_spike_segment_log
+             )
+
+    assert :ok = WARaftBackend.stop()
+    assert :ok = ShardHelpers.restore_default_waraft!()
+
+    active_ctx = WARaftBackend.context!(:ferricstore_waraft_backend)
+    identity_fields = [:name, :data_dir_expanded, :shard_count, :keydir_refs]
+
+    assert Map.take(active_ctx, identity_fields) == Map.take(default_ctx, identity_fields)
+    assert :ok = ShardHelpers.wait_default_pipeline_ready(5_000)
   end
 end

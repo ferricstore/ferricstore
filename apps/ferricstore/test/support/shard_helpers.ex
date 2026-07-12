@@ -425,6 +425,21 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   @doc """
+  Strictly restores the application-owned WARaft backend after tests that bind
+  the singleton backend to an isolated instance.
+
+  Unlike the best-effort readiness helpers, this raises on startup or apply
+  failure so a leaking fixture cannot silently invalidate later durability
+  tests.
+  """
+  @spec restore_default_waraft!(non_neg_integer()) :: :ok
+  def restore_default_waraft!(timeout_ms \\ 30_000) do
+    ctx = FerricStore.Instance.get(:default)
+    :ok = Ferricstore.Raft.WARaftBackend.start(ctx)
+    wait_default_waraft_ready(timeout_ms)
+  end
+
+  @doc """
   Waits until every default-instance shard can accept a public quorum write.
 
   `FerricStore.await_ready/1` verifies process and leader health, but tests that
