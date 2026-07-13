@@ -32,11 +32,11 @@
    (requires `HEX_API_KEY` secret). Docker Hub push also triggers automatically
    (requires `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets).
 
-The tag workflows verify that the tag version matches the project version and
-that `LICENSE` was stamped using the release commit date. They stop before
-publishing artifacts if either check fails. If a release commit is prepared on
-a different UTC date from the tag, rerun the stamp command and amend the
-release commit before tagging.
+The tag workflows verify that the tag version matches both project versions and
+that `LICENSE` was stamped using the tag's UTC push date. They stop before
+publishing artifacts if either check fails. Run the stamp command on the same
+UTC date that the tag will be pushed. If the date changes, rerun the command and
+amend the release commit before tagging.
 
 ## Development builds
 

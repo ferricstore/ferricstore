@@ -29,13 +29,14 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF#refs/tags/v}"
-          PROJECT_VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
-          if [ "$VERSION" != "$PROJECT_VERSION" ]; then
-            echo "Tag version $VERSION does not match project version $PROJECT_VERSION" >&2
+          CORE_VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
+          SERVER_VERSION=$(sed -n 's/.*version: "\(.*\)".*/\1/p' apps/ferricstore_server/mix.exs | head -1)
+          if [ "$VERSION" != "$CORE_VERSION" ] || [ "$VERSION" != "$SERVER_VERSION" ]; then
+            echo "Tag version $VERSION does not match core $CORE_VERSION and server $SERVER_VERSION" >&2
             exit 1
           fi
-          COMMIT_TIMESTAMP=$(git show -s --format=%ct "$GITHUB_SHA")
-          RELEASE_DATE=$(date -u -d "@${COMMIT_TIMESTAMP}" +%F)
+          RELEASE_TIMESTAMP="${{ github.event.repository.pushed_at }}"
+          RELEASE_DATE=$(date -u -d "@${RELEASE_TIMESTAMP}" +%F)
           elixir .github/scripts/stamp_bsl_license.exs --check "$VERSION" "$RELEASE_DATE"
 
   # -------------------------------------------------------------------------

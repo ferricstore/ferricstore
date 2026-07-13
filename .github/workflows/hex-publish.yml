@@ -68,8 +68,8 @@ jobs:
       - name: Validate BSL change date
         if: steps.hex_creds.outputs.available == 'true'
         run: |
-          COMMIT_TIMESTAMP=$(git show -s --format=%ct "$GITHUB_SHA")
-          RELEASE_DATE=$(date -u -d "@${COMMIT_TIMESTAMP}" +%F)
+          RELEASE_TIMESTAMP="${{ github.event.repository.pushed_at }}"
+          RELEASE_DATE=$(date -u -d "@${RELEASE_TIMESTAMP}" +%F)
           elixir .github/scripts/stamp_bsl_license.exs \
             --check "${{ steps.version.outputs.version }}" "$RELEASE_DATE"
 
