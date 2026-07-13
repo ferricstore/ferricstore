@@ -7,24 +7,36 @@
 
 ## Steps
 
-1. Bump `@version` in `apps/ferricstore/mix.exs`
-2. Commit: `git commit -am "release: vX.Y.Z"`
-3. Tag: `git tag vX.Y.Z`
-4. Push: `git push origin main --tags`
-5. Wait for the **Build precompiled NIFs** GitHub Actions workflow to complete
+1. Bump the version in `apps/ferricstore/mix.exs` and
+   `apps/ferricstore_server/mix.exs`.
+2. Stamp the release's BSL Change Date. The command uses today's UTC date and
+   writes an explicit date four years later to `LICENSE`:
+   ```bash
+   elixir .github/scripts/stamp_bsl_license.exs X.Y.Z
+   ```
+3. Commit: `git commit -am "release: vX.Y.Z"`
+4. Tag: `git tag vX.Y.Z`
+5. Push: `git push origin main --tags`
+6. Wait for the **Build precompiled NIFs** GitHub Actions workflow to complete
    - Verify all 6 platform binaries appear in the GitHub Release
-6. Download checksums locally:
+7. Download checksums locally:
    ```bash
    mix rustler_precompiled.download Ferricstore.Bitcask.NIF --all --print
    ```
-7. Commit the generated checksum file:
+8. Commit the generated checksum file:
    ```bash
    git add apps/ferricstore/checksum-Elixir.Ferricstore.Bitcask.NIF.exs
    git commit -m "release: update NIF checksums for vX.Y.Z"
    ```
-8. Hex.pm publish happens automatically via the **Publish to Hex.pm** workflow
+9. Hex.pm publish happens automatically via the **Publish to Hex.pm** workflow
    (requires `HEX_API_KEY` secret). Docker Hub push also triggers automatically
    (requires `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets).
+
+The tag workflows verify that the tag version matches the project version and
+that `LICENSE` was stamped using the release commit date. They stop before
+publishing artifacts if either check fails. If a release commit is prepared on
+a different UTC date from the tag, rerun the stamp command and amend the
+release commit before tagging.
 
 ## Development builds
 

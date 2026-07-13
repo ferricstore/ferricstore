@@ -314,5 +314,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see [SECURITY.md](S
 Business Source License 1.1 (`BUSL-1.1`). Production use is permitted except
 for providing FerricStore as a commercial hosted or managed service. See
 [LICENSE](LICENSE) for the complete terms. Each covered version converts to
-Apache-2.0 on July 13, 2030, or four years after its first public distribution
-under BSL, whichever comes first.
+Apache-2.0 four years after it is first publicly distributed under BSL.
+Previously published Apache-2.0 versions remain available under their original
+license.

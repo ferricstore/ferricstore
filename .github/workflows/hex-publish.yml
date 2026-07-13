@@ -65,6 +65,14 @@ jobs:
               ;;
           esac
 
+      - name: Validate BSL change date
+        if: steps.hex_creds.outputs.available == 'true'
+        run: |
+          COMMIT_TIMESTAMP=$(git show -s --format=%ct "$GITHUB_SHA")
+          RELEASE_DATE=$(date -u -d "@${COMMIT_TIMESTAMP}" +%F)
+          elixir .github/scripts/stamp_bsl_license.exs \
+            --check "${{ steps.version.outputs.version }}" "$RELEASE_DATE"
+
       - name: Wait for all precompiled NIF artifacts
         if: steps.hex_creds.outputs.available == 'true'
         run: |
