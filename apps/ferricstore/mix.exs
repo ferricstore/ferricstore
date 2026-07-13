@@ -74,7 +74,7 @@ defmodule Ferricstore.MixProject do
         "checksum-*.exs",
         "mix.exs"
       ],
-      licenses: ["Apache-2.0"],
+      licenses: ["BUSL-1.1"],
       links: %{
         "GitHub" => "https://github.com/ferricstore/ferricstore"
       }
