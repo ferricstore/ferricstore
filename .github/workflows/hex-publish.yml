@@ -68,10 +68,9 @@ jobs:
       - name: Validate BSL change date
         if: steps.hex_creds.outputs.available == 'true'
         run: |
-          RELEASE_TIMESTAMP="${{ github.event.repository.pushed_at }}"
-          RELEASE_DATE=$(date -u -d "@${RELEASE_TIMESTAMP}" +%F)
           elixir .github/scripts/stamp_bsl_license.exs \
-            --check "${{ steps.version.outputs.version }}" "$RELEASE_DATE"
+            --check-timestamp "${{ steps.version.outputs.version }}" \
+            "${{ github.event.repository.pushed_at }}"
 
       - name: Wait for all precompiled NIF artifacts
         if: steps.hex_creds.outputs.available == 'true'

@@ -64,6 +64,18 @@ defmodule StampBslLicenseTest do
     assert output =~ "LICENSE is not stamped"
   end
 
+  test "check-timestamp mode derives the UTC release date", %{license_path: path} do
+    timestamp = DateTime.to_unix(~U[2027-05-09 23:30:00Z]) |> Integer.to_string()
+    assert {_, 0} = System.cmd("elixir", [@script, "0.8.0", "2027-05-09", path])
+
+    assert {output, 0} =
+             System.cmd("elixir", [@script, "--check-timestamp", "0.8.0", timestamp, path],
+               stderr_to_stdout: true
+             )
+
+    assert output =~ "LICENSE is correctly stamped"
+  end
+
   test "rejects an invalid semantic version", %{license_path: path} do
     assert {output, status} =
              System.cmd("elixir", [@script, "next", "2027-05-09", path], stderr_to_stdout: true)

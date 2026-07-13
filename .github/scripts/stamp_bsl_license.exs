@@ -2,6 +2,21 @@ defmodule FerricStore.BslLicenseStamp do
   @version_pattern ~r/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/
   @months ~w(January February March April May June July August September October November December)
 
+  def run(["--check-timestamp", version, timestamp | remaining]) do
+    release_date =
+      timestamp
+      |> Integer.parse()
+      |> case do
+        {unix_timestamp, ""} -> unix_timestamp
+        _other -> raise "invalid Unix release timestamp #{inspect(timestamp)}"
+      end
+      |> DateTime.from_unix!()
+      |> DateTime.to_date()
+      |> Date.to_iso8601()
+
+    run(["--check", version, release_date | remaining])
+  end
+
   def run(args) do
     {check?, positional} = extract_mode(args)
     {version, release_date, license_path} = parse_arguments(positional)

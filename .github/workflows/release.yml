@@ -35,9 +35,8 @@ jobs:
             echo "Tag version $VERSION does not match core $CORE_VERSION and server $SERVER_VERSION" >&2
             exit 1
           fi
-          RELEASE_TIMESTAMP="${{ github.event.repository.pushed_at }}"
-          RELEASE_DATE=$(date -u -d "@${RELEASE_TIMESTAMP}" +%F)
-          elixir .github/scripts/stamp_bsl_license.exs --check "$VERSION" "$RELEASE_DATE"
+          elixir .github/scripts/stamp_bsl_license.exs \
+            --check-timestamp "$VERSION" "${{ github.event.repository.pushed_at }}"
 
   # -------------------------------------------------------------------------
   # Linux builds: use rustler-precompiled-action with cross-compilation
