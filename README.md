@@ -3,7 +3,7 @@
 [![Hex.pm](https://img.shields.io/hexpm/v/ferricstore.svg)](https://hex.pm/packages/ferricstore)
 [![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/ferricstore)
 [![CI](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml/badge.svg)](https://github.com/ferricstore/ferricstore/actions/workflows/test.yml)
-[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License](https://img.shields.io/badge/License-BUSL--1.1-orange.svg)](LICENSE)
 
 **FerricStore is a durable server with a Ferric native TCP protocol and FerricFlow workflow state built in.**
 
@@ -311,4 +311,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see [SECURITY.md](S
 
 ## License
 
-Apache-2.0
+Business Source License 1.1 (`BUSL-1.1`). Production use is permitted except
+for providing FerricStore as a commercial hosted or managed service. See
+[LICENSE](LICENSE) for the complete terms. Each covered version converts to
+Apache-2.0 four years after it is first publicly distributed under BSL.
+Previously published Apache-2.0 versions remain available under their original
+license.
