@@ -9,10 +9,6 @@ on:
         description: "Release version to publish, for example 0.4.1"
         required: true
         type: string
-      release_date:
-        description: "Original release date in YYYY-MM-DD format"
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -54,32 +50,9 @@ jobs:
           echo "major_minor=$MAJOR.$MINOR" >> "$GITHUB_OUTPUT"
           echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
 
-  validate_release:
-    name: Validate release metadata
-    needs: version
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.19"
-          otp-version: "28"
-
-      - name: Validate BSL change date
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            elixir .github/scripts/stamp_bsl_license.exs \
-              --check "${{ needs.version.outputs.version }}" "${{ inputs.release_date }}"
-          else
-            elixir .github/scripts/stamp_bsl_license.exs \
-              --check-timestamp "${{ needs.version.outputs.version }}" \
-              "${{ github.event.repository.pushed_at }}"
-          fi
-
   build:
     name: Build ${{ matrix.platform }} image
-    needs: [version, validate_release]
+    needs: version
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -115,7 +88,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
-            org.opencontainers.image.licenses=BUSL-1.1
+            org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.description=Redis-compatible durable store and FerricFlow durable execution engine
           cache-from: type=gha,scope=ferricstore-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=ferricstore-${{ matrix.suffix }}
