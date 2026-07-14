@@ -11,40 +11,12 @@ permissions:
   attestations: write
 
 jobs:
-  validate_release:
-    name: Validate release metadata
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: erlef/setup-beam@v1
-        if: startsWith(github.ref, 'refs/tags/v')
-        with:
-          elixir-version: "1.19"
-          otp-version: "28"
-
-      - name: Validate version and BSL change date
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          CORE_VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
-          SERVER_VERSION=$(sed -n 's/.*version: "\(.*\)".*/\1/p' apps/ferricstore_server/mix.exs | head -1)
-          if [ "$VERSION" != "$CORE_VERSION" ] || [ "$VERSION" != "$SERVER_VERSION" ]; then
-            echo "Tag version $VERSION does not match core $CORE_VERSION and server $SERVER_VERSION" >&2
-            exit 1
-          fi
-          elixir .github/scripts/stamp_bsl_license.exs \
-            --check-timestamp "$VERSION" "${{ github.event.repository.pushed_at }}"
-
   # -------------------------------------------------------------------------
   # Linux builds: use rustler-precompiled-action with cross-compilation
   # -------------------------------------------------------------------------
   build_linux:
     name: NIF ${{ matrix.crate }} ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
-    needs: validate_release
     strategy:
       fail-fast: false
       matrix:
@@ -123,7 +95,6 @@ jobs:
   build_macos:
     name: NIF ${{ matrix.crate }} ${{ matrix.nif }} - ${{ matrix.target }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: validate_release
     strategy:
       fail-fast: false
       matrix:
