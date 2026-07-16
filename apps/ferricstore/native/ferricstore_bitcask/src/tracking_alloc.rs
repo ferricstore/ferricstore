@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+static TOTAL_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
 pub struct TrackingAllocator;
 
 // SAFETY: We delegate entirely to `System` which is itself a valid
@@ -21,6 +24,9 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+
+            #[cfg(test)]
+            TOTAL_ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
         }
         ptr
     }
@@ -59,6 +65,11 @@ pub fn tracked_allocated_bytes() -> Option<u64> {
     } else {
         None
     }
+}
+
+#[cfg(test)]
+fn total_allocated_bytes() -> u64 {
+    TOTAL_ALLOCATED.load(Ordering::Relaxed) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -159,15 +170,16 @@ mod tests {
 
     #[test]
     fn large_allocation_tracked() {
-        let before = allocated_bytes();
-        let v: Vec<u8> = vec![0u8; 100 * 1024 * 1024]; // 100 MB
-        let after = allocated_bytes();
+        let allocation_bytes = 100 * 1024 * 1024;
+        let before = total_allocated_bytes();
+        let v: Vec<u8> = vec![0u8; allocation_bytes];
+        std::hint::black_box(&v);
+        let after = total_allocated_bytes();
         let increase = after - before;
-        // Should track at least ~99 MB (Vec may allocate slightly less due to
-        // allocator rounding, and concurrent threads may free memory)
+
         assert!(
-            increase >= 99 * 1024 * 1024,
-            "expected >= 99MB increase, got {increase} bytes ({} MB)",
+            increase >= allocation_bytes as u64,
+            "expected >= 100MB in allocation requests, got {increase} bytes ({} MB)",
             increase / (1024 * 1024)
         );
         drop(v);
