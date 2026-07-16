@@ -438,6 +438,7 @@ defmodule Ferricstore.Application do
 
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
+    Ferricstore.HLC.clear()
     :persistent_term.erase(@started_at_key)
     :ok
   end
@@ -447,6 +448,7 @@ defmodule Ferricstore.Application do
     _ = Ferricstore.Raft.WARaftBackend.stop()
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
+    Ferricstore.HLC.clear()
     :persistent_term.erase(@started_at_key)
     :ok
   end

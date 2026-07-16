@@ -155,6 +155,7 @@ defmodule Ferricstore.ApplicationTest do
         stop_app_if_started(:ferricstore_server)
         assert :ok = Application.stop(:ferricstore)
         assert Ferricstore.Raft.Backend.running() == :undefined
+        assert :persistent_term.get(:ferricstore_hlc_ref, nil) == nil
 
         assert_raise ArgumentError, fn ->
           FerricStore.Instance.get(:default)

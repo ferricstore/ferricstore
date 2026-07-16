@@ -34,8 +34,8 @@ defmodule Ferricstore.HLC do
 
   The GenServer is retained only for:
 
-    * Process supervision -- the `init/1` callback creates the atomics ref and
-      stores it in `:persistent_term`.
+    * Process supervision -- the `init/1` callback creates the atomics ref on
+      first start and reuses it across child restarts.
 
   Packed layout in a single unsigned 64-bit atomic:
 
@@ -155,9 +155,10 @@ defmodule Ferricstore.HLC do
   @doc """
   Starts the HLC GenServer.
 
-  The GenServer creates an `:atomics` ref on init and stores it in
+  The GenServer creates an `:atomics` ref on first init and stores it in
   `:persistent_term` so that `now/0` and `now_ms/0` can read/write it
-  without a GenServer call.
+  without a GenServer call. A supervised child restart reuses the existing
+  ref so the clock cannot move backward.
 
   ## Options
 
@@ -168,6 +169,15 @@ defmodule Ferricstore.HLC do
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  @doc false
+  @spec clear() :: :ok
+  def clear do
+    :persistent_term.erase(@atomics_key)
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @doc """
@@ -338,19 +348,17 @@ defmodule Ferricstore.HLC do
 
   @impl true
   def init(_opts) do
-    ref = :atomics.new(1, signed: false)
-    :atomics.put(ref, @slot, 0)
-    :persistent_term.put(@atomics_key, ref)
+    if atomics_ref() == nil do
+      ref = :atomics.new(1, signed: false)
+      :atomics.put(ref, @slot, 0)
+      :persistent_term.put(@atomics_key, ref)
+    end
+
     {:ok, %{}}
   end
 
   @impl true
-  def terminate(_reason, _state) do
-    :persistent_term.erase(@atomics_key)
-    :ok
-  rescue
-    ArgumentError -> :ok
-  end
+  def terminate(_reason, _state), do: :ok
 
   # ---------------------------------------------------------------------------
   # Private helpers

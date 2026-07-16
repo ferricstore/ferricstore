@@ -80,6 +80,30 @@ defmodule Ferricstore.HLCTest do
     end
   end
 
+  describe "supervised restart" do
+    test "preserves the last published timestamp when the HLC child crashes" do
+      old_pid = Process.whereis(HLC)
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+
+      on_exit(fn ->
+        case :persistent_term.get(:ferricstore_hlc_ref, nil) do
+          nil -> :ok
+          current_ref -> :atomics.put(current_ref, 1, 0)
+        end
+      end)
+
+      future_ms = System.os_time(:millisecond) + 60_000
+      packed = Bitwise.bsl(future_ms, 16) + 42
+      :atomics.put(ref, 1, packed)
+
+      Process.exit(old_pid, :kill)
+      new_pid = wait_for_hlc_restart(old_pid, 100)
+
+      assert is_pid(new_pid)
+      assert :atomics.get(:persistent_term.get(:ferricstore_hlc_ref), 1) >= packed
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # now_ms/0 -- monotonic millisecond convenience (lock-free)
   # ---------------------------------------------------------------------------
@@ -448,6 +472,19 @@ defmodule Ferricstore.HLCTest do
       :persistent_term.erase(:ferricstore_hlc_ref)
 
       assert HLC.drift_ms() == 0
+    end
+  end
+
+  defp wait_for_hlc_restart(_old_pid, 0), do: nil
+
+  defp wait_for_hlc_restart(old_pid, attempts) do
+    case Process.whereis(HLC) do
+      pid when is_pid(pid) and pid != old_pid ->
+        pid
+
+      _ ->
+        Process.sleep(10)
+        wait_for_hlc_restart(old_pid, attempts - 1)
     end
   end
 end
