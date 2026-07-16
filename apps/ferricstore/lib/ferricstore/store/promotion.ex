@@ -1666,9 +1666,20 @@ defmodule Ferricstore.Store.Promotion do
       |> Enum.map(&{:delete, &1})
       |> Kernel.++([{:delete, marker_key}])
 
-    case NIF.v2_append_ops_batch(active_path, cleanup_ops) do
-      {:ok, _locations} ->
-        :ok
+    case append_recovery_cleanup_ops(active_path, cleanup_ops) do
+      {:ok, locations} ->
+        case AppendResult.validate_operation_locations(locations, cleanup_ops) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            fail_recovery!(
+              :cleanup_expired_promoted,
+              redis_key,
+              shard_index,
+              {:tombstone_records, reason}
+            )
+        end
 
       {:error, reason} ->
         fail_recovery!(
@@ -1685,6 +1696,19 @@ defmodule Ferricstore.Store.Promotion do
           shard_index,
           {:unexpected_tombstone_result, other}
         )
+    end
+  end
+
+  defp append_recovery_cleanup_ops(active_path, cleanup_ops) do
+    case Process.get(:ferricstore_promotion_recovery_cleanup_append_hook) do
+      hook when is_function(hook, 2) ->
+        case hook.(active_path, cleanup_ops) do
+          :passthrough -> NIF.v2_append_ops_batch(active_path, cleanup_ops)
+          result -> result
+        end
+
+      _missing ->
+        NIF.v2_append_ops_batch(active_path, cleanup_ops)
     end
   end
 
@@ -2208,9 +2232,15 @@ defmodule Ferricstore.Store.Promotion do
   @doc "Returns the active (highest file_id) log file path in a dedicated directory."
   @spec find_active(binary()) :: binary()
   def find_active(path) do
-    case list_log_files(path) do
-      [] -> Path.join(path, "00000.log")
-      files -> files |> List.last() |> elem(1)
+    case list_log_files_result(path) do
+      {:ok, []} ->
+        Path.join(path, "00000.log")
+
+      {:ok, files} ->
+        files |> List.last() |> elem(1)
+
+      {:error, reason} ->
+        raise "promotion active-file discovery failed for #{inspect(path)}: #{inspect(reason)}"
     end
   end
 
@@ -2386,15 +2416,6 @@ defmodule Ferricstore.Store.Promotion do
     |> Path.basename()
     |> String.trim_trailing(".log")
     |> String.to_integer()
-  end
-
-  # Returns all .log files in a directory as [{file_id, full_path}], sorted by file_id.
-  # Cleans up leftover compact_*.log temp files from crashed compaction.
-  defp list_log_files(dir) do
-    case list_log_files_result(dir) do
-      {:ok, files} -> files
-      {:error, _reason} -> []
-    end
   end
 
   defp list_log_files_result(dir) do

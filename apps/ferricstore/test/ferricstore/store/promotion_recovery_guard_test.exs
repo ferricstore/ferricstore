@@ -91,6 +91,15 @@ defmodule Ferricstore.Store.PromotionRecoveryGuardTest do
     assert Promotion.find_active(dedicated_path) == active_path
   end
 
+  test "dedicated active-file discovery fails closed when the directory cannot be listed", ctx do
+    invalid_path = Path.join(ctx.data_dir, "dedicated-not-a-directory")
+    File.write!(invalid_path, "not a directory")
+
+    assert_raise RuntimeError, ~r/promotion active-file discovery failed.*not_a_directory/, fn ->
+      Promotion.find_active(invalid_path)
+    end
+  end
+
   test "promoted directory accounting ignores numeric symlinks", ctx do
     dedicated_path = Path.join(ctx.data_dir, "dedicated-size-symlink-guard")
     File.mkdir_p!(dedicated_path)
@@ -391,6 +400,41 @@ defmodule Ferricstore.Store.PromotionRecoveryGuardTest do
 
     assert %{} = Promotion.recover_promoted(ctx.shard_path, ctx.keydir, ctx.data_dir, 0)
     assert [] = :ets.lookup(ctx.keydir, marker)
+  end
+
+  test "expired cleanup rejects incomplete tombstone batch results", ctx do
+    redis_key = "expired-cleanup-short-batch"
+    {marker, _offset, _value_size} = put_marker(ctx, redis_key, "hash")
+    {:ok, dedicated_path} = Promotion.open_dedicated(ctx.data_dir, 0, :hash, redis_key)
+    dedicated_log = Promotion.find_active(dedicated_path)
+    expired_at_ms = HLC.now_ms() - 1
+
+    assert {:ok, {_offset, _value_size}} =
+             NIF.v2_append_record(
+               dedicated_log,
+               CompoundKey.type_key(redis_key),
+               "hash",
+               expired_at_ms
+             )
+
+    Process.put(:ferricstore_promotion_recovery_cleanup_append_hook, fn _path, _ops ->
+      {:ok, []}
+    end)
+
+    try do
+      assert_raise RuntimeError,
+                   ~r/cleanup_expired_promoted failed.*location_count_mismatch/,
+                   fn ->
+                     Promotion.recover_promoted(ctx.shard_path, ctx.keydir, ctx.data_dir, 0)
+                   end
+    after
+      Process.delete(:ferricstore_promotion_recovery_cleanup_append_hook)
+    end
+
+    refute File.dir?(dedicated_path)
+    :ets.delete_all_objects(ctx.keydir)
+    assert :ok = ShardLifecycle.recover_keydir(ctx.shard_path, ctx.keydir, 0)
+    assert [{^marker, nil, 0, _lfu, 0, _offset, _value_size}] = :ets.lookup(ctx.keydir, marker)
   end
 
   test "a dedicated type with no live members is durably cleaned", ctx do
