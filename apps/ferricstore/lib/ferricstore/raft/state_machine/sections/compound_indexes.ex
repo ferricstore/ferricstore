@@ -569,49 +569,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp keydir_binary_ref(
-             %{instance_ctx: %{keydir_binary_bytes: ref, shard_count: count}} = state
-           )
-           when ref != nil do
-        shard_index = metrics_shard_index(state)
-        if shard_index < count, do: ref, else: nil
+      defp keydir_binary_ref(%{instance_ctx: ctx} = state) when is_map(ctx) do
+        keydir_binary_ref_from_ctx(ctx, metrics_shard_index(state))
       end
 
       defp keydir_binary_ref(%{instance_name: name} = state) when is_atom(name) do
-        keydir_binary_ref_for_instance(name, metrics_shard_index(state))
+        state
+        |> instance_ctx_for_state()
+        |> keydir_binary_ref_from_ctx(metrics_shard_index(state))
       end
 
-      defp keydir_binary_ref(state) do
-        keydir_binary_ref_for_instance(:default, metrics_shard_index(state))
-      end
+      defp keydir_binary_ref(_state), do: nil
 
-      defp expiry_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
-
-      defp expiry_instance_ctx(%{instance_name: name}) when is_atom(name) do
-        try do
-          FerricStore.Instance.get(name)
-        rescue
-          _ -> nil
-        catch
-          :exit, _ -> nil
-        end
-      end
-
-      defp expiry_instance_ctx(_state), do: nil
+      defp expiry_instance_ctx(state), do: instance_ctx_for_state(state)
 
       defp metrics_shard_index(%{shard_index: shard_index}), do: shard_index
       defp metrics_shard_index(%{index: index}), do: index
 
-      defp keydir_binary_ref_for_instance(name, shard_index) do
-        try do
-          %{keydir_binary_bytes: ref, shard_count: count} = FerricStore.Instance.get(name)
-          if ref != nil and shard_index < count, do: ref, else: nil
-        rescue
-          _ -> nil
-        catch
-          :exit, _ -> nil
-        end
+      defp keydir_binary_ref_from_ctx(
+             %{keydir_binary_bytes: ref, shard_count: count},
+             shard_index
+           )
+           when ref != nil and shard_index < count do
+        ref
       end
+
+      defp keydir_binary_ref_from_ctx(_ctx, _shard_index), do: nil
 
       defp binary_byte_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
       defp binary_byte_size(_), do: 0

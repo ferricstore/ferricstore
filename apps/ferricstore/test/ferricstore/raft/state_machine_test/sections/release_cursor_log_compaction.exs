@@ -670,14 +670,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
                shard_index: shard_index
              } do
           instance_name = :"cursor_metric_instance_#{System.unique_integer([:positive])}"
-          root = Path.join(System.tmp_dir!(), Atom.to_string(instance_name))
-          File.rm_rf!(root)
-          File.mkdir_p!(root)
 
           instance_ctx =
             FerricStore.Instance.build(instance_name,
               shard_count: shard_index + 1,
-              data_dir: root
+              data_dir: state.data_dir
             )
 
           :atomics.put(instance_ctx.replay_safe_index, shard_index + 1, 77)
@@ -686,7 +683,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
 
           on_exit({:cursor_metric_instance, instance_name}, fn ->
             FerricStore.Instance.cleanup(instance_name)
-            File.rm_rf!(root)
           end)
 
           state = %{
@@ -711,16 +707,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
                ets: ets
              } do
           instance_name = :"cursor_dirty_instance_#{System.unique_integer([:positive])}"
-          root = Path.join(System.tmp_dir!(), Atom.to_string(instance_name))
-          File.rm_rf!(root)
-          File.mkdir_p!(root)
-
-          instance_ctx = FerricStore.Instance.build(instance_name, shard_count: 1, data_dir: root)
-
-          on_exit({:cursor_dirty_instance, instance_name}, fn ->
-            FerricStore.Instance.cleanup(instance_name)
-            File.rm_rf!(root)
-          end)
 
           state =
             init_state_for_release_cursor(ets,
@@ -729,6 +715,16 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
               instance_ctx: nil,
               instance_name: instance_name
             )
+
+          instance_ctx =
+            FerricStore.Instance.build(instance_name,
+              shard_count: 1,
+              data_dir: state.data_dir
+            )
+
+          on_exit({:cursor_dirty_instance, instance_name}, fn ->
+            FerricStore.Instance.cleanup(instance_name)
+          end)
 
           meta = %{index: 88, term: 1, system_time: System.os_time(:millisecond)}
 

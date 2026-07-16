@@ -731,11 +731,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       defp instance_ctx_for_state(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
 
-      defp instance_ctx_for_state(%{instance_name: name}) when is_atom(name) do
-        instance_ctx_by_name(name)
+      # A reused instance name must not bind recovered state to a different data root.
+      defp instance_ctx_for_state(%{instance_name: name} = state) when is_atom(name) do
+        case instance_ctx_by_name(name) do
+          %FerricStore.Instance{} = ctx ->
+            if instance_data_path?(ctx, state), do: ctx, else: nil
+
+          _missing ->
+            nil
+        end
       end
 
-      defp instance_ctx_for_state(_state), do: instance_ctx_by_name(:default)
+      defp instance_ctx_for_state(_state), do: nil
 
       defp instance_ctx_by_name(name) do
         FerricStore.Instance.get(name)

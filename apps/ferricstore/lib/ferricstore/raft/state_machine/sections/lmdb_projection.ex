@@ -736,17 +736,38 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp live_active_file(state) do
         try do
-          {file_id, file_path, shard_data_path} =
-            Ferricstore.Store.ActiveFile.get(state.instance_ctx, state.shard_index)
+          case active_file_instance_ctx(state) do
+            {:ok, ctx} ->
+              {file_id, file_path, shard_data_path} =
+                Ferricstore.Store.ActiveFile.get(ctx, state.shard_index)
 
-          if active_file_shard_path?(state, shard_data_path) and
-               Ferricstore.FS.exists?(file_path) do
-            {file_path, file_id}
-          else
-            :stale
+              if active_file_shard_path?(state, shard_data_path) and
+                   Ferricstore.FS.exists?(file_path) do
+                {file_path, file_id}
+              else
+                :stale
+              end
+
+            :stale ->
+              :stale
           end
         rescue
           _ -> :stale
+        end
+      end
+
+      defp active_file_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx}),
+        do: {:ok, ctx}
+
+      defp active_file_instance_ctx(%{instance_ctx: ctx}) when is_map(ctx), do: {:ok, ctx}
+
+      defp active_file_instance_ctx(%{instance_name: :default} = state),
+        do: {:ok, instance_ctx_for_state(state)}
+
+      defp active_file_instance_ctx(state) do
+        case instance_ctx_for_state(state) do
+          %FerricStore.Instance{} = ctx -> {:ok, ctx}
+          _unresolved -> :stale
         end
       end
 

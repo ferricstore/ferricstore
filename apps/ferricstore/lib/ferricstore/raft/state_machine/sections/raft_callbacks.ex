@@ -935,16 +935,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
            when is_atom(field) and is_integer(index) and index >= 0 do
         instance_ctx =
           case Map.get(state, :instance_ctx) do
+            %FerricStore.Instance{} -> instance_ctx_for_state(state)
             ctx when is_map(ctx) -> ctx
-            _ -> instance_ctx_by_name(Map.get(state, :instance_name, :default))
+            _missing -> instance_ctx_for_state(state)
           end
 
-        case Map.get(instance_ctx, field) do
-          ref when is_reference(ref) ->
-            size = :atomics.info(ref).size
-            if shard_index < size, do: :atomics.put(ref, shard_index + 1, index)
+        case instance_ctx do
+          ctx when is_map(ctx) ->
+            case Map.get(ctx, field) do
+              ref when is_reference(ref) ->
+                size = :atomics.info(ref).size
+                if shard_index < size, do: :atomics.put(ref, shard_index + 1, index)
 
-          _ ->
+              _missing ->
+                :ok
+            end
+
+          _missing ->
             :ok
         end
       rescue

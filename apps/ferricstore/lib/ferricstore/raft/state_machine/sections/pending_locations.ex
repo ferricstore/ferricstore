@@ -908,21 +908,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
         _ -> :ok
       end
 
+      defp checkpoint_ctx_for_state(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
+
       defp checkpoint_ctx_for_state(%{instance_ctx: ctx}) when is_map(ctx), do: ctx
 
-      defp checkpoint_ctx_for_state(%{instance_name: :default} = state) do
-        case instance_ctx_by_name(:default) do
-          %FerricStore.Instance{} = ctx ->
-            if instance_data_path?(ctx, state), do: ctx, else: nil
-
-          _ ->
-            nil
-        end
-      end
-
-      defp checkpoint_ctx_for_state(%{instance_name: name}) when is_atom(name) do
-        instance_ctx_by_name(name)
-      end
+      defp checkpoint_ctx_for_state(%{instance_name: name} = state) when is_atom(name),
+        do: instance_ctx_for_state(state)
 
       defp checkpoint_ctx_for_state(_state), do: nil
 
