@@ -674,7 +674,7 @@ defmodule Ferricstore.Flow.DueCatalog do
     do: score >= 0 and score <= @max_exact_score
 
   defp valid_score?(score) when is_float(score),
-    do: score == score and score >= 0.0 and score <= @max_exact_score
+    do: score >= 0.0 and score <= @max_exact_score
 
   defp valid_score?(_score), do: false
 
