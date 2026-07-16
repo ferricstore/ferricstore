@@ -25,6 +25,13 @@ defmodule Ferricstore.Flow.PipelineClaimDueTest do
     }
   end
 
+  test "results preserves accumulated results for an empty command batch" do
+    accumulated = [{:error, "ERR second"}, {:error, "ERR first"}]
+
+    assert {[{:error, "ERR first"}, {:error, "ERR second"}], stats()} ==
+             PipelineClaimDue.results([], :ctx, accumulated, stats(), callbacks())
+  end
+
   test "results preserves errors and coalesces globally compatible claims" do
     claim_a = %{
       type: "email",

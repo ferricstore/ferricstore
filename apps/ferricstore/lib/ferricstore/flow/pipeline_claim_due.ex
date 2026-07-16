@@ -5,6 +5,8 @@ defmodule Ferricstore.Flow.PipelineClaimDue do
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
 
+  def results([], _ctx, acc, stats, _callbacks), do: {Enum.reverse(acc), stats}
+
   def results(commands, ctx, acc, stats, callbacks) do
     if global_grouping_safe?(commands) do
       grouped_results(commands, ctx, stats, callbacks)
