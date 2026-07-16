@@ -753,29 +753,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       defp apply_flush_shard_pages(_state, :"$end_of_table", deleted), do: {:ok, deleted}
 
       defp apply_flush_shard_pages(state, {keys, continuation}, deleted) do
-        delete_keys = Enum.reject(keys, &flush_shard_preserved_key?(state, &1))
+        {preserved_keys, delete_keys} =
+          Enum.split_with(keys, &flush_shard_preserved_key?(state, &1))
 
-        with {:ok, page_deleted} <- apply_flush_shard_page(state, delete_keys) do
+        with {:ok, page_deleted} <-
+               apply_flush_shard_page(state, preserved_keys, delete_keys) do
           apply_flush_shard_pages(state, :ets.select(continuation), deleted + page_deleted)
         end
       end
 
-      defp apply_flush_shard_page(_state, []), do: {:ok, 0}
+      defp apply_flush_shard_page(_state, [], []), do: {:ok, 0}
 
-      defp apply_flush_shard_page(state, keys) do
-        stream_roots = FlushDerivedState.stream_roots(state, keys)
+      defp apply_flush_shard_page(state, preserved_keys, delete_keys) do
+        stream_roots = FlushDerivedState.stream_roots(state, delete_keys)
 
         with :ok <- FlushDerivedState.clear_stream_roots(state, stream_roots),
-             results when is_list(results) <-
-               with_pending_writes(state, fn -> apply_delete_batch_keys(state, keys) end),
-             true <- length(results) == length(keys) and Enum.all?(results, &(&1 == :ok)) do
-          {:ok, length(keys)}
+             {:ok, results} <-
+               with_pending_writes(state, fn ->
+                 with :ok <- rewrite_flush_shard_preserved_keys(state, preserved_keys) do
+                   {:ok, apply_delete_batch_keys(state, delete_keys)}
+                 end
+               end),
+             true <-
+               length(results) == length(delete_keys) and Enum.all?(results, &(&1 == :ok)) do
+          {:ok, length(delete_keys)}
         else
-          {:error, {:flush_shard_delete_failed, _reason}} = error -> error
-          {:error, reason} -> {:error, {:flush_shard_delete_failed, reason}}
-          false -> {:error, {:flush_shard_delete_failed, :invalid_delete_results}}
-          other -> {:error, {:flush_shard_delete_failed, other}}
+          {:error, {:flush_shard_delete_failed, _reason}} = error ->
+            error
+
+          {:error, {:invalid_preserved_key, _key, _invalid} = reason} ->
+            {:error, {:flush_shard_preserved_rewrite_failed, reason}}
+
+          {:error, reason} ->
+            {:error, {:flush_shard_delete_failed, reason}}
+
+          false ->
+            {:error, {:flush_shard_delete_failed, :invalid_delete_results}}
+
+          other ->
+            {:error, {:flush_shard_delete_failed, other}}
         end
+      end
+
+      defp rewrite_flush_shard_preserved_keys(state, keys) do
+        Enum.reduce_while(keys, :ok, fn key, :ok ->
+          case do_get_meta(state, key) do
+            {value, expire_at_ms}
+            when is_binary(value) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+              :ok = raw_put(state, key, value, expire_at_ms)
+              {:cont, :ok}
+
+            invalid ->
+              {:halt, {:error, {:invalid_preserved_key, key, invalid}}}
+          end
+        end)
       end
 
       defp flush_shard_preserved_key?(_state, key), do: ServerCatalog.internal_key?(key)

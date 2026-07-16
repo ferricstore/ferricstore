@@ -4,6 +4,7 @@ defmodule Ferricstore.Raft.WARaftBackend.RuntimeSupervisor do
   use Supervisor
 
   alias Ferricstore.Raft.WARaftSegmentReader.TableOwner, as: ApplyProjectionTableOwner
+  alias Ferricstore.Raft.WARaftBackend.SyncGate.TableOwner, as: SyncAdmissionTableOwner
   alias Ferricstore.Store.ActiveFile.TableOwner, as: ActiveFileTableOwner
   alias Ferricstore.Store.BlobStore.TableOwner, as: BlobTableOwner
   alias Ferricstore.Store.ETSTableHeir
@@ -11,6 +12,7 @@ defmodule Ferricstore.Raft.WARaftBackend.RuntimeSupervisor do
   @active_file_table_heir Ferricstore.Store.ActiveFile.TableHeir
   @apply_projection_table_heir Ferricstore.Raft.WARaftSegmentReader.TableHeir
   @blob_table_heir Ferricstore.Store.BlobStore.TableHeir
+  @sync_admission_table_heir Ferricstore.Raft.WARaftBackend.SyncGate.TableHeir
   @kernel_child_id __MODULE__
   @owner_wait_attempts 100
   @owner_wait_ms 10
@@ -57,7 +59,12 @@ defmodule Ferricstore.Raft.WARaftBackend.RuntimeSupervisor do
         {ETSTableHeir, name: @apply_projection_table_heir},
         id: @apply_projection_table_heir
       ),
-      ApplyProjectionTableOwner
+      ApplyProjectionTableOwner,
+      Supervisor.child_spec(
+        {ETSTableHeir, name: @sync_admission_table_heir},
+        id: @sync_admission_table_heir
+      ),
+      SyncAdmissionTableOwner
     ]
 
     Supervisor.init(children, strategy: :one_for_one)
@@ -117,7 +124,8 @@ defmodule Ferricstore.Raft.WARaftBackend.RuntimeSupervisor do
   defp ensure_tables do
     with :ok <- ActiveFileTableOwner.ensure_table(),
          :ok <- BlobTableOwner.ensure_tables(),
-         :ok <- ApplyProjectionTableOwner.ensure_table() do
+         :ok <- ApplyProjectionTableOwner.ensure_table(),
+         :ok <- SyncAdmissionTableOwner.ensure_table() do
       :ok
     end
   end

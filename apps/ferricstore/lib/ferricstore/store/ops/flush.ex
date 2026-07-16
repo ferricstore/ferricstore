@@ -162,16 +162,8 @@ defmodule Ferricstore.Store.Ops.Flush do
   @doc false
   def pause_local_durable(instance_name, shard_count, pause_lease)
       when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
-    with {:ok, ctx} <- local_instance(instance_name, shard_count),
-         :ok <- Batcher.pause_writes_for_sync_all(shard_count, pause_lease, @pause_timeout_ms) do
-      case pause_local_shards(ctx, pause_lease) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          _ = Batcher.resume_writes_for_sync_all(shard_count, pause_lease, @resume_timeout_ms)
-          {:error, reason}
-      end
+    with {:ok, _ctx} <- local_instance(instance_name, shard_count) do
+      Batcher.pause_writes_for_sync_all(shard_count, pause_lease, @pause_timeout_ms)
     end
   end
 
@@ -258,21 +250,8 @@ defmodule Ferricstore.Store.Ops.Flush do
 
   @doc false
   def resume_local_durable(instance_name, shard_count, pause_lease)
-      when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
-    shard_result =
-      case local_instance(instance_name, shard_count) do
-        {:ok, ctx} ->
-          resume_standalone_shards(Tuple.to_list(ctx.shard_names), pause_lease)
-
-        {:error, _reason} = error ->
-          error
-      end
-
-    gate_result =
-      Batcher.resume_writes_for_sync_all(shard_count, pause_lease, @resume_timeout_ms)
-
-    merge_local_resume_results(shard_result, gate_result)
-  end
+      when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0,
+      do: Batcher.resume_writes_for_sync_all(shard_count, pause_lease, @resume_timeout_ms)
 
   def resume_local_durable(_instance_name, shard_count, _pause_lease),
     do: {:error, {:invalid_shard_count, shard_count}}
@@ -317,25 +296,6 @@ defmodule Ferricstore.Store.Ops.Flush do
     GenServer.call(shard, command, timeout)
   catch
     :exit, reason -> {:error, {:shard_call_failed, reason}}
-  end
-
-  defp pause_local_shards(ctx, pause_lease) do
-    ctx.shard_names
-    |> Tuple.to_list()
-    |> Enum.reduce_while({:ok, []}, fn shard, {:ok, paused} ->
-      case call_standalone_shard(shard, {:pause_writes, pause_lease}, @pause_timeout_ms) do
-        :ok ->
-          {:cont, {:ok, [shard | paused]}}
-
-        other ->
-          _ = resume_standalone_shards(Enum.reverse(paused), pause_lease)
-          {:halt, {:error, {:local_shard_pause_failed, shard, other}}}
-      end
-    end)
-    |> case do
-      {:ok, _paused} -> :ok
-      {:error, _reason} = error -> error
-    end
   end
 
   defp flush_replicated_shards(ctx, flush_epoch) do
@@ -798,11 +758,6 @@ defmodule Ferricstore.Store.Ops.Flush do
   catch
     kind, reason -> {:error, {:instance_unavailable, kind, reason}}
   end
-
-  defp merge_local_resume_results(:ok, :ok), do: :ok
-
-  defp merge_local_resume_results(shard_result, gate_result),
-    do: {:error, {:local_resume_failed, shard_result, gate_result}}
 
   defp post_flush_origin_cleanup(ctx) do
     :ok = clear_stream_tables(ctx)

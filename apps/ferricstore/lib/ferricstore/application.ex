@@ -245,6 +245,12 @@ defmodule Ferricstore.Application do
               id: Ferricstore.Raft.WARaftSegmentReader.TableHeir
             ),
             Ferricstore.Raft.WARaftSegmentReader.TableOwner,
+            Supervisor.child_spec(
+              {Ferricstore.Store.ETSTableHeir,
+               name: Ferricstore.Raft.WARaftBackend.SyncGate.TableHeir},
+              id: Ferricstore.Raft.WARaftBackend.SyncGate.TableHeir
+            ),
+            Ferricstore.Raft.WARaftBackend.SyncGate.TableOwner,
             Ferricstore.Raft.WARaftBackend.BatcherSupervisor,
             Supervisor.child_spec(
               {Ferricstore.Store.ETSTableHeir,

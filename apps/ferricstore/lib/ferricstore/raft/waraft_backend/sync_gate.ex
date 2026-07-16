@@ -3,11 +3,11 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   use GenServer
 
-  @active_index 1
-  @state_key {__MODULE__, :state}
+  alias Ferricstore.Raft.WARaftBackend.SyncGate.TableOwner
+
   @pause_key {__MODULE__, :pause}
 
-  @type token :: {non_neg_integer(), :atomics.atomics_ref()}
+  @type token :: {non_neg_integer(), reference()}
   @type pause_lease :: {pid(), reference()}
 
   @spec lease(pid()) :: pause_lease()
@@ -15,17 +15,16 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   @spec init_shards(pos_integer()) :: :ok
   def init_shards(shard_count) when is_integer(shard_count) and shard_count > 0 do
-    Enum.each(0..(shard_count - 1), &ensure_state/1)
-    :ok
+    TableOwner.ensure_table()
   end
 
-  def init_shards(_shard_count), do: :ok
+  def init_shards(_shard_count), do: TableOwner.ensure_table()
 
   @spec clear_shards(non_neg_integer()) :: :ok
   def clear_shards(shard_count) when is_integer(shard_count) and shard_count > 0 do
     Enum.each(0..(shard_count - 1), fn shard_index ->
       _ = force_resume(shard_index, 5_000)
-      :persistent_term.erase(state_key(shard_index))
+      delete_shard_admissions(shard_index)
       :persistent_term.erase(pause_key(shard_index))
     end)
 
@@ -36,23 +35,20 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   @spec enter(non_neg_integer()) :: {:ok, token()} | {:error, term()}
   def enter(shard_index) when is_integer(shard_index) and shard_index >= 0 do
-    counters = ensure_state(shard_index)
-    :atomics.add(counters, @active_index, 1)
+    with {:ok, token} <- claim(shard_index) do
+      case pause_pid(shard_index) do
+        nil ->
+          {:ok, token}
 
-    case pause_pid(shard_index) do
-      nil ->
-        {:ok, {shard_index, counters}}
+        pid ->
+          leave(token)
 
-      pid ->
-        leave({shard_index, counters})
-
-        case await(pid, :infinity) do
-          :ok -> enter(shard_index)
-          {:error, _reason} = error -> error
-        end
+          case await(pid, :infinity) do
+            :ok -> enter(shard_index)
+            {:error, _reason} = error -> error
+          end
+      end
     end
-  catch
-    :error, reason -> {:error, {:sync_gate_enter_failed, reason}}
   end
 
   def enter(shard_index), do: {:error, {:invalid_shard_index, shard_index}}
@@ -71,17 +67,34 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   def enter_many(shard_indexes), do: {:error, {:invalid_shard_indexes, shard_indexes}}
 
   @spec leave(token()) :: :ok
-  def leave({shard_index, counters})
-      when is_integer(shard_index) and shard_index >= 0 do
-    case :atomics.sub_get(counters, @active_index, 1) do
-      0 -> notify_drained(shard_index)
-      active when is_integer(active) and active > 0 -> :ok
-    end
+  def leave({shard_index, admission_ref})
+      when is_integer(shard_index) and shard_index >= 0 and is_reference(admission_ref) do
+    _ = take_admission(shard_index, admission_ref)
+    notify_admission_changed(shard_index)
+    :ok
   catch
     :error, _reason -> :ok
   end
 
   def leave(_token), do: :ok
+
+  @spec transfer(token(), pid()) :: :ok | {:error, term()}
+  def transfer({shard_index, admission_ref}, owner_pid)
+      when is_integer(shard_index) and shard_index >= 0 and is_reference(admission_ref) and
+             is_pid(owner_pid) do
+    case update_admission_owner(shard_index, admission_ref, owner_pid) do
+      true ->
+        notify_admission_changed(shard_index)
+        :ok
+
+      false ->
+        {:error, :unknown_sync_admission}
+    end
+  catch
+    :error, reason -> {:error, {:sync_gate_transfer_failed, reason}}
+  end
+
+  def transfer(_token, _owner_pid), do: {:error, :invalid_sync_admission}
 
   defp do_enter_many([]), do: {:ok, []}
 
@@ -121,15 +134,19 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   end
 
   defp claim(shard_index) do
-    counters = ensure_state(shard_index)
-    :atomics.add(counters, @active_index, 1)
-    {:ok, {shard_index, counters}}
+    admission_ref = make_ref()
+    token = {shard_index, admission_ref}
+
+    case insert_admission(shard_index, admission_ref, self()) do
+      true -> {:ok, token}
+      false -> {:error, :sync_gate_admission_conflict}
+    end
   catch
     :error, reason -> {:error, {:sync_gate_enter_failed, reason}}
   end
 
   defp active_pauses(tokens) do
-    Enum.flat_map(tokens, fn {shard_index, _counters} ->
+    Enum.flat_map(tokens, fn {shard_index, _admission_ref} ->
       case pause_pid(shard_index) do
         nil -> []
         pid -> [{shard_index, pid}]
@@ -148,9 +165,9 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   @spec pause(non_neg_integer()) :: {:ok, pid()} | {:error, term()}
   def pause(shard_index) when is_integer(shard_index) and shard_index >= 0 do
-    case GenServer.start(__MODULE__, {:legacy, shard_index}, name: name(shard_index)) do
+    case GenServer.start(__MODULE__, {:unscoped, shard_index}, name: name(shard_index)) do
       {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> acquire_existing_legacy_pause(shard_index, pid)
+      {:error, {:already_started, pid}} -> acquire_existing_unscoped_pause(shard_index, pid)
       {:error, reason} -> {:error, reason}
     end
   end
@@ -352,9 +369,9 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   def name(shard_index), do: :"ferricstore_waraft_sync_gate_#{shard_index}"
 
   @impl true
-  def init({:legacy, shard_index}) do
+  def init({:unscoped, shard_index}) do
     state = initial_pause_state(shard_index)
-    {:ok, %{state | legacy_holds: 1}}
+    {:ok, %{state | unscoped_holds: 1}}
   end
 
   def init({shard_index, pause_lease}) do
@@ -367,8 +384,8 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   end
 
   @impl true
-  def handle_call(:acquire_legacy, _from, state) do
-    {:reply, :ok, %{state | legacy_holds: state.legacy_holds + 1}}
+  def handle_call(:acquire_unscoped, _from, state) do
+    {:reply, :ok, %{state | unscoped_holds: state.unscoped_holds + 1}}
   end
 
   def handle_call({:acquire, pause_lease}, _from, state) do
@@ -383,16 +400,18 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   end
 
   def handle_call(:await_drained, from, state) do
-    if active_count(state.counters) == 0 do
+    state = refresh_admission_monitors(state)
+
+    if admissions_empty?(state.shard_index) do
       {:reply, :ok, state}
     else
       {:noreply, %{state | drain_waiters: [from | state.drain_waiters]}}
     end
   end
 
-  def handle_call(:resume, _from, %{legacy_holds: legacy_holds} = state)
-      when legacy_holds > 0 do
-    state = %{state | legacy_holds: legacy_holds - 1}
+  def handle_call(:resume, _from, %{unscoped_holds: unscoped_holds} = state)
+      when unscoped_holds > 0 do
+    state = %{state | unscoped_holds: unscoped_holds - 1}
     maybe_release_pause(state)
   end
 
@@ -409,13 +428,16 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   end
 
   defp release_pause(state) do
+    state = demonitor_admission_owners(state)
     unpublish_pause(state.shard_index)
     Enum.each(state.waiters, &GenServer.reply(&1, :ok))
     Enum.each(state.drain_waiters, &GenServer.reply(&1, {:error, :sync_pause_released}))
-    {:stop, :normal, :ok, %{state | waiters: []}}
+
+    {:stop, :normal, :ok,
+     %{state | waiters: [], drain_waiters: [], admission_owners: %{}, admission_monitors: %{}}}
   end
 
-  defp maybe_release_pause(%{legacy_holds: 0, leases: leases} = state)
+  defp maybe_release_pause(%{unscoped_holds: 0, leases: leases} = state)
        when map_size(leases) == 0,
        do: release_pause(state)
 
@@ -427,13 +449,19 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     {:noreply, state}
   end
 
+  def handle_cast(:admission_changed, state) do
+    state = maybe_reply_drained(state)
+    {:noreply, state}
+  end
+
   @impl true
   def handle_info({:DOWN, monitor_ref, :process, owner_pid, _reason}, state) do
     case Map.get(state.monitor_owners, monitor_ref) do
       ^owner_pid ->
         state = remove_owner_leases(state, owner_pid, false)
 
-        if state.legacy_holds == 0 and map_size(state.leases) == 0 do
+        if state.unscoped_holds == 0 and map_size(state.leases) == 0 do
+          state = demonitor_admission_owners(state)
           unpublish_pause(state.shard_index)
           Enum.each(state.waiters, &GenServer.reply(&1, :ok))
 
@@ -442,24 +470,34 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
             &GenServer.reply(&1, {:error, :sync_pause_released})
           )
 
-          {:stop, :normal, %{state | waiters: [], drain_waiters: []}}
+          {:stop, :normal,
+           %{
+             state
+             | waiters: [],
+               drain_waiters: [],
+               admission_owners: %{},
+               admission_monitors: %{}
+           }}
         else
           {:noreply, state}
         end
 
       _unknown_monitor ->
-        {:noreply, state}
+        handle_admission_owner_down(state, monitor_ref, owner_pid)
     end
   end
 
   @impl true
   def terminate(_reason, state) do
+    _ = demonitor_admission_owners(state)
     unpublish_pause(state.shard_index)
     :ok
   end
 
   defp maybe_reply_drained(state) do
-    if active_count(state.counters) == 0 do
+    state = refresh_admission_monitors(state)
+
+    if admissions_empty?(state.shard_index) do
       Enum.each(state.drain_waiters, &GenServer.reply(&1, :ok))
       %{state | drain_waiters: []}
     else
@@ -467,16 +505,14 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     end
   end
 
-  defp notify_drained(shard_index) do
+  defp notify_admission_changed(shard_index) do
     case pause_pid(shard_index) do
       nil -> :ok
-      pid -> GenServer.cast(pid, :drained)
+      pid -> GenServer.cast(pid, :admission_changed)
     end
   catch
     :exit, _reason -> :ok
   end
-
-  defp active_count(counters), do: :atomics.get(counters, @active_index)
 
   defp sync_gate_deadline(:infinity), do: :infinity
 
@@ -488,52 +524,24 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   defp sync_gate_remaining(deadline),
     do: max(deadline - System.monotonic_time(:millisecond), 0)
 
-  defp ensure_state(shard_index) do
-    case :persistent_term.get(state_key(shard_index), nil) do
-      nil ->
-        initialize_state(shard_index)
-
-      counters ->
-        counters
-    end
-  end
-
-  defp initialize_state(shard_index) do
-    :global.trans(
-      {{__MODULE__, {:state, shard_index}}, self()},
-      fn ->
-        case :persistent_term.get(state_key(shard_index), nil) do
-          nil ->
-            counters = :atomics.new(1, signed: false)
-            :persistent_term.put(state_key(shard_index), counters)
-            counters
-
-          counters ->
-            counters
-        end
-      end,
-      [node()]
-    )
-  end
-
   defp initial_pause_state(shard_index) do
-    counters = ensure_state(shard_index)
     :persistent_term.put(pause_key(shard_index), self())
 
     %{
       shard_index: shard_index,
-      counters: counters,
       waiters: [],
       drain_waiters: [],
-      legacy_holds: 0,
+      unscoped_holds: 0,
       leases: %{},
       owners: %{},
-      monitor_owners: %{}
+      monitor_owners: %{},
+      admission_owners: %{},
+      admission_monitors: %{}
     }
   end
 
-  defp acquire_existing_legacy_pause(shard_index, pid) do
-    case GenServer.call(pid, :acquire_legacy, 5_000) do
+  defp acquire_existing_unscoped_pause(shard_index, pid) do
+    case GenServer.call(pid, :acquire_unscoped, 5_000) do
       :ok -> {:ok, pid}
       other -> {:error, {:sync_pause_acquire_failed, other}}
     end
@@ -647,7 +655,144 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
       Process.demonitor(owner.monitor_ref, [:flush])
     end)
 
-    %{state | legacy_holds: 0, leases: %{}, owners: %{}, monitor_owners: %{}}
+    %{state | unscoped_holds: 0, leases: %{}, owners: %{}, monitor_owners: %{}}
+  end
+
+  defp handle_admission_owner_down(state, monitor_ref, owner_pid) do
+    case Map.get(state.admission_monitors, monitor_ref) do
+      ^owner_pid ->
+        delete_owner_admissions(state.shard_index, owner_pid)
+
+        state =
+          %{
+            state
+            | admission_owners: Map.delete(state.admission_owners, owner_pid),
+              admission_monitors: Map.delete(state.admission_monitors, monitor_ref)
+          }
+
+        {:noreply, maybe_reply_drained(state)}
+
+      _unknown_monitor ->
+        {:noreply, state}
+    end
+  end
+
+  defp refresh_admission_monitors(state) do
+    owners =
+      state.shard_index
+      |> live_admission_owners()
+      |> MapSet.new()
+
+    state =
+      Enum.reduce(state.admission_owners, state, fn {owner_pid, monitor_ref}, acc ->
+        if MapSet.member?(owners, owner_pid) do
+          acc
+        else
+          Process.demonitor(monitor_ref, [:flush])
+
+          %{
+            acc
+            | admission_owners: Map.delete(acc.admission_owners, owner_pid),
+              admission_monitors: Map.delete(acc.admission_monitors, monitor_ref)
+          }
+        end
+      end)
+
+    Enum.reduce(owners, state, fn owner_pid, acc ->
+      if Map.has_key?(acc.admission_owners, owner_pid) do
+        acc
+      else
+        monitor_ref = Process.monitor(owner_pid)
+
+        %{
+          acc
+          | admission_owners: Map.put(acc.admission_owners, owner_pid, monitor_ref),
+            admission_monitors: Map.put(acc.admission_monitors, monitor_ref, owner_pid)
+        }
+      end
+    end)
+  end
+
+  defp demonitor_admission_owners(state) do
+    Enum.each(state.admission_owners, fn {_owner_pid, monitor_ref} ->
+      Process.demonitor(monitor_ref, [:flush])
+    end)
+
+    %{state | admission_owners: %{}, admission_monitors: %{}}
+  end
+
+  defp live_admission_owners(shard_index) do
+    shard_index
+    |> shard_admissions()
+    |> Enum.reduce(MapSet.new(), fn {key, owner_pid}, owners ->
+      if Process.alive?(owner_pid) do
+        MapSet.put(owners, owner_pid)
+      else
+        delete_admission(key)
+        owners
+      end
+    end)
+  end
+
+  defp admissions_empty?(shard_index) do
+    shard_admissions(shard_index) == []
+  end
+
+  defp insert_admission(shard_index, admission_ref, owner_pid) do
+    with_admission_table(fn table ->
+      :ets.insert_new(table, {{shard_index, admission_ref}, owner_pid})
+    end)
+  end
+
+  defp update_admission_owner(shard_index, admission_ref, owner_pid) do
+    with_admission_table(fn table ->
+      :ets.update_element(table, {shard_index, admission_ref}, {2, owner_pid})
+    end)
+  end
+
+  defp take_admission(shard_index, admission_ref) do
+    with_admission_table(fn table ->
+      :ets.take(table, {shard_index, admission_ref})
+    end)
+  end
+
+  defp shard_admissions(shard_index) do
+    with_admission_table(fn table ->
+      :ets.match_object(table, {{shard_index, :_}, :_})
+    end)
+  end
+
+  defp delete_owner_admissions(shard_index, owner_pid) do
+    with_admission_table(fn table ->
+      :ets.match_delete(table, {{shard_index, :_}, owner_pid})
+    end)
+  end
+
+  defp delete_shard_admissions(shard_index) do
+    case :ets.whereis(TableOwner.table()) do
+      :undefined -> :ok
+      table -> :ets.match_delete(table, {{shard_index, :_}, :_})
+    end
+  end
+
+  defp delete_admission(key) do
+    with_admission_table(fn table ->
+      :ets.delete(table, key)
+    end)
+  end
+
+  defp with_admission_table(fun) when is_function(fun, 1) do
+    table = TableOwner.table()
+
+    try do
+      fun.(table)
+    rescue
+      ArgumentError ->
+        case TableOwner.ensure_table() do
+          :ok -> fun.(table)
+          {:error, reason} -> :erlang.error({:sync_admission_table_unavailable, reason})
+        end
+    end
   end
 
   defp pause_pid(shard_index) do
@@ -674,6 +819,5 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     :error, :badarg -> :ok
   end
 
-  defp state_key(shard_index), do: {@state_key, shard_index}
   defp pause_key(shard_index), do: {@pause_key, shard_index}
 end

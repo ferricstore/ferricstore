@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   alias Ferricstore.Raft.WARaftBackend.Batcher.Telemetry
 
   @call_timeout 30_000
+  @handoff_timeout 1_000
   @default_max_batch_size 10_000
   @default_hot_batch_window_ms 1
   @default_generic_batch_window_ms 0
@@ -641,16 +642,33 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       {:defer, notify} when is_pid(notify) ->
         ref = make_ref()
 
-        {:ok, _pid} =
+        {:ok, worker} =
           Task.start(fn ->
-            send(notify, {:waraft_backend_batcher_cast_deferred, ref, self()})
-
             receive do
-              {^ref, :continue} -> maybe_cast_hot_batch(pid, message)
+              {^ref, :begin_handoff} ->
+                send(notify, {:waraft_backend_batcher_cast_deferred, ref, self()})
+
+                receive do
+                  {^ref, :continue} -> maybe_cast_hot_batch(pid, message)
+                after
+                  @call_timeout -> handle_lost_hot_batch(message)
+                end
+
+              {^ref, :abort_handoff} ->
+                :ok
             after
-              @call_timeout -> handle_lost_hot_batch(message)
+              @handoff_timeout -> handle_lost_hot_batch(message)
             end
           end)
+
+        case transfer_sync_token(message, worker) do
+          :ok ->
+            send(worker, {ref, :begin_handoff})
+
+          {:error, _reason} ->
+            send(worker, {ref, :abort_handoff})
+            handle_lost_hot_batch(message)
+        end
 
         :ok
 
@@ -660,10 +678,16 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   end
 
   defp maybe_cast_hot_batch(pid, message) do
-    if Process.alive?(pid) do
-      GenServer.cast(pid, message)
-    else
-      handle_lost_hot_batch(message)
+    case transfer_sync_token(message, pid) do
+      :ok ->
+        if Process.alive?(pid) do
+          GenServer.cast(pid, message)
+        else
+          handle_lost_hot_batch(message)
+        end
+
+      {:error, _reason} ->
+        handle_lost_hot_batch(message)
     end
   end
 
@@ -684,6 +708,22 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   defp release_sync_token(nil), do: :ok
   defp release_sync_token(token), do: SyncGate.leave(token)
+
+  defp transfer_sync_token(message, owner_pid) do
+    case sync_token(message) do
+      nil -> :ok
+      token -> SyncGate.transfer(token, owner_pid)
+    end
+  end
+
+  defp sync_token({:write_put_batch, _entries, _window_ms, _from, sync_token}),
+    do: sync_token
+
+  defp sync_token({:write_batch, _commands, _window_ms, _from, sync_token}),
+    do: sync_token
+
+  defp sync_token({:write_delete_batch, _keys, _window_ms, _from, sync_token}),
+    do: sync_token
 
   defp drain_unhandled_async_sync_tokens do
     receive do

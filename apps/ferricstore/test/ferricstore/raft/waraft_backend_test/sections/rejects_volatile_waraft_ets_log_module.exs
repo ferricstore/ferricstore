@@ -247,6 +247,59 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
+      @tag :sync_gate_async_owner_handoff
+      test "async batch handoff survives submitter exit until the cast reaches the batcher", %{
+        ctx: ctx
+      } do
+        previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
+        previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_cast_hook)
+        parent = self()
+
+        try do
+          Application.put_env(:ferricstore, :waraft_hot_batch_window_ms, 60_000)
+          Application.put_env(:ferricstore, :waraft_backend_batcher_cast_hook, {:defer, self()})
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          reply_ref = make_ref()
+
+          {submitter, submitter_monitor} =
+            spawn_monitor(fn ->
+              send(
+                parent,
+                {:async_submit_result,
+                 WARaftBackend.write_put_batch_async(
+                   0,
+                   [{"sync-pause-async-owner:k", "v1", 0}],
+                   {parent, reply_ref}
+                 )}
+              )
+            end)
+
+          assert_receive {:async_submit_result, :ok}, 1_000
+          assert_receive {:waraft_backend_batcher_cast_deferred, cast_ref, cast_worker}, 1_000
+          assert_receive {:DOWN, ^submitter_monitor, :process, ^submitter, :normal}, 1_000
+
+          pause_task =
+            Task.async(fn ->
+              Ferricstore.Raft.Batcher.pause_writes_for_sync(0, 5_000)
+            end)
+
+          refute Task.yield(pause_task, 50),
+                 "submitter exit must not release work already handed to the cast worker"
+
+          send(cast_worker, {cast_ref, :continue})
+          assert_receive {^reply_ref, {:ok, [:ok]}}, 5_000
+          assert {:ok, :ok} == Task.yield(pause_task, 5_000)
+          assert "v1" == Router.get(ctx, "sync-pause-async-owner:k")
+          assert :ok = Ferricstore.Raft.Batcher.resume_writes_for_sync(0, 1_000)
+        after
+          restore_env(:waraft_hot_batch_window_ms, previous_window)
+          restore_env(:waraft_backend_batcher_cast_hook, previous_hook)
+        end
+      end
+
       test "pause_writes_for_sync resumes new writes after drain timeout", %{ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 

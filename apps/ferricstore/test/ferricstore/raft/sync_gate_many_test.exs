@@ -3,7 +3,7 @@ defmodule Ferricstore.Raft.SyncGateManyTest do
 
   alias Ferricstore.Raft.WARaftBackend.SyncGate
 
-  test "concurrent first entrants share one shard counter" do
+  test "concurrent entrants receive distinct exactly-once admission tokens" do
     shard_index = System.unique_integer([:positive]) + 100_000
     parent = self()
 
@@ -33,7 +33,7 @@ defmodule Ferricstore.Raft.SyncGateManyTest do
     assert tokens
            |> Enum.map(&elem(&1, 1))
            |> MapSet.new()
-           |> MapSet.size() == 1
+           |> MapSet.size() == length(tokens)
 
     Enum.each(entrants, &send(&1, :leave))
   end
@@ -154,7 +154,7 @@ defmodule Ferricstore.Raft.SyncGateManyTest do
     assert :ok = SyncGate.resume(shard_index, pause_lease, 1_000)
   end
 
-  test "legacy pause survives the acquiring process and resumes from another process" do
+  test "unscoped pause survives the acquiring process and resumes from another process" do
     shard_index = System.unique_integer([:positive]) + 600_000
     parent = self()
 
@@ -162,10 +162,10 @@ defmodule Ferricstore.Raft.SyncGateManyTest do
 
     {pause_pid, pause_monitor} =
       spawn_monitor(fn ->
-        send(parent, {:legacy_pause_result, SyncGate.pause(shard_index)})
+        send(parent, {:unscoped_pause_result, SyncGate.pause(shard_index)})
       end)
 
-    assert_receive {:legacy_pause_result, {:ok, _gate_pid}}, 1_000
+    assert_receive {:unscoped_pause_result, {:ok, _gate_pid}}, 1_000
     assert_receive {:DOWN, ^pause_monitor, :process, ^pause_pid, :normal}, 1_000
     Process.sleep(20)
     assert SyncGate.paused?(shard_index)
@@ -196,6 +196,65 @@ defmodule Ferricstore.Raft.SyncGateManyTest do
 
     assert {:ok, {:error, :sync_pause_released}} = Task.yield(drain_waiter, 1_000)
     SyncGate.leave(active_token)
+  end
+
+  test "admission owner death cannot strand a shard pause" do
+    shard_index = System.unique_integer([:positive]) + 800_000
+    pause_lease = {self(), make_ref()}
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, token} = SyncGate.enter(shard_index)
+        send(parent, {:admission_owned, self(), token})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:admission_owned, ^owner, _token}, 1_000
+    Process.exit(owner, :kill)
+
+    assert {:ok, gate_pid} = SyncGate.pause(shard_index, pause_lease)
+    assert :ok = SyncGate.await_drained(gate_pid, 1_000)
+    assert :ok = SyncGate.resume(shard_index, pause_lease, 1_000)
+  end
+
+  test "transferred admission remains active after its original owner exits" do
+    shard_index = System.unique_integer([:positive]) + 900_000
+    pause_lease = {self(), make_ref()}
+    parent = self()
+
+    holder =
+      spawn(fn ->
+        receive do
+          {:hold_admission, token} ->
+            send(parent, {:admission_held, self()})
+
+            receive do
+              :release_admission -> SyncGate.leave(token)
+            end
+        end
+      end)
+
+    {owner, owner_monitor} =
+      spawn_monitor(fn ->
+        {:ok, token} = SyncGate.enter(shard_index)
+        :ok = SyncGate.transfer(token, holder)
+        send(holder, {:hold_admission, token})
+      end)
+
+    assert_receive {:admission_held, ^holder}, 1_000
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}, 1_000
+    assert {:ok, gate_pid} = SyncGate.pause(shard_index, pause_lease)
+
+    drain =
+      Task.async(fn ->
+        SyncGate.await_drained(gate_pid, 1_000)
+      end)
+
+    refute Task.yield(drain, 50)
+    send(holder, :release_admission)
+    assert {:ok, :ok} = Task.yield(drain, 1_000)
+    assert :ok = SyncGate.resume(shard_index, pause_lease, 1_000)
   end
 
   defp eventually(fun, attempts \\ 50)

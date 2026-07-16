@@ -40,7 +40,15 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
              StateMachine.apply(%{}, {:flush_shard, {1, 0}}, state)
 
     assert Enum.all?(keys, &(:ets.lookup(keydir, &1) == []))
-    assert [{^catalog_key, "control", 0, _, 0, 0, 7}] = :ets.lookup(keydir, catalog_key)
+
+    assert [
+             {^catalog_key, "control", 0, _lfu, catalog_file_id, catalog_offset, 7}
+           ] = :ets.lookup(keydir, catalog_key)
+
+    catalog_path =
+      Ferricstore.Store.Shard.ETS.file_path(state.shard_data_path, catalog_file_id)
+
+    assert {:ok, "control"} = NIF.v2_pread_at(catalog_path, catalog_offset)
     assert [{^watermark_key, <<1>>, 0, _, _, _, 1}] = :ets.lookup(keydir, watermark_key)
     assert [{^progress_key, _progress, 0, _, _, _, _}] = :ets.lookup(keydir, progress_key)
 
@@ -52,6 +60,38 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
 
     assert {^active_file_size, _dead_bytes} =
              Map.fetch!(new_state.file_stats, new_state.active_file_id)
+  end
+
+  test "replicated shard flush rewrites preserved catalog rows after active-file rotation" do
+    %{state: state, keydir: keydir, path: path} = start_state()
+    catalog_key = ServerCatalog.entry_key("acl", "default")
+    encoded = ServerCatalog.encode_entry(7, "catalog-value")
+
+    assert {:ok, {offset, _record_size}} = NIF.v2_append_record(path, catalog_key, encoded, 0)
+
+    true =
+      :ets.insert(keydir, {catalog_key, encoded, 0, LFU.initial(), 0, offset, byte_size(encoded)})
+
+    active_file_size = File.stat!(path).size
+    state = %{state | active_file_size: active_file_size, max_active_file_size: active_file_size}
+
+    assert {new_state, {:ok, 0}} =
+             StateMachine.apply(%{}, {:flush_shard, {1, 0}}, state)
+
+    assert new_state.active_file_id > 0
+
+    assert [
+             {^catalog_key, ^encoded, 0, _lfu, rewritten_file_id, rewritten_offset,
+              rewritten_size}
+           ] = :ets.lookup(keydir, catalog_key)
+
+    assert rewritten_file_id > 0
+    assert rewritten_size == byte_size(encoded)
+
+    rewritten_path =
+      Ferricstore.Store.Shard.ETS.file_path(state.shard_data_path, rewritten_file_id)
+
+    assert {:ok, ^encoded} = NIF.v2_pread_at(rewritten_path, rewritten_offset)
   end
 
   test "replicated shard flush clears fetch-or-compute locks before deleting rows" do
