@@ -154,6 +154,34 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
         end
       end
 
+      test "blob garbage sweep skips cold values whose stored size cannot be a blob ref", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
+        Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+        on_exit(fn ->
+          Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+        end)
+
+        payload = "dead-blob-with-unrelated-cold-value"
+        assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, payload)
+        path = BlobRef.path(ctx.data_dir, 0, ref)
+        cold_key = "blob:gc:non-ref-cold-value"
+
+        :ets.insert(
+          keydir,
+          {cold_key, nil, 0, LFU.initial(), 999_999, 0, BlobRef.encoded_size() + 1}
+        )
+
+        try do
+          assert {:ok, %{deleted_files: 1}} = Router.sweep_blob_garbage(ctx)
+          refute File.exists?(path)
+        after
+          :ets.delete(keydir, cold_key)
+        end
+      end
+
       test "blob garbage sweep does not delete a blob written after live-ref scan starts", %{
         ctx: ctx,
         keydir: keydir

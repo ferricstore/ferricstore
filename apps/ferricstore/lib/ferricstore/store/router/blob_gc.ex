@@ -1,6 +1,8 @@
 defmodule Ferricstore.Store.Router.BlobGC do
   @moduledoc false
 
+  @blob_ref_encoded_size Ferricstore.Store.BlobRef.encoded_size()
+
   def sweep_blob_garbage(ctx) do
     initial = blob_gc_empty_stats()
 
@@ -400,16 +402,24 @@ defmodule Ferricstore.Store.Router.BlobGC do
     blob_gc_decode_ref(value)
   end
 
-  defp blob_gc_live_entry_ref(ctx, idx, state, {key, _value, _exp, _lfu, fid, off, _size})
+  defp blob_gc_live_entry_ref(
+         ctx,
+         idx,
+         state,
+         {key, _value, _exp, _lfu, fid, off, value_size}
+       )
        when :erlang.andalso(
               :erlang.andalso(
                 :erlang.andalso(
-                  :erlang.andalso(:erlang.is_binary(key), :erlang.is_integer(fid)),
-                  :erlang.>=(fid, 0)
+                  :erlang.andalso(
+                    :erlang.andalso(:erlang.is_binary(key), :erlang.is_integer(fid)),
+                    :erlang.>=(fid, 0)
+                  ),
+                  :erlang.is_integer(off)
                 ),
-                :erlang.is_integer(off)
+                :erlang.>=(off, 0)
               ),
-              :erlang.>=(off, 0)
+              :erlang.==(value_size, @blob_ref_encoded_size)
             ) do
     path = blob_gc_entry_file_path(ctx, idx, state, key, fid)
 
